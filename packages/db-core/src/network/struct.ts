@@ -97,12 +97,15 @@ export type DurabilityQuorum =
 	 *  (`withTornBlocks` clamps `full` down to this; `torn` then names the blocks, and `unconfirmed`
 	 *  may be empty). */
 	| 'majority'
-	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. */
+	/** The cohort resolved, and it is this node alone. Nobody else holds the revision yet. When this
+	 *  node knows of other members of the cohort that it could not reach (`IKeyNetwork.absentCohortMembers`),
+	 *  they are named in `unconfirmed` and counted in `cohort`: the write is owed to them. With none
+	 *  named, it is a correct, complete one-machine write. */
 	| 'local'
 	/** The cohort did NOT resolve: the lookup threw, or named nobody, or named a single peer that
 	 *  is not this node. The write is on this node's storage and the network was never consulted.
-	 *  Deliberately NOT `local`: a genuine cohort of one is a correct, complete write, whereas this
-	 *  is a write whose correct destination is unknown. */
+	 *  Deliberately NOT `local`: a write that lands where its cohort resolved to is in the right
+	 *  place, whereas this is a write whose correct destination is unknown. */
 	| 'unrouted';
 
 /** What the answering layer knows about who holds a successful write. Each layer refines it:
@@ -120,15 +123,24 @@ export type WriteDurability = {
 	 *  it means "accepted the pending record". The two are NOT comparable — a pend confers no
 	 *  storage durability (see the note in `CoordinatorRepo.pendThroughCluster`). */
 	readonly confirmed: number;
-	/** Size of the cohort the write ran on. Zero exactly when `quorum` is 'unrouted'. */
+	/** Size of the cohort the write ran on. Zero exactly when `quorum` is 'unrouted'. For `local`
+	 *  it is one plus the known members the write ran without, so `local` does not imply 1. */
 	readonly cohort: number;
 	/** Cohort members that did not confirm, by peer-id string. Empty when `quorum` is 'full'.
 	 *  ABSENT (not empty) when the answering layer could not name the cohort — an empty array
-	 *  here means "named the cohort, nobody is missing". */
+	 *  here means "named the cohort, nobody is missing". On a `local` write these are the members
+	 *  this node knows of but could not reach when it wrote alone. */
 	readonly unconfirmed?: readonly string[];
 	/** The cohort the write ran on, by peer-id string. Absent where the answering layer has no
 	 *  cohort view at all (a bare `StorageRepo` verdict). */
 	readonly cohortPeerIds?: readonly string[];
+	/** Peer-id string of the node whose under-replication ledger recorded this write's missing
+	 *  copies — the one node that will fire `BlockDurabilityReachedEvent` for these blocks when they
+	 *  reach full replication. Set only below `full`, and only when every non-torn block's shortfall
+	 *  was recorded. Absent: no node is tracking the shortfall (nothing to push from the coordinator,
+	 *  a ledger fault, no ledger, a producer that predates the field), so no full-replication event
+	 *  should be expected. Per cohort answer: each `otherCohorts` entry carries its own. */
+	readonly recordedBy?: string;
 	/** Present only on an action-level result assembled from MORE THAN ONE distinct coordinator
 	 *  answer: the other answers. Identical answers are collapsed (`mergeDurability`), so a healthy
 	 *  single-cohort commit has none; one cohort answering differently for two batches appears
@@ -140,6 +152,14 @@ export type WriteDurability = {
 	 *  These blocks NEVER heal by replication: their transform is gone, and only the writer
 	 *  re-driving the action puts them back. */
 	readonly torn?: readonly BlockId[];
+	/** Action-level: every block this write committed, with the revision it committed at — what a
+	 *  host holds to match full-replication events (`BlockDurabilityReachedEvent`, keyed by block and
+	 *  revision) back to this write. Set by the db-core layer that issued the commit
+	 *  (`withBlockRevs`), never by a coordinator and never on the wire. Excludes `torn` blocks: they
+	 *  hold nothing. Merging two reports keeps, per block, the HIGHER revision — a block written at r
+	 *  and again at r+1 by one write is covered by an event at r+1 or later. A `Record` rather than a
+	 *  `Map` so the type stays plain JSON. */
+	readonly blockRevs?: Readonly<Record<BlockId, number>>;
 };
 
 export type PendSuccess = {

@@ -4,7 +4,8 @@ import { routingKeyForBlock } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
-import type { IUnderReplicationLedger, UnderReplicatedEntry } from './i-under-replication-ledger.js';
+import type { IUnderReplicationLedger, SatisfyOutcome, UnderReplicatedEntry } from './i-under-replication-ledger.js';
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
 
@@ -52,7 +53,8 @@ export const DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG: UnderReplicationDrainConfig
 /**
  * The one method the drain may call on the node's storage repo: emit a full-replication event.
  * Handed in as a function, exactly as the cluster side receives a `CommitCertificateSink`, so the
- * drain has no way to reach anything else on the repo.
+ * drain has no way to reach anything else on the repo. `CoordinatorRepo` is handed the same
+ * callable, for the entries a `full` commit settles — the event's other producer.
  */
 export type BlockDurabilitySink = (event: BlockDurabilityReachedEvent) => void;
 
@@ -78,6 +80,9 @@ export interface UnderReplicationDrainDeps {
 	/** The `/optimystic/<networkName>` prefix; a connected peer counts as pushable only once identify
 	 *  reports it serving this network's block-transfer protocol. Default: none (any connected peer). */
 	protocolPrefix?: string;
+	/** The node's network-membership gate (`createNetworkMembershipGate`): a connected peer it refuses
+	 *  is never pushable, whatever its protocol list says. Absent → no check. */
+	membership?: NetworkMembershipGate;
 }
 
 /** What woke a pass. */
@@ -124,18 +129,19 @@ const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
  * finally has all of them.
  *
  * `CoordinatorRepo.commit` writes an entry per block it acknowledged below full replication, naming
- * the cohort members that had not confirmed it (or an EMPTY set when no cohort could be named — a
- * `local` or `unrouted` write). This service is the other half: on start, whenever a peer connects or
- * is identified, and on a re-check timer while anything is outstanding, it walks the ledger and pushes
- * each block to the owed peers that are reachable right now. A peer that confirms is removed from the
- * entry; when the entry empties it is deleted and ONE {@link BlockDurabilityReachedEvent} fires through
- * the sink — after the deletion, never before.
+ * the cohort members that had not confirmed it (or an EMPTY set when no cohort could be named — an
+ * `unrouted` write, or a `local` one that knew of no other member). This service is the other half:
+ * on start, whenever a peer connects or is identified, and on a re-check timer while anything is
+ * outstanding, it walks the ledger and pushes each block to the owed peers that are reachable right
+ * now. A peer that confirms is removed from the entry; when the entry empties it is deleted and ONE
+ * {@link BlockDurabilityReachedEvent} fires through the sink — after the deletion, never before.
  *
  * What it deliberately does not do:
  * - **Dial the world.** A copy goes only to a peer that is connected and identified as serving this
  *   network. An entry whose owed peers are all away simply waits; the next arrival wakes the drain.
  * - **Re-resolve a NAMED peer.** A `majority` entry names members that were in the cohort when the
- *   write was acknowledged; a copy there is never harmful even if the cohort has since moved on.
+ *   write was acknowledged, and a `local` entry the members the node knew belonged in it; a copy there
+ *   is never harmful even if the cohort has since moved on.
  * - **Count an attempt against a node that is alone.** An entry with no named members whose cohort
  *   still resolves to this node alone is left exactly as it is: nobody is owed anything yet.
  * - **Delete an entry to tidy up.** Only a confirmed copy (or the block leaving local storage) removes
@@ -411,12 +417,19 @@ export class UnderReplicationDrain implements Startable {
 		}
 
 		if (outcome.confirmed.length > 0) {
-			const cleared = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev);
-			if (cleared) {
+			const status = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev);
+			if (status === 'cleared') {
 				counts.cleared++;
 				this.forgetBlock(entry.blockId);
 				// After the deletion, never before: a listener that re-reads the ledger sees it gone.
 				this.deps.emit({ blockIds: [entry.blockId], rev: entry.rev, actionId: entry.actionId, collectionId: outcome.collectionId });
+				return;
+			}
+			if (status === 'absent') {
+				// Removed while the copy was in flight — by a `full` commit, whose coordinator fired the
+				// event when it removed the entry (firing here too would announce the block twice), or by
+				// the ledger's size cap, which owes no event: the block was never confirmed held.
+				this.forgetBlock(entry.blockId);
 				return;
 			}
 		}
@@ -433,24 +446,25 @@ export class UnderReplicationDrain implements Startable {
 	 * is left alone (`name` touches only its own revision; `satisfy` keeps a higher one), and neither
 	 * recreates an entry a concurrent `settle` removed mid-push.
 	 *
-	 * NOTE: an entry settled mid-push by a `full` commit at a newer revision is gone by the time
-	 * `satisfy` runs, which reports that as "gone", so the event fires here too. It is true — the block
-	 * IS fully replicated — but under the older `rev`/`actionId`, and a listener may also have heard
-	 * `full` on that commit's own result. If a host ever needs the two told apart, have `satisfy`
-	 * distinguish "deleted now" from "absent".
+	 * An entry settled mid-push by a `full` commit is gone by the time `satisfy` runs, which reports it
+	 * `absent` rather than `cleared`: the commit that settled it announced it, so this drain does not.
 	 *
-	 * @returns whether the entry is gone — its last missing member confirmed.
+	 * @returns `cleared` when this call removed the entry (its last missing member confirmed), `absent`
+	 * when it was already gone, `owed` when it still stands.
 	 */
-	private async recordConfirmed(entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number): Promise<boolean> {
+	private async recordConfirmed(
+		entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number
+	): Promise<SatisfyOutcome['status']> {
 		if (!owed.named) {
 			await this.deps.ledger.name(entry.blockId, entry.rev, owed.peerIds);
 		}
-		const remaining = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
-		if (remaining === undefined) {
+		const outcome = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
+		if (outcome.status === 'cleared') {
 			log('entry:cleared block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
-			return true;
+		} else if (outcome.status === 'absent') {
+			log('entry:settled-elsewhere block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
 		}
-		return false;
+		return outcome.status;
 	}
 
 	/** Log each refusal so "cannot place" reads differently from "cannot reach", and count the round. */
@@ -517,7 +531,13 @@ export class UnderReplicationDrain implements Startable {
 	 * Connected peers identified as serving this network's block-transfer protocol — the only peers a
 	 * push can land on. Identify fills the peer store's protocol list, so a peer that just connected
 	 * is not yet pushable; the `peer:identify` trigger brings it in. With no prefix configured every
-	 * connected peer counts.
+	 * connected peer counts. A peer the membership gate refuses never counts: that protocol list is
+	 * one any connected peer can write.
+	 *
+	 * NOTE: an entry NAMING a peer the gate has since refused waits for it, so that block's
+	 * full-replication event does not fire while the peer stays refused — the drain has no notion of a
+	 * named member leaving the cohort, refused or otherwise. If a removed member's entries are seen
+	 * never clearing, drop refused peers from the named set (and settle an entry left empty by that).
 	 */
 	private async pushablePeers(): Promise<Set<string>> {
 		const seen = new Set<string>();
@@ -527,6 +547,7 @@ export class UnderReplicationDrain implements Startable {
 			const peerIdStr = peerId.toString();
 			if (seen.has(peerIdStr)) continue;
 			seen.add(peerIdStr);
+			if (!admittedBy(this.deps.membership, peerIdStr)) continue;
 			if (this.deps.protocolPrefix === undefined || await this.servesBlockTransfer(peerId)) {
 				pushable.add(peerIdStr);
 			}

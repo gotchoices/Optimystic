@@ -111,7 +111,7 @@ The `TransactionBridge` supports two modes:
 1. **Legacy mode** (default): Direct collection sync on commit
 2. **Transaction mode**: Uses `TransactionSession` for distributed consensus when configured with a coordinator and engine via `configureTransactionMode()`
 
-> **Read consistency note.** In the default `lazy` read-repair mode, a read served from a locally-cached block may return data up to one commit stale (bounded by `readRepairWindowMs`, default 10 s). Reads used as transaction read-dependencies are protected — validators catch stale data at commit time. Bare reads (outside a transaction) carry no such check. Use `readRepairMode: 'paranoid'` to force per-read verification. See [docs/transactions.md — Read Consistency and Staleness](../../docs/transactions.md#read-consistency-and-staleness) for the full discussion and configuration knobs.
+> **Read consistency note.** In the default `lazy` read-repair mode, a read served from a locally-cached block may return data up to one commit stale (bounded by `readRepairWindowMs`, default 10 s, plus the cohort consult the expiring read starts behind it — a read never waits on that consult). Reads used as transaction read-dependencies are protected — validators catch stale data at commit time. Bare reads (outside a transaction) carry no such check. Use `readRepairMode: 'paranoid'` to force per-read verification. See [docs/transactions.md — Read Consistency and Staleness](../../docs/transactions.md#read-consistency-and-staleness) for the full discussion and configuration knobs.
 
 ### StampId() Function
 
@@ -124,6 +124,44 @@ COMMIT;
 ```
 
 Format: 16 bytes SHA-256(peer ID) + 16 random bytes, base64url encoded. Stable within a transaction, unique across transactions and peers.
+
+### A commit's durability — `plugin.onCommitDurability(listener)`
+
+A commit can succeed while only this machine holds what it wrote. To tell the application which, register a listener on the object `register` returns. After every commit that wrote something, it is called once with an `SqlCommitDurability`:
+
+- `transactionId` — what `StampId()` returned inside the transaction, so a host that tagged rows with it can find them.
+- `durability` — who holds each collection the commit wrote (a table's main tree and each of its index trees), and `overall`, the weakest of them.
+- `tables` — the same folded per table, keyed `schema.table`.
+- `followed` — whether `onCommitFullyHeld` (below) will tell you when a pending commit becomes fully held.
+
+```typescript
+import { isFullyDurable } from '@optimystic/quereus-plugin-optimystic';
+
+const unsubscribe = plugin.onCommitDurability(({ transactionId, durability }) => {
+  const saved = durability.overall !== undefined && isFullyDurable(durability.overall);
+  markMessage(transactionId, saved ? 'delivered' : 'pending');
+});
+```
+
+An absent `overall` means a collection is saved but nobody could say who holds it; show that commit as pending.
+
+The listener is called synchronously before the commit returns. Quereus runs one writer at a time behind its exec lock, so every report delivered while `await db.exec(...)` is running belongs to that call, which is how a wrapper can hand the answer back from its own `exec`. A transaction that wrote nothing (a read, or a statement that matched no rows) calls no one. A failed commit is reported through its error instead: `CoordinatorPartialCommitError.durability` and `PartialCommitError.durability` describe the half that landed. A listener that throws is logged and the other listeners still run; the commit still succeeds. The returned function unsubscribes and is safe to call twice. A dropped table stops being named in `tables`, so a table later declared over the same URI reports its writes under its own name only.
+
+#### When a pending commit becomes fully held — `plugin.onCommitFullyHeld(listener)`
+
+A commit saved while the other members were offline is pending. When they come back, this machine pushes them the copies they missed, and the commit becomes held by every member. To be told when that happens, register a second listener; it is called once per such commit with `{ transactionId }`:
+
+```typescript
+plugin.onCommitDurability(({ transactionId, durability, followed }) => {
+  if (durability.overall !== undefined && isFullyDurable(durability.overall)) markMessage(transactionId, 'delivered');
+  else markMessage(transactionId, followed ? 'pending' : 'pending, will not clear');
+});
+plugin.onCommitFullyHeld(({ transactionId }) => markMessage(transactionId, 'delivered'));
+```
+
+Read `isFullyDurable(overall)` as "saved now" and `onCommitFullyHeld` as "saved later": a commit already fully held when reported is never reported again. A pending commit is followed only when this machine itself owes the missing copies — its own record of what each member still lacks is the one that announces when they all have them. A commit is reported with `followed: false`, and `onCommitFullyHeld` never fires for it, when that record belongs to another machine or to none (a `local`, `test` or `mesh-test` transactor keeps none), when a block was abandoned (`torn`), or when a collection's holders are unknown. One more case is refused for now: a collection some of whose blocks were held by their whole cohort while others were not, which only happens in a group larger than one cohort. A machine alone in its group — the node the plugin builds for itself runs `clusterSize: 1` — reports every commit pending and followed, and a commit is reported fully held only once another member has taken its copies, so it can stay pending for as long as the machine is alone.
+
+The listener runs synchronously, from the event that covered the commit's last block or from a later commit through this plugin that wrote those blocks at full replication, with the same discipline as `onCommitDurability`. Followed commits live in memory: a restart or `plugin.dispose()` forgets them, and so does a cap on how many can be pending at once (10 000, oldest dropped first). A forgotten commit is never reported, though its copies still reach the other members.
 
 ## Reactive Watching
 
@@ -287,8 +325,10 @@ await plugin.dispose();
 ```
 
 `dispose()` closes the network watches of tables tagged `optimystic.network_watch`
-(each would otherwise keep renewing its cohort registration until the node stops), and
-releases the plugin's claim on the read cache that sits in front of your
+(each would otherwise keep renewing its cohort registration until the node stops), stops
+following commits for [`onCommitFullyHeld`](#when-a-pending-commit-becomes-fully-held--pluginoncommitfullyheldlistener)
+(releasing its subscription to the node's full-replication events and forgetting every commit
+still pending), and releases the plugin's claim on the read cache that sits in front of your
 `rawStorageFactory` storage. That cache is **one per backing store per process**, shared by
 every `Database` registered over the same store — which is what lets two `Database`s over one
 directory see each other's committed writes — and it is only cleared once the last claim on it
@@ -301,8 +341,9 @@ instead of re-reading the backend. If something outside Optimystic mutates that 
 two `Database`s — a test that writes files into the directory itself, say — dispose in between
 or the second `Database` will serve the pre-mutation values.
 
-When the plugin owns libp2p nodes, `plugin.collectionFactory.shutdown()` stops them and calls
-`dispose()` as its last step; use that instead.
+When the plugin owns libp2p nodes, `plugin.collectionFactory.shutdown()` stops them and then
+releases the watches and the read cache as its last step; call `plugin.dispose()` as well, before
+or after, so the plugin also stops following commits. Both are safe to call more than once.
 
 ## Custom Networks and Transactors
 
@@ -401,11 +442,15 @@ object, so `instanceof` matches whichever one you import from:
 import { PartialCommitError } from '@optimystic/quereus-plugin-optimystic/plugin';
 ```
 
+Its `durability` says who holds the trees it persisted, in the same shape a successful commit's report and `CoordinatorPartialCommitError.durability` use (see [A commit's durability](#a-commits-durability--pluginoncommitdurabilitylistener)).
+
 Both entries also re-export the `@optimystic/db-core` errors a caller classifies commit and write
 failures by — `CoordinatorPartialCommitError` (a coordinated commit that landed on some trees but
 not others), `SyncRetryExhaustedError`, and `TornActionError` — so a host needs no direct
 `@optimystic/db-core` import to catch them. See [docs/transactions.md](../../docs/transactions.md)
 for the partial-commit pair and [docs/internals.md](../../docs/internals.md) for the other two.
+They re-export `isFullyDurable` too, the predicate a
+[commit-durability listener](#a-commits-durability--pluginoncommitdurabilitylistener) tests with.
 
 When two writers race and the loser's commit is refused, the failure is a typed engine error, the
 same as its sequential counterpart. A concurrent duplicate key (or unique value) is the engine's own

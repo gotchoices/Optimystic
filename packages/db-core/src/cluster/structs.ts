@@ -334,9 +334,22 @@ export interface ClusterConsensusConfig {
 	 * single reset here would otherwise drop the peer and sink super-majority.
 	 */
 	promiseImmediateRetries?: number;
-	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read). Default 'lazy'. In every mode a block missing locally consults its cohort on every read. */
+	/**
+	 * How a block the node HOLDS is re-verified against its cohort on a read. Default 'lazy'.
+	 *  - 'lazy': the held copy is served at once; when the block was last checked more than
+	 *    `readRepairWindowMs` ago (or never, as after a restart) the read also starts a cohort
+	 *    consult that runs BEHIND it, and what that consult learns (a repair, the window's stamp,
+	 *    the `unconfirmedAheadRev` doubt) reaches the next read of the block. A read never waits
+	 *    on a cohort peer that is connected but silent. A read carrying a floor above the held
+	 *    copy still waits for its consult, because the asker has proof the copy is too old.
+	 *  - 'paranoid': every read of a held block consults the cohort and waits for the consult —
+	 *    for callers that cannot tolerate any staleness, including the first read after a restart.
+	 *  - 'off': never consults for a held block (legacy; staleness unbounded).
+	 * In every mode a block missing locally consults its cohort on every read, and that read waits.
+	 * On a node, set through `clusterPolicy.readRepairMode`.
+	 */
 	readRepairMode?: 'off' | 'lazy' | 'paranoid';
-	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. Default 10000. */
+	/** For 'lazy' mode: a held block's read starts a cohort consult when (now - lastSeenCommitMs) > this. Default 10000. On a node, set through `clusterPolicy.readRepairWindowMs`. */
 	readRepairWindowMs?: number;
 	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
@@ -352,10 +365,12 @@ export interface ClusterConsensusConfig {
 	 * client's own dial and response defaults do not apply underneath it.
 	 *
 	 * Raise it for a deployment whose links are slower than a LAN: two phones reaching each other
-	 * only through a public circuit relay have a round trip near 1.8s, and every fresh stream (dial
-	 * or reuse, protocol select, send, receive) must fit inside this budget or the peer counts as
-	 * silent. The protocol select costs a round trip even on an open connection, so a request over a
-	 * reused connection costs two. In a two-member cohort one late answer is the whole quorum, so the
+	 * only through a public circuit relay have a round trip near 1.8s, and a request that opens its
+	 * stream (dial or reuse, protocol select, send, receive) must fit inside this budget or the peer
+	 * counts as silent. The protocol select costs a round trip even on an open connection, so such a
+	 * request over a reused connection costs two. db-p2p negotiates the next stream to a peer it is
+	 * talking to in advance, so a later request in a busy spell costs one, but the first after a quiet
+	 * spell still costs two. In a two-member cohort one late answer is the whole quorum, so the
 	 * consult declines every time and a rejoining node never catches up.
 	 *
 	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not

@@ -56,10 +56,11 @@ describe('KvUnderReplicationLedger over FileKVStore', () => {
 
 		const after = new KvUnderReplicationLedger(new FileKVStore(base));
 		await after.record(entry('block-a', { rev: 6 }));
-		const remaining = await after.satisfy('block-a' as BlockId, ['peer-1']);
+		const outcome = await after.satisfy('block-a' as BlockId, ['peer-1']);
 		await after.settle('block-b' as BlockId, 8);
 
-		assert.deepStrictEqual(remaining?.missingPeerIds, ['peer-2'], 'the lower revision was skipped, then one peer satisfied');
+		assert.deepStrictEqual(outcome.status === 'owed' ? outcome.entry.missingPeerIds : outcome.status, ['peer-2'],
+			'the lower revision was skipped, then one peer satisfied');
 		assert.strictEqual(await after.get('block-b' as BlockId), undefined, 'settled by a later full commit');
 		const reread = new KvUnderReplicationLedger(new FileKVStore(base));
 		assert.deepStrictEqual((await reread.list()).map(e => e.blockId), ['block-a']);

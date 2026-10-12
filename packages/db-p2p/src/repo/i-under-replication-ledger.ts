@@ -18,15 +18,31 @@ export type UnderReplicatedEntry = {
 	/** The class the commit was acknowledged at — `local`, `unrouted`, or `majority`. */
 	readonly quorum: ShortfallQuorum;
 	/** Cohort members that had not confirmed holding `rev`, by peer-id string.
-	 *  EMPTY when the cohort could not be named (`local`, `unrouted`): there was nobody to name,
-	 *  and the drain must re-resolve the cohort at drain time instead. An empty array therefore
-	 *  means "unknown", not "nobody". */
+	 *  EMPTY when the cohort could not be named (`unrouted`, or a `local` write that knew of no
+	 *  other member): there was nobody to name, and the drain must re-resolve the cohort at drain
+	 *  time instead. An empty array therefore means "unknown", not "nobody". A `local` entry names
+	 *  the members the node knew of and wrote without. */
 	readonly missingPeerIds: readonly string[];
 	/** When this shortfall was first recorded, in milliseconds since the epoch. */
 	readonly recordedAt: number;
 	/** Consecutive unsuccessful drain rounds — the give-up counter the drain owns. */
 	readonly attempts: number;
 };
+
+/**
+ * What {@link IUnderReplicationLedger.satisfy} found and did:
+ * - `owed` — the entry still stands, as `entry` (changed or not);
+ * - `cleared` — THIS call removed it: its last missing member confirmed;
+ * - `absent` — there was no entry to satisfy, most often because a `full` commit settled it while
+ *   the copy was in flight.
+ * `cleared` and `absent` both leave the block with no entry; they are told apart because each of the
+ * two ways an entry is removed (`satisfy` emptying it, `settle` deleting it) owes the full-replication
+ * event exactly once, and only the remover knows it was the one.
+ */
+export type SatisfyOutcome =
+	| { readonly status: 'owed'; readonly entry: UnderReplicatedEntry }
+	| { readonly status: 'cleared' }
+	| { readonly status: 'absent' };
 
 /**
  * The durable record of blocks this node acknowledged below full replication. Written by
@@ -50,9 +66,11 @@ export interface IUnderReplicationLedger {
 	record(entry: UnderReplicatedEntry): Promise<void>;
 	/**
 	 * A commit at `rev` reached full replication: delete the block's entry, unless that entry records
-	 * a HIGHER revision — a newer shortfall is not settled by an older commit finishing.
+	 * a HIGHER revision — a newer shortfall is not settled by an older commit finishing. Returns the
+	 * entry it removed, or `undefined` when it removed nothing; a caller that removed one owes the
+	 * full-replication event for it, since nothing else will fire it.
 	 */
-	settle(blockId: BlockId, rev: number): Promise<void>;
+	settle(blockId: BlockId, rev: number): Promise<UnderReplicatedEntry | undefined>;
 	get(blockId: BlockId): Promise<UnderReplicatedEntry | undefined>;
 	/** Every outstanding entry, oldest `recordedAt` first. The drain pages nothing today: the set is
 	 *  bounded by the node's own owned-block count and shrinks as copies land. */
@@ -61,10 +79,10 @@ export interface IUnderReplicationLedger {
 	 *  passes, so it must be cheap once warm: answered from memory after the first call. */
 	size(): Promise<number>;
 	/**
-	 * Remove `peerIds` from an entry's missing set, deleting the entry when it empties. Returns the
-	 * remaining entry, or `undefined` when it was deleted or never existed.
+	 * Remove `peerIds` from an entry's missing set, deleting the entry when it empties. Returns what
+	 * the call found and did — see {@link SatisfyOutcome}.
 	 *
-	 * An entry whose missing set is UNKNOWN (empty — recorded `local` or `unrouted`) is returned
+	 * An entry whose missing set is UNKNOWN (empty — recorded `unrouted`, or `local` naming nobody) is returned
 	 * unchanged: removing named peers from an unknown set cannot prove it empty. `name` its missing
 	 * set first, or `delete` it once the whole re-resolved cohort has confirmed.
 	 *
@@ -73,7 +91,7 @@ export interface IUnderReplicationLedger {
 	 * shortfall recorded while that copy was in flight. A copy of a newer revision satisfies an older
 	 * entry — a later revision supersedes an earlier one — so `heldRev` above the entry's is fine.
 	 */
-	satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined>;
+	satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<SatisfyOutcome>;
 	/**
 	 * Give an entry recorded with an UNKNOWN missing set the members the drain has since resolved,
 	 * so `satisfy` has a set to shrink. Applies only to the entry as it stands — at exactly `rev`,

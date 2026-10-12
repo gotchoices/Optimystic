@@ -85,25 +85,37 @@ export function isBlockChangeNotifier(x: unknown): x is IBlockChangeNotifier {
  * acknowledged below `full` (`WriteDurability.quorum`) is pending until these events cover its
  * blocks, at which point a host can move it from "pending" to "saved".
  *
+ * **Fired only on the node whose ledger recorded the shortfall** — the one a below-`full` answer
+ * names as `WriteDurability.recordedBy`. An answer without `recordedBy` is a write no node is
+ * tracking, and no event should be expected for it. That node fires the event when its record of a
+ * block's shortfall is removed, which happens two ways, each firing exactly once per record: the
+ * node's push of the missing copies empties it (the event carries the record's own `rev` and
+ * `actionId`), or a later commit of the block that every member confirmed settles it (the event
+ * carries that later commit's `rev` and `actionId`).
+ *
  * **Keyed by block, deliberately, never by action.** The node's record of what is still owed (the
  * under-replication ledger) keeps ONE entry per block, at the block's highest under-replicated
  * revision: a block written again by a LATER action replaces the earlier entry, so the earlier
  * action's shortfall is cleared by the later action's copies and reported under the later
  * action's `actionId` — the earlier action never fires an event of its own. A host that keys its
- * pending state by action alone therefore waits forever for a superseded write. Hold the block ids
- * the write's result names (`PendSuccess.blockIds`) and clear each as an event covers it; `rev`
- * and `actionId` say which write's copies did the covering.
+ * pending state by action alone therefore waits forever for a superseded write. Hold the blocks the
+ * write's durability names (`WriteDurability.blockRevs`, each with the revision it committed at) and
+ * clear a block when an event names it at that revision or a later one; `rev` and `actionId` say
+ * which write's copies did the covering. An event can arrive before the write's answer has reached
+ * the host, so a host that registers on the answer must also remember events it has already seen.
  */
 export type BlockDurabilityReachedEvent = {
-	/** Blocks that reached full replication in this round. Today's producer reports one block per
-	 *  event; the list shape lets a producer report several blocks of one action together. */
+	/** Blocks that reached full replication in this round. Both of today's producers report one block
+	 *  per event; the list shape lets a producer report several blocks of one action together. */
 	readonly blockIds: readonly BlockId[];
 	/** The revision every cohort member now holds — the block's highest under-replicated revision,
-	 *  which supersedes every lower one. */
+	 *  or the fully replicated commit that settled it, either of which supersedes every lower one. */
 	readonly rev: number;
-	/** The action whose recorded shortfall cleared. See the note above on superseded writes. */
+	/** The action whose copies covered the block: the one whose recorded shortfall cleared, or the
+	 *  fully replicated commit that settled it. See the note above on superseded writes. */
 	readonly actionId: ActionId;
-	/** Best-effort; absent when the collection could not be resolved from the block's header. */
+	/** Best-effort; absent when the collection could not be resolved from the block's header, and
+	 *  always when a settling commit fired the event (the coordinator does not read the block). */
 	readonly collectionId?: CollectionId;
 };
 

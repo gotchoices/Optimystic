@@ -234,6 +234,9 @@ describe('CoordinatorRepo read-repair', () => {
 			clusterLatestCallback
 		);
 
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
+
 		// Stub the clock so the spec is deterministic.
 		const baseTime = 1_000_000;
 		repo.now = () => baseTime;
@@ -277,6 +280,9 @@ describe('CoordinatorRepo read-repair', () => {
 			clusterLatestCallback
 		);
 
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
+
 		// No setLastSeenForTest call — block has never been marked seen, so lazy
 		// must treat it as stale and trigger.
 		await repo.get({ blockIds: [blockId] });
@@ -307,6 +313,9 @@ describe('CoordinatorRepo read-repair', () => {
 			undefined,
 			clusterLatestCallback
 		);
+
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
 
 		const baseTime = 3_000_000;
 		repo.now = () => baseTime;
@@ -350,6 +359,9 @@ describe('CoordinatorRepo read-repair', () => {
 			undefined,
 			clusterLatestCallback
 		);
+
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
 
 		const baseTime = 2_000_000;
 		repo.now = () => baseTime;
@@ -667,6 +679,9 @@ describe('CoordinatorRepo read-repair', () => {
 				clusterLatestCallback
 			);
 			repo.now = () => 1_000_000;
+			// Asserts on what each consult concluded about the window, so the consults wait here
+			// (behind the read in production).
+			repo.awaitWindowConsults = true;
 
 			await repo.get({ blockIds: [blockId] });
 			const afterFirst = invocations.length;
@@ -1095,7 +1110,7 @@ describe('CoordinatorRepo read-repair', () => {
 				expect(await servedRev(7), 'the floor gets the cohort asked, and the newer revision served').to.equal(7);
 			});
 			expect(consults()).to.equal(1);
-			expect(triggers(captured)).to.deep.equal([{ blockId, mode: 'lazy', ageMs: 0, localRev: 6, reason: 'floor', floor: 7 }]);
+			expect(triggers(captured)).to.deep.equal([{ blockId, mode: 'lazy', ageMs: 0, localRev: 6, reason: 'floor', background: false, floor: 7 }]);
 
 			// Met: the local copy is at the floor now, so the floor is no reason to ask again.
 			expect(await servedRev(7)).to.equal(7);
@@ -1123,6 +1138,8 @@ describe('CoordinatorRepo read-repair', () => {
 			// consults and re-stamps without a floor, and the old floor consults once more.
 			repo.now = () => baseTime + window + 1;
 			await servedRev();
+			// The lapsed window's consult runs behind the read; let it end before counting.
+			await repo.settleHeldBlockConsults();
 			expect(consults(), 'the lapsed window consulted').to.equal(3);
 			await servedRev(7);
 			expect(consults(), 'the re-stamp without a floor forgot the floor consulted under').to.equal(4);
@@ -1194,6 +1211,8 @@ describe('CoordinatorRepo read-repair', () => {
 		);
 
 		const result = await repo.get({ blockIds });
+		// The window's consults run behind the read; wait for them before counting how many overlapped.
+		await repo.settleHeldBlockConsults();
 
 		expect(mostOpenAtOnce, 'both blocks\' consults in flight at once').to.equal(blockIds.length);
 		for (const id of blockIds) expect(result[id]?.state?.latest).to.deep.equal(held);

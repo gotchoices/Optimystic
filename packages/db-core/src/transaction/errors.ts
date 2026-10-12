@@ -1,4 +1,6 @@
 import type { CollectionId } from "../collection/index.js";
+import type { WriteDurability } from "../network/struct.js";
+import { transactionDurability, type TransactionDurability } from "./durability.js";
 
 /**
  * Thrown by {@link TransactionCoordinator.commit} when a multi-collection commit
@@ -49,12 +51,22 @@ import type { CollectionId } from "../collection/index.js";
  * treat it as a clean abort: `committedCollections` are durable and cannot be rolled back,
  * so a whole-transaction retry would double-apply them. Reconcile the named committed set
  * against `failedCollections` (re-drive only the failed collections, or repair the split).
+ * `durability` says who holds the committed half, in the same shape a successful commit reports.
  */
 export class CoordinatorPartialCommitError extends Error {
+	/** Collections durably committed before the failure (NOT rolled back) — by an attempt, or
+	 * by the refresh between attempts finishing the collection's own log entry. Exactly the keys of
+	 * {@link durability}'s `collections`. */
+	readonly committedCollections: readonly CollectionId[];
+	/** Who holds the half that DID commit: exactly {@link committedCollections}, each with its class,
+	 * and `overall` over them (absent when any one's class is unknown). Says nothing about
+	 * {@link failedCollections}, which wrote nothing. */
+	readonly durability: TransactionDurability;
+
 	constructor(
-		/** Collections durably committed before the failure (NOT rolled back) — by an attempt, or
-		 * by the refresh between attempts finishing the collection's own log entry. */
-		public readonly committedCollections: readonly CollectionId[],
+		/** The committed collections with who holds each (`undefined` where that is unknown). Never
+		 * empty: a commit in which nothing was committed is not a partial commit. */
+		committed: ReadonlyMap<CollectionId, WriteDurability | undefined>,
 		/** Collections of this transaction that never committed (local state reverted for retry —
 		 * their staged actions are still in place). Can be empty when the failure came after every
 		 * collection was already saved. */
@@ -65,6 +77,7 @@ export class CoordinatorPartialCommitError extends Error {
 		 * refusal never cleared within the retry budget (its own `reason` names the last refusal). */
 		public readonly reason?: unknown,
 	) {
+		const committedCollections = [...committed.keys()];
 		super(
 			`Multi-collection commit was not atomic: ${committedCollections.length} collection(s) ` +
 			`durably committed via distributed consensus before the commit failed and CANNOT be ` +
@@ -73,6 +86,8 @@ export class CoordinatorPartialCommitError extends Error {
 			`Failed (never committed; local state reverted for retry): [${failedCollections.join(', ')}]. ` +
 			`Underlying failure: ${reason instanceof Error ? reason.message : String(reason)}`
 		);
+		this.committedCollections = committedCollections;
+		this.durability = transactionDurability(committed);
 		this.name = 'CoordinatorPartialCommitError';
 	}
 }

@@ -40,6 +40,12 @@
  * moment it opens. The caller's signal keeps its contract: a signal already aborted rejects with its
  * reason before anything is touched, and one that fires later rejects the open with that reason.
  *
+ * **The negotiation round trip itself is not avoided here.** multistream-select waits for the
+ * remote's echo before handing the stream back, whatever `negotiateFully` says (see that option), so
+ * every open costs a link round trip. What removes it from the request path is `PreparedStreams`
+ * (`prepared-streams.ts`), which opens the next request's stream through this function ahead of
+ * time — with `allowDial: false`, so it only ever uses a connection that is already open.
+ *
  * NOTE: accepted tradeoff — this duplicates FRET's `rpc/protocols.ts#openRpcStream` (exported since
  * `p2p-fret@1.0.0-beta.3`) rather than delegating to it. FRET's helper pins `negotiateFully: false`
  * with no way to opt out, and `cohort-topic/stream-util.ts` deliberately does not set that option
@@ -78,9 +84,17 @@ export interface OpenProtocolStreamOptions {
 	 * Pass `false` to ask libp2p not to wait for the remote's acknowledgement, accepting that an
 	 * unsupported-protocol failure is deferred to the first read — only safe when the caller always
 	 * reads a reply. `@libp2p/multistream-select@7` ignores it, so today the stream open costs one
-	 * round trip either way (`test/stream-open-costs-a-round-trip.spec.ts`).
+	 * round trip either way (`test/stream-open-costs-a-round-trip.spec.ts`); `PreparedStreams` is what
+	 * takes that round trip off the request path.
 	 */
 	negotiateFully?: boolean;
+	/**
+	 * Omit (or `true`) to fall back to a fresh dial once every open connection has failed. `false`
+	 * leaves the dial path out: the open runs over the peer's open connections only — hedged and
+	 * condemned as usual — and rejects at once with {@link NoOpenConnectionError} when it has none.
+	 * For an open nobody is waiting on, which must not create a connection (`PreparedStreams`).
+	 */
+	allowDial?: boolean;
 	/**
 	 * Runs immediately before a FRESH dial, and never on the connection-reuse paths.
 	 * Throwing fails the dial path, which fails the open once every connection path has failed too.
@@ -110,6 +124,18 @@ export class DeadConnectionError extends Error {
 	constructor(peer: string, protocol: string, connectionId: string, pendingMs: number) {
 		super(`stream open for ${protocol} on connection ${connectionId} to ${peer} stayed pending for ${pendingMs}ms: connection aborted as dead`);
 		this.name = "DeadConnectionError";
+	}
+}
+
+/** `.code` on {@link NoOpenConnectionError}. */
+export const NO_OPEN_CONNECTION_ERROR_CODE = "NO_OPEN_CONNECTION";
+
+/** What an open with `allowDial: false` rejects with when it finds no open connection to the peer. */
+export class NoOpenConnectionError extends Error {
+	readonly code = NO_OPEN_CONNECTION_ERROR_CODE;
+	constructor(peer: string, protocol: string) {
+		super(`no open connection to ${peer} for ${protocol}, and dialing was not allowed`);
+		this.name = "NoOpenConnectionError";
 	}
 }
 
@@ -161,11 +187,11 @@ type OpenPath =
 
 /**
  * The paths to try, in order: every open connection to the peer, direct before limited, newest first
- * within each group, then a fresh dial. Newest first is a tie-break, not the fix: a re-dial usually
- * replaces a connection that failed, but a fresh connection can be the dead one too (the field case),
- * and the hedge is what covers that.
+ * within each group, then a fresh dial unless `allowDial` is false. Newest first is a tie-break, not
+ * the fix: a re-dial usually replaces a connection that failed, but a fresh connection can be the dead
+ * one too (the field case), and the hedge is what covers that.
  */
-function orderedPaths(node: Libp2p, peer: PeerId): OpenPath[] {
+function orderedPaths(node: Libp2p, peer: PeerId, allowDial: boolean): OpenPath[] {
 	const conns = node.getConnections?.(peer) ?? [];
 	const open = conns.filter(c => c?.status === "open" && typeof c?.newStream === "function");
 	const newestFirst = (a: Connection, b: Connection): number => (b.timeline?.open ?? 0) - (a.timeline?.open ?? 0);
@@ -173,7 +199,7 @@ function orderedPaths(node: Libp2p, peer: PeerId): OpenPath[] {
 	const limited = open.filter(c => isLimitedConnection(c)).sort(newestFirst);
 	return [
 		...[...direct, ...limited].map(connection => ({ kind: "connection" as const, connection })),
-		{ kind: "dial" as const },
+		...(allowDial ? [{ kind: "dial" as const }] : []),
 	];
 }
 
@@ -209,12 +235,17 @@ class StreamOpenRace {
 		private readonly protocol: string,
 		private readonly options: OpenProtocolStreamOptions | undefined,
 	) {
-		this.paths = orderedPaths(node, peer);
+		this.paths = orderedPaths(node, peer, options?.allowDial ?? true);
 		this.deadlines = options?.deadlines ?? UNDECLARED_STREAM_OPEN_DEADLINES;
 		this.log = options?.log ?? moduleLog;
 	}
 
 	run(): Promise<Stream> {
+		// Only an open that may not dial can have no path at all; with nothing to start, nothing would
+		// ever settle the race.
+		if (this.paths.length === 0) {
+			return Promise.reject(new NoOpenConnectionError(this.peer.toString(), this.protocol));
+		}
 		return new Promise<Stream>((resolve, reject) => {
 			this.settle = { resolve, reject };
 			this.options?.signal?.addEventListener("abort", this.onCallerAbort, { once: true });
@@ -357,7 +388,7 @@ class StreamOpenRace {
 }
 
 /** Close a stream nobody will use (opened by a path that lost); a close that fails is aborted instead. */
-function discardStream(stream: Stream): void {
+export function discardStream(stream: Stream): void {
 	void stream.close().catch((err: unknown) => {
 		stream.abort?.(err instanceof Error ? err : new Error(String(err)));
 	});

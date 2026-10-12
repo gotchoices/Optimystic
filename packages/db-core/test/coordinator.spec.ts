@@ -336,12 +336,12 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; committedCollections: Map<CollectionId, unknown>; failedCollections: Set<CollectionId> }>;
 			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.true;
 			expect(transactor.commitMaxInFlight).to.equal(collectionIds.length);
-			expect([...result.committedCollections].sort()).to.deep.equal([...collectionIds].sort());
+			expect([...result.committedCollections.keys()].sort()).to.deep.equal([...collectionIds].sort());
 			expect(result.failedCollections.size).to.equal(0);
 		});
 
@@ -359,12 +359,12 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Map<CollectionId, unknown>; failedCollections: Set<CollectionId> }>;
 			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(failing);
-			expect([...result.committedCollections].sort()).to.deep.equal(['c0', 'c2']);
+			expect([...result.committedCollections.keys()].sort()).to.deep.equal(['c0', 'c2']);
 			expect([...result.failedCollections]).to.deep.equal([failing]);
 			// Stale failure → attempted exactly once (no retry).
 			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(1);
@@ -431,12 +431,12 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			const criticalBlockIds = collectionIds.map(id => `${id}-tail` as BlockId);
 
 			const result = await (coordinator as unknown as {
-				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Set<CollectionId>; failedCollections: Set<CollectionId> }>;
+				commitPhase: (a: string, c: BlockId[], p: Map<CollectionId, BlockId[]>, r: Map<CollectionId, number>) => Promise<{ success: boolean; error?: string; committedCollections: Map<CollectionId, unknown>; failedCollections: Set<CollectionId> }>;
 			}).commitPhase('txn-1', criticalBlockIds, pendedBlockIds, revsFor(collectionIds));
 
 			expect(result.success).to.be.false;
 			expect(result.error).to.contain(failing);
-			expect([...result.committedCollections].sort()).to.deep.equal(['c0', 'c2']);
+			expect([...result.committedCollections.keys()].sort()).to.deep.equal(['c0', 'c2']);
 			expect([...result.failedCollections]).to.deep.equal([failing]);
 			// Transient failure → retried the full 3 attempts before giving up.
 			expect(transactor.commitAttemptsByCollection.get(failing)).to.equal(3);
@@ -455,8 +455,8 @@ describe('TransactionCoordinator phases (concurrency + cancel-on-failure)', () =
 			);
 
 			await (coordinator as unknown as {
-				cancelPhase: (a: string, p: Map<CollectionId, BlockId[]>, e?: Set<CollectionId>) => Promise<void>;
-			}).cancelPhase('txn-1', pendedBlockIds, new Set(['c1']));
+				cancelPhase: (a: string, p: Map<CollectionId, BlockId[]>, e?: ReadonlyMap<CollectionId, unknown>) => Promise<void>;
+			}).cancelPhase('txn-1', pendedBlockIds, new Map([['c1', undefined]]));
 
 			// c1 was excluded; c0 and c2 are cancelled.
 			expect([...transactor.cancelledBlockIds].sort()).to.deep.equal(['c0-tail', 'c2-tail']);

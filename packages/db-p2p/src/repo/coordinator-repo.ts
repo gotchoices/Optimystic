@@ -17,6 +17,7 @@ import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-
 import type { ReconcileBlockCallback, BlockHoldersSink } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
+import type { BlockDurabilitySink } from "./under-replication-drain.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
@@ -37,6 +38,20 @@ export type AcquireBlockCallback = ReconcileBlockCallback;
 function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined): boolean {
 	return typeof rev === 'number' && (baselineRev === undefined || rev > baselineRev);
 }
+
+/**
+ * How many held-block consults may run behind reads at once
+ * ({@link CoordinatorRepo.startHeldBlockConsult}). A table scan after a restart reads every block
+ * once, and each consult opens one stream per cohort peer on the sync protocol, so unbounded, a cold
+ * scan would open one stream per block per peer at once. The sync protocol is registered under
+ * libp2p's defaults (`registerProtocolHandler`: 32 inbound streams per connection on the answering
+ * peer, 64 outbound here), so 16 leaves the answering peer half its inbound allowance for its other
+ * readers and for the archive fetches that acquisition runs over the same protocol.
+ *
+ * NOTE: a conservative bound, not a measured one. If `cluster-tx:read-repair-deferred` lines show
+ * steadily under normal load, raise it or queue the deferred blocks instead of dropping them.
+ */
+const MAX_HELD_BLOCK_CONSULTS = 16;
 
 /**
  * Reject if `promise` has not settled within `ms`. The timer is cleared on either outcome, so no
@@ -172,6 +187,16 @@ interface AheadClaimState {
 	 * it — the pair is one fact. `deadlocksReported` keeps its own independent lifetime.
 	 */
 	claimants?: readonly string[];
+	/**
+	 * The sequence number ({@link CoordinatorRepo.nextPassSeq}) of the latest-STARTED pass that wrote
+	 * {@link rev} and {@link claimants}. Passes end out of order — a held block's background consult
+	 * can run a whole per-peer budget while a floored blocking consult for the same block starts after
+	 * it and finishes first — and a pass's answers are no newer than its start, so a pass that started
+	 * before the one that wrote the memo may not WEAKEN it: its "nothing ahead" predates the claim it
+	 * would retire ({@link CoordinatorRepo.recordAheadClaim}). Raising is never gated — a higher claim
+	 * errs toward flagging, the safe direction. Written and cleared with `rev`.
+	 */
+	writtenBy?: number;
 	/**
 	 * Which `cluster-fetch:repair-deadlock` reasons have already been said for this block (see
 	 * {@link CoordinatorRepo.reportRepairDeadlock}). Neither reason is about any one revision — one is
@@ -448,6 +473,12 @@ interface CoordinatorRepoComponents {
 	 * {@link CoordinatorRepo.reportBlockHolders}. Absent → commit behaves exactly as without it.
 	 */
 	onBlockHolders?: BlockHoldersSink;
+	/**
+	 * Optional: where a `full` commit announces a ledger entry it settled — the second producer of
+	 * the full-replication event, beside the drain emptying an entry. The node wires the same
+	 * callable it hands the drain. Absent → a settled entry is removed silently, as before.
+	 */
+	onBlockDurabilityReached?: BlockDurabilitySink;
 }
 
 /**
@@ -484,7 +515,8 @@ export function coordinatorRepo(
 		components.acquireBlockFromCohort,
 		components.proofAnchoring,
 		components.underReplicationLedger,
-		components.onBlockHolders
+		components.onBlockHolders,
+		components.onBlockDurabilityReached
 	);
 }
 
@@ -614,6 +646,25 @@ export class CoordinatorRepo implements IRepo {
 	now: () => number = () => Date.now();
 	/** Test seam: overridable RNG (0..1) for sample-rate gating. */
 	rand: () => number = () => Math.random();
+	/**
+	 * Test seam: when true, a held block's window-demanded consult takes the blocking path, so a spec
+	 * about what a consult CONCLUDES (the doubt memo, arming, flags, repair outcomes, callback counts)
+	 * can read once and assert. Never set in production wiring, and not in a spec about read latency.
+	 */
+	awaitWindowConsults = false;
+	/**
+	 * Per block, the consult running behind a read that was served from the local copy (see
+	 * {@link startHeldBlockConsult}): at most one per block, at most {@link MAX_HELD_BLOCK_CONSULTS} in
+	 * all. An entry removes itself when its pass ends, and the pass never rejects.
+	 *
+	 * NOTE: `CoordinatorRepo` has no stop. A pass in flight when the node stops runs until its
+	 * deadlines expire (per peer `cohortQueryTimeoutMs`; acquisition `reconcilePassTimeoutMs`), fails
+	 * against the closed node and is logged `cluster-fetch:error`. If that ever delays process exit or
+	 * test teardown measurably, give this class a stop that aborts the in-flight passes.
+	 */
+	private readonly heldBlockConsults = new Map<BlockId, Promise<void>>();
+	/** Last sequence number handed out by {@link nextPassSeq}. */
+	private passSeq = 0;
 
 	constructor(
 		readonly keyNetwork: IKeyNetwork,
@@ -629,7 +680,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly acquireBlockFromCohort?: AcquireBlockCallback,
 		private readonly proofAnchoring?: ProofAnchoring,
 		private readonly underReplicationLedger?: IUnderReplicationLedger,
-		private readonly onBlockHolders?: BlockHoldersSink
+		private readonly onBlockHolders?: BlockHoldersSink,
+		private readonly onBlockDurabilityReached?: BlockDurabilitySink
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -858,6 +910,15 @@ export class CoordinatorRepo implements IRepo {
 	 * `blockId` (freshness stamp, unsettled-claim memo), and acquisition latches the one block, which is
 	 * what lets `get` run one of these per block concurrently.
 	 *
+	 * A held block whose consult only the WINDOW asked for does not wait on it in `'lazy'` mode: the
+	 * read is answered from the local copy at once and the consult runs behind it
+	 * ({@link startHeldBlockConsult}), so a cohort peer that is connected but not answering, or whose
+	 * dial hangs, costs the read nothing (GitHub #25, #34). Three consults still block: a MISSING
+	 * block, whose absence verdict depends on what the cohort says; a held block whose read carries a
+	 * FLOOR above it ({@link floorDemandsConsult}), because the asker has proof the local copy is too
+	 * old and the consult is what lets this node answer at the floor's revision; and every consult
+	 * under `'paranoid'`, which is documented as verifying on every read.
+	 *
 	 * A consult that throws is caught here and flags only this block, so one block's failed consult
 	 * cannot fail the rest of the read.
 	 */
@@ -886,22 +947,27 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 
-		if (isStale) {
-			// `reason` is 'floor' whenever the floor demanded the consult, even when the window
-			// would have consulted anyway: an operator reading `ageMs` at or below the window needs
-			// to know the asker asked for it (see docs/debugging.md).
-			this.log('cluster-tx:read-repair-triggered', {
-				blockId,
-				mode: this.readRepairMode,
-				ageMs: this.ageMs(blockId),
-				localRev,
-				reason: floorDemands ? 'floor' : 'window',
-				...(floor === undefined ? {} : { floor })
-			});
+		// `shouldReadRepair` says true on every read under `'paranoid'`, so the mode is tested here
+		// rather than inferred from `windowDemands`.
+		const background = isStale && !floorDemands && this.readRepairMode === 'lazy' && !this.awaitWindowConsults;
+		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
+		if (background) {
+			// The trigger line is logged only when a consult actually starts: a read that lands while the
+			// block's pass is still running, or past the cap, consulted nobody, and the line's one-per-consult
+			// reading (docs/debugging.md) is what the issue #8 count relied on.
+			if (this.startHeldBlockConsult(blockId, blockGets.context, localRev, floor, asker)) {
+				this.logRepairTriggered(blockId, localRev, 'window', true, floor);
+			}
+			// Served from the local copy, stamped from the unsettled-claim memo as it stands: what moves
+			// off the read is the consult's EFFORT, not its honesty — the same split the window already
+			// makes for the reads inside it.
+			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			return;
 		}
+		if (isStale) this.logRepairTriggered(blockId, localRev, floorDemands ? 'floor' : 'window', false, floor);
 
+		const passSeq = this.nextPassSeq();
 		try {
-			const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
 			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
 			// entry that lost its lineage answer would read to the asker as "could not say".
@@ -913,13 +979,7 @@ export class CoordinatorRepo implements IRepo {
 			if (refreshed[blockId]) {
 				results[blockId] = refreshed[blockId];
 			}
-			if (isStale) {
-				if (typeof newRev === 'number' && typeof localRev === 'number' && newRev > localRev) {
-					this.log('cluster-tx:read-repair-applied', { blockId, oldRev: localRev, newRev });
-				} else {
-					this.log('cluster-tx:read-repair-noop', { blockId });
-				}
-			}
+			if (isStale) this.logRepairOutcome(blockId, localRev, newRev);
 			// A still-missing block the consult could not rule out must not pose as an
 			// authoritative absent; the reason names what the consult established.
 			const unavailable = isMissing ? await this.absenceFlagFor(absence, floor) : undefined;
@@ -937,11 +997,11 @@ export class CoordinatorRepo implements IRepo {
 			// claim already reads as either authoritative (cohort answered, nothing
 			// corroborated) or flagged.
 			if (!isMissing) {
-				this.recordAheadClaim(blockId, currency);
+				this.recordAheadClaim(blockId, currency, passSeq);
 				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			}
 		} catch (err) {
-			this.log('cluster-fetch:error', { blockId, error: (err as Error).message });
+			this.log('cluster-fetch:error', { blockId, background: false, error: (err as Error).message });
 			// The consult that was supposed to make this answer trustworthy did not run.
 			// NOTE: a consult that THROWS (e.g. `findCluster` itself rejected) is reported
 			// 'peers-unreachable' even on an isolated node: a failed cohort lookup is a
@@ -1056,8 +1116,16 @@ export class CoordinatorRepo implements IRepo {
 	 * difference instead, so a new exit cannot mean the wrong one by omission — and `nothing-ahead`
 	 * now carries the evidence rather than a pre-baked refutation for the same reason, so a caller
 	 * cannot assert a refutation it did not observe.
+	 *
+	 * Evidence also has an AGE. `passSeq` is the sequence number the pass took when it started
+	 * ({@link nextPassSeq}), and a pass may not weaken a memo written by a pass that started after
+	 * it: its answers predate the ones the memo rests on, so they are no refutation of it (see
+	 * {@link AheadClaimState.writtenBy}). Two concurrent `get`s could always race this way; a
+	 * background consult that runs a whole per-peer budget beside a floored blocking one makes it
+	 * likely. Only the stamps are ungated: an older pass stamping "checked" after a newer one is
+	 * harmless, and its clearing a newer pass's recorded floor costs at most one extra floored consult.
 	 */
-	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict): void {
+	private recordAheadClaim(blockId: BlockId, currency: CurrencyVerdict, passSeq: number): void {
 		if (currency.kind === 'no-evidence') return;
 		const prior = this.unsettledAheadClaims.get(blockId);
 		const priorRev = prior?.rev;
@@ -1071,6 +1139,10 @@ export class CoordinatorRepo implements IRepo {
 		const weakensPrior = priorRev !== undefined
 			&& (currency.kind === 'nothing-ahead' || currency.rev < priorRev);
 		if (weakensPrior) {
+			if (prior?.writtenBy !== undefined && prior.writtenBy > passSeq) {
+				this.log('cluster-fetch:stale-pass-ignored', { blockId, rev: priorRev, passSeq, recordedBy: prior.writtenBy });
+				return;	// the memo stands: this pass's answers are older than the claim it would weaken
+			}
 			const silentClaimants = (prior?.claimants ?? []).filter(id => currency.silent.includes(id));
 			if (silentClaimants.length > 0) {
 				// The operator's only signal that a block's doubt CANNOT settle from this node's
@@ -1095,6 +1167,11 @@ export class CoordinatorRepo implements IRepo {
 			// not about any revision — it is about how many machines this deployment can field, or how
 			// many of them hold the block — so it outlives the claim that first exposed it and is
 			// dropped only when the block converges (see {@link flagUnconfirmedCurrency}).
+			// NOTE: retiring clears `writtenBy` with the claim, so a pass that started BEFORE this one and
+			// ends after it with an unsettled claim re-records it, and the doubt stands until the next
+			// consult that reaches the claimants (one window later at most). That is the flagging
+			// direction, accepted; if it ever shows as `unconfirmedAheadRev` returning right after a
+			// refutation, keep the retiring pass's sequence on the entry and gate the re-record on it.
 			if (prior?.deadlocksReported) this.unsettledAheadClaims.set(blockId, { deadlocksReported: prior.deadlocksReported });
 			else this.unsettledAheadClaims.delete(blockId);
 			return;
@@ -1116,6 +1193,9 @@ export class CoordinatorRepo implements IRepo {
 		this.unsettledAheadClaims.set(blockId, {
 			rev: currency.rev,
 			claimants,
+			// The newest pass whose evidence this memo now rests on — an older pass that joined a
+			// same-revision claim does not make the memo older.
+			writtenBy: Math.max(prior?.writtenBy ?? 0, passSeq),
 			...(prior?.deadlocksReported ? { deadlocksReported: prior.deadlocksReported } : {})
 		});
 	}
@@ -1286,6 +1366,99 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	setLastSeenForTest(blockId: BlockId, ts: number): void {
 		this.lastSeenCommitMs.set(blockId, { at: ts });
+	}
+
+	/**
+	 * Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). Loops,
+	 * because a pass that ends without arming the window (a transient decline) leaves the block open
+	 * to a read made meanwhile starting the next one.
+	 */
+	async settleHeldBlockConsults(): Promise<void> {
+		while (this.heldBlockConsults.size > 0) {
+			await Promise.all([...this.heldBlockConsults.values()]);
+		}
+	}
+
+	/**
+	 * The sequence number for a repair pass that is starting now. Every pass takes one before its
+	 * consult goes out, blocking or background, and hands it to {@link recordAheadClaim}, which uses
+	 * it to refuse an older pass's weakening of a memo a newer pass wrote.
+	 */
+	private nextPassSeq(): number {
+		return ++this.passSeq;
+	}
+
+	/**
+	 * Run the consult for a held block behind the read that asked for it, so the read is answered from
+	 * the local copy without waiting on a cohort peer that is connected but silent, or whose dial
+	 * hangs. What the pass learns — a repair (promotion or acquisition), the window's stamp, the
+	 * unsettled-claim memo behind `unconfirmedAheadRev`, the `cohort-too-small` arming, a deadlock
+	 * report — applies to the reads after it; a repair that lands content also emits the collection's
+	 * change event (`StorageRepo.saveReplicatedBlock`, `emitPromotions`), which wakes a watcher.
+	 *
+	 * At most one pass per block: the block stays unstamped until the pass ends, so every read of it
+	 * meanwhile lands here, is served, and starts nothing. At most {@link MAX_HELD_BLOCK_CONSULTS}
+	 * passes in all: past that the read is served, nothing starts, and the block stays unstamped so a
+	 * later read starts it. Returns whether a pass started, so the caller logs a trigger only for one.
+	 *
+	 * `asker` and `floor` are captured from the triggering read — the floor only so the stamp records
+	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
+	 * for this consult, not the floor — and `localRev` is what that read served, which is the baseline
+	 * the pass measures its outcome against.
+	 */
+	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined): boolean {
+		if (this.heldBlockConsults.has(blockId)) return false;
+		if (this.heldBlockConsults.size >= MAX_HELD_BLOCK_CONSULTS) {
+			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: this.heldBlockConsults.size });
+			return false;
+		}
+		const passSeq = this.nextPassSeq();
+		const pass = this.runHeldBlockConsult(blockId, context, localRev, floor, asker, passSeq)
+			.finally(() => this.heldBlockConsults.delete(blockId));
+		this.heldBlockConsults.set(blockId, pass);
+		return true;
+	}
+
+	/**
+	 * The background pass itself: the same consult, memo update and outcome line as the blocking path
+	 * in {@link readRepairBlock}, minus the absence verdict (the block is held). Never rejects: an error
+	 * is logged and the memo stands, since a thrown consult refutes nothing — as on the blocking path.
+	 */
+	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
+		try {
+			const { currency } = await this.fetchBlockFromCluster(blockId, context, localRev, floor, asker);
+			this.recordAheadClaim(blockId, currency, passSeq);
+			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId, context));
+		} catch (err) {
+			this.log('cluster-fetch:error', { blockId, background: true, error: (err as Error).message });
+		}
+	}
+
+	/**
+	 * The `cluster-tx:read-repair-triggered` line: a consult for a held block is starting. `reason` is
+	 * 'floor' whenever the floor demanded the consult, even when the window would have consulted anyway:
+	 * an operator reading `ageMs` at or below the window needs to know the asker asked for it (see
+	 * docs/debugging.md). `background` says whether the read waited for the consult.
+	 */
+	private logRepairTriggered(blockId: BlockId, localRev: number | undefined, reason: 'window' | 'floor', background: boolean, floor: number | undefined): void {
+		this.log('cluster-tx:read-repair-triggered', {
+			blockId,
+			mode: this.readRepairMode,
+			ageMs: this.ageMs(blockId),
+			localRev,
+			reason,
+			background,
+			...(floor === undefined ? {} : { floor })
+		});
+	}
+
+	/** Report what a held block's consult did to the local copy: `applied` when it advanced, else `noop`. */
+	private logRepairOutcome(blockId: BlockId, oldRev: number | undefined, newRev: number | undefined): void {
+		if (typeof newRev === 'number' && typeof oldRev === 'number' && newRev > oldRev) {
+			this.log('cluster-tx:read-repair-applied', { blockId, oldRev, newRev });
+		} else {
+			this.log('cluster-tx:read-repair-noop', { blockId });
+		}
 	}
 
 	/**
@@ -2220,7 +2393,7 @@ export class CoordinatorRepo implements IRepo {
 
 		const cohort = await this.coordinator.resolveCohort(coordinatingBlockIds[0]!);
 		if (!cohort.resolved || cohort.peerIds.length <= 1) {
-			return await this.pendSolo(request, cohort, options);
+			return await this.pendSolo(request, coordinatingBlockIds[0]!, cohort, options);
 		}
 
 		const message: RepoMessage = {
@@ -2394,16 +2567,19 @@ export class CoordinatorRepo implements IRepo {
 	 * pend goes straight to local storage exactly as before. What changes is the answer's class —
 	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
 	 */
-	private async pendSolo(request: PendRequest, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+	private async pendSolo(request: PendRequest, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
 		const result = await this.storageRepo.pend(request, options);
-		return result.success ? { ...result, durability: this.soloCohortDurability(cohort) } : result;
+		return result.success ? { ...result, durability: await this.soloCohortDurability(cohort, blockId) } : result;
 	}
 
 	/**
 	 * The class of a write that took the solo short-circuit, from the cohort resolution that put it
-	 * there. Policy-free: the write already happened, this only says what it was.
+	 * there, for the block whose cohort that was. Policy-free: the write already happened, this only
+	 * says what it was.
 	 *  - not resolved (the lookup threw, or named nobody) → `unrouted`;
-	 *  - resolved to exactly this node → `local`, a correct and complete one-machine write;
+	 *  - resolved to exactly this node → `local`, naming as unconfirmed every member the key network
+	 *    knows belongs in this cohort but could not place in it ({@link absentCohortMembers}) — the
+	 *    write is owed to them. With none, a correct and complete one-machine write;
 	 *  - resolved to exactly one peer that is NOT this node → `unrouted` — this node wrote somewhere
 	 *    the cohort does not look, which is a write whose destination is wrong, not a solo write.
 	 * With no local peer id (direct constructors, single-node and test wiring) a resolved cohort of
@@ -2416,11 +2592,29 @@ export class CoordinatorRepo implements IRepo {
 	 * staleness window, or when a second lookup fails moments after the first succeeded — and then it
 	 * still reports honestly rather than posing as `local`.
 	 */
-	private soloCohortDurability(cohort: CohortResolution): WriteDurability {
+	private async soloCohortDurability(cohort: CohortResolution, blockId: BlockId): Promise<WriteDurability> {
 		if (!cohort.resolved) return unroutedDurability();
 		const sole = cohort.peerIds[0]!;
 		if (this.localPeerId !== undefined && sole !== this.localPeerId.toString()) return unroutedDurability();
-		return localDurability(sole);
+		const absent = (await this.absentCohortMembers(blockId)).filter(peerId => peerId !== sole);
+		return localDurability(sole, absent);
+	}
+
+	/**
+	 * The members the key network knows belong in `blockId`'s cohort but are missing from the cohort it
+	 * assembles now (`IKeyNetwork.absentCohortMembers`). Asked only by the solo short-circuit, once its
+	 * cohort resolved to this node, so no write that ran on a real cohort pays for the lookup. A failure
+	 * names nobody: the write already happened, and an answer that cannot name its absent members is
+	 * the answer this node gave before it could.
+	 */
+	private async absentCohortMembers(blockId: BlockId): Promise<string[]> {
+		if (this.keyNetwork.absentCohortMembers === undefined) return [];
+		try {
+			return await this.keyNetwork.absentCohortMembers(routingKeyForBlock(blockId));
+		} catch (err) {
+			this.log('coordinator-repo:absent-members-failed', { blockId, error: (err as Error).message });
+			return [];
+		}
 	}
 
 	/**
@@ -3060,9 +3254,10 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * The one way a success leaves {@link commit}: record the replication shortfall the answer
-	 * describes, then return the answer unchanged. Every success exit — solo, local-executed, local
-	 * fallback, tolerated divergence — runs after the durability gate admitted it, so a refused
-	 * commit never reaches the ledger.
+	 * describes, then return the answer — naming this node as `recordedBy` when its ledger now owes
+	 * every block's missing copies, so the writer knows which node will announce full replication.
+	 * Every success exit — solo, local-executed, local fallback, tolerated divergence — runs after the
+	 * durability gate admitted it, so a refused commit never reaches the ledger.
 	 *
 	 * `localHolds` is whether this node's own storage durably holds every block of the commit, which
 	 * is what makes it a source for the missing copies — not whether the class counted it. `record`
@@ -3071,8 +3266,10 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
 		if (localHolds && record !== undefined) this.reportBlockHolders(request, answer.durability, record);
-		await this.noteReplicationShortfall(request, answer.durability, localHolds);
-		return answer;
+		const recorded = await this.noteReplicationShortfall(request, answer.durability, localHolds);
+		const self = this.localPeerId?.toString();
+		if (!recorded || self === undefined) return answer;
+		return { ...answer, durability: { ...answer.durability, recordedBy: self } };
 	}
 
 	/**
@@ -3104,9 +3301,13 @@ export class CoordinatorRepo implements IRepo {
 	 * cohort's answer is gone the moment the writer is answered, and the in-memory commit retry does
 	 * not survive a restart. One entry per block, all sharing this commit's one cohort answer
 	 * (consensus ran on `blockIds[0]`'s cohort for the whole request):
-	 * - `full` settles any older entry for the block, whether or not this node holds it;
+	 * - `full` settles any older entry for the block, whether or not this node holds it, and announces
+	 *   each entry it removed as a full-replication event — the copies it was waiting on are now on
+	 *   every member, at this commit's revision;
 	 * - `majority` records the unconfirmed members by name;
-	 * - `local` and `unrouted` record an EMPTY missing set, meaning "unknown" — nobody could be named.
+	 * - `local` records the members it names unconfirmed — the ones this node knows of and wrote
+	 *   without — or an EMPTY missing set, meaning "unknown", when it named none;
+	 * - `unrouted` records an EMPTY missing set — no cohort was named.
 	 * A shortfall is recorded only when `localHolds`: a node holding nothing has nothing to push, and
 	 * the remote majority that admitted the commit already holds it.
 	 *
@@ -3120,10 +3321,15 @@ export class CoordinatorRepo implements IRepo {
 	 * the ledger's in-memory index and touches the store only when an entry exists). If it shows in
 	 * commit latency, coalesce the writes rather than answering first: an entry written after the
 	 * answer can be lost to a crash in between, which is the one case the ledger exists for.
+	 *
+	 * @returns whether this node's ledger now tracks EVERY non-torn block's shortfall — the condition
+	 * for naming it `recordedBy`. False for a `full` answer, for a node holding nothing, with no
+	 * ledger, and when any one block's recording failed: a writer told to wait on this node must
+	 * never wait on an event its ledger cannot produce.
 	 */
-	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<void> {
+	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<boolean> {
 		const ledger = this.underReplicationLedger;
-		if (ledger === undefined) return;
+		if (ledger === undefined) return false;
 		// Blocks a torn commit abandoned were cancelled and hold nothing at this revision: there is no
 		// copy to push, and an entry would have a drain repeatedly read a block that is not there.
 		// No answer built in this class names `torn` today — the writer's transactor derives it after
@@ -3142,25 +3348,52 @@ export class CoordinatorRepo implements IRepo {
 				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
 			});
 		});
+		return blockIds.length > 0 && outcomes.every(outcome => outcome.status === 'fulfilled' && outcome.value);
 	}
 
+	/** @returns whether an entry was recorded for the block — never for a settle or a skip. */
 	private async noteBlockShortfall(
 		ledger: IUnderReplicationLedger, request: CommitRequest, blockId: BlockId, durability: WriteDurability, localHolds: boolean
-	): Promise<void> {
+	): Promise<boolean> {
 		if (durability.quorum === 'full') {
-			await ledger.settle(blockId, request.rev);
-			return;
+			const settled = await ledger.settle(blockId, request.rev);
+			if (settled !== undefined) this.announceFullReplication(request, blockId);
+			return false;
 		}
-		if (!localHolds) return;
+		if (!localHolds) return false;
+		// NOTE: accepted tradeoff — a `local` entry naming a member that never comes back stays until
+		// the ledger's size cap evicts it, as an unnamed entry on a node whose cohort stays self-only
+		// already did, so naming adds no cost. Revisit if a deployment reports ledger growth from a
+		// permanently departed partner: the remedy is a declared member list (backlog
+		// `feat-declared-membership-feeds-cohort-assembly`) or a "forget peer" operation, the remedy
+		// the accepted-tradeoff note at `membershipOf` in `libp2p-key-network.ts` names.
 		await ledger.record({
 			blockId,
 			rev: request.rev,
 			actionId: request.actionId,
 			quorum: durability.quorum,
-			missingPeerIds: durability.quorum === 'majority' ? durability.unconfirmed ?? [] : [],
+			missingPeerIds: durability.quorum === 'unrouted' ? [] : durability.unconfirmed ?? [],
 			recordedAt: this.now(),
 			attempts: 0
 		});
+		return true;
+	}
+
+	/**
+	 * Fire the full-replication event for a ledger entry a `full` commit just settled — after the
+	 * removal, never before, the order the drain keeps. The entry is gone, so nothing else will ever
+	 * announce it, and a host waiting on an earlier write to this block would otherwise wait forever.
+	 * `rev` is this commit's revision, which every cohort member now holds and which supersedes the
+	 * entry's. No `collectionId`: the coordinator does not read the block, and the field is
+	 * best-effort. A sink that throws is logged, never fails the commit.
+	 */
+	private announceFullReplication(request: CommitRequest, blockId: BlockId): void {
+		if (!this.onBlockDurabilityReached) return;
+		try {
+			this.onBlockDurabilityReached({ blockIds: [blockId], rev: request.rev, actionId: request.actionId });
+		} catch (err) {
+			this.log('coordinator-repo:block-durability-sink-error', { actionId: request.actionId, blockId, error: (err as Error).message });
+		}
 	}
 
 	/**
@@ -3191,17 +3424,27 @@ export class CoordinatorRepo implements IRepo {
 	 * tells a real cohort of one — cohortSize 1, soleIsSelf true — from a routing failure) now also
 	 * carries the `quorum` the writer is told, and both come from {@link soloCohortDurability}, so the
 	 * log and the answer cannot disagree.
+	 *
+	 * Two more fields tell apart the three ways a node that is part of a group comes to write alone:
+	 * `knownAbsent` counts the members it knows of and could not reach (named in `absentPeers`), and
+	 * `awaitingBootstrap` says it is still waiting to hear from a peer it was configured to join
+	 * through. With neither, the node is genuinely alone or has never identified another member of
+	 * its group.
 	 */
 	private async commitSolo(request: CommitRequest, blockIds: BlockId[], cohort: CohortResolution, options?: MessageOptions): Promise<CommitResult> {
 		const cohortPeerIds = cohort.resolved ? cohort.peerIds : [];
 		const peerCount = cohortPeerIds.length;
-		const soloDurability = this.soloCohortDurability(cohort);
+		const soloDurability = await this.soloCohortDurability(cohort, blockIds[0]!);
+		const absent = soloDurability.unconfirmed ?? [];
 		this.log('commit:solo-cohort', {
 			blockId: blockIds[0],
 			cohortSize: peerCount,
 			soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
 				&& cohortPeerIds[0] === this.localPeerId.toString(),
 			quorum: soloDurability.quorum,
+			knownAbsent: absent.length,
+			...(absent.length === 0 ? {} : { absentPeers: absent.map(peerId => peerId.substring(0, 12)) }),
+			awaitingBootstrap: await this.keyNetwork.awaitingBootstrapContact?.() ?? false,
 			...(cohort.resolved ? {} : { reason: cohort.reason })
 		});
 		// Same message shape the multi-peer path produces — executeClusterTransaction stamps

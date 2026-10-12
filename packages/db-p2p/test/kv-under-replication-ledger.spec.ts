@@ -171,10 +171,10 @@ describe('KvUnderReplicationLedger', () => {
 	});
 
 	describe('settling on full replication', () => {
-		it('deletes an entry at a lower revision', async () => {
+		it('deletes an entry at a lower revision, and returns what it removed for the caller to announce', async () => {
 			await ledger.record(entry({ rev: 3 }));
 
-			await ledger.settle(BLOCK_A, 4);
+			expect(await ledger.settle(BLOCK_A, 4)).to.deep.equal(entry({ rev: 3 }));
 
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
 		});
@@ -190,13 +190,13 @@ describe('KvUnderReplicationLedger', () => {
 		it('keeps an entry recording a higher revision — an older commit finishing settles nothing newer', async () => {
 			await ledger.record(entry({ rev: 5 }));
 
-			await ledger.settle(BLOCK_A, 4);
+			expect(await ledger.settle(BLOCK_A, 4), 'removed nothing, so nothing to announce').to.equal(undefined);
 
 			expect((await ledger.get(BLOCK_A))?.rev).to.equal(5);
 		});
 
 		it('is a no-op for a block with no entry', async () => {
-			await ledger.settle(BLOCK_A, 4);
+			expect(await ledger.settle(BLOCK_A, 4)).to.equal(undefined);
 
 			expect(await ledger.list()).to.deep.equal([]);
 		});
@@ -206,19 +206,18 @@ describe('KvUnderReplicationLedger', () => {
 		it('removing one of two missing peers leaves the entry naming the other', async () => {
 			await ledger.record(entry());
 
-			const remaining = await ledger.satisfy(BLOCK_A, ['peer-x']);
+			const outcome = await ledger.satisfy(BLOCK_A, ['peer-x']);
 
-			expect(remaining?.missingPeerIds).to.deep.equal(['peer-y']);
-			expect(await ledger.get(BLOCK_A)).to.deep.equal(remaining);
+			expect(outcome).to.deep.equal({ status: 'owed', entry: entry({ missingPeerIds: ['peer-y'] }) });
+			expect(await ledger.get(BLOCK_A)).to.deep.equal(entry({ missingPeerIds: ['peer-y'] }));
 		});
 
 		it('removing the last missing peer deletes the entry', async () => {
 			await ledger.record(entry());
 			await ledger.satisfy(BLOCK_A, ['peer-x']);
 
-			const remaining = await ledger.satisfy(BLOCK_A, ['peer-y']);
+			expect(await ledger.satisfy(BLOCK_A, ['peer-y'])).to.deep.equal({ status: 'cleared' });
 
-			expect(remaining).to.equal(undefined);
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
 			expect(await ledger.list()).to.deep.equal([]);
 		});
@@ -226,9 +225,9 @@ describe('KvUnderReplicationLedger', () => {
 		it('an entry whose missing set is unknown is not satisfied peer by peer', async () => {
 			await ledger.record(entry({ quorum: 'local', missingPeerIds: [] }));
 
-			const remaining = await ledger.satisfy(BLOCK_A, ['peer-x']);
+			const outcome = await ledger.satisfy(BLOCK_A, ['peer-x']);
 
-			expect(remaining, 'unknown is not empty').to.deep.equal(entry({ quorum: 'local', missingPeerIds: [] }));
+			expect(outcome, 'unknown is not empty').to.deep.equal({ status: 'owed', entry: entry({ quorum: 'local', missingPeerIds: [] }) });
 			expect(await ledger.get(BLOCK_A)).to.not.equal(undefined);
 		});
 
@@ -236,7 +235,7 @@ describe('KvUnderReplicationLedger', () => {
 			await ledger.record(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
 
 			const captured = await captureLog('under-replication-ledger', async () => {
-				expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 5)).to.deep.equal(entry({ rev: 6, missingPeerIds: ['peer-x'] }));
+				expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 5)).to.deep.equal({ status: 'owed', entry: entry({ rev: 6, missingPeerIds: ['peer-x'] }) });
 			});
 
 			expect(hasTag(captured, 'satisfy:keep-higher-rev')).to.equal(true);
@@ -245,15 +244,15 @@ describe('KvUnderReplicationLedger', () => {
 
 		it('a copy of the same or a NEWER revision than the entry records satisfies it', async () => {
 			await ledger.record(entry({ rev: 5, missingPeerIds: ['peer-x', 'peer-y'] }));
-			expect((await ledger.satisfy(BLOCK_A, ['peer-x'], 5))?.missingPeerIds).to.deep.equal(['peer-y']);
-			expect(await ledger.satisfy(BLOCK_A, ['peer-y'], 7)).to.equal(undefined);
+			expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 5)).to.deep.equal({ status: 'owed', entry: entry({ rev: 5, missingPeerIds: ['peer-y'] }) });
+			expect(await ledger.satisfy(BLOCK_A, ['peer-y'], 7)).to.deep.equal({ status: 'cleared' });
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
 		});
 
 		it('satisfying peers the entry never named changes nothing', async () => {
 			await ledger.record(entry());
 
-			expect(await ledger.satisfy(BLOCK_A, ['peer-q'])).to.deep.equal(entry());
+			expect(await ledger.satisfy(BLOCK_A, ['peer-q'])).to.deep.equal({ status: 'owed', entry: entry() });
 		});
 
 		it('name gives an unknown missing set its members at the same rev, keeping recordedAt and attempts', async () => {
@@ -263,7 +262,8 @@ describe('KvUnderReplicationLedger', () => {
 
 			expect(named).to.deep.equal(entry({ quorum: 'local', missingPeerIds: ['peer-x', 'peer-y'], attempts: 2 }));
 			expect(await ledger.get(BLOCK_A)).to.deep.equal(named);
-			expect((await ledger.satisfy(BLOCK_A, ['peer-x'], 3))?.missingPeerIds, 'satisfy now has a set to shrink').to.deep.equal(['peer-y']);
+			expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 3), 'satisfy now has a set to shrink')
+				.to.deep.equal({ status: 'owed', entry: entry({ quorum: 'local', missingPeerIds: ['peer-y'], attempts: 2 }) });
 		});
 
 		it('name leaves an already-named entry and an entry at another rev unchanged', async () => {

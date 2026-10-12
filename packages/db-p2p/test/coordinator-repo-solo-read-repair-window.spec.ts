@@ -136,6 +136,9 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 			undefined,
 			clusterLatestCallback
 		);
+		// The specs count triggers and consults per window for a HELD block; in production the window's
+		// consult runs behind the read, so it waits here.
+		repo.awaitWindowConsults = true;
 		// Deterministic clock. The block is never marked seen up front — this node has not
 		// committed it, which is exactly the field case (control-network blocks this node reads
 		// but never writes).
@@ -296,6 +299,10 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 		);
 		let clock = BASE_TIME;
 		repo.now = () => clock;
+		// Built inline rather than through `makeSoloRepo`, so the seam is set here for the same reason:
+		// the spec counts one trigger per read, and a read that lands while the previous read's consult
+		// is still running behind it starts none and logs none.
+		repo.awaitWindowConsults = true;
 
 		const captured = await captureCoordinatorLog(async () => {
 			for (let i = 0; i < 9; i++) {

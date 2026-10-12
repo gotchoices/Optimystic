@@ -1,5 +1,5 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
-import { Tree, Collection, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
+import { Tree, Collection, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -614,6 +614,21 @@ export class CollectionFactory {
     const nodeKey = this.getNodeKey(options);
     const nodeInfo = this.libp2pNodes.get(nodeKey);
     return nodeInfo?.node.peerId.toString();
+  }
+
+  /**
+   * The full-replication event source (`BlockDurabilityReachedEvent`) of the node behind the
+   * `network` transactor: its `StorageRepo`, whose under-replication ledger records the copies a
+   * write acknowledged below full replication still owes. `undefined` for every other transactor —
+   * `local`, `test` and `mesh-test` keep no ledger and run no drain, so nothing would ever fire —
+   * and for an injected node built without a store.
+   */
+  getBlockDurabilityNotifier(options: ParsedOptimysticOptions): IBlockDurabilityNotifier | undefined {
+    if (options.transactor !== 'network') {
+      return undefined;
+    }
+    const store = this.libp2pNodes.get(this.getNodeKey(options))?.node.storageRepo;
+    return isBlockDurabilityNotifier(store) ? store : undefined;
   }
 
   /**

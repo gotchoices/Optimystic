@@ -148,6 +148,7 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 			const { durability } = attempt;
 			if (!durability) throw new Error('an acknowledged write must report who holds it, but none came back');
 			expect(durability.quorum, 'a write A accepted with B away is held by A alone').to.equal('local');
+			expect(durability.unconfirmed, 'A knows B is a member and names it as owed the write').to.deep.equal([bPeerId.toString()]);
 			expect(isFullyDurable(durability), 'a solo write is not fully durable').to.equal(false);
 		}
 

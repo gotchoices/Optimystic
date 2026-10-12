@@ -617,9 +617,16 @@ describe('CoordinatorRepo Integration (TEST-5.3.1)', () => {
 			);
 			mesh.failures.silentPeers = new Set([darkPeer.peerId.toString()]);
 
-			// First half: the stale coordinator itself now says "possibly behind rev 2" instead
-			// of posing as confirmed. (Its consult: fresh holder claims 2 — one claim, quorum of
-			// two, declined; dark peer silent.)
+			// First half: the stale coordinator itself says "possibly behind rev 2" instead of posing
+			// as confirmed — one read later than it used to. The first read of a block this node holds
+			// starts its consult BEHIND the read and is served unflagged from the held copy; the consult
+			// (fresh holder claims 2 — one claim, quorum of two, declined; dark peer silent) records
+			// the unsettled claim, and the next read carries it. `settleHeldBlockConsults` is the
+			// deterministic form of waiting for that consult to end.
+			const servedBeforeConsult = await staleReader.coordinatorRepo.get({ blockIds: [blockId] });
+			expect(servedBeforeConsult[blockId]?.state?.latest?.rev, 'the held copy is served at once').to.equal(1);
+			expect(servedBeforeConsult[blockId]?.unconfirmedAheadRev, 'the consult has not concluded yet').to.equal(undefined);
+			await staleReader.coordinatorRepo.settleHeldBlockConsults();
 			const staleAnswer = await staleReader.coordinatorRepo.get({ blockIds: [blockId] });
 			expect(staleAnswer[blockId]?.state?.latest?.rev, 'the stale copy is still served').to.equal(1);
 			expect(staleAnswer[blockId]?.unconfirmedAheadRev, 'marked with the unsettled claim').to.equal(2);

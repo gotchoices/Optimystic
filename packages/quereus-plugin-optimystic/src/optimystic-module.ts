@@ -1903,7 +1903,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private registerCollections(): void {
     if (this.collection) {
-      this.txnBridge.registerCollection(this.collection.getCollection());
+      this.registerTree(this.collection);
       // Teach the bridge how to render a concurrency-refused duplicate key for THIS
       // table (a TreeKeyTakenError surfacing at commit from the main collection's
       // conflict replay). Registered here — after doInitialize resolved the schema,
@@ -1923,10 +1923,29 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
     if (this.indexManager) {
       for (const tree of this.indexManager.getIndexTrees()) {
-        this.txnBridge.registerCollection(tree.getCollection());
+        this.registerTree(tree);
       }
     }
     this.registerUniqueKeyTakenMessages();
+  }
+
+  /**
+   * Register one of this table's trees with the bridge (see
+   * {@link TransactionBridge.registerCollection}), under this table's qualified name — the key a
+   * commit's durability report groups the tree's collection under.
+   */
+  private registerTree(tree: Tree<any, any>): void {
+    this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedName);
+  }
+
+  /** Stop the bridge naming this table in commit reports; on DROP and on a refused CREATE. */
+  forgetInCommitReports(): void {
+    this.txnBridge.forgetTable(this.qualifiedName);
+  }
+
+  /** The `schema.table` key a commit's durability report groups this table's collections under. */
+  private get qualifiedName(): string {
+    return `${this.schemaName}.${this.tableName}`;
   }
 
   /**
@@ -3218,7 +3237,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       if (!tree) {
         throw new Error(`Index tree not found: ${descriptor.name}`);
       }
-      this.txnBridge.registerCollection(tree.getCollection());
+      this.registerTree(tree);
       await this.populateUniqueTree(descriptor, tree);
       this.populatedUniqueTrees.add(descriptor.name);
       this.uniqueEnforcementIndexes = [...this.uniqueEnforcementIndexes, descriptor];
@@ -3671,7 +3690,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         manager.registerIndexTree(idx.name, tree);
       }
       // Idempotent (keyed by collection id) — see TransactionBridge.registerCollection.
-      this.txnBridge.registerCollection(tree.getCollection());
+      this.registerTree(tree);
     }
     return attached;
   }
@@ -4293,6 +4312,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // instance stayed cached. Nothing was registered with Quereus yet.
       this.tables.delete(tableKey);
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
       throw error;
     }
 
@@ -5052,6 +5072,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // Release the collection-change → watch bridge before forgetting the table
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
       try {
         await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {

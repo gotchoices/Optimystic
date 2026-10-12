@@ -110,6 +110,15 @@ const TORN: WriteDurability = {
 	torn: ['abandoned-block-1', 'abandoned-block-2']
 }
 
+/** The answer minus `blockRevs`, which the db-core layer that issued the commit adds on the way up
+ *  (the blocks it committed, under random ids): these tests compare the class the transactor
+ *  answered with. */
+function answered(d: WriteDurability | undefined): WriteDurability | undefined {
+	if (d === undefined) return undefined
+	const { blockRevs: _blockRevs, ...rest } = d
+	return rest
+}
+
 describe('write durability reaches the writer', () => {
 	describe('Collection.sync', () => {
 		it('reports the class the transactor answered the commit with', async () => {
@@ -119,8 +128,13 @@ describe('write durability reaches the writer', () => {
 
 			const durability = await collection.sync()
 
-			expect(durability, 'sync answers with who holds the write').to.deep.equal(MAJORITY)
+			expect(answered(durability), 'sync answers with who holds the write').to.deep.equal(MAJORITY)
 			expect(isFullyDurable(durability!), 'a majority write is not fully durable').to.equal(false)
+			// What a host matches full-replication events against: every block the commit wrote — the
+			// header (id = collection id), the log block and the inserted block — at its revision.
+			expect(Object.values(durability!.blockRevs ?? {}), 'names the blocks it committed, at the commit revision')
+				.to.have.lengthOf(3).and.to.satisfy((revs: number[]) => revs.every(rev => rev === 1))
+			expect(durability!.blockRevs).to.have.property('majority-coll', 1)
 		})
 
 		it('reports undefined when nothing is staged — no write happened, so there is no class to report', async () => {
@@ -150,7 +164,7 @@ describe('write durability reaches the writer', () => {
 
 			expect(transactor.refusals, 'the first two attempts were refused').to.equal(2)
 			expect(transactor.commits, 'exactly one attempt committed').to.equal(1)
-			expect(durability, "the answer is the committing attempt's").to.deep.equal(MAJORITY)
+			expect(answered(durability), "the answer is the committing attempt's").to.deep.equal(MAJORITY)
 		})
 
 		it('throws rather than reporting a class when the write never lands', async () => {
@@ -186,7 +200,7 @@ describe('write durability reaches the writer', () => {
 				transactor, 'staged-tree', entry => entry.key)
 			await tree.stage([[2, { key: 2, value: 'two' }]])
 
-			expect(await tree.sync(), 'the staged row reports its class').to.deep.equal(MAJORITY)
+			expect(answered(await tree.sync()), 'the staged row reports its class').to.deep.equal(MAJORITY)
 			expect(tree.hasUnsyncedChanges(), 'the flush emptied the tree').to.equal(false)
 			expect(await tree.sync(), 'a second flush writes nothing, so it reports nothing').to.equal(undefined)
 		})
@@ -195,7 +209,7 @@ describe('write durability reaches the writer', () => {
 			const transactor = new StampedDurabilityTransactor(new TestTransactor(), MAJORITY)
 			const diary = await Diary.createOrOpen<string>(transactor, 'durable-diary')
 
-			expect(await diary.append('first entry')).to.deep.equal(MAJORITY)
+			expect(answered(await diary.append('first entry'))).to.deep.equal(MAJORITY)
 		})
 	})
 
@@ -209,7 +223,7 @@ describe('write durability reaches the writer', () => {
 
 			const durability = await collection.updateAndSync()
 
-			expect(durability, 'updateAndSync carries the same answer as sync').to.deep.equal(MAJORITY)
+			expect(answered(durability), 'updateAndSync carries the same answer as sync').to.deep.equal(MAJORITY)
 			expect(durability?.cohortPeerIds, 'the cohort list is not flattened away').to.deep.equal(MAJORITY.cohortPeerIds)
 		})
 	})

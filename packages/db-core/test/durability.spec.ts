@@ -11,7 +11,7 @@
  */
 import { expect } from 'chai';
 import type { BlockId, DurabilityQuorum, WriteDurability } from '../src/index.js';
-import { durabilityRank, isFullyDurable, localDurability, mergeDurability, unroutedDurability, withTornBlocks } from '../src/index.js';
+import { durabilityRank, isFullyDurable, localDurability, mergeDurability, unroutedDurability, withBlockRevs, withTornBlocks } from '../src/index.js';
 
 const CLASSES: readonly DurabilityQuorum[] = ['unrouted', 'local', 'majority', 'full'];
 
@@ -76,6 +76,11 @@ describe('mergeDurability', () => {
 		const differing = mergeDurability([cohort, { ...cohort, quorum: 'majority', confirmed: 2, unconfirmed: ['full-peer-2'] }]);
 		expect(differing.quorum).to.equal('majority');
 		expect(differing.otherCohorts).to.deep.equal([cohort]);
+		// The same shortfall recorded by two coordinators is two facts: a host waiting on the
+		// full-replication event must see that one of them is another node's to announce.
+		const owed = { ...report('majority', 3), unconfirmed: ['majority-peer-2'] };
+		const twoRecorders = mergeDurability([{ ...owed, recordedBy: 'node-a' }, { ...owed, recordedBy: 'node-b' }]);
+		expect([twoRecorders.recordedBy, ...(twoRecorders.otherCohorts ?? []).map(r => r.recordedBy)]).to.deep.equal(['node-a', 'node-b']);
 	});
 
 	it('an unrouted batch beside a full one reports unrouted — the weakest is the binding constraint', () => {
@@ -96,6 +101,22 @@ describe('mergeDurability', () => {
 		// full cohort — three reports, the weakest of which becomes the scalar answer.
 		expect((merged.otherCohorts ?? []).map(r => r.quorum)).to.deep.equal(['majority', 'full']);
 		expect((merged.otherCohorts ?? []).every(r => r.otherCohorts === undefined && r.torn === undefined)).to.equal(true);
+	});
+
+	it('names every committed block at its highest revision, never a torn one, and a merge of a merge equals the flat merge', () => {
+		// One write: an own-entry finish at r=5, a later attempt at r=6 under the same action, a third
+		// answer that tore `b3`, and a fourth naming `b3` committed — a torn block stays unnamed
+		// whichever input tore it. `b2` appears at both 5 and 6; an event at 6 covers it.
+		const finish = withBlockRevs(report('full', 3), ['tail', 'b1', 'b2'] as BlockId[], 5);
+		const attempt = withBlockRevs(report('majority', 3), ['tail', 'b2'] as BlockId[], 6);
+		const torn = withBlockRevs(withTornBlocks(report('full', 4), ['b3' as BlockId]), ['b1', 'b3'] as BlockId[], 7);
+		expect(torn.blockRevs, 'a torn block is never named').to.deep.equal({ b1: 7 });
+		const flat = mergeDurability([finish, attempt, torn, withBlockRevs(report('full', 3), ['b3' as BlockId], 6)]);
+		expect(flat.blockRevs).to.deep.equal({ tail: 6, b1: 7, b2: 6 });
+		expect(flat.torn).to.deep.equal(['b3']);
+		expect((flat.otherCohorts ?? []).every(r => r.blockRevs === undefined), 'action-level only').to.equal(true);
+		const nested = mergeDurability([mergeDurability([finish, attempt]), mergeDurability([torn, withBlockRevs(report('full', 3), ['b3' as BlockId], 6)])]);
+		expect(nested).to.deep.equal(flat);
 	});
 
 	it('THROWS on an empty input rather than fabricating an answer', () => {

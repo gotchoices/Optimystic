@@ -15,7 +15,8 @@
 import { expect } from 'chai';
 import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult,
-	ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage, StaleFailure, FindCoordinatorOptions, WriteDurability
+	ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage, StaleFailure, FindCoordinatorOptions, WriteDurability,
+	BlockDurabilityReachedEvent
 } from '@optimystic/db-core';
 import { isFullyDurable, localDurability } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
@@ -70,6 +71,10 @@ interface SeamOptions {
 	consensus?: Partial<Awaited<ReturnType<ICoordinatorClusterSeam['executeClusterTransaction']>>>;
 	/** Handed to the repo through its components object, as the node wiring does. */
 	ledger?: IUnderReplicationLedger;
+	/** Where a settling `full` commit announces full replication, as the node wiring hands it. */
+	onBlockDurabilityReached?: (event: BlockDurabilityReachedEvent) => void;
+	/** What the key network says belongs in the cohort but is missing from it; absent → it cannot say. */
+	absentMembers?: readonly string[];
 }
 
 /**
@@ -91,12 +96,14 @@ const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): 
 		async findCoordinator(_key: Uint8Array, _o?: Partial<FindCoordinatorOptions>): Promise<PeerId> { throw new Error('not implemented'); },
 		async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
 			return Object.fromEntries(responsibilityView.map(id => [id, { multiaddrs: [], publicKey: '' }]));
-		}
+		},
+		...(seam.absentMembers === undefined ? {} : { absentCohortMembers: async () => [...seam.absentMembers!] })
 	};
 	const repo = coordinatorRepo(keyNetwork, (_p: PeerId) => ({} as unknown as ClusterClient), { clusterSize: 3 })({
 		storageRepo: storage,
 		localPeerId: self,
-		underReplicationLedger: seam.ledger
+		underReplicationLedger: seam.ledger,
+		onBlockDurabilityReached: seam.onBlockDurabilityReached
 	});
 	(repo as unknown as { coordinator: ICoordinatorClusterSeam }).coordinator = {
 		async getClusterSize(): Promise<number> { return peerIds.length; },
@@ -380,21 +387,55 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 		const result = successOf(await repo.commit(TWO_BLOCKS));
 
 		expect(result.durability.quorum).to.equal('majority');
+		expect(result.durability.recordedBy, 'this node owes the copies, so it will announce them').to.equal(selfId);
 		expect(await ledger.list()).to.have.deep.members([
 			expected(BLOCK, { missingPeerIds: [absent] }),
 			expected(BLOCK_2, { missingPeerIds: [absent] })
 		]);
 	});
 
+	it('a commit whose shortfall the ledger failed to record for one block names no recorder', async () => {
+		const [holderA, holderB] = others as [string, string, string];
+		const failsForOneBlock = new KvUnderReplicationLedger(new MemoryKVStore());
+		const record = failsForOneBlock.record.bind(failsForOneBlock);
+		failsForOneBlock.record = async (entry: UnderReplicatedEntry) => {
+			if (entry.blockId === BLOCK_2) throw new Error('ledger disk full');
+			await record(entry);
+		};
+		const repo = withClock(makeRepo(storageRepo(), self, {
+			cohort: { resolved: true, peerIds: cohort },
+			consensus: { localExecuted: true, localCommitResult: { success: true, durability: localDurability() }, cohortCommitOutcomes: reportsFrom(others, [holderA, holderB]) },
+			ledger: failsForOneBlock
+		}));
+
+		const result = successOf(await repo.commit(TWO_BLOCKS));
+
+		expect(result.durability.quorum).to.equal('majority');
+		expect(result.durability.recordedBy, 'no event can come for the unrecorded block, so none may be promised').to.equal(undefined);
+		expect((await failsForOneBlock.list()).map(e => e.blockId)).to.deep.equal([BLOCK]);
+	});
+
 	it('a solo commit records an empty missing set — unknown, not nobody — at local and at unrouted', async () => {
 		const local = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: true, peerIds: [selfId] }, ledger }));
-		successOf(await local.commit(COMMIT));
+		expect(successOf(await local.commit(COMMIT)).durability.recordedBy, 'the event fires once a peer appears and confirms').to.equal(selfId);
 		expect(await ledger.get(BLOCK)).to.deep.equal(expected(BLOCK, { quorum: 'local' }));
 
 		const unroutedLedger = new KvUnderReplicationLedger(new MemoryKVStore());
 		const unrouted = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: false, reason: 'findCluster threw' }, ledger: unroutedLedger }));
 		successOf(await unrouted.commit(COMMIT));
 		expect(await unroutedLedger.get(BLOCK)).to.deep.equal(expected(BLOCK, { quorum: 'unrouted' }));
+	});
+
+	it('a solo commit that knows of a member it could not reach names it as owed, in the answer and in the ledger', async () => {
+		// The lone survivor of a two-machine group: its partner is remembered as serving but has left
+		// the ring, so the cohort resolved to this node alone.
+		const partner = others[0]!;
+		const repo = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: true, peerIds: [selfId] }, ledger, absentMembers: [partner] }));
+
+		const result = successOf(await repo.commit(COMMIT));
+
+		expect(result.durability).to.deep.equal({ quorum: 'local', confirmed: 1, cohort: 2, unconfirmed: [partner], cohortPeerIds: [selfId, partner], recordedBy: selfId });
+		expect(await ledger.get(BLOCK)).to.deep.equal(expected(BLOCK, { quorum: 'local', missingPeerIds: [partner] }));
 	});
 
 	it('a full commit records nothing and settles an older entry for the same blocks', async () => {
@@ -410,6 +451,22 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 
 		expect(result.durability.quorum).to.equal('full');
 		expect(await ledger.list()).to.deep.equal([]);
+	});
+
+	it('a full commit announces each entry it settles, once, at its own revision — and nothing for a block with no entry', async () => {
+		await ledger.record(expected(BLOCK, { rev: COMMIT.rev - 1, actionId: 'a-earlier', missingPeerIds: [others[0]!] }));
+		const events: BlockDurabilityReachedEvent[] = [];
+		const repo = withClock(makeRepo(storageRepo(), self, {
+			cohort: { resolved: true, peerIds: cohort },
+			consensus: { localExecuted: true, localCommitResult: { success: true, durability: localDurability() }, cohortCommitOutcomes: reportsFrom(others, others) },
+			ledger,
+			onBlockDurabilityReached: (event) => { events.push(event); }
+		}));
+
+		const result = successOf(await repo.commit(TWO_BLOCKS));
+
+		expect(result.durability.recordedBy, 'a full answer owes nobody a copy').to.equal(undefined);
+		expect(events).to.deep.equal([{ blockIds: [BLOCK], rev: COMMIT.rev, actionId: COMMIT.actionId }]);
 	});
 
 	it('a full commit through the local fallback settles too', async () => {
@@ -435,6 +492,7 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 		const result = successOf(await repo.commit(COMMIT));
 
 		expect(result.durability.quorum, 'this node is the unconfirmed member').to.equal('majority');
+		expect(result.durability.recordedBy, 'nobody tracks this shortfall, so no event will come').to.equal(undefined);
 		expect(await ledger.list()).to.deep.equal([]);
 	});
 
@@ -482,7 +540,7 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 			get: async () => undefined,
 			list: async () => [],
 			size: async () => 0,
-			satisfy: async () => undefined,
+			satisfy: async () => ({ status: 'absent' }),
 			name: async () => undefined,
 			noteAttempt: async () => { },
 			delete: async () => { }

@@ -150,7 +150,10 @@ not a silent local flip.
 
 Enumerate the blocks the node currently holds in the shed range. For each, confirm it is replicated
 to **≥ N post-move holders, excluding self and excluding any peer that is itself `status='moving'`
-and shedding the same sub-range** (see concurrent-moves below). The existing push primitive is the
+and shedding the same sub-range** (see concurrent-moves below). A node built with a network
+membership predicate also excludes every peer the predicate refuses: such a peer is neither pushed
+the block nor counted, since Arachnode info is something any ring member can advertise (see
+[internals.md § Network Membership Predicate](internals.md#network-membership-predicate)). The existing push primitive is the
 confirm mechanism: `BlockTransferClient.pushBlocks` returns a `missing` list, so a block counts as
 confirmed on a holder when that holder reports it *not* missing (it already had it, or accepted the
 push). Retries and per-block timeouts apply. The phase completes only when **every** block in the

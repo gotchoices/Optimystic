@@ -57,7 +57,8 @@ proximity ranking, whenever the node is one of the block's responsible peers and
 self-coordination guard allows it (`selfReadVerdict` in
 `packages/db-p2p/src/libp2p-key-network.ts`). So on a machine in the block's cohort an idle
 poll costs no network request inside the lazy read-repair window, plus one cohort consult per
-block per window. That adds no staleness: a remote coordinator answers from its own copy
+block per window — which runs behind the read that starts it, not on it, so the poll's latency
+is a local read whatever the cohort is doing. That adds no staleness: a remote coordinator answers from its own copy
 under the same window, so answering locally changes which cohort member answers, not what the
 answer guarantees — the bound is the one stated in
 [transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window). Floors,
@@ -522,7 +523,11 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage, the log tail first
 ```
 
-The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. `TransactionCoordinator.commit` is the one write path that reports no class; see the note on that method.
+The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. Every answer that confirms a commit also names the blocks it committed, each at the revision it committed at (`WriteDurability.blockRevs`): the full-replication event (`BlockDurabilityReachedEvent` in `packages/db-core/src/transactor/change-notifier.ts`) is keyed by block and revision, not by action, so this is what a host matches the events against. It is stamped client-side where the commit is confirmed — `TransactorSource.transact`, `TransactionCoordinator`'s per-collection commit, and `Collection.settleUnfinished` when it finds a superseded write saved — through `withBlockRevs` in `packages/db-core/src/network/durability.ts`, so it never travels on the wire, and it never names a `torn` block; merging two answers keeps the higher revision per block. A commit spanning several collections, `TransactionCoordinator.commit` (and `TransactionSession.commit`, as `ExecutionResult.durability`), answers with a `TransactionDurability` (`packages/db-core/src/transaction/durability.ts`): each collection it wrote, across every attempt, with its own class, and `overall`, the weakest of them, so a caller reading only `overall` is reading the binding constraint. A collection the refresh between attempts saved without learning who holds it is listed with an `undefined` class, and `overall` is then absent rather than fabricated — show such a transaction as pending. `undefined` from the commit means the same as from a sync: nothing was written. A commit that fails after something landed throws `CoordinatorPartialCommitError`, whose `durability` describes exactly the committed half.
+
+The SQL layer passes that answer on rather than dropping it. `TransactionBridge.commitTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts` takes a `TransactionDurability` from whichever of its three commit routes ran — session mode's `ExecutionResult.durability`, the batched legacy commit's coordinator answer, or, for the per-tree sweep that every single-table write takes, each tree's `sync()` answer folded by collection id — and after a commit that wrote something calls every listener registered with `onCommitDurability`, once, before the commit returns, with an `SqlCommitDurability` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-durability.ts`): the transaction's `StampId()`, the per-collection answer, and the same folded per table. Quereus's exec lock is what lets a host attribute a report to the `db.exec` call it arrived during. A commit that wrote nothing calls nobody; the sweep's own partial commit, `PartialCommitError`, carries the committed half's `durability` the way `CoordinatorPartialCommitError` does.
+
+A commit reported below `full` can also be followed until its whole cohort holds it. `DurabilityFollower` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/durability-follower.ts` holds each such commit's `blockRevs` and clears a block when the node's `BlockDurabilityReachedEvent` names it at that revision or later (or a later commit through the bridge writes it at `full`), then calls every `onCommitFullyHeld` listener with the transaction id. It follows a commit only when the event will reach this node — every below-`full` cohort answer names this node as `recordedBy`, nothing is `torn`, `overall` is known — and says so in the report's `followed`. The bridge subscribes when a transaction begins, before its commit is sent, and the follower remembers recent events per block, because the drain can empty the ledger entry and fire the event before the commit's answer has climbed back to the bridge. Followed commits are in memory only; a restart forgets them (backlog `feat-a-host-can-ask-whether-an-earlier-commit-is-fully-held`).
 
 #### One commit round when one coordinator covers every block
 
@@ -728,7 +733,12 @@ cohort of one (1 / true) from a routing failure (0, or a sole peer that is not t
 `quorum` — the durability class the writer was told (`local` for the former, `unrouted` for the
 latter; see `WriteDurability` in `packages/db-core/src/network/struct.ts`), plus `reason` when the
 cohort did not resolve. The log and the returned answer come from the same classification
-(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree. A node briefly
+(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree.
+Two more fields say why a node that belongs to a group wrote alone: `knownAbsent` counts the members
+it knows of and could not reach (with their short ids in `absentPeers`), whom the `local` answer names
+as `unconfirmed`, and `awaitingBootstrap` says it is still waiting to hear from a peer it was
+configured to join through. With neither, the node is genuinely alone or has never identified
+another member of its group. A node briefly
 alone can still mint a proof for a revision the rest of its cohort never saw, so the repair
 selectors weigh a proof by **how many distinct peers signed it**: a one-signer proof — which is
 exactly what this branch mints — no longer out-ranks a corroborated claim at equal revision. Two or
@@ -2009,7 +2019,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `absenceFlagFor`: a node configured with a bootstrap peer that is permanently gone, and holding
   no persisted network state, can neither create a collection nor read a block it lacks until that
   peer is heard from or taken out of its configuration. Out of scope here: a write to a collection
-  the node already holds, made before contact, still commits alone.
+  the node already holds, made before contact, still commits alone, at `local`. What it now does is
+  say who it is owed to: every serving member the node knows of that belongs in the block's cohort
+  but is missing from it (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) is
+  named in the answer's `unconfirmed` and in the under-replication ledger, so the copy is pushed to
+  that member as soon as it is connected (see
+  [packages/db-p2p/docs/repo.md §The durability gate and the under-replication ledger](../packages/db-p2p/docs/repo.md#the-durability-gate-and-the-under-replication-ledger)).
+  Whether such a write should be admitted at all belongs to the partition-healing design (backlog
+  `6.5-partition-healing`).
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each
@@ -2518,12 +2535,61 @@ Semantics:
 - **Absent predicate → today's behavior exactly.**  Each service holds `InboundStreamAuthorization | undefined`; when it is `undefined` the handler awaits nothing extra and no gate code runs.  This is the default.
 - **Supplied predicate → fail closed.**  Only a literal `true` allows the stream.  `false`, a throw, a rejection, expiry of the timeout, or an inbound connection with no resolvable remote peer id all **deny**, and denial aborts the stream *before* any frame is decoded or any operation executed.  Failures are logged (via the service's error logger), never swallowed.
 - **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (The `repo` protocol's `RepoMessage.operations` is an array, but the handler executes `operations[0]` only.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
+- **A stream is authorized when it opens, which can be well before its request.**  A node keeps one stream per peer and protocol negotiated ahead of its next request to that peer, for up to 30 s (`PreparedStreams` in `packages/db-p2p/src/network/prepared-streams.ts`), so an honest peer routinely holds an authorized stream open on this node with no request on it yet.  A peer the predicate stops admitting can therefore still deliver one request on each stream it already holds, until that stream's idle time runs out.  This is not a new exposure — any peer could always open a stream and hold it — but revoking a peer now takes full effect on these four protocols only once its held streams expire.  To cut a peer off at once, close its connections, or refuse it at the `connectionGater` as well.
 - **Peer id encoding**: the predicate receives `connection.remotePeer.toString()` — the libp2p base58btc/CIDv1 string (`12D3KooW…`).  Compare against that, never against a multiaddr or a raw public key.
 - **What a caller observes**: a stream reset.  Denial is deliberately *not* reported on the wire — telling an unauthorized peer "you are not a member" confirms membership state to exactly the party the embedder decided not to trust, and the four protocols have four different response shapes with no common error frame.  The denial is loud on the *denying* node instead: logged with peer id, protocol and reason, and the stream is aborted with an `UnauthorizedInboundStreamError` carrying `ERR_INBOUND_STREAM_UNAUTHORIZED`.
 - **Self-dials never reach the gate.**  libp2p refuses to dial self at three layers (connection manager, dial queue, upgrader), and every internal caller short-circuits self before dialling anyway (`ClusterCoordinator.updateMember`, `clusterLatestCallback`, `fetchArchiveFromPeer`, `RestorationCoordinator`, `SpreadOnChurnMonitor`).  An embedder predicate that only knows about remote members will therefore never deny its own node.
 - **Cost**: the predicate sits in the hot path of every inbound stream.  Keep it to an in-memory lookup; memoize anything that would otherwise hit storage or the network per stream.
 
-**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.
+**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.  Neither decides which peers this node *sends* its writes to; that is the [Network Membership Predicate](#network-membership-predicate) below, and a private database needs it too.
+
+### Network Membership Predicate
+
+A node chooses the peers that hold and coordinate a block from FRET's ring, then keeps only the ones it classifies as serving its own network: `membershipOf` in `packages/db-p2p/src/libp2p-key-network.ts` reads each peer's libp2p peerStore protocol list and counts a peer that lists `<prefix>/cluster/1.0.0` or `<prefix>/repo/1.0.0`. Any connected peer can put those protocols into that list, in two ways, and `authorizeInboundStream` stops neither:
+
+- **By opening a stream on one.** libp2p's `onIncomingStream` (libp2p 3.3.11, `libp2p/dist/src/connection.js`) merges the negotiated protocol into the remote peer's peerStore record *before* it looks up the handler, so a stream the authorization gate then resets has already written it.
+- **By advertising them.** The peer registers this network's protocol ids on its own node, and identify announces them.
+
+A stranger classified that way is a cohort member like any other. An embedding application measured it: after an outsider opened one refused stream on each members-only protocol of a member, that member's `findCluster` for a control block named the outsider first, and every later write to the block sent the outsider the block's contents (a pend carries the transforms) and counted it toward the cohort.
+
+`NodeOptions.isNetworkMember` (typed `IsNetworkMember` in `packages/db-p2p/src/network-membership-gate.ts`) lets the embedder overrule the protocol list:
+
+```ts
+const node = await createLibp2pNode({
+  /* … */
+  authorizeInboundStream: (remotePeerId) => memberSet.has(remotePeerId),
+  isNetworkMember: (peerId) => memberSet.has(peerId)
+});
+```
+
+Contract:
+
+- **Absent predicate → today's behavior exactly.** `createNetworkMembershipGate` returns `undefined` and no check runs anywhere.
+- **Synchronous.** It runs inside the per-peer loop of every cohort assembly, so keep it an in-memory lookup. This is one reason it is a separate option rather than derived from `authorizeInboundStream`, which is asynchronous, under a timeout, and asked once per inbound stream. The other is that the two answer different questions: authorization decides who may *send to* this node, membership decides who this node *sends to*.
+- **Fail closed.** Only a literal `true` admits. A throw, or any value other than a boolean (a promise included), refuses and is logged with the peer id under the `network-membership` namespace; nothing is thrown into a lookup.
+- **Self is always a member**, so the predicate may list remote members only — the same contract `authorizeInboundStream` has.
+- **Peer id encoding**: `PeerId.toString()`, the base58btc `12D3KooW…` form.
+- **Read live.** No verdict the predicate gave is kept: a peer the application admits counts on the next lookup, and one it removes drops out of the next lookup. There is no reclassify call to make.
+- **Requires network scoping.** `Libp2pKeyPeerNetwork` refuses a gate without a `protocolPrefix`, since the unscoped path classifies nobody; every node `createLibp2pNode` builds has one.
+
+What it gates. `membershipOf` is the one place every cohort and coordinator choice classifies remote peers — `findCluster`, every `findCoordinator` tier, `servingCohortAt` (where a reactivity topic's root group is placed) and `absentCohortMembers` — and a remote peer the gate refuses reads `foreign` there, ahead of both the protocol list and the remembered serving verdict. So a forged list is never added to that memory, and never persisted from it. Around that one place:
+
+- `isSelectable` refuses the peer as well, so it is neither a connected-fallback pick nor a reason for `findCoordinator` to keep its retry window open.
+- The coordinator cache — the one verdict the key network does remember, for 30 minutes by default — is re-checked on every hit: a pick the gate now refuses is evicted (`findCoordinator:cache-refused`) and the lookup runs the tiers (`getCachedCoordinator`).
+- `CoordinatorRepo`'s 60-second responsibility cache needs nothing: it remembers only whether *this* node is responsible for a block, and the replica set a transaction goes to is a fresh `findCluster` made when the transaction runs, so a removed peer receives nothing after the predicate changes.
+- **A bootstrap peer the gate refuses while it serves this network is not yet heard from** (`heardFromBootstrapPeer`). Otherwise a joining node whose predicate has not yet learned its inviter would see a self-only cohort, rule the shared catalog absent and found a second one — GitHub issue #27's failure through a new door. So `awaitingBootstrapContact` stays true, an absence is flagged `'cohort-unreachable'`, and an open fails, retryably, until the predicate admits the peer. A refused bootstrap peer that does not serve this network — a relay, or a peer that refused identify — is heard from as before, so a node behind infrastructure bootstrap peers is unaffected. The cost, that a node configured with a bootstrap peer its predicate permanently refuses cannot create collections, is the `NOTE:` there.
+- The `cohort:membership` log line counts refused peers as `refused=`, apart from `foreign`, so an operator can tell "another network" from "the predicate said no".
+- **The four background senders that take peers from FRET rather than from the key network** get the same gate instance, which `createLibp2pNodeBase` builds once beside the key network, and drop every candidate it refuses before dialing: spread-on-churn's expansion targets (`SpreadOnChurnMonitor`), the ring-shift confirm's qualifying holders (`RingShiftCoordinator`, where a refused peer also does not count toward the floor, so refused peers in the band roll the shift back rather than release a block only an outsider holds), the ring peers restoration asks for an archive (`RestorationCoordinator`), and the under-replication drain's pushable set (`UnderReplicationDrain`, where a ledger entry naming a peer the predicate has since refused waits for it — the `NOTE:` at its `pushablePeers`). The rebalance reaction and the cohort-growth push need nothing, since both take a block's owners from `findCluster`.
+
+So apart from redirect targets and the opt-in dispute path (both below), no peer this node chooses to send block contents to, or to ask for an archive to restore, is one the predicate refuses. Content a refused peer *pushes* to this node is the business of `authorizeInboundStream`, not of this predicate.
+
+What it does not gate:
+
+- **FRET's own ring membership and routing.** A refused peer is still a ring member: it still routes, it still takes one of the over-fetch slots a cohort is cut from (the `NOTE:` at `membershipOverfetch`), and it can still be a member of a cohort-topic tier below a reactivity topic's root, which FRET assembles directly. Backlog `feat-fret-honours-the-network-membership-predicate`.
+- **Dispute arbitrators**, drawn straight from FRET by the `selectArbitrators` hook `createLibp2pNodeBase` hands the dispute service. A challenge carries the disputed `ClusterRecord`, transforms included, so on a node with `dispute.disputeEnabled` (off by default) an escalation can reach a refused peer.
+- **Redirect targets**, which `RepoClient` and `ClusterClient` follow without asking the gate. A redirect comes from a cohort member applying its own predicate, so this matters only where members are configured differently; a coordinator hint the redirect records is re-checked on its next use (the `NOTE:` at the redirect branch in `packages/db-p2p/src/repo/client.ts`).
+
+**An embedder that supplies only `authorizeInboundStream` is still exposed.** Any peer that can open a stream to this node — refused or not — can be chosen as a cohort member and sent every write to the blocks near it on the ring. The two options are complementary: authorization keeps strangers from reading or writing through this node, membership keeps this node from handing them its writes.
 
 ### Equivocation Detection
 
@@ -2638,7 +2704,7 @@ Both monitors are initialized through `NetworkManagerService.initRebalanceMonito
 
 ### UnderReplicationDrain
 
-The third sender, and the only one driven by a durable record rather than by topology: `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`) walks the under-replication ledger — the per-block record `CoordinatorRepo.commit` writes of which cohort members still miss a block it acknowledged below `full` — and pushes each block to the owed peers that are connected and identified, on start (the entries carried across a restart), on `connection:open` / `peer:identify` (debounced, throttled), and on a re-check timer while anything is outstanding. A confirming peer is taken off the entry; when the entry empties it is deleted and `StorageRepo.emitBlockDurabilityReached` fires the full-replication event. It is constructed directly in `createLibp2pNodeBase`, outside the FRET gate, because it needs only the key network and the node's own store. The rules — who is owed, the solo case that counts no attempt, the per-(block, peer) give-up cleared on reconnect, the revision guard on `satisfy` — are in [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
+The third sender, and the only one driven by a durable record rather than by topology: `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`) walks the under-replication ledger — the per-block record `CoordinatorRepo.commit` writes of which cohort members still miss a block it acknowledged below `full` — and pushes each block to the owed peers that are connected and identified, on start (the entries carried across a restart), on `connection:open` / `peer:identify` (debounced, throttled), and on a re-check timer while anything is outstanding. A confirming peer is taken off the entry; when the entry empties it is deleted and `StorageRepo.emitBlockDurabilityReached` fires the full-replication event. A later `full` commit that settles an entry fires the same event from `CoordinatorRepo`, and only one of the two ever removes a given entry. Both run on the node whose ledger holds the entry, which the commit's answer names as `WriteDurability.recordedBy`, so a writer can tell whether the event will reach it. It is constructed directly in `createLibp2pNodeBase`, outside the FRET gate, because it needs only the key network and the node's own store. The rules — who is owed, the solo case that counts no attempt, the per-(block, peer) give-up cleared on reconnect, the revision guard on `satisfy` — are in [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
 
 **One push loop.** All three senders — `BlockTransferCoordinator`'s push and confirm, the spread loop, the drain — go through `pushBlockToPeers` in `packages/db-p2p/src/cluster/block-transfer-service.ts`: read the block unpinned, build its certification from that read, push to each peer, and read each answer the one true way (a peer holds the block only when its response does NOT list it as missing). Retry, stopping condition (`stopAfterConfirmed`) and the two per-peer deadlines are the caller's; the helper logs nothing per peer and returns a `PushBlockOutcome` the caller's own diagnostics describe.
 

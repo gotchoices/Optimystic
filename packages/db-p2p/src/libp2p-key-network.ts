@@ -3,13 +3,15 @@ import { toString as u8ToString } from 'uint8arrays'
 import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork, RoutingKey } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
-import { hashKey } from 'p2p-fret'
+import { hashKey, hashPeerId, lexLess, minDistance } from 'p2p-fret'
 import { createLogger, verbose } from './logger.js'
 import { classifySelfDialability, mergePeerAddresses, publishableConnectionAddr, unionPublishableAddrs, type AddressLog } from './peer-address-book.js'
 import type { IPeerReputation } from './reputation/types.js'
 import { openProtocolStream } from './network/open-protocol-stream.js'
+import type { PreparedStreams } from './network/prepared-streams.js'
 import { UNDECLARED_STREAM_OPEN_DEADLINES, type StreamOpenDeadlines } from './rpc-deadline.js'
 import type { BootstrapContact } from './network/bootstrap-contact.js'
+import { admittedBy, type NetworkMembershipGate } from './network-membership-gate.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -77,6 +79,9 @@ export type FindCoordinatorErrorCode =
  *                `unknown` forever) — indistinguishable at a single instant, separated over
  *                the retry/stabilization window. A peer this node has already seen serving
  *                reads `serves` instead, across a restart too (`rememberedServing`).
+ *
+ * A peer the embedder's membership predicate refuses (`NodeOptions.isNetworkMember`) reads
+ * `foreign` whatever its protocol list says.
  */
 export type NetworkMembership = 'serves' | 'foreign' | 'unknown';
 
@@ -280,10 +285,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private bootstrapWaitClosed?: 'deadline' | 'nothing-arriving';
 	private readonly persistence?: NetworkStatePersistence;
 
-	// NOTE: eight positional parameters. The options-bag conversion was weighed again when the
-	// eighth (`streamOpen`) was added and deferred again: it would touch ~98 construction sites in
-	// `test/libp2p-key-network.spec.ts` alone, while an optional trailing parameter with a default
-	// touches none. Take the conversion when that spec is rewritten, or before a ninth parameter.
+	// NOTE: ten positional parameters. The options-bag conversion was weighed a third time when the
+	// ninth (`membership`) was added and deferred again: it would touch ~110 construction sites, 99 of
+	// them in `test/libp2p-key-network.spec.ts`, while an optional trailing parameter touches only the
+	// production site that passes it. The tenth (`preparedStreams`) was added the same way, by the
+	// ticket's explicit choice not to reshuffle the list in a latency change. Take the conversion when
+	// that spec is rewritten, and before an eleventh parameter in any case.
 	constructor(
 		private readonly libp2p: Libp2p,
 		/**
@@ -322,8 +329,25 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		 * the Quereus collection-factory when the node carries them). A caller built without a node
 		 * gets the undeclared defaults, which is what every deadline falls back to.
 		 */
-		private readonly streamOpen: StreamOpenDeadlines = UNDECLARED_STREAM_OPEN_DEADLINES
+		private readonly streamOpen: StreamOpenDeadlines = UNDECLARED_STREAM_OPEN_DEADLINES,
+		/**
+		 * The embedder's "is this peer one of us?" check (`NodeOptions.isNetworkMember`), in the total
+		 * form `createNetworkMembershipGate` builds. When present, a remote peer it refuses is never a
+		 * cohort member and never a coordinator pick, whatever its protocol list says
+		 * ({@link membershipOf}, {@link isSelectable}, {@link getCachedCoordinator}). Absent → no check.
+		 * Requires {@link protocolPrefix}: the unscoped path classifies nobody.
+		 */
+		private readonly membership?: NetworkMembershipGate,
+		/**
+		 * Streams negotiated ahead of the request that takes them (`network/prepared-streams.ts`), which
+		 * {@link connect} takes from and replenishes. Absent → every request opens a fresh stream, as
+		 * every construction other than `createLibp2pNodeBase`'s does.
+		 */
+		private readonly preparedStreams?: PreparedStreams
 	) {
+		if (membership !== undefined && protocolPrefix == null) {
+			throw new Error('Libp2pKeyPeerNetwork: a network membership gate needs a protocolPrefix — the unscoped path classifies no peer, so the gate would never run')
+		}
 		// Built here rather than as a field initializer: field initializers run before the
 		// constructor body, where `this.libp2p` (a parameter property) is not yet assigned.
 		this.log = createLogger('libp2p-key-network', this.libp2p.peerId.toString())
@@ -583,7 +607,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * walking through them, feed the verdict into the tiers instead of discovering it at dial.
 	 */
 	private isSelectable(id: string, excluded: Set<string>): boolean {
-		return !excluded.has(id) && !(this.reputation?.isBanned(id));
+		return !excluded.has(id) && !(this.reputation?.isBanned(id)) && !this.refusedMembership(id);
+	}
+
+	/**
+	 * Does the embedder's membership predicate refuse this peer? Never true for self (the gate admits
+	 * it) or with no predicate configured. Read live on every call, so no verdict outlasts the
+	 * predicate's answer.
+	 */
+	private refusedMembership(id: string): boolean {
+		return !admittedBy(this.membership, id);
 	}
 
 	private persistState(): void {
@@ -747,6 +780,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
+	 * A remembered coordinator pick, re-checked against the membership predicate: an entry for a
+	 * peer it now refuses is evicted, and the lookup falls through to the tiers. That is the one
+	 * verdict this class caches, and a pick recorded before the predicate refused its peer — or fed
+	 * in by a redirect (`recordCoordinator` is public) — would otherwise be served for the rest of
+	 * its TTL.
+	 *
 	 * NOTE: a cached coordinator is trusted without re-deriving the key's cohort. A peer that
 	 * has since LEFT the cohort (ring growth shifted the nearest set) is corrected on the next
 	 * hop rather than here: the server-side responsibility check redirects to a current member
@@ -757,7 +796,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private getCachedCoordinator(key: RoutingKey): PeerId | undefined {
 		const k = this.toCacheKey(key)
 		const hit = this.coordinatorCache.get(k)
-		if (hit && hit.expires > Date.now()) return hit.id
+		if (hit && hit.expires > Date.now()) {
+			if (!this.refusedMembership(hit.id.toString())) return hit.id
+			this.log('findCoordinator:cache-refused key=%s coordinator=%s', k.substring(0, 12), hit.id.toString().substring(0, 12))
+		}
 		if (hit) this.coordinatorCache.delete(k)
 		return undefined
 	}
@@ -774,18 +816,24 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * dead-connection delay is aborted as dead (`open-stream:connection-dead`) so the next request
 	 * does not pick it. Both delays are this node's `LinkDeadlines`, passed at construction.
 	 *
-	 * `negotiateFully: false` is meant to skip waiting for the remote's protocol acknowledgement, and
-	 * is safe here because this is request/response and the caller always reads a reply, so an
-	 * unsupported-protocol failure deferred to the first read is still observed. It currently saves
-	 * nothing: `@libp2p/multistream-select@7` accepts the option and ignores it, so opening a stream
-	 * costs one link round trip even on a connection that is already open, and a dial deadline shorter
-	 * than that round trip fails every request (`test/stream-open-costs-a-round-trip.spec.ts` pins
-	 * this, and fails if libp2p honours the option again). It is passed anyway, since it costs nothing
-	 * and takes effect if it is ever honoured. The caller's `AbortSignal` is forwarded so a per-peer
-	 * dial deadline (enforced upstream by `ProtocolClient.processMessage`) rejects the open with its
-	 * own reason — `DialTimeoutError` when every path is slow — and cancels a fresh dial in flight.
-	 * It does not end an open on an existing connection: that runs on to the dead-connection delay,
-	 * since the caller's deadline is no evidence that the connection is dead.
+	 * With a {@link PreparedStreams} pool, a stream already negotiated for this peer and protocol is
+	 * handed out instead, and either way the pool is told to have the next one ready. That is what
+	 * takes the negotiation round trip off the request path: `negotiateFully: false` is meant to skip
+	 * waiting for the remote's protocol acknowledgement, and is safe here because this is
+	 * request/response and the caller always reads a reply, so an unsupported-protocol failure
+	 * deferred to the first read is still observed — but `@libp2p/multistream-select@7` accepts the
+	 * option and ignores it, so opening a stream costs one link round trip even on a connection that
+	 * is already open, and a dial deadline shorter than that round trip fails every request that does
+	 * not find a prepared stream (`test/stream-open-costs-a-round-trip.spec.ts` pins this, and fails if
+	 * libp2p honours the option again). It is passed anyway, since it costs nothing and takes effect if
+	 * it is ever honoured.
+	 *
+	 * The caller's `AbortSignal` is forwarded so a per-peer dial deadline (enforced upstream by
+	 * `ProtocolClient.processMessage`) rejects the open with its own reason — `DialTimeoutError` when
+	 * every path is slow — and cancels a fresh dial in flight. It does not end an open on an existing
+	 * connection: that runs on to the dead-connection delay, since the caller's deadline is no
+	 * evidence that the connection is dead. A prepared stream is handed out without waiting, so the
+	 * signal matters to it only if it has already fired.
 	 *
 	 * The cold path pays one `peerStore.get` before dialing, to separate two failures libp2p
 	 * reports identically: "nobody ever taught us an address" and "every address we hold routes
@@ -798,13 +846,23 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * when there was one.
 	 */
 	async connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream> {
-		return await openProtocolStream(this.libp2p, peerId, protocol, {
+		// Ahead of the pool too: a caller that has already given up takes nothing from it.
+		options?.signal?.throwIfAborted()
+		const pool = this.preparedStreams
+		const prepared = pool?.take(peerId, protocol)
+		if (pool !== undefined && prepared !== undefined) {
+			pool.replenish(peerId, protocol)
+			return prepared
+		}
+		const stream = await openProtocolStream(this.libp2p, peerId, protocol, {
 			signal: options?.signal,
 			negotiateFully: false,
 			beforeDial: () => this.assertNotSelfRelayOnly(peerId, protocol, options),
 			deadlines: this.streamOpen,
 			log: this.streamOpenLog
 		})
+		pool?.replenish(peerId, protocol)
+		return stream
 	}
 
 	/**
@@ -1075,7 +1133,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 				// FRET's own ring membership has already applied a stricter cut upstream —
 				// `assembleCohort` returns confirmed live ring members only — so a
 				// configured-but-never-reached bootstrap peer is absent from the band entirely,
-				// and only the dial-in-flight signal below can keep the window for it.
+				// and only the dial-in-flight signal below can keep the window for it. The membership
+				// PREDICATE is applied (inside `isSelectable`): its refusal is a settled answer, not a
+				// classification still pending, so a refused peer is nothing to wait for.
 				const knowable = band.filter(id => this.isSelectable(id, excludedSet));
 				if (!this.retryCouldImprove(knowable)) {
 					this.log('findCoordinator:retry-futile key=%s neighbors=%d dialsInFlight=%d mode=%s hwm=%d',
@@ -1378,6 +1438,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * (A ring polluted by more cross-network peers than this band is the domain of the
 	 * separate FRET-side eviction follow-up; this band covers realistic co-location.)
 	 */
+	// NOTE: a peer the membership predicate refuses is still a FRET ring member, so it occupies an
+	// over-fetch slot like any cross-network peer. More refused peers than this band nearer a key
+	// than the genuine members would shrink that key's cohort. Not reachable at a deployment's
+	// scale today; if it is ever seen, the remedy is FRET honouring the predicate (backlog
+	// `feat-fret-honours-the-network-membership-predicate`), not a wider band.
 	private membershipOverfetch(): number {
 		return Math.max(this.clusterSize * 4, this.clusterSize + 16)
 	}
@@ -1386,7 +1451,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * Does an advertised protocol list serve THIS network's storage — its namespaced `cluster`
 	 * or `repo` protocol? The one test behind every membership verdict, self's included.
 	 */
-	private servesThisNetwork(protocols: string[]): boolean {
+	private servesThisNetwork(protocols: readonly string[]): boolean {
 		return protocols.includes(`${this.protocolPrefix}/cluster/1.0.0`)
 			|| protocols.includes(`${this.protocolPrefix}/repo/1.0.0`)
 	}
@@ -1443,6 +1508,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * A non-empty protocol list always wins and updates {@link rememberedServing}; an empty one
 	 * falls back to it.
 	 *
+	 * The membership predicate, when configured, outranks both: a remote peer it refuses is
+	 * `foreign`, and the answer returns before either is read or written, so a forged list never
+	 * reaches the memory nor is persisted from it. The memory is not edited on a refusal, so a
+	 * re-admitted peer reads correctly on its next lookup.
+	 *
 	 * NOTE: a non-empty list is not necessarily identify's list. libp2p adds every protocol a
 	 * stream negotiates with a peer, in either direction, to that peer's list, so between a
 	 * connection opening and identify landing a peer of this network can show a partial list and
@@ -1454,6 +1524,10 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private membershipOf(idStr: string, protocols: string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'
 		if (idStr === this.libp2p.peerId.toString()) return this.selfServes() ? 'serves' : 'foreign'
+		// Both the protocol list and the remembered verdict below can be put there by any peer that
+		// opens a stream or advertises this network's protocols; overruling them is the predicate's
+		// whole purpose.
+		if (this.refusedMembership(idStr)) return 'foreign'
 		if (protocols == null || protocols.length === 0) {
 			// NOTE: accepted tradeoff — a remembered peer that never comes back keeps this node's
 			// cohorts from shrinking to self until FRET declares it dead, so meanwhile reads of
@@ -1502,7 +1576,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * missing from the ring.
 	 */
 	async awaitingBootstrapContact(): Promise<boolean> {
-		return this.unheardBootstrapPeers().length > 0
+		return (await this.unheardBootstrapPeers()).length > 0
 	}
 
 	/**
@@ -1514,13 +1588,47 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * A connection is not an answer, and neither is a non-empty peerStore protocol list: libp2p
 	 * adds each negotiated stream's protocol to it, so for a moment before identify lands a peer
 	 * of this network shows a partial list that reads as foreign.
+	 *
+	 * One exception, when the membership predicate is configured: a peer whose settled answer says
+	 * it serves this network — identify's protocol list (`protocols`, read only for this case) when
+	 * identify answered, else the remembered verdict — but which the predicate refuses is NOT yet
+	 * heard from. A joining
+	 * node whose predicate has not yet learned its inviter would otherwise see a self-only cohort,
+	 * rule the shared catalog absent and found a second one (GitHub issue #27's failure through a
+	 * new door). A refused peer that does not serve this network — a relay, or one that refused
+	 * identify — is heard from as before, so a node behind infrastructure bootstrap peers is
+	 * unaffected. A protocol list that could not be read counts as serving: fail closed.
+	 *
+	 * NOTE: accepted cost — a node configured with a bootstrap peer that serves this network and
+	 * that its predicate permanently refuses can neither create a collection nor read a block it
+	 * lacks, since every such absence is flagged `'cohort-unreachable'`. The remedy is to take that
+	 * peer out of the bootstrap configuration, or admit it; ruling absence on a view the predicate
+	 * emptied is the failure this rule exists to prevent.
+	 *
+	 * NOTE: the list read here is the peerStore's, which a refused bootstrap peer can also fill by
+	 * opening a stream on this network's `cluster` protocol, holding this node in the state above
+	 * for as long as it does so. Only configured bootstrap peers are read, so that takes a hostile
+	 * peer the operator chose to join through; if one is ever seen doing it, judge on identify's
+	 * own list (captured in `identifyOnConnectionOpen`) rather than the peerStore's.
 	 */
-	private heardFromBootstrapPeer(idStr: string): boolean {
-		return this.bootstrap?.contact.answerOf(idStr) !== undefined || this.rememberedServing.has(idStr)
+	private heardFromBootstrapPeer(idStr: string, protocols: readonly string[] | undefined): boolean {
+		const answer = this.bootstrap?.contact.answerOf(idStr)
+		if (answer === 'foreign') return true
+		if (answer === undefined && !this.rememberedServing.has(idStr)) return false
+		if (!this.refusedMembership(idStr)) return true
+		// Refused. Identify's list, when there is one, outranks the remembered verdict: `membershipOf`
+		// never refreshes that memory for a refused peer, so it may describe what the peer used to be.
+		if (answer === 'identified') return protocols !== undefined && !this.servesThisNetwork(protocols)
+		return false
 	}
 
-	private unheardBootstrapPeers(): string[] {
-		return (this.bootstrap?.contact.peerIds ?? []).filter(id => !this.heardFromBootstrapPeer(id))
+	private async unheardBootstrapPeers(): Promise<string[]> {
+		const contact = this.bootstrap?.contact
+		if (contact == null) return []
+		// Only a refused peer identify answered for needs its protocol list; nothing else here reads the peerStore.
+		const needProtocols = contact.peerIds.filter(id => contact.answerOf(id) === 'identified' && this.refusedMembership(id))
+		const protocols = needProtocols.length > 0 ? await this.getPeerStoreProtocolsByPeer(needProtocols) : {}
+		return contact.peerIds.filter(id => !this.heardFromBootstrapPeer(id, protocols[id]))
 	}
 
 	/**
@@ -1557,9 +1665,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return this.closeBootstrapWait('nothing-arriving')
 	}
 
-	private closeBootstrapWait(reason: 'deadline' | 'nothing-arriving'): false {
+	private async closeBootstrapWait(reason: 'deadline' | 'nothing-arriving'): Promise<false> {
 		this.bootstrapWaitClosed = reason
-		this.log('bootstrap-wait:closed reason=%s unheard=%d', reason, this.unheardBootstrapPeers().length)
+		this.log('bootstrap-wait:closed reason=%s unheard=%d', reason, (await this.unheardBootstrapPeers()).length)
 		return false
 	}
 
@@ -1645,6 +1753,62 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
+	 * The peers this node has seen serving this network that belong in `key`'s cohort but are missing
+	 * from the one {@link assembleServingCohort} assembles now — a partner that went offline, or a
+	 * relay-only peer FRET dropped from the ring once it disconnected. A write this node makes without
+	 * them is owed to them, which `CoordinatorRepo`'s solo short-circuit reports and records.
+	 *
+	 * Candidates are the peers whose membership verdict is `serves` ({@link membershipOf}, so they
+	 * come from {@link rememberedServing}, the one memory of positive verdicts) and that FRET does not
+	 * hold live near the key: anything in the assembly's band was placed or left out by FRET itself,
+	 * which is the authority on live members. Never self, an `unknown` or `foreign` peer, or a
+	 * bootstrap peer that is merely configured. The expected cohort is the nearest `clusterSize` of the
+	 * assembled cohort and the candidates together; the candidates in it are returned, nearest first.
+	 * A node that has never seen another serving peer answers `[]`, so a genuine one-machine
+	 * deployment is unchanged.
+	 *
+	 * NOTE: the expected cohort is ranked by two-sided ring distance, which approximates FRET's
+	 * alternating successor/predecessor walk rather than reproducing it. That decides only who is
+	 * pushed a copy, and a copy to a peer just outside the true cohort is harmless, so the difference
+	 * needs no closing. Whenever the assembled cohort and the candidates together number at most
+	 * `clusterSize` — every group up to the cluster size, two-machine groups included — every
+	 * candidate is in it whatever the ranking.
+	 */
+	async absentCohortMembers(key: RoutingKey): Promise<string[]> {
+		const coord = await hashKey(key)
+		const { cohort, band } = await this.assembleServingCohortAt(coord, this.toCacheKey(key).substring(0, 12))
+		const candidates = await this.servingPeersOutside(band)
+		if (candidates.length === 0) return []
+		const expected = await this.nearestTo(coord, [...cohort, ...candidates], this.clusterSize)
+		const absent = new Set(candidates)
+		return expected.filter(id => absent.has(id))
+	}
+
+	/**
+	 * Remote peers outside `band` whose membership verdict, read from their peerStore protocols now, is `serves`.
+	 *
+	 * NOTE: one peerStore read here, and one ring hash in {@link nearestTo}, per remembered serving peer
+	 * outside the band, on every solo write — a node cut off from a wide network it once saw pays that
+	 * for every peer it ever saw serving. If it shows in a profile, memoize each peer's ring position
+	 * (it never changes) and pre-select by distance before reading the peerStore.
+	 */
+	private async servingPeersOutside(band: readonly string[]): Promise<string[]> {
+		const excluded = new Set([...band, this.libp2p.peerId.toString()])
+		const remembered = [...this.rememberedServing].filter(id => !excluded.has(id))
+		if (remembered.length === 0) return []
+		const protocols = await this.getPeerStoreProtocolsByPeer(remembered)
+		return remembered.filter(id => this.membershipOf(id, protocols[id]) === 'serves')
+	}
+
+	/** The `count` of `ids` nearest `coord` by two-sided ring distance, nearest first. */
+	private async nearestTo(coord: Uint8Array, ids: readonly string[], count: number): Promise<string[]> {
+		const placed = await Promise.all(ids.map(async id =>
+			({ id, distance: minDistance(coord, await hashPeerId(peerIdFromString(id))) })))
+		placed.sort((a, b) => lexLess(a.distance, b.distance) ? -1 : lexLess(b.distance, a.distance) ? 1 : 0)
+		return placed.slice(0, count).map(p => p.id)
+	}
+
+	/**
 	 * Steps 2 to 5 of {@link assembleServingCohort}'s rule, at `coord`; `coordStr` only labels the
 	 * log line. An assembly that finds this node alone is made again for as long as a configured
 	 * bootstrap peer is on its way into view ({@link bootstrapContactImminent}).
@@ -1691,15 +1855,19 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const serving: string[] = []
 		let unknown = 0
 		let foreign = 0
+		// Counted apart from `foreign` so an operator can tell "another network" from "the
+		// membership predicate said no"; `membershipOf` reports both as `foreign`.
+		let refused = 0
 		for (const id of band) {
 			const m = this.membershipOf(id, peerStoreRecords[id]?.protocols)
 			if (m === 'serves') serving.push(id)
 			else if (m === 'unknown') unknown++
+			else if (this.refusedMembership(id)) refused++
 			else foreign++
 		}
 		const cohort = serving.slice(0, this.clusterSize)
-		this.log('cohort:membership key=%s band=%d serves=%d unknown=%d foreign=%d cohort=%d selfInCohort=%s',
-			coordStr, band.length, serving.length, unknown, foreign, cohort.length, cohort.includes(selfId))
+		this.log('cohort:membership key=%s band=%d serves=%d unknown=%d foreign=%d refused=%d cohort=%d selfInCohort=%s',
+			coordStr, band.length, serving.length, unknown, foreign, refused, cohort.length, cohort.includes(selfId))
 		const protocolsByPeer = Object.fromEntries(Object.entries(peerStoreRecords).map(([id, r]) => [id, r.protocols]))
 		return { cohort, band, peerStoreRecords, protocolsByPeer, alone: !serving.some(id => id !== selfId) }
 	}

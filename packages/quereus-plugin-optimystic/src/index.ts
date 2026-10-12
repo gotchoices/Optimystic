@@ -25,6 +25,13 @@ export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js
 // too; test/entry-identity.spec.ts holds both entries to the same objects.
 export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
+// The predicate an `onCommitDurability` listener tests "saved" with, so a host needs no db-core import for it.
+export { isFullyDurable } from '@optimystic/db-core';
+// What the plugin's `onCommitDurability` listener receives after each SQL commit, and what its
+// `onCommitFullyHeld` listener receives when a followed commit becomes fully held.
+export type {
+	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
+} from './optimystic-adapter/commit-durability.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';

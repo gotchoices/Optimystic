@@ -43,12 +43,14 @@ import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstr
 import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
-import { pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
+import { buildSyncProtocol } from './sync/protocol.js';
 import { resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
@@ -110,6 +112,7 @@ import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
 import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
+import { createNetworkMembershipGate, type IsNetworkMember } from './network-membership-gate.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -454,6 +457,29 @@ export type NodeOptions = ClusterPolicyOptions & {
 	authorizeInboundStreamTimeoutMs?: number;
 
 	/**
+	 * Optional predicate answering "is this peer a member of this node's network?", consulted
+	 * wherever this node chooses peers to hold or coordinate its writes. Without it, a peer counts
+	 * as serving this network when its peerStore protocol list names this network's `cluster` or
+	 * `repo` protocol — a list any connected peer can fill, by opening a stream on one of them
+	 * (even a stream {@link NodeOptions.authorizeInboundStream} then refuses) or by advertising
+	 * them. Supplied, a remote peer it refuses is never a cohort member and never a coordinator,
+	 * whatever its protocol list says.
+	 *
+	 * A separate option from {@link NodeOptions.authorizeInboundStream}, which answers who may SEND
+	 * to this node; this one answers who this node sends TO. An embedder whose database is private
+	 * needs both: with only the authorization predicate, any peer that opens a stream can still be
+	 * chosen as a cohort member and sent every write to the blocks it lands near.
+	 *
+	 * Synchronous — it runs inside every cohort assembly's per-peer loop, so keep it an in-memory
+	 * lookup. Fail closed: only a literal `true` admits; a throw or a non-boolean refuses, logged.
+	 * This node is always a member, so the predicate may list remote members only. `peerId` is
+	 * `PeerId.toString()` (base58btc). Read live on every lookup, so admitting or removing a member
+	 * takes effect on the next one. Absent → no check at all. See {@link IsNetworkMember} and
+	 * `docs/internals.md` § Network Membership Predicate.
+	 */
+	isNetworkMember?: IsNetworkMember;
+
+	/**
 	 * Optional libp2p connection gater. The libp2p browser default denies
 	 * dialing insecure WebSockets and private/loopback addresses; callers
 	 * that need to dial local or unsecured bootstraps (web reference dev,
@@ -704,6 +730,20 @@ function resolveFretEngine(fret: FretService | undefined): FretService | undefin
 function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collectionId: string): Uint8Array | undefined {
 	const ps = forwarderHost.pushStateForCollection(collectionId);
 	return ps === undefined ? undefined : b64urlToBytes(ps.tailIdAtJoin);
+}
+
+/**
+ * The protocols a node's own clients send requests on that get a prepared stream: repo, cluster, sync
+ * and block-transfer, under the same ids the four services register. Dispute is left out — rare, and
+ * off by default, so a prepared stream for it would almost always expire unused.
+ */
+function preparedStreamProtocols(protocolPrefix: string): string[] {
+	return [
+		`${protocolPrefix}/repo/1.0.0`,
+		`${protocolPrefix}/cluster/1.0.0`,
+		buildSyncProtocol(protocolPrefix),
+		buildBlockTransferProtocol(protocolPrefix)
+	];
 }
 
 export async function createLibp2pNodeBase(
@@ -1182,7 +1222,32 @@ export async function createLibp2pNodeBase(
 		// bootstraps registers a different (network-namespaced) identify protocol, so it is
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines);
+		// Built once, here, and handed to every peer-selection path that must obey it (`undefined`
+		// without a predicate, which every consumer skips): the key network, and the four senders that
+		// take peers from FRET directly — spread-on-churn, the ring-shift confirm, restoration and the
+		// under-replication drain.
+		const membership = createNetworkMembershipGate(options.isNetworkMember, node.peerId.toString(),
+			createLogger('network-membership', node.peerId.toString()));
+		// Streams negotiated ahead of the request that takes them, so a request to a peer this node is
+		// already talking to skips the protocol negotiation's round trip (`network/prepared-streams.ts`).
+		// Its stop wrapper is installed at once, so a startup rollback closes it too; it reports its
+		// background opens under the same peer-suffixed `open-protocol-stream` namespace the key network does.
+		const preparedStreams = new PreparedStreams(node, {
+			protocols: preparedStreamProtocols(protocolPrefix),
+			deadlines: linkDeadlines,
+			streamOpenLog: createLogger('open-protocol-stream', node.peerId.toString())
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					preparedStreams.close();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership, preparedStreams);
 		await keyNetwork.initFromPersistedState();
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
@@ -1415,10 +1480,13 @@ export async function createLibp2pNodeBase(
 			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
 			// genuinely absent block still costs no archive fetch.
 			acquireBlockFromCohort: reconcileBlock,
-			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
-			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
+			// Records who is still missing each block of a commit acknowledged below `full`; the
+			// under-replication drain below sends those copies.
 			underReplicationLedger,
-			onBlockHolders
+			onBlockHolders,
+			// A `full` commit that settles a ledger entry announces it through the same callable the
+			// drain emits through, so a host hears one event per entry whichever of the two removed it.
+			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event)
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
@@ -1501,6 +1569,7 @@ export async function createLibp2pNodeBase(
 						pushResponseTimeoutMs: linkDeadlines.responseTimeoutMs,
 						...options.spreadOnChurn
 					},
+					membership,
 				);
 				await spreadMonitor.start();
 				ensureOwnedBlockFeed();
@@ -1550,6 +1619,7 @@ export async function createLibp2pNodeBase(
 				keyNetwork,
 				partitionDetector,
 				protocolPrefix,
+				membership,
 				pushBlock: (blockId, peerIds) => pushBlockToPeers(storageRepo, keyNetwork, blockId, peerIds, {
 					reason: 'replication',
 					protocolPrefix,
@@ -1635,7 +1705,8 @@ export async function createLibp2pNodeBase(
 					keyNetwork,
 					`/optimystic/${options.networkName}`,
 					node.peerId.toString(),
-					linkDeadlines
+					linkDeadlines,
+					membership
 				);
 
 				// Update restore callback to use new coordinator
@@ -1760,6 +1831,7 @@ export async function createLibp2pNodeBase(
 							confirmer: coordinator,
 							ownedBlocks,
 							selfPeerId: peerId,
+							membership,
 							getFloor: () => rebalanceMonitor.getCohortSize(),
 							onRelease: (blockIds) => {
 								for (const blockId of blockIds) {
@@ -1900,6 +1972,9 @@ export async function createLibp2pNodeBase(
 					// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
 					// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
 					// filters to known members; excluding the original cluster + self keeps arbitrators independent.
+					// NOTE: not filtered by `membership` — a node-local predicate would make the draw differ between
+					// nodes — so a refused peer can be drawn and sent the disputed record. Settled before the dispute
+					// subsystem goes live (`feat-dispute-subsystem-live-activation`, "Who may arbitrate?").
 					const excludeSet = new Set(excludePeers);
 					// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
 					// determinism (the verifiable-recompute property) holds today only because the dissent

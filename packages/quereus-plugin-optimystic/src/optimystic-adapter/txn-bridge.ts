@@ -1,11 +1,16 @@
-import type { ITransactionEngine, ITransactor, Collection, CollectionId, Transaction } from '@optimystic/db-core';
+import type {
+  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Transaction, TransactionDurability,
+  WriteDurability,
+} from '@optimystic/db-core';
 import {
   TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
-  TreeKeyTakenError, createTransactionId, createTransactionStamp,
+  TreeKeyTakenError, createTransactionId, createTransactionStamp, recordCollectionDurability, transactionDurability,
 } from '@optimystic/db-core';
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
+import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurabilityListener } from './commit-durability.js';
+import { DurabilityFollower } from './durability-follower.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { createLogger, revisionToken } from '../logger.js';
 
@@ -25,14 +30,12 @@ const log = createLogger('txn-bridge');
  */
 export interface DirtyTree {
   /**
-   * Flush this tree's staged changes. Declared as `Promise<unknown>` because a real `Tree.sync`
-   * resolves to the write's `WriteDurability` (ticket write-durability-reaches-the-writer) while a
-   * test double resolves to nothing, and this bridge consumes NEITHER — it only needs the flush to
-   * have happened. Anything here that wants to report how durable a commit was has to go through
-   * the multi-collection gap tracked in
-   * `tickets/backlog/feat-multi-collection-commit-reports-durability.md`, not by reading this back.
+   * Flush this tree's staged changes, resolving to who holds what the flush wrote — or
+   * `undefined` when the tree had nothing staged (and so wrote nothing). The per-tree sweep
+   * ({@link TransactionBridge.sweepDirtyTreesLegacy}) folds these into the commit's
+   * durability report; a test double may resolve nothing, which reads as "wrote nothing".
    */
-  sync(): Promise<unknown>;
+  sync(): Promise<WriteDurability | undefined>;
   snapshot(): unknown;
   restore(snapshot: unknown): void;
   /**
@@ -95,6 +98,37 @@ export interface DirtyTree {
  * lists so both name the same tree the same way.
  */
 const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() ?? `tree#${index}`;
+
+/** What a commit wrote, from the per-collection answers gathered so far: `undefined` when none
+ * was gathered — nothing was written, or no tree that wrote could say (a test double). */
+const writtenDurability = (written: ReadonlyMap<CollectionId, WriteDurability | undefined>): TransactionDurability | undefined =>
+  written.size === 0 ? undefined : transactionDurability(written);
+
+/** Add `listener` to `listeners`, returning an idempotent unsubscribe. */
+function addListener<L>(listeners: Set<L>, listener: L): () => void {
+  listeners.add(listener);
+  let unsubscribed = false;
+  return () => {
+    if (unsubscribed) return;
+    unsubscribed = true;
+    listeners.delete(listener);
+  };
+}
+
+/**
+ * Call every listener with `event`, in registration order. Over a snapshot, so a listener that
+ * (un)subscribes while being called changes the next delivery, not this one; a listener that throws
+ * is logged and the next still runs.
+ */
+function notifyListeners<E>(listeners: ReadonlySet<(event: E) => void>, event: E, what: string, transactionId: string): void {
+  for (const listener of [...listeners]) {
+    try {
+      listener(event);
+    } catch (error) {
+      log('commit:%s-listener-threw transaction=%s: %o', what, transactionId, error);
+    }
+  }
+}
 
 /**
  * The committed revision to print for a dirty tree in the `commit:collections` trace.
@@ -194,6 +228,12 @@ export class PartialCommitError extends Error {
     public readonly unpersisted: readonly string[],
     /** The underlying flush failure that aborted the commit sweep. */
     public readonly reason?: unknown,
+    /**
+     * Who holds the {@link persisted} half — the same shape, folded the same way, as the
+     * report a successful commit delivers and as `CoordinatorPartialCommitError.durability`.
+     * Absent only when no persisted tree reported one (a test double).
+     */
+    public readonly durability?: TransactionDurability,
   ) {
     super(
       `Legacy multi-tree commit was not atomic: ${persisted.length} tree(s) were durably ` +
@@ -353,6 +393,30 @@ export class TransactionBridge {
    */
   private collectionRegistry = new Map<CollectionId, Collection<any>>();
   /**
+   * The tables (`schema.table`) each registered collection backs — its main tree or one of its
+   * index trees — recorded by {@link registerCollection}. A set because two tables declared over
+   * one collection URI share its collections. Read only to build a commit report's per-table view
+   * ({@link reportCommitDurability}).
+   */
+  private collectionTables = new Map<CollectionId, Set<string>>();
+  /**
+   * Listeners registered with {@link onCommitDurability}, called in registration order once per
+   * commit that wrote something.
+   */
+  private durabilityListeners = new Set<SqlCommitDurabilityListener>();
+  /** Listeners registered with {@link onCommitFullyHeld}. */
+  private fullyHeldListeners = new Set<CommitFullyHeldListener>();
+  /** Follows each reported commit saved below full replication until its whole cohort holds it. */
+  private durabilityFollower = new DurabilityFollower({
+    onFullyHeld: transactionId => this.reportFullyHeld(transactionId),
+  });
+  /**
+   * The full-replication event source of the node this bridge writes through, resolved at
+   * {@link beginTransaction} beside {@link peerId}; `undefined` for a transactor that keeps no
+   * under-replication ledger.
+   */
+  private durabilityNotifier: IBlockDurabilityNotifier | undefined;
+  /**
    * Per-collection SQL rendering of a concurrency-refused duplicate: the
    * `UNIQUE constraint failed: <table>.<col>[, …]` message the vtab registers for its
    * MAIN collection (naming the PRIMARY KEY columns) and for each UNIQUE-enforcing
@@ -511,8 +575,14 @@ export class TransactionBridge {
    * instance registered under an already-known id (a table re-initializing
    * mid-transaction) still gets its own clean capture while the old instance's
    * capture is left alone.
+   *
+   * `table` is the qualified `schema.table` the collection backs, which a commit's durability
+   * report groups its collections under (see {@link onCommitDurability}).
    */
-  registerCollection(collection: Collection<any>): void {
+  registerCollection(collection: Collection<any>, table?: string): void {
+    if (table !== undefined) {
+      this.recordCollectionTable(collection.id, table);
+    }
     const known = this.collectionRegistry.get(collection.id);
     this.collectionRegistry.set(collection.id, collection);
     // Fast path only: a re-registration of a known INSTANCE is already present in
@@ -529,6 +599,73 @@ export class TransactionBridge {
         snapshots.set(collection, collection.snapshotPending());
       }
     }
+  }
+
+  private recordCollectionTable(id: CollectionId, table: string): void {
+    const tables = this.collectionTables.get(id);
+    if (tables === undefined) {
+      this.collectionTables.set(id, new Set([table]));
+    } else {
+      tables.add(table);
+    }
+  }
+
+  /**
+   * Stop naming `table` (`schema.table`) in commit reports — for a table that was dropped, or
+   * whose CREATE was refused. Its collections stay registered (a DROP has never unregistered
+   * them), so without this a later table declared over the same URI would report its writes
+   * under the dropped table's name as well as its own.
+   */
+  forgetTable(table: string): void {
+    for (const [id, tables] of this.collectionTables) {
+      if (tables.delete(table) && tables.size === 0) {
+        this.collectionTables.delete(id);
+      }
+    }
+  }
+
+  /**
+   * Subscribe to the durability of every SQL commit that wrote something: after the commit
+   * succeeds and the bridge has torn its transaction down, and before `commitTransaction`
+   * returns, each listener is called once, synchronously, in registration order, with a frozen
+   * {@link SqlCommitDurability}. A commit that wrote nothing (a read-only transaction, a
+   * statement that matched no rows) calls nobody, and a commit that fails reports through its
+   * error instead (`CoordinatorPartialCommitError.durability`, {@link PartialCommitError.durability}).
+   *
+   * Quereus serializes writers behind its exec mutex, so every report delivered while a host's
+   * `await db.exec(...)` is running belongs to that exec. A listener that throws is logged and
+   * the rest still run; it never turns an acknowledged commit into a reported failure.
+   *
+   * Returns an idempotent unsubscribe.
+   */
+  onCommitDurability(listener: SqlCommitDurabilityListener): () => void {
+    return addListener(this.durabilityListeners, listener);
+  }
+
+  /**
+   * Subscribe to the moment a followed commit becomes fully held: one whose
+   * {@link SqlCommitDurability} said `followed` while it was held below full replication. Each
+   * listener is called once per such commit, synchronously, in registration order, with its
+   * `transactionId` — from the event that covered the last of its blocks, or from a later commit
+   * through this bridge that wrote those blocks at full replication. A commit already fully held
+   * when reported is never reported here. Same listener discipline as {@link onCommitDurability}.
+   *
+   * Followed commits live in memory: a restart, {@link dispose}, or the follower's cap on pending
+   * commits forgets them, and they are then never reported.
+   *
+   * Returns an idempotent unsubscribe.
+   */
+  onCommitFullyHeld(listener: CommitFullyHeldListener): () => void {
+    return addListener(this.fullyHeldListeners, listener);
+  }
+
+  /**
+   * Stop following commits: release the full-replication subscriptions and forget every pending
+   * commit, so no {@link onCommitFullyHeld} listener is called again for one. Commits made after
+   * this are followed afresh.
+   */
+  dispose(): void {
+    this.durabilityFollower.dispose();
   }
 
   /**
@@ -658,6 +795,11 @@ export class TransactionBridge {
     const transactor = await this.collectionFactory.getOrCreateTransactor(options);
     const peerId = this.collectionFactory.getPeerId(options);
     this.peerId = peerId;
+    this.durabilityNotifier = this.collectionFactory.getBlockDurabilityNotifier(options);
+    // Before the commit is sent: an event for its blocks can fire before its answer reaches us.
+    if (this.durabilityNotifier !== undefined) {
+      this.durabilityFollower.watch(this.durabilityNotifier);
+    }
 
     // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
@@ -708,42 +850,12 @@ export class TransactionBridge {
     if (!this.currentTransaction?.isActive) {
       throw new Error('No active transaction to commit');
     }
+    const transactionId = this.currentTransaction.stampId;
 
+    let durability: TransactionDurability | undefined;
     try {
       if (this.session) {
-        // Transaction mode: commit through the session for distributed consensus.
-        // The DML path STAGES into the collection trackers (no inline sync), and
-        // the coordinator's commit() iterates its collection map and reads each
-        // `tracker.transforms` directly. Because that map is the SAME live
-        // registry the vtab stages into (see registerCollection /
-        // getCollectionRegistry), the staged transforms are exactly what
-        // consensus pends/commits — so we deliberately do NOT tree.sync() here;
-        // flushing would reset the trackers out from under consensus.
-        // NOTE: session.commit() with no options inherits the coordinator's default
-        // bounded backoff+jitter retry of a clean stale loss (~10 attempts, up to a
-        // few seconds under sustained contention) before surfacing an error. That is
-        // the intended safe default; if the SQL layer ever needs faster failure here,
-        // thread a SyncOptions ({ maxAttempts, deadlineMs, signal }) through commit().
-        //
-        // Trace what the coordinator is about to carry BEFORE handing off: in session
-        // mode the commit set is the whole live registry (the coordinator iterates its
-        // collection map), not just the trees the vtab happened to mark dirty.
-        if (log.enabled) {
-          this.logCommitCollections('session', [...this.collectionRegistry].map(([id, collection]) => ({
-            id: String(id),
-            staged: collection.hasUnsyncedChanges(),
-            // A real Collection always implements these, so `unknown` is unreachable here;
-            // `none` still is: for the revision it means the collection was invented in
-            // this process, and for the action id it additionally covers a revision slot
-            // the log gave to a checkpoint or invalidation entry.
-            rev: collection.committedRevision() ?? 'none' as const,
-            action: collection.committedActionId() ?? 'none' as const,
-          })));
-        }
-        const result = await this.session.commit();
-        if (!result.success) {
-          throw new Error(result.error || 'Transaction commit failed');
-        }
+        durability = await this.commitSession(this.session);
       } else {
         // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
@@ -761,7 +873,7 @@ export class TransactionBridge {
         // after every pend succeeded, surfaced as CoordinatorPartialCommitError
         // rather than papered over. See commitDirtyTreesLegacy and
         // docs/transactions.md (§ "Legacy (single-node) commit").
-        await this.commitDirtyTreesLegacy();
+        durability = await this.commitDirtyTreesLegacy();
       }
 
       this.currentTransaction.isActive = false;
@@ -817,6 +929,80 @@ export class TransactionBridge {
       await this.rollbackTransaction();
       throw this.mapCommitRefusal(error);
     }
+    this.reportCommitDurability(transactionId, durability);
+  }
+
+  /**
+   * Session-mode commit: hand the staged transforms to the session's coordinator for
+   * distributed consensus. Resolves to who holds what the commit wrote, or `undefined` when
+   * it wrote nothing.
+   */
+  private async commitSession(session: TransactionSession): Promise<TransactionDurability | undefined> {
+    // The DML path STAGES into the collection trackers (no inline sync), and
+    // the coordinator's commit() iterates its collection map and reads each
+    // `tracker.transforms` directly. Because that map is the SAME live
+    // registry the vtab stages into (see registerCollection /
+    // getCollectionRegistry), the staged transforms are exactly what
+    // consensus pends/commits — so we deliberately do NOT tree.sync() here;
+    // flushing would reset the trackers out from under consensus.
+    // NOTE: session.commit() with no options inherits the coordinator's default
+    // bounded backoff+jitter retry of a clean stale loss (~10 attempts, up to a
+    // few seconds under sustained contention) before surfacing an error. That is
+    // the intended safe default; if the SQL layer ever needs faster failure here,
+    // thread a SyncOptions ({ maxAttempts, deadlineMs, signal }) through commit().
+    //
+    // Trace what the coordinator is about to carry BEFORE handing off: in session
+    // mode the commit set is the whole live registry (the coordinator iterates its
+    // collection map), not just the trees the vtab happened to mark dirty.
+    if (log.enabled) {
+      this.logCommitCollections('session', [...this.collectionRegistry].map(([id, collection]) => ({
+        id: String(id),
+        staged: collection.hasUnsyncedChanges(),
+        // A real Collection always implements these, so `unknown` is unreachable here;
+        // `none` still is: for the revision it means the collection was invented in
+        // this process, and for the action id it additionally covers a revision slot
+        // the log gave to a checkpoint or invalidation entry.
+        rev: collection.committedRevision() ?? 'none' as const,
+        action: collection.committedActionId() ?? 'none' as const,
+      })));
+    }
+    const result = await session.commit();
+    if (!result.success) {
+      throw new Error(result.error || 'Transaction commit failed');
+    }
+    return result.durability;
+  }
+
+  /**
+   * Deliver one commit's durability to every {@link onCommitDurability} listener, following it
+   * first so the report can say whether {@link onCommitFullyHeld} will fire for it. A commit that
+   * wrote nothing (`undefined`) reaches nobody, and with no listener of either kind it is neither
+   * followed nor reported. Each listener runs isolated: a throw is logged and the next still runs.
+   *
+   * Whatever the listeners, the collections the commit wrote at full replication then cover any
+   * earlier followed commit waiting on those blocks.
+   */
+  private reportCommitDurability(transactionId: string, durability: TransactionDurability | undefined): void {
+    if (durability === undefined) {
+      return;
+    }
+    if (this.durabilityListeners.size > 0 || this.fullyHeldListeners.size > 0) {
+      const verdict = this.durabilityFollower.follow(
+        transactionId, durability, { selfPeerId: this.peerId, notifier: this.durabilityNotifier });
+      const report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id), verdict !== 'unfollowed');
+      notifyListeners(this.durabilityListeners, report, 'durability', transactionId);
+      // Every block's event came before the commit's answer did: fully held already, but reported
+      // so only after the commit itself has been.
+      if (verdict === 'covered') {
+        this.reportFullyHeld(transactionId);
+      }
+    }
+    this.durabilityFollower.coverHeld(durability, this.durabilityNotifier);
+  }
+
+  /** Tell every {@link onCommitFullyHeld} listener that a followed commit is fully held. */
+  private reportFullyHeld(transactionId: string): void {
+    notifyListeners(this.fullyHeldListeners, Object.freeze({ transactionId }), 'fully-held', transactionId);
   }
 
   /**
@@ -914,8 +1100,10 @@ export class TransactionBridge {
    *   refused with nothing stored — the tear the per-tree sweep could not avoid.
    * - **The per-tree sweep** ({@link sweepDirtyTreesLegacy}) only when the trees cannot
    *   share one batch — see {@link legacyBatch} for the two cases.
+   *
+   * Resolves to who holds what the commit wrote, or `undefined` when no tree wrote anything.
    */
-  private async commitDirtyTreesLegacy(): Promise<void> {
+  private async commitDirtyTreesLegacy(): Promise<TransactionDurability | undefined> {
     const trees = [...this.dirtyTrees.keys()];
 
     // Trace what this commit is about to carry. Legacy mode's commit set is the
@@ -934,11 +1122,9 @@ export class TransactionBridge {
     }
 
     const batch = this.legacyBatch(trees);
-    if (batch === undefined) {
-      await this.sweepDirtyTreesLegacy(trees);
-      return;
-    }
-    await this.commitBatchLegacy(batch);
+    return batch === undefined
+      ? await this.sweepDirtyTreesLegacy(trees)
+      : await this.commitBatchLegacy(batch);
   }
 
   /**
@@ -1012,8 +1198,10 @@ export class TransactionBridge {
    *   their pre-transaction snapshots — memory mirrors storage for both halves, exactly as
    *   the fallback sweep leaves a torn commit — and the catch latches the degraded state.
    *   Nothing rolls the committed half back.
+   *
+   * On success, resolves to the coordinator's answer: who holds each collection it wrote.
    */
-  private async commitBatchLegacy({ collections, transactor }: LegacyBatch): Promise<void> {
+  private async commitBatchLegacy({ collections, transactor }: LegacyBatch): Promise<TransactionDurability | undefined> {
     // NOTE: the batch pends each tree at the revision this handle currently holds for it — the
     // coordinator does not refresh before its first attempt, where the sweep's `updateAndSync`
     // did. A tree a rival advanced since this handle last refreshed it therefore costs one
@@ -1028,7 +1216,7 @@ export class TransactionBridge {
       { pendValidation: 'none' },
     );
     try {
-      await coordinator.commit(await this.legacyTransaction());
+      return await coordinator.commit(await this.legacyTransaction());
     } catch (error) {
       if (error instanceof CoordinatorPartialCommitError) {
         this.restoreUncommittedTrees(new Set(error.committedCollections));
@@ -1082,11 +1270,16 @@ export class TransactionBridge {
    *   cannot be un-committed locally. Restore ONLY the trees that never touched
    *   storage (they revert cleanly), leave the committed trees' in-memory state
    *   as-is (it matches storage), tear down the transaction, and throw a
-   *   {@link PartialCommitError} naming both sets. We do NOT report success and do
-   *   NOT falsely claim a rollback.
+   *   {@link PartialCommitError} naming both sets, with who holds the persisted half.
+   *   We do NOT report success and do NOT falsely claim a rollback.
+   *
+   * On success, resolves to who holds what the sweep wrote — each tree's `sync()` answer,
+   * keyed by its collection id (two trees over one id merge, weakest first) — or `undefined`
+   * when no tree had anything to push.
    */
-  private async sweepDirtyTreesLegacy(trees: readonly DirtyTree[]): Promise<void> {
+  private async sweepDirtyTreesLegacy(trees: readonly DirtyTree[]): Promise<TransactionDurability | undefined> {
     const synced: DirtyTree[] = [];
+    const written = new Map<CollectionId, WriteDurability | undefined>();
 
     // PRE-FLIGHT: refresh every staged tree against storage BEFORE the first flush, so a
     // guarded entry a rival has ALREADY contradicted (a duplicate key or unique value, a
@@ -1110,10 +1303,13 @@ export class TransactionBridge {
       }
     }
 
-    for (const tree of trees) {
+    for (const [index, tree] of trees.entries()) {
       try {
-        await tree.sync();
+        const durability = await tree.sync();
         synced.push(tree);
+        if (durability !== undefined) {
+          recordCollectionDurability(written, tree.getCollection?.()?.id ?? treeLabel(tree, index), durability);
+        }
       } catch (rawError) {
         // Map a concurrency-refused duplicate key (TreeKeyTakenError out of this
         // tree's conflict replay) to its table's UNIQUE-constraint message HERE, so
@@ -1158,9 +1354,10 @@ export class TransactionBridge {
         this.accumulatedStatements = [];
         this.session = null;
 
-        throw new PartialCommitError(persisted, unpersisted, error);
+        throw new PartialCommitError(persisted, unpersisted, error, writtenDurability(written));
       }
     }
+    return writtenDurability(written);
   }
 
   /**
@@ -1281,17 +1478,19 @@ export class TransactionBridge {
    * The reverse of {@link markDirty} and {@link registerCollection}, for a tree the vtab has
    * stopped maintaining (`DROP INDEX`). It leaves the dirty set, so a legacy commit does not flush
    * what DML staged into it this transaction and a rollback does not restore it; and its collection
-   * leaves the registry — only while the registered instance IS this tree's, so a newer instance
-   * under the same id (a re-created index) is left alone. Without the registry half a session-mode
-   * coordinator, which commits every registered collection with unsynced changes, would carry a
-   * dropped index's staged entries into a tree nothing lists. Open savepoints keep whatever they
-   * captured for it: restoring an abandoned tree changes nothing anyone reads.
+   * leaves the registry, with the tables recorded for it — only while the registered instance IS
+   * this tree's, so a newer instance under the same id (a re-created index) is left alone. Without
+   * the registry half a session-mode coordinator, which commits every registered collection with
+   * unsynced changes, would carry a dropped index's staged entries into a tree nothing lists. Open
+   * savepoints keep whatever they captured for it: restoring an abandoned tree changes nothing
+   * anyone reads.
    */
   forgetTree(tree: DirtyTree): void {
     this.dirtyTrees.delete(tree);
     const collection = tree.getCollection?.();
     if (collection && this.collectionRegistry.get(collection.id) === collection) {
       this.collectionRegistry.delete(collection.id);
+      this.collectionTables.delete(collection.id);
     }
   }
 

@@ -162,7 +162,10 @@ and the conventions behind it are in `packages/db-p2p/docs/repo.md` § Protocol 
 These protocols are open to any peer that can connect. An embedder whose database is private can
 supply `createLibp2pNode({ authorizeInboundStream })` — one optional, fail-closed predicate consulted
 once per inbound stream on the `repo`, `cluster`, `sync` and `block-transfer` protocols, before any
-decoding or execution. See [internals](internals.md) § Inbound Stream Authorization.
+decoding or execution. See [internals](internals.md) § Inbound Stream Authorization. That gates
+who may send to this node; who this node chooses to hold and coordinate its writes is gated
+separately, by `createLibp2pNode({ isNetworkMember })` — see
+[internals § Network Membership Predicate](internals.md#network-membership-predicate).
 
 ```mermaid
 graph LR

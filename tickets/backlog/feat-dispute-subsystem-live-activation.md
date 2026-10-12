@@ -171,3 +171,14 @@ The design of record is now synchronous block-then-escalate (`docs/right-is-righ
 - **Status reconciliation.** Rewrite the status notes on `docs/correctness.md` Theorems 1 (Case 3), 7, 8, 10 and §1.5, the implementation-status notice at the top of that file, `docs/right-is-right.md` §Current Implementation, and `docs/architecture.md` §Status & Evolution to describe what then ships.
 - **Validator reality check.** The mechanism is inert while no deployment supplies a transaction validator (`feat-no-deployment-validates-transactions-at-pend`): no validator, no validity rejections, no disputes. Turning disputes on does not need it, but the end-to-end claim in the docs must say which deployments actually validate.
 
+
+## Who may arbitrate? (added by the `network-membership-predicate-gates-block-pushes` review, 2026-10-11)
+
+A node can be given a network membership predicate (`NodeOptions.isNetworkMember`) saying which peers belong to its network. Every path that chooses peers to send block contents to obeys it — except the arbitrator draw: the `selectArbitrators` hook in `packages/db-p2p/src/libp2p-node-base.ts` takes candidates straight from FRET's `assembleCohort`, and a challenge carries the disputed `ClusterRecord`, transforms included. With `disputeEnabled` on today, a peer the predicate refuses can be drawn, sent that record, and cast an arbitrator vote — a stranger registering the dispute protocol on its own node is enough, since nothing on the arbitrator side needs this network's handler. `docs/internals.md` § Network Membership Predicate lists it under *What it does not gate*, and a `NOTE:` sits at the hook.
+
+It was not simply filtered, because the draw must be identical on every honest node (see the existing `exclude` determinism note above): a node-local predicate breaks that unless every honest node's predicate agrees. Settle, as part of going live:
+
+- **Recommended:** let `feat-fret-honours-the-network-membership-predicate` close it — once FRET's ring excludes refused peers, `assembleCohort` never yields one, and the draw is as deterministic as ring membership already is (both are per-node views). Activation then only has to confirm that ticket landed.
+- **Alternative:** filter in the hook and accept that nodes whose predicates differ draw different arbitrators; a verify-path recompute would then need the predicate's answers as part of what it reconstructs, which the anchoring work would have to carry.
+
+Expected behaviour: on a node with a membership predicate, a refused peer is never drawn as an arbitrator and never sent a challenge.
