@@ -36,6 +36,7 @@ The `ClusterClient` provides a network client for communicating with remote clus
 - **Network Abstraction**: Simplifies peer-to-peer cluster communication
 - **Protocol Handling**: Manages libp2p protocol details
 - **Record Updates**: Sends and receives cluster record updates
+- **Carried Records**: `updateCarrying` sends decided records the member is still owed ahead of the request's own record (see [Owed deliveries ride on the next request](#owed-deliveries-ride-on-the-next-request))
 - **Error Management**: Handles network failures and timeouts
 
 **Implementation:**
@@ -654,6 +655,18 @@ Retries reuse the original `ClusterRecord` so peers that missed the initial comm
 A successful retry clears the pending list; hitting the max attempts emits `cluster-tx:retry-abort` so operators can intervene. The coordinator keeps the transaction in memory while the retry is live, ensuring follow-up requests (reads, additional commits) see a consistent state, and releases it when the retry ends — whichever way it ends. All three terminal exits (the commit finished with no retry pending, the retry caught every peer up, the retry gave up) go through one `releaseTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, which cancels any armed retry and then deletes the in-memory entry and the persisted coordinator state on a 100 ms deferral, logging `cluster-tx:transaction-remove` with a `reason` naming the exit.
 
 Cluster members are idempotent: they ignore duplicate commits once their signature is present, so forced retries do not double-apply user operations.
+
+The timer is not the only way a pending peer gets the record: any other request the coordinator sends that peer carries it first ([below](#owed-deliveries-ride-on-the-next-request)), and a peer that takes it that way leaves the retry exactly as one the timer reached does. The timer skips a peer while the record is riding to it on another request, and it is still pending until that request's answer says it took the record.
+
+### Owed deliveries ride on the next request
+
+A record whose retry still lists a peer, and which already carries a commit majority, is **owed** to that peer: it is decided, and the peer only has to receive it. `ClusterCoordinator.updateMember` is the one place a request goes to a remote member, and there it attaches the peer's owed records ahead of the request's own record — oldest first, at most `MaxCarriedRecords` (4, `packages/db-core/src/cluster/structs.ts`), never the record the request is for, and only once the coordinator's own member has applied the record, so the coordinating member still applies first. A record short of a majority is never carried: re-sending it asks for a vote, and the compact answer below has no room for one.
+
+On the wire the request envelope `{ operation: 'update', record }` gains an optional `carried: ClusterRecord[]`, and the answer to a request that carried any gets one more field, `carried: CarriedOutcome[]`, on whatever it already returns — the record, a redirect, or the error envelope. Each `CarriedOutcome` is `{ messageHash, delivered, outcome?, error? }`, one per carried record in the order sent, where `outcome` is the member's own `applyOutcomes` entry. `ClusterService` applies the carried records first, in order, each exactly as it takes a standalone record — address learning, the redirect check (a redirect is "not delivered"), then the member's `update` in its own `try`, so one carried record's failure never fails the request — and then the request's own record. The loop is `applyCarriedRecords` in `packages/db-p2p/src/cluster/carried-records.ts`, which the mesh harness's client runs too. A `carried` that is not a list of at most four records is ignored, not refused.
+
+- **Who is carried to.** Every answer a member gives stamps `MemberApplyOutcome.acceptsCarried`. The coordinator remembers, per peer, what that peer's own last answer said (1024 peers, least recently used dropped), and carries only to a peer whose last answer stamped it. An older member never stamps it, so it is never carried to and gets the timer's deliveries, as before; an older coordinator never sends the field.
+- **Taking and returning.** A record is marked in flight for the peer when it is attached, so two concurrent requests never both carry it. When the answer says the peer took it, the coordinator books it as it books a delivery by the timer — the peer's report joins the record, the peer leaves the retry, the retry ends when nobody is left, and the coordinating member gets its second reconcile if the peer now reports holding the revision. Otherwise — not delivered, or the carrying request failed — the record stays owed for the timer or the next request. A member dedups a record it already applied, so a lost answer costs only a re-send.
+- **Size.** `ClusterClient.updateCarrying` sends the request without its carried records, reporting each not delivered, when they would push it past the 1 MiB control-message limit (`carried:too-large` under `cluster-client`).
 
 ### Timeout Management
 

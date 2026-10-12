@@ -961,13 +961,14 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Add this member's own apply report to a record's {@link ClusterRecord.applyOutcomes}, when it
-	 * has anything to report for this transaction. The fields follow the rules on
-	 * {@link MemberApplyOutcome}: `executed` is set once this member has run the consensus apply; the
-	 * pend arm carries ONLY a conflict-shaped refusal (a success, a bare-reason fault, or no retained
-	 * verdict leaves it off — the coordinator's rule is "an entry means retry", so an entry that does
-	 * not mean retry must not exist); the commit arm carries the retained durable verdict whatever it
-	 * says, because the coordinator counts the successes.
+	 * Add this member's own apply report to a record's {@link ClusterRecord.applyOutcomes}. The fields
+	 * follow the rules on {@link MemberApplyOutcome}: `executed` is set once this member has run the
+	 * consensus apply; the pend arm carries ONLY a conflict-shaped refusal (a success, a bare-reason
+	 * fault, or no retained verdict leaves it off — the coordinator's rule is "an entry means retry", so
+	 * an entry that does not mean retry must not exist); the commit arm carries the retained durable
+	 * verdict whatever it says, because the coordinator counts the successes. `acceptsCarried` is on
+	 * every answer, so the entry is never omitted; an entry carrying only that reports nothing about the
+	 * transaction.
 	 *
 	 * The member never signs this and never writes another peer's entry.
 	 */
@@ -977,11 +978,9 @@ export class ClusterMember implements ICluster {
 		const own: MemberApplyOutcome = {
 			...(this.executedTransactions.has(record.messageHash) ? { executed: true } : {}),
 			...(pend !== undefined && !pend.success && isConflictFailure(pend) ? { pend } : {}),
-			...(commit !== undefined ? { commit } : {})
+			...(commit !== undefined ? { commit } : {}),
+			acceptsCarried: true
 		};
-		if (Object.keys(own).length === 0) {
-			return record;
-		}
 		return {
 			...record,
 			applyOutcomes: { ...record.applyOutcomes, [this.peerId.toString()]: own }
@@ -2358,7 +2357,8 @@ export class ClusterMember implements ICluster {
 	 * assembles consensus and the write fails loudly instead of forking the block. That is the
 	 * intended outcome here — a clean retryable conflict answer is {@link ClusterRecord.applyOutcomes}'
 	 * job, and this arm is the backstop for the paths that channel cannot reach (a member that applies
-	 * late, via the scheduled commit-retry timer, after the coordinator has already answered).
+	 * late, via the scheduled commit-retry timer or carried on a later request, after the coordinator
+	 * has already answered).
 	 *
 	 * Never throws out of the vote path: a read fault is an abstain, same rule as its two siblings.
 	 */

@@ -1588,7 +1588,11 @@ saveMaterializedBlock(block): store(structuredClone(block));
   remote members that still need it: one whose commit-round call failed, one whose response does
   not report having applied (`MemberApplyOutcome.executed`, which an older build never sets), and
   one that reports a refused commit. In a healthy two- or three-member cohort that list is empty,
-  so a consensus operation costs each remote member two calls rather than three. The coordinating
+  so a consensus operation costs each remote member two calls rather than three. A member that
+  missed that delivery is owed it, and it rides, ahead of the request's own record, on the next
+  request the coordinating node sends that member, rather than waiting for the commit-retry timer
+  to send it alone (`takeOwedRecords` in `packages/db-p2p/src/repo/cluster-coordinator.ts`); either
+  way the coordinating member has applied first. The coordinating
   member's copy carries the cohort's commit proof (`buildBlockCommitProof`), which the certified
   single-holder rule below accepts without a second corroborator, so a whole cohort of behind
   members can heal from it. A single parallel fan-out let the remote reconciles race the local

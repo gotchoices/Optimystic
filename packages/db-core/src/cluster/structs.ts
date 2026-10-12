@@ -157,6 +157,35 @@ export type MemberApplyOutcome = {
 	 * for the operator's benefit — the coordinator reads only `success`.
 	 */
 	commit?: CommitResult;
+	/**
+	 * This member applies decided records carried ahead of a request's own record
+	 * ({@link CarriedOutcome}). Stamped on every answer, so a coordinator can tell a member that
+	 * understands carried records from one on an older build, which never sets it; a coordinator
+	 * carries records only to a member whose last answer stamped it.
+	 */
+	acceptsCarried?: true;
+};
+
+/**
+ * The most decided records one cluster request may carry ahead of its own record. A coordinator never
+ * sends more, and a member ignores a request's carried list that is longer.
+ */
+export const MaxCarriedRecords = 4;
+
+/**
+ * A member's answer for one decided record carried ahead of a request's own record — one per carried
+ * record, in the order sent. Compact on purpose: echoing whole records back would double the size of
+ * the response.
+ */
+export type CarriedOutcome = {
+	/** The carried record's `messageHash`. */
+	messageHash: string;
+	/** True only when the member ran `update` on the record without throwing and without redirecting it. */
+	delivered: boolean;
+	/** The member's own {@link ClusterRecord.applyOutcomes} entry from its answer to the carried record. */
+	outcome?: MemberApplyOutcome;
+	/** Why the member did not take the record, when it threw. */
+	error?: string;
 };
 
 export type ClusterRecord = {

@@ -109,6 +109,7 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 
 	after(() => {
 		mesh.failures.onClusterDelivery = undefined;
+		mesh.failures.dropCarried = undefined;
 		releaseRival();
 	});
 
@@ -125,12 +126,14 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 		let gateReached = false;
 		const gate = new Promise<void>(resolve => { releaseRival = resolve; });
 
-		// D misses R's pend: every delivery of it to D fails, including the coordinator's scheduled retries.
+		// D misses R's pend: every delivery of it to D fails, including the coordinator's scheduled retries
+		// and the copies it carries, still owed, on its other requests to D.
 		mesh.failures.onClusterDelivery = (target, record) => {
 			if (target === dId && pendsFor(record, rivalAction)) {
 				throw new Error(`D (${dId}) misses the rival's pend`);
 			}
 		};
+		mesh.failures.dropCarried = (target, record) => target === dId && pendsFor(record, rivalAction);
 		// On the writer's side: learn R's action from its pend, and hold its data-block stage. One coordinator
 		// covers every block here, so R's commit would carry its tail and data blocks in one round; that round
 		// is refused with a transport-shaped throw (before it reaches any member), which makes the writer
@@ -191,6 +194,7 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 	it('phase 4 — R\'s commit is released: R lands everywhere, and N is saved with both rows or refused, never acknowledged over R', async () => {
 		releaseRival();
 		mesh.failures.onClusterDelivery = undefined;
+		mesh.failures.dropCarried = undefined;
 		await rivalWrite;
 		acknowledged.set('row-R', 'written-by-R');
 
