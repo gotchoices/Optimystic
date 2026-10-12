@@ -73,3 +73,7 @@ Fully. Holding back the decision has a setting (`pendDeliveryDeferralMs`, `0` tu
 ## Measured numbers
 
 (Record here: setup, per-request time, per-write time, before and after stream reuse.)
+
+## Decision (maintainer, 2026-10-11)
+
+Accepted without waiting for the re-measure: "If we aren't compromising correctness, yes of course we should eliminate a round-trip." The design above changes no signed data, vote kind or threshold; the one rule that moves (a two-member pend refusal surfaces at commit, as the same retryable conflict) is documented by the proposed `docs/correctness.md` §2 text, which `a-two-member-pend-defers-its-final-delivery-to-the-commit` adds. Implementers and reviewers: hold the work to that bar — if any step turns out to need a weaker guarantee than the one argued above, stop and route it back to `blocked/` rather than ship it.
