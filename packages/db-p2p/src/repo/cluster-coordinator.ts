@@ -1,5 +1,5 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
+import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
 import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
@@ -43,6 +43,26 @@ function collectApplyOutcomes(
 function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['applyOutcomes']): void {
 	if (collected === undefined) return;
 	record.applyOutcomes = { ...record.applyOutcomes, ...collected };
+}
+
+/** At most this many pend actions' late refusals are held for {@link ClusterCoordinator.takeLatePendRefusals}. */
+const MaxLatePendRefusalActions = 1024;
+
+/** A member's own report, when it is a conflict-shaped pend refusal — the only pend report that means anything. */
+function conflictPendRefusalOf(outcome: MemberApplyOutcome | undefined): WriteFailure | undefined {
+	const pend = outcome?.pend;
+	return pend !== undefined && !pend.success && isConflictFailure(pend) ? pend : undefined;
+}
+
+/** The action ids of a message's pend operations. */
+function pendActionIdsOf(message: RepoMessage): ActionId[] {
+	return message.operations.flatMap(op => 'pend' in op ? [op.pend.actionId] : []);
+}
+
+/** The action ids a message commits or cancels — the operations that settle a pend. */
+function settledActionIdsOf(message: RepoMessage): ActionId[] {
+	return message.operations.flatMap(op =>
+		'commit' in op ? [op.commit.actionId] : 'cancel' in op ? [op.cancel.actionRef.actionId] : []);
 }
 
 /** Fold the commit signatures of every answered response into a record in place. */
@@ -259,6 +279,12 @@ export class ClusterCoordinator {
 	 * `returnCarried`, `settleCarriedDelivery`) grows further, move it into its own module.
 	 */
 	private readonly carryCapablePeers = new LruMap<string, true>(1024);
+	/**
+	 * Conflict-shaped pend refusals that arrived after the pend's writer was answered — reported on a
+	 * carried delivery of the pend record or on a scheduled retry of it — keyed by the pend's action id
+	 * until {@link takeLatePendRefusals} reads them or the record expires.
+	 */
+	private readonly latePendRefusals = new LruMap<ActionId, { refusals: { [peerId: string]: WriteFailure }; expiresAt: number }>(MaxLatePendRefusalActions);
 	private readonly retryInitialIntervalMs: number;
 	private readonly retryBackoffFactor: number;
 	private readonly retryMaxIntervalMs: number;
@@ -344,7 +370,7 @@ export class ClusterCoordinator {
 	 */
 	private async requestMember(peerIdStr: string, record: ClusterRecord): Promise<ClusterRecord> {
 		const client = this.createClusterClient(peerIdFromString(peerIdStr));
-		const carried = client.updateCarrying ? this.takeOwedRecords(peerIdStr, record.messageHash) : [];
+		const carried = client.updateCarrying ? this.takeOwedRecords(peerIdStr, record) : [];
 		if (carried.length === 0) {
 			return this.noteCarryCapability(peerIdStr, await client.update(record));
 		}
@@ -362,15 +388,25 @@ export class ClusterCoordinator {
 
 	/**
 	 * Take the decided records `peerId` is still owed, oldest first and at most {@link MaxCarriedRecords},
-	 * to carry on a request for `forMessageHash` — never that record itself. A record is owed to a member
+	 * to carry on a request for `forRecord` — never that record itself. A record is owed to a member
 	 * when its armed retry still lists the member and the record already carries a commit majority: a
 	 * record short of one would ask the member for a vote, which the compact carried answer has no room
 	 * for. Only a member whose last answer stamped `acceptsCarried` is carried to, and only once this
 	 * node's own member has applied the record, keeping the delivery order {@link broadcastMergedRecord}
 	 * depends on.
 	 *
+	 * **A request that commits or cancels an action always carries that action's owed pends, first** —
+	 * even while another request is carrying them, and ahead of everything else owed. The member then has
+	 * applied the pend before it votes on the commit or applies the cancel, from this one request. A
+	 * commit voted by a member that has not applied its pend can neither be checked against the pended
+	 * content (`ClusterMember.validateCommitOperations` abstains) nor refused for a pend the member would
+	 * have refused (`validateCommitAgainstRefusedPend`); a cancel that overtakes its pend leaves a pending
+	 * record nothing will remove. A copy the member already took is answered from its dedup
+	 * (`ClusterMember.update` waits for an update of the same record still in progress, so the vote comes
+	 * after the apply either way).
+	 *
 	 * Synchronous on purpose: each record taken is marked in flight before any await, so two concurrent
-	 * requests to one member never both carry it.
+	 * requests to one member never both carry it — the escorted pends above excepted.
 	 *
 	 * NOTE: scans every held transaction on each remote request; a node holds only the transactions in
 	 * consensus and those still retrying, so this stays small. If a node ever holds many, index owed
@@ -378,24 +414,33 @@ export class ClusterCoordinator {
 	 * NOTE: a record whose retry run is sending it to `peerId` right now is not marked in flight, so a
 	 * request made meanwhile carries it too; the member dedups the second copy. If that ever shows up as
 	 * wasted traffic, mark the run's own deliveries in `carrying` as well.
+	 * NOTE: an escorted pend that was already riding on another request is marked once, so whichever of
+	 * the two answers first clears the mark and the retry timer may send the record again while the other
+	 * still rides; the member dedups it. If that ever shows up as wasted traffic, count rides per member.
 	 */
-	private takeOwedRecords(peerId: string, forMessageHash: string): ClusterRecord[] {
+	private takeOwedRecords(peerId: string, forRecord: ClusterRecord): ClusterRecord[] {
 		if (!this.carryCapablePeers.has(peerId)) return [];
 		const selfId = this.localCluster?.peerId.toString();
+		const settling = new Set(settledActionIdsOf(forRecord.message));
 		const owed = Array.from(this.transactions.values())
 			.filter(state => {
 				const pending = state.retry?.pendingPeers;
 				return pending !== undefined
-					&& state.messageHash !== forMessageHash
+					&& state.messageHash !== forRecord.messageHash
 					&& pending.has(peerId)
-					&& !state.carrying.has(peerId)
 					&& (selfId === undefined || !pending.has(selfId))
 					&& this.hasCommitMajority(state.record);
 			})
-			.sort((a, b) => (a.owedSince ?? 0) - (b.owedSince ?? 0))
+			.sort((a, b) => (a.owedSince ?? 0) - (b.owedSince ?? 0));
+		const escorted = owed
+			.filter(state => pendActionIdsOf(state.record.message).some(actionId => settling.has(actionId)))
 			.slice(0, MaxCarriedRecords);
-		for (const state of owed) state.carrying.add(peerId);
-		return owed.map(state => ({ ...state.record }));
+		const others = owed
+			.filter(state => !escorted.includes(state) && !state.carrying.has(peerId))
+			.slice(0, MaxCarriedRecords - escorted.length);
+		const taken = [...escorted, ...others];
+		for (const state of taken) state.carrying.add(peerId);
+		return taken.map(state => ({ ...state.record }));
 	}
 
 	/**
@@ -454,7 +499,44 @@ export class ClusterCoordinator {
 	 */
 	private noteDelivered(record: ClusterRecord, pendingPeers: Set<string>, delivered: readonly string[], outcomes: ClusterRecord['applyOutcomes']): void {
 		mergeApplyOutcomes(record, outcomes);
+		this.retainLatePendRefusals(record, outcomes);
 		for (const peerId of delivered) pendingPeers.delete(peerId);
+	}
+
+	/**
+	 * Keep each conflict-shaped pend refusal in `outcomes` — reported by a member that applied the pend
+	 * `record` only on a carried or retried delivery, after the pend's writer was answered — for the
+	 * action's commit to answer with ({@link takeLatePendRefusals}). This node's own member is never in
+	 * it: its verdict reached the writer with the pend's answer.
+	 */
+	private retainLatePendRefusals(record: ClusterRecord, outcomes: ClusterRecord['applyOutcomes']): void {
+		const actionIds = pendActionIdsOf(record.message);
+		if (outcomes === undefined || actionIds.length === 0) return;
+		const selfId = this.localCluster?.peerId.toString();
+		for (const [peerId, outcome] of Object.entries(outcomes)) {
+			const refusal = peerId === selfId ? undefined : conflictPendRefusalOf(outcome);
+			if (refusal === undefined) continue;
+			for (const actionId of actionIds) {
+				const held = this.latePendRefusals.get(actionId) ?? { refusals: {}, expiresAt: record.message.expiration ?? Number.POSITIVE_INFINITY };
+				held.refusals[peerId] = refusal;
+				this.latePendRefusals.set(actionId, held);
+				log('cluster-tx:late-pend-refusal', { messageHash: record.messageHash, actionId, peerId, reason: refusal.reason });
+			}
+		}
+	}
+
+	/**
+	 * Return and forget the pend refusals other members reported for `actionId` after its pend was
+	 * answered ({@link retainLatePendRefusals}), keyed by peer; empty when there are none, or when the
+	 * pend record they belong to has expired. `CoordinatorRepo.commit` reads this once per commit, and a
+	 * commit that is not acknowledged answers with the refusal, the retryable conflict the pend would
+	 * have returned had the member applied it in time.
+	 */
+	takeLatePendRefusals(actionId: ActionId): { [peerId: string]: WriteFailure } {
+		const held = this.latePendRefusals.get(actionId);
+		if (held === undefined) return {};
+		this.latePendRefusals.delete(actionId);
+		return held.expiresAt < this.now() ? {} : held.refusals;
 	}
 
 	/**
@@ -628,11 +710,13 @@ export class ClusterCoordinator {
 		 * stay on that member while the writer was told the pend won. Unsigned advisory data — an
 		 * entry means "retry", never "this write was invalid". Absent when nobody reported one.
 		 *
-		 * Residual: a member that reaches consensus only via a later delivery — the scheduled
-		 * commit-retry timer, or carried on a later request ({@link takeOwedRecords}) — applies after
-		 * this method has already resolved, so its refusal arrives too late to appear here. The
-		 * member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is the backstop for
-		 * that path.
+		 * A member that reaches consensus only via a later delivery — the scheduled commit-retry timer,
+		 * or carried on a later request ({@link takeOwedRecords}), which for an action's own commit is
+		 * always its first request to that member — applies after this method has already resolved,
+		 * so its refusal arrives too late to appear here. It is retained instead, and the action's
+		 * commit answers with it when that commit is not acknowledged ({@link takeLatePendRefusals});
+		 * the member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is what keeps such a
+		 * commit from reaching consensus while the refusal still stands.
 		 */
 		cohortPendRefusals?: { [peerId: string]: WriteFailure };
 		/**
@@ -671,6 +755,10 @@ export class ClusterCoordinator {
 		const coordinated: RepoMessage = message.coordinatingBlockIds?.length
 			? message
 			: { ...message, coordinatingBlockIds: [blockId] };
+
+		// A writer's retry reuses its action id, so a refusal of an earlier attempt's pend must not be
+		// read back by this attempt's commit.
+		for (const actionId of pendActionIdsOf(coordinated)) this.latePendRefusals.delete(actionId);
 
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
@@ -740,9 +828,9 @@ export class ClusterCoordinator {
 			const cohortCommitOutcomes: { [peerId: string]: CommitResult } = {};
 			for (const [peerId, outcome] of Object.entries(result.applyOutcomes ?? {})) {
 				if (peerId === selfId) continue;
-				const pend = outcome?.pend;
-				if (pend !== undefined && !pend.success && isConflictFailure(pend)) {
-					cohortPendRefusals[peerId] = pend;
+				const pendRefusal = conflictPendRefusalOf(outcome);
+				if (pendRefusal !== undefined) {
+					cohortPendRefusals[peerId] = pendRefusal;
 				}
 				const commit = outcome?.commit;
 				if (commit !== null && typeof commit === 'object' && (commit.success === true || commit.success === false)) {
@@ -1600,6 +1688,7 @@ export class ClusterCoordinator {
 			const { failures, applyOutcomes } = await this.broadcastMergedRecord(record,
 				membersAwaitingConsensus(deliveries.filter(d => d.success && d.peerId !== selfId)));
 			mergeApplyOutcomes(record, applyOutcomes);
+			this.retainLatePendRefusals(record, applyOutcomes);
 			if (selfId !== undefined) pendingPeers.delete(selfId);
 			for (const peerId of failures) pendingPeers.add(peerId);
 		}

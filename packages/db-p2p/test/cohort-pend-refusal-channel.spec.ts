@@ -36,7 +36,7 @@ import type {
 	ClusterRecord, ClusterPeers, ClusterConsensusConfig, IKeyNetwork, ICluster, IBlock, BlockHeader,
 	BlockId, PendRequest, PendResult, RepoMessage, Signature, StaleFailure, Transforms
 } from '@optimystic/db-core';
-import { isConflictFailure } from '@optimystic/db-core';
+import { blockIdsForTransforms, isConflictFailure } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
@@ -46,6 +46,8 @@ import { base58btc } from 'multiformats/bases/base58';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
 const BLOCK = 'block-race' as BlockId;
+/** A block no member holds a committed revision of. */
+const NEW_BLOCK = 'block-new' as BlockId;
 const SEED_ACTION = 'a-seed';
 const LOSER_ACTION = 'a-loser';
 const WINNER_ACTION = 'a-winner';
@@ -301,11 +303,11 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 	 * already holds the block), leaving the member in the state the guard reads: a retained,
 	 * conflict-shaped refusal for that action.
 	 */
-	const driveLoserPendConsensus = async (nonce = 0): Promise<PendResult | undefined> => {
+	const driveLoserPendConsensus = async (nonce = 0, pend = pendFor(LOSER_ACTION)): Promise<PendResult | undefined> => {
 		const peers = makeClusterPeers([self, other]);
 		const message: RepoMessage = {
-			operations: [{ pend: pendFor(LOSER_ACTION) }],
-			coordinatingBlockIds: [BLOCK],
+			operations: [{ pend }],
+			coordinatingBlockIds: blockIdsForTransforms(pend.transforms),
 			// The nonce only exists to give a second round its own messageHash — a redelivery of the
 			// same hash short-circuits on the executed marker and never re-applies.
 			expiration: Date.now() + 30000 + nonce
@@ -338,10 +340,10 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 	};
 
 	/** A promise-round delivery of the loser's COMMIT: no votes yet, so the member must cast one. */
-	const commitPromiseRecord = async (): Promise<ClusterRecord> => {
+	const commitPromiseRecord = async (blockId = BLOCK, rev = CONTESTED_REV): Promise<ClusterRecord> => {
 		const message: RepoMessage = {
-			operations: [{ commit: { actionId: LOSER_ACTION, blockIds: [BLOCK], tailId: BLOCK, rev: CONTESTED_REV } }],
-			coordinatingBlockIds: [BLOCK],
+			operations: [{ commit: { actionId: LOSER_ACTION, blockIds: [blockId], tailId: blockId, rev } }],
+			coordinatingBlockIds: [blockId],
 			expiration: Date.now() + 30000
 		};
 		return { messageHash: await computeMessageHash(message), message, peers: makeClusterPeers([self, other]), promises: {}, commits: {} };
@@ -374,6 +376,22 @@ describe('a member that refused a pend will not sign that action\'s commit', () 
 		const vote = answer.promises[self.peerId.toString()];
 		expect(vote?.type, 'the member must refuse to endorse a commit it already refused the pend for').to.equal('reject');
 		expect((vote as { rejectReason?: string }).rejectReason).to.include('refused pend');
+	});
+
+	it('votes reject when the rival holds a block with no committed revision', async () => {
+		// A new block — a new collection's header is the usual one — has no committed revision, and a
+		// read of such a block lists no pending records. The guard reads the claims storage keeps, so the
+		// rival is seen here as it is on a committed block.
+		const insertOf = (actionId: string): PendRequest => ({
+			actionId, rev: 1, transforms: { inserts: { [NEW_BLOCK]: makeBlock(NEW_BLOCK) }, updates: {}, deletes: [] }, policy: 'r'
+		});
+		expect((await storage.pend(insertOf(WINNER_ACTION))).success, 'the rival takes the new block').to.equal(true);
+		const outcome = await driveLoserPendConsensus(0, insertOf(LOSER_ACTION));
+		expect(outcome?.success, 'the member\'s storage refused the loser\'s pend').to.equal(false);
+
+		const answer = await member.update(await commitPromiseRecord(NEW_BLOCK, 1));
+
+		expect(answer.promises[self.peerId.toString()]?.type).to.equal('reject');
 	});
 
 	it('abstains once the refusal is no longer corroborated (cancelled rival)', async () => {

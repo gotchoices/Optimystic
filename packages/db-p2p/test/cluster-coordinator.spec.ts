@@ -584,6 +584,31 @@ describe('ClusterCoordinator carries owed consensus deliveries', function () {
 		expect(stamping.plainUpdates.length, 'the retry has nothing left for the member that took the carried record').to.equal(stampingSent);
 	});
 
+	it('a commit carries its own action\'s owed pend even while another request is carrying it', async () => {
+		const { clock, coordinator, message, stamping, second } = await setup(idStr => new CarryingClusterClient(idStr, true));
+		const operationMessage = (operation: RepoMessage['operations'][number]): RepoMessage => ({ operations: [operation], expiration: clock.now + 30000 });
+
+		stamping.failCommit = true;
+		second.failCommit = true;
+		const pend = await coordinator.executeClusterTransaction('block-1' as BlockId,
+			operationMessage({ pend: { actionId: 'action-1', transforms: { inserts: {}, updates: {}, deletes: [] }, policy: 'r' } }));
+		const owed = pend.record.messageHash;
+		stamping.failCommit = false;
+		second.failCommit = false;
+
+		// An unrelated transaction's request carries the owed pend to the member, and its answer is held.
+		let releaseCarried!: () => void;
+		stamping.holdCarried = new Promise<void>(resolve => { releaseCarried = resolve; });
+		const unrelated = coordinator.executeClusterTransaction('block-2' as BlockId, message('block-2'));
+		const commit = coordinator.executeClusterTransaction('block-1' as BlockId,
+			operationMessage({ commit: { actionId: 'action-1', blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 } }));
+		for (let turn = 0; turn < 50 && stamping.carriedCalls.length < 2; turn++) await flush();
+		releaseCarried();
+		await Promise.all([unrelated, commit]);
+
+		expect(stamping.carriedCalls, 'the pend rides on the unrelated request and again on its own commit').to.deep.equal([[owed], [owed]]);
+	});
+
 	it('a carried delivery that empties a retry mid-run leaves the run to finish it, so the run\'s own broadcast failures are retried', async () => {
 		const { clock, coordinator, message, stamping: carrier, second: missed } = await setup(idStr => new UnappliedThenHeld(idStr));
 

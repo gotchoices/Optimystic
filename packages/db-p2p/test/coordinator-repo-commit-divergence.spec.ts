@@ -144,6 +144,7 @@ const makeRepo = (
 		async getClusterSize(): Promise<number> { return peerIds.length; },
 		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: peerIds }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
+		takeLatePendRefusals: () => ({}),
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes?: { [peerId: string]: CommitResult } }> {
 			return { record, localExecuted: false, ...(reports === undefined ? {} : { cohortCommitOutcomes: reports }) };
 		}

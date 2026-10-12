@@ -2371,7 +2371,7 @@ export class ClusterMember implements ICluster {
 			if (!this.refusedPendActions.has(commit.actionId)) {
 				continue;
 			}
-			const corroboration = await this.refusedPendConflictsWithLocalState(commit);
+			const corroboration = await this.refusedPendConflictsWithLocalState(record, commit);
 			if (corroboration === undefined) {
 				continue;
 			}
@@ -2392,28 +2392,34 @@ export class ClusterMember implements ICluster {
 	 * Condition (b) of {@link validateCommitAgainstRefusedPend}: does local storage still back up a
 	 * retained pend refusal for this commit? Returns a short prose fragment naming what corroborates
 	 * it, or `undefined` for "no longer corroborated — abstain" (which a read fault also yields).
+	 *
+	 * Reads storage metadata, as the pend vote does ({@link heldLatestOf}, {@link rivalClaimsOn}), not
+	 * `get`: `get` lists pending records only beside a block it materialized, so a rival holding a block
+	 * with no committed revision — a brand-new block, such as a new collection's header — went unseen,
+	 * and this member co-signed the commit of the pend it had refused for that rival. Two writers racing
+	 * for one new block, each refused by the member that held the other's pend, could then both commit
+	 * it at one revision: a fork.
 	 */
-	private async refusedPendConflictsWithLocalState(commit: CommitRequest): Promise<string | undefined> {
-		let blockResults: Awaited<ReturnType<IRepo['get']>>;
+	private async refusedPendConflictsWithLocalState(record: ClusterRecord, commit: CommitRequest): Promise<string | undefined> {
+		const viaGet = this.onceGet(commit.blockIds);
 		try {
-			blockResults = await this.storageRepo.get({ blockIds: commit.blockIds });
+			const held = await this.heldLatestOf(commit.blockIds, viaGet);
+			for (const blockId of commit.blockIds) {
+				const rivals = await this.rivalClaimsOn(record, blockId, commit.actionId, viaGet);
+				if (rivals.length > 0) {
+					return `block ${blockId} is still held by unresolved action(s) ${rivals.map(claim => claim.actionId).join(', ')}`;
+				}
+				const latest = held[blockId];
+				if (latest?.rev === commit.rev && !isOwnRevision(latest, commit.rev, commit.actionId)) {
+					return `block ${blockId} rev ${commit.rev} is already committed by a different action`;
+				}
+			}
 		} catch (err) {
 			log('cluster-member:refused-pend-read-error', {
 				actionId: commit.actionId,
 				error: err instanceof Error ? err.message : String(err)
 			});
-			return undefined; // a local read fault is an abstain, never an escape out of the vote path
-		}
-		for (const blockId of commit.blockIds) {
-			const state = blockResults[blockId]?.state;
-			const rivals = (state?.pendings ?? []).filter(actionId => actionId !== commit.actionId);
-			if (rivals.length > 0) {
-				return `block ${blockId} is still held by unresolved action(s) ${rivals.join(', ')}`;
-			}
-			const latest = state?.latest;
-			if (latest?.rev === commit.rev && !isOwnRevision(latest, commit.rev, commit.actionId)) {
-				return `block ${blockId} rev ${commit.rev} is already committed by a different action`;
-			}
+			// a local read fault is an abstain, never an escape out of the vote path
 		}
 		return undefined;
 	}

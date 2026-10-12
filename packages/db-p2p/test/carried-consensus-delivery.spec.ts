@@ -11,6 +11,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId } from '@libp2p/interface';
 import type { BlockHeader, BlockId, ClusterRecord, IBlock, ICluster, IPeerNetwork, RepoMessage, Transforms } from '@optimystic/db-core';
+import { isConflictFailure } from '@optimystic/db-core';
 import { createMesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { ClusterClient } from '../src/cluster/client.js';
 import { ClusterService } from '../src/cluster/service.js';
@@ -27,6 +28,9 @@ const latestOn = async (node: MeshNode, block: BlockId) =>
 
 const isCommitOf = (record: ClusterRecord, actionId: string): boolean =>
 	record.message.operations.some(op => 'commit' in op && op.commit.actionId === actionId);
+
+const isPendOf = (record: ClusterRecord, actionId: string): boolean =>
+	record.message.operations.some(op => 'pend' in op && op.pend.actionId === actionId);
 
 /** The coordinating node's scheduled commit retry for `messageHash` — internal state; no public seam reports it. */
 const retryFor = (node: MeshNode, messageHash: string): { pendingPeers: Set<string> } | undefined =>
@@ -122,5 +126,34 @@ describe('a cluster request carries the consensus deliveries its target is still
 		expect(applied.slice(0, 2), 'the member applies the carried commit ahead of the request\'s own record').to.deep.equal([owed, firstRequest.messageHash]);
 		expect(await latestOn(missing, first.block), 'the member holds write 1').to.deep.equal({ actionId: first.action, rev: 1 });
 		expect(retryFor(coordinator, owed!), 'write 1\'s retry is cleared').to.equal(undefined);
+	});
+
+	it('a member that refuses a pend carried on its commit makes the commit answer the retryable conflict', async () => {
+		const mesh = await createMesh(3, { responsibilityK: 3, clusterSize: 3, coordinatorConfig: { commitBroadcastRetryInitialMs: 60_000 } });
+		const [coordinator, missing] = mesh.nodes as [MeshNode, MeshNode, MeshNode];
+		const missingId = missing.peerId.toString();
+		const block = 'carried-refused' as BlockId;
+		const action = 'carried-refused-action';
+
+		// The member votes on the pend but misses its decision; the other two members apply it.
+		mesh.failures.onClusterDelivery = (target, record) => {
+			if (target === missingId && isPendOf(record, action) && Object.keys(record.commits).length > 0) {
+				throw new Error('the member misses the pend\'s decision');
+			}
+		};
+		expect((await coordinator.coordinatorRepo.pend({ actionId: action, transforms: transformsFor(block), policy: 'r', rev: 1 })).success, 'pend').to.equal(true);
+		mesh.failures.onClusterDelivery = undefined;
+		// A rival takes the block on that member before the decision reaches it.
+		expect((await missing.storageRepo.pend({ actionId: 'carried-rival', transforms: transformsFor(block), policy: 'c', rev: 1 })).success, 'rival').to.equal(true);
+
+		// The commit's first request carries the pend; the member's storage refuses it, and the member then
+		// refuses to co-sign the commit.
+		const committed = await coordinator.coordinatorRepo.commit({ actionId: action, tailId: block, rev: 1, blockIds: [block] });
+
+		expect(committed.success, 'commit').to.equal(false);
+		expect(!committed.success && isConflictFailure(committed), 'the member\'s pend refusal, as a retryable conflict').to.equal(true);
+		for (const node of mesh.nodes) {
+			expect(await latestOn(node, block), 'no member holds the revision').to.equal(undefined);
+		}
 	});
 });
