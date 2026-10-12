@@ -87,6 +87,7 @@ const makeRepo = (
 		async getClusterSize(): Promise<number> { return 3; },
 		async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 		async recoverTransactions(): Promise<void> { /* unused on these paths */ },
+		takeLatePendRefusals: () => ({}),
 		async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, localPendResult?: PendResult, cohortPendRefusals?: { [peerId: string]: StaleFailure } }> {
 			if ('throws' in consensus) throw consensus.throws;
 			return { record: RECORD, localExecuted: true, ...consensus };
@@ -244,6 +245,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 			async getClusterSize(): Promise<number> { return 3; },
 			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
+			takeLatePendRefusals: () => ({}),
 			async executeClusterTransaction() {
 				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };
 			}
@@ -273,6 +275,7 @@ describe('CoordinatorRepo pend — retained storage verdict after cluster consen
 			async getClusterSize(): Promise<number> { return 3; },
 			async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: ['peer-1', 'peer-2', 'peer-3'] }; },
 			async recoverTransactions(): Promise<void> { },
+			takeLatePendRefusals: () => ({}),
 			async executeClusterTransaction() {
 				return { record: RECORD, localExecuted: false, cohortPendRefusals: { 'peer-2': remote } };
 			}

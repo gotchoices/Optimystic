@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, TransactionExpiredError, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -11,6 +11,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { ResponsibilityRefusalError } from "./responsibility.js";
 import { unrefTimer } from "../unref-timer.js";
+import { LatePendRefusals, conflictPendRefusalOf } from "./late-pend-refusals.js";
 
 const log = createLogger('cluster')
 
@@ -43,6 +44,17 @@ function collectApplyOutcomes(
 function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['applyOutcomes']): void {
 	if (collected === undefined) return;
 	record.applyOutcomes = { ...record.applyOutcomes, ...collected };
+}
+
+/** The action ids of a message's pend operations. */
+function pendActionIdsOf(message: RepoMessage): ActionId[] {
+	return message.operations.flatMap(op => 'pend' in op ? [op.pend.actionId] : []);
+}
+
+/** The action ids a message commits or cancels — the operations that settle a pend. */
+function settledActionIdsOf(message: RepoMessage): ActionId[] {
+	return message.operations.flatMap(op =>
+		'commit' in op ? [op.commit.actionId] : 'cancel' in op ? [op.cancel.actionRef.actionId] : []);
 }
 
 /** Fold the commit signatures of every answered response into a record in place. */
@@ -205,6 +217,11 @@ interface CommitRetryState {
 	attempt: number;
 	intervalMs: number;
 	cancel?: TimerCancel;
+	/**
+	 * Set while {@link ClusterCoordinator.retryCommits} runs this retry. A carried delivery that empties
+	 * `pendingPeers` meanwhile leaves the finish to the run, whose broadcast may yet add a member back.
+	 */
+	running?: boolean;
 }
 
 /**
@@ -222,6 +239,15 @@ interface ClusterTransactionState {
 	promiseTimeout?: NodeJS.Timeout;
 	resolutionTimeout?: NodeJS.Timeout;
 	retry?: CommitRetryState;
+	/**
+	 * Remote members this record is riding to right now, carried on a request for another record
+	 * ({@link ClusterCoordinator.takeOwedRecords}). Such a member stays in `retry.pendingPeers` until the
+	 * answer says it took the record; meanwhile no other request carries it there and the retry timer
+	 * does not send it there. Kept here rather than on `retry`, which every re-arm replaces.
+	 */
+	carrying: Set<string>;
+	/** When a retry was first armed for this record with a commit majority on it: the order owed records are carried in. */
+	owedSince?: number;
 }
 
 /** Manages distributed transactions across clusters */
@@ -237,6 +263,19 @@ export type CohortResolution =
 
 export class ClusterCoordinator {
 	private transactions: Map<string, ClusterTransactionState> = new Map();
+	/**
+	 * Members whose last answer stamped `acceptsCarried` ({@link noteCarryCapability}): the only ones
+	 * {@link takeOwedRecords} carries records to. Bounded, as it is keyed by peers off the wire.
+	 *
+	 * NOTE: this file is past 1700 lines; if owed-delivery bookkeeping (this map, `takeOwedRecords`,
+	 * `returnCarried`, `settleCarriedDelivery`) grows further, move it into its own module.
+	 */
+	private readonly carryCapablePeers = new LruMap<string, true>(1024);
+	/**
+	 * Pend refusals reported on a carried or retried delivery, after the pend's writer was answered,
+	 * until the action's commit of those blocks takes them ({@link takeLatePendRefusals}).
+	 */
+	private readonly latePendRefusals = new LatePendRefusals();
 	private readonly retryInitialIntervalMs: number;
 	private readonly retryBackoffFactor: number;
 	private readonly retryMaxIntervalMs: number;
@@ -298,7 +337,7 @@ export class ClusterCoordinator {
 		let lastError: unknown;
 		for (let attempt = 1; attempt <= maxAttempts; attempt++) {
 			try {
-				return await this.createClusterClient(peerIdFromString(peerIdStr)).update(record);
+				return await this.requestMember(peerIdStr, record);
 			} catch (err) {
 				lastError = err;
 				if (attempt < maxAttempts) {
@@ -313,6 +352,175 @@ export class ClusterCoordinator {
 			}
 		}
 		throw lastError;
+	}
+
+	/**
+	 * One request to a remote member. Decided records the member is still owed ride ahead of `record`
+	 * ({@link takeOwedRecords}) when its client can carry them, and come back through
+	 * {@link returnCarried} whether the request succeeded or not.
+	 */
+	private async requestMember(peerIdStr: string, record: ClusterRecord): Promise<ClusterRecord> {
+		const client = this.createClusterClient(peerIdFromString(peerIdStr));
+		const carried = client.updateCarrying ? this.takeOwedRecords(peerIdStr, record) : [];
+		if (carried.length === 0) {
+			return this.noteCarryCapability(peerIdStr, await client.update(record));
+		}
+		log('cluster-tx:carry', { messageHash: record.messageHash, peerId: peerIdStr, carried: carried.map(r => r.messageHash) });
+		let result: { answer: ClusterRecord; carried: CarriedOutcome[] };
+		try {
+			result = await client.updateCarrying!(record, carried);
+		} catch (err) {
+			this.returnCarried(peerIdStr, carried, []);
+			throw err;
+		}
+		this.returnCarried(peerIdStr, carried, result.carried);
+		return this.noteCarryCapability(peerIdStr, result.answer);
+	}
+
+	/**
+	 * Take the decided records `peerId` is still owed, oldest first and at most {@link MaxCarriedRecords},
+	 * to carry on a request for `forRecord` — never that record itself. A record is owed to a member
+	 * when its armed retry still lists the member and the record already carries a commit majority: a
+	 * record short of one would ask the member for a vote, which the compact carried answer has no room
+	 * for. Only a member whose last answer stamped `acceptsCarried` is carried to, and only once this
+	 * node's own member has applied the record, keeping the delivery order {@link broadcastMergedRecord}
+	 * depends on.
+	 *
+	 * **A request that commits or cancels an action always carries that action's owed pends, first** —
+	 * even while another request is carrying them, and ahead of everything else owed. The member then has
+	 * applied the pend before it votes on the commit or applies the cancel, from this one request. A
+	 * commit voted by a member that has not applied its pend can neither be checked against the pended
+	 * content (`ClusterMember.validateCommitOperations` abstains) nor refused for a pend the member would
+	 * have refused (`validateCommitAgainstRefusedPend`); a cancel that overtakes its pend leaves a pending
+	 * record nothing will remove. A copy the member already took is answered from its dedup
+	 * (`ClusterMember.update` waits for an update of the same record still in progress, so the vote comes
+	 * after the apply either way).
+	 *
+	 * Synchronous on purpose: each record taken is marked in flight before any await, so two concurrent
+	 * requests to one member never both carry it — the escorted pends above excepted.
+	 *
+	 * NOTE: scans every held transaction on each remote request; a node holds only the transactions in
+	 * consensus and those still retrying, so this stays small. If a node ever holds many, index owed
+	 * records by member instead.
+	 * NOTE: a record whose retry run is sending it to `peerId` right now is not marked in flight, so a
+	 * request made meanwhile carries it too; the member dedups the second copy. If that ever shows up as
+	 * wasted traffic, mark the run's own deliveries in `carrying` as well.
+	 * NOTE: an escorted pend that was already riding on another request is marked once, so whichever of
+	 * the two answers first clears the mark and the retry timer may send the record again while the other
+	 * still rides; the member dedups it. If that ever shows up as wasted traffic, count rides per member.
+	 */
+	private takeOwedRecords(peerId: string, forRecord: ClusterRecord): ClusterRecord[] {
+		if (!this.carryCapablePeers.has(peerId)) return [];
+		const selfId = this.localCluster?.peerId.toString();
+		const settling = new Set(settledActionIdsOf(forRecord.message));
+		const owed = Array.from(this.transactions.values())
+			.filter(state => {
+				const pending = state.retry?.pendingPeers;
+				return pending !== undefined
+					&& state.messageHash !== forRecord.messageHash
+					&& pending.has(peerId)
+					&& (selfId === undefined || !pending.has(selfId))
+					&& this.hasCommitMajority(state.record);
+			})
+			.sort((a, b) => (a.owedSince ?? 0) - (b.owedSince ?? 0));
+		const escorted = owed
+			.filter(state => pendActionIdsOf(state.record.message).some(actionId => settling.has(actionId)))
+			.slice(0, MaxCarriedRecords);
+		const others = owed
+			.filter(state => !escorted.includes(state) && !state.carrying.has(peerId))
+			.slice(0, MaxCarriedRecords - escorted.length);
+		const taken = [...escorted, ...others];
+		for (const state of taken) state.carrying.add(peerId);
+		return taken.map(state => ({ ...state.record }));
+	}
+
+	/**
+	 * Settle each record {@link takeOwedRecords} took for `peerId`, by what the member answered for it
+	 * (`outcomes`; empty when the carrying request failed). A delivered record is booked exactly as a
+	 * delivery by the retry timer is ({@link settleCarriedDelivery}); any other clears the in-flight mark
+	 * and stays owed, for the timer or the next request. Delivery is idempotent on the member
+	 * (`handleConsensus` dedups by `messageHash`), so a record that member applied but whose answer was
+	 * lost costs only a re-send.
+	 */
+	private returnCarried(peerId: string, carried: readonly ClusterRecord[], outcomes: readonly CarriedOutcome[]): void {
+		for (const record of carried) {
+			const outcome = outcomes.find(o => o.messageHash === record.messageHash);
+			const state = this.transactions.get(record.messageHash);
+			state?.carrying.delete(peerId);
+			log('cluster-tx:carried-outcome', {
+				messageHash: record.messageHash,
+				peerId,
+				delivered: outcome?.delivered ?? false,
+				...(outcome?.error === undefined ? {} : { error: outcome.error })
+			});
+			// No retry left means the transaction was released while this rode — its budget ran out — and
+			// there is nothing left to book the answer against.
+			if (outcome?.delivered === true && state?.retry !== undefined) {
+				this.settleCarriedDelivery(state, state.retry, peerId, outcome.outcome);
+			}
+		}
+	}
+
+	/**
+	 * Book a carried record `peerId` took: its report joins the record and it leaves the retry, which
+	 * finishes once nobody is left. When this node's member applied the record and `peerId` now reports
+	 * holding the revision, this node's member gets the second reconcile {@link broadcastMergedRecord}
+	 * would have given it — not awaited, since it belongs to another transaction than the request that
+	 * carried the record.
+	 *
+	 * A delivered answer books the member done even when it reports a refused commit. The timer's run
+	 * re-sends to such a member because there it may have applied before this node's member did, with
+	 * no holder to reconcile from; a record is carried only after this node's member applied, so the
+	 * member's own reconcile already had that holder. The finish is left to a retry run in progress
+	 * ({@link CommitRetryState.running}), whose broadcast can still put a member back.
+	 */
+	private settleCarriedDelivery(state: ClusterTransactionState, retry: CommitRetryState, peerId: string, outcome: MemberApplyOutcome | undefined): void {
+		this.noteDelivered(state.record, retry.pendingPeers, [peerId], outcome === undefined ? undefined : { [peerId]: outcome });
+		if (outcome?.commit?.success === true && this.localMemberHasApplied(state.record, undefined)) {
+			void this.reconcileLocalMemberAgain(state.record);
+		}
+		if (retry.pendingPeers.size === 0 && retry.running !== true) {
+			this.finishRetry(state.messageHash);
+		}
+	}
+
+	/**
+	 * Remote members that took a retried record — by the retry timer or carried on another request:
+	 * their own reports join the record, and they leave the retry's pending set.
+	 */
+	private noteDelivered(record: ClusterRecord, pendingPeers: Set<string>, delivered: readonly string[], outcomes: ClusterRecord['applyOutcomes']): void {
+		mergeApplyOutcomes(record, outcomes);
+		this.latePendRefusals.retain(record, outcomes, this.localCluster?.peerId.toString());
+		for (const peerId of delivered) pendingPeers.delete(peerId);
+	}
+
+	/**
+	 * Return and forget the pend refusals other members reported for `actionId`'s pend of any of
+	 * `blockIds` after that pend was answered, keyed by peer (see {@link LatePendRefusals}).
+	 * `CoordinatorRepo.commit` reads this once per commit, and a commit that throws answers with the
+	 * refusal, the retryable conflict the pend would have returned had the member applied it in time.
+	 */
+	takeLatePendRefusals(actionId: ActionId, blockIds: readonly BlockId[]): { [peerId: string]: WriteFailure } {
+		return this.latePendRefusals.take(actionId, blockIds, this.now());
+	}
+
+	/**
+	 * Remember whether `peerId` understands carried records, from its own entry in the answer it gave —
+	 * keyed by the peer asked, as {@link collectApplyOutcomes} takes it. An answer without the stamp
+	 * forgets the peer, so a member moved back to an older build stops being sent carried records.
+	 *
+	 * NOTE: an older member echoes the `applyOutcomes` of the record it was sent, so on a record that
+	 * already carries its old entry (a broadcast or a retry) a downgraded member still reads as capable;
+	 * the next promise round, whose record carries no entries, forgets it. Until then what it is carried
+	 * comes back not delivered and stays owed — wasted bytes, nothing worse.
+	 */
+	private noteCarryCapability(peerId: string, answer: ClusterRecord): ClusterRecord {
+		if (answer?.applyOutcomes?.[peerId]?.acceptsCarried === true) {
+			this.carryCapablePeers.set(peerId, true);
+		} else {
+			this.carryCapablePeers.delete(peerId);
+		}
+		return answer;
 	}
 
 	/**
@@ -467,10 +675,13 @@ export class ClusterCoordinator {
 		 * stay on that member while the writer was told the pend won. Unsigned advisory data — an
 		 * entry means "retry", never "this write was invalid". Absent when nobody reported one.
 		 *
-		 * Residual: a member that reaches consensus only via the scheduled commit-retry timer applies
-		 * after this method has already resolved, so its refusal arrives too late to appear here. The
-		 * member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is the backstop for
-		 * that path.
+		 * A member that reaches consensus only via a later delivery — the scheduled commit-retry timer,
+		 * or carried on a later request ({@link takeOwedRecords}), which for an action's own commit is
+		 * always its first request to that member — applies after this method has already resolved,
+		 * so its refusal arrives too late to appear here. It is retained instead, and the action's
+		 * commit answers with it when that commit is not acknowledged ({@link takeLatePendRefusals});
+		 * the member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is what keeps such a
+		 * commit from reaching consensus while the refusal still stands.
 		 */
 		cohortPendRefusals?: { [peerId: string]: WriteFailure };
 		/**
@@ -484,8 +695,9 @@ export class ClusterCoordinator {
 		 * member's signed approve vote already admitted to the majority; a false refusal is retry
 		 * pressure. Absent when nobody reported one (a pend message, or pre-upgrade members).
 		 *
-		 * Same residual as `cohortPendRefusals`: a member reached only by the scheduled commit-retry
-		 * timer applies after this method has resolved, and its report arrives too late to count —
+		 * Same residual as `cohortPendRefusals`: a member reached only by a later delivery (the
+		 * commit-retry timer, or a carried one) applies after this method has resolved, and its report
+		 * arrives too late to count —
 		 * the gate then refuses honestly and the writer re-drives.
 		 */
 		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
@@ -508,6 +720,8 @@ export class ClusterCoordinator {
 		const coordinated: RepoMessage = message.coordinatingBlockIds?.length
 			? message
 			: { ...message, coordinatingBlockIds: [blockId] };
+
+		this.latePendRefusals.forgetFor(coordinated, this.now());
 
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
@@ -545,7 +759,8 @@ export class ClusterCoordinator {
 			messageHash,
 			record,
 			pending,
-			lastUpdate: this.now()
+			lastUpdate: this.now(),
+			carrying: new Set()
 		};
 		this.transactions.set(messageHash, state);
 		this.persistCoordinatorState(messageHash, record, 'promising');
@@ -576,9 +791,9 @@ export class ClusterCoordinator {
 			const cohortCommitOutcomes: { [peerId: string]: CommitResult } = {};
 			for (const [peerId, outcome] of Object.entries(result.applyOutcomes ?? {})) {
 				if (peerId === selfId) continue;
-				const pend = outcome?.pend;
-				if (pend !== undefined && !pend.success && isConflictFailure(pend)) {
-					cohortPendRefusals[peerId] = pend;
+				const pendRefusal = conflictPendRefusalOf(outcome);
+				if (pendRefusal !== undefined) {
+					cohortPendRefusals[peerId] = pendRefusal;
 				}
 				const commit = outcome?.commit;
 				if (commit !== null && typeof commit === 'object' && (commit.success === true || commit.success === false)) {
@@ -1362,6 +1577,9 @@ export class ClusterCoordinator {
 			return;
 		}
 		const pendingPeers = new Set(missingPeers);
+		if (state.owedSince === undefined && this.hasCommitMajority(state.record)) {
+			state.owedSince = this.now();
+		}
 		const baseInterval = existing ? Math.min(existing.intervalMs * this.retryBackoffFactor, this.retryMaxIntervalMs) : this.retryInitialIntervalMs;
 		existing?.cancel?.();
 		const cancel = this.setTimer(() => {
@@ -1383,15 +1601,26 @@ export class ClusterCoordinator {
 
 	private async retryCommits(messageHash: string): Promise<void> {
 		const state = this.transactions.get(messageHash);
-		if (!state?.retry) {
+		const retry = state?.retry;
+		if (state === undefined || retry === undefined) {
 			return;
 		}
-		const { pendingPeers, attempt } = state.retry;
-		if (pendingPeers.size === 0) {
+		if (retry.pendingPeers.size === 0) {
 			this.clearRetry(messageHash);
 			return;
 		}
-		const record = state.record;
+		retry.running = true;
+		try {
+			await this.runRetry(state, retry);
+		} finally {
+			retry.running = false;
+		}
+	}
+
+	/** One scheduled attempt of `retry`: deliver to its pending members, then finish or re-arm it. */
+	private async runRetry(state: ClusterTransactionState, retry: CommitRetryState): Promise<void> {
+		const { messageHash, record } = state;
+		const { pendingPeers, attempt } = retry;
 		const selfId = this.localCluster?.peerId.toString();
 		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
 		// Each pending member gets the record as it stands: it adds its commit, and applies once the
@@ -1400,14 +1629,18 @@ export class ClusterCoordinator {
 		// majority; before that (the commit round failed on it too) it is asked for its commit like the rest.
 		const payload: ClusterRecord = { ...record };
 		const selfToBroadcast = this.hasCommitMajority(record);
+		// A member the record is riding to on another request right now is left to that request's
+		// answer, and stays pending until it arrives, so the retry is re-armed rather than finished on
+		// its account.
+		// NOTE: a timer that fires while every pending member's delivery is riding elsewhere sends
+		// nothing and still spends an attempt. Harmless while a request outlives a retry interval only
+		// rarely; if carried requests on slow links routinely do, re-arm without counting the attempt.
 		const deliveries = await Promise.all(Array.from(pendingPeers)
 			.filter(peerId => !selfToBroadcast || peerId !== selfId)
+			.filter(peerId => !state.carrying.has(peerId))
 			.map(peerId => this.deliver(payload, peerId, 0, 'commit-retry')));
 		mergeCommits(record, deliveries);
-		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
-		for (const { peerId, success } of deliveries) {
-			if (success) pendingPeers.delete(peerId);
-		}
+		this.noteDelivered(record, pendingPeers, deliveries.filter(d => d.success).map(d => d.peerId), collectApplyOutcomes(deliveries));
 		if (this.hasCommitMajority(record)) {
 			// The retry may itself have assembled the majority (a two-member cohort whose remote member
 			// missed the commit round), and then this node's member has not applied; a remote member that
@@ -1418,6 +1651,7 @@ export class ClusterCoordinator {
 			const { failures, applyOutcomes } = await this.broadcastMergedRecord(record,
 				membersAwaitingConsensus(deliveries.filter(d => d.success && d.peerId !== selfId)));
 			mergeApplyOutcomes(record, applyOutcomes);
+			this.latePendRefusals.retain(record, applyOutcomes, selfId);
 			if (selfId !== undefined) pendingPeers.delete(selfId);
 			for (const peerId of failures) pendingPeers.add(peerId);
 		}
@@ -1429,14 +1663,19 @@ export class ClusterCoordinator {
 			stillPending: Array.from(pendingPeers)
 		});
 		if (pendingPeers.size === 0) {
-			log('cluster-tx:retry-finished', { messageHash });
-			this.clearRetry(messageHash);
+			this.finishRetry(messageHash);
 			return;
 		}
 		if (!this.transactions.has(messageHash)) {
 			return;
 		}
 		this.scheduleCommitRetry(messageHash, state.record, Array.from(pendingPeers));
+	}
+
+	/** A retry's last pending member took the record — on the retry timer's delivery, or carried on another request. */
+	private finishRetry(messageHash: string): void {
+		log('cluster-tx:retry-finished', { messageHash });
+		this.clearRetry(messageHash);
 	}
 
 	/**
@@ -1531,7 +1770,8 @@ export class ClusterCoordinator {
 					messageHash,
 					record: state.record,
 					pending,
-					lastUpdate: state.lastUpdate
+					lastUpdate: state.lastUpdate,
+					carrying: new Set()
 				};
 				this.transactions.set(messageHash, txState);
 				// Schedule retry from where we left off

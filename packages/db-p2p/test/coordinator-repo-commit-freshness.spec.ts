@@ -266,6 +266,7 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 				async getClusterSize(): Promise<number> { return Object.keys(cluster).length; },
 				async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(cluster) }; },
 				async recoverTransactions(): Promise<void> { /* unused */ },
+				takeLatePendRefusals: () => ({}),
 				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes: { [peerId: string]: CommitResult } }> {
 					return { record: opts.record, localExecuted: opts.localExecuted, cohortCommitOutcomes };
 				}

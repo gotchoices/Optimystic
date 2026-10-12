@@ -551,6 +551,8 @@ export interface ICoordinatorClusterSeam {
 		/** Other cohort members' post-reconcile commit durability reports; see `ClusterCoordinator.executeClusterTransaction`. */
 		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
 	}>;
+	/** Pend refusals other members reported for an action's pend of any of `blockIds` after that pend was answered, taken once by its commit; see `ClusterCoordinator.takeLatePendRefusals`. */
+	takeLatePendRefusals(actionId: ActionId, blockIds: readonly BlockId[]): { [peerId: string]: WriteFailure };
 	recoverTransactions(): Promise<void>;
 }
 
@@ -2411,16 +2413,16 @@ export class CoordinatorRepo implements IRepo {
 			// so the two numbers are never comparable, and the field says so.
 			const pendDurability = (selfAccepted: boolean | undefined): WriteDurability =>
 				pendCohortDurability(record, selfAccepted, this.localPeerId?.toString());
-			// The first cohort refusal in peer-id order, so two coordinators facing the same cohort
-			// answer with the same one. Which refusal is reported does not change the outcome — every
-			// entry is conflict-shaped and every one means "rebase and retry" — only which `pending` /
-			// `missing` lists the writer sees, and a stable choice keeps that reproducible.
-			const remoteRefusal = Object.entries(cohortPendRefusals ?? {})
-				.sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)[0];
+			const remoteRefusal = firstPendRefusal(cohortPendRefusals);
 			/**
 			 * The ONE rule every exit from this method passes through: a cohort member's reported
 			 * refusal downgrades a *success* into the retryable conflict it really is, and touches
 			 * nothing else.
+			 *
+			 * Only members that applied the pend before this answer can report here. A member reached
+			 * later — by the commit-retry timer, or carried on a later request — reports its refusal to
+			 * this node afterwards, and it reaches the writer as the action's commit's answer instead
+			 * ({@link latePendRefusalFor}).
 			 *
 			 * Applied at every exit deliberately. This node's own member applying the pend cleanly —
 			 * or not applying it at all, or having lost its retained verdict to a restart or the
@@ -2931,8 +2933,49 @@ export class CoordinatorRepo implements IRepo {
 		if (!cohort.resolved || cohort.peerIds.length <= 1) {
 			return await this.commitSolo(request, blockIds, cohort, options);
 		}
-		const peerCount = cohort.peerIds.length;
+		let answer: CommitResult;
+		try {
+			answer = await this.commitThroughCluster(request, cohort.peerIds.length, options);
+		} catch (error) {
+			const refusal = await this.latePendRefusalFor(request, 'threw');
+			if (refusal !== undefined) return refusal;
+			throw error;
+		}
+		await this.latePendRefusalFor(request, answer.success ? 'acknowledged' : 'refused');
+		return answer;
+	}
 
+	/**
+	 * The pend refusal another member reported for this commit's action after its pend was answered
+	 * (`ClusterCoordinator.takeLatePendRefusals`, read exactly once per commit), when the commit should
+	 * answer with it. A member that missed a pend's decision is sent it again — carried on the commit's
+	 * first request to it, or by the commit-retry timer — so its refusal reaches this node during the
+	 * commit rather than with the pend's answer (docs/correctness.md §2), and the member then refuses to
+	 * co-sign the commit (`ClusterMember.validateCommitAgainstRefusedPend`). That refusal reached the
+	 * writer as a thrown validator rejection no local re-read confirms, which db-core retries verbatim
+	 * and then fails hard; a commit that `threw` answers with the first refusal in peer-id order instead,
+	 * the retryable conflict the pend would have returned. Two answers stand: a commit that returned an
+	 * answer (acknowledged, or refused with its own conflict or expiry, which may carry a confirmed
+	 * `staleAt`), and a throw over a revision this node already holds under this action, which
+	 * {@link classifyCommitStaleRejection} keeps a throw on purpose.
+	 */
+	private async latePendRefusalFor(request: CommitRequest, settled: 'threw' | 'acknowledged' | 'refused'): Promise<WriteFailure | undefined> {
+		const refusal = firstPendRefusal(this.coordinator.takeLatePendRefusals(request.actionId, request.blockIds));
+		if (refusal === undefined) return undefined;
+		const answers = settled === 'threw' && await this.confirmCommitRivalAgainstLocal(request) !== 'own-durable';
+		this.log('coordinator-repo:commit-late-pend-refusal', {
+			actionId: request.actionId,
+			peerId: refusal[0],
+			reason: refusal[1].reason,
+			commit: settled,
+			answered: answers
+		});
+		return answers ? refusal[1] : undefined;
+	}
+
+	/** The cluster half of {@link commit}, once the cohort is known to have more than one member. */
+	private async commitThroughCluster(request: CommitRequest, peerCount: number, options?: MessageOptions): Promise<CommitResult> {
+		const blockIds = request.blockIds;
 		const message: RepoMessage = {
 			operations: [{ commit: request }],
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
@@ -3597,4 +3640,14 @@ function clusterReachedCommitConsensus(record: ClusterRecord): boolean {
 /** Approve-typed commit votes on a consensus record — the numerator `commitQuorumRulesOutRivals` measures against the full cohort. */
 function countApprovingCommitVotes(record: ClusterRecord): number {
 	return Object.values(record.commits).filter(s => s.type === 'approve').length;
+}
+
+/**
+ * The first of several members' pend refusals in peer-id order, so two coordinators facing the same
+ * cohort answer with the same one. Which refusal is reported does not change the outcome — every
+ * entry is conflict-shaped and every one means "rebase and retry" — only which `pending` / `missing`
+ * lists the writer sees, and a stable choice keeps that reproducible.
+ */
+function firstPendRefusal(refusals: { [peerId: string]: WriteFailure } | undefined): [peerId: string, refusal: WriteFailure] | undefined {
+	return Object.entries(refusals ?? {}).sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)[0];
 }

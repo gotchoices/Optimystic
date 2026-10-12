@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
@@ -8,6 +8,8 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair, generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
 import { createReconcileBlock } from '../cluster/reconcile-block.js';
+import { applyCarriedRecords, readCarriedOutcomes } from '../cluster/carried-records.js';
+import { createLogger } from '../logger.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
@@ -122,6 +124,13 @@ export interface MeshOptions {
 	 * its own. Omitted → nothing is reported.
 	 */
 	onBlockHolders?: (node: MeshNode, holders: BlockHolders) => void;
+	/**
+	 * Spread over the resolved policy for every node's COORDINATOR only — the knobs a node's
+	 * composition root passes its coordinator that `clusterPolicy` has no field for, such as the
+	 * scheduled commit-retry timing (`commitBroadcastRetryInitialMs` and its siblings). Omitted → the
+	 * coordinator runs on the resolved policy alone.
+	 */
+	coordinatorConfig?: Partial<ClusterConsensusConfig>;
 }
 
 export interface MeshFailureConfig {
@@ -151,16 +160,25 @@ export interface MeshFailureConfig {
 	partitionSides?: Set<string>[];
 	/**
 	 * Observes every REMOTE cluster delivery — promise round, commit round, commit broadcast and
-	 * scheduled commit retry alike — with the target's peer-id string and the record as sent, BEFORE
-	 * `failingPeers` is consulted for that delivery. It exists so a spec can change reachability at an
-	 * exact protocol step rather than between whole transactions: a member that promised and then
-	 * dropped before voting to commit is set unreachable here, on the delivery that would have carried
-	 * its commit vote, and that very delivery fails.
+	 * scheduled commit retry alike — with the target's peer-id string, the record as sent, and the
+	 * decided records the request carries ahead of it (`ICluster.updateCarrying`; empty when it carries
+	 * none), BEFORE `failingPeers` is consulted for that delivery. It exists so a spec can change
+	 * reachability at an exact protocol step rather than between whole transactions: a member that
+	 * promised and then dropped before voting to commit is set unreachable here, on the delivery that
+	 * would have carried its commit vote, and that very delivery fails. Throwing fails the whole
+	 * request, carried records included.
 	 *
 	 * A coordinator's OWN member is invoked in process, never through this path — as in production,
 	 * where `ClusterCoordinator.updateMember` calls it directly — so the hook never sees it.
 	 */
-	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord) => void;
+	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord, carried: readonly ClusterRecord[]) => void;
+	/**
+	 * A record carried to a member (see {@link onClusterDelivery}) that this answers true for is lost on
+	 * the way: the rest of the request arrives, and the member answers that one not delivered, so it stays
+	 * owed. A spec that makes a member miss one record entirely needs this beside `onClusterDelivery`,
+	 * since the coordinator carries a record it still owes on every later request to that member.
+	 */
+	dropCarried?: (targetPeerId: string, record: ClusterRecord) => boolean;
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -354,6 +372,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// mesh ever holds something a timer keeps alive — a real socket, a file handle, a fake clock a
 	// spec advances — give `Mesh` a `dispose()` that walks the nodes, and make the specs use it.
 	const failures: MeshFailureConfig = {};
+	// The member side of the wire, which the harness stands in for, logs under this namespace.
+	const carriedLog = createLogger('cluster-service');
 
 	// NOTE: one policy for the whole mesh, so every node necessarily agrees on cluster size and
 	// thresholds. That is right for repair tests, where disagreement is not the variable. A test
@@ -506,13 +526,27 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		if (!target) {
 			throw new Error(`Unknown peer: ${targetPeerId.toString()}`);
 		}
+		const targetStr = targetPeerId.toString();
+		const reach = (record: ClusterRecord, carried: readonly ClusterRecord[]): void => {
+			failures.onClusterDelivery?.(targetStr, record, carried);
+			if (failures.failingPeers?.has(targetStr)) {
+				throw new Error(`Peer ${targetStr} is unreachable`);
+			}
+		};
 		return {
 			async update(record: ClusterRecord): Promise<ClusterRecord> {
-				failures.onClusterDelivery?.(targetPeerId.toString(), record);
-				if (failures.failingPeers?.has(targetPeerId.toString())) {
-					throw new Error(`Peer ${targetPeerId.toString()} is unreachable`);
-				}
+				reach(record, []);
 				return target.clusterMember.update(record);
+			},
+			// The member side runs the SAME loop `ClusterService` does, so carried records are applied
+			// ahead of the request's own record here exactly as over the wire. Mesh nodes are always
+			// members of the records they are sent and learn no addresses, so the loop's address and
+			// redirect steps have nothing to do.
+			async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
+				reach(record, carried);
+				const arriving = carried.filter(owed => failures.dropCarried?.(targetStr, owed) !== true);
+				const outcomes = await applyCarriedRecords(arriving, { cluster: target.clusterMember, selfId: targetStr, log: carriedLog });
+				return { answer: await target.clusterMember.update(record), carried: readCarriedOutcomes(carried, outcomes) };
 			}
 		};
 	};
@@ -569,6 +603,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 					async update(record: ClusterRecord): Promise<ClusterRecord> {
 						if (lifetime.stopped) throw stoppedError();
 						return await client.update(record);
+					},
+					async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]) {
+						if (lifetime.stopped) throw stoppedError();
+						return await client.updateCarrying!(record, carried);
 					}
 				};
 			},
@@ -578,7 +616,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// production `minAbsoluteClusterSize` (2, not the coordinator's own fallback of 3), and the
 			// `allowUnvalidatedSmallCluster` gate — ARMED (false) unless the mesh opted out at its call
 			// site.
-			{ ...policy }
+			{ ...policy, ...options.coordinatorConfig }
 		);
 		node.coordinatorRepo = factory({
 			storageRepo: node.storageRepo,

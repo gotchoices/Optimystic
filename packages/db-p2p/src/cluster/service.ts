@@ -11,6 +11,18 @@ import type { Uint8ArrayList } from 'uint8arraylist';
 import { createLogger, type Logger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
+import { applyCarriedRecords } from './carried-records.js';
+
+/**
+ * One request on the cluster protocol. `carried` holds decided records the coordinator still owes this
+ * member, to apply ahead of `record` (`ICluster.updateCarrying`); an older coordinator never sends it,
+ * and it arrives unvalidated, so it is typed as what it is.
+ */
+export interface ClusterRequest {
+	operation: string;
+	record: ClusterRecord;
+	carried?: unknown;
+}
 
 interface BaseComponents {
 	registrar: {
@@ -211,16 +223,40 @@ export class ClusterService implements Startable {
 	}
 
 	/**
-	 * Run a single decoded protocol message. An application-level throw
-	 * (validation / signature / merge / consensus failure inside `cluster.update`)
-	 * propagates to the caller, which turns it into a structured error envelope;
-	 * a redirect or a successful {@link ClusterRecord} is returned as-is.
+	 * Answer a single decoded protocol message: a redirect or the {@link ClusterRecord} the member
+	 * returned, or — for an application-level throw (validation / signature / merge / consensus failure
+	 * inside `cluster.update`, or an unknown operation) — the structured error envelope, logged here.
+	 *
+	 * Decided records the request carried ahead of its own record (`carried`) are applied first, in
+	 * order ({@link applyCarriedRecords}), and their outcomes ride back as a `carried` field on whichever
+	 * of those three the answer is. A throw is answered rather than propagated so that field is never
+	 * lost with it.
 	 *
 	 * Public for the same reason {@link checkRedirect} is: it is the whole wire-ingress decision
 	 * for a cluster update, and a test that reconstructs it by hand stops proving anything about
 	 * the real ordering (address learning before redirect before consensus).
 	 */
-	async processOperation(message: { operation: string; record: ClusterRecord }): Promise<unknown> {
+	async processOperation(message: ClusterRequest, remotePeer?: PeerId): Promise<unknown> {
+		const carried = message.operation === 'update'
+			? await applyCarriedRecords(message.carried, {
+				cluster: this.cluster,
+				selfId: this.getSelfId()?.toString(),
+				learnPeerAddresses: (record) => this.learnPeerAddresses(record),
+				checkRedirect: (record) => this.checkRedirect(record),
+				log: this.log
+			})
+			: undefined;
+		let response: object;
+		try {
+			response = await this.processRecord(message);
+		} catch (err) {
+			this.log.error('error processing cluster %s from %p - %e', message.operation, remotePeer, err);
+			response = toClusterErrorEnvelope(err);
+		}
+		return carried === undefined ? response : { ...response, carried };
+	}
+
+	private async processRecord(message: ClusterRequest): Promise<RedirectPayload | ClusterRecord> {
 		if (message.operation === 'update') {
 			// Learn the cohort's addresses FIRST — before both the redirect decision and
 			// local consensus, since either can go on to dial these same peers. libp2p only
@@ -264,20 +300,14 @@ export class ClusterService implements Startable {
 				// Decode the framing. A malformed/undecodable message is a transport
 				// fault handled by the outer abort path, not an application error.
 				const decoded = new TextDecoder().decode(msg.subarray());
-				const message = JSON.parse(decoded) as { operation: string; record: ClusterRecord };
+				const message = JSON.parse(decoded) as ClusterRequest;
 
-				// Application-level processing: surface any throw to the coordinator as
-				// a structured error envelope (closing the stream normally) instead of
-				// aborting, so the real cause — not an opaque StreamResetError — reaches
-				// the coordinator, which already enables debug logging. The abort path
-				// is reserved for genuinely unrecoverable framing/transport faults.
-				let response: unknown;
-				try {
-					response = await this.processOperation(message);
-				} catch (err) {
-					this.log.error('error processing cluster %s from %p - %e', message.operation, peerId, err);
-					response = toClusterErrorEnvelope(err);
-				}
+				// Application-level processing answers any throw with a structured error
+				// envelope (closing the stream normally) instead of aborting, so the real
+				// cause — not an opaque StreamResetError — reaches the coordinator, which
+				// already enables debug logging. The abort path is reserved for genuinely
+				// unrecoverable framing/transport faults.
+				const response = await this.processOperation(message, peerId);
 
 				// Encode and yield the response
 				yield new TextEncoder().encode(JSON.stringify(response));

@@ -109,6 +109,7 @@ const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): 
 		async getClusterSize(): Promise<number> { return peerIds.length; },
 		async resolveCohort(): Promise<CohortResolution> { return seam.cohort; },
 		async recoverTransactions(): Promise<void> { },
+		takeLatePendRefusals: () => ({}),
 		async executeClusterTransaction() {
 			if (seam.consensus === undefined) throw new Error('consensus must not run on the solo path');
 			return { record: makeRecord(peerIds), localExecuted: false, ...seam.consensus };

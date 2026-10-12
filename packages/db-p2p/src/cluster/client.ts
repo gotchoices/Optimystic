@@ -1,4 +1,4 @@
-import type { PeerId, IPeerNetwork, ICluster, ClusterRecord } from '@optimystic/db-core';
+import type { PeerId, IPeerNetwork, ICluster, ClusterRecord, CarriedOutcome } from '@optimystic/db-core';
 import { blockIdsForTransforms } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
@@ -8,8 +8,24 @@ import { mergeRecordPeerAddresses } from '../peer-address-book.js';
 import { createLogger } from '../logger.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { readCarriedOutcomes } from './carried-records.js';
 
 const log = createLogger('cluster-client');
+
+/** The UTF-8 size of `message` as `ProtocolClient` frames it: JSON. */
+function encodedBytes(message: object): number {
+	return new TextEncoder().encode(JSON.stringify(message)).byteLength;
+}
+
+/**
+ * Split a member's `carried` field off its answer. The service puts it on whatever it answers with — the
+ * record, a redirect, or an error envelope — and it must not ride on into the coordinator's record.
+ */
+function takeCarriedField(raw: unknown): { response: unknown; answered: unknown } {
+	if (typeof raw !== 'object' || raw === null || !('carried' in raw)) return { response: raw, answered: undefined };
+	const { carried: answered, ...response } = raw as { carried?: unknown };
+	return { response, answered };
+}
 
 export class ClusterClient extends ProtocolClient implements ICluster {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string, rpcDeadlines?: RpcDeadlineDefaults) {
@@ -22,10 +38,34 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 	}
 
 	async update(record: ClusterRecord, hop: number = 0, options?: RpcDeadlineOptions): Promise<ClusterRecord> {
-		const message = {
-			operation: 'update',
-			record
-		};
+		const response = await this.send({ operation: 'update', record }, options);
+		return await this.answerFor(record, response, hop, options);
+	}
+
+	/**
+	 * {@link update}, with decided records the member is still owed carried ahead of `record` — see
+	 * `ICluster.updateCarrying`. The member's `carried` field is taken off the answer here, before the
+	 * redirect and error handling {@link update} shares sees it.
+	 *
+	 * A request too large to send with the carried records is sent without them, every one reported not
+	 * delivered, so carrying never makes an otherwise-sendable request fail. A redirect of `record` does
+	 * not undo the carried records the member already applied: only `record` follows the redirect.
+	 */
+	async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[], options?: RpcDeadlineOptions): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
+		const message = { operation: 'update', record, carried };
+		if (carried.length === 0 || encodedBytes(message) > MAX_CONTROL_MESSAGE_BYTES) {
+			if (carried.length > 0) log('carried:too-large peer=%s messageHash=%s carried=%d', this.peerId.toString(), record.messageHash, carried.length);
+			return { answer: await this.update(record, 0, options), carried: readCarriedOutcomes(carried, undefined) };
+		}
+		const { response, answered } = takeCarriedField(await this.send(message, options));
+		const outcomes = readCarriedOutcomes(carried, answered);
+		// An error answer for `record` throws here and takes `outcomes` with it; the caller then treats
+		// every carried record as not delivered, and a member that did apply one dedups the re-send.
+		return { answer: await this.answerFor(record, response, 0, options), carried: outcomes };
+	}
+
+	/** One request on this node's cluster protocol, under the client's deadlines; the raw answer. */
+	private async send(message: object, options?: RpcDeadlineOptions): Promise<unknown> {
 		// Every node registers the cluster service under its network-prefixed
 		// protocol id (`/optimystic/<network>/cluster/1.0.0`); the bare
 		// `/db-p2p/cluster/1.0.0` is never registered, so there is no legacy
@@ -34,8 +74,11 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		// Apply the client-level dial/response deadline so a silent cluster peer
 		// can't hang the coordinator forever; an explicit caller override wins.
 		// Response is a ClusterRecord (peer set + signatures + small metadata) → control cap.
-		const response = await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
+		return await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
+	}
 
+	/** The member's answer for `record`: its error rethrown, its redirect followed, or the record it returned. */
+	private async answerFor(record: ClusterRecord, response: unknown, hop: number, options?: RpcDeadlineOptions): Promise<ClusterRecord> {
 		// A member that threw inside `update` replies with a structured error
 		// envelope rather than aborting the stream; rethrow the server's real
 		// error (preserving name/code) so the coordinator sees the true cause.
