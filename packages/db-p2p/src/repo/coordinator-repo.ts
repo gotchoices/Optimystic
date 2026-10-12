@@ -551,8 +551,8 @@ export interface ICoordinatorClusterSeam {
 		/** Other cohort members' post-reconcile commit durability reports; see `ClusterCoordinator.executeClusterTransaction`. */
 		cohortCommitOutcomes?: { [peerId: string]: CommitResult };
 	}>;
-	/** Pend refusals other members reported for an action after its pend was answered, taken once by its commit; see `ClusterCoordinator.takeLatePendRefusals`. */
-	takeLatePendRefusals(actionId: ActionId): { [peerId: string]: WriteFailure };
+	/** Pend refusals other members reported for an action's pend of any of `blockIds` after that pend was answered, taken once by its commit; see `ClusterCoordinator.takeLatePendRefusals`. */
+	takeLatePendRefusals(actionId: ActionId, blockIds: readonly BlockId[]): { [peerId: string]: WriteFailure };
 	recoverTransactions(): Promise<void>;
 }
 
@@ -2960,7 +2960,7 @@ export class CoordinatorRepo implements IRepo {
 	 * {@link classifyCommitStaleRejection} keeps a throw on purpose.
 	 */
 	private async latePendRefusalFor(request: CommitRequest, settled: 'threw' | 'acknowledged' | 'refused'): Promise<WriteFailure | undefined> {
-		const refusal = firstPendRefusal(this.coordinator.takeLatePendRefusals(request.actionId));
+		const refusal = firstPendRefusal(this.coordinator.takeLatePendRefusals(request.actionId, request.blockIds));
 		if (refusal === undefined) return undefined;
 		const answers = settled === 'threw' && await this.confirmCommitRivalAgainstLocal(request) !== 'own-durable';
 		this.log('coordinator-repo:commit-late-pend-refusal', {

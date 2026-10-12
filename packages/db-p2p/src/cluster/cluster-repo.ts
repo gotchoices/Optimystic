@@ -459,13 +459,16 @@ export class ClusterMember implements ICluster {
 	// pruning and rollback as executedCommitResults.
 	private behindCommitRefusals: Set<string> = new Set();
 	// Conflict-shaped pend refusals this member's storage produced at consensus-apply, keyed by the
-	// refused action's id rather than by messageHash. The messageHash-keyed map above cannot serve the
-	// commit-promise guard: a commit is a DIFFERENT message with a different hash, so a member holding
-	// "I refused action X's pend" has no way to find that verdict when X's commit arrives to be voted
-	// on. Keyed by actionId, it does. Same TTL, pruning and rollback discipline as its sibling —
-	// see {@link refusedPendConflictsWithLocalState} for how a stale entry is prevented from vetoing a
-	// commit the rest of the cohort holds fine. (-> refusedAt timestamp)
-	private refusedPendActions: Map<ActionId, number> = new Map();
+	// refused action's id rather than by messageHash, then by each block the refused pend named. The
+	// messageHash-keyed map above cannot serve the commit-promise guard: a commit is a DIFFERENT
+	// message with a different hash, so a member holding "I refused action X's pend" has no way to
+	// find that verdict when X's commit arrives to be voted on. Keyed by actionId, it does. Keyed by
+	// block under it because every collection of a multi-collection transaction pends under the one
+	// action id: an accepted pend of one collection must not retire the refusal of another's, and
+	// only a commit of a refused block is vetoed. Same TTL, pruning and rollback discipline as its
+	// sibling — see {@link refusedPendConflictsWithLocalState} for how a stale entry is prevented from
+	// vetoing a commit the rest of the cohort holds fine. (-> blockId -> refusedAt timestamp)
+	private refusedPendActions: Map<ActionId, Map<BlockId, number>> = new Map();
 	// Fast in-memory dedup for applied invalidations, keyed `${invalidatedActionId}:${disputeId}`.
 	// The durable source of truth is the invalidation log entry (Log.findInvalidation, re-checked
 	// inside the sink); this map only spares redundant work when the same invalidation reaches
@@ -2329,6 +2332,21 @@ export class ClusterMember implements ICluster {
 		return { valid: true };
 	}
 
+	/** Remember that this member's storage refused `pend`, for each block it named ({@link refusedPendActions}). */
+	private retainPendRefusal(pend: PendRequest, refusedAt: number): void {
+		const refused = this.refusedPendActions.get(pend.actionId) ?? new Map<BlockId, number>();
+		for (const blockId of blockIdsForTransforms(pend.transforms)) refused.set(blockId, refusedAt);
+		this.refusedPendActions.set(pend.actionId, refused);
+	}
+
+	/** Forget a refusal of `pend`'s blocks, leaving the action's refusals of other blocks standing. */
+	private retirePendRefusal(pend: PendRequest): void {
+		const refused = this.refusedPendActions.get(pend.actionId);
+		if (refused === undefined) return;
+		for (const blockId of blockIdsForTransforms(pend.transforms)) refused.delete(blockId);
+		if (refused.size === 0) this.refusedPendActions.delete(pend.actionId);
+	}
+
 	/**
 	 * Promise-round check that this member is not about to co-sign the commit of an action whose PEND
 	 * its own storage refused.
@@ -2341,8 +2359,8 @@ export class ClusterMember implements ICluster {
 	 * consensus at a revision this member will never durably hold.
 	 *
 	 * Two conditions, both required:
-	 *  (a) this member retains a conflict-shaped pend refusal for `commit.actionId`
-	 *      ({@link refusedPendActions}), and
+	 *  (a) this member retains a conflict-shaped pend refusal for `commit.actionId` on one of the
+	 *      commit's blocks ({@link refusedPendActions}), and
 	 *  (b) local storage STILL corroborates it — a rival pending action holds one of the commit's
 	 *      blocks, or a different action already took `commit.rev`.
 	 *
@@ -2368,7 +2386,8 @@ export class ClusterMember implements ICluster {
 				continue;
 			}
 			const commit = operation.commit;
-			if (!this.refusedPendActions.has(commit.actionId)) {
+			const refused = this.refusedPendActions.get(commit.actionId);
+			if (!commit.blockIds.some(blockId => refused?.has(blockId))) {
 				continue;
 			}
 			const corroboration = await this.refusedPendConflictsWithLocalState(record, commit);
@@ -2727,7 +2746,7 @@ export class ClusterMember implements ICluster {
 			this.executedCommitResults.delete(record.messageHash);
 			this.behindCommitRefusals.delete(record.messageHash);
 			for (const operation of record.message.operations) {
-				if ('pend' in operation) this.refusedPendActions.delete(operation.pend.actionId);
+				if ('pend' in operation) this.retirePendRefusal(operation.pend);
 			}
 			throw err;
 		}
@@ -2835,13 +2854,13 @@ export class ClusterMember implements ICluster {
 				// `Date.now()`, not the injected `this.now()`: the prune sweep and the executed-marker
 				// timestamps this retention shares a TTL with are both on the wall clock, and a mixed
 				// pair would prune on the first sweep (or never) under an injected clock.
-				this.refusedPendActions.set(operation.pend.actionId, Date.now());
+				this.retainPendRefusal(operation.pend, Date.now());
 			} else if (result.success) {
 				// A later apply of the SAME action that storage accepted retires the refusal: the
 				// retention means "the last thing my storage said about this action's pend was no",
 				// and a stale yes-then-no would veto the commit of an action this member now holds
 				// pended, whenever any unrelated rival happens to sit on one of its blocks.
-				this.refusedPendActions.delete(operation.pend.actionId);
+				this.retirePendRefusal(operation.pend);
 			}
 			if (!result.success) {
 				log('cluster-member:consensus-pend-diverged', {
@@ -3464,10 +3483,11 @@ export class ClusterMember implements ICluster {
 			}
 		}
 		// Prune actionId-keyed pend refusals on the same TTL as the verdicts they were derived from.
-		for (const [actionId, refusedAt] of Array.from(this.refusedPendActions.entries())) {
-			if (refusedAt < expirationThreshold) {
-				this.refusedPendActions.delete(actionId);
+		for (const [actionId, refused] of Array.from(this.refusedPendActions.entries())) {
+			for (const [blockId, refusedAt] of Array.from(refused.entries())) {
+				if (refusedAt < expirationThreshold) refused.delete(blockId);
 			}
+			if (refused.size === 0) this.refusedPendActions.delete(actionId);
 		}
 		// Prune old applied-invalidation dedup markers on the same TTL.
 		for (const [dedupKey, appliedAt] of Array.from(this.appliedInvalidations.entries())) {

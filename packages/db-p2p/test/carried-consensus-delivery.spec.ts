@@ -156,4 +156,37 @@ describe('a cluster request carries the consensus deliveries its target is still
 			expect(await latestOn(node, block), 'no member holds the revision').to.equal(undefined);
 		}
 	});
+
+	it('a late pend refusal is kept for the commit of the blocks it refused, not taken by a sibling collection\'s commit', async () => {
+		const mesh = await createMesh(3, { responsibilityK: 3, clusterSize: 3, coordinatorConfig: { commitBroadcastRetryInitialMs: 60_000 } });
+		const [coordinator, missing] = mesh.nodes as [MeshNode, MeshNode, MeshNode];
+		const missingId = missing.peerId.toString();
+		const refused = 'sibling-refused' as BlockId;
+		const sibling = 'sibling-clean' as BlockId;
+		// A transaction spanning two collections pends and commits both under one action id. Neither the
+		// member's acceptance of the sibling's pend nor the coordinator's answer to the sibling's commit
+		// may retire the member's refusal of the other collection's pend.
+		const action = 'sibling-action';
+
+		mesh.failures.onClusterDelivery = (target, record) => {
+			if (target === missingId && isPendOf(record, action) && Object.keys(record.commits).length > 0
+				&& record.message.operations.some(op => 'pend' in op && refused in (op.pend.transforms.inserts ?? {}))) {
+				throw new Error('the member misses the refused block\'s pend decision');
+			}
+		};
+		expect((await coordinator.coordinatorRepo.pend({ actionId: action, transforms: transformsFor(refused), policy: 'r', rev: 1 })).success, 'pend').to.equal(true);
+		mesh.failures.onClusterDelivery = undefined;
+		expect((await missing.storageRepo.pend({ actionId: 'sibling-rival', transforms: transformsFor(refused), policy: 'c', rev: 1 })).success, 'rival').to.equal(true);
+		// The sibling's requests carry the owed pend to the member, which refuses it; the sibling commits.
+		expect((await coordinator.coordinatorRepo.pend({ actionId: action, transforms: transformsFor(sibling), policy: 'r', rev: 1 })).success, 'sibling pend').to.equal(true);
+		const siblingCommit = await coordinator.coordinatorRepo.commit({ actionId: action, tailId: sibling, rev: 1, blockIds: [sibling] });
+		expect(siblingCommit.success, 'the sibling commit lands').to.equal(true);
+
+		const committed = await coordinator.coordinatorRepo.commit({ actionId: action, tailId: refused, rev: 1, blockIds: [refused] });
+
+		expect(!committed.success && isConflictFailure(committed), 'the refused block\'s commit answers the member\'s refusal').to.equal(true);
+		for (const node of mesh.nodes) {
+			expect(await latestOn(node, refused), 'no member holds the refused block\'s revision').to.equal(undefined);
+		}
+	});
 });

@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, computeClusterMessageHash, isConflictFailure, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -11,6 +11,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { ResponsibilityRefusalError } from "./responsibility.js";
 import { unrefTimer } from "../unref-timer.js";
+import { LatePendRefusals, conflictPendRefusalOf } from "./late-pend-refusals.js";
 
 const log = createLogger('cluster')
 
@@ -43,15 +44,6 @@ function collectApplyOutcomes(
 function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['applyOutcomes']): void {
 	if (collected === undefined) return;
 	record.applyOutcomes = { ...record.applyOutcomes, ...collected };
-}
-
-/** At most this many pend actions' late refusals are held for {@link ClusterCoordinator.takeLatePendRefusals}. */
-const MaxLatePendRefusalActions = 1024;
-
-/** A member's own report, when it is a conflict-shaped pend refusal — the only pend report that means anything. */
-function conflictPendRefusalOf(outcome: MemberApplyOutcome | undefined): WriteFailure | undefined {
-	const pend = outcome?.pend;
-	return pend !== undefined && !pend.success && isConflictFailure(pend) ? pend : undefined;
 }
 
 /** The action ids of a message's pend operations. */
@@ -280,11 +272,10 @@ export class ClusterCoordinator {
 	 */
 	private readonly carryCapablePeers = new LruMap<string, true>(1024);
 	/**
-	 * Conflict-shaped pend refusals that arrived after the pend's writer was answered — reported on a
-	 * carried delivery of the pend record or on a scheduled retry of it — keyed by the pend's action id
-	 * until {@link takeLatePendRefusals} reads them or the record expires.
+	 * Pend refusals reported on a carried or retried delivery, after the pend's writer was answered,
+	 * until the action's commit of those blocks takes them ({@link takeLatePendRefusals}).
 	 */
-	private readonly latePendRefusals = new LruMap<ActionId, { refusals: { [peerId: string]: WriteFailure }; expiresAt: number }>(MaxLatePendRefusalActions);
+	private readonly latePendRefusals = new LatePendRefusals();
 	private readonly retryInitialIntervalMs: number;
 	private readonly retryBackoffFactor: number;
 	private readonly retryMaxIntervalMs: number;
@@ -499,44 +490,18 @@ export class ClusterCoordinator {
 	 */
 	private noteDelivered(record: ClusterRecord, pendingPeers: Set<string>, delivered: readonly string[], outcomes: ClusterRecord['applyOutcomes']): void {
 		mergeApplyOutcomes(record, outcomes);
-		this.retainLatePendRefusals(record, outcomes);
+		this.latePendRefusals.retain(record, outcomes, this.localCluster?.peerId.toString());
 		for (const peerId of delivered) pendingPeers.delete(peerId);
 	}
 
 	/**
-	 * Keep each conflict-shaped pend refusal in `outcomes` — reported by a member that applied the pend
-	 * `record` only on a carried or retried delivery, after the pend's writer was answered — for the
-	 * action's commit to answer with ({@link takeLatePendRefusals}). This node's own member is never in
-	 * it: its verdict reached the writer with the pend's answer.
+	 * Return and forget the pend refusals other members reported for `actionId`'s pend of any of
+	 * `blockIds` after that pend was answered, keyed by peer (see {@link LatePendRefusals}).
+	 * `CoordinatorRepo.commit` reads this once per commit, and a commit that throws answers with the
+	 * refusal, the retryable conflict the pend would have returned had the member applied it in time.
 	 */
-	private retainLatePendRefusals(record: ClusterRecord, outcomes: ClusterRecord['applyOutcomes']): void {
-		const actionIds = pendActionIdsOf(record.message);
-		if (outcomes === undefined || actionIds.length === 0) return;
-		const selfId = this.localCluster?.peerId.toString();
-		for (const [peerId, outcome] of Object.entries(outcomes)) {
-			const refusal = peerId === selfId ? undefined : conflictPendRefusalOf(outcome);
-			if (refusal === undefined) continue;
-			for (const actionId of actionIds) {
-				const held = this.latePendRefusals.get(actionId) ?? { refusals: {}, expiresAt: record.message.expiration ?? Number.POSITIVE_INFINITY };
-				held.refusals[peerId] = refusal;
-				this.latePendRefusals.set(actionId, held);
-				log('cluster-tx:late-pend-refusal', { messageHash: record.messageHash, actionId, peerId, reason: refusal.reason });
-			}
-		}
-	}
-
-	/**
-	 * Return and forget the pend refusals other members reported for `actionId` after its pend was
-	 * answered ({@link retainLatePendRefusals}), keyed by peer; empty when there are none, or when the
-	 * pend record they belong to has expired. `CoordinatorRepo.commit` reads this once per commit, and a
-	 * commit that is not acknowledged answers with the refusal, the retryable conflict the pend would
-	 * have returned had the member applied it in time.
-	 */
-	takeLatePendRefusals(actionId: ActionId): { [peerId: string]: WriteFailure } {
-		const held = this.latePendRefusals.get(actionId);
-		if (held === undefined) return {};
-		this.latePendRefusals.delete(actionId);
-		return held.expiresAt < this.now() ? {} : held.refusals;
+	takeLatePendRefusals(actionId: ActionId, blockIds: readonly BlockId[]): { [peerId: string]: WriteFailure } {
+		return this.latePendRefusals.take(actionId, blockIds, this.now());
 	}
 
 	/**
@@ -756,9 +721,7 @@ export class ClusterCoordinator {
 			? message
 			: { ...message, coordinatingBlockIds: [blockId] };
 
-		// A writer's retry reuses its action id, so a refusal of an earlier attempt's pend must not be
-		// read back by this attempt's commit.
-		for (const actionId of pendActionIdsOf(coordinated)) this.latePendRefusals.delete(actionId);
+		this.latePendRefusals.forgetFor(coordinated, this.now());
 
 		// Get the cluster peers for this block
 		const peers = await this.getClusterForBlock(blockId);
@@ -1688,7 +1651,7 @@ export class ClusterCoordinator {
 			const { failures, applyOutcomes } = await this.broadcastMergedRecord(record,
 				membersAwaitingConsensus(deliveries.filter(d => d.success && d.peerId !== selfId)));
 			mergeApplyOutcomes(record, applyOutcomes);
-			this.retainLatePendRefusals(record, applyOutcomes);
+			this.latePendRefusals.retain(record, applyOutcomes, selfId);
 			if (selfId !== undefined) pendingPeers.delete(selfId);
 			for (const peerId of failures) pendingPeers.add(peerId);
 		}
