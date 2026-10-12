@@ -490,6 +490,8 @@ class CarryingClusterClient extends MockClusterClient {
 	readonly carriedCalls: string[][] = [];
 	/** The messageHash of every record sent through plain `update`. */
 	readonly plainUpdates: string[] = [];
+	/** While set, an `updateCarrying` call waits on it before answering anything. */
+	holdCarried?: Promise<void>;
 
 	constructor(peerIdStr: string, readonly stampsCarried: boolean) {
 		super(peerIdStr);
@@ -502,6 +504,7 @@ class CarryingClusterClient extends MockClusterClient {
 
 	async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
 		this.carriedCalls.push(carried.map(c => c.messageHash));
+		await this.holdCarried;
 		const outcomes: CarriedOutcome[] = [];
 		for (const owed of carried) {
 			const answer = await this.answer(owed);
@@ -529,20 +532,20 @@ describe('ClusterCoordinator carries owed consensus deliveries', function () {
 		partitionDetectionWindow: 60000
 	};
 
-	it('carries a record owed to a member only when that member\'s last answer stamped acceptsCarried', async () => {
+	/**
+	 * Five members, so two can miss a commit and the other three still make its majority — only a record
+	 * carrying a majority is ever carried. Members 0 and 1 are the two the specs make miss it.
+	 */
+	const setup = async <Second extends CarryingClusterClient>(second: (idStr: string) => Second) => {
 		const clock = new FakeScheduler();
-		// Five members, so two can miss a commit and the other three still make its majority — only a
-		// record carrying a majority is ever carried.
 		const peerIds = await Promise.all(Array.from({ length: 5 }, makePeerId));
 		const clusterPeers: ClusterPeers = {};
 		const clients = new Map<string, CarryingClusterClient>();
 		for (const [index, pid] of peerIds.entries()) {
 			const idStr = pid.toString();
 			clusterPeers[idStr] = { multiaddrs: ['/ip4/127.0.0.1/tcp/8000'], publicKey: u8ToString(pid.publicKey!.raw, 'base64url') };
-			clients.set(idStr, new CarryingClusterClient(idStr, index !== 1));
+			clients.set(idStr, index === 1 ? second(idStr) : new CarryingClusterClient(idStr, true));
 		}
-		const stamping = clients.get(peerIds[0]!.toString())!;
-		const unstamped = clients.get(peerIds[1]!.toString())!;
 		const keyNetwork: IKeyNetwork = {
 			async findCoordinator() { return peerIds[0]!; },
 			async findCluster() { return { ...clusterPeers }; }
@@ -550,6 +553,17 @@ describe('ClusterCoordinator carries owed consensus deliveries', function () {
 		const coordinator = new ClusterCoordinator(keyNetwork, ((peerId: PeerId) => clients.get(peerId.toString())!) as any, cfg,
 			undefined, undefined, undefined, undefined, clockOpts(clock));
 		const message = (blockId: string): RepoMessage => ({ operations: [{ get: { blockIds: [blockId] } }], expiration: clock.now + 30000 });
+		return {
+			clock,
+			coordinator,
+			message,
+			stamping: clients.get(peerIds[0]!.toString())!,
+			second: clients.get(peerIds[1]!.toString())! as Second
+		};
+	};
+
+	it('carries a record owed to a member only when that member\'s last answer stamped acceptsCarried', async () => {
+		const { clock, coordinator, message, stamping, second: unstamped } = await setup(idStr => new CarryingClusterClient(idStr, false));
 
 		stamping.failCommit = true;
 		unstamped.failCommit = true;
@@ -569,7 +583,70 @@ describe('ClusterCoordinator carries owed consensus deliveries', function () {
 		expect(unstamped.plainUpdates.slice(unstampedSent), 'the retry sends the unstamped member the record alone').to.deep.equal([owed]);
 		expect(stamping.plainUpdates.length, 'the retry has nothing left for the member that took the carried record').to.equal(stampingSent);
 	});
+
+	it('a carried delivery that empties a retry mid-run leaves the run to finish it, so the run\'s own broadcast failures are retried', async () => {
+		const { clock, coordinator, message, stamping: carrier, second: missed } = await setup(idStr => new UnappliedThenHeld(idStr));
+
+		carrier.failCommit = true;
+		missed.failCommit = true;
+		const owed = (await coordinator.executeClusterTransaction('block-1' as BlockId, message('block-1'))).record.messageHash;
+		carrier.failCommit = false;
+		missed.failCommit = false;
+		missed.target = owed;
+
+		// Transaction 2's first request to the carrier carries transaction 1, and its answer is held.
+		let releaseCarried!: () => void;
+		carrier.holdCarried = new Promise<void>(resolve => { releaseCarried = resolve; });
+		const second = coordinator.executeClusterTransaction('block-2' as BlockId, message('block-2'));
+		await flush();
+		expect(carrier.carriedCalls, 'transaction 1 is riding to the carrier').to.deep.equal([[owed]]);
+
+		// Transaction 1's retry runs: the other pending member takes its commit without applying, so the run
+		// goes on to the consensus broadcast, which is held there.
+		let releaseBroadcast!: () => void;
+		missed.hold = new Promise<void>(resolve => { releaseBroadcast = resolve; });
+		clock.advance(250);
+		await flush();
+		// The carried answer lands mid-run and takes the carrier, the retry's last pending member, off it.
+		releaseCarried();
+		await flush();
+		// The broadcast to the other member then fails, and it is pending again.
+		releaseBroadcast();
+		await flush();
+
+		missed.reachable = true;
+		const deliveredBefore = missed.deliveriesOfTarget;
+		clock.advance(10_000);
+		await flush();
+		expect(missed.deliveriesOfTarget, 'the retry goes on for the member its broadcast missed').to.be.greaterThan(deliveredBefore);
+		await second;
+	});
 });
+
+/**
+ * Member 1 of the mid-run spec: its first delivery of `target` adds its commit without applying, and
+ * every later one waits on `hold` and fails until `reachable` is set.
+ */
+class UnappliedThenHeld extends CarryingClusterClient {
+	target?: string;
+	hold?: Promise<void>;
+	reachable = false;
+	deliveriesOfTarget = 0;
+
+	constructor(peerIdStr: string) {
+		super(peerIdStr, false);
+	}
+
+	override async update(record: ClusterRecord): Promise<ClusterRecord> {
+		if (record.messageHash !== this.target) return await super.update(record);
+		if (++this.deliveriesOfTarget === 1) {
+			return { ...record, commits: { ...record.commits, [this.peerIdStr]: { type: 'approve', signature: 'csig-unapplied' } as Signature } };
+		}
+		await this.hold;
+		if (!this.reachable) throw new Error('unreachable');
+		return await super.update(record);
+	}
+}
 
 describe('ClusterCoordinator undersized-cluster gate (validateSmallCluster)', function () {
 	const baseCfg: ClusterConsensusConfig & { clusterSize: number } = {

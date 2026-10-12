@@ -205,6 +205,11 @@ interface CommitRetryState {
 	attempt: number;
 	intervalMs: number;
 	cancel?: TimerCancel;
+	/**
+	 * Set while {@link ClusterCoordinator.retryCommits} runs this retry. A carried delivery that empties
+	 * `pendingPeers` meanwhile leaves the finish to the run, whose broadcast may yet add a member back.
+	 */
+	running?: boolean;
 }
 
 /**
@@ -249,6 +254,9 @@ export class ClusterCoordinator {
 	/**
 	 * Members whose last answer stamped `acceptsCarried` ({@link noteCarryCapability}): the only ones
 	 * {@link takeOwedRecords} carries records to. Bounded, as it is keyed by peers off the wire.
+	 *
+	 * NOTE: this file is past 1700 lines; if owed-delivery bookkeeping (this map, `takeOwedRecords`,
+	 * `returnCarried`, `settleCarriedDelivery`) grows further, move it into its own module.
 	 */
 	private readonly carryCapablePeers = new LruMap<string, true>(1024);
 	private readonly retryInitialIntervalMs: number;
@@ -367,6 +375,9 @@ export class ClusterCoordinator {
 	 * NOTE: scans every held transaction on each remote request; a node holds only the transactions in
 	 * consensus and those still retrying, so this stays small. If a node ever holds many, index owed
 	 * records by member instead.
+	 * NOTE: a record whose retry run is sending it to `peerId` right now is not marked in flight, so a
+	 * request made meanwhile carries it too; the member dedups the second copy. If that ever shows up as
+	 * wasted traffic, mark the run's own deliveries in `carrying` as well.
 	 */
 	private takeOwedRecords(peerId: string, forMessageHash: string): ClusterRecord[] {
 		if (!this.carryCapablePeers.has(peerId)) return [];
@@ -420,13 +431,19 @@ export class ClusterCoordinator {
 	 * holding the revision, this node's member gets the second reconcile {@link broadcastMergedRecord}
 	 * would have given it — not awaited, since it belongs to another transaction than the request that
 	 * carried the record.
+	 *
+	 * A delivered answer books the member done even when it reports a refused commit. The timer's run
+	 * re-sends to such a member because there it may have applied before this node's member did, with
+	 * no holder to reconcile from; a record is carried only after this node's member applied, so the
+	 * member's own reconcile already had that holder. The finish is left to a retry run in progress
+	 * ({@link CommitRetryState.running}), whose broadcast can still put a member back.
 	 */
 	private settleCarriedDelivery(state: ClusterTransactionState, retry: CommitRetryState, peerId: string, outcome: MemberApplyOutcome | undefined): void {
 		this.noteDelivered(state.record, retry.pendingPeers, [peerId], outcome === undefined ? undefined : { [peerId]: outcome });
 		if (outcome?.commit?.success === true && this.localMemberHasApplied(state.record, undefined)) {
 			void this.reconcileLocalMemberAgain(state.record);
 		}
-		if (retry.pendingPeers.size === 0) {
+		if (retry.pendingPeers.size === 0 && retry.running !== true) {
 			this.finishRetry(state.messageHash);
 		}
 	}
@@ -1533,15 +1550,26 @@ export class ClusterCoordinator {
 
 	private async retryCommits(messageHash: string): Promise<void> {
 		const state = this.transactions.get(messageHash);
-		if (!state?.retry) {
+		const retry = state?.retry;
+		if (state === undefined || retry === undefined) {
 			return;
 		}
-		const { pendingPeers, attempt } = state.retry;
-		if (pendingPeers.size === 0) {
+		if (retry.pendingPeers.size === 0) {
 			this.clearRetry(messageHash);
 			return;
 		}
-		const record = state.record;
+		retry.running = true;
+		try {
+			await this.runRetry(state, retry);
+		} finally {
+			retry.running = false;
+		}
+	}
+
+	/** One scheduled attempt of `retry`: deliver to its pending members, then finish or re-arm it. */
+	private async runRetry(state: ClusterTransactionState, retry: CommitRetryState): Promise<void> {
+		const { messageHash, record } = state;
+		const { pendingPeers, attempt } = retry;
 		const selfId = this.localCluster?.peerId.toString();
 		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
 		// Each pending member gets the record as it stands: it adds its commit, and applies once the
