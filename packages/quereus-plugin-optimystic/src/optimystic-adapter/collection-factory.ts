@@ -363,8 +363,8 @@ export class CollectionFactory {
       // NOTE: holds a warm-connection cancel with five round trips to spare, but not one that must
       // first open a cold relayed connection (up to ten more). A cancel usually reuses the connection
       // its pend just opened; if cancels on slow links run out of time anyway (a failed cancel leaves
-      // its pending records standing; see `NetworkTransactor.dischargeCancel`), give this budget its
-      // own number of round trips.
+      // its pending records standing until a re-send lands; see `NetworkTransactor.dischargeCancel`),
+      // give this budget its own number of round trips.
       abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
       dialTimeoutMs,
       keyNetwork,
@@ -797,6 +797,11 @@ export class CollectionFactory {
    * Shutdown all libp2p nodes, then release the read caches ({@link dispose}).
    */
   async shutdown(): Promise<void> {
+    // A network transactor keeps re-sending cancels it could not land; through a stopped node they
+    // never would, and the retry timer would keep the transactor and the node alive.
+    for (const transactor of this.transactors.values()) {
+      if (transactor instanceof NetworkTransactor) transactor.stop();
+    }
     for (const [key, { node }] of this.libp2pNodes.entries()) {
       log('Stopping libp2p node: %s', key);
       await node.stop();

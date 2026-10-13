@@ -350,7 +350,9 @@ late is safe whenever it arrives, because a cancel deletes only its own action's
 never moves a revision, so it commutes with every other action — except a re-pend of the *same*
 action id, whose fresh record a late cancel would delete. So a pend of an owed action supersedes the
 owed cancel for every block it names and waits out any re-send already in flight. Only a writer that
-exits, or drops its transactor, while a cancel is owed still strands the record; the node-side
+exits, or stops its transactor (`NetworkTransactor.stop`, which the Quereus plugin's
+`CollectionFactory.shutdown` calls before it stops its nodes), while a cancel is owed still strands
+the record; the node-side
 backstop for that residual is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
 
 A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is

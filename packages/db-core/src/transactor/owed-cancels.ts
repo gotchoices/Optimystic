@@ -82,6 +82,7 @@ export class OwedCancels {
 	private readonly setTimer: (fn: () => void, delayMs: number) => OwedCancelTimerCancel;
 	private readonly maxActions: number;
 	private timer: { cancel: OwedCancelTimerCancel; dueAt: number } | undefined;
+	private stopped = false;
 
 	constructor(init: OwedCancelsInit) {
 		this.attempt = init.attempt;
@@ -98,6 +99,10 @@ export class OwedCancels {
 	/** A cancel for `actionId` ran out of budget with `blockIds` still unanswered. */
 	record(actionId: ActionId, blockIds: readonly BlockId[], why: string | undefined): void {
 		if (blockIds.length === 0) return;
+		if (this.stopped) {
+			log('cancel:owed-abandoned actionId=%s blocks=%o why=stopped', actionId, blockIds);
+			return;
+		}
 		const existing = this.entries.get(actionId);
 		if (existing) {
 			for (const bid of blockIds) existing.blockIds.add(bid);
@@ -117,6 +122,22 @@ export class OwedCancels {
 		if (settled) {
 			log('cancel:owed-discharged actionId=%s attempts=%d stoodMs=%d', actionId, settled.attempts, this.now() - settled.since);
 		}
+	}
+
+	/**
+	 * Re-sends nothing from here on: the timer is disarmed and every cancel still owed is logged
+	 * (`cancel:owed-abandoned`) and forgotten, its records left to the node-side backstop. For when the
+	 * node the re-sends go through stops — they could never land, and the timer would otherwise keep
+	 * the transactor, and everything it reaches, alive for the life of the process.
+	 */
+	stop(): void {
+		this.stopped = true;
+		this.timer?.cancel();
+		this.timer = undefined;
+		for (const [actionId, entry] of this.entries) {
+			log('cancel:owed-abandoned actionId=%s blocks=%o stoodMs=%d', actionId, Array.from(entry.blockIds), this.now() - entry.since);
+		}
+		this.entries.clear();
 	}
 
 	/**

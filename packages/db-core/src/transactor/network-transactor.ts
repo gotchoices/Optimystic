@@ -138,6 +138,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	/**
+	 * Stops re-sending owed cancels; whatever is still owed is logged (`cancel:owed-abandoned`) and
+	 * left standing. Call when the node this transactor sends through stops, or its re-send timer keeps
+	 * the transactor alive, retrying against a node that can no longer answer, for the life of the process.
+	 */
+	stop(): void {
+		this.owedCancels.stop();
+	}
+
+	/**
 	 * Subscribe to commits landing on the local node for `collectionId`, delegating
 	 * to the `localChangeNotifier` supplied at construction. When no notifier was
 	 * supplied this is a no-op (returns an inert unsubscribe) — a NetworkTransactor
@@ -1316,8 +1325,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * this loop costs the records' holders some refused writes, not the block. Recording it here,
 	 * from this loop's own outstanding set, is what spares every caller from having to remember to.
 	 *
-	 * NOTE: a writer that exits (or drops this transactor) while a cancel is still owed strands the
-	 * record, and nothing node-side reclaims it. That residual is the backstop tracked in backlog
+	 * NOTE: a writer that exits (or stops this transactor, {@link stop}) while a cancel is still owed
+	 * strands the record, and nothing node-side reclaims it. That residual is the backstop tracked in backlog
 	 * `debt-unpromotable-pending-records-need-a-sweep`.
 	 *
 	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
