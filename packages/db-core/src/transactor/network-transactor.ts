@@ -1566,12 +1566,15 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
 	const { baseRevs, soleReservation, ...rest } = action;
 	const batchBlockIds = blockIdsForTransforms(payload);
-	const whole = blockIdsForTransforms(action.transforms).every(blockId => batchBlockIds.includes(blockId));
+	const whole = (): boolean => {
+		const inBatch = new Set(batchBlockIds);
+		return blockIdsForTransforms(action.transforms).every(blockId => inBatch.has(blockId));
+	};
 	return {
 		...rest,
 		transforms: payload,
 		...baseRevsFor(baseRevs, batchBlockIds),
-		...(soleReservation === true && whole ? { soleReservation } : {})
+		...(soleReservation === true && whole() ? { soleReservation } : {})
 	};
 }
 

@@ -978,13 +978,8 @@ describe('ClusterCoordinator keeps a promise-round commit signature only when it
 		return { presign: local.received[1]!, remote };
 	};
 
-	it('keeps it in a two-member cohort, where it was signed over the final map, so no commit round runs', async () => {
-		const { presign, remote: [other] } = await run(2, 0.75);
-
-		expect(Object.keys(presign.commits), 'the pre-sign record carries the other member\'s commit').to.deep.equal([other!.peerIdStr]);
-		expect(other!.received.map(r => Object.keys(r.commits).length), 'the promise round, then the decision — no commit round').to.deep.equal([0, 2]);
-	});
-
+	// The kept case — a two-member cohort, where no commit round runs — is pinned on a real mesh by
+	// `commit-round-carries-coordinator-commit-vote.spec.ts`.
 	it('drops it when the member signed over fewer promises than the round ended with', async () => {
 		// At a threshold below the default each member of three signs after seeing two promises, so its
 		// signature covers a map the round's third promise is then added to.

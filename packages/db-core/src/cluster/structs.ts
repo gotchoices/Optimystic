@@ -359,8 +359,9 @@ export interface ClusterConsensusConfig {
 	 * ms (default 2000, `DEFAULT_PEND_DELIVERY_DEFERRAL_MS` in db-p2p), so it rides on the first request
 	 * of the action's commit instead of costing a request of its own. Only for a pend on a two-member
 	 * cohort that reached its commit majority without a commit round, whose writer marked it the action's
-	 * only reservation (`PendRequest.soleReservation`), and only to a member this node can carry records to. When the time runs out first the delivery goes alone, and that
-	 * does not count against `commitBroadcastRetryMaxAttempts`. `0` turns the deferral off: a
+	 * only reservation (`PendRequest.soleReservation`), and only to a member this node can carry records
+	 * to. When the time runs out first the delivery goes alone, and that does not count against
+	 * `commitBroadcastRetryMaxAttempts`. `0` turns the deferral off: a
 	 * single-collection write on a two-member cohort then costs the other member four requests instead
 	 * of three.
 	 */

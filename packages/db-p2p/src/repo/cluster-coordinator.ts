@@ -284,8 +284,9 @@ export class ClusterCoordinator {
 	 * Members whose last answer stamped `acceptsCarried` ({@link noteCarryCapability}): the only ones
 	 * {@link takeOwedRecords} carries records to. Bounded, as it is keyed by peers off the wire.
 	 *
-	 * NOTE: this file is past 1700 lines; if owed-delivery bookkeeping (this map, `takeOwedRecords`,
-	 * `returnCarried`, `settleCarriedDelivery`) grows further, move it into its own module.
+	 * NOTE: owed-delivery bookkeeping (this map, `takeOwedRecords`, `returnCarried`,
+	 * `settleCarriedDelivery`, the pend deferral and the retry timer) has outgrown this file; moving it
+	 * into its own module is backlog `debt-cluster-coordinator-owed-delivery-outgrew-its-file`.
 	 */
 	private readonly carryCapablePeers = new LruMap<string, true>(1024);
 	/**
