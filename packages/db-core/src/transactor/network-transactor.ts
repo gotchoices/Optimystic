@@ -17,6 +17,7 @@ import { routingKeyForBlock } from "../network/routing-key.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
 import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
+import { OwedCancels, type OwedCancelClock } from "./owed-cancels.js";
 import { createLogger, verbose } from "../logger.js";
 
 const log = createLogger('network-transactor');
@@ -54,6 +55,12 @@ type NetworkTransactorInit = {
 	 * which is the nearest.
 	 */
 	localPeerId?: PeerId;
+	/**
+	 * Time for the re-sends of cancels this transactor could not discharge ({@link OwedCancels}).
+	 * Omit in production (`Date.now` and an unref'd `setTimeout`); a test injects a fake to fire the
+	 * re-send without waiting on the wall clock.
+	 */
+	owedCancelClock?: OwedCancelClock;
 }
 
 /**
@@ -95,6 +102,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly txnCoordinatorCache = new Map<ActionId, { coordinators: Map<BlockId, PeerId>; expires: number }>();
 	private static readonly MAX_TXN_COORDINATOR_CACHE_ENTRIES = 1000;
 
+	/**
+	 * Cancels {@link dischargeCancel} gave up on, kept and re-sent before this transactor's next pend
+	 * of their blocks and on a backoff timer, for this transactor's life — see {@link OwedCancels}.
+	 */
+	private readonly owedCancels: OwedCancels;
+
 	constructor(
 		init: NetworkTransactorInit,
 	) {
@@ -109,6 +122,19 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		this.getRepo = init.getRepo;
 		this.localChangeNotifier = init.localChangeNotifier;
 		this.localPeerId = init.localPeerId?.toString();
+		this.owedCancels = new OwedCancels({
+			attempt: actionRef => this.resendOwedCancel(actionRef),
+			clock: init.owedCancelClock
+		});
+	}
+
+	/**
+	 * Every action this transactor owes a cancel for — one it sent, could not get answered, and is
+	 * still re-sending — with the blocks still owed. A snapshot, for diagnostics: an embedder about to
+	 * drop this transactor can see what it would leave standing.
+	 */
+	owedCancelBlocks(): Map<ActionId, BlockId[]> {
+		return this.owedCancels.snapshot();
 	}
 
 	/**
@@ -648,6 +674,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				: transformsFromTransform(filteredTransform, blockId);
 		};
 		const blockIds = blockIdsForTransforms(blockAction.transforms);
+		// A cancel this transactor still owes on any of these blocks goes out first: its records would
+		// otherwise refuse this pend — or, for this same action id, the late cancel would delete it.
+		await this.owedCancels.beforePend(blockAction.actionId, blockIds);
 		const batches = await this.consolidateCoordinators(blockIds, blockAction.transforms, transformForBlock);
 		log('pend actionId=%s blockIds=%d batches=%d', blockAction.actionId, blockIds.length, batches.length);
 		if (verbose) {
@@ -1015,8 +1044,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * Confirmed blocks are excluded only to skip a pointless consensus round — cancelling one would
 	 * also be a no-op — so an over-broad `confirmed` set costs latency, never correctness.
 	 *
-	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}) but still bounded, so a
-	 * fault outlasting its budget leaves the record wedged until a node-side backstop sweep exists (backlog:
+	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}), and one that outlasts its
+	 * budget is kept and re-sent for this transactor's life ({@link owedCancels}), so only a writer that
+	 * exits first leaves the record wedged until a node-side backstop sweep exists (backlog:
 	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
@@ -1046,7 +1076,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		try {
 			await this.cancel({ actionId, blockIds: abandoned });
 		} catch (cancelError) {
-			try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
+			try { log('WARN: cancel of abandoned sweep blocks failed — kept and re-sent until it lands (cancel:owed): %o', cancelError); } catch { /* ignore */ }
 		}
 		return abandoned;
 	}
@@ -1280,8 +1310,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * cost latency only. Each round narrows to the blocks still outstanding, so a partially
 	 * successful round does not re-issue the cancels that already landed.
 	 *
-	 * NOTE: a fault that outlasts these bounds still strands the record, and nothing node-side
-	 * reclaims it. That residual is the backstop tracked in backlog
+	 * **What happens when the bounds run out.** The blocks still outstanding are handed to
+	 * {@link owedCancels} before the throw, which re-sends their cancel before this transactor's next
+	 * pend of any of them and on a backoff timer, for the transactor's life — a fault that outlasts
+	 * this loop costs the records' holders some refused writes, not the block. Recording it here,
+	 * from this loop's own outstanding set, is what spares every caller from having to remember to.
+	 *
+	 * NOTE: a writer that exits (or drops this transactor) while a cancel is still owed strands the
+	 * record, and nothing node-side reclaims it. That residual is the backstop tracked in backlog
 	 * `debt-unpromotable-pending-records-need-a-sweep`.
 	 *
 	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
@@ -1291,7 +1327,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		actionRef: ActionBlocks,
 		seedBatches?: CoordinatorBatch<BlockId[], void>[]
 	): Promise<void> {
-		let outstanding = Array.from(new Set(actionRef.blockIds));
+		const requested = Array.from(new Set(actionRef.blockIds));
+		let outstanding = requested;
 		if (outstanding.length === 0) {
 			return;
 		}
@@ -1299,30 +1336,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		let roundBatches: CoordinatorBatch<BlockId[], void>[] = [];
 		let lastError: Error | undefined;
 		for (let round = 0; ; ++round) {
-			roundBatches = [];
-			try {
-				// Batch construction can throw (coordinator lookup); `processBatches` cannot.
-				roundBatches = round === 0 && seedBatches
-					? seedBatches
-					: await this.batchesForPayload<BlockId[], void>(outstanding, outstanding, mergeBlocks, []);
-				await processBatches(
-					roundBatches,
-					(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration: deadline, dialTimeoutMs: this.dialTimeoutMs }),
-					batch => batch.payload,
-					mergeBlocks,
-					deadline,
-					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
-				);
-			} catch (e) {
-				lastError = asError(e);
-			}
-
-			const discharged = dischargedBlocks(roundBatches);
-			outstanding = outstanding.filter(bid => !discharged.has(bid));
+			const result = await this.cancelRound(actionRef.actionId, outstanding, deadline, round === 0 ? seedBatches : undefined);
+			roundBatches = result.batches;
+			lastError = result.error ?? lastError;
+			outstanding = outstanding.filter(bid => !result.discharged.has(bid));
 			if (outstanding.length === 0) {
 				if (round > 0) {
 					log('cancel:discharged actionId=%s rounds=%d', actionRef.actionId, round + 1);
 				}
+				this.owedCancels.discharged(actionRef.actionId, requested);
 				return;
 			}
 
@@ -1341,12 +1363,58 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`;
 			});
 		const rootCause = firstBatchError(roundBatches) ?? lastError;
+		const stillHeld = new Set(outstanding);
+		this.owedCancels.discharged(actionRef.actionId, requested.filter(bid => !stillHeld.has(bid)));
+		this.owedCancels.record(actionRef.actionId, outstanding, rootCause?.message);
 		const aggregate = new Error(`Cancel of action ${actionRef.actionId} did not discharge ${outstanding.length} block(s): ${outstanding.join(', ')}`
 			+ (details ? `; peers: ${details}` : '')
 			+ (rootCause ? `; root: ${rootCause.message}` : ''));
 		(aggregate as any).cause = rootCause;
 		(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
 		throw aggregate;
+	}
+
+	/**
+	 * One cancel round for `blockIds`: batches built from `seedBatches` or resolved live, sent, and
+	 * judged by which blocks some peer answered for. Never throws — a failed lookup is returned as
+	 * `error` beside an empty discharged set.
+	 */
+	private async cancelRound(
+		actionId: ActionId,
+		blockIds: BlockId[],
+		deadline: number,
+		seedBatches?: CoordinatorBatch<BlockId[], void>[]
+	): Promise<{ batches: CoordinatorBatch<BlockId[], void>[]; discharged: Set<BlockId>; error?: Error }> {
+		let batches: CoordinatorBatch<BlockId[], void>[] = [];
+		let error: Error | undefined;
+		try {
+			// Batch construction can throw (coordinator lookup); `processBatches` cannot.
+			batches = seedBatches ?? await this.batchesForPayload<BlockId[], void>(blockIds, blockIds, mergeBlocks, []);
+			await processBatches(
+				batches,
+				(batch) => this.getRepo(batch.peerId).cancel({ actionId, blockIds: batch.payload }, { expiration: deadline, dialTimeoutMs: this.dialTimeoutMs }),
+				batch => batch.payload,
+				mergeBlocks,
+				deadline,
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
+			);
+		} catch (e) {
+			error = asError(e);
+		}
+		return { batches, discharged: dischargedBlocks(batches), error };
+	}
+
+	/**
+	 * One re-send of a cancel {@link dischargeCancel} gave up on, for {@link owedCancels}: a single
+	 * round within `abortOrCancelTimeoutMs`, never the full loop — it runs ahead of a pend, and a
+	 * cohort that still cannot approve the cancel cannot approve the pend either.
+	 */
+	private async resendOwedCancel(actionRef: ActionBlocks): Promise<ReadonlySet<BlockId>> {
+		const { discharged, error } = await this.cancelRound(actionRef.actionId, actionRef.blockIds, Date.now() + this.abortOrCancelTimeoutMs);
+		if (discharged.size < actionRef.blockIds.length) {
+			log('cancel:owed-retry-short actionId=%s answered=%d of %d%s', actionRef.actionId, discharged.size, actionRef.blockIds.length, error ? ` error=${error.message}` : '');
+		}
+		return discharged;
 	}
 
 	/** Renders the batches worth naming in an aggregate error: the ones that never completed, or —

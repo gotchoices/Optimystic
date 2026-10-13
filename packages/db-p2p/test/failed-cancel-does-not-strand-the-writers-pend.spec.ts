@@ -115,8 +115,12 @@ describe('A cancel that misses the promise bar does not strand the writer\'s pen
 
 	it('phase 3 — C returns, and A writes the same row again: the write lands and no member still holds the failed write\'s record', async () => {
 		setUnreachable(mesh, []);
+		const before = attempts.length;
 		const durability = await write(a, 'row', 'after-C-returned');
 		expect(durability, 'the write after C returned is acknowledged').to.not.equal(undefined);
 		expect(await holdersOfStranded(), `members still holding ${stranded!.actionId}`).to.deep.equal([]);
+		// The owed cancel goes out ahead of the pend, so the write's first pend meets no stranded record.
+		const pends = attempts.slice(before).filter(attempt => attempt.kind === 'pend');
+		expect(pends.length, 'the write lands on its first pend, not after retrying past the stranded record').to.equal(1);
 	});
 });
