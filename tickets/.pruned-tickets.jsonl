@@ -172,3 +172,4 @@
 {"slug":"cold-apply-gate-counts-every-cohort-lookup","file":"cold-apply-gate-counts-every-cohort-lookup.md","completedAt":"2026-09-11","commit":"04a6ab9d996da99d6cb133fca9af1ec6bdaf7d93","prunedAt":"2026-10-11T11:09:45.832Z"}
 {"slug":"document-log-fields-that-say-which-case-you-are-in","file":"document-log-fields-that-say-which-case-you-are-in.md","completedAt":"2026-09-11","commit":"6bde698b244bddf2515e0eb4aa03cfb292faed5f","prunedAt":"2026-10-11T11:09:45.832Z"}
 {"slug":"enable-optimystic-logging-on-every-debug-copy","file":"enable-optimystic-logging-on-every-debug-copy.md","completedAt":"2026-09-11","commit":"094d91c0768b46d06de6cf0fd65b78bacccfdb65","prunedAt":"2026-10-11T11:09:45.832Z"}
+{"slug":"debt-relay-cohort-spec-skips-itself-on-unlucky-layout","file":"1-debt-relay-cohort-spec-skips-itself-on-unlucky-layout.md","completedAt":"2026-09-12","commit":"08af74221cbf70a8768e238006722fc60d3d78a7","prunedAt":"2026-10-13T04:46:05.644Z"}
