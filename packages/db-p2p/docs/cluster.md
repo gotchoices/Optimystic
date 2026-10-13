@@ -311,20 +311,43 @@ Once super-majority promises are collected, the commit phase begins. **Commits o
 **The coordinator's own member votes first, and its vote rides on the commit round.** Before the
 round goes out, `ClusterCoordinator.commitTransaction` delivers the promise-complete record to its own
 member in process; the member signs its commit, and the round carries that signature to every remote
-member. A remote member adds its own commit, and in a cohort of two (2 of 2) or three (2 of 3) that is
-already the majority its phase loop needs, so it reaches consensus and applies in the same delivery,
-answering with its apply report. Nothing about what a member accepts changes — it reaches consensus
-only on commit signatures it verified, having signed its own only after seeing a super-majority of
-approved promises — the record simply arrives one round earlier than the broadcast would bring it. In a
-cohort of four or more the two commits are short of a majority and nobody applies on receipt.
+member. A remote member adds its own commit, and in a cohort of three (2 of 3) that is already the
+majority its phase loop needs, so it reaches consensus and applies in the same delivery, answering with
+its apply report. Nothing about what a member accepts changes — it reaches consensus only on commit
+signatures it verified, having signed its own only after seeing a super-majority of approved promises —
+the record simply arrives one round earlier than the broadcast would bring it. In a cohort of four or
+more the two commits are short of a majority and nobody applies on receipt.
+
+**In a cohort of two there is no commit round.** The other member, answering the promise round, already
+sees both approvals (the coordinator's pre-vote and its own) and signs its commit in the same answer.
+The coordinator keeps that signature when the answer's promise map equals the round's merged one — the
+map a commit signature covers — so its own member's pre-sign completes the majority and applies, and
+the other member is owed only the decision (`keepCommitsSignedOverMergedPromises` and
+`deliverDecidedWithoutCommitRound` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). A commit
+signature signed over any other map is dropped, as every one from the promise round used to be.
 
 Once the merged commits reach the majority, `broadcastMergedRecord` delivers the record to the
-coordinator's own member (awaited) and then only to the remote members still needing it: a member whose
-commit-round call failed, one whose answer does not report having applied (`MemberApplyOutcome.executed`,
-which a member on an older build never sets), and one reporting a refused commit — sending that one the
-record again, now that the coordinator's member holds the revision, gives a behind member another
-reconcile. In a healthy two- or three-member cohort that list is empty, so a consensus operation costs
-each remote member two calls instead of three.
+coordinator's own member (awaited, unless it already applied) and then only to the remote members still
+needing it: a member whose commit-round call failed, one whose answer does not report having applied
+(`MemberApplyOutcome.executed`, which a member on an older build never sets), one reporting a refused
+commit — sending that one the record again, now that the coordinator's member holds the revision, gives
+a behind member another reconcile — and, in a cohort of two, the other member. In a healthy two- or
+three-member cohort a consensus operation therefore costs each remote member two calls instead of three.
+
+**A single-collection write's pend delivers its decision with the commit.** In a cohort of two, the
+decision of a pend whose writer marked it the action's only reservation (`PendRequest.soleReservation`:
+`TransactorSource.transact`, and `TransactionCoordinator` for a one-collection transaction) is not sent
+on its own. It is owed to the other member, and the action's commit carries it on its first request,
+ahead of the commit's own record ([below](#owed-deliveries-ride-on-the-next-request)), so the member
+applies the pend, or refuses it, before it votes on the commit. Such a write costs the other member three
+requests instead of four. The decision is held back only when this node's own member applied the pend
+and its storage accepted it, every remote member can be carried to — its answers stamp
+`acceptsCarried` and this node's client for it can carry — and the record's expiration is more than
+twice the deferral away (`mayDeferPendDelivery`). If no commit follows within `pendDeliveryDeferralMs`
+the decision goes alone, as a scheduled retry that does not count against
+`commitBroadcastRetryMaxAttempts`. A pend without the mark — every pend of a transaction spanning
+several collections — is delivered at once: its late refusal could surface after a sibling collection's
+commit landed, tearing the write (see [`docs/correctness.md` §2](../../../docs/correctness.md#2-definitions)).
 
 This simple majority is the *cluster-internal* commit-signature count — how many members have signed commit — not the writer-facing acknowledgement. The coordinator's answer to the writer is gated separately, by a post-reconcile storage-durability majority (the durability gate); it does not follow from commit-signature count alone. See [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for the full three-checkpoint pipeline.
 
@@ -653,7 +676,9 @@ Once the tail block commits, the coordinator now tracks any peers that promised 
 
 Unless the node was built with a `transactionStateStore` (from which `recoverTransactions` resumes a persisted retry after a restart), the retry lives only in the coordinator's memory: a member that stays away longer than the schedule, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
 
-Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort whose other member missed the commit round, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
+Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort that ran a commit round (the other member's promise-round commit was not kept) and whose other member missed it, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
+
+The same retry carries a pend's decision that is waiting for its commit ([Phase 2](#phase-2-commit-execution-simple-majority-required)). `pendDeliveryDeferralMs` (`ClusterConsensusConfig`, default 2000 ms, `DEFAULT_PEND_DELIVERY_DEFERRAL_MS`; resolved in the `CoordinatorRepo` constructor beside the retry settings above) is that retry's first interval, and it is not a counted attempt: the attempt budget and the backoff start with the first retry after it. `0` turns the deferral off, and a two-member single-collection write then costs the other member four requests. The commit that follows a pend usually arrives within milliseconds when the writer runs on the coordinating node, and within one writer-to-coordinator round trip otherwise, so a deferral that runs out first costs only the standalone delivery it replaced.
 
 A successful retry clears the pending list; hitting the max attempts emits `cluster-tx:retry-abort` so operators can intervene. The coordinator keeps the transaction in memory while the retry is live, ensuring follow-up requests (reads, additional commits) see a consistent state, and releases it when the retry ends — whichever way it ends. All three terminal exits (the commit finished with no retry pending, the retry caught every peer up, the retry gave up) go through one `releaseTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, which cancels any armed retry and then deletes the in-memory entry and the persisted coordinator state on a 100 ms deferral, logging `cluster-tx:transaction-remove` with a `reason` naming the exit.
 
@@ -667,8 +692,8 @@ A record whose retry still lists a peer, and which already carries a commit majo
 
 On the wire the request envelope `{ operation: 'update', record }` gains an optional `carried: ClusterRecord[]`, and the answer to a request that carried any gets one more field, `carried: CarriedOutcome[]`, on whatever it already returns — the record, a redirect, or the error envelope. Each `CarriedOutcome` is `{ messageHash, delivered, outcome?, error? }`, one per carried record in the order sent, where `outcome` is the member's own `applyOutcomes` entry. `ClusterService` applies the carried records first, in order, each exactly as it takes a standalone record — address learning, the redirect check (a redirect is "not delivered"), then the member's `update` in its own `try`, so one carried record's failure never fails the request — and then the request's own record. The loop is `applyCarriedRecords` in `packages/db-p2p/src/cluster/carried-records.ts`, which the mesh harness's client runs too. A `carried` that is not a list of at most four records is ignored, not refused.
 
-- **Who is carried to.** Every answer a member gives stamps `MemberApplyOutcome.acceptsCarried`. The coordinator remembers, per peer, what that peer's own last answer said (1024 peers, least recently used dropped), and carries only to a peer whose last answer stamped it. An older member never stamps it, so it is never carried to and gets the timer's deliveries, as before; an older coordinator never sends the field.
-- **A commit carries its own pend.** A request that commits or cancels an action carries that action's owed pends first, ahead of the other owed records and even while another request is already carrying them. The member has then applied the pend — or refused it — before it votes on the commit or applies the cancel, which is what the commit-promise guard (`validateCommitAgainstRefusedPend`, below) needs to see; a cancel that overtook its pend would leave a pending record nothing removes. A second copy is answered from the member's dedup.
+- **Who is carried to.** Every answer a member gives stamps `MemberApplyOutcome.acceptsCarried`. The coordinator remembers, per peer, what that peer's own last answer said (1024 peers, least recently used dropped), and carries only to a peer whose last answer stamped it — and only when this node's client for that peer can carry at all (`ICluster.updateCarrying`), whatever the peer advertises. An older member never stamps it, so it is never carried to and gets the timer's deliveries, as before; an older coordinator never sends the field.
+- **A commit carries its own pend.** A request that commits or cancels an action carries that action's owed pends first, ahead of the other owed records and even while another request is already carrying them. For a single-collection write on a two-member cohort the pend is owed this way by design, so this is its ordinary path. The member has then applied the pend — or refused it — before it votes on the commit or applies the cancel, which is what the commit-promise guard (`validateCommitAgainstRefusedPend`, below) needs to see; a cancel that overtook its pend would leave a pending record nothing removes. A second copy is answered from the member's dedup.
 - **A late pend refusal answers the commit.** A conflict-shaped pend refusal a peer reports on a carried or retried delivery is kept, by action id and the blocks the pend named, until a commit of the action touching one of those blocks reads it (`ClusterCoordinator.takeLatePendRefusals`, 1024 actions, dropped when a new pend of the same action and blocks starts). Scoping by block is what keeps one collection of a multi-collection transaction, which commits concurrently with the others under the same action id, from taking a sibling's refusal. When the commit throws — typically that peer refusing to co-sign it — `CoordinatorRepo.commit` answers with the refusal instead: the retryable conflict the pend would have returned had the peer applied it in time. A commit that returned an answer keeps it, and so does a throw over a revision this node already holds under the same action (`coordinator-repo:commit-late-pend-refusal` records which).
 - **Taking and returning.** A record is marked in flight for the peer when it is attached, so two concurrent requests never both carry it (a commit's own pend excepted, above). When the answer says the peer took it, the coordinator books it as it books a delivery by the timer — the peer's report joins the record, the peer leaves the retry, the retry ends when nobody is left (or, when the timer's own run is in progress, that run ends it, since its broadcast can still put a peer back), and the coordinating member gets its second reconcile if the peer now reports holding the revision. Otherwise — not delivered, or the carrying request failed — the record stays owed for the timer or the next request. A member dedups a record it already applied, so a lost answer costs only a re-send.
 - **Size.** `ClusterClient.updateCarrying` sends the request without its carried records, reporting each not delivered, when they would push it past the 1 MiB control-message limit (`carried:too-large` under `cluster-client`).
@@ -822,7 +847,7 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 
 - **Promise Phase**: Single round-trip to all peers (~100-500ms)
 - **Commit Phase**: Second round-trip for final confirmation (~100-500ms)
-- **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer, where members apply on receipt of the commit round; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
+- **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer — in a cohort of three members apply on receipt of the commit round; in a cohort of two there is no commit round, and the second is the decision, which for a single-collection write's pend rides on the commit's first request instead, so such a write costs three in all; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
 
 ### Throughput Optimization
 

@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, canonicalJson, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -14,6 +14,13 @@ import { unrefTimer } from "../unref-timer.js";
 import { LatePendRefusals, conflictPendRefusalOf } from "./late-pend-refusals.js";
 
 const log = createLogger('cluster')
+
+/**
+ * Default for {@link ClusterConsensusConfig.pendDeliveryDeferralMs}. The commit that follows a pend comes
+ * within milliseconds when the writer runs on the coordinating node, and within one writer-to-coordinator
+ * round trip otherwise; a deferral that runs out first costs only the standalone delivery it replaced.
+ */
+export const DEFAULT_PEND_DELIVERY_DEFERRAL_MS = 2000;
 
 /**
  * Pick each peer's OWN {@link ClusterRecord.applyOutcomes} entry out of the record that peer answered
@@ -49,6 +56,11 @@ function mergeApplyOutcomes(record: ClusterRecord, collected: ClusterRecord['app
 /** The action ids of a message's pend operations. */
 function pendActionIdsOf(message: RepoMessage): ActionId[] {
 	return message.operations.flatMap(op => 'pend' in op ? [op.pend.actionId] : []);
+}
+
+/** Whether every operation of `message` is a pend its writer marked the action's only reservation (`PendRequest.soleReservation`). */
+function soleReservationsOnly(message: RepoMessage): boolean {
+	return message.operations.length > 0 && message.operations.every(op => 'pend' in op && op.pend.soleReservation === true);
 }
 
 /** The action ids a message commits or cancels — the operations that settle a pend. */
@@ -222,6 +234,11 @@ interface CommitRetryState {
 	 * `pendingPeers` meanwhile leaves the finish to the run, whose broadcast may yet add a member back.
 	 */
 	running?: boolean;
+	/**
+	 * Armed by {@link ClusterCoordinator.deferPendDelivery} rather than by a failed delivery: its timer is
+	 * not a counted attempt, so the first retry after it starts the attempt budget and the backoff afresh.
+	 */
+	deferred?: true;
 }
 
 /**
@@ -276,6 +293,7 @@ export class ClusterCoordinator {
 	 * until the action's commit of those blocks takes them ({@link takeLatePendRefusals}).
 	 */
 	private readonly latePendRefusals = new LatePendRefusals();
+	private readonly pendDeliveryDeferralMs: number;
 	private readonly retryInitialIntervalMs: number;
 	private readonly retryBackoffFactor: number;
 	private readonly retryMaxIntervalMs: number;
@@ -312,6 +330,7 @@ export class ClusterCoordinator {
 		this.retryMaxIntervalMs = cfg.commitBroadcastRetryMaxIntervalMs ?? 8000;
 		this.retryMaxAttempts = cfg.commitBroadcastRetryMaxAttempts ?? 5;
 		this.commitBroadcastImmediateRetries = cfg.commitBroadcastImmediateRetries ?? 1;
+		this.pendDeliveryDeferralMs = cfg.pendDeliveryDeferralMs ?? DEFAULT_PEND_DELIVERY_DEFERRAL_MS;
 		this.promiseImmediateRetries = cfg.promiseImmediateRetries ?? 1;
 		this.now = clock?.now ?? ((): number => Date.now());
 		this.setTimer = clock?.setTimer ?? defaultSetTimer;
@@ -363,7 +382,8 @@ export class ClusterCoordinator {
 		const client = this.createClusterClient(peerIdFromString(peerIdStr));
 		const carried = client.updateCarrying ? this.takeOwedRecords(peerIdStr, record) : [];
 		if (carried.length === 0) {
-			return this.noteCarryCapability(peerIdStr, await client.update(record));
+			const answer = await client.update(record);
+			return client.updateCarrying ? this.noteCarryCapability(peerIdStr, answer) : this.forgetCarryCapability(peerIdStr, answer);
 		}
 		log('cluster-tx:carry', { messageHash: record.messageHash, peerId: peerIdStr, carried: carried.map(r => r.messageHash) });
 		let result: { answer: ClusterRecord; carried: CarriedOutcome[] };
@@ -394,7 +414,8 @@ export class ClusterCoordinator {
 	 * have refused (`validateCommitAgainstRefusedPend`); a cancel that overtakes its pend leaves a pending
 	 * record nothing will remove. A copy the member already took is answered from its dedup
 	 * (`ClusterMember.update` waits for an update of the same record still in progress, so the vote comes
-	 * after the apply either way).
+	 * after the apply either way). On a two-member cohort a single-collection write's pend is owed this
+	 * way by design until its commit ({@link deferPendDelivery}), so there this is the ordinary path.
 	 *
 	 * Synchronous on purpose: each record taken is marked in flight before any await, so two concurrent
 	 * requests to one member never both carry it — the escorted pends above excepted.
@@ -517,9 +538,19 @@ export class ClusterCoordinator {
 	private noteCarryCapability(peerId: string, answer: ClusterRecord): ClusterRecord {
 		if (answer?.applyOutcomes?.[peerId]?.acceptsCarried === true) {
 			this.carryCapablePeers.set(peerId, true);
-		} else {
-			this.carryCapablePeers.delete(peerId);
+			return answer;
 		}
+		return this.forgetCarryCapability(peerId, answer);
+	}
+
+	/**
+	 * `peerId` is not carried to: its answer lacks the stamp, or this node's client for it cannot carry
+	 * (`ICluster.updateCarrying` absent) whatever the member advertises. A pend's delivery is deferred
+	 * only to members this list holds ({@link mayDeferPendDelivery}), so a member nothing can carry a
+	 * record to is never left waiting for the deferral's timer.
+	 */
+	private forgetCarryCapability(peerId: string, answer: ClusterRecord): ClusterRecord {
+		this.carryCapablePeers.delete(peerId);
 		return answer;
 	}
 
@@ -664,8 +695,8 @@ export class ClusterCoordinator {
 		 * `localPendResult`. `CoordinatorRepo.commit` uses a retained refusal to detect a rival's
 		 * win swallowed by the member-side ahead-divergence tolerance, instead of fabricating a
 		 * success no member durably stored. Read after the consensus broadcast, so a behind member's
-		 * verdict already reflects the reconcile it ran against the remote members that applied in the
-		 * commit round, and any second one `broadcastMergedRecord` gave it.
+		 * verdict already reflects the reconcile it ran against any remote members that applied before
+		 * it, and the second one `broadcastMergedRecord` gives it once a remote member holds the revision.
 		 */
 		localCommitResult?: CommitResult;
 		/**
@@ -677,8 +708,9 @@ export class ClusterCoordinator {
 		 *
 		 * A member that reaches consensus only via a later delivery — the scheduled commit-retry timer,
 		 * or carried on a later request ({@link takeOwedRecords}), which for an action's own commit is
-		 * always its first request to that member — applies after this method has already resolved,
-		 * so its refusal arrives too late to appear here. It is retained instead, and the action's
+		 * always its first request to that member, and which on a two-member cohort is the ordinary path
+		 * for a single-collection write's pend ({@link deferPendDelivery}) — applies after this method has
+		 * already resolved, so its refusal arrives too late to appear here. It is retained instead, and the action's
 		 * commit answers with it when that commit is not acknowledged ({@link takeLatePendRefusals});
 		 * the member-side commit-promise guard (`validateCommitAgainstRefusedPend`) is what keeps such a
 		 * commit from reaching consensus while the refusal still stands.
@@ -1097,12 +1129,21 @@ export class ClusterCoordinator {
 	 * approval the counts tie, the tie-breaks run, and every member computes the same winner
 	 * (docs/correctness.md Theorem 9).
 	 *
-	 * Merging the member's promises here cannot invalidate a signature the way a LATE promise can on the
-	 * commit round (backlog `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`):
-	 * a commit signature covers the promise map it was signed over, and at this point in the transaction
-	 * no commit signature exists anywhere — the commit round has not run, and no member signs a commit
-	 * before it sees a super-majority of approved promises. Keep that true: anything that would let a
-	 * commit signature exist before the promise round completes brings that defect here.
+	 * **A member's commit signature is kept from this round only when it was signed over the final promise
+	 * map** ({@link keepCommitsSignedOverMergedPromises}). A member signs its commit as soon as its view of
+	 * the record shows a super-majority of approved promises, and at the default threshold that happens
+	 * while answering this round only in a two-member cohort (this node's pre-vote plus the member's own
+	 * promise). A commit signature covers `computeClusterCommitHash(messageHash, message, promises,
+	 * membershipDigest)`, so one signed over the map this round ends with verifies against the record,
+	 * and keeping it lets this node's member reach consensus on its pre-sign ({@link commitTransaction})
+	 * without a commit round. Any other commit signature is dropped, as every one from this round used to
+	 * be: it would fail every member's signature check and get its signer penalized for `InvalidSignature`.
+	 *
+	 * The rule cannot bring in backlog `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`
+	 * (a commit signature invalidated by a promise merged after it): the kept signature is over the final
+	 * map, and no promise is merged after it. Every remote answer is merged before the keep runs, and the
+	 * keep runs only when this node's member's promise is already in the map, so {@link presignLocalCommit}
+	 * has no promise to add either. Keep both true.
 	 */
 	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
@@ -1199,6 +1240,10 @@ export class ClusterCoordinator {
 			messageHash: record.messageHash,
 			mergedPromises: Object.keys(record.promises ?? {})
 		});
+		// A pre-vote that threw left this node's promise out of the map, and the pre-sign would add it.
+		if (selfId === undefined || !(selfId in record.peers) || selfId in record.promises) {
+			this.keepCommitsSignedOverMergedPromises(record, roundPeers.map((peerId, idx) => ({ peerId, response: results[idx] ?? null })));
+		}
 		log('cluster-tx:promise-merge-end', {
 			messageHash: record.messageHash,
 			finalPromises: Object.keys(record.promises ?? {}),
@@ -1206,6 +1251,23 @@ export class ClusterCoordinator {
 		});
 		this.updateTransactionRecord(record, 'after-promises');
 		return { record };
+	}
+
+	/**
+	 * Keep the commit signature each promise-round member signed while answering, when its answer's
+	 * promise map equals `record`'s merged one exactly — same peers, same signatures — and so the
+	 * signature verifies against `record` (see {@link collectPromises}). Only the member's own entry is
+	 * taken, keyed by the peer asked, as {@link collectApplyOutcomes} takes reports.
+	 */
+	private keepCommitsSignedOverMergedPromises(record: ClusterRecord, answers: ReadonlyArray<{ peerId: string; response: ClusterRecord | null }>): void {
+		const merged = canonicalJson(record.promises);
+		for (const { peerId, response } of answers) {
+			const own = response?.commits?.[peerId];
+			if (response == null || own === undefined) continue;
+			const kept = canonicalJson(response.promises ?? {}) === merged;
+			log('cluster-tx:promise-round-commit', { messageHash: record.messageHash, peerId, kept });
+			if (kept) record.commits = { ...record.commits, [peerId]: own };
+		}
 	}
 
 	/**
@@ -1222,15 +1284,14 @@ export class ClusterCoordinator {
 	 * transport churn worth a second call. `undefined` means there is no local member in this cohort
 	 * (some test wiring), and the round then runs over every peer unchanged.
 	 *
-	 * Only `promises` is merged, not `commits` — which is exactly what the round itself merges from
-	 * every other member's answer, so the pre-vote is not a second rule. A commit signature normally
-	 * cannot exist yet: a member signs one only on a super-majority of approved promises, and one vote
-	 * is that only in a cohort of one, which `CoordinatorRepo`'s solo path keeps away from this class.
-	 * Were one to arrive anyway — a cohort that shrank between `resolveCohort` and
-	 * {@link getClusterForBlock}, admitted by `allowUnvalidatedSmallCluster` — the member reaches
-	 * consensus and applies during the pre-vote, and the commit signature dropped here is simply
-	 * re-collected by {@link presignLocalCommit} on the next round, as it was when self voted inside
-	 * the round.
+	 * Only `promises` is merged, not `commits`. A commit signature normally cannot exist yet: a member
+	 * signs one only on a super-majority of approved promises, and one vote is that only in a cohort of
+	 * one, which `CoordinatorRepo`'s solo path keeps away from this class. Were one to arrive anyway — a
+	 * cohort that shrank between `resolveCohort` and {@link getClusterForBlock}, admitted by
+	 * `allowUnvalidatedSmallCluster` — it is signed over the map before any remote promise is merged, so
+	 * the round's own rule for commit signatures ({@link keepCommitsSignedOverMergedPromises}) would not
+	 * keep it either. The member reaches consensus and applies during the pre-vote, and the dropped
+	 * signature is re-collected by {@link presignLocalCommit}, as it was when self voted inside the round.
 	 */
 	private async prevoteLocalPromise(record: ClusterRecord): Promise<ClusterLogPeerOutcome | undefined> {
 		const selfId = this.localCluster?.peerId.toString();
@@ -1277,10 +1338,23 @@ export class ClusterCoordinator {
 	 * empty, so a consensus operation costs each remote member two calls (promise, commit) instead of
 	 * three. When the pre-sign is unavailable the round runs as it did before — every member in
 	 * parallel, this node's included — and the broadcast then reaches every member.
+	 *
+	 * **There is no commit round when the pre-sign completes the majority.** That happens when the record
+	 * already carries remote commit signatures kept from the promise round
+	 * ({@link keepCommitsSignedOverMergedPromises}) — at the default thresholds, in a two-member cohort.
+	 * This node's member then reaches consensus and applies during its pre-sign, and every remote member
+	 * is owed only the consensus delivery ({@link deliverDecidedWithoutCommitRound}), so the operation
+	 * still costs each remote member two calls, the second being the delivery — or one, when a pend's
+	 * delivery rides on its commit ({@link deferPendDelivery}). The order members apply in is then
+	 * this node's first and the remote ones after, the order a cohort of four or more already uses, whose
+	 * behind-member reconciles {@link broadcastMergedRecord} covers.
 	 */
 	private async commitTransaction(record: ClusterRecord): Promise<ClusterRecord> {
 		const selfId = this.localCluster?.peerId.toString();
 		const presigned = await this.presignLocalCommit(record);
+		if (presigned && this.hasCommitMajority(record)) {
+			return await this.deliverDecidedWithoutCommitRound(record);
+		}
 		const roundPeers = Object.keys(record.peers).filter(id => !presigned || id !== selfId);
 		const deliveries = await this.collectCommits(record, roundPeers);
 		// A member can reach consensus during THIS round (see above), so its apply report arrives on
@@ -1305,7 +1379,31 @@ export class ClusterCoordinator {
 			threshold: this.cfg.simpleMajorityThreshold
 		});
 		// This node's member is not in the list: the broadcast decides its delivery itself.
-		const awaiting = membersAwaitingConsensus(deliveries.filter(d => d.peerId !== selfId));
+		return await this.deliverConsensus(record, membersAwaitingConsensus(deliveries.filter(d => d.peerId !== selfId)));
+	}
+
+	/**
+	 * The consensus delivery of a record whose majority this node's pre-sign completed, so no remote
+	 * member has applied it: every remote member is sent it — or, for a pend that may wait for its
+	 * commit, owed it ({@link deferPendDelivery}).
+	 */
+	private async deliverDecidedWithoutCommitRound(record: ClusterRecord): Promise<ClusterRecord> {
+		const selfId = this.localCluster?.peerId.toString();
+		log('cluster-tx:commit-round-skipped', { messageHash: record.messageHash, commits: Object.keys(record.commits) });
+		this.updateTransactionRecord(record, 'after-presign');
+		const remote = Object.keys(record.peers).filter(id => id !== selfId);
+		if (this.mayDeferPendDelivery(record, remote)) {
+			this.deferPendDelivery(record, remote);
+			return record;
+		}
+		return await this.deliverConsensus(record, remote);
+	}
+
+	/**
+	 * Deliver a majority record to this node's member and to `awaiting` ({@link broadcastMergedRecord}),
+	 * and arm the scheduled retry for whoever it did not reach.
+	 */
+	private async deliverConsensus(record: ClusterRecord, awaiting: readonly string[]): Promise<ClusterRecord> {
 		const { failures, applyOutcomes } = await this.broadcastMergedRecord(record, awaiting);
 		mergeApplyOutcomes(record, applyOutcomes);
 		// The scheduled retry works from the stored copy, and reads its apply outcomes to decide on the
@@ -1313,6 +1411,71 @@ export class ClusterCoordinator {
 		this.updateTransactionRecord(record, 'after-broadcast');
 		this.scheduleOrClearRetry(record, failures);
 		return record;
+	}
+
+	/**
+	 * Whether the consensus delivery of `record` to `awaiting` may wait for the action's commit to carry
+	 * it ({@link deferPendDelivery}). Every condition protects something:
+	 * - every operation is a pend its writer marked the action's only reservation
+	 *   (`PendRequest.soleReservation`), so its commit is one commit, sent to this node: a member that
+	 *   refuses the pend when it finally applies it refuses that commit, before anything of the action
+	 *   is durable, and the commit answers the writer with the refusal ({@link takeLatePendRefusals}).
+	 *   A pend of a write spanning several collections or coordinators is delivered at once, because its
+	 *   late refusal could surface after a sibling's commit landed;
+	 * - the cohort is two members: there this node's stored pending record answers any rival with a
+	 *   `held` vote that alone denies it the promise bar, which is what makes the deferral window safe
+	 *   (the first NOTE at {@link deferPendDelivery}). At the default thresholds only a two-member cohort
+	 *   skips the commit round anyway; a lowered threshold can skip it in a larger one, where it is not;
+	 * - this node's member applied it and its storage accepted it (`getExecutedPendResult`), so the
+	 *   writer is answered on a real local reservation, and a refused or unknown local verdict is
+	 *   delivered at once, as before, so the writer's cancel finds every member in the usual state;
+	 * - every awaiting member can be carried to ({@link noteCarryCapability}), or its delivery would only
+	 *   ever come from the timer;
+	 * - the deferral is enabled, and the record's expiration is more than twice the deferral away, so the
+	 *   timer's delivery never runs the record into its expiration (a member that already voted refuses
+	 *   an expired delivery by throwing).
+	 */
+	private mayDeferPendDelivery(record: ClusterRecord, awaiting: readonly string[]): boolean {
+		if (awaiting.length === 0 || this.pendDeliveryDeferralMs <= 0 || !soleReservationsOnly(record.message)) return false;
+		if (Object.keys(record.peers).length !== 2) return false;
+		if (record.message.expiration !== undefined && record.message.expiration - this.now() <= 2 * this.pendDeliveryDeferralMs) return false;
+		const local = this.localCluster;
+		if (local?.wasTransactionExecuted?.(record.messageHash) !== true || local.getExecutedPendResult?.(record.messageHash)?.success !== true) return false;
+		return awaiting.every(peerId => this.carryCapablePeers.has(peerId));
+	}
+
+	/**
+	 * Owe `awaiting` the consensus delivery of the pend `record` instead of sending it now: the action's
+	 * commit carries it, ahead of its own record, on its first request to each member
+	 * ({@link takeOwedRecords}), and the member applies the pend before it votes on the commit. That is
+	 * how a single-collection write on a two-member cohort costs the other member three requests rather
+	 * than four. The retry timer, armed at `pendDeliveryDeferralMs` and not counted as an attempt
+	 * ({@link CommitRetryState.deferred}), sends it alone when no commit comes first — a writer that
+	 * cancels, or crashes.
+	 *
+	 * NOTE: during the deferral the other member holds no pending record for the action: it dropped its
+	 * in-memory reservation when it signed the commit, and has not applied the pend. A rival write it
+	 * coordinates in that window gets its own approval, and this node's member answers `held` from the
+	 * pending record it stored; on two members one `held` vote stops the rival, so the window only
+	 * lengthens the stretch Theorem 9's "quorum intersection, not the reservation" argument already
+	 * covers. {@link mayDeferPendDelivery} allows two members only; widening it means redoing this.
+	 * NOTE: a node that crashes holding an owed delivery loses it: the durable transaction store is not
+	 * wired in production (backlog `debt-a-recovered-commit-retry-restarts-its-budget`). The other member
+	 * then lacks only the pending record, and the action's commit, which it applies without the pend,
+	 * reconciles the revision from this node's copy.
+	 * NOTE: when the commit reaches the other member through a different coordinator (this node failed
+	 * between pend and commit), the member votes on the commit without the pend — it abstains on content
+	 * — and its apply reconciles the revision. The owed pend that arrives afterwards is a pend of an
+	 * action already committed, which `StorageRepo.pend`'s own-revision check (`isOwnRevision`) answers
+	 * without storing a record (and a later revision there refuses it as stale), so only a member whose
+	 * commit apply and reconcile both failed stores a pending record nothing will commit — until a
+	 * replica of the revision reaches it, which removes the record (Invariant P in docs/repository.md).
+	 */
+	private deferPendDelivery(record: ClusterRecord, awaiting: readonly string[]): void {
+		const state = this.transactions.get(record.messageHash);
+		if (state === undefined) return;
+		log('cluster-tx:pend-delivery-deferred', { messageHash: record.messageHash, peerIds: awaiting, delayMs: this.pendDeliveryDeferralMs });
+		this.armRetry(state, awaiting, { attempt: 0, intervalMs: this.pendDeliveryDeferralMs, deferred: true });
 	}
 
 	/**
@@ -1324,10 +1487,12 @@ export class ClusterCoordinator {
 	 * cohort (some test wiring) or the member threw (an expired message, or `validateRecord` refused):
 	 * the round then runs with it included, as it always did.
 	 *
-	 * The member cannot reach consensus here: the record carries no commit yet, and its own is a
-	 * majority only in a cohort of one, which `CoordinatorRepo`'s solo path keeps away from this class.
-	 * Were one to arrive anyway, the member would apply here and the broadcast would skip it as
-	 * already executed.
+	 * The member reaches consensus here, and applies, when the record already carries remote commit
+	 * signatures kept from the promise round ({@link keepCommitsSignedOverMergedPromises}) that its own
+	 * completes to a majority — in a two-member cohort at the default thresholds, the ordinary path.
+	 * {@link commitTransaction} then runs no commit round, and the consensus delivery skips this member as
+	 * already executed. Otherwise the record carries no commit but its own, which is a majority only in a
+	 * cohort of one, kept away from this class by `CoordinatorRepo`'s solo path.
 	 */
 	private async presignLocalCommit(record: ClusterRecord): Promise<boolean> {
 		const selfId = this.localCluster?.peerId.toString();
@@ -1430,18 +1595,19 @@ export class ClusterCoordinator {
 	 * it holds the revision, and its copy carries the cohort's commit proof (`buildBlockCommitProof`),
 	 * which `createReconcileBlock` accepts from a single holder, so a whole cohort of behind members can
 	 * heal from it. This is also why `remoteTargets` includes members that have ALREADY applied but
-	 * report a refused commit: in a cohort of three or fewer a remote member applies on receipt of the
-	 * commit round ({@link commitTransaction}), before this node's member, so a behind one reconciled
-	 * while nobody held the revision. Sending it the record again now gives it another reconcile
-	 * (`ClusterMember.handleAlreadyExecuted`), and its answer carries the refreshed verdict. A
-	 * coordinator outside `record.peers` is not a reconcile target and gains nothing from this order;
-	 * the durability gate in `CoordinatorRepo.commit` is what makes that shape refuse rather than
-	 * acknowledge.
+	 * report a refused commit: in a cohort of three (or of two, when the pre-sign did not complete the
+	 * majority) a remote member applies on receipt of the commit round ({@link commitTransaction}),
+	 * before this node's member, so a behind one reconciled while nobody held the revision. Sending it
+	 * the record again now gives it another reconcile (`ClusterMember.handleAlreadyExecuted`), and its
+	 * answer carries the refreshed verdict. A coordinator outside `record.peers` is not a reconcile
+	 * target and gains nothing from this order; the durability gate in `CoordinatorRepo.commit` is what
+	 * makes that shape refuse rather than acknowledge.
 	 *
-	 * The mirror case — the coordinating member is ITSELF behind — mostly heals on its own: in a small
-	 * cohort a remote member applied during the commit round, so this node's member finds a holder on
-	 * its first reconcile. Where no remote member has applied yet (a cohort of four or more, where
-	 * nobody applies on receipt), that first reconcile runs before anyone holds the revision and
+	 * The mirror case — the coordinating member is ITSELF behind — heals on its own in a cohort of
+	 * three: a remote member applied during the commit round, so this node's member finds a holder on
+	 * its first reconcile. Where no remote member has applied yet — a cohort of four or more, where
+	 * nobody applies on receipt, and a two-member cohort, where this node's member applies during its
+	 * pre-sign and no commit round runs — that first reconcile runs before anyone holds the revision and
 	 * retains a refusal. So once a remote member reports holding the revision, this node's member gets
 	 * one more reconcile (`reconcileRefusedCommit`). The member skips it unless its retained refusal has
 	 * the behind shape, so only a behind coordinator pays the extra fetch. It finishes before this
@@ -1565,8 +1731,9 @@ export class ClusterCoordinator {
 		if (!state) {
 			return;
 		}
-		const existing = state.retry;
-		const nextAttempt = (existing?.attempt ?? 0) + 1;
+		// A deferral's timer was not a counted attempt (see `CommitRetryState.deferred`).
+		const counted = state.retry?.deferred === true ? undefined : state.retry;
+		const nextAttempt = (counted?.attempt ?? 0) + 1;
 		if (nextAttempt > this.retryMaxAttempts) {
 			log('cluster-tx:retry-abort', { messageHash, missingPeers });
 			this.releaseTransaction(messageHash, 'retry-abandoned');
@@ -1576,27 +1743,27 @@ export class ClusterCoordinator {
 			this.clearRetry(messageHash);
 			return;
 		}
-		const pendingPeers = new Set(missingPeers);
+		const baseInterval = counted ? Math.min(counted.intervalMs * this.retryBackoffFactor, this.retryMaxIntervalMs) : this.retryInitialIntervalMs;
+		this.armRetry(state, missingPeers, { attempt: nextAttempt, intervalMs: baseInterval });
+		log('cluster-tx:retry-scheduled', { messageHash, attempt: nextAttempt, missingPeers, delayMs: baseInterval });
+	}
+
+	/** Replace `state`'s retry with one owing `peers` the record, whose timer fires after `timing.intervalMs`. */
+	private armRetry(state: ClusterTransactionState, peers: readonly string[], timing: { attempt: number; intervalMs: number; deferred?: true }): void {
+		const { messageHash } = state;
 		if (state.owedSince === undefined && this.hasCommitMajority(state.record)) {
 			state.owedSince = this.now();
 		}
-		const baseInterval = existing ? Math.min(existing.intervalMs * this.retryBackoffFactor, this.retryMaxIntervalMs) : this.retryInitialIntervalMs;
-		existing?.cancel?.();
+		state.retry?.cancel?.();
 		const cancel = this.setTimer(() => {
 			void this.retryCommits(messageHash);
-		}, baseInterval);
-		state.retry = {
-			pendingPeers,
-			attempt: nextAttempt,
-			intervalMs: baseInterval,
-			cancel
-		};
+		}, timing.intervalMs);
+		state.retry = { pendingPeers: new Set(peers), ...timing, cancel };
 		this.persistCoordinatorState(messageHash, state.record, 'broadcasting', {
-			pendingPeers: Array.from(pendingPeers),
-			attempt: nextAttempt,
-			intervalMs: baseInterval
+			pendingPeers: [...peers],
+			attempt: timing.attempt,
+			intervalMs: timing.intervalMs
 		});
-		log('cluster-tx:retry-scheduled', { messageHash, attempt: nextAttempt, missingPeers, delayMs: baseInterval });
 	}
 
 	private async retryCommits(messageHash: string): Promise<void> {
@@ -1622,7 +1789,7 @@ export class ClusterCoordinator {
 		const { messageHash, record } = state;
 		const { pendingPeers, attempt } = retry;
 		const selfId = this.localCluster?.peerId.toString();
-		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
+		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers), ...(retry.deferred ? { deferred: true } : {}) });
 		// Each pending member gets the record as it stands: it adds its commit, and applies once the
 		// record then carries a majority, which in a small cohort this very delivery can complete. This
 		// node's member is left to the consensus broadcast below once the record already carries a

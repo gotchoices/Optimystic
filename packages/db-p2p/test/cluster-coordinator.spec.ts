@@ -926,3 +926,76 @@ describe('ClusterCoordinator cohort-membership guard', function () {
 		expect(localMember.updateCalls, 'the local member voted').to.be.greaterThan(0);
 	});
 });
+
+/**
+ * A member that votes as `ClusterMember` does on the points the promise-round commit rule depends on: it
+ * adds its promise, and once the promise map it sees holds `superMajority` approvals it signs a commit over
+ * that map (the signature names the map, so a test can see what it covers). Remembers every record it is sent.
+ */
+class SigningMember {
+	readonly received: ClusterRecord[] = [];
+
+	constructor(readonly peerIdStr: string, private readonly superMajority: number) {}
+
+	async update(record: ClusterRecord): Promise<ClusterRecord> {
+		this.received.push(structuredClone(record));
+		const promises = { ...record.promises, [this.peerIdStr]: record.promises[this.peerIdStr] ?? { type: 'approve', signature: `psig-${this.peerIdStr}` } as Signature };
+		const signs = Object.keys(promises).length >= this.superMajority && record.commits[this.peerIdStr] === undefined;
+		const signedOver = Object.keys(promises).sort().join('+');
+		const commits = signs ? { ...record.commits, [this.peerIdStr]: { type: 'approve', signature: `csig-over-${signedOver}` } as Signature } : record.commits;
+		return { ...record, promises, commits };
+	}
+}
+
+describe('ClusterCoordinator keeps a promise-round commit signature only when it covers the merged promises', function () {
+	/**
+	 * Run one transaction over `memberCount` signing members, the first of them this node's own, and return
+	 * the record this node's member was handed for its commit pre-sign, plus what each remote member was sent.
+	 */
+	const run = async (memberCount: number, superMajorityThreshold: number) => {
+		const clock = new FakeScheduler();
+		const peerIds = await Promise.all(Array.from({ length: memberCount }, makePeerId));
+		const superMajority = Math.ceil(memberCount * superMajorityThreshold);
+		const members = new Map(peerIds.map(pid => [pid.toString(), new SigningMember(pid.toString(), superMajority)]));
+		const clusterPeers: ClusterPeers = Object.fromEntries(peerIds.map(pid =>
+			[pid.toString(), { multiaddrs: ['/ip4/127.0.0.1/tcp/8000'], publicKey: u8ToString(pid.publicKey!.raw, 'base64url') }]));
+		const keyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const local = members.get(peerIds[0]!.toString())!;
+		const coordinator = new ClusterCoordinator(
+			keyNetwork,
+			((peerId: PeerId) => members.get(peerId.toString())!) as any,
+			{ clusterSize: memberCount, superMajorityThreshold, simpleMajorityThreshold: 0.51, minAbsoluteClusterSize: 2, allowClusterDownsize: true, clusterSizeTolerance: 0.5, partitionDetectionWindow: 60000 },
+			{ update: record => local.update(record), peerId: peerIds[0]! },
+			undefined, undefined, undefined,
+			clockOpts(clock)
+		);
+		await coordinator.executeClusterTransaction('block-1' as BlockId, { operations: [{ get: { blockIds: ['block-1'] } }], expiration: clock.now + 30000 });
+		const remote = peerIds.slice(1).map(pid => members.get(pid.toString())!);
+		// The pre-vote is the local member's first call; the pre-sign its second.
+		return { presign: local.received[1]!, remote };
+	};
+
+	it('keeps it in a two-member cohort, where it was signed over the final map, so no commit round runs', async () => {
+		const { presign, remote: [other] } = await run(2, 0.75);
+
+		expect(Object.keys(presign.commits), 'the pre-sign record carries the other member\'s commit').to.deep.equal([other!.peerIdStr]);
+		expect(other!.received.map(r => Object.keys(r.commits).length), 'the promise round, then the decision — no commit round').to.deep.equal([0, 2]);
+	});
+
+	it('drops it when the member signed over fewer promises than the round ended with', async () => {
+		// At a threshold below the default each member of three signs after seeing two promises, so its
+		// signature covers a map the round's third promise is then added to.
+		const { presign, remote } = await run(3, 0.5);
+
+		expect(Object.keys(presign.commits), 'no remote commit reaches this node\'s member').to.deep.equal([]);
+		for (const record of remote.flatMap(member => member.received)) {
+			const map = Object.keys(record.promises).sort().join('+');
+			for (const [signer, commit] of Object.entries(record.commits)) {
+				expect(commit.signature, `${signer}'s commit on a record sent to a member covers that record's promises`).to.equal(`csig-over-${map}`);
+			}
+		}
+	});
+});

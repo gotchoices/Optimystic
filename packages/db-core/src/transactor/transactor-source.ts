@@ -240,7 +240,9 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 		const pendResult = await this.transactor.pend({
 			transforms: transform, actionId, rev, policy: 'r',
 			...(priority > 0 ? { priority } : {}),
-			...baseRevsField(baseRevs)
+			...baseRevsField(baseRevs),
+			// One collection, pended whole and then committed: the shape `PendRequest.soleReservation` names.
+			soleReservation: true
 		});
 		if (!pendResult.success) {
 			return pendResult;

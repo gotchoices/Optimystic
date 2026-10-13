@@ -179,6 +179,12 @@ export interface MeshFailureConfig {
 	 * since the coordinator carries a record it still owes on every later request to that member.
 	 */
 	dropCarried?: (targetPeerId: string, record: ClusterRecord) => boolean;
+	/**
+	 * Members that answer as a build predating carried records does: their answers lack
+	 * `MemberApplyOutcome.acceptsCarried`, and records carried to them are ignored (reported not
+	 * delivered). A coordinator then never carries records to them, nor defers a pend's delivery to them.
+	 */
+	carryUnawarePeers?: Set<string>;
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -533,20 +539,30 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				throw new Error(`Peer ${targetStr} is unreachable`);
 			}
 		};
+		const carryUnaware = (): boolean => failures.carryUnawarePeers?.has(targetStr) === true;
+		/** The member's answer, without its `acceptsCarried` stamp when it plays an older build. */
+		const answerFrom = async (record: ClusterRecord): Promise<ClusterRecord> => {
+			const answer = await target.clusterMember.update(record);
+			const own = answer.applyOutcomes?.[targetStr];
+			if (!carryUnaware() || own === undefined) return answer;
+			const { acceptsCarried: _stamp, ...unstamped } = own;
+			return { ...answer, applyOutcomes: { ...answer.applyOutcomes, [targetStr]: unstamped } };
+		};
 		return {
 			async update(record: ClusterRecord): Promise<ClusterRecord> {
 				reach(record, []);
-				return target.clusterMember.update(record);
+				return await answerFrom(record);
 			},
 			// The member side runs the SAME loop `ClusterService` does, so carried records are applied
 			// ahead of the request's own record here exactly as over the wire. Mesh nodes are always
 			// members of the records they are sent and learn no addresses, so the loop's address and
-			// redirect steps have nothing to do.
+			// redirect steps have nothing to do. An older build ignores the carried records, which then
+			// read as not delivered.
 			async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
 				reach(record, carried);
-				const arriving = carried.filter(owed => failures.dropCarried?.(targetStr, owed) !== true);
+				const arriving = carryUnaware() ? [] : carried.filter(owed => failures.dropCarried?.(targetStr, owed) !== true);
 				const outcomes = await applyCarriedRecords(arriving, { cluster: target.clusterMember, selfId: targetStr, log: carriedLog });
-				return { answer: await target.clusterMember.update(record), carried: readCarriedOutcomes(carried, outcomes) };
+				return { answer: await answerFrom(record), carried: readCarriedOutcomes(carried, outcomes) };
 			}
 		};
 	};

@@ -1558,10 +1558,21 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
 /** `action` re-scoped to one coordinator batch: the batch's own transforms, and the bases for the
  * blocks in it alone (see {@link PendRequest.baseRevs}). The action-wide `baseRevs` key is dropped
  * BEFORE the subset is spread, so a batch none of whose blocks names a base carries no key at all
- * rather than the whole action's map — and no cohort signs for a block it is not responsible for. */
+ * rather than the whole action's map — and no cohort signs for a block it is not responsible for.
+ *
+ * `soleReservation` survives only on a batch carrying every block of the action: a pend split across
+ * coordinators — by `consolidateCoordinators`, or by `processBatches` re-batching a failed batch — is
+ * several reservations, which the field must never claim to be. Decided per send, like the bases. */
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
-	const { baseRevs, ...rest } = action;
-	return { ...rest, transforms: payload, ...baseRevsFor(baseRevs, blockIdsForTransforms(payload)) };
+	const { baseRevs, soleReservation, ...rest } = action;
+	const batchBlockIds = blockIdsForTransforms(payload);
+	const whole = blockIdsForTransforms(action.transforms).every(blockId => batchBlockIds.includes(blockId));
+	return {
+		...rest,
+		transforms: payload,
+		...baseRevsFor(baseRevs, batchBlockIds),
+		...(soleReservation === true && whole ? { soleReservation } : {})
+	};
 }
 
 /** The read one coordinator batch sends downstream: the batch's ids, the caller's context, and the

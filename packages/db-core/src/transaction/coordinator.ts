@@ -1601,6 +1601,11 @@ export class TransactionCoordinator {
 
 		const actionId = transaction.id as ActionId;
 		const nominees = superclusterNominees ? Array.from(superclusterNominees) : undefined;
+		// A one-collection transaction pends once and commits that one collection (commitPhase), as a
+		// `Collection.sync` write does, so its pend may say so (`PendRequest.soleReservation`). Two or
+		// more never may: each collection's commit lands on its own, and a late refusal of another
+		// collection's pend would surface after it.
+		const sole = collectionTransforms.size === 1;
 
 		// Fan out the independent per-collection pends concurrently. Each settles to a
 		// { collectionId, blockIds } on success, or rejects with the per-collection reason.
@@ -1609,7 +1614,7 @@ export class TransactionCoordinator {
 		// with a concurrency limiter so peak in-flight round-trips stays sane. Same for commitPhase.
 		const outcomes = await Promise.allSettled(
 			Array.from(collectionTransforms.entries()).map(([collectionId, transforms]) =>
-				this.pendCollection(transaction, validation, collectionId, transforms, pendedRevs.get(collectionId)!, actionId, nominees)
+				this.pendCollection(transaction, validation, collectionId, transforms, pendedRevs.get(collectionId)!, actionId, nominees, sole)
 			)
 		);
 
@@ -1666,7 +1671,9 @@ export class TransactionCoordinator {
 		 * a concurrent refresh already moved past. */
 		rev: number,
 		actionId: ActionId,
-		nominees: PeerId[] | undefined
+		nominees: PeerId[] | undefined,
+		/** Whether this is the transaction's only collection (see {@link pendPhase}). */
+		sole: boolean
 	): Promise<{ collectionId: CollectionId; blockIds: BlockId[] }> {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
@@ -1696,7 +1703,8 @@ export class TransactionCoordinator {
 				? (priority > 0 ? { priority } : {})
 				: { validation }),
 			...baseRevsField(baseRevs),
-			superclusterNominees: nominees
+			superclusterNominees: nominees,
+			...(sole ? { soleReservation: true as const } : {})
 		};
 
 		const pendResult = await this.transactor.pend(pendRequest);

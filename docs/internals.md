@@ -537,8 +537,12 @@ every cohort, because the pend's cover (`consolidateCoordinators`) collapses ont
 listing the log tail first and the rest after it (`commitInOneRound`). `CoordinatorRepo.commit` runs consensus
 on `blockIds[0]`'s cohort, so that record runs on the tail's cohort, as a tail-only round would; the other
 blocks commit on that cohort too, the approximation a multi-block batch already makes. With one consensus
-operation for the pend and one for the commit, a single-collection write on a two-member group costs 4
-`/cluster` calls to the other member (measured on the in-process mesh), where a tail round plus a sweep costs 6.
+operation for the pend and one for the commit, a single-collection write on a two-member group costs 3
+`/cluster` calls to the other member (measured on the in-process mesh, and by
+`packages/quereus-plugin-optimystic/test/two-node-write-request-count.spec.ts` for a SQL insert): each
+operation is a promise round and a decision, and the pend's decision rides on the commit's promise round
+(see *Both consensus rounds carry the coordinator's own member's vote*). A write spanning several
+collections costs 4 per collection, and a tail round plus a sweep costs more again.
 
 What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
@@ -565,8 +569,17 @@ round and `presignLocalCommit` on the commit round, both in
 already voted in, so it is invoked exactly once per phase.
 
 The two rounds want it for different reasons. On the **commit** round the pre-signature is what lets a remote
-member in a cohort of three or fewer reach its majority and apply in the same delivery, which is where the
-reconcile ordering in *A behind member actively reconciles* (under Key Invariants) starts. On the **promise**
+member in a cohort of three reach its majority and apply in the same delivery, which is where the reconcile
+ordering in *A behind member actively reconciles* (under Key Invariants) starts. In a cohort of two the
+pre-signature does more: the remote member already signed its commit while answering the promise round (it saw
+both approvals), the coordinator kept that signature, and the pre-signature completes the majority, so the
+coordinating member applies on its own pre-sign and **no commit round runs**. The remote member is owed only
+the decision. For a pend whose writer marked it the action's only reservation (`PendRequest.soleReservation`),
+that decision is held back and carried on the first request of the action's commit, ahead of the commit's own
+record (`deferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, sent alone after
+`pendDeliveryDeferralMs`), so the member applies the pend, or refuses it, before it votes on the commit. That is
+how a single-collection write costs the other member three requests; why a write spanning several collections
+does not get it is in [correctness.md §2 Definitions](correctness.md#2-definitions). On the **promise**
 round it is what makes the race arbiter run at all. `resolveRace`
 (`packages/db-p2p/src/cluster/race-resolution.ts`) compares the count of `approve` promise votes first, and
 that comparison gates the two below it — the aged priority and the message hash, which are the comparisons
@@ -586,12 +599,16 @@ Three rules hold this together, each of which has a failure mode if dropped:
   the reputation accounting and the shortfall arithmetic see it exactly as they saw a failed local delivery
   before. Pinned by `packages/db-p2p/test/cluster-coordinator-promise-retry.spec.ts` ("does NOT retry the
   LOCAL cluster on a throw").
-- **The promise round merges only `promises`.** Merging a member's promises into a record that already carries
-  commit signatures is the defect in backlog
+- **The promise round keeps a commit signature only when it was signed over the final promise map.** Merging a
+  member's promises into a record that already carries commit signatures is the defect in backlog
   `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`: a commit signature covers the
-  promise map it was signed over, so a late promise invalidates it. The pre-vote cannot hit that, because no
-  commit signature exists anywhere before the promise round completes — a member signs a commit only after
-  seeing a super-majority of approved promises. Keep that true.
+  promise map it was signed over, so a late promise invalidates it. The round therefore merges every answer's
+  promises first, and only then keeps a member's own commit signature from its answer, and only when that
+  answer's promise map equals the merged one exactly (`keepCommitsSignedOverMergedPromises`, compared by
+  `canonicalJson`) — at the default threshold, in a cohort of two. No promise is merged after the keep: it runs
+  only once this node's member's promise is in the map, so the pre-sign has none to add. Any other commit
+  signature is dropped, as every one used to be; one signed over a smaller map would fail every member's check
+  and get its signer penalized. Keep both orderings.
 - **It fixes the two coordinators' members, not the whole cohort.** A member that is neither coordinator still
   votes for whichever record reached it first, and its approval re-inflates that record to two against the
   newcomer's one, so from three members up the count comparison can decide again one layer out. Observed at
@@ -1581,14 +1598,19 @@ saveMaterializedBlock(block): store(structuredClone(block));
   who already holds the revision at that moment.** Before the commit round goes out, the
   coordinator's own member signs its commit vote in process, and that signature rides on the
   round (`commitTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). In a cohort of
-  three or fewer a remote member's own commit plus the coordinator's is already a strict majority,
-  so it applies on receipt of the commit round; in a cohort of four or more it is not, and nobody
-  applies before the consensus broadcast. The broadcast (`broadcastMergedRecord`, same file) then
-  delivers the merged record to the coordinator's own member first, awaited, and only then to the
-  remote members that still need it: one whose commit-round call failed, one whose response does
-  not report having applied (`MemberApplyOutcome.executed`, which an older build never sets), and
-  one that reports a refused commit. In a healthy two- or three-member cohort that list is empty,
-  so a consensus operation costs each remote member two calls rather than three. A member that
+  three a remote member's own commit plus the coordinator's is already a strict majority, so it
+  applies on receipt of the commit round; in a cohort of four or more it is not, and nobody
+  applies before the consensus broadcast. In a cohort of two no commit round runs: the remote
+  member's commit came with its promise, the coordinating member applies on its pre-sign, and
+  the remote member applies when the decision reaches it. The broadcast (`broadcastMergedRecord`,
+  same file) then delivers the merged record to the coordinator's own member first, unless it
+  already applied, awaited, and only then to the remote members that still need it: one whose
+  commit-round call failed, one whose response does not report having applied
+  (`MemberApplyOutcome.executed`, which an older build never sets), and one that reports a refused
+  commit — and, in a cohort of two, every remote member. In a healthy two- or three-member cohort a
+  consensus operation therefore costs each remote member two calls rather than three (in a cohort
+  of two, the second is the decision; for a single-collection write's pend it rides on the
+  commit's first request instead). A member that
   missed that delivery is owed it, and it rides, ahead of the request's own record, on the next
   request the coordinating node sends that member, rather than waiting for the commit-retry timer
   to send it alone (`takeOwedRecords` in `packages/db-p2p/src/repo/cluster-coordinator.ts`); either
@@ -1598,14 +1620,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   members can heal from it. A single parallel fan-out let the remote reconciles race the local
   apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a fully-approved
   commit ended up on no responsible node. Each case therefore gets a reconcile after someone holds
-  the revision. A behind *remote* member in a small cohort applied first, found no holder, and
+  the revision. A behind *remote* member in a cohort of three applied first, found no holder, and
   answered with a refused commit, so the broadcast sends it the merged record again once the
   coordinating member has applied; a member receiving a record it already applied runs
   `ClusterMember.reconcileRefusedCommit` (a no-op unless its retained refusal has the behind
-  shape), and its answer carries the refreshed verdict. A behind *coordinating* member in a small
-  cohort finds the remote members' copies on its first reconcile. In a larger cohort, where it
-  applies first, it gets one more reconcile once a remote member reports holding the revision,
-  before the durability gate reads its verdict. A coordinator *outside* `record.peers`
+  shape), and its answer carries the refreshed verdict. In a cohort of two the remote member applies
+  after the coordinating member, so it reconciles from that copy the first time. A behind
+  *coordinating* member in a cohort of three finds the remote members' copies on its first
+  reconcile. In a cohort of two, or of four or more, where it applies first, it gets one more
+  reconcile once a remote member reports holding the revision, before the durability gate reads its
+  verdict. A coordinator *outside* `record.peers`
   is not a reconcile target, so a cohort with no holder at all stays behind; the durability gate
   in `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge. The read path
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and

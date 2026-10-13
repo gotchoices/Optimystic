@@ -1,6 +1,6 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
 import { LruMap, blockIdsForTransforms, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError } from "@optimystic/db-core";
-import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
+import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -704,6 +704,7 @@ export class CoordinatorRepo implements IRepo {
 			commitBroadcastRetryMaxIntervalMs: cfg?.commitBroadcastRetryMaxIntervalMs ?? 8000,
 			commitBroadcastRetryMaxAttempts: cfg?.commitBroadcastRetryMaxAttempts ?? 5,
 			commitBroadcastImmediateRetries: cfg?.commitBroadcastImmediateRetries ?? 1,
+			pendDeliveryDeferralMs: cfg?.pendDeliveryDeferralMs ?? DEFAULT_PEND_DELIVERY_DEFERRAL_MS,
 			promiseImmediateRetries: cfg?.promiseImmediateRetries ?? 1,
 			readRepairMode: cfg?.readRepairMode ?? 'lazy',
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,

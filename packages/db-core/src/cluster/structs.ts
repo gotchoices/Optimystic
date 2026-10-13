@@ -355,6 +355,17 @@ export interface ClusterConsensusConfig {
 	/** Immediate in-line retries per failed peer inside the broadcast (default 1) */
 	commitBroadcastImmediateRetries?: number;
 	/**
+	 * How long a coordinator may hold back a pend's final "apply it" delivery to the other members, in
+	 * ms (default 2000, `DEFAULT_PEND_DELIVERY_DEFERRAL_MS` in db-p2p), so it rides on the first request
+	 * of the action's commit instead of costing a request of its own. Only for a pend on a two-member
+	 * cohort that reached its commit majority without a commit round, whose writer marked it the action's
+	 * only reservation (`PendRequest.soleReservation`), and only to a member this node can carry records to. When the time runs out first the delivery goes alone, and that
+	 * does not count against `commitBroadcastRetryMaxAttempts`. `0` turns the deferral off: a
+	 * single-collection write on a two-member cohort then costs the other member four requests instead
+	 * of three.
+	 */
+	pendDeliveryDeferralMs?: number;
+	/**
 	 * Immediate in-line retries per peer while collecting promises (default 1).
 	 * The promise phase rides the same libp2p stream the commit broadcast does;
 	 * a circuit-relay ("limited") connection can reset that stream once a
