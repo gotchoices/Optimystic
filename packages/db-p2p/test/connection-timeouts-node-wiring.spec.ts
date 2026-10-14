@@ -18,6 +18,15 @@ const NETWORK = 'connection-timeouts-node-wiring';
 
 const TOO_SHORT_MS = 1;
 
+/**
+ * The dial budget FRET resolved at start. FRET exposes no accessor for its config, so this reads the
+ * private `cfg` of the core service its libp2p wrapper builds on `start()`.
+ */
+function fretDialTimeoutMs(node: OptimysticNode): number | undefined {
+	const wrapper = node.services.fret as { inner?: { cfg?: { dialTimeoutMs?: number } } } | undefined;
+	return wrapper?.inner?.cfg?.dialTimeoutMs;
+}
+
 describe('connectionManager timeouts — node-level wiring', function () {
 	// Two real libp2p boots dominate.
 	this.timeout(60_000);
@@ -62,6 +71,11 @@ describe('connectionManager timeouts — node-level wiring', function () {
 		const dialer = await spawn({ dialTimeout: TOO_SHORT_MS });
 		const listener = await spawn();
 		expect(await dialFails(dialer, listener), 'the supplied dialTimeout did not reach libp2p').to.equal(true);
+	});
+
+	it("gives FRET's maintenance redial the same dialTimeout", async () => {
+		const node = await spawn({ dialTimeout: 21_500 });
+		expect(fretDialTimeoutMs(node)).to.equal(21_500);
 	});
 
 	it("applies the listener's inboundUpgradeTimeout", async () => {

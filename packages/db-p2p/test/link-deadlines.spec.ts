@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { MAX_LINK_ROUND_TRIP_MS, MAX_RPC_DIAL_TIMEOUT_MS, resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
+import { MAX_LINK_ROUND_TRIP_MS, MAX_RPC_DIAL_TIMEOUT_MS, resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, type LinkDeadlines } from '../src/rpc-deadline.js';
 
 const UNDECLARED: LinkDeadlines = {
 	dialTimeoutMs: 3000,
@@ -98,6 +98,22 @@ describe('resolveBootstrapContactTimeoutMs', () => {
 	for (const declared of [-1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
 		it(`throws on ${String(declared)} rather than waiting an unusable time`, () => {
 			expect(() => resolveBootstrapContactTimeoutMs(declared, deadlines)).to.throw(/bootstrapContactTimeoutMs must be a finite number/);
+		});
+	}
+});
+
+describe('resolveLibp2pDialTimeoutMs', () => {
+	const deadlines = resolveLinkDeadlines(3000);
+
+	it('undeclared is the derived value, and a declared one replaces it exactly', () => {
+		expect(resolveLibp2pDialTimeoutMs(undefined, deadlines)).to.equal(deadlines.libp2pDialTimeoutMs);
+		expect(resolveLibp2pDialTimeoutMs(1, deadlines)).to.equal(1);
+	});
+
+	// `0` is what libp2p alone would accept; FRET's maintenance redial takes the same value and refuses it.
+	for (const declared of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+		it(`throws on ${String(declared)}, naming connectionManager.dialTimeout`, () => {
+			expect(() => resolveLibp2pDialTimeoutMs(declared, deadlines)).to.throw(/connectionManager\.dialTimeout must be a finite number/);
 		});
 	}
 });

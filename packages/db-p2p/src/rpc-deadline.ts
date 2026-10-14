@@ -293,6 +293,24 @@ export function resolveBootstrapContactTimeoutMs(declared: number | undefined, d
 	return declared;
 }
 
+/**
+ * The whole-dial deadline a node applies: `NodeOptions.connectionManager.dialTimeout` when declared,
+ * else `LinkDeadlines.libp2pDialTimeoutMs`. One value serves two consumers — libp2p's connection
+ * manager, and FRET's maintenance redial, which always dials with a signal and so is never reached
+ * by libp2p's limit.
+ *
+ * A declared value that is not a finite number above zero, or is above the 32-bit timer limit,
+ * throws. libp2p alone would take `0` and arm `AbortSignal.timeout(0)` on every signal-less dial,
+ * failing each at once, and FRET's constructor refuses it — but only at `node.start()`, under a
+ * name (`dialTimeoutMs`) the host never set. Refusing it here names the option the host did set,
+ * before the node has acquired anything.
+ */
+export function resolveLibp2pDialTimeoutMs(declared: number | undefined, deadlines: LinkDeadlines): number {
+	return declared === undefined
+		? deadlines.libp2pDialTimeoutMs
+		: validDeclaredMs('connectionManager.dialTimeout', declared, MAX_TIMER_DELAY_MS);
+}
+
 function validDeclaredMs(field: string, declared: number, ceiling: number): number {
 	if (!Number.isFinite(declared) || declared <= 0 || declared > ceiling) {
 		throw new Error(

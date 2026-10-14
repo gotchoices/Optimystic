@@ -51,7 +51,7 @@ import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
 import { buildSyncProtocol } from './sync/protocol.js';
-import { resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
+import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -561,7 +561,11 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * round trip has no need to set any of them.
 	 *
 	 * - `dialTimeout` — how long an outbound dial may take, socket through upgrade, when the caller
-	 *   passes no abort signal of its own.
+	 *   passes no abort signal of its own. The same value bounds each dial FRET's maintenance redial
+	 *   makes (FRET's `dialTimeoutMs`): FRET's dials carry a signal, so libp2p's limit would not
+	 *   otherwise reach them. Unlike the other two, it is checked: a value that is not a finite number
+	 *   above zero, or is above 2^31 − 1, throws at node construction. libp2p would take `0` and fail
+	 *   every signal-less dial at once; FRET refuses it.
 	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
 	 *   (encryption + muxer) before this node discards it.
 	 * - `addressDialTimeout` — how long one address of a peer may take to connect, inside any dial,
@@ -757,6 +761,8 @@ export async function createLibp2pNodeBase(
 	// throws, and there is nothing yet to release. Every network deadline below is read off this one result.
 	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs, options.rpcDeadlines);
 	const bootstrapContactTimeoutMs = resolveBootstrapContactTimeoutMs(options.bootstrapContactTimeoutMs, linkDeadlines);
+	// One value for libp2p's connection manager and FRET's maintenance redial, so the two cannot drift.
+	const libp2pDialTimeoutMs = resolveLibp2pDialTimeoutMs(options.connectionManager?.dialTimeout, linkDeadlines);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 	const kvStore = resolveKvStore(options.kvStore);
@@ -903,7 +909,7 @@ export async function createLibp2pNodeBase(
 			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
 			// with libp2p. Both ends: every node is someone's listener.
 			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.inboundUpgradeTimeoutMs,
-			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.libp2pDialTimeoutMs,
+			dialTimeout: libp2pDialTimeoutMs,
 			// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
 			// a relayed connection open on a slow link whatever the dial's own deadline said.
 			addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
@@ -1092,6 +1098,8 @@ export async function createLibp2pNodeBase(
 					capacity: 2048,
 					profile: options.fretProfile ?? ((options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge'),
 					networkName: options.networkName,
+					// FRET dials with a signal, so libp2p's `dialTimeout` never bounds its redials; this does.
+					dialTimeoutMs: libp2pDialTimeoutMs,
 					// NOTE: FRET's `seedFromBootstraps` seeds the FIRST `/p2p/` id of each entry, so a partner's circuit
 					// address (`<relay>/p2p/<relay>/p2p-circuit/p2p/<partner>`) seeds the relay, not the partner. Harmless
 					// today: the partner is learned once its connection opens, and the relay is classified foreign. If a
