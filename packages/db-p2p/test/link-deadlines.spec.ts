@@ -111,7 +111,9 @@ describe('resolveLibp2pDialTimeoutMs', () => {
 	});
 
 	// `0` is what libp2p alone would accept; FRET's maintenance redial takes the same value and refuses it.
-	for (const declared of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 31]) {
+	// 2^31 is this field's own ceiling. The other non-positive and non-finite values share
+	// `validDeclaredMs` with the `rpcDeadlines` fields, which are tested below.
+	for (const declared of [0, 2 ** 31]) {
 		it(`throws on ${String(declared)}, naming connectionManager.dialTimeout`, () => {
 			expect(() => resolveLibp2pDialTimeoutMs(declared, deadlines)).to.throw(/connectionManager\.dialTimeout must be a finite number/);
 		});
