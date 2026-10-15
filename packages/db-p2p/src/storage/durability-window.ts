@@ -85,8 +85,9 @@ export function durabilityWindowMs(cohortSize: number, policy: DurabilityWindowP
 	if (!policy.independentFailures) {
 		return 0;
 	}
-	const n = Math.min(cohortSize, policy.declaredCohortSize);
-	if (n <= 1) {
+	// A malformed size (NaN, fractional) falls to the strict answer rather than a NaN or fractional-cohort window.
+	const n = Math.min(Math.floor(cohortSize), policy.declaredCohortSize);
+	if (!Number.isFinite(n) || n <= 1) {
 		return 0;
 	}
 	const approvals = Math.ceil(policy.superMajorityThreshold * n);
