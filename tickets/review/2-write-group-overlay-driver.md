@@ -4,6 +4,13 @@ architecture: packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-
 files: packages/db-p2p/src/storage/batch-backend.ts, packages/db-p2p/src/storage/write-group.ts, packages/db-p2p/src/storage/write-group-driver.ts, packages/db-p2p/src/testing/memory-batch-backend.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/with-read-cache.ts, packages/db-p2p/src/testing/raw-storage-conformance.ts, packages/db-p2p/src/index.ts, packages/db-p2p/src/rn.ts, packages/db-p2p/src/testing/index.ts, packages/db-p2p/test/write-group-driver.spec.ts, packages/db-p2p/docs/storage.md, docs/debugging.md
 difficulty: hard
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-15T21:29:57.612Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\2-write-group-overlay-driver.review.2026-10-15T21-29-57-612Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # Write-group overlay driver
 
