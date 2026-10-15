@@ -117,9 +117,8 @@ export async function openTestDb(): Promise<SqliteDb> {
 }
 
 /**
- * Open a fresh `SqliteDb` backed by a real file (under `:memory:` by default
- * but with `setReadOnly:false`), useful for tests that need to close and
- * reopen the same database. Returns the path so callers can reopen.
+ * Open a `SqliteDb` backed by the file at `path` (created if absent) with the
+ * Optimystic schema applied, for tests that close and reopen the same database.
  */
 export async function openTestFileDb(path: string): Promise<SqliteDb> {
 	const raw = new DatabaseSync(path);

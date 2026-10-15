@@ -1,5 +1,6 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { StoreIdentity } from "./store-identity.js";
+import type { StoreDurability } from "./store-durability.js";
 
 /**
  * Bytes-valued, per-logical-store driver surface. Each backend implements the
@@ -90,6 +91,37 @@ export interface RawStoreDriver {
 	promote(blockId: BlockId, actionId: ActionId): Promise<void>;
 
 	/**
+	 * Make every write that resolved before this call survive the crashes {@link durability} names.
+	 *
+	 * ### The flush contract
+	 *
+	 * Stated once, here; `IRawStorage.flush` and `IKVStore.flush` hold to the same five rules.
+	 *
+	 * 1. A write method resolves once its effect is visible to every later read in this process.
+	 * 2. Once a `flush()` called after the write resolved has itself resolved, the write survives
+	 *    every crash this store's `durability` names.
+	 * 3. **What survives any crash is a prefix of the resolved writes, in the order they resolved.**
+	 *    No write survives while one that resolved before it is lost. This is what keeps the
+	 *    crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid once writes stop being
+	 *    synced one at a time.
+	 * 4. A `flush()` covers every write resolved before it was called, including writes made by
+	 *    other callers; concurrent flushes may share one sync.
+	 * 5. A rejected `flush()` is a storage fault. After one, the store rejects every later write and
+	 *    flush until it is reopened, because a retried sync can report success for data the
+	 *    operating system already dropped.
+	 *
+	 * Required, not optional, so a wrapper that forgets to forward it does not type-check.
+	 */
+	flush(): Promise<void>;
+
+	/**
+	 * What a write survives once a `flush()` called after it has resolved (see {@link flush}).
+	 * Fixed at construction and never changes over the driver's life, like {@link storeIdentity}; a
+	 * wrapper reports the value of the driver it fronts. Required for the same reason as `flush`.
+	 */
+	readonly durability: StoreDurability;
+
+	/**
 	 * Optional — a stable, process-scoped string naming what this driver is backed by (a
 	 * resolved directory, an open database handle). Passed through by the kernel and by every
 	 * wrapper, so a cache and the storage it fronts name the same store.
@@ -145,4 +177,7 @@ export interface RawStoreDriver {
 	// on purpose, and says why at its site), and each has direct tests. If a THIRD wrapper driver
 	// appears, replace the per-wrapper tests with one shared conformance check that asserts
 	// forwarding of each optional, with an explicit per-wrapper exception list.
+	// `flush` and `durability` are REQUIRED for exactly that reason: a wrapper that forgot `flush`
+	// would resolve a flush without reaching the store underneath, and one that forgot
+	// `durability` would leave the composition's guarantee unstated, so the type checker refuses both.
 }

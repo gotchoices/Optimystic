@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import type { BlockId, ActionId } from "@optimystic/db-core";
-import { KvRawStorage, type RawStoreDriver, type StoreIdentity } from "@optimystic/db-p2p";
+import { KvRawStorage, type RawStoreDriver, type StoreDurability, type StoreIdentity } from "@optimystic/db-p2p";
 import { createLogger } from './logger.js';
 import { atomicWriteFile } from './atomic-write.js';
 
@@ -57,6 +57,19 @@ function isParseableJson(bytes: Uint8Array): boolean {
  * the legacy raw-colon read fallback + win32 guards, and rename-based promote.
  */
 export class FileStoreDriver implements RawStoreDriver {
+	/**
+	 * Every value is fsynced, file and directory, as `atomicWriteFile` writes it, so each write is
+	 * already as durable as this driver makes it by the time it resolves.
+	 *
+	 * NOTE: renames and unlinks are NOT directory-synced — `promote`'s rename, and the unlinks behind
+	 * `deletePending` / `deleteMaterialized` — so a power cut can lose a promote or a delete while
+	 * keeping the metadata write after it, which breaks the flush contract's prefix rule
+	 * (`RawStoreDriver.flush`) for those two kinds of write. On win32 no directory is synced at all
+	 * (`fsyncDir` in `atomic-write.ts` skips it there). `file-storage-pays-one-fsync-per-write-group`
+	 * closes that.
+	 */
+	readonly durability: StoreDurability = 'power-loss';
+
 	private readonly identity: StoreIdentity;
 
 	constructor(private readonly basePath: string) {
@@ -284,6 +297,13 @@ export class FileStoreDriver implements RawStoreDriver {
 				log('promote rename failed for %s/%s - %o', blockId, actionId, err);
 				throw err;
 			});
+	}
+
+	// --- flush ---
+
+	// No-op: each write already waited for its own fsync before resolving (see `durability`).
+	flush(): Promise<void> {
+		return Promise.resolve();
 	}
 
 	// --- optional passthroughs ---

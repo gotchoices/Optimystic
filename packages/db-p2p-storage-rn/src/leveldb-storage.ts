@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
 import { drain, type LevelDBLike } from './leveldb-like.js';
 import {
 	TAG_PENDING,
@@ -34,6 +34,10 @@ const log = createLogger('storage:leveldb');
  * consumer's `await`), and the single `WriteBatch` that makes `promote` atomic.
  */
 export class LevelDBStoreDriver implements RawStoreDriver {
+	// LevelDB's default write options hand each write to the operating system without syncing it,
+	// so a write survives this process crashing but not an operating-system crash or power cut.
+	readonly durability: StoreDurability = 'process-crash';
+
 	// NOTE: identity is the HANDLE object, so two handles opened over the same LevelDB PATH read
 	// as two identities. Resolving that would mean naming the underlying on-disk path, which
 	// `LevelDBLike` does not expose. The package opener (`rn-opener.ts`) hands out one handle per
@@ -157,6 +161,14 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 			.put(tKey, value)
 			.delete(pKey)
 			.write();
+	}
+
+	// --- flush ---
+
+	// No-op: no write here asks LevelDB to sync, so there is nothing for a flush to wait on yet.
+	// `mobile-and-browser-storage-keep-the-durability-window` gives it real work.
+	flush(): Promise<void> {
+		return Promise.resolve();
 	}
 
 	// --- optional passthroughs ---

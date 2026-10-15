@@ -14,7 +14,22 @@ import { withBlockWriteLatch } from '../storage/block-latch.js';
  */
 export interface ConformanceHarness {
 	storage: IRawStorage;
+	/** Release everything the case used: the location, and the handle `reopen` returned if it ran. */
 	cleanup: () => Promise<void>;
+	/**
+	 * Close whatever the current storage holds open and return a fresh storage over the same
+	 * location. Required — and read only — when the suite is registered `{ persistent: true }`.
+	 */
+	reopen?: () => Promise<IRawStorage>;
+}
+
+/** How a backend's suite is registered; see {@link runRawStorageConformance}. */
+export interface ConformanceOptions {
+	/**
+	 * The backend keeps what it stores across a reopen. Registers the flush-then-reopen case, which
+	 * fails (rather than skipping) when the harness supplies no `reopen`.
+	 */
+	persistent?: true;
 }
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -69,10 +84,15 @@ async function collect<T>(iter: AsyncIterable<T>): Promise<T[]> {
  * error, drain-before-yield iteration, and a `BlockStorage`-level slice that
  * guards the `meta.ranges` open-ended seeding invariant, tombstone read-back,
  * and the exact id population `listBlockIds` yields on the node path.
+ *
+ * A backend that keeps its data across a reopen passes `{ persistent: true }`, which adds the
+ * flush contract's durability case: every write resolved before `flush()` is read back by a fresh
+ * store over the same location.
  */
 export function runRawStorageConformance(
 	name: string,
-	makeStorage: () => Promise<ConformanceHarness>
+	makeStorage: () => Promise<ConformanceHarness>,
+	options: ConformanceOptions = {}
 ): void {
 	describe(name, () => {
 		let harness: ConformanceHarness;
@@ -561,5 +581,49 @@ export function runRawStorageConformance(
 			// The prior revision still materializes.
 			expect((await bs.getBlock(1))?.block.header.id, 'rev 1 still serves the live block').to.equal('parity-tombstone');
 		});
+
+		// --- Flush (persistent backends only) ---
+
+		if (options.persistent) {
+			it('every write resolved before flush() is read back by a fresh store over the same location', async () => {
+				if (!harness.reopen) {
+					throw new Error(`${name} is registered { persistent: true } but its harness supplies no reopen()`);
+				}
+				const blockId = 'flush-block' as BlockId;
+				const promoted = 'flush-promoted' as ActionId;
+				const deleted = 'flush-deleted' as ActionId;
+				const committed = 'flush-committed' as ActionId;
+				const removed = 'flush-removed' as ActionId;
+				const meta: BlockMetadata = { ranges: [[1]], latest: { rev: 1, actionId: committed } };
+				const block = makeBlock('flush-block', { items: ['kept'] });
+				const proof = makeProof('flush');
+
+				await storage.saveMetadata(blockId, meta);
+				await storage.saveRevision(blockId, 1, committed);
+				await storage.savePendingTransaction(blockId, promoted, { insert: makeBlock('promoted') });
+				await storage.savePendingTransaction(blockId, deleted, { insert: makeBlock('deleted') });
+				await storage.promotePendingTransaction(blockId, promoted);
+				await storage.deletePendingTransaction(blockId, deleted);
+				await storage.saveTransaction(blockId, committed, { insert: block });
+				await storage.saveBlockProof(blockId, 1, proof);
+				await storage.saveMaterializedBlock(blockId, committed, block);
+				await storage.saveMaterializedBlock(blockId, removed, makeBlock('removed'));
+				await storage.saveMaterializedBlock(blockId, removed);
+				await storage.flush();
+
+				const reopened = await harness.reopen();
+
+				expect(await reopened.getMetadata(blockId), 'metadata').to.deep.equal(meta);
+				expect(await reopened.getRevision(blockId, 1), 'revision').to.equal(committed);
+				expect(await reopened.getTransaction(blockId, promoted), 'promoted pending is committed').to.deep.equal({ insert: makeBlock('promoted') });
+				expect(await reopened.getPendingTransaction(blockId, promoted), 'promoted pending left the pending store').to.equal(undefined);
+				expect(await reopened.getPendingTransaction(blockId, deleted), 'deleted pending').to.equal(undefined);
+				expect(await collect(reopened.listPendingTransactions(blockId)), 'pending store is empty').to.deep.equal([]);
+				expect(await reopened.getTransaction(blockId, committed), 'committed transaction').to.deep.equal({ insert: block });
+				expect(await reopened.getBlockProof(blockId, 1), 'proof').to.deep.equal(proof);
+				expect(await reopened.getMaterializedBlock(blockId, committed), 'materialized block').to.deep.equal(block);
+				expect(await reopened.getMaterializedBlock(blockId, removed), 'deleted materialized block').to.equal(undefined);
+			});
+		}
 	});
 }

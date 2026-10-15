@@ -13,15 +13,17 @@ import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
 // behaves identically to every other backend — round-trips, listRevisions
 // ordering, promote atomicity + missing-pend error, clone-on-store/read (now
 // structural via the byte boundary), drain-before-yield, and the BlockStorage
-// parity slice. Each case gets a fresh temp dir that cleanup rm -rf's.
+// parity slice. Each case gets a fresh temp dir that cleanup rm -rf's; reopen is a
+// second FileRawStorage over the same dir (the fs backend holds no handle to close).
 // ---------------------------------------------------------------------------
 runRawStorageConformance('FileSystem', async (): Promise<ConformanceHarness> => {
 	const base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-conformance-'));
 	return {
 		storage: new FileRawStorage(base),
+		reopen: async () => new FileRawStorage(base),
 		cleanup: async () => { await fs.rm(base, { recursive: true, force: true }); }
 	};
-});
+}, { persistent: true });
 
 // ---------------------------------------------------------------------------
 // fs-only tests the shared suite cannot cover: atomic-write / torn-file

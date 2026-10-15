@@ -10,6 +10,7 @@ import { CachedRawStorage, RawStorageDriverAdapter } from '../src/storage/cached
 import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
 import { withReadCache } from '../src/storage/with-read-cache.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
+import type { StoreDurability } from '../src/storage/store-durability.js';
 import {
 	CountingStoreDriver, identifiedDriver, READ_METHODS, WRITE_METHODS,
 	makeBlock, collect, runColdStartWorkload,
@@ -75,6 +76,8 @@ class GatedStoreDriver implements RawStoreDriver {
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
 	promote(blockId: BlockId, actionId: ActionId) { return this.inner.promote(blockId, actionId); }
+	flush() { return this.inner.flush(); }
+	get durability(): StoreDurability { return this.inner.durability; }
 
 	async *listPendingActionIds(blockId: BlockId): AsyncIterable<ActionId> {
 		this.listCalls++;
@@ -121,6 +124,8 @@ class FaultyStoreDriver implements RawStoreDriver {
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
 	promote(blockId: BlockId, actionId: ActionId) { return this.inner.promote(blockId, actionId); }
+	flush() { return this.inner.flush(); }
+	get durability(): StoreDurability { return this.inner.durability; }
 }
 
 // --- Full backend-parity conformance over BOTH cached compositions ---

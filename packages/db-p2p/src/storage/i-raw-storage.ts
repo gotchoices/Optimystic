@@ -2,6 +2,7 @@ import type { BlockId, ActionId, ActionRev, Transform, IBlock } from "@optimysti
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockMetadata } from "./struct.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { StoreDurability } from "./store-durability.js";
 
 export interface IRawStorage {
 	// Metadata operations
@@ -40,6 +41,21 @@ export interface IRawStorage {
 
 	// Promote a pending action to a committed action
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void>;
+
+	/**
+	 * Make every write that resolved before this call survive the crashes {@link durability} names.
+	 * Holds to the flush contract stated in full on `RawStoreDriver.flush`
+	 * (`packages/db-p2p/src/storage/raw-store-driver.ts`). Required, not optional, so a wrapper that
+	 * forgets to forward it does not type-check.
+	 */
+	flush(): Promise<void>;
+
+	/**
+	 * What a write survives once a `flush()` called after it has resolved. Fixed at construction and
+	 * never changes over the storage's life, like {@link getStoreIdentity}; a wrapper reports the value
+	 * of the storage it fronts. Required for the same reason as `flush`.
+	 */
+	readonly durability: StoreDurability;
 
 	/**
 	 * A stable, process-scoped string naming what this storage is ultimately backed by (a

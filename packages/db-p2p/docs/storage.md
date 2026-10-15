@@ -28,7 +28,7 @@ of this doc) is complete.
 
 ## Invariants
 
-These five properties are what make it safe to build another layer (e.g. a
+These six properties are what make it safe to build another layer (e.g. a
 cache) over `IRawStorage`. Each entry states the rule, where it's enforced, and
 what breaks if it's violated.
 
@@ -179,7 +179,7 @@ stops a future host from embedding two nodes over one path.
 **Violate it and:** Invariant 1 breaks silently. A second process writing to the
 same backend produces writes that never funnel through the first process's
 `IRawStorage`, so any in-process cache the first process keeps — including one
-built over this document's other four invariants — serves stale data, potentially
+built over this document's other invariants — serves stale data, potentially
 into a consensus decision.
 
 **For embedders:** wire exactly one `IRawStorage` instance (one
@@ -205,6 +205,63 @@ carry:
   So equality proves sameness; inequality proves nothing. A consumer may merge on
   equality, but must never treat inequality as proof that two stores are distinct.
   Each backend's `NOTE:` states its own gaps.
+
+### 6. A write survives a crash once a `flush()` called after it has resolved
+
+Every `RawStoreDriver` and every `IRawStorage` has a `flush()` and a `durability`. The
+durability (`StoreDurability` in `packages/db-p2p/src/storage/store-durability.ts`) names
+which crashes a flushed write survives: `'none'` (nothing survives a restart),
+`'process-crash'` (this process crashing, but not an operating-system crash or power cut)
+or `'power-loss'` (a power cut or operating-system crash too). It is fixed when the store is
+constructed and never changes. Both members are required, so a wrapper that forgets to
+forward either does not compile. `IKVStore` has an optional `flush` instead, because hosts
+implement that interface outside this repository; absent means every write is already as
+durable as it will ever be when it resolves.
+
+The contract, stated in full on `RawStoreDriver.flush` in
+`packages/db-p2p/src/storage/raw-store-driver.ts`:
+
+1. A write method resolves once its effect is visible to every later read in this process.
+2. Once a `flush()` called after the write resolved has itself resolved, the write survives
+   every crash this store's `durability` names.
+3. **What survives any crash is a prefix of the resolved writes, in the order they
+   resolved.** No write survives while one that resolved before it is lost.
+4. A `flush()` covers every write resolved before it was called, including writes made by
+   other callers; concurrent flushes may share one sync.
+5. A rejected `flush()` is a storage fault. After one, the store rejects every later write
+   and flush until it is reopened, because a retried sync can report success for data the
+   operating system already dropped.
+
+Rule 3 is what keeps the crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid
+once a backend stops syncing each write on its own. Rules 4 and 5 bind a backend whose flush
+does real work; no backend's does yet, so every one satisfies them trivially:
+
+| Driver | What a write waits for today | What `flush()` does | `durability` |
+|---|---|---|---|
+| `MemoryStoreDriver` | the in-memory map update | nothing | `'none'` |
+| `FileStoreDriver` (`packages/db-p2p-storage-fs/src/file-storage.ts`) | an fsync of the new file, its rename into place, then an fsync of its directory (skipped on win32) | nothing | `'power-loss'`, with the gap below |
+| `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | `'process-crash'` |
+| `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | `'process-crash'` |
+| `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | `'process-crash'` |
+
+The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStorage` with every
+storage class built on it — report the durability of what they wrap and flush by flushing
+it. The cache is write-through and holds no dirty state, so flushing it is flushing the
+driver underneath.
+
+**The file backend's gap.** Renames and unlinks are not directory-synced: `promote`'s rename,
+and the unlinks behind deleting a pending or a materialized record. A power cut can therefore
+lose a promote or a delete while keeping the metadata write that followed it, which rule 3
+forbids. The `NOTE:` at `FileStoreDriver` records it.
+
+**Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
+channel at start-up naming what the resolved storage's flushed writes survive
+(`logStorageDurability` in `packages/db-p2p/src/libp2p-node-base.ts`).
+
+Every persistent backend's conformance suite registers `{ persistent: true }`, which adds a
+case that flushes a write of every kind and reads each back through a fresh store over the
+same location (`runRawStorageConformance` in
+`packages/db-p2p/src/testing/raw-storage-conformance.ts`).
 
 ## Core Components
 
@@ -258,6 +315,7 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 - **Transaction Storage**: Both pending and committed transactions
 - **Block Materialization**: Storing and retrieving materialized blocks
 - **Revision Management**: Mapping revisions to transaction IDs
+- **Durability**: `flush()` makes every write resolved before it survive the crashes the store's fixed `durability` names (Invariant 6 above)
 
 ### 4. File-based Storage (`FileRawStorage`)
 

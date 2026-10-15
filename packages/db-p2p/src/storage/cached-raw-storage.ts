@@ -5,6 +5,7 @@ import { KvRawStorage } from "./kv-raw-storage.js";
 import { CachedStoreDriver } from "./cached-store-driver.js";
 import type { SharedCachePool } from "./shared-cache-pool.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -34,7 +35,11 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	storeIdentity?: () => StoreIdentity;
 	readCached?: true;
 
+	/** The wrapped storage's; this adapter only re-encodes values and adds no durability of its own. */
+	readonly durability: StoreDurability;
+
 	constructor(private readonly inner: IRawStorage) {
+		this.durability = inner.durability;
 		if (inner.getStoreIdentity) {
 			this.storeIdentity = () => inner.getStoreIdentity!();
 		}
@@ -153,6 +158,12 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 
 	async promote(blockId: BlockId, actionId: ActionId): Promise<void> {
 		await this.inner.promotePendingTransaction(blockId, actionId);
+	}
+
+	// --- flush ---
+
+	flush(): Promise<void> {
+		return this.inner.flush();
 	}
 }
 

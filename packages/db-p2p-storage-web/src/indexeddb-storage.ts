@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
 import type { OptimysticWebDBHandle } from './db.js';
 import { createLogger } from './logger.js';
 
@@ -17,6 +17,11 @@ const log = createLogger('storage:indexeddb');
  * yielding), and the single `readwrite` transaction that makes `promote` atomic.
  */
 export class IndexedDBStoreDriver implements RawStoreDriver {
+	// Each write is one implicit transaction at the default durability, which current browsers
+	// treat as relaxed: it commits once the browser has the data, before the disk does. So a write
+	// survives the page or browser process crashing but not an operating-system crash or power cut.
+	readonly durability: StoreDurability = 'process-crash';
+
 	// NOTE: identity is the HANDLE object, so two handles opened over the same IndexedDB database
 	// NAME read as two identities. Resolving that would mean naming the underlying database,
 	// which `OptimysticWebDBHandle` does not expose. The package opener (`db.ts`) hands out one
@@ -161,6 +166,14 @@ export class IndexedDBStoreDriver implements RawStoreDriver {
 		await transactionsStore.put(value, key);
 		await pendingStore.delete(key);
 		await tx.done;
+	}
+
+	// --- flush ---
+
+	// No-op: no transaction here asks for strict durability, so there is nothing for a flush to
+	// wait on yet. `mobile-and-browser-storage-keep-the-durability-window` gives it real work.
+	flush(): Promise<void> {
+		return Promise.resolve();
 	}
 
 	// --- optional passthroughs ---

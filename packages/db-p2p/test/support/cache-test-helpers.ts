@@ -3,6 +3,7 @@ import type { BlockId, ActionId, IBlock, Transforms } from '@optimystic/db-core'
 import type { RawStoreDriver } from '../../src/storage/raw-store-driver.js';
 import type { IRawStorage } from '../../src/storage/i-raw-storage.js';
 import type { StoreIdentity } from '../../src/storage/store-identity.js';
+import type { StoreDurability } from '../../src/storage/store-durability.js';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 import { BlockStorage } from '../../src/storage/block-storage.js';
 
@@ -135,6 +136,13 @@ export class CountingStoreDriver implements RawStoreDriver {
 	async promote(blockId: BlockId, actionId: ActionId): Promise<void> {
 		this.bump('promote');
 		return this.inner.promote(blockId, actionId);
+	}
+	async flush(): Promise<void> {
+		this.bump('flush');
+		return this.inner.flush();
+	}
+	get durability(): StoreDurability {
+		return this.inner.durability;
 	}
 }
 

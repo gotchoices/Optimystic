@@ -97,6 +97,12 @@ into; keys stay TEXT/INTEGER.
 Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = OFF`.
 Schema is versioned via `PRAGMA user_version`.
 
+Under `synchronous = NORMAL` a WAL commit does not wait for the disk, so
+`SqliteRawStorage` reports `durability: 'process-crash'`: a write survives the
+app's process crashing, but not an operating-system crash or power cut. Its
+`flush()` is a no-op today. See
+[storage.md §6](../db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
+
 `listRevisions` and `listPendingTransactions` issue bounded
 `SELECT … ORDER BY` queries — never `SELECT * FROM <table>` + JS filter —
 so list latency stays bounded as the tables grow.

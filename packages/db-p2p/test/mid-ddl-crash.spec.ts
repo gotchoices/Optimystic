@@ -3,6 +3,7 @@ import { Tree, type ITransactor, type BlockId, type ActionId, type IBlock, type 
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshOptions } from '../src/testing/mesh-harness.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
+import type { StoreDurability } from '../src/storage/store-durability.js';
 import type { BlockMetadata } from '../src/storage/struct.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
 
@@ -142,6 +143,12 @@ class CrashingRawStorage implements IRawStorage {
 	}
 	promotePendingTransaction(blockId: BlockId, actionId: ActionId) {
 		return this.invoke('promotePendingTransaction', [blockId, actionId], blockId, actionId, () => this.inner.promotePendingTransaction(blockId, actionId));
+	}
+	flush() {
+		return this.invoke('flush', [], undefined, undefined, () => this.inner.flush());
+	}
+	get durability(): StoreDurability {
+		return this.inner.durability;
 	}
 }
 

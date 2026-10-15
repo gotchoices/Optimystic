@@ -1,6 +1,9 @@
 import { expect } from 'chai';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { SqliteRawStorage } from '../src/sqlite-storage.js';
-import { openTestDb } from './node-sqlite-driver.js';
+import { openTestDb, openTestFileDb } from './node-sqlite-driver.js';
 import type { SqliteDb } from '../src/db.js';
 import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId } from '@optimystic/db-core';
@@ -13,15 +16,26 @@ import type { BlockMetadata } from '@optimystic/db-p2p';
 // clone-on-store/read (structural via the byte boundary), drain-before-yield
 // iteration, and the BlockStorage parity slice. Runs against `node:sqlite`;
 // production is NativeScript SQLite, both satisfy `SqliteDb`. Each case gets a
-// fresh in-memory db that cleanup closes.
+// fresh file-backed db in its own temp dir, so reopen can close it and open the
+// same file again; cleanup closes whichever handle is open and removes the dir.
 // ---------------------------------------------------------------------------
 runRawStorageConformance('SQLite', async (): Promise<ConformanceHarness> => {
-	const db = await openTestDb();
+	const dir = await mkdtemp(join(tmpdir(), 'optimystic-sqlite-conformance-'));
+	const file = join(dir, 'optimystic.db');
+	let db = await openTestFileDb(file);
 	return {
 		storage: new SqliteRawStorage(db),
-		cleanup: async () => { await db.close(); }
+		reopen: async () => {
+			await db.close();
+			db = await openTestFileDb(file);
+			return new SqliteRawStorage(db);
+		},
+		cleanup: async () => {
+			await db.close();
+			await rm(dir, { recursive: true, force: true });
+		}
 	};
-});
+}, { persistent: true });
 
 // ---------------------------------------------------------------------------
 // SQLite-only tests the shared suite does not cover: the value columns are BLOB

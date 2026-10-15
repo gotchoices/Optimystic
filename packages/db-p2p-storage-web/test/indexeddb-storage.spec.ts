@@ -8,8 +8,12 @@ import type { BlockId, ActionId } from '@optimystic/db-core';
 
 let dbCounter = 0;
 
+function freshDbName(): string {
+	return `optimystic-idb-test-${++dbCounter}-${Math.random().toString(36).slice(2)}`;
+}
+
 async function freshDb(): Promise<OptimysticWebDBHandle> {
-	return openOptimysticWebDb(`optimystic-idb-test-${++dbCounter}-${Math.random().toString(36).slice(2)}`);
+	return openOptimysticWebDb(freshDbName());
 }
 
 // ---------------------------------------------------------------------------
@@ -19,15 +23,22 @@ async function freshDb(): Promise<OptimysticWebDBHandle> {
 // clone-on-store/read (structural via the byte boundary), drain-before-yield
 // iteration, and a BlockStorage parity slice. Runs against `fake-indexeddb`;
 // production is the browser, both satisfy the handle interface. Each case gets a
-// fresh, uniquely-named db that cleanup closes.
+// fresh, uniquely-named db that cleanup closes; reopen closes it and opens the same
+// name again through the package's own opener.
 // ---------------------------------------------------------------------------
 runRawStorageConformance('IndexedDB', async (): Promise<ConformanceHarness> => {
-	const db = await freshDb();
+	const name = freshDbName();
+	let db = await openOptimysticWebDb(name);
 	return {
 		storage: new IndexedDBRawStorage(db),
+		reopen: async () => {
+			db.close();
+			db = await openOptimysticWebDb(name);
+			return new IndexedDBRawStorage(db);
+		},
 		cleanup: async () => { db.close(); }
 	};
-});
+}, { persistent: true });
 
 // ---------------------------------------------------------------------------
 // IndexedDB-only tests the shared suite does not cover.

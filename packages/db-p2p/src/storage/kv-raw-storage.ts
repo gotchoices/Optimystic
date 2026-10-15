@@ -4,6 +4,7 @@ import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -36,7 +37,11 @@ export class KvRawStorage implements IRawStorage {
 	getStoreIdentity?: () => StoreIdentity;
 	readCached?: true;
 
+	/** Copied from the driver once, at construction — a store's durability never changes over its life. */
+	readonly durability: StoreDurability;
+
 	constructor(private readonly driver: RawStoreDriver) {
+		this.durability = driver.durability;
 		if (driver.storeIdentity) {
 			this.getStoreIdentity = () => driver.storeIdentity!();
 		}
@@ -163,5 +168,11 @@ export class KvRawStorage implements IRawStorage {
 
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		await this.driver.promote(blockId, actionId);
+	}
+
+	// --- Flush (what a flush does is the driver's; see RawStoreDriver.flush for the contract) ---
+
+	flush(): Promise<void> {
+		return this.driver.flush();
 	}
 }

@@ -124,7 +124,7 @@ The storage layer implements the core database abstractions over a pluggable raw
 
 - **StorageRepo**: Implements the `IRepo` interface on top of `BlockStorage` — backend-agnostic
 - **BlockStorage**: Provides versioned block storage with conflict resolution, reading/writing through an injected `IRawStorage`
-- **`IRawStorage`**: The raw persistence interface. An in-memory backend ships in this package; the filesystem backend (`FileRawStorage`) lives in `@optimystic/db-p2p-storage-fs`
+- **`IRawStorage`**: The raw persistence interface. An in-memory backend ships in this package; the filesystem backend (`FileRawStorage`) lives in `@optimystic/db-p2p-storage-fs`. Every backend reports a fixed `durability` — what a write survives once a later `flush()` has resolved: `'none'` for the in-memory backend, `'power-loss'` for the filesystem one, `'process-crash'` for the LevelDB, IndexedDB and SQLite ones — and a node logs it once at start-up. See [docs/storage.md §6](docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved)
 - **Data restoration**: Pluggable restoration for missing data from network peers
 
 ## Detailed Component Architecture

@@ -18,6 +18,7 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import type { StoreDurability } from './storage/store-durability.js';
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
@@ -685,6 +686,22 @@ function resolveStorage(provider: RawStorageProvider | undefined, networkName: s
 	return withReadCache(storage, `node:${networkName}`);
 }
 
+/** What a flushed write survives, phrased for an operator reading the node's start-up log. */
+const STORAGE_DURABILITY_LINES: Record<StoreDurability, string> = {
+	'none': 'storage: in memory — nothing written survives a restart',
+	'process-crash': 'storage: a flushed write survives this process crashing, but not an operating-system crash or power cut',
+	'power-loss': 'storage: a flushed write survives a power cut or operating-system crash',
+};
+
+/**
+ * Report, once at start-up, what the resolved storage's writes survive. Keep this the ONE line
+ * that says so: a later report about the same storage (a backend that cannot sync, say) extends
+ * this function rather than logging from somewhere else.
+ */
+function logStorageDurability(durability: StoreDurability): void {
+	wiringLog('%s', STORAGE_DURABILITY_LINES[durability]);
+}
+
 /**
  * Resolve the node's durable key-value store, beside {@link resolveStorage}. The memory fallback is
  * LOUD on purpose: a silent one would look like the under-replication ledger works and then fail the
@@ -765,6 +782,7 @@ export async function createLibp2pNodeBase(
 	const libp2pDialTimeoutMs = resolveLibp2pDialTimeoutMs(options.connectionManager?.dialTimeout, linkDeadlines);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
+	logStorageDurability(rawStorage.durability);
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
 

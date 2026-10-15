@@ -80,10 +80,20 @@ id form.
 
 ## Atomic writes
 
-Every write goes through `atomic-write.ts`: the new content is written to a
-`.tmp` sibling, then renamed over the canonical path. A crash mid-write
+Every value write goes through `atomic-write.ts`: the new content is written to
+a `.tmp` sibling, then renamed over the canonical path. A crash mid-write
 therefore leaves either the complete old file or the complete new file — never
 a partial/torn one.
+
+## Durability
+
+Each value write fsyncs the new file, and on POSIX its directory, before it
+resolves, so `FileRawStorage` reports `durability: 'power-loss'` and its
+`flush()` has nothing left to do. One gap: a promote (a rename) and the deletes
+of pending and materialized records (unlinks) are not directory-synced, so a
+power cut can lose one of those while keeping a later metadata write. Windows
+syncs no directory at all. See the `NOTE:` at `FileStoreDriver` and
+[storage.md §6](../db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
 
 ## Identity
 

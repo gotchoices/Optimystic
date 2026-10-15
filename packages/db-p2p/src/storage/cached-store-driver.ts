@@ -1,6 +1,7 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { StoreDurability } from "./store-durability.js";
 import {
 	defaultCachePool,
 	SharedCachePool,
@@ -208,6 +209,9 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 */
 	readonly readCached: true = true;
 
+	/** The inner driver's — this cache adds no durability of its own (see {@link flush}). */
+	readonly durability: StoreDurability;
+
 	constructor(
 		private readonly inner: RawStoreDriver,
 		private readonly pool: SharedCachePool = defaultCachePool(),
@@ -233,6 +237,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		// lets the pool refuse a second, permanently divergent view of it. Throws before anything else is
 		// wired; the half-built driver is never returned and holds nothing to clean up.
 		this.store = pool.registerStore(label, inner.storeIdentity?.());
+		this.durability = inner.durability;
 		if (inner.storeIdentity) {
 			this.storeIdentity = () => inner.storeIdentity!();
 		}
@@ -280,6 +285,14 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		this.clear();
 		this.pool.unregisterStore(this.store);
 		await this.inner.close?.();
+	}
+
+	/**
+	 * Flushing this wrapper is flushing the inner driver: the cache is write-through and holds no
+	 * dirty state, so every write it accepted already reached the inner driver.
+	 */
+	flush(): Promise<void> {
+		return this.inner.flush();
 	}
 
 	/** This store's live pool occupancy; pool-wide numbers come from `SharedCachePool.stats()`. */

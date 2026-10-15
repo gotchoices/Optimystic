@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreIdentity } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
 import type { SqliteDb, SqliteStatement } from './db.js';
 import { createLogger } from './logger.js';
 
@@ -23,6 +23,11 @@ const log = createLogger('storage:sqlite');
  * deadlock — see `st-nativescript-sqlite-transaction-mutex`).
  */
 export class SqliteStoreDriver implements RawStoreDriver {
+	// `applySchema` (`db.ts`) opens every database in WAL mode with `synchronous = NORMAL`, under
+	// which a commit does not wait for the disk: it survives this process crashing but not an
+	// operating-system crash or power cut.
+	readonly durability: StoreDurability = 'process-crash';
+
 	private readonly stmts: {
 		getMetadata: SqliteStatement;
 		saveMetadata: SqliteStatement;
@@ -195,6 +200,14 @@ export class SqliteStoreDriver implements RawStoreDriver {
 			await saveTransaction.run(blockId, actionId, row.value as Uint8Array);
 			await deletePending.run(blockId, actionId);
 		});
+	}
+
+	// --- flush ---
+
+	// No-op: nothing here checkpoints or syncs the write-ahead log, so there is nothing for a flush
+	// to wait on yet. `mobile-and-browser-storage-keep-the-durability-window` gives it real work.
+	flush(): Promise<void> {
+		return Promise.resolve();
 	}
 
 	// --- optional passthroughs ---

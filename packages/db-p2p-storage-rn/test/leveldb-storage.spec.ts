@@ -1,6 +1,7 @@
 import { expect } from 'chai';
 import { LevelDBRawStorage } from '../src/leveldb-storage.js';
-import { openTestDb, type TestDbHandle } from './classic-level-driver.js';
+import { openAtPath, openTestDb, type TestDbHandle } from './classic-level-driver.js';
+import type { LevelDBLike } from '../src/leveldb-like.js';
 import { makeProof, runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { ActionId, BlockHeader, BlockId, IBlock, Transform } from '@optimystic/db-core';
 
@@ -25,15 +26,25 @@ const makeTransform = (): Transform => ({ insert: makeBlock(blockId) });
 // clone-on-store/read (now structural via the byte boundary), drain-before-yield
 // iteration, and the BlockStorage parity slice. Runs against `classic-level`;
 // production uses `rn-leveldb`, both satisfy `LevelDBLike`. Each case gets a fresh
-// file-backed db in an isolated temp dir that cleanup closes and removes.
+// file-backed db in an isolated temp dir that cleanup closes and removes. reopen
+// closes the handle first: LevelDB holds a lock on its directory.
 // ---------------------------------------------------------------------------
 runRawStorageConformance('LevelDB', async (): Promise<ConformanceHarness> => {
 	const handle = await openTestDb();
+	let reopened: LevelDBLike | undefined;
 	return {
 		storage: new LevelDBRawStorage(handle.db),
-		cleanup: async () => { await handle.cleanup(); },
+		reopen: async () => {
+			await handle.db.close();
+			reopened = await openAtPath(handle.path);
+			return new LevelDBRawStorage(reopened);
+		},
+		cleanup: async () => {
+			await reopened?.close();
+			await handle.cleanup();
+		},
 	};
-});
+}, { persistent: true });
 
 // ---------------------------------------------------------------------------
 // LevelDB-only tests the shared suite does not cover: the tag-range byte-key
