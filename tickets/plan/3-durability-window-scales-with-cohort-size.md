@@ -1,5 +1,5 @@
 description: How long a node may leave a write unsynced is computed from how many machines would have to lose it together, so larger cohorts are more relaxed and a write held by one machine is synced before it is reported held. Decided by the maintainer 2026-10-15; build the policy, the window function and the background flush, and make docs/correctness.md Theorem 6 say what the code does.
-prereq: storage-flushes-once-per-write-group, file-storage-pays-one-fsync-per-write-group
+prereq: storage-flushes-once-per-write-group, file-store-checkpoint-and-shared-log
 architecture: docs/correctness.md#theorem-6-durability
 files: docs/correctness.md, packages/db-p2p/docs/storage.md, packages/db-p2p-storage-fs/src/atomic-write.ts, packages/db-p2p-storage-rn/src/rn-opener.ts, packages/db-p2p-storage-web/src/indexeddb-storage.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-core/src/network/struct.ts, packages/db-p2p/src/libp2p-node-base.ts, tickets/backlog/more-design/6.5-partition-healing.md, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/repo/kv-under-replication-ledger.ts, packages/db-p2p-storage-fs/src/file-storage.ts, packages/db-p2p-storage-fs/src/file-kv-store.ts, packages/db-p2p/readme.md
 ----
