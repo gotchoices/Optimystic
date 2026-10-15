@@ -27,6 +27,6 @@ Every call runs on a native thread and returns a promise; blobs are bound and re
 
 ## Interaction
 
-`mobile-and-browser-storage-lose-acknowledged-writes-on-power-loss` gives this backend a real `flush()` (a commit under `synchronous = FULL`, or one transaction per write group). Whichever lands second must keep the other's behaviour; one transaction or `batch()` per write group serves both.
+`mobile-and-browser-storage-keep-the-durability-window` gives this backend a real `flush()` (a commit under `synchronous = FULL`, or one transaction per write group). Whichever lands second must keep the other's behaviour; one transaction or `batch()` per write group serves both.
 
 The Node test driver (`test/node-sqlite-driver.ts`, over `node:sqlite`) stays the unit-test surrogate; the plugin itself is an uninstalled peer dependency in the Node test environment, so the migration needs a device or emulator check.

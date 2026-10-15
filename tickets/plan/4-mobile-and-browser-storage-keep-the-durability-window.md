@@ -1,9 +1,20 @@
-description: On phones and in browsers, a write the network has been told is saved can disappear if the device loses power or its operating system crashes within the next few seconds; if that device then writes alone before it reconnects, its copy of the data splits from its partner's for good.
-prereq: decide-what-a-node-must-have-on-disk-before-it-reports-holding-a-write, storage-flushes-once-per-write-group, file-storage-pays-one-fsync-per-write-group
+description: Phone and browser storage (React Native LevelDB, IndexedDB, NativeScript SQLite) never wait for the disk, and React Native cannot even ask to, so they cannot honour the durability window `durability-window-scales-with-cohort-size` computes, and LevelDB can lose an older write while keeping a newer one. Make each backend commit a write group as one atomic batch, keep write order across a power cut, sync by the window deadline where the backend can, and say plainly in the docs where it cannot yet.
+prereq: durability-window-scales-with-cohort-size, storage-flushes-once-per-write-group, file-storage-pays-one-fsync-per-write-group
 architecture: docs/correctness.md#theorem-6-durability
 files: packages/db-p2p/src/storage/raw-store-driver.ts, packages/db-p2p/src/storage/i-kv-store.ts, packages/db-p2p-storage-rn/src/rn-opener.ts, packages/db-p2p-storage-rn/src/leveldb-like.ts, packages/db-p2p-storage-rn/src/leveldb-storage.ts, packages/db-p2p-storage-rn/src/leveldb-kv-store.ts, packages/db-p2p-storage-rn/src/identity.ts, packages/db-p2p-storage-rn/test/leveldb-storage.spec.ts, packages/db-p2p-storage-web/src/db.ts, packages/db-p2p-storage-web/src/indexeddb-storage.ts, packages/db-p2p-storage-web/src/indexeddb-kv-store.ts, packages/db-p2p-storage-web/src/identity.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p-storage-ns/src/ns-opener.ts, packages/db-p2p-storage-ns/src/sqlite-storage.ts, packages/db-p2p-storage-ns/src/sqlite-kv-store.ts, packages/db-p2p-storage-ns/src/identity.ts, packages/db-p2p/src/testing/mesh-harness.ts, packages/db-p2p/src/storage/memory-store-driver.ts, packages/db-p2p/docs/storage.md
 repro: static
 ----
+
+## Decision (maintainer, 2026-10-15) — overrides this ticket where they differ
+
+Phones relax by the cohort-size formula in `durability-window-scales-with-cohort-size`, because they need to perform. So these backends do **not** sync every write group. What they must do:
+
+- Commit each write group as one atomic native batch (a LevelDB `WriteBatch`, one IndexedDB transaction, one SQLite transaction), so a crash never leaves half a group.
+- Keep write order across a power cut (what survives is a prefix), including LevelDB's log-switch case.
+- Sync by the group's window deadline, and at once when `w = 0` (sole holder), wherever the backend can: IndexedDB `durability: 'strict'` on that transaction; SQLite `synchronous = FULL` for that transaction or a checkpoint; React Native only once `gotchoices/rn-leveldb` offers a sync write. That binding is outside this repository: the plan files a `blocked/` report ticket naming the exact API needed.
+- Where a backend cannot, it logs once at start, and the per-backend table `durability-window-scales-with-cohort-size` adds to the docs states its actual guarantee.
+
+Read "Expected behaviour (under the decision's proposed answer)" below through this section.
 
 # Mobile and browser storage lose acknowledged writes on power loss
 

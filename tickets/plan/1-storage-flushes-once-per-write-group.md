@@ -5,14 +5,14 @@ files: packages/db-p2p/src/storage/raw-store-driver.ts, packages/db-p2p/src/stor
 
 # Storage flushes once per write group
 
-Reported in GitHub #37 (kjeib). This ticket is the seam; `file-storage-pays-one-fsync-per-write-group` uses it to cut the file backend's cost, and `mobile-and-browser-storage-lose-acknowledged-writes-on-power-loss` uses it to make the other backends durable. It changes no backend's behaviour on disk.
+Reported in GitHub #37 (kjeib). This ticket is the seam; `file-storage-pays-one-fsync-per-write-group` uses it to cut the file backend's cost, and `mobile-and-browser-storage-keep-the-durability-window` uses it to make the other backends durable. It changes no backend's behaviour on disk.
 
 ## What is wrong now
 
 The storage interfaces have one durability rule, and it is implicit: a write is whatever the backend makes it at the moment the call resolves. That produces two opposite problems.
 
 1. **The file backend pays for durability once per file.** `atomicWriteFile` in `packages/db-p2p-storage-fs/src/atomic-write.ts` writes a temp file, fsyncs it, renames it, then fsyncs the directory, for every value it stores. A node applies one pend as two such writes per block (`BlockStorage.savePendingTransaction`: the metadata with the pending record's claim, then the record) and one commit as four per block (`StorageRepo.internalCommit`: the materialized block, the revision record, the metadata `BlockStorage.setLatest` writes, the commit proof), plus a rename and an unlink. That is twelve fsyncs per block per write, one after another; six to twelve blocks per small SQL transaction gives the 72–144 fsyncs per commit #37 counted (the block count is inferred from that match, not measured). `FileKVStore.set` adds two more per under-replication ledger entry.
-2. **The other three backends never wait for the disk**, and nothing lets the node ask them to (LevelDB with default write options, IndexedDB with default durability, SQLite with `synchronous = NORMAL`). See `decide-what-a-node-must-have-on-disk-before-it-reports-holding-a-write` for what that costs.
+2. **The other three backends never wait for the disk**, and nothing lets the node ask them to (LevelDB with default write options, IndexedDB with default durability, SQLite with `synchronous = NORMAL`). See `durability-window-scales-with-cohort-size` for what that costs.
 
 The writes already arrive in groups. Every write to block storage happens inside one of a few `StorageRepo` methods in `packages/db-p2p/src/storage/storage-repo.ts` — `pend`, `commit`, `cancel`, `saveReplicatedBlock`, `recoverBlock`, and the read-driven promotion and coverage restore inside `get` — or in `applyInvalidation` (`packages/db-p2p/src/dispute/invalidation.ts`), always under the block write latches, and the caller reports the outcome to other machines only after the method returns. The storage interfaces have no way to hear where a group ends.
 

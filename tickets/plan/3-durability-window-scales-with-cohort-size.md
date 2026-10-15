@@ -1,9 +1,32 @@
-description: The documentation promises that a machine reports holding a write only once it is safely on disk, but three of the four storage backends never wait for the disk, so a power cut can erase writes other machines were told were saved. Decide what a machine must have on disk before it says it holds a write, and whether a deployment may trade some of that for speed.
+description: How long a node may leave a write unsynced is computed from how many machines would have to lose it together, so larger cohorts are more relaxed and a write held by one machine is synced before it is reported held. Decided by the maintainer 2026-10-15; build the policy, the window function and the background flush, and make docs/correctness.md Theorem 6 say what the code does.
+prereq: storage-flushes-once-per-write-group, file-storage-pays-one-fsync-per-write-group
 architecture: docs/correctness.md#theorem-6-durability
-files: docs/correctness.md, packages/db-p2p/docs/storage.md, packages/db-p2p-storage-fs/src/atomic-write.ts, packages/db-p2p-storage-rn/src/rn-opener.ts, packages/db-p2p-storage-web/src/indexeddb-storage.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-core/src/network/struct.ts, packages/db-p2p/src/libp2p-node-base.ts, tickets/backlog/more-design/6.5-partition-healing.md
+files: docs/correctness.md, packages/db-p2p/docs/storage.md, packages/db-p2p-storage-fs/src/atomic-write.ts, packages/db-p2p-storage-rn/src/rn-opener.ts, packages/db-p2p-storage-web/src/indexeddb-storage.ts, packages/db-p2p-storage-ns/src/db.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/cluster-repo.ts, packages/db-core/src/network/struct.ts, packages/db-p2p/src/libp2p-node-base.ts, tickets/backlog/more-design/6.5-partition-healing.md, packages/db-p2p/src/storage/storage-repo.ts, packages/db-p2p/src/repo/kv-under-replication-ledger.ts, packages/db-p2p-storage-fs/src/file-storage.ts, packages/db-p2p-storage-fs/src/file-kv-store.ts, packages/db-p2p/readme.md
 ----
 
-**Blocked, category (a): the specification contradicts the code.** `docs/correctness.md` Theorem 6 says log entries are "written via batch write with fsync" and that an acknowledged write is held "in durable storage" by a majority of its cohort; three of the four storage backends make no write survive a power cut. Unblocks when the maintainer accepts or edits the proposed answer below. Raised by GitHub #37 (kjeib), which also asks for one deliberate decision across the fs, rn and web stores.
+## Decision (maintainer, 2026-10-15) — overrides the rest of this ticket where they differ
+
+"We don't have to get this perfect to start with; make sure the code and docs are consistent and get something built." So:
+
+1. **The window comes from theory, per write**: the formula and rules in "How the theory sets the loss window" below, with the proposed defaults accepted: `p` = one power cut or OS crash per machine per month, `ε` = one lost acknowledged write per 10^9, hard cap 5 s.
+2. **Independence is assumed by default.** A deployment can declare that its machines are *not* independent (for example two machines on one circuit), which makes every node strict (`w = 0`). This replaces rule 2 of "How the theory sets the loss window" (undeclared = strict): the maintainer wants relaxed behaviour, phones included, out of the box. Name the option in the plan (proposed: `NodeOptions.storageDurability: { independentFailures?: boolean (default true), lossRatePerHour?, lossTarget?, maxWindowMs? }`).
+3. **Two-member cohorts relax** by the formula like any other size.
+4. **Phones relax** by the formula, because they need to perform. Where a backend cannot sync at all yet (React Native, until `gotchoices/rn-leveldb` has a sync write), its window is "whenever the OS writes it"; the node logs that once at start and still starts, and the docs state each backend's real guarantee. Backend work is `mobile-and-browser-storage-keep-the-durability-window`.
+5. **`w = 0` wherever only one machine would hold the write** (`m = 1`: `CoordinatorRepo.pendSolo` / `commitSolo`, and the shortfall entry `noteReplicationShortfall` records), on every backend that can sync. This follows from the formula, not from a separate rule.
+6. **`WriteDurability` unchanged.** The docs say that each holder's copy reaches stable storage within the window its cohort allows.
+7. **Option F (relaxed nodes refuse to write alone) is not adopted.** The fork case stays documented, owned by backlog `partition-healing`.
+8. **`allowDownsize`** is out of scope here; the docs-versus-code mismatch is `implement/5-allow-downsize-docs-match-the-lone-write-path`.
+
+Where the older "Proposed answer" below says strict by default with background flushing only on declaration, the decision above wins. The implementation notes from the former backlog ticket `feat-a-node-can-be-declared-to-flush-storage-in-the-background` are appended at the end ("Implementation notes"); read their `maxLossMs` as the computed `w`, and their "declared" mode as the default.
+
+## TODO (plan stage)
+
+- Settle the option's name and shape, and write the window function's table (cohort sizes 1–10 at the defaults) into the docs.
+- Rewrite `docs/correctness.md` Theorem 6 and §1.2, and `packages/db-p2p/docs/storage.md`, to the decided policy, with a per-backend table of what each actually guarantees.
+- Split into implement tickets: (a) the pure window function and option resolution; (b) `StorageRepo` hands each group's deadline to `flush()` and the stores sync by the earliest deadline (file store first); (c) docs. Mobile and browser backends follow in `mobile-and-browser-storage-keep-the-durability-window`.
+
+
+**Was blocked (category (a): the specification contradicts the code); decided 2026-10-15, see "Decision" below.** `docs/correctness.md` Theorem 6 says log entries are "written via batch write with fsync" and that an acknowledged write is held "in durable storage" by a majority of its cohort; three of the four storage backends make no write survive a power cut. Unblocks when the maintainer accepts or edits the proposed answer below. Raised by GitHub #37 (kjeib), which also asks for one deliberate decision across the fs, rn and web stores.
 
 ## Background
 
@@ -120,3 +143,35 @@ The parts of that, and what follows from each:
 - `storage-flushes-once-per-write-group` and `file-storage-pays-one-fsync-per-write-group` do not: they keep the file store's current guarantees and make them cheap.
 - `mobile-and-browser-storage-lose-acknowledged-writes-on-power-loss` (prereq on this ticket).
 - `feat-a-node-can-be-declared-to-flush-storage-in-the-background` (prereq on this ticket).
+
+
+## Implementation notes (from the former backlog ticket)
+
+The relaxed half of `decide-what-a-node-must-have-on-disk-before-it-reports-holding-a-write`; adjust to whatever that ticket settles. GitHub #37 asked for "a durability setting". The maintainer's direction (2026-10-15): "lean on theory — the more nodes in a cluster, the more relaxed we can be." So the loss window is not one declared number per node: it is computed per write from the cohort that write's consensus ran on, under a declared independence assumption (see that ticket's "How the theory sets the loss window").
+
+## What the mode is
+
+A deployment declares that its machines fail independently, with a per-machine failure rate and a loss target (shape and name per the decision; for example `NodeOptions.storageDurability: { independentFailures: true, lossRate, target }`). Undeclared, every node stays strict. Given the declaration:
+
+- For each write group, the node computes its allowed window `w` from the cohort the write's consensus ran on (`record.peers`, capped at the declared cohort size) with the decision ticket's formula, capped at a hard maximum. One pure function, unit-tested against the table the docs publish.
+- Writes become visible and survive a process crash when they resolve (every backend already reaches the OS by then), and survive a power cut within `w`.
+- `StorageRepo`'s end-of-group flush (from `storage-flushes-once-per-write-group`) becomes a request with a deadline of `w` rather than a wait: the method returns without awaiting the sync, and the store syncs before the earliest outstanding deadline.
+- `w = 0` (strict) wherever only one machine would hold the write: `CoordinatorRepo.pendSolo` and `commitSolo` in `packages/db-p2p/src/repo/coordinator-repo.ts`, the shortfall entry `noteReplicationShortfall` records for it, and any cohort the formula gives no window. This falls out of the formula (`m = 1`), not a separate rule.
+- The node's reports count toward `majority` and `full` like any other member's. `WriteDurability` is unchanged; the docs state what `full` means for a background-flushing member.
+- The node logs its mode and bound once at start.
+
+## Requirements and edge cases
+
+- **Prefix order is kept.** Background syncing must still leave a prefix after a power cut. The file log appends in order and syncs on a timer, which keeps it. LevelDB as vendored by `gotchoices/rn-leveldb` does not: written unsynced, groups left in a log file that LevelDB then switches away from are closed without a sync (`DBImpl::MakeRoomForWrite`), so a power cut can lose an older group while a newer one survives. A backend that cannot keep the prefix is not offered this mode until it can (for LevelDB, a sync of the old log at the switch, in the binding's vendored copy).
+- **Order across stores.** Two writes in different stores where the second describes the first — the executed marker `ClusterMember.handleConsensus` writes after an apply, a ledger entry after a commit — must not become durable in the wrong order. Under the default this holds because `StorageRepo` syncs before returning; here, either the stores share one log (the file store's shared log for a common base path) or the describing store syncs only after the described store has. Otherwise a power cut can keep an executed marker whose apply was lost, and the member then skips that transaction forever on redelivery.
+- **Bounded memory.** The file store's overlay holds up to `w` of writes; bound it by bytes as well and sync early when it fills.
+- **The loss window is a promise.** A sync that cannot keep up (a slow disk) must not let the window grow silently: log it, and sync on the write path once the backlog exceeds the bound.
+- **Mixed cohorts** (some members background, some not) need nothing special.
+- **The known hazard stays documented, not fixed here:** a background node that loses its last writes and then writes alone forks the collection (case 2 in the decision ticket). Whether to refuse solo writes in this mode is the decision's option F; the general fix for that forked state belongs to backlog `partition-healing` and `docs/crdt-sync.md`.
+- Applies per node, so a deployment can run its always-on servers in background mode and its phones under the default.
+
+## Verification
+
+- The power-loss storage double from `mobile-and-browser-storage-lose-acknowledged-writes-on-power-loss`, extended to sync on a timer: a background node that loses power loses at most the writes inside each one's window, always a suffix, and never a write it acknowledged as the only holder.
+- One test that a solo commit on a background node is synced before it is acknowledged.
+- `packages/db-p2p/readme.md` documents the option, and `docs/correctness.md` (Theorem 6, and §1.2's storage durability paragraph from the decision) states what the class means under it.
