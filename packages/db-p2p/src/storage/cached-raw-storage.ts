@@ -222,8 +222,9 @@ export class CachedRawStorage extends KvRawStorage {
 	 * Release this storage's cache registration with the shared pool (drops all entries,
 	 * retires the store id). Call when the workspace departs; a skipped dispose leaks only
 	 * cold entries the pool will evict under pressure, but the polite release keeps a
-	 * long-lived process's occupancy honest. `IRawStorage` itself has no close, so this is
-	 * the wrapper's own lifecycle method.
+	 * long-lived process's occupancy honest. The kernel also wires `close` here, from
+	 * `CachedStoreDriver.close`, and the two do the same thing; `dispose` is the name
+	 * `withReadCache`'s last lease release calls.
 	 */
 	async dispose(): Promise<void> {
 		await this.cacheDriver.close();

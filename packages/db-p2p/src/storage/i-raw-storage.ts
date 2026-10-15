@@ -131,4 +131,14 @@ export interface IRawStorage {
 	 * no seed — the monitors still populate over time via the live change feed.
 	 */
 	listBlockIds?(): AsyncIterable<BlockId>;
+
+	/**
+	 * Optional — flush whatever the storage still holds in memory and release what it holds open
+	 * (a log handle, a lock, a cache registration). The storage is not usable afterwards. Present
+	 * only when the storage really has something to close, under the same feature-detection rule as
+	 * `listBlockIds`: `KvRawStorage` wires it when its driver has one and never installs a stub, so
+	 * `typeof storage.close === 'function'` sees the backend's true capability. A host that was
+	 * handed a storage does not close it; the one that built it does.
+	 */
+	close?(): Promise<void>;
 }

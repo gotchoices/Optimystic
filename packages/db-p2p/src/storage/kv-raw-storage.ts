@@ -31,11 +31,13 @@ export class KvRawStorage implements IRawStorage {
 	 * for the same reason: it is set only when the driver reports a read cache at or below
 	 * itself, so `withReadCache` sees whether this composition is REALLY already cached
 	 * rather than inferring it from a concrete class name (see {@link IRawStorage.readCached}).
+	 * `close` likewise: only a driver with something to close gets one here.
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	getApproximateBytesUsed?: () => Promise<number>;
 	getStoreIdentity?: () => StoreIdentity;
 	readCached?: true;
+	close?: () => Promise<void>;
 
 	/** Copied from the driver once, at construction — a store's durability never changes over its life. */
 	readonly durability: StoreDurability;
@@ -53,6 +55,9 @@ export class KvRawStorage implements IRawStorage {
 		}
 		if (driver.readCached) {
 			this.readCached = true;
+		}
+		if (driver.close) {
+			this.close = () => driver.close!();
 		}
 	}
 

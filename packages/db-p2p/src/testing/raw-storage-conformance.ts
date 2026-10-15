@@ -17,8 +17,10 @@ export interface ConformanceHarness {
 	/** Release everything the case used: the location, and the handle `reopen` returned if it ran. */
 	cleanup: () => Promise<void>;
 	/**
-	 * Close whatever the current storage holds open and return a fresh storage over the same
-	 * location. Required — and read only — when the suite is registered `{ persistent: true }`.
+	 * Return a fresh storage over the same location. The suite has already called the current
+	 * storage's `close`, when it has one, so a backend that holds a group's writes in memory or a
+	 * handle open has let go of both. Required — and read only — when the suite is registered
+	 * `{ persistent: true }`.
 	 */
 	reopen?: () => Promise<IRawStorage>;
 }
@@ -610,6 +612,10 @@ export function runRawStorageConformance(
 				await storage.saveMaterializedBlock(blockId, removed, makeBlock('removed'));
 				await storage.saveMaterializedBlock(blockId, removed);
 				await storage.flush();
+				// Closed before the second store opens: over a backend that serves unflushed writes from
+				// memory, a second store opened beside the first would read the first's memory and prove
+				// nothing about what reached the location.
+				await storage.close?.();
 
 				const reopened = await harness.reopen();
 

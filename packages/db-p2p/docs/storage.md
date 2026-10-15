@@ -233,12 +233,15 @@ The contract, stated in full on `RawStoreDriver.flush` in
    operating system already dropped.
 
 Rule 3 is what keeps the crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid
-once a backend stops syncing each write on its own. Rules 4 and 5 bind a backend whose flush
-does real work; no backend's does yet, so every one satisfies them trivially:
+once a backend stops syncing each write on its own. Rules 4 and 5 bind a store whose flush
+does real work. No backend's does yet, so every backend satisfies them trivially; the one store
+whose flush is the sync is `WriteGroupDriver`, the wrapper the file backend is about to be
+rebuilt on (see *Writes that wait in memory* below):
 
 | Driver | What a write waits for today | What `flush()` does | `durability` |
 |---|---|---|---|
 | `MemoryStoreDriver` | the in-memory map update | nothing | `'none'` |
+| `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`, resolving when that has | the backend's |
 | `FileStoreDriver` (`packages/db-p2p-storage-fs/src/file-storage.ts`) | an fsync of the new file, its rename into place, then an fsync of its directory (skipped on win32) | nothing | `'power-loss'`, with the gap below |
 | `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | `'process-crash'` |
 | `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | `'process-crash'` |
@@ -248,6 +251,26 @@ The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStora
 storage class built on it — report the durability of what they wrap and flush by flushing
 it. The cache is write-through and holds no dirty state, so flushing it is flushing the
 driver underneath.
+
+**Writes that wait in memory.** `WriteGroupDriver` in
+`packages/db-p2p/src/storage/write-group-driver.ts` is a `RawStoreDriver` over a `BatchBackend`
+(`packages/db-p2p/src/storage/batch-backend.ts`): a backend with reads, listings and one write,
+`commit`, which applies a whole batch atomically and as durably as its `durability` says. Over
+this driver every write of every store — metadata, revisions, pending, transactions, proofs,
+materialized, and the two entries a promote records — resolves at once, recorded in an
+in-memory overlay that point reads consult first and listings merge over the backend's rows.
+`flush()` seals the writes recorded so far into one batch and resolves when the backend has
+committed it; batches commit one at a time, in sequence (rule 3), a flush arriving while a
+commit is in flight waits for it and then shares the next commit with every other flush that
+arrived meanwhile (rule 4), and a rejected commit latches the driver failed, after which every
+write and flush throws `StoreFailedError` (rule 5) while reads keep serving the overlay. The
+key-agnostic part — overlay, open batch, commit chain, failure latch and idle timer — is
+`WriteGroup` in `packages/db-p2p/src/storage/write-group.ts`, which `FileKVStore` will reuse
+over string keys. A write that no group flushes is flushed by the driver's own idle timer,
+`idleFlushMs` (default one second) after the first write of an open batch. `IRawStorage.close`,
+optional and wired by the kernel only when the driver has one, flushes once more and releases
+the backend; the conformance suite's reopen case closes the first store before opening the
+second, since a second store opened beside the first would otherwise read the first's memory.
 
 **The file backend's gap.** Renames and unlinks are not directory-synced: `promote`'s rename,
 and the unlinks behind deleting a pending or a materialized record. Nor is the parent of a
@@ -304,7 +327,8 @@ block (`materializeBlock` in `packages/db-p2p/src/storage/block-storage.ts`), wh
 recomputed and becomes durable with the next group's flush. `PersistentTransactionStateStore`
 (`packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`), wired only when a host
 passes `NodeOptions.transactionStateStore`, writes without waiting and promises nothing before
-it replies, so it is not flushed.
+it replies, so it is not flushed. Over `WriteGroupDriver` both wait in memory, like every other
+write, until the next group's flush or the driver's idle flush, whichever comes first.
 
 **Visible before durable (accepted).** Between a write resolving and its group's flush,
 readers in this process can see it, and through them other machines. What a read can expose
@@ -439,6 +463,12 @@ driver. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
 exported from the `./testing/conformance` entry — separate from `./testing` because
 it imports `chai`, which is a devDependency consumers never install) asserts every
 backend behaves identically against the shared kernel contract.
+
+A backend that would rather take its writes a group at a time supplies a `BatchBackend`
+(`packages/db-p2p/src/storage/batch-backend.ts`) instead of a driver and is composed as
+`KvRawStorage` over `WriteGroupDriver` over that backend; the suite runs that composition over
+the test-only `MemoryBatchBackend` (`packages/db-p2p/src/testing/memory-batch-backend.ts`). What
+the driver does is under Invariant 6, *Writes that wait in memory*.
 
 **File System Structure:**
 ```

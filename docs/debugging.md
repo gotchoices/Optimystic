@@ -155,6 +155,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `storage-repo`        | Pend/commit/cancel entry with action ids, revs and block counts, plus commit-proof digest mismatches, missing or unmaterializable bases, and stale-pending drops |
 | `block-storage`       | Block-level pend/commit/cancel, per-revision save/skip, prune, latest-revision recovery, and refused restores |
 | `block-archive`       | Serving archived revisions: pinned-read skips that refuse to mislabel content, and commit-proof lookup failures or claim mismatches |
+| `write-group`         | A write group's idle flush failing (`idle-flush-failed`, with the backend's reason): the store is latched failed and refuses every later write and flush until it is reopened |
 | `storage:restoration` | Block restoration coordination: per-block restore success/failure with elapsed ms, peer query failures, solo-node skips |
 | `block-transfer`      | Rebalance block movement: per-block push/confirm/grow outcomes, retries, holder counts, and partition-detected bail-outs |
 | `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |

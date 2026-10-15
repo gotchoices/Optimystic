@@ -1,0 +1,60 @@
+description: Storage writes are held in memory and served from there until the node says the group of writes is finished, then handed to the backend as one batch to make safe on disk in a single step. This is the shared half of making file storage wait for the disk once per commit instead of dozens of times, and the phone and browser backends will commit their groups through the same seam.
+prereq: storage-flushes-once-per-write-group
+architecture: packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved
+files: packages/db-p2p/src/storage/batch-backend.ts, packages/db-p2p/src/storage/write-group.ts, packages/db-p2p/src/storage/write-group-driver.ts, packages/db-p2p/src/testing/memory-batch-backend.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/storage/with-read-cache.ts, packages/db-p2p/src/testing/raw-storage-conformance.ts, packages/db-p2p/src/index.ts, packages/db-p2p/src/rn.ts, packages/db-p2p/src/testing/index.ts, packages/db-p2p/test/write-group-driver.spec.ts, packages/db-p2p/docs/storage.md, docs/debugging.md
+difficulty: hard
+----
+
+# Write-group overlay driver
+
+First of three tickets from `file-storage-pays-one-fsync-per-write-group` (GitHub #37). This one built the backend-independent part; `file-storage-commits-groups-through-a-log` builds the file backend's batch commit on it, and `file-store-checkpoint-and-shared-log` reuses `WriteGroup` for the key-value store.
+
+## What landed
+
+- **`BatchBackend`** (`packages/db-p2p/src/storage/batch-backend.ts`): the contract a backend implements instead of a `RawStoreDriver` when it takes writes a group at a time. Reads (`get`, `rangeRevisions` and `listPendingActionIds`, both fully drained arrays) and one write, `commit(entries)`, which applies a whole batch atomically and as durably as its `durability` says. `StoreKey` addresses a record of any of the six stores; `canonicalStoreKey` gives each a string, with the block id length-prefixed so a collection-name block id or a client-chosen action id can never run into the rest of the key.
+- **`WriteGroup<K>`** (`packages/db-p2p/src/storage/write-group.ts`): the key-agnostic part, over any key type with a canonical-string function and a `commit` callback. It keeps the overlay (canonical key to bytes or a delete marker, each with the sequence of the batch holding it) and the open batch (writes in resolution order). `put` and `delete` record and return at once. `flush()` seals and commits, with the four cases the ticket named: nothing to do and nothing in flight resolves at once; nothing to do while a commit is in flight waits for that commit; writes recorded while a commit is in flight wait for it and then share one next commit with every other flush that arrived meanwhile; a rejected commit latches the group failed, so this and every later write and flush throw `StoreFailedError` carrying the cause, while reads keep serving the overlay. When a commit resolves, only the overlay entries of that batch's sequence are dropped, so a key written again after the seal keeps serving its newer value. The first write of an open batch arms an unref'd idle timer (`idleFlushMs`, default 1000 ms, injectable `setTimer`) that flushes; a failure there is logged once under `optimystic:db-p2p:write-group:error` and latches the group the same way. `close()` flushes once more and cancels the timer.
+- **`WriteGroupDriver`** (`packages/db-p2p/src/storage/write-group-driver.ts`): a `RawStoreDriver` over `WriteGroup<StoreKey>` and a `BatchBackend`. Every write records and resolves. Point reads consult the overlay first, a delete there answering `undefined` without the backend. `promote` reads the pending bytes (overlay, else backend), throws the exact `Pending action <actionId> not found for block <blockId>` message when absent, and records the transactions put and the pending delete with no await between them, so no flush can seal one without the other. Listings merge the overlay over the backend: `rangeRevisions` adds overlay puts in range and orders after merging, reversed on request; `listPendingActionIds` removes overlay deletes and adds overlay puts; `listBlockIds`, when the backend has it, streams the backend's ids and then yields the blocks whose metadata is only in the overlay, deduplicated. Every listing takes its overlay snapshot before awaiting the backend, because a commit resolving in between moves entries into the backend that a backend listing taken earlier does not have. `storeIdentity`, `listBlockIds` and `approximateBytesUsed` are wired only when the backend has them, never stubbed; `close` is always present and closes the backend after the flush, in a `finally`, so a failed store still releases its backend. `durability` is the backend's.
+- **`IRawStorage.close?`**, wired by `KvRawStorage` only when its driver has one, under the same no-stub rule as `listBlockIds`. The conformance `reopen` case now calls `storage.close?.()` before `harness.reopen()`. `CachedRawStorage` gains a `close` through that wiring, which does what its `dispose` already did; its comment says so.
+- **`MemoryBatchBackend`** (`packages/db-p2p/src/testing/memory-batch-backend.ts`, exported from the `./testing` entry, which imports no devDependency): a `BatchBackend` over maps that keeps every committed batch in `committed` and takes a `beforeApply` hook to park or fail a commit. The conformance suite runs `WriteGroupDriver over memory` with `{ persistent: true }`, the reopen being a second driver over the same backend, so the reopen case proves `close` hands every unflushed write of every store, promote included, to the backend.
+- Docs: `packages/db-p2p/docs/storage.md` Invariant 6 has a `WriteGroupDriver` row in the driver table, a *Writes that wait in memory* paragraph (what waits, the four flush cases against rules 3 to 5, the idle flush, `close`), and the sentence that the out-of-group writes now wait until the next group's flush or the idle flush; the kernel section says how a `BatchBackend` is composed. `docs/debugging.md` lists the new `write-group` log namespace. Exports added to `src/index.ts` and `src/rn.ts`.
+
+## How to exercise it
+
+- Compose `new KvRawStorage(new WriteGroupDriver(backend, { idleFlushMs?, setTimer? }))`. Writes through `StorageRepo` reach the backend at `endGroup`'s flush, one `commit` per group; a read in between is served from the overlay.
+- `MemoryBatchBackend.committed` is the batch recorder: count commits, read what each carried and in what order. `beforeApply` returning a promise parks the next commit; throwing fails it.
+- `DEBUG=optimystic:db-p2p:write-group*` shows an idle flush failing.
+
+## Tests added (`packages/db-p2p/test/write-group-driver.spec.ts`)
+
+- Conformance registration `WriteGroupDriver over memory`, persistent: every parity case over the overlay driver, and the reopen case proving `close` flushes every write kind.
+- A write resolves before any commit and is served from memory; flush hands the group to one commit in resolution order; a group that wrote nothing costs no commit.
+- A flush with nothing to commit while a commit is in flight waits for that commit.
+- Three flushes around one parked commit produce exactly two commits, the second carrying both later writes.
+- A key written again after its batch was sealed is still served from memory when that batch commits (the sequence rule on the overlay drop).
+- A delete in the overlay hides a record the backend still holds, from reads and from `listPendingActionIds`.
+- A rejected commit latches the store failed: the flush rejects with `StoreFailedError` carrying the cause, later writes, flushes and promotes reject the same way, nothing reached the backend, and reads still serve the overlay.
+- `rangeRevisions` orders overlay rows with backend rows, reversed when asked, with both bounds applied to overlay rows.
+- `listBlockIds` yields the backend's blocks and the overlay-only ones once each.
+- The idle timer is armed by the first write of a batch, disarmed by the seal, and flushes a group nobody flushed when it fires.
+- `close` waits for the commit in flight, flushes the remainder once, then closes the backend.
+- Optional members follow the backend: none are stubbed over a bare backend, all forwarded over a full one, and `durability` is the backend's.
+
+## Verification run
+
+- `yarn workspace @optimystic/db-p2p build`: clean.
+- db-p2p `test/**/*.spec.ts`: 3363 passing, 71 pending, 0 failing. The first full run failed two guards my change tripped, the entry-parity spec (new modules missing from `src/rn.ts`) and the log-namespace guard (`write-group` missing from `docs/debugging.md`); both fixed, both re-run green. The `storage-repo.spec.ts` flush cases pass unchanged.
+- `@optimystic/db-p2p-storage-fs` (80 passing), `-storage-web` (53), `-storage-ns` (59), `-storage-rn` (54): each runs the conformance suite from the rebuilt dist with the reopen case's new optional close, a no-op for all four since none wires a close.
+- Repo-wide `eslint .` and `yarn lint:docs`: clean. (`yarn lint` is that same eslint invocation; the yarn script would not resolve from the agent shell, so eslint was run directly.)
+- Not run: the integration suites, `check:rn`, and the other packages' unit suites. Nothing outside db-p2p's storage layer and the storage packages' conformance runs changed.
+
+## Known gaps and judgment calls for the reviewer
+
+- **`listBlockIds` streams the backend rather than draining it.** The driver yields backend ids as they arrive and the overlay's afterwards; the consumer's awaits straddle the backend's own iterator, as they already do through `KvRawStorage`, which passes a driver's `listBlockIds` straight through. The two listings the `RawStoreDriver` contract names drain-before-yield (`rangeRevisions`, `listPendingActionIds`) do drain.
+- **Writes after `close()` are not refused.** They would sit in the overlay with no timer. The ticket did not ask for a closed state; `CachedStoreDriver.close` does not refuse either.
+- **`close()` on an already failed store rejects with `StoreFailedError` after closing the backend.** The flush inside it is refused by the latch; the backend is still released in the `finally`. If the failure happened in an idle flush, this rejection is the first a host hears of it beyond the log line.
+- **`CachedRawStorage` now has `close` as well as `dispose`.** A `withReadCache` lease holder calling `close` on the shared cache would tear it down for every other consumer; that hazard was already there with `dispose`, and the lease doc already says never to dispose the storage. Nothing in the tree calls `close` on a storage except the conformance suite.
+- **`withReadCache` still drops the duplicate instance on a dedupe hit without closing it.** Its `NOTE:` now says `IRawStorage.close` is the way to close it and names the file backend's write-ahead log as what will make it matter; `file-storage-commits-groups-through-a-log` should close it there, or key the file backend by handle.
+- **`approximateBytesUsed` is the backend's estimate**; unflushed overlay bytes are not counted. Forwarded exactly as `CachedStoreDriver` forwards it, per the ticket.
+- **Overlay listing merges scan the whole map per listing.** Fine while the overlay is bounded by unflushed groups; the `NOTE:` at the map in `write-group.ts` names `durability-window-scales-with-cohort-size` as the mode that must bound it, by size as well as by time.
+- **The flush cases "close racing a commit in flight" and "failure inside the idle flush" have tests** beyond the ticket's by-inspection bar; both are short, deterministic, and pin real branching in `WriteGroup`. Cut them if they fail the test bar.
+- **`RawStoreDriver`'s wrapper `NOTE:`** asks for a shared forwarding check once a third wrapper driver over a `RawStoreDriver` appears. `WriteGroupDriver` wraps a `BatchBackend`, not a driver, so it has a direct forwarding test instead, like the two existing wrappers.
