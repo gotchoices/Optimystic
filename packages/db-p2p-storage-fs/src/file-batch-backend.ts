@@ -3,7 +3,7 @@ import * as path from 'path';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { BatchBackend, BatchEntry, StoreDurability, StoreIdentity, StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
-import { FileWriteLog, fileStoreIdentity, readFileIfExists, type WriteLogEntry } from './file-write-log.js';
+import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
 const log = createLogger('storage:file');
 
@@ -75,7 +75,9 @@ export class FileBatchBackend implements BatchBackend {
 	private readonly identity: StoreIdentity;
 	private log: FileWriteLog | undefined;
 
-	constructor(basePath: string) {
+	/** `options` are the directory log's checkpoint settings, applied when this is the first store to open it. */
+	constructor(basePath: string, private readonly options: FileWriteLogOptions = {}) {
+		assertFileWriteLogOptions(options);
 		this.basePath = path.resolve(basePath);
 		this.identity = fileStoreIdentity(basePath);
 	}
@@ -243,7 +245,7 @@ export class FileBatchBackend implements BatchBackend {
 	// --- the log ---
 
 	private shared(): FileWriteLog {
-		return this.log ??= FileWriteLog.acquire(this.basePath);
+		return this.log ??= FileWriteLog.acquire(this.basePath, this.options);
 	}
 
 	private open(): Promise<void> {

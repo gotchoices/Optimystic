@@ -262,7 +262,8 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * is still missing each). An instance or a factory, the same shape as {@link NodeOptions.storage}.
 	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger still works, but what it
 	 * records is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
-	 * `FileRawStorage`'s base path; see its README.
+	 * `FileRawStorage`'s base path; see its README. Like the raw storage, the node never closes it:
+	 * a host that supplies one closes it after `stop()`.
 	 */
 	kvStore?: KVStoreProvider;
 	/**

@@ -1,13 +1,29 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import { crc32 } from 'zlib';
-import { StoreFailedError, type StoreIdentity } from '@optimystic/db-p2p';
+import { armUnrefTimer } from '@optimystic/db-core';
+import { StoreFailedError, type SetTimer, type StoreIdentity } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { acquireStoreLock, StoreLockedError, type StoreLock } from './store-lock.js';
 
 const log = createLogger('write-log');
 
 export const WRITE_LOG_FILENAME = 'write-ahead.log';
+
+/**
+ * The log a checkpoint has sealed and is syncing the tree under. Present on disk only between a
+ * checkpoint's seal and its truncate; an open replays it ahead of {@link WRITE_LOG_FILENAME}.
+ */
+export const SEALED_WRITE_LOG_FILENAME = 'write-ahead.log.sealed';
+
+/** {@link FileWriteLogOptions.checkpointBytes}'s default: 16 MiB. */
+export const DEFAULT_CHECKPOINT_BYTES = 16 * 1024 * 1024;
+
+/** {@link FileWriteLogOptions.checkpointIdleMs}'s default. */
+export const DEFAULT_CHECKPOINT_IDLE_MS = 5000;
+
+/** How many files, then directories, a checkpoint syncs at once. */
+const CHECKPOINT_SYNC_CONCURRENCY = 16;
 
 /**
  * The log's fixed header: the magic bytes `OPTIMYSTIC-WAL`, then one format-version byte. A file
@@ -248,7 +264,7 @@ export function fileStoreIdentity(basePath: string): StoreIdentity {
 
 // --- the log ---
 
-/** Paths the tree has been written to since the log was last truncated; the checkpoint's work list. */
+/** Paths the tree has been written to since the log was last checkpointed; the checkpoint's work list. */
 export interface DirtyPaths {
 	/** Absolute paths of files written, less those deleted since. */
 	readonly files: Set<string>;
@@ -256,7 +272,45 @@ export interface DirtyPaths {
 	readonly directories: Set<string>;
 }
 
+/** When the log is checkpointed. Shared by every store over the directory; see {@link FileWriteLog.acquire}. */
+export interface FileWriteLogOptions {
+	/**
+	 * Checkpoint once the log holds at least this many bytes of records, checked after each append.
+	 * Default {@link DEFAULT_CHECKPOINT_BYTES}.
+	 */
+	checkpointBytes?: number;
+	/**
+	 * Checkpoint this long after the last append, so a store that stops writing does not keep its
+	 * log until it closes. Re-armed by every append. Default {@link DEFAULT_CHECKPOINT_IDLE_MS}.
+	 */
+	checkpointIdleMs?: number;
+	/** Arms the idle checkpoint; defaults to an unref'd `setTimeout`, so it never holds a process open. Injected by tests. */
+	setTimer?: SetTimer;
+}
+
+interface CheckpointSettings {
+	readonly checkpointBytes: number;
+	readonly checkpointIdleMs: number;
+	readonly setTimer: SetTimer;
+}
+
+/** Throws a `RangeError` for a checkpoint setting out of range; a store's constructor calls it, so a bad setting fails there rather than at the first write. */
+export function assertFileWriteLogOptions(options: FileWriteLogOptions): void {
+	checkpointSettings(options);
+}
+
+function checkpointSettings(options: FileWriteLogOptions): CheckpointSettings {
+	const checkpointBytes = options.checkpointBytes ?? DEFAULT_CHECKPOINT_BYTES;
+	const checkpointIdleMs = options.checkpointIdleMs ?? DEFAULT_CHECKPOINT_IDLE_MS;
+	if (!(checkpointBytes > 0)) throw new RangeError(`checkpointBytes must be positive, got ${checkpointBytes}`);
+	if (!(checkpointIdleMs >= 0) || !Number.isFinite(checkpointIdleMs)) {
+		throw new RangeError(`checkpointIdleMs must be a finite number of milliseconds, got ${checkpointIdleMs}`);
+	}
+	return { checkpointBytes, checkpointIdleMs, setTimer: options.setTimer ?? armUnrefTimer };
+}
+
 const noop = (): void => { };
+const emptyDirty = (): DirtyPaths => ({ files: new Set(), directories: new Set() });
 
 /**
  * The write-ahead log of one store directory: `<basePath>/write-ahead.log`, every batch of writes
@@ -271,15 +325,15 @@ const noop = (): void => { };
  * the tree was ever given. A store written by a build before the log has no log file and opens
  * with nothing to replay.
  *
- * One instance per directory per process, shared by reference count through {@link acquire}, so
- * two stores over one directory in one process share one log and one lock rather than deadlocking
- * on the lock or interleaving two writers into one file. Each keeps its own overlay above this,
- * which is why a second store opened beside a first cannot see the first's unflushed writes.
+ * A {@link checkpoint} makes the tree as durable as the log and then discards the log, so the log
+ * never grows without bound: it runs when the log passes `checkpointBytes`, `checkpointIdleMs` after
+ * the last append, and on the last {@link release}. Its three steps are under {@link checkpointOnce}.
  *
- * NOTE: nothing truncates the log once it is open — it grows by one record per flush until the
- * store is reopened, and `dirty` grows with it. `file-store-checkpoint-and-shared-log` adds the
- * checkpoint that syncs the dirty tree and discards the log on a size threshold, an idle timer and
- * `close`.
+ * One instance per directory per process, shared by reference count through {@link acquire}, so
+ * every store over one directory in one process — `FileRawStorage` and `FileKVStore` alike — shares
+ * one log, one lock and one checkpoint, rather than deadlocking on the lock or interleaving two
+ * writers into one file. Each keeps its own overlay above this, which is why a second store opened
+ * beside a first cannot see the first's unflushed writes.
  */
 export class FileWriteLog {
 	private static readonly registry = new Map<StoreIdentity, FileWriteLog>();
@@ -289,12 +343,18 @@ export class FileWriteLog {
 	/**
 	 * The shared log for the directory, counted once more. Synchronous, so two acquirers in one
 	 * tick get one instance. Balance every call with one {@link release}.
+	 *
+	 * The checkpoint settings are the first acquirer's: a store opened over a directory whose log is
+	 * already open shares that log's settings, and a setting it names that differs is logged and
+	 * not applied.
 	 */
-	static acquire(basePath: string): FileWriteLog {
+	static acquire(basePath: string, options: FileWriteLogOptions = {}): FileWriteLog {
 		const identity = fileStoreIdentity(basePath);
 		let shared = FileWriteLog.registry.get(identity);
-		if (!shared) {
-			shared = new FileWriteLog(path.resolve(basePath), identity, FileWriteLog.closing.get(identity));
+		if (shared) {
+			shared.noteDifferingSettings(options);
+		} else {
+			shared = new FileWriteLog(path.resolve(basePath), identity, checkpointSettings(options), FileWriteLog.closing.get(identity));
 			FileWriteLog.registry.set(identity, shared);
 		}
 		shared.refs += 1;
@@ -302,28 +362,38 @@ export class FileWriteLog {
 	}
 
 	readonly logPath: string;
-	/** What the tree has been given since the log was last truncated; see {@link DirtyPaths}. */
-	readonly dirty: DirtyPaths = { files: new Set(), directories: new Set() };
+	readonly sealedPath: string;
 
+	/** What the tree has been given since the log was last sealed; see {@link DirtyPaths}. Swapped for an empty set by each seal. */
+	private dirty: DirtyPaths = emptyDirty();
+	/** Bytes of records in the current log, the size threshold's measure. Zero means there is nothing to checkpoint. */
+	private appendedBytes = 0;
 	private refs = 0;
 	private opening: Promise<void> | undefined;
 	private handle: fs.FileHandle | undefined;
 	private lock: StoreLock | undefined;
-	/** Commits run one at a time, in order, on this chain; it never rejects. */
-	private queue: Promise<void> = Promise.resolve();
+	/** Commits and seals run one at a time, in order, on this chain; it never rejects. */
+	private queue: Promise<unknown> = Promise.resolve();
 	private fault: { cause: unknown } | undefined;
 	private closed = false;
+	/** The checkpoint running now, if any, which also runs every one asked for while it ran. */
+	private checkpointRun: Promise<void> | undefined;
+	/** A checkpoint was asked for while {@link checkpointRun} was running: run one more after it. */
+	private checkpointAgain = false;
+	private cancelIdleCheckpoint: (() => void) | undefined;
 
 	private constructor(
 		readonly basePath: string,
 		readonly identity: StoreIdentity,
+		private readonly settings: CheckpointSettings,
 		/** A previous log over this directory still releasing its handle and lock; opening waits for it. */
 		private readonly predecessorClosed: Promise<void> | undefined,
 	) {
 		this.logPath = path.join(basePath, WRITE_LOG_FILENAME);
+		this.sealedPath = path.join(basePath, SEALED_WRITE_LOG_FILENAME);
 	}
 
-	/** True once an open, an append or an apply failed; every later commit then throws {@link StoreFailedError}. */
+	/** True once an open, an append, an apply or a checkpoint failed; every later commit then throws {@link StoreFailedError}. */
 	get failed(): boolean {
 		return this.fault !== undefined;
 	}
@@ -352,20 +422,39 @@ export class FileWriteLog {
 			await this.open();
 			if (this.closed) throw new Error(`write-ahead log at ${this.basePath} is closed`);
 			this.throwIfFailed();
+			const record = encodeWriteLogRecord(entries);
 			try {
-				await writeAll(this.handle!, encodeWriteLogRecord(entries));
+				await writeAll(this.handle!, record);
 				await this.handle!.sync();
+				this.appendedBytes += record.length;
 				await this.applyBatch(entries, this.dirty);
 			} catch (err) {
 				this.fault ??= { cause: err };
 				throw new StoreFailedError(err);
 			}
+			this.scheduleCheckpoint();
 		});
 	}
 
 	/**
-	 * Give back one reference. The last release waits for the commit in flight, closes the log
-	 * handle and removes the lock; a log acquired for the directory meanwhile opens after that.
+	 * Make the tree as durable as the log, then discard the log. One at a time: asked for while one
+	 * runs, it runs once more after that one, and resolves when that has. Skipped when the log has
+	 * failed, was never opened, or holds no record. A failure latches the log failed, like a rejected
+	 * commit: a half-synced tree under a discarded log cannot be recovered.
+	 */
+	checkpoint(): Promise<void> {
+		if (this.checkpointRun) {
+			this.checkpointAgain = true;
+			return this.checkpointRun;
+		}
+		return this.checkpointRun = this.runCheckpoints();
+	}
+
+	/**
+	 * Give back one reference. The last release waits for the commit in flight and for a checkpoint
+	 * in flight, runs a final checkpoint, closes the log handle and removes the lock; a log acquired
+	 * for the directory meanwhile opens after that. Rejects only when that final checkpoint fails,
+	 * and lets go of the handle and the lock either way.
 	 */
 	async release(): Promise<void> {
 		if (this.refs === 0) throw new Error(`write-ahead log at ${this.basePath} was released more often than acquired`);
@@ -384,11 +473,23 @@ export class FileWriteLog {
 		if (this.fault) throw new StoreFailedError(this.fault.cause);
 	}
 
-	private enqueue(task: () => Promise<void>): Promise<void> {
+	private enqueue<T>(task: () => Promise<T>): Promise<T> {
 		const run = this.queue.then(task);
 		this.queue = run.catch(noop);
 		return run;
 	}
+
+	private noteDifferingSettings(options: FileWriteLogOptions): void {
+		const differing = (['checkpointBytes', 'checkpointIdleMs'] as const)
+			.filter(name => options[name] !== undefined && options[name] !== this.settings[name]);
+		if (differing.length > 0) {
+			log('a store over %s asked for %o; the log already open there keeps %o', this.basePath,
+				Object.fromEntries(differing.map(name => [name, options[name]])),
+				Object.fromEntries(differing.map(name => [name, this.settings[name]])));
+		}
+	}
+
+	// --- open and replay ---
 
 	private async openOnce(): Promise<void> {
 		try {
@@ -396,10 +497,7 @@ export class FileWriteLog {
 			await fs.mkdir(this.basePath, { recursive: true });
 			this.lock = await acquireStoreLock(this.basePath);
 			await this.replay();
-			this.handle = await fs.open(this.logPath, 'w');
-			await writeAll(this.handle, WRITE_LOG_HEADER);
-			await this.handle.sync();
-			await fsyncDir(this.basePath);
+			this.handle = await this.createEmptyLog();
 		} catch (err) {
 			await this.releaseResources().catch(closeErr => log('releasing after a failed open: %o', closeErr));
 			if (err instanceof StoreLockedError) throw err;
@@ -408,25 +506,67 @@ export class FileWriteLog {
 		}
 	}
 
-	/** Apply every intact record in order, make what it touched durable, and report a short read. */
+	/**
+	 * Apply the sealed segment's records, then the current log's, in order; make what they touched
+	 * durable; then remove the sealed segment. The two files are one log: a sealed segment that
+	 * stops short ends the replay there, and the current log is discarded with the rest of it.
+	 *
+	 * Re-applying a sealed segment whose checkpoint already synced the tree is harmless, because the
+	 * current log holds every later write of the same paths, in order, and is applied after it. What
+	 * must never happen is the sealed segment outliving the current log's truncation, since replaying
+	 * it alone would put older content over newer: so the sealed segment is removed, and the
+	 * directory synced, before {@link openOnce} truncates the current log. (On win32, where
+	 * {@link fsyncDir} is skipped, NTFS commits the unlink and the later truncation through its
+	 * metadata journal in order.)
+	 */
 	private async replay(): Promise<void> {
-		// NOTE: the whole log is read into memory for one decode. Fine while a log is bounded by the
-		// checkpoint `file-store-checkpoint-and-shared-log` adds (16 MiB by default); if a log is
-		// ever found larger than that, decode it record by record from a stream instead.
-		const bytes = await readFileIfExists(this.logPath);
-		if (bytes === undefined) return;
+		const touched = emptyDirty();
+		const sealed = await this.replaySegment(this.sealedPath, touched);
+		if (sealed === 'stopped-short') {
+			log('replay of %s stopped short, so %s was not applied', this.sealedPath, this.logPath);
+		} else {
+			await this.replaySegment(this.logPath, touched);
+		}
+		await syncDirtyPaths(touched);
+		if (sealed !== 'absent') {
+			await fs.unlink(this.sealedPath);
+			await fsyncDir(this.basePath);
+		}
+	}
+
+	/** Apply one log file's intact records, in order, into `touched`. */
+	private async replaySegment(filePath: string, touched: DirtyPaths): Promise<'absent' | 'complete' | 'stopped-short'> {
+		// NOTE: a log file is read into memory for one decode. A checkpoint bounds the current log to
+		// about `checkpointBytes` plus what is appended while a checkpoint runs, and a sealed segment
+		// to one such log; if a log is ever found much larger than that, decode it record by record
+		// from a stream instead.
+		const bytes = await readFileIfExists(filePath);
+		if (bytes === undefined) return 'absent';
 		const decoded = decodeWriteLog(bytes);
-		const touched: DirtyPaths = { files: new Set(), directories: new Set() };
 		for (const batch of decoded.batches) {
 			await this.applyBatch(batch, touched);
 		}
-		if (decoded.stoppedBy) {
-			log('replay of %s stopped at byte %d of %d (%s): %d batch(es) before it applied, the rest discarded',
-				this.logPath, decoded.stoppedAt, bytes.length, decoded.stoppedBy, decoded.batches.length);
-		}
-		for (const file of touched.files) await fsyncFile(file);
-		for (const dir of touched.directories) await fsyncDir(dir);
+		if (!decoded.stoppedBy) return 'complete';
+		log('replay of %s stopped at byte %d of %d (%s): %d batch(es) before it applied, the rest discarded',
+			filePath, decoded.stoppedAt, bytes.length, decoded.stoppedBy, decoded.batches.length);
+		return 'stopped-short';
 	}
+
+	/** Create (or truncate) the current log to its header, and make it and its directory entry durable before any record goes in. */
+	private async createEmptyLog(): Promise<fs.FileHandle> {
+		const handle = await fs.open(this.logPath, 'w');
+		try {
+			await writeAll(handle, WRITE_LOG_HEADER);
+			await handle.sync();
+			await fsyncDir(this.basePath);
+		} catch (err) {
+			await handle.close().catch(noop);
+			throw err;
+		}
+		return handle;
+	}
+
+	// --- apply ---
 
 	/** Write each entry to its canonical path, creating missing directories; record what the tree was given. */
 	private async applyBatch(entries: readonly WriteLogEntry[], touched: DirtyPaths): Promise<void> {
@@ -459,11 +599,108 @@ export class FileWriteLog {
 		}
 	}
 
+	// --- checkpoint ---
+
+	/**
+	 * After an append: re-arm the idle checkpoint, and start one now when the log has passed its size
+	 * threshold. Nothing once the last release has begun, since it runs the final checkpoint itself.
+	 */
+	private scheduleCheckpoint(): void {
+		if (this.closed) return;
+		this.disarmIdleCheckpoint();
+		this.cancelIdleCheckpoint = this.settings.setTimer(() => {
+			this.cancelIdleCheckpoint = undefined;
+			this.checkpointInBackground('idle');
+		}, this.settings.checkpointIdleMs);
+		if (this.appendedBytes >= this.settings.checkpointBytes) this.checkpointInBackground('size');
+	}
+
+	/** Never awaited by a commit: a commit holds the queue the checkpoint's seal waits in. Its failure has latched the log. */
+	private checkpointInBackground(trigger: 'idle' | 'size'): void {
+		this.checkpoint().catch((err: unknown) => {
+			log('checkpoint (%s) of %s failed; the store refuses every later write: %o', trigger, this.basePath, err);
+		});
+	}
+
+	private disarmIdleCheckpoint(): void {
+		this.cancelIdleCheckpoint?.();
+		this.cancelIdleCheckpoint = undefined;
+	}
+
+	private async runCheckpoints(): Promise<void> {
+		try {
+			do {
+				this.checkpointAgain = false;
+				await this.checkpointOnce();
+			} while (this.checkpointAgain);
+		} finally {
+			// Cleared before this promise settles, so a checkpoint asked for from here on starts afresh.
+			this.checkpointRun = undefined;
+		}
+	}
+
+	/**
+	 * 1. **Seal**, in the commit queue so no apply is in flight: rename the log to
+	 *    {@link SEALED_WRITE_LOG_FILENAME} and start an empty one, and take the dirty set, leaving an
+	 *    empty one. Commits resume on the new log at once; only this step waits in the queue.
+	 * 2. **Sync**, off the commit path: every file in the taken set, then every directory. A file
+	 *    deleted since is skipped; one rewritten since is synced with its newer content, which the
+	 *    new log covers too.
+	 * 3. **Truncate**: unlink the sealed segment and sync the directory.
+	 *
+	 * A crash anywhere in this leaves the sealed segment, the current log or both, and the next open
+	 * replays them in that order (see {@link replay}).
+	 */
+	private async checkpointOnce(): Promise<void> {
+		if (!this.opening || this.fault) return;
+		await this.opening.catch(noop);
+		const sealed = await this.seal();
+		if (!sealed) return;
+		try {
+			await syncDirtyPaths(sealed);
+			await fs.unlink(this.sealedPath);
+			await fsyncDir(this.basePath);
+		} catch (err) {
+			this.fault ??= { cause: err };
+			throw new StoreFailedError(err);
+		}
+	}
+
+	/** Step 1 of {@link checkpointOnce}: the dirty set the sealed segment covers, or `undefined` when there is nothing to seal. */
+	private seal(): Promise<DirtyPaths | undefined> {
+		return this.enqueue(async () => {
+			if (this.fault || this.appendedBytes === 0) return undefined;
+			try {
+				const handle = this.handle!;
+				this.handle = undefined;
+				await handle.close();
+				await fs.rename(this.logPath, this.sealedPath);
+				this.handle = await this.createEmptyLog();
+			} catch (err) {
+				this.fault ??= { cause: err };
+				throw new StoreFailedError(err);
+			}
+			const sealed = this.dirty;
+			this.dirty = emptyDirty();
+			this.appendedBytes = 0;
+			return sealed;
+		});
+	}
+
+	// --- close ---
+
 	private async shutDown(): Promise<void> {
 		this.closed = true;
+		this.disarmIdleCheckpoint();
 		await this.queue;
-		if (this.opening) await this.opening.catch(noop);
-		await this.releaseResources();
+		try {
+			// A failure of the checkpoint in flight has been logged by whatever started it, and has
+			// latched the log, which skips the final one.
+			await this.checkpointRun?.catch(noop);
+			await this.checkpoint();
+		} finally {
+			await this.releaseResources();
+		}
 	}
 
 	private async releaseResources(): Promise<void> {
@@ -474,6 +711,39 @@ export class FileWriteLog {
 		this.lock = undefined;
 		if (lock) await lock.release();
 	}
+}
+
+/**
+ * Sync every file, then every directory, {@link CHECKPOINT_SYNC_CONCURRENCY} at a time.
+ *
+ * NOTE: a checkpoint's file sync holds a handle open while later commits may delete and re-create
+ * the same path. libuv opens with delete sharing and, on Windows 10 1809 and later, unlinks with
+ * POSIX semantics, so the name goes at once; on an older Windows the re-create would fail with
+ * EPERM while the deleted name lingers, latching the store. If that is ever seen, retry the apply's
+ * write on EPERM for the length of one sync.
+ */
+async function syncDirtyPaths(dirty: DirtyPaths): Promise<void> {
+	await forEachConcurrently(dirty.files, CHECKPOINT_SYNC_CONCURRENCY, fsyncFile);
+	await forEachConcurrently(dirty.directories, CHECKPOINT_SYNC_CONCURRENCY, fsyncDir);
+}
+
+/** Run `fn` over `items` with at most `limit` in flight; after the first failure no more start, and it is thrown once all in flight have settled. */
+async function forEachConcurrently<T>(items: Iterable<T>, limit: number, fn: (item: T) => Promise<void>): Promise<void> {
+	const iterator = items[Symbol.iterator]();
+	let failure: { cause: unknown } | undefined;
+	const worker = async (): Promise<void> => {
+		while (!failure) {
+			const next = iterator.next();
+			if (next.done) return;
+			try {
+				await fn(next.value);
+			} catch (err) {
+				failure ??= { cause: err };
+			}
+		}
+	};
+	await Promise.all(Array.from({ length: limit }, worker));
+	if (failure) throw failure.cause;
 }
 
 async function writeAll(handle: fs.FileHandle, bytes: Uint8Array): Promise<void> {

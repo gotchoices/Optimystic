@@ -34,7 +34,7 @@ Steps run in order over one data directory, each building on the last, so run th
 
 There is one fixture per storage backend a deployment runs on:
 
-- **`fs`** — `FileRawStorage` and `FileKVStore` from `@optimystic/db-p2p-storage-fs`, what `reference-peer` runs on. Packed as `files`, keyed by path.
+- **`fs`** — `FileRawStorage` and `FileKVStore` from `@optimystic/db-p2p-storage-fs`, what `reference-peer` runs on. Packed as `files`, keyed by path. A release with the write-ahead log leaves a `write-ahead.log` in each directory: empty after the writer's clean close, and still readable if it holds records, since the reader's open replays them. It must never leave a `store.lock`, which only a store that was not closed leaves behind, and the generator refuses to pack one.
 - **`leveldb`** — `LevelDBRawStorage` and `LevelDBKVStore` from `@optimystic/db-p2p-storage-rn` over one LevelDB database, what a React Native app runs on. Written through `classic-level` (`writer/classic-level.mjs`, the binding that package's own suite uses) rather than `rn-leveldb`: the keys and values come from the package, not from the binding. Packed as `entries`, in key order, each key in hex.
 
 Each stored value is packed as parsed JSON when that gives back exactly its bytes, else as UTF-8 text, else base64, and is unpacked to those same bytes.

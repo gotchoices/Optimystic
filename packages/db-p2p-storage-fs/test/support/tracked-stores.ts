@@ -1,4 +1,4 @@
-import { FileRawStorage, type FileRawStorageOptions } from '../../src/index.js';
+import { FileKVStore, FileRawStorage, type FileKVStoreOptions, type FileRawStorageOptions } from '../../src/index.js';
 
 /**
  * Opens stores a test can forget about: every store opened here is closed by {@link closeAll},
@@ -8,22 +8,25 @@ import { FileRawStorage, type FileRawStorageOptions } from '../../src/index.js';
  */
 export interface TrackedStores {
 	open(base: string, options?: FileRawStorageOptions): FileRawStorage;
+	openKv(base: string, options?: FileKVStoreOptions): FileKVStore;
 	closeAll(): Promise<void>;
 }
 
 export function trackedStores(): TrackedStores {
-	const opened: FileRawStorage[] = [];
+	const opened: { close(): Promise<void> }[] = [];
+	const track = <T extends { close(): Promise<void> }>(store: T): T => {
+		opened.push(store);
+		return store;
+	};
 	return {
-		open(base, options) {
-			const storage = new FileRawStorage(base, options);
-			opened.push(storage);
-			return storage;
-		},
+		open: (base, options) => track(new FileRawStorage(base, options)),
+		openKv: (base, options) => track(new FileKVStore(base, options)),
 		async closeAll() {
-			for (const storage of opened.splice(0)) {
-				// A store latched failed rejects its close after releasing its backend; the test that
+			for (const store of opened.splice(0)) {
+				// A store latched failed rejects its close after releasing its log; the test that
 				// latched it has already asserted on the failure, and the release is what matters here.
-				await storage.close().catch(() => { /* released regardless */ });
+				// Closing one already closed is a no-op flush and a release of nothing.
+				await store.close().catch(() => { /* released regardless */ });
 			}
 		},
 	};

@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage, FileKVStore, WRITE_LOG_FILENAME, STORE_LOCK_FILENAME } from '../src/index.js';
+import { FileRawStorage, WRITE_LOG_FILENAME, WRITE_LOG_HEADER, STORE_LOCK_FILENAME, decodeWriteLog } from '../src/index.js';
 import { BlockStorage, StoreFailedError, withBlockWriteLatch } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
 import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
@@ -37,25 +37,6 @@ runRawStorageConformance('FileSystem', async (): Promise<ConformanceHarness> => 
 // torn-file corruption tolerance, colon-encoded filenames + legacy raw-colon fallback, readdir
 // error discrimination, and the directory-based listBlockIds meta-gate.
 // ---------------------------------------------------------------------------
-
-// Injects a "crash" between the atomic writer's temp write and its rename by
-// making fs.rename throw. atomic-write.ts holds the same `fs.promises` singleton,
-// so overriding `rename` on it aborts the write exactly at the rename step. Always
-// restore in a finally so one test's injection never leaks into another.
-async function withFailingRename(fn: () => Promise<void>): Promise<void> {
-	const original = fs.rename;
-	(fs as { rename: typeof fs.rename }).rename = async () => { throw new Error('injected crash before rename'); };
-	try {
-		await fn();
-	} finally {
-		(fs as { rename: typeof fs.rename }).rename = original;
-	}
-}
-
-async function hasTempSibling(dir: string): Promise<boolean> {
-	const entries = await fs.readdir(dir);
-	return entries.some(e => e.endsWith('.tmp'));
-}
 
 // Injects a readdir failure with a specific errno code (e.g. EACCES), so a caller can assert
 // how the storage layer discriminates readdir errors. file-batch-backend.ts holds the same
@@ -365,67 +346,84 @@ describe('FileRawStorage.listBlockIds', () => {
 	});
 });
 
-describe('FileKVStore atomic writes', () => {
+describe('FileKVStore over the write-ahead log', () => {
 	let base: string;
+	const stores = trackedStores();
 
 	beforeEach(async () => {
 		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-kv-'));
 	});
 
 	afterEach(async () => {
+		await stores.closeAll();
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
-	it('set round-trips and leaves no .tmp sibling', async () => {
-		const kv = new FileKVStore(base);
-		await kv.set('coordinator/key1', 'value-1');
-
-		assert.strictEqual(await kv.get('coordinator/key1'), 'value-1');
-		assert.ok(!(await hasTempSibling(path.join(base, 'coordinator'))), 'expected no leftover *.tmp files');
-	});
-
-	it('a failed rename leaves the prior value intact (never torn)', async () => {
-		const kv = new FileKVStore(base);
-		await kv.set('coordinator/key1', 'value-A');
-
-		let threw = false;
-		await withFailingRename(async () => {
-			await kv.set('coordinator/key1', 'value-B').catch(() => { threw = true; });
-		});
-		assert.ok(threw, 'set should reject when the rename fails');
-
-		assert.strictEqual(await kv.get('coordinator/key1'), 'value-A');
-		assert.ok(!(await hasTempSibling(path.join(base, 'coordinator'))), 'expected no orphaned *.tmp files');
-	});
-
-	it('list(prefix) returns all keys under prefix recursively', async () => {
-		const kv = new FileKVStore(base);
+	it('list(prefix) merges the tree with writes not yet flushed: unflushed puts appear, unflushed deletes do not', async () => {
+		const kv = stores.openKv(base);
 		await kv.set('ns/a', 'v1');
-		await kv.set('ns/b', 'v2');
-		await kv.set('ns/sub/c', 'v3');
+		await kv.set('ns/sub/b', 'v2');
 		await kv.set('other/x', 'vx');
+		await kv.flush();
+		await kv.set('ns/c', 'v3');
+		await kv.delete('ns/a');
 
-		const results = await kv.list('ns/');
-		results.sort();
-		assert.deepStrictEqual(results, ['ns/a', 'ns/b', 'ns/sub/c']);
+		assert.deepStrictEqual((await kv.list('ns/')).sort(), ['ns/c', 'ns/sub/b']);
+		assert.strictEqual(await kv.get('ns/a'), undefined, 'the unflushed delete hides the tree file');
+		assert.strictEqual(await readFileIfPresent(path.join(base, 'ns', 'a.json')), 'v1', 'the tree still holds it until the flush');
+		await kv.flush();
+		assert.strictEqual(await readFileIfPresent(path.join(base, 'ns', 'a.json')), undefined);
+		assert.strictEqual(await readFileIfPresent(path.join(base, 'ns', 'c.json')), 'v3');
 	});
 
-	it('list(prefix) returns empty for non-existent prefix', async () => {
-		const kv = new FileKVStore(base);
+	it('list(prefix) returns empty for a prefix nothing was written under', async () => {
+		const kv = stores.openKv(base);
 		assert.deepStrictEqual(await kv.list('no-such/'), []);
 	});
 
-	it('delete removes a key; get returns undefined afterward', async () => {
-		const kv = new FileKVStore(base);
-		await kv.set('del/key', 'to-delete');
-		assert.strictEqual(await kv.get('del/key'), 'to-delete');
-
-		await kv.delete('del/key');
-		assert.strictEqual(await kv.get('del/key'), undefined);
+	it('a flushed delete of a key that never existed does not throw', async () => {
+		const kv = stores.openKv(base);
+		await kv.delete('never/existed');
+		await assert.doesNotReject(() => kv.flush());
 	});
 
-	it('delete on non-existent key does not throw', async () => {
-		const kv = new FileKVStore(base);
-		await assert.doesNotReject(() => kv.delete('never/existed'));
-	});
+	for (const order of [['raw', 'kv'], ['kv', 'raw']] as const) {
+		it(`shares one log and one lock with a FileRawStorage over the same directory (${order[0]} opened and closed first)`, async () => {
+			const raw = stores.open(base);
+			const kv = stores.openKv(base);
+			const meta: BlockMetadata = { latest: { rev: 1, actionId: 'tx:a1' as ActionId }, ranges: [[1, 1]] };
+			const writeAndFlush = {
+				raw: async () => { await raw.saveMetadata('blk' as BlockId, meta); await raw.flush(); },
+				kv: async () => { await kv.set('under-replicated/blk', 'entry'); await kv.flush(); },
+			};
+			await writeAndFlush[order[0]]();
+			await writeAndFlush[order[1]]();
+			const records = decodeWriteLog(await fs.readFile(path.join(base, WRITE_LOG_FILENAME))).batches;
+			assert.deepStrictEqual(records.map(batch => batch.map(entry => entry.path)),
+				order.map(store => store === 'raw' ? ['blk/meta.json'] : ['under-replicated/blk.json']), 'both stores append to one log, in flush order');
+
+			const closers = { raw: () => raw.close(), kv: () => kv.close() };
+			await closers[order[0]]();
+			assert.ok(await exists(path.join(base, STORE_LOCK_FILENAME)), 'the lock outlives the first close');
+			await closers[order[1]]();
+			assert.ok(!(await exists(path.join(base, STORE_LOCK_FILENAME))), 'the last close removes the lock');
+			assert.ok((await fs.readFile(path.join(base, WRITE_LOG_FILENAME))).equals(Buffer.from(WRITE_LOG_HEADER)), 'and checkpoints the log empty');
+
+			const reopenedRaw = stores.open(base);
+			const reopenedKv = stores.openKv(base);
+			assert.deepStrictEqual(await reopenedRaw.getMetadata('blk' as BlockId), meta);
+			assert.strictEqual(await reopenedKv.get('under-replicated/blk'), 'entry');
+		});
+	}
 });
+
+async function readFileIfPresent(filePath: string): Promise<string | undefined> {
+	return fs.readFile(filePath, 'utf8').catch((err: NodeJS.ErrnoException) => {
+		if (err.code === 'ENOENT') return undefined;
+		throw err;
+	});
+}
+
+async function exists(filePath: string): Promise<boolean> {
+	return fs.access(filePath).then(() => true, () => false);
+}

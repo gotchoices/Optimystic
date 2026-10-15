@@ -41,11 +41,47 @@ class LocalTransactor implements ITransactor {
 
 interface NetworkSession {
 	node: any;
+	stores: NodeStores;
 	transactor: NetworkTransactor | LocalTransactor;
 	diaries: Map<string, Diary<any>>;
 	trees: Map<string, BTree<any, any>>;
 	isConnected: boolean;
 	isSingleNode: boolean; // Track if we're in single-node mode
+}
+
+/** The stores handed to the node, kept because the node never closes a store it was handed (`RawStorageProvider`). */
+interface NodeStores {
+	storage: IRawStorage;
+	kvStore: IKVStore;
+	/** For file storage, checkpoints the shared write-ahead log and removes the directory's lock. */
+	close(): Promise<void>;
+}
+
+/**
+ * The block store, and the node-local state that must survive a restart (the under-replication
+ * ledger). File storage puts both over one base path, where they share one write-ahead log and one
+ * lock: FileRawStorage.listBlockIds yields only directories that hold a meta.json, so the ledger's
+ * `under-replicated/` directory is never read as a block. Memory storage gets a memory key-value
+ * store explicitly — the node's own fallback would warn about losing state across a restart, which a
+ * memory-storage peer loses anyway.
+ */
+function openStores(options: { storage?: 'memory' | 'file'; storagePath?: string }): NodeStores {
+	if (options.storage !== 'file') {
+		return { storage: new MemoryRawStorage(), kvStore: new MemoryKVStore(), close: async () => { } };
+	}
+	const storage = new FileRawStorage(options.storagePath!);
+	const kvStore = new FileKVStore(options.storagePath!);
+	return {
+		storage,
+		kvStore,
+		close: async () => {
+			try {
+				await kvStore.close();
+			} finally {
+				await storage.close();
+			}
+		},
+	};
 }
 
 class PeerSession {
@@ -375,26 +411,6 @@ class PeerSession {
 			mode: options.offline ? 'offline' : 'distributed'
 		});
 
-		// Create storage provider based on options
-		const createStorage = (): IRawStorage => {
-			if (options.storage === 'file') {
-				return new FileRawStorage(options.storagePath!);
-			}
-			return new MemoryRawStorage();
-		};
-
-		// Node-local state that must survive a restart (the under-replication ledger). File storage
-		// shares FileRawStorage's base path: FileRawStorage.listBlockIds yields only directories that
-		// hold a meta.json, so the ledger's `under-replicated/` directory is never read as a block.
-		// Memory storage gets a memory store explicitly — the node's own fallback would warn about
-		// losing state across a restart, which a memory-storage peer loses anyway.
-		const createKvStore = (): IKVStore => {
-			if (options.storage === 'file') {
-				return new FileKVStore(options.storagePath!);
-			}
-			return new MemoryKVStore();
-		};
-
 		const wsPortNum = options.wsPort !== undefined ? parseInt(options.wsPort, 10) : undefined;
 		if (wsPortNum !== undefined && (!Number.isFinite(wsPortNum) || wsPortNum < 0)) {
 			throw new Error('--ws-port must be a non-negative integer');
@@ -405,6 +421,7 @@ class PeerSession {
 		if (effectiveRelay) {
 			console.log('🔁 Circuit-relay limits: disabled (reference-peer trusted)');
 		}
+		const stores = openStores(options);
 		const node = await createLibp2pNode({
 			port: parseInt(options.port || '0'),
 			wsPort: wsPortNum,
@@ -423,8 +440,8 @@ class PeerSession {
 			appendAnnounceAddrs: options.appendAnnounceAddr,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
-			storage: createStorage,
-			kvStore: createKvStore,
+			storage: stores.storage,
+			kvStore: stores.kvStore,
 			clusterSize,
 			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
 				|| repairCorroborationClusterSize !== undefined
@@ -434,6 +451,10 @@ class PeerSession {
 				enableRingZulu: true,
 				storage: storageCapacityBytes ? { totalBytes: storageCapacityBytes } : undefined
 			}
+		}).catch(async (err: unknown) => {
+			// The factory stops a node whose wiring failed, but the stores are ours to close.
+			await stores.close().catch(closeErr => logDebug('closing the stores after a failed start', closeErr));
+			throw err;
 		});
 
 		console.log(`✅ Node started with ID: ${node.peerId.toString()}`);
@@ -495,6 +516,7 @@ class PeerSession {
 
 		this.session = {
 			node,
+			stores,
 			transactor,
 			diaries: new Map(),
 			trees: new Map(),
@@ -569,6 +591,7 @@ class PeerSession {
 		console.log('🛑 Stopping network...');
 		await this.session.node.stop();
 		this.session.isConnected = false;
+		await this.session.stores.close();
 		console.log('✅ Network stopped');
 	}
 

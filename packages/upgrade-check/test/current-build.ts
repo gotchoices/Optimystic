@@ -60,7 +60,7 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 interface OpenBackend {
 	storage: () => IRawStorage;
 	kvStore: IKVStore;
-	/** Releases what the node does not own: the LevelDB handle, which the backend never closes. */
+	/** Releases what the node does not own: the two file stores, or the LevelDB handle, which the backend never closes. */
 	close(): Promise<void>;
 }
 
@@ -69,12 +69,20 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 	switch (layout.backend) {
 		case 'fs': {
 			// Kept and closed here: the node never closes a store it was handed, and closing is what
-			// releases the directory's lock and makes the restart below reopen it from disk.
+			// checkpoints each directory's write-ahead log, releases its lock and makes the restart
+			// below reopen it from disk.
 			const storage = new FileRawStorage(join(dataDir, layout.blocks));
+			const kvStore = new FileKVStore(join(dataDir, layout.kv));
 			return {
 				storage: () => storage,
-				kvStore: new FileKVStore(join(dataDir, layout.kv)),
-				close: () => storage.close(),
+				kvStore,
+				close: async () => {
+					try {
+						await kvStore.close();
+					} finally {
+						await storage.close();
+					}
+				},
 			};
 		}
 		case 'leveldb': {

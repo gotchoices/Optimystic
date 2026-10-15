@@ -293,6 +293,9 @@ class BlockStorage implements IBlockStorage {
 ```typescript
 // Filesystem backend layout (@optimystic/db-p2p-storage-fs)
 {basePath}/
+├── write-ahead.log              # Groups written since the last checkpoint
+├── write-ahead.log.sealed       # Present only while a checkpoint runs, or after a crash in one
+├── store.lock                   # { pid, hostname } of the process holding the store
 ├── {blockId}/
 │   ├── meta.json                # Block metadata and revision ranges
 │   ├── revs/{rev}.json          # Revision → ActionId mappings
@@ -425,13 +428,16 @@ disagree about the same key's cohort.
 import { createLibp2pNode } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 
+// In-memory when omitted; a raw-storage backend makes it durable. Options such as
+// { idleFlushMs, checkpointBytes, checkpointIdleMs } are in that package's README.
+const storage = new FileRawStorage('/var/lib/optimystic');
+
 // Create (and start) a libp2p node. The repo and cluster protocol services are registered by the
 // factory itself — there is no `services` option to pass them in.
 const node = await createLibp2pNode({
   networkName: 'my-net',
   bootstrapNodes: ['...'],
-  // In-memory when omitted; a raw-storage backend makes it durable
-  storage: new FileRawStorage('/var/lib/optimystic'),
+  storage,
 });
 
 // The handles the node already owns (see `OptimysticNodeAttachments`)
@@ -441,6 +447,8 @@ const keyNetwork = node.keyNetwork;            // Peer/coordinator discovery
 
 // ... use them, then:
 await node.stop();
+// The node never closes a store it was handed: closing it flushes, checkpoints and releases its lock
+await storage.close();
 ```
 
 `createLibp2pNode` is all-or-nothing: the node is started early and then wired, so if any wiring step

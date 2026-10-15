@@ -43,7 +43,7 @@ const THIRD_PARTY_PACKAGES = ['@quereus/quereus', 'p2p-fret', 'libp2p', '@libp2p
 
 /** How each backend's data is read back into a fixture; the names match `BACKENDS` in the writer. */
 const PACKERS = {
-	fs: async dataDir => ({ files: packDirectory(dataDir) }),
+	fs: async dataDir => ({ files: refuseStoreLocks(packDirectory(dataDir)) }),
 	leveldb: async (dataDir, manifest) => ({ entries: await packLevelDB(join(dataDir, manifest.storage.path)) }),
 };
 
@@ -176,6 +176,19 @@ function findPackageManifests(nodeModules) {
 	};
 	visit(nodeModules);
 	return manifests;
+}
+
+/**
+ * The packed files, unless one is a `store.lock`: a lock in a fixture means the writer stopped
+ * without closing its stores, so the fixture is not what a clean stop of that release leaves.
+ * `write-ahead.log` may be present, and a log left unapplied is still a valid fixture.
+ */
+function refuseStoreLocks(files) {
+	const locks = Object.keys(files).filter(path => path === 'store.lock' || path.endsWith('/store.lock'));
+	if (locks.length > 0) {
+		throw new FixtureError(`the writer left ${locks.join(', ')} behind: it must close every store it opened`);
+	}
+	return files;
 }
 
 /**

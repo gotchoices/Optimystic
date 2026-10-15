@@ -50,11 +50,18 @@ const BACKENDS = {
 		const layout = { backend: 'fs', blocks: 'blocks', kv: 'kv' };
 		mkdirSync(join(dir, layout.blocks), { recursive: true });
 		mkdirSync(join(dir, layout.kv), { recursive: true });
+		const storage = new FileRawStorage(join(dir, layout.blocks));
+		const kvStore = new FileKVStore(join(dir, layout.kv));
 		return {
 			layout,
-			storage: () => new FileRawStorage(join(dir, layout.blocks)),
-			kvStore: new FileKVStore(join(dir, layout.kv)),
-			close: async () => { },
+			storage: () => storage,
+			kvStore,
+			// A build with a write-ahead log checkpoints it and removes the directory's lock on close, so
+			// the fixture holds an empty log and no `store.lock`. Older builds have no `close` on either.
+			close: async () => {
+				await kvStore.close?.();
+				await storage.close?.();
+			},
 		};
 	},
 	// The LevelDB backend a React Native app runs on: one database for blocks and key-value records.

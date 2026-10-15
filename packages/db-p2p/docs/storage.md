@@ -170,11 +170,13 @@ observer can see both records.
 ### 5. A store is owned by exactly one process
 
 No two processes may point an `IRawStorage` (or a `RawStoreDriver`) at the same
-underlying path/keyspace at the same time. This is **not enforced anywhere in
-code today** — it holds only because every current deployment happens to wire
-one store per node (and, in the Sereus fabric layered over Optimystic, one store
-per trust domain besides), so nothing shares a directory in practice. Nothing
-stops a future host from embedding two nodes over one path.
+underlying path/keyspace at the same time. The filesystem backend enforces it on
+one machine: its `store.lock` refuses a second live process on the same host (see
+*The file backend* under Invariant 6). **No other backend enforces it** — there it
+holds only because every current deployment happens to wire one store per node
+(and, in the Sereus fabric layered over Optimystic, one store per trust domain
+besides), so nothing shares a keyspace in practice. Nothing stops a future host
+from embedding two nodes over one path.
 
 **Violate it and:** Invariant 1 breaks silently. A second process writing to the
 same backend produces writes that never funnel through the first process's
@@ -241,7 +243,7 @@ does real work: `WriteGroupDriver`, whose flush is the sync, and the file backen
 |---|---|---|---|
 | `MemoryStoreDriver` | the in-memory map update | nothing | `'none'` |
 | `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`, resolving when that has | the backend's |
-| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | appends the group as one record to `write-ahead.log`, syncs it once, then writes the tree without waiting | `'power-loss'` |
+| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log, synced once per flush, then the tree written without waiting | `'power-loss'` |
 | `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | `'process-crash'` |
 | `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | `'process-crash'` |
 | `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | `'process-crash'` |
@@ -264,7 +266,7 @@ commit is in flight waits for it and then shares the next commit with every othe
 arrived meanwhile (rule 4), and a rejected commit latches the driver failed, after which every
 write and flush throws `StoreFailedError` (rule 5) while reads keep serving the overlay. The
 key-agnostic part — overlay, open batch, commit chain, failure latch and idle timer — is
-`WriteGroup` in `packages/db-p2p/src/storage/write-group.ts`, which `FileKVStore` will reuse
+`WriteGroup` in `packages/db-p2p/src/storage/write-group.ts`, which `FileKVStore` also uses
 over string keys. A write that no group flushes is flushed by the driver's own idle timer,
 `idleFlushMs` (default one second) after the first write of an open batch. `IRawStorage.close`,
 optional and wired by the kernel only when the driver has one, flushes once more and releases
@@ -284,15 +286,34 @@ a torn final record, a record whose length runs past the end of the file, a CRC 
 that is not this build's stops the read before that record, and the records before it are applied.
 Rule 3 holds by construction, since the log is one sequence of whole groups; a promote is two
 entries of one record, which is what makes it atomic and durable; and a new block's directory needs
-no sync of its own ahead of its files. The backend keeps every path it wrote and every directory it
-created since the last truncation (`FileWriteLog.dirty`), which is what the checkpoint of
-`file-store-checkpoint-and-shared-log` will sync before discarding the log; until it lands the log
-grows for the store's life and is truncated only by a reopen. Opening also takes
-`<basePath>/store.lock` (`acquireStoreLock` in `packages/db-p2p-storage-fs/src/store-lock.ts`): a
-lock naming a live process on this machine refuses the open with `StoreLockedError`, any other is
-stale and replaced. One `FileWriteLog` per directory per process, shared by reference count, so two
-`FileRawStorage` over one directory share one log and one lock — each with its own overlay, which is
-why a second store opened beside a first does not see the first's unflushed writes.
+no sync of its own ahead of its files.
+
+The log keeps every file it wrote and every directory whose entries changed since the last
+checkpoint, and a checkpoint (`FileWriteLog.checkpoint`) spends that set to discard the log: it
+**seals** the log, in line with commits so no apply is in flight, by renaming it to
+`write-ahead.log.sealed`, starting an empty one and taking the set; it **syncs** every file and then
+every directory in the set, sixteen at a time, while commits carry on into the new log; and it
+**truncates** by deleting the sealed segment and syncing the directory. A file deleted since the seal
+is skipped and one rewritten since is synced with content the new log also covers. It runs when the
+log reaches `checkpointBytes` (16 MiB by default), `checkpointIdleMs` (5 s) after the last append,
+and on the last close of the directory's log, one at a time, and a failure latches the store failed
+as a rejected commit does. An open replays the sealed segment, if a crash left one, before the
+current log — harmless, since the current log holds every later write of the same paths in order —
+and deletes it, with a directory sync, before truncating the current log, so the older segment can
+never be replayed alone over newer content. A sealed segment that stops short ends the replay there,
+the current log included — the two files are read as one log, by the same rule as a bad record
+inside one. Directories are therefore
+synced only at a checkpoint and at open, never per write; on win32, where a directory cannot be
+synced, only files are.
+
+Opening also takes `<basePath>/store.lock` (`acquireStoreLock` in
+`packages/db-p2p-storage-fs/src/store-lock.ts`): a lock naming a live process on this machine refuses
+the open with `StoreLockedError`, any other is stale and replaced. One `FileWriteLog` per directory
+per process, shared by reference count, so every store over one directory — `FileRawStorage` and
+`FileKVStore` (`packages/db-p2p-storage-fs/src/file-kv-store.ts`), which writes through a
+`WriteGroup` over string keys into the same log — shares one log, one lock and one checkpoint, and
+two stores' commits never interleave within a record. Each keeps its own overlay, which is why a
+second store opened beside a first does not see the first's unflushed writes.
 
 **Rule 3 past the crashes a store names.** For the `'process-crash'` backends, rule 3 under an
 operating-system crash or power cut is not established today. SQLite's write-ahead log stops
@@ -454,7 +475,8 @@ the directory's write-ahead log (`FileWriteLog` in
 `packages/db-p2p-storage-fs/src/file-write-log.ts`). The kernel owns JSON
 (de)serialization on top; the driver holds each group in memory until its flush;
 the backend appends the group to the log with one sync, writes the tree, and
-replays the log on the next open. The constructor is synchronous; the first
+replays the log on the next open; a checkpoint syncs the tree and discards the
+log in the background, and on the last close. The constructor is synchronous; the first
 operation takes the directory's lock and replays. How the log holds Invariant 6
 is under *The file backend* there. See "Shared KV Kernel" below.
 
@@ -473,7 +495,7 @@ read yields a fresh object *by construction*. The `structuredClone`-on-every-get
 discipline the old in-memory backend needed is now structural, not a rule — see
 docs/internals.md "Storage Returns References". `promote` (pending → committed) is
 the only cross-key atomic operation the kernel requires; each backend satisfies it
-with its native atomic primitive (batch / DB transaction / rename).
+with its native atomic primitive (batch / DB transaction / one write-ahead-log record).
 
 Every shipping backend uses this kernel today: in-memory (`MemoryStoreDriver`),
 IndexedDB, LevelDB, and SQLite each supply only a driver, and the filesystem
@@ -491,7 +513,8 @@ the driver does is under Invariant 6, *Writes that wait in memory*.
 **File System Structure:**
 ```
 {basePath}/
-├── write-ahead.log         # Groups committed but not yet checkpointed into the tree
+├── write-ahead.log         # Groups written since the last checkpoint
+├── write-ahead.log.sealed  # The log a checkpoint is syncing the tree under (only during one, or after a crash in one)
 ├── store.lock              # { pid, hostname } of the process holding the store
 ├── {blockId}/
 │   ├── meta.json           # Block metadata

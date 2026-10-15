@@ -7,15 +7,15 @@ import { crc32 } from 'zlib';
 import { StoreFailedError } from '@optimystic/db-p2p';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import {
-	FileWriteLog, StoreLockedError, WRITE_LOG_FILENAME, STORE_LOCK_FILENAME, WRITE_LOG_HEADER,
+	FileWriteLog, StoreLockedError, WRITE_LOG_FILENAME, SEALED_WRITE_LOG_FILENAME, STORE_LOCK_FILENAME, WRITE_LOG_HEADER,
 	encodeWriteLogRecord, decodeWriteLog, type WriteLogEntry,
 } from '../src/index.js';
 import { trackedStores } from './support/tracked-stores.js';
-import { interceptHandleSync, withFailingWriteFile } from './support/fs-injection.js';
+import { interceptHandleSync, interceptRename, parkUnlink, withFailingWriteFile } from './support/fs-injection.js';
 
 // ---------------------------------------------------------------------------
 // The write-ahead log on its own: what a strict replay applies from a damaged log, what a commit
-// leaves behind when it fails at each of its two steps, and the lock. Logs are hand-built from the
+// leaves behind when it fails at each of its two steps, the checkpoint, and the lock. Logs are hand-built from the
 // exported codec so a replay can be given records the store never applied — the shape a crash
 // between the sync and the apply leaves — without a real crash.
 // ---------------------------------------------------------------------------
@@ -194,6 +194,137 @@ describe('FileWriteLog commit failures', () => {
 		} finally {
 			restore();
 		}
+	});
+});
+
+describe('FileWriteLog checkpoint', () => {
+	let base: string;
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-wal-checkpoint-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	const sealedPath = () => path.join(base, SEALED_WRITE_LOG_FILENAME);
+	const sealedExists = () => fs.access(sealedPath()).then(() => true, () => false);
+
+	it('a batch larger than the size threshold is checkpointed once, without being asked', async () => {
+		let seals = 0;
+		let sealed!: () => void;
+		const firstSeal = new Promise<void>(resolve => { sealed = resolve; });
+		const restore = interceptRename(to => {
+			if (path.basename(to) === SEALED_WRITE_LOG_FILENAME) { seals += 1; sealed(); }
+		});
+		try {
+			const log = FileWriteLog.acquire(base, { checkpointBytes: 1 });
+			try {
+				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')]);
+				await firstSeal;
+			} finally {
+				await log.release();
+			}
+			assert.strictEqual(seals, 1, 'one checkpoint for the append that crossed the threshold, none after it');
+			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)), 'the log is back to its header');
+			assert.ok(!(await sealedExists()), 'and the sealed segment is gone');
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one');
+		} finally {
+			restore();
+		}
+	});
+
+	it('the idle checkpoint is re-armed by every append and checkpoints when it fires', async () => {
+		const armed = new Set<() => void>();
+		const setTimer = (fn: () => void): (() => void) => {
+			armed.add(fn);
+			return () => { armed.delete(fn); };
+		};
+		const log = FileWriteLog.acquire(base, { setTimer });
+		try {
+			await log.commit([put('blk/meta.json', 'one')]);
+			await log.commit([put('blk/meta.json', 'two')]);
+			assert.strictEqual(armed.size, 1, 'the second append replaced the first one\'s timer');
+			const parked = parkUnlink(sealedPath());
+			try {
+				[...armed][0]!();
+				await parked.reached;
+				assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)), 'the fired checkpoint sealed the log and started an empty one');
+				parked.proceed();
+			} finally {
+				parked.restore();
+			}
+		} finally {
+			await log.release();
+		}
+		assert.ok(!(await sealedExists()));
+	});
+
+	it('a checkpoint that fails before discarding its sealed segment latches the log, and the next open replays the sealed segment and then the current log', async () => {
+		const parked = parkUnlink(sealedPath());
+		try {
+			await withLog(base, async log => {
+				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')]);
+				const checkpointing = log.checkpoint();
+				await parked.reached;
+				await log.commit([put('blk/meta.json', 'two')]);
+				parked.proceed(new Error('injected crash before the truncate'));
+				await assert.rejects(checkpointing, StoreFailedError);
+				assert.ok(log.failed);
+				await assert.rejects(() => log.commit([put('blk/meta.json', 'three')]), StoreFailedError, 'latched: later commits are refused');
+			});
+		} finally {
+			parked.restore();
+		}
+		assert.deepStrictEqual(decodeWriteLog(await fs.readFile(sealedPath())).batches.map(batch => batch.map(e => e.path)), [['blk/meta.json', 'blk/revs/1.json']]);
+		assert.deepStrictEqual(decodeWriteLog(await logFileBytes(base)).batches.map(batch => batch.map(e => e.path)), [['blk/meta.json']],
+			'the commit made while the checkpoint was parked went to the new log');
+
+		// What a crash takes from the tree: the files written without a sync.
+		await fs.rm(path.join(base, 'blk'), { recursive: true });
+		await withLog(base, async log => {
+			await log.open();
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'two', 'the current log, replayed after the sealed segment, wins');
+			assert.strictEqual(await readText(base, 'blk/revs/1.json'), 'tx:1', 'the sealed segment was replayed');
+			assert.ok(!(await sealedExists()), 'and then removed');
+			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)));
+		});
+	});
+
+	it('a commit made while a checkpoint is syncing stays in the new log, which that checkpoint does not discard', async () => {
+		const parked = parkUnlink(sealedPath());
+		try {
+			await withLog(base, async log => {
+				await log.commit([put('blk/meta.json', 'one')]);
+				const checkpointing = log.checkpoint();
+				await parked.reached;
+				await log.commit([put('blk/revs/2.json', 'tx:2')]);
+				parked.proceed();
+				await checkpointing;
+				assert.ok(!(await sealedExists()));
+				assert.deepStrictEqual(decodeWriteLog(await logFileBytes(base)).batches.map(batch => batch.map(e => e.path)), [['blk/revs/2.json']]);
+			});
+		} finally {
+			parked.restore();
+		}
+		await withLog(base, async log => {
+			await log.open();
+			assert.strictEqual(await readText(base, 'blk/revs/2.json'), 'tx:2');
+		});
+	});
+
+	it('a sealed segment that stops short ends the replay: the current log is not applied', async () => {
+		const sealed = Buffer.from(encodeWriteLogRecord([put('blk/revs/2.json', 'tx:2')]));
+		await fs.writeFile(sealedPath(), Buffer.concat([Buffer.from(WRITE_LOG_HEADER), Buffer.from(encodeWriteLogRecord([put('blk/meta.json', 'one')])), sealed.subarray(0, sealed.length - 1)]));
+		await writeLogFile(base, WRITE_LOG_HEADER, encodeWriteLogRecord([put('blk/meta.json', 'three')]));
+
+		await withLog(base, async log => {
+			await log.open();
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one', 'a write after the lost one is not replayed over the prefix');
+			assert.ok(!(await sealedExists()));
+			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)));
+		});
 	});
 });
 
