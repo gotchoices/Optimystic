@@ -461,6 +461,25 @@ host assembling a stack *without* `createLibp2pNode`. A standalone `CoordinatorR
 `Libp2pKeyPeerNetwork` must be told its cluster size; pass `DEFAULT_CLUSTER_SIZE` (exported from
 this package) to match what an unconfigured node resolves to.
 
+### How long a write may wait for its sync (`storageDurability`)
+
+A node may leave a storage write unsynced for a short window before forcing it onto disk; how long is computed per write from the size of the cohort the write's consensus ran on, as the longest wait for which every machine that would have to lose the write losing power within it stays less likely than the accepted loss chance (`durabilityWindowMs` in `src/storage/durability-window.ts`). A cohort of one always syncs first.
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  storage,
+  storageDurability: {
+    independentFailures: true,  // default; false when machines share power — every write then syncs first
+    lossRatePerHour: 1 / 720,   // default: one power cut or OS crash per machine per 30 days
+    lossTarget: 1e-9,           // default: accepted chance of losing one acknowledged write
+    maxWindowMs: 5000,          // default: cap on any window
+  },
+});
+```
+
+At the defaults every cohort of two or more members gets the 5000 ms cap. The window matters only on storage that can sync (`durability: 'power-loss'`); a `'process-crash'` backend cannot sync at all, so a power cut may lose any write the operating system has not yet written out, whatever the window. The node's start-up storage line reports the windows in force. An out-of-range value throws at node construction.
+
 ### External Client Operations
 
 ```typescript

@@ -19,6 +19,7 @@ import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import type { StoreDurability } from './storage/store-durability.js';
+import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindowPolicy, type StorageDurabilityOptions } from './storage/durability-window.js';
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
@@ -256,6 +257,16 @@ export type NodeOptions = ClusterPolicyOptions & {
 	relayServerInit?: CircuitRelayServerInit;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
 	storage?: RawStorageProvider;
+	/**
+	 * How long a storage write may wait before it is forced onto disk, computed per write from the size
+	 * of the cohort its consensus ran on (see `durabilityWindowMs` in `storage/durability-window.ts`).
+	 * Defaults assume machines lose power independently, one loss per machine per 30 days, and accept a
+	 * one-in-10^9 chance of losing an acknowledged write, with no window above 5000 ms. Set
+	 * `independentFailures: false` when machines share power, so every write syncs before it is reported.
+	 * Applies only on storage that can sync (`durability: 'power-loss'`). A value out of range throws at
+	 * node construction.
+	 */
+	storageDurability?: StorageDurabilityOptions;
 	/**
 	 * Durable key-value store for node-local state that must survive a restart — today, the
 	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
@@ -699,8 +710,29 @@ const STORAGE_DURABILITY_LINES: Record<StoreDurability, string> = {
  * that says so: a later report about the same storage (a backend that cannot sync, say) extends
  * this function rather than logging from somewhere else.
  */
-function logStorageDurability(durability: StoreDurability): void {
-	wiringLog('%s', STORAGE_DURABILITY_LINES[durability]);
+function logStorageDurability(durability: StoreDurability, policy: DurabilityWindowPolicy): void {
+	wiringLog('%s%s', STORAGE_DURABILITY_LINES[durability], durabilityWindowClause(durability, policy));
+}
+
+/** Largest cohort size the start-up line spells a window out for. */
+const LOGGED_WINDOW_COHORT_LIMIT = 10;
+
+/** What the durability window means on this storage, appended to the start-up storage line. */
+function durabilityWindowClause(durability: StoreDurability, policy: DurabilityWindowPolicy): string {
+	switch (durability) {
+		case 'none':
+			return '';
+		case 'process-crash':
+			return '; this backend cannot sync, so a power cut may lose any write the operating system has not yet written out, whatever the window';
+		case 'power-loss': {
+			if (!policy.independentFailures) {
+				return '; every write is synced before it is reported held';
+			}
+			const limit = Math.min(policy.declaredCohortSize, LOGGED_WINDOW_COHORT_LIMIT);
+			const windows = Array.from({ length: Math.max(limit, 1) }, (_, i) => `n=${i + 1} ${durabilityWindowMs(i + 1, policy)}ms`);
+			return `; a write may wait for its sync up to: ${windows.join(', ')} (independent failures assumed; storageDurability.independentFailures=false makes every write sync first)`;
+		}
+	}
 }
 
 /**
@@ -781,9 +813,27 @@ export async function createLibp2pNodeBase(
 	const bootstrapContactTimeoutMs = resolveBootstrapContactTimeoutMs(options.bootstrapContactTimeoutMs, linkDeadlines);
 	// One value for libp2p's connection manager and FRET's maintenance redial, so the two cannot drift.
 	const libp2pDialTimeoutMs = resolveLibp2pDialTimeoutMs(options.connectionManager?.dialTimeout, linkDeadlines);
+
+	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
+	// gate and the repair corroboration floor resolve to different values when nothing is declared,
+	// and why they take TWO operator fields (`clusterPolicy.assumedClusterSize`, which sets both, and
+	// `clusterPolicy.repairCorroborationClusterSize`, which sets the repair yardstick alone so a host
+	// can tighten repair without also raising the low-confidence write floor). Resolved ONCE, here,
+	// before anything that reads a cluster size is constructed: `networkManagerService` below,
+	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
+	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
+	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
+	// below is the fail-fast backstop if a future edit reintroduces that split.
+	//
+	// The cohort budget is filled from the declared link round trip BEFORE resolution, so the member,
+	// the coordinator and `reconcilePassTimeoutMs` all read the one resolved number.
+	const consensusConfig = resolveClusterPolicy(withLinkDerivedCohortBudget(options, linkDeadlines));
+	// Also before storage is acquired, so a bad value throws with nothing to release; read from the
+	// one resolved cluster policy, never a second copy of the size or threshold.
+	const durabilityWindowPolicy = resolveDurabilityWindowPolicy(options.storageDurability, consensusConfig);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
-	logStorageDurability(rawStorage.durability);
+	logStorageDurability(rawStorage.durability, durabilityWindowPolicy);
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
 
@@ -878,21 +928,6 @@ export async function createLibp2pNodeBase(
 		// the store first keeps origination correct regardless of the caller sink (`put` never throws).
 		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
 		: options.onCommitCertificate;
-
-	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
-	// gate and the repair corroboration floor resolve to different values when nothing is declared,
-	// and why they take TWO operator fields (`clusterPolicy.assumedClusterSize`, which sets both, and
-	// `clusterPolicy.repairCorroborationClusterSize`, which sets the repair yardstick alone so a host
-	// can tighten repair without also raising the low-confidence write floor). Resolved ONCE, here,
-	// before anything that reads a cluster size is constructed: `networkManagerService` below,
-	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
-	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
-	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
-	// below is the fail-fast backstop if a future edit reintroduces that split.
-	//
-	// The cohort budget is filled from the declared link round trip BEFORE resolution, so the member,
-	// the coordinator and `reconcilePassTimeoutMs` all read the one resolved number.
-	const consensusConfig = resolveClusterPolicy(withLinkDerivedCohortBudget(options, linkDeadlines));
 
 	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither
 	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Four
