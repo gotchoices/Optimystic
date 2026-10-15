@@ -13,3 +13,7 @@ Expected:
 
 - Once FRET publishes the release containing `dialTimeoutMs` (FRET ticket `maintenance-redial-off-the-tick`), both declared ranges name that version as their floor, and `yarn lint:deps` passes.
 - This must happen before (or with) the first optimystic release published after FRET's, not after it.
+
+## Done
+
+FRET 1.1.0 published (tag v1.1.0 = FRET 12b509a plus version bump). `p2p-fret` raised to `^1.1.0` in `packages/db-p2p/package.json` and `packages/substrate-simulator/package.json`; `yarn install` and `yarn lint:deps` clean. Release note added under "Unreleased — since v1.14.0" in `.release-notes.pending.md` (the previous "Unreleased — since v1.13.0" section relabelled `v1.14.0`, which is on npm).
