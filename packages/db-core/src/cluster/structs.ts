@@ -214,6 +214,12 @@ export type ClusterRecord = {
 	commits: { [peerId: string]: Signature };
 	/** Sender's recommended cluster size: min(estimated network size, configured cluster size) */
 	suggestedClusterSize?: number;
+	/**
+	 * The coordinator's `clusterSize` when its `allowClusterDownsize` is false, else absent.
+	 * NOTE: advisory only — nothing reads it but the coordinator's `cluster-tx:start` log line, and it
+	 * sits outside `messageHash`, so any relaying peer can rewrite it. If members ever need a size
+	 * floor, derive it from the member's own configuration rather than trusting this field.
+	 */
 	minRequiredSize?: number;
 	/** Sender's current network size estimate */
 	networkSizeHint?: number;
