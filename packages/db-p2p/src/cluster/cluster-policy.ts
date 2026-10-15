@@ -100,6 +100,14 @@ export interface ClusterPolicyOptions {
 	 */
 	clusterSize?: number;
 	clusterPolicy?: {
+		/**
+		 * Whether a cohort of two or more members smaller than the configured `clusterSize` may run
+		 * consensus (default true); `false` refuses it with "below configured minimum". It has no effect
+		 * on a cohort of at most one peer — this node alone, or a lookup that named nobody — which
+		 * always commits alone, answered as durability class `local` or `unrouted`
+		 * (`CoordinatorRepo`'s solo path). Whether a lone write should ever be refused is open in
+		 * backlog `partition-healing`.
+		 */
 		allowDownsize?: boolean;
 		/** Acceptable relative difference (e.g. 0.5 = +/-50%). */
 		sizeTolerance?: number;

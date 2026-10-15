@@ -296,7 +296,11 @@ export interface ClusterConsensusConfig {
 	simpleMajorityThreshold: number;
 	/** Minimum absolute cluster size (default 3) */
 	minAbsoluteClusterSize: number;
-	/** Allow cluster to operate below configured size (default false) */
+	/**
+	 * Whether a cohort of two or more members smaller than the configured `clusterSize` may run
+	 * consensus (db-p2p resolves it to true when unset). It has no effect on a cohort of at most one
+	 * peer, which commits alone without consensus.
+	 */
 	allowClusterDownsize: boolean;
 	/** Tolerance for cluster size variance as fraction (default 0.5 = 50%) */
 	clusterSizeTolerance: number;

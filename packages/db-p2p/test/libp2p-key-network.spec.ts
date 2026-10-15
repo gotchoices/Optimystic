@@ -820,7 +820,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// self-coordination guard refuses. That refusal used to fail the whole lookup with
 	// SELF_COORDINATION_BLOCKED — which bought no safety, because the SAME node with the SAME
 	// information self-coordinates freely once the clock passes gracePeriodMs (and a self-only
-	// cohort commits under allowClusterDownsize, the default). A grace-period denial is now
+	// cohort always commits alone, whatever allowClusterDownsize says). A grace-period denial is now
 	// DEFERRABLE: the last-resort tier degrades to self with a warning instead of throwing,
 	// and a READ skips the retry loop entirely since answering from our own replica is what an
 	// isolated node must accept anyway. Only a HARD denial — an explicit `disabled` switch, or
@@ -2205,8 +2205,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// An 'unknown' peer (empty peerStore protocol list) is indistinguishable between a
 			// permanently cross-network contaminant and a fresh same-network peer mid-identify.
 			// findCluster therefore never admits one on a viability floor: the cohort is self-only.
-			// A genuine fresh mesh is not starved — the write completes self-only under
-			// allowClusterDownsize (the default) and the peer is re-included as 'serves' on the
+			// A genuine fresh mesh is not starved — the write completes self-only (a lone cohort
+			// always commits alone) and the peer is re-included as 'serves' on the
 			// caller's retry once identify completes.
 			const freshA = await makePeerId();
 			const freshB = await makePeerId();

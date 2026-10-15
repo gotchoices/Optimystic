@@ -197,8 +197,9 @@ export interface SelfCoordinationDecision {
 	 * `grace-period-not-elapsed` is deferrable for BOTH because it is a timing condition
 	 * with no evidence behind it: the same node, with the same FRET table and the same zero
 	 * connections, is allowed to self-coordinate once the clock passes `gracePeriodMs`. It
-	 * postpones an isolated write rather than preventing it (a self-only cohort commits
-	 * under `allowClusterDownsize`, the default), so failing the caller buys no safety.
+	 * postpones an isolated write rather than preventing it (a self-only cohort always
+	 * commits alone; `allowClusterDownsize` does not reach that path), so failing the
+	 * caller buys no safety.
 	 *
 	 * The read column is uniformly deferrable because none of these reasons protects a
 	 * read: self-coordinating a read means "answer from my own replica", which is what an
@@ -1848,9 +1849,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		// dial then negotiates a different network's protocol and the whole write fails. A fresh
 		// same-network peer is not starved: it flips to 'serves' once identify completes and is
 		// re-included on the caller's retry, and in the meantime a self-only cohort (when self is
-		// the only serving member known) still completes the write under allowClusterDownsize
-		// (the default). One peerStore read per non-self band member yields both protocols (for
-		// the classification here) and addresses (reused by `findCluster`'s backfill).
+		// the only serving member known) still completes the write alone, whatever
+		// allowClusterDownsize says. One peerStore read per non-self band member yields both
+		// protocols (for the classification here) and addresses (reused by `findCluster`'s backfill).
 		const peerStoreRecords = await this.getPeerStoreRecordsByPeer(band.filter(id => id !== selfId))
 		const serving: string[] = []
 		let unknown = 0
