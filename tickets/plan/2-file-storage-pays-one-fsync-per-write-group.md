@@ -4,6 +4,13 @@ architecture: packages/db-p2p/docs/storage.md#4-file-based-storage-filerawstorag
 files: packages/db-p2p/src/storage/raw-store-driver.ts, packages/db-p2p/src/storage/cached-store-driver.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p-storage-fs/src/atomic-write.ts, packages/db-p2p-storage-fs/src/file-storage.ts, packages/db-p2p-storage-fs/src/file-kv-store.ts, packages/db-p2p-storage-fs/src/index.ts, packages/db-p2p-storage-fs/README.md, packages/db-p2p-storage-fs/test/file-storage.spec.ts, packages/db-p2p-storage-fs/test/under-replication-ledger.spec.ts, packages/db-p2p/src/unref-timer.ts, packages/db-p2p/docs/storage.md, docs/repository.md, packages/reference-peer/src/cli.ts, packages/upgrade-check/readme.md
 difficulty: hard
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-15T19:16:09.821Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\2-file-storage-pays-one-fsync-per-write-group.plan.2026-10-15T19-16-09-821Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 # File storage pays one fsync per write group
 
