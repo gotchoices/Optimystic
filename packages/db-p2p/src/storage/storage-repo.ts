@@ -87,6 +87,21 @@ export function isCommitNotDurableFailure(result: CommitResult): boolean {
 /** Whether one {@link StorageRepo.get} entered a block write latch, which decides whether it ends with a flush. */
 type ReadWrites = { wrote: boolean };
 
+/**
+ * `Promise.all` that waits for every block's work to settle before rethrowing the first failure. A
+ * write group fanned out per block must not reach its flush while a sibling block is still writing:
+ * the flush covers only writes resolved before it was called, so plain `Promise.all` would let a
+ * failed group report with sibling writes not yet covered.
+ */
+async function settleAllPerBlock<T>(work: readonly Promise<T>[]): Promise<T[]> {
+	const settled = await Promise.allSettled(work);
+	const failed = settled.find((s): s is PromiseRejectedResult => s.status === 'rejected');
+	if (failed !== undefined) {
+		throw failed.reason;
+	}
+	return settled.map(s => (s as PromiseFulfilledResult<T>).value);
+}
+
 export type StorageRepoOptions = {
 	/**
 	 * Builds the per-block storage over THIS repo's store — the one {@link StorageRepo} flushes at the
@@ -393,7 +408,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// Set by any block whose read entered a write latch (the promotion below, or a coverage restore
 		// in readBlockHealing), so a read that wrote nothing — the hot path — never flushes.
 		const writes: ReadWrites = { wrote: false };
-		const results = await this.endGroup(() => Promise.all(distinctBlockIds.map(async (blockId): Promise<[BlockId, GetBlockResult]> => {
+		const results = await this.endGroup(() => settleAllPerBlock(distinctBlockIds.map(async (blockId): Promise<[BlockId, GetBlockResult]> => {
 			const blockStorage = this.createBlockStorage(blockId);
 			// Set when this node KNOWS its answer for the block is a guess: the promotion
 			// below refused for a missing base, or getBlock() threw (truncated history /
@@ -497,7 +512,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			//
 			// readBlockHealing() THROWS when this node holds a `latest` it cannot materialize
 			// (truncated history: "Failed to find materialized block", or a failed restore). Caught
-			// PER BLOCK so one broken block cannot fail the whole batch's Promise.all and take healthy
+			// PER BLOCK so one broken block cannot fail the whole batch and take healthy
 			// siblings down with it. The read still fails for THIS block — TransactorSource throws
 			// BlockUnavailableError on the flagged entry — so nothing is swallowed.
 			let blockRev: Awaited<ReturnType<IBlockStorage['getBlock']>>;
@@ -939,7 +954,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	async cancel(actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {
 		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
 		await this.endGroup(async () => {
-			await Promise.all(actionRef.blockIds.map(blockId => {
+			await settleAllPerBlock(actionRef.blockIds.map(blockId => {
 				const blockStorage = this.createBlockStorage(blockId);
 				return withBlockWriteLatch(blockId, latch => blockStorage.deletePendingTransaction(actionRef.actionId, latch));
 			}));

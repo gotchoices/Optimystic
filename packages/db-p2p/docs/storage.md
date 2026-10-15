@@ -285,7 +285,9 @@ node is about to report to another machine:
   promotion, or a coverage restore). The flush runs after the group's latches are released,
   so a concurrent group on the same blocks is not held behind the disk and several groups can
   share one sync, and before the group's change events, so nothing announces a commit this
-  node could still lose. A group whose work throws is flushed before the error propagates; a
+  node could still lose. A group whose work throws is flushed before the error propagates, and
+  one fanned out per block (`get`, `cancel`) first waits for every block to settle, so the
+  flush covers a sibling block still writing when another failed; a
   flush that rejects after the work returned makes the call throw and emit nothing. A `get`
   that took no latch does not flush, so the plain read path costs nothing extra.
 - `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls

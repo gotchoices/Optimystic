@@ -3788,3 +3788,93 @@ describe('StorageRepo.get — read-driven promotion applies a record only to the
 		expect(await raw.getPendingTransaction(BLOCK, 'a2' as ActionId), 'declined, not refused: the record stays').to.not.equal(undefined);
 	});
 });
+
+describe('StorageRepo — every write group ends with one flush (storage.md Invariant 6)', () => {
+	/** A memory store whose flush records into `trace` and can be made to reject. */
+	const makeTracedStore = (trace: string[]) => {
+		const store = new MemoryRawStorage();
+		const flushState = { fail: false };
+		store.flush = async () => {
+			trace.push('flush');
+			if (flushState.fail) {
+				throw new Error('disk gone');
+			}
+		};
+		return { store, flushState };
+	};
+
+	const pendInsert = (repo: StorageRepo, actionId: string, blockId: string) => repo.pend({
+		actionId: actionId as ActionId,
+		transforms: makeInsertTransforms(blockId as BlockId, makeBlock(blockId)),
+		policy: 'c'
+	});
+
+	it('flushes once before the change event, and a contextless read flushes nothing', async () => {
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		repo.onCollectionChange('collection-1' as BlockId, () => trace.push('event'));
+
+		await pendInsert(repo, 'a1', 'block-1');
+		trace.length = 0;
+		const result = await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+		expect(result.success).to.equal(true);
+		expect(trace).to.deep.equal(['flush', 'event']);
+
+		trace.length = 0;
+		await repo.get({ blockIds: ['block-1' as BlockId] });
+		expect(trace, 'a read that took no write latch must not flush').to.deep.equal([]);
+	});
+
+	it('a flush that rejects after the work makes commit throw and announce nothing', async () => {
+		const trace: string[] = [];
+		const { store, flushState } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		repo.onCollectionChange('collection-1' as BlockId, () => trace.push('event'));
+
+		await pendInsert(repo, 'a1', 'block-1');
+		flushState.fail = true;
+		trace.length = 0;
+		let thrown: unknown;
+		try {
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as Error | undefined)?.message).to.equal('disk gone');
+		expect(trace).to.deep.equal(['flush']);
+	});
+
+	it('a read whose one block fails still flushes only after a sibling block\'s promotion has written', async () => {
+		// Block `bad` fails before any latch; block `good` promotes its pending under the write latch,
+		// slowly. The group's flush must cover `good`'s writes, so it waits for them before reporting
+		// `bad`'s failure.
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store, { createBlockStorage: (blockId, raw) => {
+			const storage = new BlockStorage(blockId, raw);
+			if (blockId === 'bad') {
+				storage.getLatest = async () => { throw new Error('bad block'); };
+			} else {
+				const setLatest = storage.setLatest.bind(storage);
+				storage.setLatest = async (latest, deleted, latch) => {
+					await delay(20);
+					await setLatest(latest, deleted, latch);
+					trace.push('good:setLatest');
+				};
+			}
+			return storage;
+		} });
+		await pendInsert(repo, 'a1', 'good');
+		trace.length = 0;
+
+		let thrown: unknown;
+		try {
+			await repo.get({ blockIds: ['bad' as BlockId, 'good' as BlockId], context: { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 } });
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as Error | undefined)?.message).to.equal('bad block');
+		expect(trace).to.deep.equal(['good:setLatest', 'flush']);
+	});
+});

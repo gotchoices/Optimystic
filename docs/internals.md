@@ -855,14 +855,16 @@ funnel for both the coordinated and direct paths, so it originates a per-collect
 StorageRepo.commit()                       # critical section (block locks held)
   → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
   → release locks (finally)
+  → storage.flush()                        # the write group is durable before anyone hears of it
   → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
 StorageRepo.get()                          # read-driven promotion (context proves committed)
   → internalCommit() returns collectionId  # promotes a pending action that landed durably
+  → storage.flush()                        # only when the read took a write latch
   → emitPromotions()                        # group by (actionId, rev), emit per group
 ```
 
 - Subscribe via `onCollectionChange(collectionId, listener)` → idempotent unsubscribe.
-- Events fire **after** locks release, synchronously in commit order, fire-and-forget
+- Events fire **after** locks release and the write group's flush, synchronously in commit order, fire-and-forget
   (never awaited); a throwing listener is isolated + logged. Ordering across concurrent
   commits / across collections is **not** guaranteed.
 - **Emission guarantee (Option A — emit eagerly):** a `CollectionChangeEvent` fires

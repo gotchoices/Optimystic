@@ -731,6 +731,10 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	// under-claim, and re-delivery re-applies (step 1 dedups on the entry, which is not there). The
 	// asymmetry only stops being acceptable if a consumer starts treating "revision present, entry
 	// absent" as authoritative rather than as a state to re-sync.
+	//
+	// NOTE: the entry's own durability belongs to the store `ctx.log` writes through — flushed by its
+	// group when that is a `StorageRepo`. If a composition root ever backs the log with a store written
+	// directly (no `StorageRepo` in between), flush after this append too before reporting `applied`.
 	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);
 
