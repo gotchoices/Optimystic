@@ -214,7 +214,9 @@ export class WriteGroup<K> {
 			await this.commit(batch.map(open => open.entry));
 			this.dropCommitted(batch, seq);
 		} catch (err) {
-			this.fault ??= { cause: err };
+			// A backend that has already latched itself throws its own StoreFailedError; the group's
+			// cause is the fault underneath it, not a wrapper naming a wrapper.
+			this.fault ??= { cause: err instanceof StoreFailedError ? err.cause : err };
 			throw new StoreFailedError(this.fault.cause);
 		} finally {
 			// Cleared before this promise settles, so every waiter on it finds no commit in flight.

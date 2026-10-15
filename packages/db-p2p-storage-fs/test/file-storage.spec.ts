@@ -2,33 +2,40 @@ import assert from 'node:assert';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage, FileKVStore } from '../src/index.js';
-import { BlockStorage, withBlockWriteLatch } from '@optimystic/db-p2p';
+import { FileRawStorage, FileKVStore, WRITE_LOG_FILENAME, STORE_LOCK_FILENAME } from '../src/index.js';
+import { BlockStorage, StoreFailedError, withBlockWriteLatch } from '@optimystic/db-p2p';
 import type { BlockMetadata } from '@optimystic/db-p2p';
 import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId, Transform, IBlock } from '@optimystic/db-core';
+import { trackedStores } from './support/tracked-stores.js';
+import { withFailingWriteFile } from './support/fs-injection.js';
 
 // ---------------------------------------------------------------------------
-// Shared parity suite. Proves FileRawStorage (KvRawStorage over FileStoreDriver)
-// behaves identically to every other backend — round-trips, listRevisions
-// ordering, promote atomicity + missing-pend error, clone-on-store/read (now
-// structural via the byte boundary), drain-before-yield, and the BlockStorage
-// parity slice. Each case gets a fresh temp dir that cleanup rm -rf's; reopen is a
-// second FileRawStorage over the same dir (the fs backend holds no handle to close).
+// Shared parity suite. Proves FileRawStorage (KvRawStorage over WriteGroupDriver over
+// FileBatchBackend) behaves identically to every other backend — round-trips, listRevisions
+// ordering, promote atomicity + missing-pend error, clone-on-store/read (now structural via the
+// byte boundary), drain-before-yield, the BlockStorage parity slice, and the persistent reopen
+// case. Each case gets a fresh temp dir; the suite closes the first store before `reopen` (the
+// second would otherwise share the first's log and read the first's memory), and cleanup closes
+// whatever is still open before it rm -rf's the directory.
 // ---------------------------------------------------------------------------
 runRawStorageConformance('FileSystem', async (): Promise<ConformanceHarness> => {
 	const base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-conformance-'));
+	const stores = trackedStores();
 	return {
-		storage: new FileRawStorage(base),
-		reopen: async () => new FileRawStorage(base),
-		cleanup: async () => { await fs.rm(base, { recursive: true, force: true }); }
+		storage: stores.open(base),
+		reopen: async () => stores.open(base),
+		cleanup: async () => {
+			await stores.closeAll();
+			await fs.rm(base, { recursive: true, force: true });
+		}
 	};
 }, { persistent: true });
 
 // ---------------------------------------------------------------------------
-// fs-only tests the shared suite cannot cover: atomic-write / torn-file
-// corruption tolerance, colon-encoded filenames + legacy raw-colon fallback,
-// readdir error discrimination, and the directory-based listBlockIds meta-gate.
+// fs-only tests the shared suite cannot cover: what the write-ahead log leaves in the tree,
+// torn-file corruption tolerance, colon-encoded filenames + legacy raw-colon fallback, readdir
+// error discrimination, and the directory-based listBlockIds meta-gate.
 // ---------------------------------------------------------------------------
 
 // Injects a "crash" between the atomic writer's temp write and its rename by
@@ -51,7 +58,7 @@ async function hasTempSibling(dir: string): Promise<boolean> {
 }
 
 // Injects a readdir failure with a specific errno code (e.g. EACCES), so a caller can assert
-// how the storage layer discriminates readdir errors. file-storage.ts holds the same
+// how the storage layer discriminates readdir errors. file-batch-backend.ts holds the same
 // `fs.promises` singleton, so overriding `readdir` on it intercepts its calls. Always restore
 // in a finally so one test's injection never leaks into another.
 async function withFailingReaddir(code: string, fn: () => Promise<void>): Promise<void> {
@@ -76,19 +83,21 @@ async function drainPendings(storage: FileRawStorage, blockId: BlockId): Promise
 	return out;
 }
 
-describe('FileRawStorage atomic writes + corruption tolerance', () => {
+describe('FileRawStorage tree writes + corruption tolerance', () => {
 	let base: string;
+	const stores = trackedStores();
 
 	beforeEach(async () => {
 		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-storage-'));
 	});
 
 	afterEach(async () => {
+		await stores.closeAll();
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
 	it('getMetadata returns undefined (not throws) for a truncated/corrupt meta.json', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-corrupt' as BlockId;
 		const metaPath = path.join(base, blockId, 'meta.json');
 		await fs.mkdir(path.dirname(metaPath), { recursive: true });
@@ -100,7 +109,7 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 	});
 
 	it('recover() over a block with corrupt meta.json does not throw (treats it as missing)', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-corrupt-recover' as BlockId;
 		const metaPath = path.join(base, blockId, 'meta.json');
 		await fs.mkdir(path.dirname(metaPath), { recursive: true });
@@ -112,7 +121,7 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 	});
 
 	it('a real I/O error (not a parse error) still propagates from a read', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-eio' as BlockId;
 		const metaPath = path.join(base, blockId, 'meta.json');
 		await fs.mkdir(path.dirname(metaPath), { recursive: true });
@@ -123,83 +132,94 @@ describe('FileRawStorage atomic writes + corruption tolerance', () => {
 		await assert.rejects(() => storage.getMetadata(blockId), (err: NodeJS.ErrnoException) => err.code !== 'ENOENT');
 	});
 
-	it('saveMetadata round-trips and leaves no .tmp sibling behind', async () => {
-		const storage = new FileRawStorage(base);
+	it('saveMetadata round-trips, and a flush puts it at its canonical path with nothing beside it', async () => {
+		const storage = stores.open(base);
 		const blockId = 'block-roundtrip' as BlockId;
 		const meta: BlockMetadata = { latest: { rev: 3, actionId: 'tx:abc' as ActionId }, ranges: [[1, 4]] };
 		await storage.saveMetadata(blockId, meta);
+		assert.deepStrictEqual(await storage.getMetadata(blockId), meta, 'served from memory before the flush');
 
-		assert.deepStrictEqual(await storage.getMetadata(blockId), meta);
-		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no leftover *.tmp files');
+		await storage.flush();
+		assert.deepStrictEqual(await fs.readdir(path.join(base, blockId)), ['meta.json'], 'the tree holds the file, no temp sibling');
+		assert.deepStrictEqual(JSON.parse(await fs.readFile(path.join(base, blockId, 'meta.json'), 'utf8')), meta);
+		assert.deepStrictEqual((await fs.readdir(base)).filter(name => !name.startsWith('block-')).sort(), [STORE_LOCK_FILENAME, WRITE_LOG_FILENAME]);
 	});
 
-	it('a successful second write replaces the prior value (rename-over-existing works on this platform)', async () => {
-		const storage = new FileRawStorage(base);
+	it('a second write replaces the prior value in the tree', async () => {
+		const storage = stores.open(base);
 		const blockId = 'block-replace' as BlockId;
 
 		const valueA: BlockMetadata = { latest: { rev: 1, actionId: 'tx:aaa' as ActionId }, ranges: [[1, 2]] };
 		const valueB: BlockMetadata = { latest: { rev: 2, actionId: 'tx:bbb' as ActionId }, ranges: [[1, 3]] };
 		await storage.saveMetadata(blockId, valueA);
 		await storage.saveMetadata(blockId, valueB);
+		await storage.flush();
 
 		assert.deepStrictEqual(await storage.getMetadata(blockId), valueB);
-		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no leftover *.tmp files');
+		assert.deepStrictEqual(JSON.parse(await fs.readFile(path.join(base, blockId, 'meta.json'), 'utf8')), valueB);
 	});
 
-	it('a failed rename leaves the canonical file at the prior complete value (never torn)', async () => {
-		const storage = new FileRawStorage(base);
-		const blockId = 'block-atomic' as BlockId;
+	it('a group whose tree write fails after its record is durable is served from memory, latches the store, and is replayed on reopen', async () => {
+		const storage = stores.open(base);
+		const blockId = 'block-replay' as BlockId;
 		const metaPath = path.join(base, blockId, 'meta.json');
 
 		const valueA: BlockMetadata = { latest: { rev: 1, actionId: 'tx:aaa' as ActionId }, ranges: [[1, 2]] };
+		const valueB: BlockMetadata = { latest: { rev: 2, actionId: 'tx:bbb' as ActionId }, ranges: [[1, 3]] };
 		await storage.saveMetadata(blockId, valueA);
+		await storage.flush();
 
-		let threw = false;
-		await withFailingRename(async () => {
-			const valueB: BlockMetadata = { latest: { rev: 2, actionId: 'tx:bbb' as ActionId }, ranges: [[1, 3]] };
-			await storage.saveMetadata(blockId, valueB).catch(() => { threw = true; });
+		await withFailingWriteFile(async () => {
+			await storage.saveMetadata(blockId, valueB);
+			await assert.rejects(() => storage.flush(), StoreFailedError);
 		});
-		assert.ok(threw, 'saveMetadata should reject when the rename fails');
+		// The tree still holds the complete OLD value — the failed apply never touched it — while
+		// in-process readers keep being served the write that resolved.
+		assert.deepStrictEqual(JSON.parse(await fs.readFile(metaPath, 'utf8')), valueA);
+		assert.deepStrictEqual(await storage.getMetadata(blockId), valueB);
+		await assert.rejects(() => storage.saveMetadata(blockId, valueA), StoreFailedError, 'latched: every later write is refused');
+		await assert.rejects(() => storage.close(), StoreFailedError);
 
-		// Canonical path still holds the complete OLD value — never a partial/torn file.
-		assert.deepStrictEqual(await storage.getMetadata(blockId), valueA);
-		const raw = await fs.readFile(metaPath, 'utf-8');
-		assert.doesNotThrow(() => JSON.parse(raw), 'canonical file must parse cleanly');
-
-		// Temp file was cleaned up on the failed write.
-		assert.ok(!(await hasTempSibling(path.join(base, blockId))), 'expected no orphaned *.tmp files');
+		// The record was durable before the apply, so the next open rebuilds the tree from it.
+		const reopened = stores.open(base);
+		assert.deepStrictEqual(await reopened.getMetadata(blockId), valueB);
+		assert.deepStrictEqual(JSON.parse(await fs.readFile(metaPath, 'utf8')), valueB);
 	});
 
 	it('non-ASCII JSON bytes round-trip exactly (lossless byte write, not a lossy text coercion)', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-unicode' as BlockId;
 		// A materialized block carrying multi-byte UTF-8 payloads (emoji, CJK, combining marks).
 		const block = { header: { id: blockId, type: 'test', collectionId: 'c1' as BlockId }, note: '🌐 日本語 café' } as unknown as IBlock;
 		await storage.saveMaterializedBlock(blockId, 'tx:unicode' as ActionId, block);
+		await storage.flush();
 		assert.deepStrictEqual(await storage.getMaterializedBlock(blockId, 'tx:unicode' as ActionId), block);
+		assert.deepStrictEqual(JSON.parse(await fs.readFile(path.join(base, blockId, 'blocks', 'tx%3Aunicode.json'), 'utf8')), block);
 	});
 });
 
 describe('FileRawStorage.listPendingTransactions readdir error discrimination', () => {
 	let base: string;
+	const stores = trackedStores();
 
 	beforeEach(async () => {
 		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-pend-'));
 	});
 
 	afterEach(async () => {
+		await stores.closeAll();
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
 	it('yields empty for a genuinely-absent pend directory (ENOENT)', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		// No block dir written at all → the pend dir does not exist → ENOENT → empty listing.
 		const out = await drainPendings(storage, 'no-such-block' as BlockId);
 		assert.deepStrictEqual(out, []);
 	});
 
 	it('rejects (does not silently yield "no pendings") when readdir fails with a non-ENOENT error', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		// A swallowed EACCES/EIO would make listPendingTransactions report an empty directory,
 		// so pend's conflict detection would be skipped — a correctness hazard, not just noise.
 		await withFailingReaddir('EACCES', async () => {
@@ -210,34 +230,39 @@ describe('FileRawStorage.listPendingTransactions readdir error discrimination', 
 		});
 	});
 
-	it('still lists recognized pending action ids after the ENOENT/other discrimination change', async () => {
-		const storage = new FileRawStorage(base);
+	it('lists a flushed pending action id from the tree, and an unflushed one from memory', async () => {
+		const storage = stores.open(base);
 		const blockId = 'block-with-pendings' as BlockId;
 		await storage.savePendingTransaction(blockId, 'tx:abc123' as ActionId, { delete: true });
+		await storage.flush();
+		await storage.savePendingTransaction(blockId, 'tx:def456' as ActionId, { delete: true });
 
 		const out = await drainPendings(storage, blockId);
-		assert.deepStrictEqual(out, ['tx:abc123']);
+		assert.deepStrictEqual(out.sort(), ['tx:abc123', 'tx:def456']);
 	});
 });
 
 describe('FileRawStorage colon-encoded action-id filenames', () => {
 	let base: string;
+	const stores = trackedStores();
 
 	beforeEach(async () => {
 		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-colon-'));
 	});
 
 	afterEach(async () => {
+		await stores.closeAll();
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
 	it('colon-bearing action id round-trips on all platforms (percent-encoded filename)', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-colon' as BlockId;
 		const colonId = 'tx:abcd1234' as ActionId;
 		const transform: Transform = { delete: true };
 
 		await storage.saveTransaction(blockId, colonId, transform);
+		await storage.flush();
 		assert.deepStrictEqual(await storage.getTransaction(blockId, colonId), transform);
 
 		// Verify filename is percent-encoded on disk (no raw colon)
@@ -252,7 +277,7 @@ describe('FileRawStorage colon-encoded action-id filenames', () => {
 	// the fallback. win32 cannot create a raw-colon file (NTFS ADS separator), so skip there.
 	it('reads a legacy raw-colon pend file and deletePendingTransaction removes it (POSIX)', async function () {
 		if (process.platform === 'win32') { this.skip(); return; }
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		const blockId = 'block-legacy-colon' as BlockId;
 		const colonId = 'tx:legacy99' as ActionId;
 
@@ -266,21 +291,25 @@ describe('FileRawStorage colon-encoded action-id filenames', () => {
 		// The read fallback finds it despite no encoded file existing.
 		assert.deepStrictEqual(await storage.getPendingTransaction(blockId, colonId), { delete: true });
 
-		// Delete must reach the raw-colon file too — otherwise the fallback resurrects it.
+		// Delete must reach the raw-colon file too — otherwise the fallback resurrects it. The
+		// sibling's unlink is a second entry of the delete's log record, applied at the flush.
 		await storage.deletePendingTransaction(blockId, colonId);
-		assert.strictEqual(await storage.getPendingTransaction(blockId, colonId), undefined);
+		assert.strictEqual(await storage.getPendingTransaction(blockId, colonId), undefined, 'hidden from memory before the flush');
+		await storage.flush();
 		await assert.rejects(() => fs.access(rawColonPath), (err: NodeJS.ErrnoException) => err.code === 'ENOENT');
 	});
 });
 
 describe('FileRawStorage.listBlockIds', () => {
 	let base: string;
+	const stores = trackedStores();
 
 	beforeEach(async () => {
 		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-listblocks-'));
 	});
 
 	afterEach(async () => {
+		await stores.closeAll();
 		await fs.rm(base, { recursive: true, force: true });
 	});
 
@@ -292,41 +321,44 @@ describe('FileRawStorage.listBlockIds', () => {
 
 	const meta = (rev: number): BlockMetadata => ({ latest: { rev, actionId: `tx:a${rev}` as ActionId }, ranges: [[1, rev]] });
 
-	it('yields exactly the ids of blocks that have metadata', async () => {
-		const storage = new FileRawStorage(base);
+	it('yields exactly the ids of blocks that have metadata, flushed or not', async () => {
+		const storage = stores.open(base);
 		await storage.saveMetadata('block-a' as BlockId, meta(1));
 		await storage.saveMetadata('block-b' as BlockId, meta(2));
+		await storage.flush();
 		await storage.saveMetadata('block-c' as BlockId, meta(3));
 
 		assert.deepStrictEqual(await collect(storage), new Set(['block-a', 'block-b', 'block-c']));
 	});
 
 	it('excludes a block that has only a pending transform (no metadata)', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		await storage.saveMetadata('committed' as BlockId, meta(1));
-		// RAW-DRIVER LAYER: pending straight through the driver creates the block dir (pend/ via
-		// atomicWriteFile's recursive mkdir) but no meta.json, so the meta-gate excludes it. This is
-		// what proves the gate is meta.json and not directory-existence — it is NOT the node's
-		// behavior: a pend through `BlockStorage` seeds metadata first and IS enumerated (pinned for
-		// every backend by the shared conformance suite's `listBlockIds` parity case).
+		// RAW-DRIVER LAYER: pending straight through the store creates the block dir (pend/ via the
+		// apply's recursive mkdir) but no meta.json, so the meta-gate excludes it. This is what proves
+		// the gate is meta.json and not directory-existence — it is NOT the node's behavior: a pend
+		// through `BlockStorage` seeds metadata first and IS enumerated (pinned for every backend by
+		// the shared conformance suite's `listBlockIds` parity case).
 		await storage.savePendingTransaction('pending-only' as BlockId, 'tx:x' as ActionId, { delete: true });
+		await storage.flush();
 
 		assert.deepStrictEqual(await collect(storage), new Set(['committed']));
 	});
 
 	it('yields empty for an existing-but-empty basePath', async () => {
-		const storage = new FileRawStorage(base);
+		const storage = stores.open(base);
 		assert.deepStrictEqual(await collect(storage), new Set());
 	});
 
-	it('yields empty for a non-existent basePath (ENOENT → no throw)', async () => {
-		const storage = new FileRawStorage(path.join(base, 'does-not-exist'));
+	it('yields empty for a basePath that did not exist (the open creates it)', async () => {
+		const storage = stores.open(path.join(base, 'does-not-exist'));
 		assert.deepStrictEqual(await collect(storage), new Set());
 	});
 
-	it('ignores a stray non-directory file at basePath root', async () => {
-		const storage = new FileRawStorage(base);
+	it('ignores stray non-directory files at basePath root — the log and lock among them', async () => {
+		const storage = stores.open(base);
 		await storage.saveMetadata('real-block' as BlockId, meta(1));
+		await storage.flush();
 		await fs.writeFile(path.join(base, 'stray.txt'), 'not a block');
 
 		assert.deepStrictEqual(await collect(storage), new Set(['real-block']));

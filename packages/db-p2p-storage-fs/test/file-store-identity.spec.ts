@@ -1,13 +1,14 @@
 import assert from 'node:assert';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage, FileStoreDriver } from '../src/index.js';
+import { FileRawStorage, FileBatchBackend } from '../src/index.js';
 import {
-	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, withReadCache,
+	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, WriteGroupDriver, withReadCache,
 } from '@optimystic/db-p2p';
 
-// FileStoreDriver names the RESOLVED directory it is backed by, so two storages over one
-// directory — however spelled — compare equal, and two over different directories do not.
+// `fileStoreIdentity` names the RESOLVED directory a store is backed by, so two storages over one
+// directory — however spelled — compare equal, and two over different directories do not. Nothing
+// here performs an operation, so no store opens its log or takes its lock.
 describe('FileRawStorage store identity', () => {
 	const base = path.join(os.tmpdir(), 'optimystic-fs-identity');
 
@@ -38,7 +39,7 @@ describe('FileRawStorage store identity', () => {
 	// Windows paths are case-insensitive, so `C:\Foo` and `C:\foo` are ONE directory and must
 	// fold to ONE identity. Off win32 the driver does not fold, so the two spellings stay
 	// distinct — correct on a case-sensitive volume, and a known alias miss on a case-insensitive
-	// one (e.g. a default macOS volume). See the alias NOTE in FileStoreDriver.
+	// one (e.g. a default macOS volume). See the alias NOTE at `fileStoreIdentity`.
 	it('treats case-differing spellings as one directory on win32 only', function () {
 		const lower = new FileRawStorage(path.join(base, 'casetest')).getStoreIdentity();
 		const upper = new FileRawStorage(path.join(base, 'CaseTest')).getStoreIdentity();
@@ -108,13 +109,14 @@ describe('FileRawStorage store identity', () => {
 	});
 
 	// The construction `docs/storage.md` RECOMMENDS whenever the backend's driver is reachable —
-	// which for this package it is, since `FileStoreDriver` is exported. db-p2p pins the seam's
-	// behaviour over memory drivers and a synthetic-identity proxy; these pin the same behaviour
-	// over a real filesystem driver reporting a real identity, which is the composition an
-	// embedding host actually builds and hands to `rawStorageFactory` / a `RawStorageProvider`.
-	describe('through a driver-level cache (KvRawStorage over CachedStoreDriver(FileStoreDriver))', () => {
+	// which for this package it is, since `FileBatchBackend` is exported and `WriteGroupDriver` is
+	// the driver over it. db-p2p pins the seam's behaviour over memory drivers and a
+	// synthetic-identity proxy; these pin the same behaviour over a real filesystem backend
+	// reporting a real identity, which is the composition an embedding host actually builds and
+	// hands to `rawStorageFactory` / a `RawStorageProvider`.
+	describe('through a driver-level cache (KvRawStorage over CachedStoreDriver(WriteGroupDriver(FileBatchBackend)))', () => {
 		const driverLevel = (dir: string, pool: SharedCachePool, label?: string) =>
-			new KvRawStorage(new CachedStoreDriver(new FileStoreDriver(dir), pool, label));
+			new KvRawStorage(new CachedStoreDriver(new WriteGroupDriver(new FileBatchBackend(dir)), pool, label));
 
 		it('reports readCached, and the file identity, up through the kernel', () => {
 			const dir = path.join(base, 'drv-level');

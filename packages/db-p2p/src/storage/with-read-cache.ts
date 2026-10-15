@@ -129,7 +129,8 @@ class Lease implements ReadCacheLease {
  * up with two caches; and a host that builds its own cache — in either construction — never
  * enters the registry, so a second consumer wrapping a fresh instance over that store still gets
  * a second cache. What remains of Invariant 5 (`packages/db-p2p/docs/storage.md`) is the cross-process
- * case: the filesystem driver takes no lock, and a second process's writes bypass this cache.
+ * case: the filesystem backend's lock refuses a second live process on one machine only, and a
+ * second machine's writes over a network share bypass this cache.
  *
  * On a dedupe hit the FIRST caller's `label` and `pool` stick: `pool.stats()` shows whoever
  * wrapped first, and a second caller's different pool is ignored. Identity beats sizing — a
@@ -168,11 +169,11 @@ export function withReadCache(storage: IRawStorage, label?: string, pool?: Share
 		// NOTE: on a hit the `storage` argument is dropped unused — the FIRST caller's instance is
 		// the one the shared cache fronts, and the only one the last release closes. Free today:
 		// the only backend whose identity can make two DISTINCT objects collide is the filesystem
-		// one, which holds nothing open. If a backend ever pairs a location-derived identity with
-		// an open handle (the file backend's write-ahead log, once
-		// `file-storage-commits-groups-through-a-log` lands), the discarded instance would leak that
-		// handle — close it here through `IRawStorage.close`, or key such backends by handle
-		// (`identityForHandle`) instead.
+		// one, and it takes its write-ahead log handle and lock on its first operation, not in its
+		// constructor, so an instance dropped here unused holds nothing. If a backend ever pairs a
+		// location-derived identity with a handle it opens at construction, the discarded instance
+		// would leak that handle — close it here through `IRawStorage.close`, or key such backends
+		// by handle (`identityForHandle`) instead.
 		existing.refs += 1;
 		return { storage: existing.cache, lease: new Lease(existing) };
 	}

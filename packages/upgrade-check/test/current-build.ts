@@ -67,12 +67,16 @@ interface OpenBackend {
 /** The current build's storage over the files the older build left, mirroring `BACKENDS` in the writer. */
 async function openBackend(dataDir: string, layout: StorageLayout): Promise<OpenBackend> {
 	switch (layout.backend) {
-		case 'fs':
+		case 'fs': {
+			// Kept and closed here: the node never closes a store it was handed, and closing is what
+			// releases the directory's lock and makes the restart below reopen it from disk.
+			const storage = new FileRawStorage(join(dataDir, layout.blocks));
 			return {
-				storage: () => new FileRawStorage(join(dataDir, layout.blocks)),
+				storage: () => storage,
 				kvStore: new FileKVStore(join(dataDir, layout.kv)),
-				close: async () => { },
+				close: () => storage.close(),
 			};
+		}
 		case 'leveldb': {
 			const db = await openClassicLevel(join(dataDir, layout.path));
 			return {

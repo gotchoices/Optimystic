@@ -71,6 +71,8 @@ Without a `kvStore`, the node falls back to an in-memory store and logs a
     blocks/<id>.json         — materialized IBlock snapshot
   <key-segment>/
     <key-segment>.json       — FileKVStore value; key "/" separators become subdirectories
+  write-ahead.log            — groups committed but not yet replayed into the tree
+  store.lock                 — { pid, hostname } of the process holding the store
 ```
 
 Action ids that contain a colon (e.g. `tx:abcd1234`) are percent-encoded in
@@ -78,24 +80,38 @@ filenames (`tx%3Aabcd1234.json`) for Windows compatibility; the storage layer
 encodes and decodes transparently so callers always work with the canonical
 id form.
 
-## Atomic writes
+## Write-ahead log
 
-Every value write goes through `atomic-write.ts`: the new content is written to
-a `.tmp` sibling, then renamed over the canonical path. A crash mid-write
-therefore leaves either the complete old file or the complete new file — never
-a partial/torn one.
+`FileRawStorage` holds each group of writes in memory and, at the group's
+`flush()`, appends the whole group to `<basePath>/write-ahead.log` as one
+record — a length, a CRC-32, then each put or delete with its path — and waits
+for the disk once. Only then are the group's files written to their canonical
+paths in the tree, without waiting. A tree file therefore never holds content
+whose log record is not durable, and the next open replays the log in order
+before serving anything: a crash loses only the groups after the last durable
+record, whole groups only, never half of one. A record cut short by the crash,
+or one whose checksum fails, ends the replay there. The log is not yet
+checkpointed, so it grows for the store's life and is emptied by a reopen;
+`file-store-checkpoint-and-shared-log` adds the checkpoint and moves
+`FileKVStore` onto the same log. Until then `FileKVStore` still writes each
+value to a `.tmp` sibling and renames it into place (`atomic-write.ts`).
 
 ## Durability
 
-Each value write fsyncs the new file, and on POSIX its directory, before it
-resolves, so `FileRawStorage` reports `durability: 'power-loss'` and its
-`flush()` has nothing left to do. The gaps: a promote (a rename) and the
-deletes of pending and materialized records (unlinks) are not directory-synced,
-and neither is the parent of a directory a write creates (a new block's
-directory, or its first `revs/`, `pend/`, …), so a power cut can lose one of
-those while keeping a later metadata write. The directory sync is best-effort,
-and Windows syncs no directory at all. See the `NOTE:` at `FileStoreDriver` and
+`FileRawStorage` reports `durability: 'power-loss'`: one sync of the log per
+flushed group makes the group survive a power cut, and the tree is rebuilt from
+the log on the next open. Directories are not synced on the write path at all
+(the log covers them); the replay syncs every file and directory it touched,
+file syncs only on Windows. See
 [storage.md §6](../db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
+
+Opening a store takes `<basePath>/store.lock`, which records the holder's
+`{ pid, hostname }`. A lock naming a live process on this machine refuses the
+open with `StoreLockedError` from every operation; a lock left by a process that
+has exited, or by another machine, is stale and replaced. Two `FileRawStorage`
+over one directory in one process share one log and one lock. `close()` flushes
+what is still held and, for the last store over the directory, closes the log
+and removes the lock.
 
 ## Identity
 
@@ -117,24 +133,27 @@ cleanup:
 
 - **Shared conformance suite** — `runRawStorageConformance('FileSystem', …)` from
   `@optimystic/db-p2p/testing/conformance`, the one cross-backend parity target. It proves the
-  fs backend (now `KvRawStorage` over a `FileStoreDriver`) behaves identically to
-  every other backend: round-trips, `listRevisions` ordering, promote atomicity +
-  the exact missing-pend error, clone-on-store/read (structural via the byte
-  boundary), drain-before-yield iteration, and a `BlockStorage` parity slice.
+  fs backend (`KvRawStorage` over `WriteGroupDriver` over a `FileBatchBackend`)
+  behaves identically to every other backend: round-trips, `listRevisions`
+  ordering, promote atomicity + the exact missing-pend error, clone-on-store/read
+  (structural via the byte boundary), drain-before-yield iteration, a
+  `BlockStorage` parity slice, and the flush-then-reopen case.
 - **fs-only tests** (`node:assert`) — the behaviors the shared suite can't cover:
-  atomic writes + torn-file corruption tolerance, `readdir` error discrimination,
-  colon-encoded filenames + the POSIX legacy raw-colon fallback, the directory-based
+  what the log leaves in the tree and what a reopen replays
+  (`test/file-write-log.spec.ts` for a damaged log, a failed apply, a failed sync
+  and the lock; `test/fsync-count.spec.ts` for one sync per `StorageRepo` group),
+  torn-file corruption tolerance, `readdir` error discrimination, colon-encoded
+  filenames + the POSIX legacy raw-colon fallback, the directory-based
   `listBlockIds` meta-gate, and `FileKVStore.list`/`delete`.
 
 ## Known limitations
 
-**No cross-process lock.** Two separate Node processes pointing at the same
-`basePath` can interleave writes with no coordination. The constructor carries
-a TODO — the "proper-lockfile" comment in
-`packages/db-p2p-storage-fs/src/file-storage.ts` — to integrate
-[`proper-lockfile`](https://www.npmjs.com/package/proper-lockfile) along with
-an explicit `dispose()` pattern. Until that lands, `FileRawStorage` is
-single-process only.
+**The lock protects one machine.** `store.lock` refuses a second live process
+on the same host; it cannot tell a live process on another machine from a dead
+one, so two machines over one network share can both open the store. That was
+never supported (Invariant 5 in
+[storage.md](../db-p2p/docs/storage.md#5-a-store-is-owned-by-exactly-one-process)).
+`FileKVStore` takes no lock until it moves onto the shared log.
 
 **Ephemeral peer identity.** There is no `loadOrCreateFSPeerKey` equivalent.
 A Node peer backed by `FileRawStorage` gets a new libp2p peer id each restart.

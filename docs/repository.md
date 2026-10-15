@@ -155,8 +155,8 @@ still costs is the replication cost in `docs/correctness.md` §"The cost of not 
 
 A block never holds a pending record and a committed record for the same action id at the same
 time. On the commit path this holds because promotion *moves* the record from the pending namespace
-to the committed one atomically (a single rename on the filesystem backend, a synchronous two-map
-swap in memory) rather than copying it.
+to the committed one atomically (two entries of one write-ahead-log record on the filesystem backend,
+a synchronous two-map swap in memory) rather than copying it.
 
 Every **other** writer of a committed transform for a block must maintain the same invariant by
 deleting that action's pending record when it writes the committed one. Today those writers are the

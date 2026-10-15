@@ -288,7 +288,7 @@ class BlockStorage implements IBlockStorage {
 `BlockStorage` persists through the `IRawStorage` interface, so the backing store is pluggable:
 
 - **In-memory** (`MemoryRawStorage`) — ships in this package; used for tests and ephemeral nodes.
-- **Filesystem** (`FileRawStorage`) — lives in the separate [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs) package; JSON files with atomic writes, organized per block:
+- **Filesystem** (`FileRawStorage`) — lives in the separate [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs) package; JSON files written through a write-ahead log, organized per block:
 
 ```typescript
 // Filesystem backend layout (@optimystic/db-p2p-storage-fs)

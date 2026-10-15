@@ -1,11 +1,11 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import { fsyncDir } from './file-write-log.js';
 
 // Per-process monotonic counter for unique temp names. Combined with the pid it
 // makes each temp path unique across concurrent writers to the same logical
-// target — even two FileRawStorage/FileKVStore instances in one process, which
-// do not lock (see the proper-lockfile TODO in file-storage.ts). Deterministic
-// and collision-safe, unlike Math.random()/Date.now().
+// target — even two FileKVStore instances in one process, which do not lock.
+// Deterministic and collision-safe, unlike Math.random()/Date.now().
 let tempCounter = 0;
 
 /**
@@ -23,10 +23,12 @@ let tempCounter = 0;
  * rename leaves only an inert `*.tmp` sibling — never read (reads target
  * canonical paths) and skipped by `.json` directory scans.
  *
- * `content` is `string | Uint8Array`: `FileKVStore` writes strings, while the
- * `KvRawStorage`-backed `FileStoreDriver` writes the kernel's raw value bytes.
- * `FileHandle.writeFile` writes either losslessly — a `Uint8Array` is written
- * byte-for-byte, so non-ASCII JSON round-trips exactly.
+ * `FileKVStore` is the one caller left: `FileRawStorage` writes through the
+ * write-ahead log (`file-write-log.ts`) instead, and
+ * `file-store-checkpoint-and-shared-log` moves `FileKVStore` onto the same log
+ * and retires this file. `content` is `string | Uint8Array`; `FileHandle.writeFile`
+ * writes either losslessly — a `Uint8Array` is written byte-for-byte, so
+ * non-ASCII JSON round-trips exactly.
  */
 export async function atomicWriteFile(filePath: string, content: string | Uint8Array): Promise<void> {
 	const dir = path.dirname(filePath);
@@ -52,8 +54,8 @@ export async function atomicWriteFile(filePath: string, content: string | Uint8A
 		// libuv retries some cases; if this ever surfaces as spurious write failures
 		// under concurrent read+write on Windows, add a bounded retry loop here (the
 		// write-file-atomic package does exactly this). Conditional — the adapter is
-		// already last-writer-wins with no cross-process lock (proper-lockfile TODO
-		// in file-storage.ts), so it is not reachable under current single-writer use.
+		// already last-writer-wins with no cross-process lock, so it is not reachable
+		// under current single-writer use.
 		await fs.rename(tmpPath, filePath);
 	} catch (err) {
 		if (handle) await handle.close().catch(() => { /* best-effort */ });
@@ -62,28 +64,4 @@ export async function atomicWriteFile(filePath: string, content: string | Uint8A
 	}
 
 	await fsyncDir(dir);
-}
-
-/**
- * Best-effort fsync of a directory so a completed rename is durable. POSIX needs
- * this; platforms that reject opening a directory for fsync throw, and we ignore
- * that rather than failing the write.
- *
- * Skipped outright on win32: there `fs.open(dir, 'r')` SUCCEEDS and only the
- * following `handle.sync()` fails with EPERM (swallowed), so the open/close pair
- * was guaranteed wasted work — exactly half of all `fs.open` calls a write
- * workload makes. Durability is unchanged on win32 (the sync never succeeded
- * there); the on-disk layout is untouched.
- */
-async function fsyncDir(dir: string): Promise<void> {
-	if (process.platform === 'win32') return;
-	let handle: fs.FileHandle | undefined;
-	try {
-		handle = await fs.open(dir, 'r');
-		await handle.sync();
-	} catch {
-		// Directory fsync unsupported here — nothing to do.
-	} finally {
-		if (handle) await handle.close().catch(() => { /* best-effort */ });
-	}
 }
