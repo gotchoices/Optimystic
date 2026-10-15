@@ -54,7 +54,6 @@ import { CoordinatorRepo, type ClusterLatestCallback, type AcquireBlockCallback 
 import type { ClusterClient } from '../src/cluster/client.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog } from './support/capture-log.js';
@@ -85,7 +84,7 @@ const insertOf = (blockId: BlockId): Transforms =>
 
 const makeStorage = () => {
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((id: BlockId) => new BlockStorage(id, raw));
+	return new StorageRepo(raw);
 };
 
 /** Pend + commit `blockId` at rev 1 straight into `storage` — what a cohort member does for a

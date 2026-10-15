@@ -403,7 +403,7 @@ const node = await createLibp2pNode({
 
 // Create coordinator repo for distributed consensus
 const repo = coordinatorRepo(keyNetwork, createClusterClient)({
-  storageRepo: new StorageRepo(createBlockStorage)
+  storageRepo: new StorageRepo(rawStorage)
 });
 ```
 

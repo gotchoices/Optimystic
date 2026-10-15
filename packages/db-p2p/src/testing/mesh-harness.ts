@@ -13,7 +13,6 @@ import { createLogger } from '../logger.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
-import { BlockStorage } from '../storage/block-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
@@ -467,9 +466,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	const buildMember = (meshNode: MeshNode, lifetime: NodeLifetime): void => {
 		const { peerId, privateKey } = meshNode;
 		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
-		const storageRepo = new StorageRepo(
-			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
-		);
+		const storageRepo = new StorageRepo(rawStorage);
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
 		// reader holds a corroborated revision it cannot promote locally, pull the committed revision

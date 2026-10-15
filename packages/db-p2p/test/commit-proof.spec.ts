@@ -420,7 +420,7 @@ describe('BlockCommitProof', () => {
 
 		const seededRepo = async (block: IBlock = insertBlock()) => {
 			const raw = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, raw));
+			const repo = new StorageRepo(raw);
 			const pended = await repo.pend({
 				actionId: ACTION,
 				transforms: { inserts: { [BLOCK]: block }, updates: {}, deletes: [] },
@@ -517,7 +517,7 @@ describe('BlockCommitProof', () => {
 		 */
 		const consensusCommit = async (declaredDigest: string) => {
 			const raw = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, raw));
+			const repo = new StorageRepo(raw);
 			const pended = await repo.pend({
 				actionId: ACTION,
 				transforms: { inserts: { [BLOCK]: insertBlock() }, updates: {}, deletes: [] },

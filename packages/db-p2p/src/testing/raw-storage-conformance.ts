@@ -511,7 +511,7 @@ export function runRawStorageConformance(
 
 		it('BlockStorage pend → commit seeds open-ended ranges [[E]] (never [[0]]) and getBlock serves it', async () => {
 			const blockId = 'parity-commit' as BlockId;
-			const repo = new StorageRepo((id) => new BlockStorage(id, storage));
+			const repo = new StorageRepo(storage);
 
 			await repo.pend({
 				actionId: 'a1' as ActionId,
@@ -543,7 +543,7 @@ export function runRawStorageConformance(
 			} else {
 				const committed = 'parity-list-committed' as BlockId;
 				const pendOnly = 'parity-list-pend-only' as BlockId;
-				const repo = new StorageRepo((id) => new BlockStorage(id, storage));
+				const repo = new StorageRepo(storage);
 
 				await repo.pend({
 					actionId: 'a1' as ActionId,

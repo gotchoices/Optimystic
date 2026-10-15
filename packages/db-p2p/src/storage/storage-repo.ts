@@ -13,6 +13,8 @@ import {
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
+import type { IRawStorage } from "./i-raw-storage.js";
+import { BlockStorage } from "./block-storage.js";
 import { isReservationAgainst, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -82,7 +84,17 @@ export function isCommitNotDurableFailure(result: CommitResult): boolean {
 	return !result.success && (result.reason?.startsWith(COMMIT_NOT_DURABLE_REASON) ?? false);
 }
 
+/** Whether one {@link StorageRepo.get} entered a block write latch, which decides whether it ends with a flush. */
+type ReadWrites = { wrote: boolean };
+
 export type StorageRepoOptions = {
+	/**
+	 * Builds the per-block storage over THIS repo's store — the one {@link StorageRepo} flushes at the
+	 * end of every write group. Default: `new BlockStorage(blockId, storage)`. Handed the store rather
+	 * than closing over one so the store a block writes to and the store the repo flushes cannot be
+	 * two different stores.
+	 */
+	createBlockStorage?: (blockId: BlockId, storage: IRawStorage) => IBlockStorage;
 	/** Optional hook to validate transactions in PendRequests */
 	validatePend?: PendValidationHook;
 	/**
@@ -206,11 +218,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	/** Full-replication listeners — fire when a block this node acknowledged below `full` has
 	 *  reached every cohort member. See {@link IBlockDurabilityNotifier}. */
 	private readonly durabilityListeners = new Set<BlockDurabilityListener>();
+	private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
 
-	constructor(
-		private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage,
-		options?: StorageRepoOptions
-	) {
+	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
+		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
+		this.createBlockStorage = blockId => factory(blockId, storage);
 		this.validatePend = options?.validatePend;
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
 	}
@@ -296,6 +308,52 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 	}
 
+	/**
+	 * Run one write group's latched work, then make it durable before the caller reports or emits.
+	 * Every method here that writes block storage — `pend`, `commit`, `cancel`, `recoverBlock`,
+	 * `saveReplicatedBlock`, and a `get` that entered a write latch — ends through this, so each call
+	 * flushes the store exactly once, after `work` has released its latches: a concurrent group on the
+	 * same blocks is not held behind the disk, and several groups can share one sync (rule 4 of the
+	 * flush contract on `RawStoreDriver.flush`). Change events are emitted only after this resolves,
+	 * so nothing announces a commit this node could still lose.
+	 *
+	 * A throwing `work` is flushed too, since whatever landed before the fault must be durable before
+	 * anyone acts on the failure; the original error is rethrown and a flush error behind it is only
+	 * logged. When `work` returned, a rejected flush propagates: the caller reports nothing, and the
+	 * store refuses later writes until reopened (rule 5), so a retry cannot report success over
+	 * writes that may be gone.
+	 *
+	 * `wrote` lets the hot read path skip the flush when it took no latch; every other group flushes
+	 * on every exit, refusals included, because an extra flush costs latency and a missed one costs
+	 * durability.
+	 */
+	private async endGroup<T>(work: () => Promise<T>, wrote: () => boolean = () => true): Promise<T> {
+		let result: T;
+		try {
+			result = await work();
+		} catch (err) {
+			if (wrote()) {
+				await this.flushBehindFault(err);
+			}
+			throw err;
+		}
+		if (wrote()) {
+			await this.storage.flush();
+		}
+		return result;
+	}
+
+	/** {@link endGroup}'s flush after a fault: the fault is what the caller must see, so a flush error is logged, not thrown. */
+	private async flushBehindFault(fault: unknown): Promise<void> {
+		try {
+			await this.storage.flush();
+		} catch (flushErr) {
+			log('group:flush-failed-after-fault fault=%s flushError=%s',
+				fault instanceof Error ? fault.message : String(fault),
+				flushErr instanceof Error ? flushErr.message : String(flushErr));
+		}
+	}
+
 	/** Subscribe to full-replication events. See {@link IBlockDurabilityNotifier}. */
 	onBlockDurabilityReached(listener: BlockDurabilityListener): () => void {
 		this.durabilityListeners.add(listener);
@@ -332,7 +390,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// parallel map closures below — safe because each push happens synchronously
 		// between awaits (single-threaded), never concurrently.
 		const promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[] = [];
-		const results = await Promise.all(distinctBlockIds.map(async (blockId): Promise<[BlockId, GetBlockResult]> => {
+		// Set by any block whose read entered a write latch (the promotion below, or a coverage restore
+		// in readBlockHealing), so a read that wrote nothing — the hot path — never flushes.
+		const writes: ReadWrites = { wrote: false };
+		const results = await this.endGroup(() => Promise.all(distinctBlockIds.map(async (blockId): Promise<[BlockId, GetBlockResult]> => {
 			const blockStorage = this.createBlockStorage(blockId);
 			// Set when this node KNOWS its answer for the block is a guess: the promotion
 			// below refused for a missing base, or getBlock() threw (truncated history /
@@ -355,6 +416,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 					: context.committed;
 				if (preMissing.length > 0) {
 					await withBlockWriteLatch(blockId, async (latch) => {
+						writes.wrote = true;
 						// Re-read authoritative state under the latch: a concurrent commit may have
 						// promoted or superseded a pending between the unlatched pre-scan and here.
 						// Recompute which committed entries are still ahead of `latest` (drops the
@@ -440,7 +502,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// BlockUnavailableError on the flagged entry — so nothing is swallowed.
 			let blockRev: Awaited<ReturnType<IBlockStorage['getBlock']>>;
 			try {
-				blockRev = await this.readBlockHealing(blockId, blockStorage, context?.rev);
+				blockRev = await this.readBlockHealing(blockId, blockStorage, context?.rev, writes);
 			} catch (err) {
 				// NOTE: the entry drops `state.latest`, which this node does know (getLatest() does not
 				// materialize, so it does not throw). Empty state is what makes CoordinatorRepo treat the
@@ -533,11 +595,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 					pendings
 				}
 			}];
-		}));
+		})), () => writes.wrote);
 
 		// Emit per durable read-driven landing (Option A — emit eagerly). Done after the
-		// parallel reads complete so emission stays outside the per-block work, matching
-		// commit's ordering. No-op when nothing was promoted.
+		// parallel reads complete and the group's flush, so emission stays outside the per-block
+		// work and never announces a promotion this node could still lose, matching commit's
+		// ordering. No-op when nothing was promoted.
 		this.emitPromotions(promotions);
 
 		if (lineageOf !== undefined) {
@@ -583,11 +646,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * real fault (a `latest` this node cannot serve) and propagates, so the caller reports the block
 	 * as unavailable. Any throw from the second read (records restored but nothing materializable
 	 * under them) propagates the same way.
+	 *
+	 * `writes` is the calling {@link get}'s flag, set on entering the latch so that read flushes.
 	 */
 	private async readBlockHealing(
 		blockId: BlockId,
 		storage: IBlockStorage,
-		rev: number | undefined
+		rev: number | undefined,
+		writes: ReadWrites
 	): Promise<{ block: IBlock, actionRev: ActionRev } | undefined> {
 		try {
 			return await storage.getBlock(rev);
@@ -601,7 +667,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// round-trip. Fine at today's restore rates (a gap is healed once, then served
 				// locally); if restore latency ever shows up delaying commits, fetch + vet OUTSIDE the
 				// latch and take it only to write, re-checking coverage inside.
-				await withBlockWriteLatch(blockId, latch => storage.restoreRevision(err.rev, latch));
+				await withBlockWriteLatch(blockId, latch => {
+					writes.wrote = true;
+					return storage.restoreRevision(err.rev, latch);
+				});
 			} catch (restoreErr) {
 				if (await storage.getLatest() === undefined) {
 					log('get:restore-failed-pending-only blockId=%s rev=%d error=%s', blockId, err.rev,
@@ -663,6 +732,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			};
 		}
 
+		return await this.endGroup(() => this.pendUnderLatches(request));
+	}
+
+	/** {@link pend}'s write group: classify every block, then save, under one hold of their write latches. */
+	private async pendUnderLatches(request: PendRequest): Promise<PendResult> {
 		// Already deduped: `blockIdsForTransforms` builds its result through a Set. So the pass-2 save
 		// loop below cannot write one block twice, and the echoed `blockIds` carries no duplicate.
 		const blockIds = blockIdsForTransforms(request.transforms);
@@ -864,10 +938,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 
 	async cancel(actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> {
 		log('cancel actionId=%s blockIds=%d', actionRef.actionId, actionRef.blockIds.length);
-		await Promise.all(actionRef.blockIds.map(blockId => {
-			const blockStorage = this.createBlockStorage(blockId);
-			return withBlockWriteLatch(blockId, latch => blockStorage.deletePendingTransaction(actionRef.actionId, latch));
-		}));
+		await this.endGroup(async () => {
+			await Promise.all(actionRef.blockIds.map(blockId => {
+				const blockStorage = this.createBlockStorage(blockId);
+				return withBlockWriteLatch(blockId, latch => blockStorage.deletePendingTransaction(actionRef.actionId, latch));
+			}));
+		});
 	}
 
 	/**
@@ -900,6 +976,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 */
 	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
+		const { result, collectionBlocks } = await this.endGroup(() => this.commitUnderLatches(request, proof));
+		// Notify after the critical section and the group's flush, for every block newly committed
+		// here — including those that landed before a mid-loop failure (alreadyDone / stale partitions
+		// never reach `collectionBlocks`).
+		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
+		return result;
+	}
+
+	/**
+	 * {@link commit}'s write group, under the write latches of every block in the batch. Returns the
+	 * result to report and the blocks newly committed here, grouped by collection, which the caller
+	 * emits once the group is durable.
+	 */
+	private async commitUnderLatches(
+		request: CommitRequest,
+		proof: BlockCommitProof | undefined
+	): Promise<{ result: CommitResult, collectionBlocks: Map<CollectionId, BlockId[]> }> {
 		// Deduped ONCE, tail first, then request order — the order blocks are committed and reported
 		// in. The latches are acquired in sorted order by `acquireBlockWriteLatches` over this same set,
 		// so every `latches.get(blockId)!` below resolves.
@@ -914,10 +1007,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// (The read-driven promotion in `get` is the other landing path; it acts only on a context
 		// proving the action committed, so the tail is committed somewhere in the cohort by then.)
 		const blockIds = tailFirst(Array.from(new Set(request.blockIds)), request.tailId);
-		// Collects the blocks newly committed in this call, grouped by collection,
-		// so we can emit change events once locks are released. Blocks that land before
-		// a mid-loop failure stay here and are still emitted (Option A — emit eagerly):
-		// they are durably committed and a retry rolls the remainder forward.
+		// Collects the blocks newly committed in this call, grouped by collection, so `commit` can emit
+		// change events once locks are released and the group is flushed. Blocks that land before a
+		// mid-loop failure stay here and are still emitted (Option A — emit eagerly): they are durably
+		// committed and a retry rolls the remainder forward.
 		const collectionBlocks = new Map<CollectionId, BlockId[]>();
 		// Captured when internalCommit throws mid-loop; we break (rather than return)
 		// so locks release and accumulated landings still emit before we report failure.
@@ -984,9 +1077,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			if (missedCommits.length) {
 				log('commit:stale actionId=%s missed=%d', request.actionId, missedCommits.length);
 				return { // Return directly, locks will be released in finally
-					success: false,
-					missing: perBlockActionTransformsToPerAction(missedCommits),
-					...(staleAt === undefined ? {} : { staleAt })
+					result: {
+						success: false,
+						missing: perBlockActionTransformsToPerAction(missedCommits),
+						...(staleAt === undefined ? {} : { staleAt })
+					},
+					collectionBlocks
 				};
 			}
 
@@ -1100,7 +1196,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 					// Partial-commit recovery: blocks already in collectionBlocks DID land
 					// durably and must still emit; a retry with the same (actionId, rev)
 					// treats them as idempotent no-ops and advances the remainder. Break
-					// instead of returning so locks release and those landings emit below.
+					// instead of returning so locks release and `commit` emits those landings.
 					failure = { reason: err instanceof Error ? err.message : 'Unknown error during commit' };
 					divergentFailure = err instanceof MissingBaseRevisionError;
 					break;
@@ -1122,13 +1218,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			release();
 		}
 
-		// Notify after the critical section, for every block newly committed here —
-		// including those that landed before a mid-loop failure (alreadyDone / stale
-		// partitions never reach `collectionBlocks`).
-		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
-
 		// `local`, as in `pend`: a single machine's verdict about its own storage.
-		return failure ? { success: false, reason: failure.reason } : { success: true, durability: localDurability() };
+		return {
+			result: failure ? { success: false, reason: failure.reason } : { success: true, durability: localDurability() },
+			collectionBlocks
+		};
 	}
 
 	/**
@@ -1185,7 +1279,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// (a non-monotonic regression). Same latching invariant as every other metadata writer.
 		// commit() calls storage.recover(latch) directly under its own held latch, so it never
 		// routes through here — no double-acquire / deadlock.
-		await withBlockWriteLatch(blockId, latch => storage.recover(latch));
+		await this.endGroup(async () => {
+			await withBlockWriteLatch(blockId, latch => storage.recover(latch));
+		});
 	}
 
 	/**
@@ -1217,9 +1313,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void> {
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
-		// Captured under the latch; emitted after release to match commit's ordering.
+		// Captured under the latch; emitted after release and the group's flush, matching commit's ordering.
 		let landed: { collectionId: CollectionId, actionId: ActionId, rev: number } | undefined;
-		await withBlockWriteLatch(blockId, async (latch) => {
+		await this.endGroup(() => withBlockWriteLatch(blockId, async (latch) => {
 			const priorLatest = await storage.getLatest();
 			const effective = await storage.saveReplica(block, source, verifiedProof, latch);
 			// Advanced iff there was no prior revision or the effective rev moved past it. On the
@@ -1253,7 +1349,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// withheld `(rev, actionId)` and skip the re-check.
 				await this.backFillProof(blockId, storage, effective.rev, effective.actionId, verifiedProof, latch);
 			}
-		});
+		}));
 		// Replica-persist has no CommitRequest, hence no tailId — like a read-driven promotion,
 		// this wakes local onCollectionChange watchers but is cert-gated out of cohort-topic
 		// re-origination downstream (the change bridge's `selfAppliedTail` gate never originates a

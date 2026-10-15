@@ -31,7 +31,6 @@ import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import type {
 	ClusterRecord, ClusterPeers, ClusterConsensusConfig, IKeyNetwork, ICluster, IBlock, BlockHeader,
 	BlockId, PendRequest, PendResult, RepoMessage, Signature, StaleFailure, Transforms
@@ -81,7 +80,7 @@ class MockPeerNetwork implements IPeerNetwork {
 
 const realStorageRepo = (): StorageRepo => {
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((blockId: BlockId) => new BlockStorage(blockId, raw));
+	return new StorageRepo(raw);
 };
 
 /** Put BLOCK into storage at rev 1, so a pend at {@link CONTESTED_REV} is an ordinary update. */

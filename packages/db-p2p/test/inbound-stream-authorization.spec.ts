@@ -10,7 +10,6 @@ import type { BlockHeader, BlockId } from '@optimystic/db-core';
 import { ClusterService } from '../src/cluster/service.js';
 import { RepoService } from '../src/repo/service.js';
 import { SyncService } from '../src/sync/service.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockTransferClient, BlockTransferService, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
@@ -375,7 +374,7 @@ describe('inbound stream authorization — what the dialing client observes', ()
 	/** A started block-transfer service reachable through a `BlockTransferClient`. */
 	async function wire(init: { authorizeInboundStream?: AuthorizeInboundStream }, clientPeerId: PeerId) {
 		const rawStorage = new MemoryRawStorage();
-		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		const repo = new StorageRepo(rawStorage);
 		await repo.saveReplicatedBlock(BLOCK_ID, {
 			header: { id: BLOCK_ID, type: 'test', collectionId: 'col-1' as BlockId } as BlockHeader
 		});

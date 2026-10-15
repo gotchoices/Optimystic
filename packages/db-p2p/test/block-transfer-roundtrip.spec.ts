@@ -92,7 +92,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 
 	beforeEach(async () => {
 		rawStorage = new MemoryRawStorage();
-		repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		repo = new StorageRepo(rawStorage);
 		peerId = await makePeerId();
 	});
 
@@ -207,7 +207,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		// One raw store shared across every BlockStorage, as a real node has: a fresh store per
 		// call would silently drop each write.
 		const sourceRaw = new MemoryRawStorage();
-		const sourceRepo = new StorageRepo((id) => new BlockStorage(id, sourceRaw));
+		const sourceRepo = new StorageRepo(sourceRaw);
 		const commit: CommitRequest = {
 			actionId: source.actionId,
 			blockIds: [blockId as BlockId],
@@ -255,7 +255,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		// One raw store shared across every BlockStorage, as a real node has: a fresh store per
 		// call would silently drop each write.
 		const sourceRaw = new MemoryRawStorage();
-		const sourceRepo = new StorageRepo((id) => new BlockStorage(id, sourceRaw));
+		const sourceRepo = new StorageRepo(sourceRaw);
 		await sourceRepo.saveReplicatedBlock(blockId as BlockId, block, source);
 
 		const read = await sourceRepo.get({ blockIds: [blockId as BlockId] });

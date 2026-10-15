@@ -18,7 +18,7 @@ For implementation details, see [transactions.md](transactions.md), [right-is-ri
 
 ### 1.2 Nodes
 
-**Crash-recovery.** Honest nodes may crash at any point and restart. On recovery, a node restores its persisted *per-cluster* coordinator state — the `broadcasting`-phase record a single block cluster keeps so it can resume its own consensus round (`PersistedCoordinatorState`, db-p2p) — and resumes protocol participation. This is per-block-cluster durability, **not** a cross-collection transaction decision journal (see Theorem 3, which no longer assumes one). Volatile state (in-flight messages, uncommitted overlays) is lost on crash.
+**Crash-recovery.** Honest nodes may crash at any point and restart. On recovery, a node restores its persisted *per-cluster* coordinator state — the `broadcasting`-phase record a single block cluster keeps so it can resume its own consensus round (`PersistedCoordinatorState`, db-p2p) — and resumes protocol participation. That restore happens only when the host supplies `NodeOptions.transactionStateStore`: no default wiring supplies one (the `NOTE:` on `resolveKvStore` in `packages/db-p2p/src/libp2p-node-base.ts`), so a node built without it restarts with that state empty. This is per-block-cluster durability, **not** a cross-collection transaction decision journal (see Theorem 3, which no longer assumes one). Volatile state (in-flight messages, uncommitted overlays) is lost on crash.
 
 **Byzantine adversary.** Up to *f* nodes may be Byzantine: they can send arbitrary messages, withhold messages, equivocate (send conflicting messages to different peers), or collude. Byzantine nodes are computationally bounded (cannot break cryptographic primitives).
 
@@ -218,7 +218,7 @@ Write-skew requires two transactions to read overlapping state and write to non-
 **Proof sketch.**
 
 Commit writes to a log-structured chain with prior-hash linking (SHA-256 of previous block). The chain provides:
-1. **Append-only persistence** — log entries are written via batch write with fsync.
+1. **Append-only persistence** — every storage apply ends with one `flush()` of the node's store, before `StorageRepo` returns or emits a change event. What a flushed write survives is the backend's `durability`: a power cut for the file backend (less the directory-sync gap recorded there), a process crash only for the LevelDB, IndexedDB and SQLite backends, and nothing for the in-memory one — see the table under [Invariant 6 in packages/db-p2p/docs/storage.md](../packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved). Which of those a commit acknowledgement can rest on is the policy ticket `durability-window-scales-with-cohort-size` decides.
 2. **Integrity verification** — prior-hash chaining detects any corruption or tampering.
 3. **Replication, gated by three distinct checkpoints — not one bar restated three ways:**
    - **Promise-phase super-majority (blocking).** The coordinator requires ⌈`superMajorityThreshold`·K⌉ approving promises (default 0.75) before it will move to commit at all. A shortfall here throws (`ValidatorRejectionError`, `ConflictRaceLostError`, or the legacy super-majority error) — this is the only one of the three checkpoints whose shortfall throws, which makes it the practically-binding constraint.

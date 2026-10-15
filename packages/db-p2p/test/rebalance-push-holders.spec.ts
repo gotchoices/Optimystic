@@ -25,7 +25,6 @@ import type {
 	ActionId, BlockHeader, BlockId, CommitRequest, IBlock, IPeerNetwork, RoutingKey
 } from '@optimystic/db-core';
 import type { FretService } from 'p2p-fret';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import {
@@ -96,7 +95,7 @@ interface Rig {
  */
 const buildRig = async (self: PeerId, cohort: PeerId[]): Promise<Rig> => {
 	const rawStorage = new MemoryRawStorage();
-	const repo = new StorageRepo((blockId: BlockId) => new BlockStorage(blockId, rawStorage));
+	const repo = new StorageRepo(rawStorage);
 	const reports: BlockHolders[] = [];
 
 	const owned = new Set<string>();

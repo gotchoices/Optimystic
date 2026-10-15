@@ -310,7 +310,7 @@ describe('ClusterMember', () => {
 			}
 		};
 
-		const storageRepoOver = (raw: MemoryRawStorage): StorageRepo => new StorageRepo(id => new BlockStorage(id, raw));
+		const storageRepoOver = (raw: MemoryRawStorage): StorageRepo => new StorageRepo(raw);
 
 		it('judges a held revision that will not materialize: approves a pend past it, rejects one at it', async () => {
 			const raw = new MemoryRawStorage();

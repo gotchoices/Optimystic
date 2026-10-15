@@ -3,7 +3,6 @@ import { createServedRepoProxy } from '../src/repo/served-repo-proxy.js';
 import { serveBlockArchive } from '../src/storage/block-archive.js';
 import type { ProofRetainingRepo } from '../src/storage/block-archive.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { PROOF_THRESHOLDS, makeSignedProof } from './support/commit-proof-fixtures.js';
 import { verifyBlockCommitProofClaim } from '../src/cluster/commit-proof.js';
@@ -29,7 +28,7 @@ const makeBlock = (): IBlock => ({
 /** A real `StorageRepo` holding one certified revision of `BLOCK`. */
 const makeLocalStore = async () => {
 	const raw = new MemoryRawStorage();
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, raw));
+	const repo = new StorageRepo(raw);
 	const block = makeBlock();
 	expect((await repo.pend({
 		actionId: ACTION, transforms: { inserts: { [BLOCK]: block }, updates: {}, deletes: [] }, policy: 'c'

@@ -28,7 +28,7 @@
 import { expect } from 'chai';
 import { Database, QuereusError } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
@@ -47,7 +47,7 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
  * every Database in a test so Trees opened by either side see the other's
  * writes (same pattern as catalog-hydration.spec.ts). */
 function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
+	const repo = new StorageRepo(storage);
 	return {
 		async get(blockGets) { return await repo.get(blockGets); },
 		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },

@@ -89,7 +89,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 	beforeEach(() => {
 		rawStorage = new MemoryRawStorage();
-		repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		repo = new StorageRepo(rawStorage);
 		service = new BlockTransferService({ registrar, repo, superMajorityThreshold: SUPER_MAJORITY });
 		legacyService = new BlockTransferService(
 			{ registrar, repo, superMajorityThreshold: SUPER_MAJORITY },

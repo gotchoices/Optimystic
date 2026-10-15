@@ -8,7 +8,6 @@ import {
 	RepoClient,
 	stateHoldingsOnReads,
 	StorageRepo,
-	BlockStorage,
 	MemoryRawStorage,
 	type ReadCacheLease,
 	withReadCache,
@@ -407,7 +406,7 @@ export class CollectionFactory {
     if (lease) {
       this.readCacheLeases.push(lease);
     }
-    const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
+    const storageRepo = new StorageRepo(rawStorage);
 
     // LocalTransactor implementation (simple wrapper around StorageRepo).
     // Also implements IBlockChangeNotifier by delegating to the StorageRepo —
@@ -440,7 +439,7 @@ export class CollectionFactory {
   private async createTestTransactor(): Promise<ITransactor> {
     const memoryStorage = new MemoryRawStorage();
 
-    const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, memoryStorage));
+    const storageRepo = new StorageRepo(memoryStorage);
 
     // Simple local transactor that wraps StorageRepo; also an IBlockChangeNotifier
     // (delegating to the StorageRepo) so plugin-level reactive-watch specs can

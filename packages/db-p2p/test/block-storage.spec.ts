@@ -107,7 +107,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		await withBlockWriteLatch(blockId, l =>
 			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore') }, undefined, undefined, l));
 
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback) });
 		const result = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
 
 		expect(restoreCalls.length, 'restoreCallback invoked for the absent revision').to.equal(1);
@@ -217,7 +217,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 		// Through the healing read, the restore cannot even be attempted (no callback wired), and a
 		// failed restore on a pending-only block reads as ABSENT rather than as a fault.
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
 		expect(got!.block, 'named rev with no committed base ⇒ absent').to.equal(undefined);
 		expect(got!.unavailable, 'absent, not unavailable').to.equal(undefined);
@@ -241,7 +241,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		await withBlockWriteLatch(blockId, l =>
 			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-empty') }, undefined, undefined, l));
 
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback) });
 		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
 		expect(got!.block, 'restore supplied nothing ⇒ absent').to.equal(undefined);
 		expect(got!.unavailable, 'and authoritatively absent, not a fault').to.equal(undefined);
@@ -296,7 +296,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		await withBlockWriteLatch(blockId, l =>
 			storage.savePendingTransaction('pending' as ActionId, { insert: makeBlock('block-restore-hollow') }, undefined, undefined, l));
 
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback) });
 		const got = (await repo.get({ blockIds: [blockId], context: { rev: 1, committed: [] } }))[blockId];
 		expect(got!.block, 'nothing served').to.equal(undefined);
 		expect(got!.unavailable, 'restored records with no materialization is a fault, not an absence')
@@ -310,7 +310,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 	it('commit opens coverage from the earliest committed rev', async () => {
 		const blockId = 'block-commit' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		await repo.pend({
 			actionId: 'a1' as ActionId,
@@ -328,7 +328,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 	it('sparse commits extend one contiguous span (the intermediate rev IS reconstructible)', async () => {
 		const blockId = 'block-gap' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		// Commit rev 1.
 		await repo.pend({
@@ -355,7 +355,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 
 	it('getBlock(intermediateRev) between sparse commits serves the prior materialization (no throw)', async () => {
 		const blockId = 'block-intermediate' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		// Modify the block at sparse global revs 1 and 3.
 		await repo.pend({
@@ -385,7 +385,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 		// rev — under the point-range bug this threw instead of serving B's rev-1 state.
 		const aId = 'blk-A' as BlockId;
 		const bId = 'blk-B' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		await repo.pend({
 			actionId: 'a1' as ActionId,
@@ -433,7 +433,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 				range: [4, 5]
 			};
 		};
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		// First (and only) commit is at rev 5.
 		await repo.pend({
@@ -664,7 +664,7 @@ describe('BlockStorage meta.ranges honesty', () => {
 			// The user-visible consequence: without the deletion the node refuses every later
 			// `policy: 'f'` write to this block, forever.
 			const blockId = 'block-invariant-p-repo' as BlockId;
-			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const repo = new StorageRepo(raw);
 			const block = makeBlock('block-invariant-p-repo', { items: [] });
 
 			await repo.pend({ actionId: 'a-diverged' as ActionId, transforms: makeInsertTransforms(blockId, block), policy: 'c' });
@@ -795,7 +795,7 @@ describe('BlockStorage restore archive vetting', () => {
 	 * E = rev, so every read BELOW it is a genuine gap — which is what fires the restore path.
 	 */
 	const seedAtRev = async (blockId: BlockId, actionId: ActionId, rev: number, block: IBlock) => {
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		await repo.pend({ actionId, transforms: makeInsertTransforms(blockId, block), policy: 'c' });
 		expect((await repo.commit({ actionId, blockIds: [blockId], tailId: blockId, rev })).success).to.equal(true);
 	};
@@ -1166,7 +1166,7 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 	});
 
 	const repoWithInterval = (interval: number) =>
-		new StorageRepo((id) => new BlockStorage(id, raw, undefined, interval));
+		new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, undefined, interval) });
 
 	// Enumerate which revs in [1, upTo] currently hold a materialized copy vs a forward transform.
 	const scanStores = async (blockId: BlockId, upTo: number) => {
@@ -1269,7 +1269,7 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 			},
 			range: [2, 3]
 		});
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback, CK));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback, CK) });
 
 		// Upper range starts at E=10 (a non-checkpoint floor — exercises the mandatory floor clause).
 		await repo.pend({ actionId: 'u10' as ActionId, transforms: makeInsertTransforms(blockId, makeBlock('ck-multirange', { items: [] })), policy: 'c' });
@@ -1325,7 +1325,7 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 			}
 		}
 		const blockId = 'ck-crash' as BlockId;
-		const repo = new StorageRepo((id) => new SkipPruneStorage(id, raw, undefined, CK));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new SkipPruneStorage(id, store, undefined, CK) });
 
 		// Commit revs 1..5 with the prune suppressed: every materialization lingers.
 		await insertRev1(repo, blockId);
@@ -1375,7 +1375,7 @@ describe('BlockStorage checkpoint materialization sweep', () => {
 			},
 			range: [2, 5]
 		});
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback, CK));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback, CK) });
 
 		// Local upper range from E=10 (disjoint from the lower archive), so a read at rev 3 must restore.
 		await repo.pend({ actionId: 'u10' as ActionId, transforms: makeInsertTransforms(blockId, makeBlock('ck-staleread', { items: [] })), policy: 'c' });
@@ -1420,7 +1420,7 @@ describe('commit-proof persistence on the replica path', () => {
 
 	it('saveReplicatedBlock persists a supplied proof, retrievable by (blockId, rev)', async () => {
 		const blockId = 'block-proof-kept' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		await repo.saveReplicatedBlock(
 			blockId, makeBlock('block-proof-kept', { items: [] }),
@@ -1433,7 +1433,7 @@ describe('commit-proof persistence on the replica path', () => {
 
 	it('saveReplicatedBlock without a proof persists none', async () => {
 		const blockId = 'block-proof-none' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		await repo.saveReplicatedBlock(
 			blockId, makeBlock('block-proof-none', { items: [] }),
@@ -1454,7 +1454,7 @@ describe('commit-proof persistence on the replica path', () => {
 		// `block-transfer-push-persist.spec.ts`, alongside the diverged-holder and stale-revision
 		// cases that make the retention rule matter.
 		const blockId = 'block-proof-skip' as BlockId;
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const block = makeBlock('block-proof-skip', { items: [] });
 
 		await repo.saveReplicatedBlock(blockId, block, { rev: 2, actionId: 'r2' as ActionId });
@@ -1525,7 +1525,7 @@ describe('commit-proof persistence on the replica path', () => {
 			// The assertion that would have failed before this ticket: the second call is a monotonic
 			// no-op, so nothing is written by `saveReplica` — the proof lands via the back-fill.
 			const blockId = 'block-backfill-reconcile' as BlockId;
-			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const repo = new StorageRepo(raw);
 			const block = makeBlock('block-backfill-reconcile', { items: [] });
 			const source = { rev: 3, actionId: 'a3' as ActionId };
 
@@ -1549,7 +1549,7 @@ describe('commit-proof persistence on the replica path', () => {
 			// refuses `proof-without-meta`) and from reconcile (its `source` is required), so this
 			// pins the guard rather than a live path.
 			const blockId = 'block-backfill-no-source' as BlockId;
-			const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+			const repo = new StorageRepo(raw);
 			const block = makeBlock('block-backfill-no-source', { items: [] });
 
 			await repo.saveReplicatedBlock(blockId, block);
@@ -1570,7 +1570,7 @@ describe('commit-proof persistence on the replica path', () => {
 			const blockId = 'block-backfill-fault' as BlockId;
 			const faulty = new MemoryRawStorage();
 			faulty.saveBlockProof = async () => { throw new Error('disk write failed'); };
-			const repo = new StorageRepo((id) => new BlockStorage(id, faulty));
+			const repo = new StorageRepo(faulty);
 			const block = makeBlock('block-backfill-fault', { items: [] });
 			const source = { rev: 3, actionId: 'a3' as ActionId };
 
@@ -1654,7 +1654,7 @@ describe('one block, one write lock', () => {
 			},
 			range: [2, 7]
 		});
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw, restoreCallback));
+		const repo = new StorageRepo(raw, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreCallback) });
 
 		// Seed the block at rev 5 (coverage [[5]]), so rev 2 is a genuine gap that triggers a restore.
 		await repo.pend({
@@ -1705,7 +1705,7 @@ describe('one block, one write lock', () => {
 			}
 		}
 		const raw = new GatedRaw();
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		// An updates-only pend with no `rev` makes no getLatest() call of its own, so the FIRST
 		// metadata read for this block is the one inside savePendingTransaction.

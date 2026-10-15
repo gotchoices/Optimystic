@@ -40,7 +40,7 @@ const makeCommit = (over: Partial<CommitRequest> = {}): CommitRequest => ({
 /** A `StorageRepo` over its own `MemoryRawStorage`, so a test can also reach the raw proof keys. */
 const makeRepo = () => {
 	const raw = new MemoryRawStorage();
-	return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+	return { raw, repo: new StorageRepo(raw) };
 };
 
 /**
@@ -245,8 +245,7 @@ describe('block archive commit proof', () => {
 		const askerForgettingRev1 = async () => {
 			const server = makeRepo();
 			const askerRaw = new MemoryRawStorage();
-			const asker = new StorageRepo((blockId) => new BlockStorage(
-				blockId, askerRaw, (id, rev) => serveBlockArchive(server.repo, id, rev)));
+			const asker = new StorageRepo(askerRaw, { createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, (id, rev) => serveBlockArchive(server.repo, id, rev)) });
 			for (const repo of [server.repo, asker]) {
 				await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
 				await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });

@@ -94,7 +94,6 @@ import {
 	type Transforms,
 } from "@optimystic/db-core";
 import { StorageRepo } from "../storage/storage-repo.js";
-import { BlockStorage } from "../storage/block-storage.js";
 import { MemoryRawStorage } from "../storage/memory-storage.js";
 import { makeCohortTopicChangeNotifier } from "../cohort-topic/change-bridge.js";
 import { buildCommitCert } from "../cluster/commit-cert.js";
@@ -432,7 +431,7 @@ export class ReactivityMesh {
 		const queueMax = opts.queueMax ?? 32;
 
 		const rawStorage = new MemoryRawStorage();
-		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		const repo = new StorageRepo(rawStorage);
 
 		// Origination is the root group's responsibility — installed on the node nearest the tail's root
 		// coordinate (the group's routed primary), one of the nodes a commit on the tail lands on in production.

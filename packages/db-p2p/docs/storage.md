@@ -276,6 +276,79 @@ case that flushes a write of every kind and reads each back through a fresh stor
 same location (`runRawStorageConformance` in
 `packages/db-p2p/src/testing/raw-storage-conformance.ts`).
 
+**Who calls `flush()`.** Exactly once at the end of every group of writes whose outcome the
+node is about to report to another machine:
+
+- `StorageRepo` ends each write group through `endGroup` in
+  `packages/db-p2p/src/storage/storage-repo.ts`: `pend`, `commit`, `cancel`, `recoverBlock`,
+  `saveReplicatedBlock`, and a `get` that entered a block write latch (a read-driven
+  promotion, or a coverage restore). The flush runs after the group's latches are released,
+  so a concurrent group on the same blocks is not held behind the disk and several groups can
+  share one sync, and before the group's change events, so nothing announces a commit this
+  node could still lose. A group whose work throws is flushed before the error propagates; a
+  flush that rejects after the work returned makes the call throw and emit nothing. A `get`
+  that took no latch does not flush, so the plain read path costs nothing extra.
+- `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls
+  `InvalidationContext.flush` after releasing its latches and before appending the entry that
+  names the compensating revisions, so an entry never names revisions the store lost. Nothing
+  wires the dispute path in production yet; this is the contract for when something does.
+- `KvUnderReplicationLedger` in `packages/db-p2p/src/repo/kv-under-replication-ledger.ts`
+  flushes its key-value store after every call that wrote to it, so a shortfall
+  `CoordinatorRepo` names in its answer, and a peer the drain reports satisfied, outlive a
+  restart.
+
+The one block-storage write outside a group is the read path's re-cache of a materialized
+block (`materializeBlock` in `packages/db-p2p/src/storage/block-storage.ts`), which can be
+recomputed and becomes durable with the next group's flush. `PersistentTransactionStateStore`
+(`packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`), wired only when a host
+passes `NodeOptions.transactionStateStore`, writes without waiting and promises nothing before
+it replies, so it is not flushed.
+
+**Visible before durable (accepted).** Between a write resolving and its group's flush,
+readers in this process can see it, and through them other machines. What a read can expose
+is consensus-decided content or a pending record, and what a crash takes back is always a
+later suffix of the resolved writes (rule 3): a vote built on a record's absence stays valid
+when the record is lost, and one built on its presence was a refusal. Likewise a second group
+on the same blocks can read the first's writes before they are durable and build on them;
+its own writes resolved later, so under rule 3 they cannot survive without the first's.
+
+**The write orders crash recovery relies on.** Every backend's flush is reviewed against this
+list. Each holds today because every step is synced before the next starts; once a backend
+syncs only at the flush, rule 3 is what holds them.
+
+1. **Claim before record.** `BlockStorage.savePendingTransaction` writes the slot and base the
+   record claims into the block's metadata before the pending record itself, so a crash
+   between them leaves an inert claim and never a claim-less record, which every reader treats
+   as the strongest reservation (`isReservationAgainst` in
+   `packages/db-p2p/src/storage/pending-claim.ts`).
+2. **One block's commit, in order** (`internalCommit` in
+   `packages/db-p2p/src/storage/storage-repo.ts`): materialized block, revision record,
+   promote, `setLatest`, proof, prune of the prior materialization. `latest` is never on disk
+   naming a revision whose record or transform is not, and the prune is never on disk without
+   the new materialization and `setLatest`. The only partial states the retry path heals are
+   revision-saved-not-promoted (Crash-D2) and promoted-with-`setLatest`-lost (Crash-D3, healed
+   by `BlockStorage.recover` from `StorageRepo.commit`).
+3. **Promote is one atomic move** ([Invariant P](../../../docs/repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action),
+   and Invariant 4 above). The file backend does not guarantee this today: its rename is not
+   directory-synced while the metadata write after it is (see *The file backend's gap* above).
+   `file-storage-pays-one-fsync-per-write-group` closes it.
+4. **Log tail first** (`tailFirst` in `packages/db-p2p/src/storage/storage-repo.ts`): a member
+   holding a committed non-tail block of an action also holds the action's committed log tail.
+5. **Forward writes** (`BlockStorage.saveForwardRevision`): revision record, transform,
+   materialization and proof before the metadata that advances `latest`, and the same action's
+   pending record deleted no later than that metadata.
+6. **Coverage restore** (`BlockStorage.restoreRevision`): the restored records before the
+   `ranges` entry that claims them.
+7. **Delete before the claim is dropped** (`BlockStorage.deletePendingTransaction`, and
+   `refuseMissingBase` and `dropUnpromotablePendings` in `StorageRepo`). The file backend does
+   not guarantee this today either: the unlink is not directory-synced while the metadata write
+   after it is. `file-storage-pays-one-fsync-per-write-group` closes it.
+8. **Across stores:** the durable executed marker (`markExecuted`, written by
+   `ClusterMember.handleConsensus` in `packages/db-p2p/src/cluster/cluster-repo.ts`) after the
+   apply it describes, and the under-replication entry after the commit it describes. Two
+   stores are two durability domains, with no prefix rule between them; these hold because
+   `StorageRepo` flushes before it returns and the second write is issued afterwards.
+
 ## Core Components
 
 ### 1. Storage Repository (`StorageRepo`)
@@ -293,6 +366,10 @@ The `StorageRepo` class provides the main interface for database operations, imp
 - `pend()`: Creates pending transactions with conflict detection
 - `commit()`: Atomically commits transactions across multiple blocks
 - `cancel()`: Cancels pending transactions
+
+**Construction and durability:** `new StorageRepo(storage, options?)` takes the raw store;
+`options.createBlockStorage` builds each block's storage over that same store (default
+`BlockStorage`), and every write group ends with one `flush()` of it (Invariant 6).
 
 ### 2. Block Storage (`BlockStorage`)
 
@@ -783,10 +860,10 @@ One write latch per block, described in full under Invariant 2 above:
 ### Basic Block Operations
 
 ```typescript
-// Create a storage repository
-const repo = new StorageRepo(blockId => 
-  new BlockStorage(blockId, rawStorage, restoreCallback)
-);
+// Create a storage repository over a raw store; every write group ends with one flush of it
+const repo = new StorageRepo(rawStorage, {
+  createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback)
+});
 
 // Get blocks with context
 const result = await repo.get({

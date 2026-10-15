@@ -94,7 +94,7 @@ function valueBlock(id: BlockId, value: string): ValueBlock {
  */
 async function seedBlock(raw: MemoryRawStorage, blockId: BlockId, revisions: { actionId: string; value: string; rev: number }[]) {
 	const createBlockStorage = (id: BlockId) => new BlockStorage(id, raw);
-	const repo = new StorageRepo(createBlockStorage);
+	const repo = new StorageRepo(raw);
 	let first = true;
 	for (const { actionId, value, rev } of revisions) {
 		const transforms = first
@@ -114,7 +114,7 @@ async function seedBlock(raw: MemoryRawStorage, blockId: BlockId, revisions: { a
  */
 async function seedWrites(raw: MemoryRawStorage, steps: { actionId: string; rev: number; blockId: BlockId; value: string }[]) {
 	const createBlockStorage = (id: BlockId) => new BlockStorage(id, raw);
-	const repo = new StorageRepo(createBlockStorage);
+	const repo = new StorageRepo(raw);
 	const seen = new Set<BlockId>();
 	for (const { actionId, rev, blockId, value } of steps) {
 		const transforms = seen.has(blockId)
@@ -495,7 +495,7 @@ describe('applyInvalidation', () => {
 		const log = await Log.create<unknown>(new MemLogStore());
 		const proof = await challengerWinsProof('d1', 'msg-1');
 
-		const result = await applyInvalidation({ log, createBlockStorage }, {
+		const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 			invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
 		});
 
@@ -519,7 +519,7 @@ describe('applyInvalidation', () => {
 		]);
 		const log = await Log.create<unknown>(new MemLogStore());
 		const proof = await challengerWinsProof('d1', 'msg-1');
-		const ctx = { log, createBlockStorage };
+		const ctx = { log, createBlockStorage, flush: () => raw.flush() };
 		const params = { invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof } as const;
 
 		const first = await applyInvalidation(ctx, params);
@@ -558,7 +558,7 @@ describe('applyInvalidation', () => {
 			arbitratorSet, challengerPeerId: challenger.peerId.toString(), arbitratorSetSignature,
 		});
 
-		const result = await applyInvalidation({ log, createBlockStorage }, {
+		const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 			invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
 		});
 
@@ -581,7 +581,7 @@ describe('applyInvalidation', () => {
 
 		// …carried in an apply against an UNRELATED innocent action 'innocent'/block 'B' → rejected,
 		// no revision and no log entry written.
-		const result = await applyInvalidation({ log, createBlockStorage }, {
+		const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 			invalidatedActionId: 'innocent', invalidatedRev: 2, blockIds: ['B'], proof,
 		});
 
@@ -600,7 +600,7 @@ describe('applyInvalidation', () => {
 		const log = await Log.create<unknown>(new MemLogStore());
 		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a1', blockIds: ['B'] });
 
-		const result = await applyInvalidation({ log, createBlockStorage }, {
+		const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 			invalidatedActionId: 'a1', invalidatedRev: 1, blockIds: ['B'], proof,
 		});
 
@@ -622,7 +622,7 @@ describe('applyInvalidation', () => {
 		const log = await Log.create<unknown>(new MemLogStore());
 		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: ['B'] });
 
-		const result = await applyInvalidation({ log, createBlockStorage }, {
+		const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 			invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
 		});
 
@@ -640,7 +640,7 @@ describe('applyInvalidation', () => {
 		]);
 		const log = await Log.create<unknown>(new MemLogStore());
 		const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a1', blockIds: ['B'] });
-		const ctx = { log, createBlockStorage };
+		const ctx = { log, createBlockStorage, flush: () => raw.flush() };
 		const params = { invalidatedActionId: 'a1', invalidatedRev: 1, blockIds: ['B'], proof } as const;
 
 		const first = await applyInvalidation(ctx, params);
@@ -669,7 +669,7 @@ describe('applyInvalidation', () => {
 				{ actionId: 'a1', value: 'created-by-tinv', rev: 1 },
 			]);
 			const log = await Log.create<unknown>(new MemLogStore());
-			const result = await applyInvalidation({ log, createBlockStorage }, {
+			const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a1', invalidatedRev: 1, blockIds: ['B'], proof,
 			});
 			return { result, latest: await createBlockStorage('B').getLatest() };
@@ -694,7 +694,7 @@ describe('applyInvalidation', () => {
 			const raw = new MemoryRawStorage();
 			const { createBlockStorage } = await seedBlock(raw, 'B', seedRevs);
 			const log = await Log.create<unknown>(new MemLogStore());
-			return applyInvalidation({ log, createBlockStorage }, {
+			return applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
 			});
 		}
@@ -730,7 +730,7 @@ describe('applyInvalidation', () => {
 			try {
 				let applied = false;
 				const p = applyInvalidation(
-					{ log, createBlockStorage },
+					{ log, createBlockStorage, flush: () => raw.flush() },
 					{ invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof, rev: 3 }
 				).then(r => { applied = true; return r; });
 
@@ -769,7 +769,7 @@ describe('applyInvalidation', () => {
 			const proof = await challengerWinsProof('d1', 'msg-1', { invalidatedActionId: 'a2', blockIds: [blockId] });
 
 			// The invalidation writes rev 6 under the block write latch it takes itself.
-			const invResult = await applyInvalidation({ log, createBlockStorage }, {
+			const invResult = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof, rev: 6,
 			});
 			expect(invResult.applied).to.equal(true);
@@ -835,7 +835,7 @@ describe('applyInvalidation', () => {
 				// read-only prefix — dedup, certificate verification — and queues behind it.
 				commitP = repo.commit({ actionId: 'c3', rev: 3, blockIds: [blockId], tailId: 'log' });
 				await delay(0);
-				invP = applyInvalidation({ log, createBlockStorage }, {
+				invP = applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: [blockId], proof,
 				});
 				await delay(25);
@@ -885,7 +885,7 @@ describe('applyInvalidation', () => {
 
 			// Slot 3 is past X's tip (2) but NOT past Y's (3) — so a per-block loop would have written X
 			// and had Y refused, leaving a log entry that claims both.
-			const result = await applyInvalidation({ log, createBlockStorage }, {
+			const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['X', 'Y'], proof, rev: 3,
 			});
 
@@ -900,7 +900,7 @@ describe('applyInvalidation', () => {
 
 			// And nothing appended — the invalidation stays re-deliverable at a slot past every tip.
 			expect(await log.findInvalidation('a2')).to.equal(undefined);
-			const retry = await applyInvalidation({ log, createBlockStorage }, {
+			const retry = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['X', 'Y'], proof, rev: 4,
 			});
 			expect(retry.applied).to.equal(true);
@@ -929,7 +929,7 @@ describe('applyInvalidation', () => {
 			// to completion and the other follows — no acquisition cycle, so neither can hang.
 			const [commitResult, invResult] = await Promise.all([
 				repo.commit({ actionId: 'c3', rev: 3, blockIds: ['mb-a', 'mb-z'], tailId: 'log' }),
-				applyInvalidation({ log, createBlockStorage }, {
+				applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['mb-z', 'mb-a'], proof,
 				}),
 			]);
@@ -970,7 +970,7 @@ describe('applyInvalidation', () => {
 
 			// `Latches` is a plain FIFO mutex with no re-entrancy: acquiring 'B' twice would park the
 			// apply against itself forever, so a hang here (mocha's 10s timeout) IS the failure.
-			const result = await applyInvalidation({ log, createBlockStorage }, {
+			const result = await applyInvalidation({ log, createBlockStorage, flush: () => raw.flush() }, {
 				invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B', 'B'], proof,
 			});
 
@@ -1011,7 +1011,7 @@ describe('applyInvalidation', () => {
 
 			let thrown: Error | undefined;
 			try {
-				await applyInvalidation({ log, createBlockStorage: lyingStorage }, {
+				await applyInvalidation({ log, createBlockStorage: lyingStorage, flush: () => raw.flush() }, {
 					invalidatedActionId: 'a2', invalidatedRev: 2, blockIds: ['B'], proof,
 				});
 			} catch (err) {

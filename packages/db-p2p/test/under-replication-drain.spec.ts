@@ -23,7 +23,6 @@ import type { UnderReplicatedEntry } from '../src/repo/i-under-replication-ledge
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { buildBlockTransferProtocol, type PushBlockOutcome } from '../src/cluster/block-transfer-service.js';
 import { captureLog, hasLine, hasTag } from './support/capture-log.js';
@@ -394,7 +393,7 @@ describe('UnderReplicationDrain', () => {
 	describe('the full-replication event', () => {
 		it('reaches every listener even when one throws, and the drain carries on', async () => {
 			const drain = await startDrain();
-			const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, new MemoryRawStorage(), async () => undefined));
+			const storageRepo = new StorageRepo(new MemoryRawStorage());
 			deps.emit = (event) => storageRepo.emitBlockDurabilityReached(event);
 			const seen: BlockDurabilityReachedEvent[] = [];
 			storageRepo.onBlockDurabilityReached(() => { throw new Error('listener bug'); });

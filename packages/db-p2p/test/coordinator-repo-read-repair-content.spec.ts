@@ -125,11 +125,11 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 
-		const aRepo = new StorageRepo(id => new BlockStorage(id, aStorage));
+		const aRepo = new StorageRepo(aStorage);
 		// B's restore callback is the in-process stand-in for RestorationCoordinator: when
 		// BlockStorage decides it needs a revision it does not hold, it pulls A's archive.
 		const restoreFromA: RestoreCallback = async (blockId) => await serveArchive(aRepo, blockId);
-		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage, restoreB ? restoreFromA : undefined));
+		const bRepo = new StorageRepo(bStorage, { createBlockStorage: (id, store) => new BlockStorage(id, store, restoreB ? restoreFromA : undefined) });
 
 		// A lands rev 1 then rev 2; B lands only rev 1, and only when seeded.
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');

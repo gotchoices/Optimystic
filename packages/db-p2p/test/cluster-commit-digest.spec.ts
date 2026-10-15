@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import { clusterMember, CONTENT_DIGEST_MISMATCH, BASE_DECLARATION_DISAGREES } from '../src/cluster/cluster-repo.js';
 import { StorageRepo, type CommitDigestPreview, type IPendingClaimReader } from '../src/storage/storage-repo.js';
 import type { PendingClaim } from '../src/storage/pending-claim.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import type { IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, ClusterPeers, BlockId, ActionId, BlockContentDigests, IBlock } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
@@ -287,7 +286,7 @@ describe('ClusterMember — commit content-digest check (promise round)', () => 
 
 		const seededRepo = async (): Promise<StorageRepo> => {
 			const rawStorage = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+			const repo = new StorageRepo(rawStorage);
 			const pended = await repo.pend({
 				actionId: ACTION,
 				transforms: { inserts: { [BLOCK]: insertBlock() }, updates: {}, deletes: [] },
@@ -492,7 +491,7 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 		/** BLOCK committed at rev 1, then an update pended at `rev` naming `base`. */
 		const seeded = async (rev = 2, base = 1): Promise<StorageRepo> => {
 			const rawStorage = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+			const repo = new StorageRepo(rawStorage);
 			expect((await repo.pend({ actionId: ACTION, transforms: { inserts: { [BLOCK]: block(['x']) }, updates: {}, deletes: [] }, rev: 1, policy: 'c' })).success).to.equal(true);
 			expect((await repo.commit({ actionId: ACTION, blockIds: [BLOCK], tailId: BLOCK, rev: 1 })).success).to.equal(true);
 			expect((await repo.pend({

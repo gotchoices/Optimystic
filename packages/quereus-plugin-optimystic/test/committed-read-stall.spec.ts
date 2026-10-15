@@ -19,7 +19,7 @@
 import { expect } from 'chai';
 import { Database, settleMacrotasks } from '@quereus/quereus';
 import type { SqlValue, FilterInfo } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import { TransactionCoordinator } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
@@ -43,7 +43,7 @@ function localOptions() {
 
 /** One in-memory StorageRepo-backed transactor, shareable across Databases. */
 function buildInnerTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
+	const repo = new StorageRepo(storage);
 	return {
 		async get(blockGets) { return await repo.get(blockGets); },
 		async getStatus(_refs) { throw new Error('getStatus not implemented in test transactor'); },

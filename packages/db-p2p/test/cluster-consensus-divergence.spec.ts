@@ -3,7 +3,6 @@ import { localDurability } from '@optimystic/db-core';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../src/cluster/cluster-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, ClusterPeers, Transforms,
 	IBlock, BlockId, BlockHeader, BlockGets, GetBlockResults, PendRequest,
@@ -139,7 +138,7 @@ class MockPeerNetwork implements IPeerNetwork {
 /** Real storage so commit/pend genuinely enforce revisions and pending-action presence. */
 const realStorageRepo = (): StorageRepo => {
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((blockId: BlockId) => new BlockStorage(blockId, raw));
+	return new StorageRepo(raw);
 };
 
 /**

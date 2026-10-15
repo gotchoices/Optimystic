@@ -77,7 +77,7 @@ const makeHarness = async (options: HarnessOptions = {}): Promise<Harness> => {
 	// AND per operation, so constructing the store inside it gives pend and commit different
 	// storage and the commit dies on `Pending action ... not found`.
 	const raw = new MemoryRawStorage();
-	const storageRepo = new StorageRepo(id => new BlockStorage(id, raw));
+	const storageRepo = new StorageRepo(raw);
 	// A REAL ClusterMember, not a double: the solo path's proof must come out of the same delegate
 	// the production wiring exposes. The peer network is a dead stub — the solo short-circuit never
 	// dials anyone, which is rather the point.

@@ -786,15 +786,16 @@ export async function createLibp2pNodeBase(
 	const kvStore = resolveKvStore(options.kvStore);
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
 
-	// Create placeholder restore callback (will be replaced after node starts)
+	// Placeholder restore callback, reassigned once the restoration coordinator exists after start.
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
 		return undefined;
 	};
 
-	// Create shared storage layers with restoration callback
-	const storageRepo = new StorageRepo((blockId) =>
-		new BlockStorage(blockId, rawStorage, restoreCallback)
-	);
+	// The factory reads the `restoreCallback` binding each time it builds a block storage, so a block
+	// storage created after the reassignment below restores through the coordinator.
+	const storageRepo = new StorageRepo(rawStorage, {
+		createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback)
+	});
 
 	let clusterImpl: ICluster | undefined;
 	let coordinatedRepo: IRepo | undefined;
@@ -1735,14 +1736,9 @@ export async function createLibp2pNodeBase(
 					membership
 				);
 
-				// Update restore callback to use new coordinator
-				const newRestoreCallback: RestoreCallback = async (blockId, rev?) => {
+				restoreCallback = async (blockId, rev?) => {
 					return await restorationCoordinatorV2.restore(blockId, rev);
 				};
-
-				// Replace the restore callback (this is a bit hacky, but works for now)
-				(storageRepo as any).createBlockStorage = (blockId: string) =>
-					new BlockStorage(blockId, rawStorage, newRestoreCallback);
 
 				// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
 				// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was

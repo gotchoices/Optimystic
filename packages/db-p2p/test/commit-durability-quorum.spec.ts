@@ -39,7 +39,6 @@ import { ClusterCoordinator } from '../src/repo/cluster-coordinator.js';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import { StorageRepo, COMMIT_NOT_DURABLE_REASON, isCommitNotDurableFailure } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
 import { serveBlockArchive } from '../src/storage/block-archive.js';
 import type {
@@ -94,7 +93,7 @@ class MockPeerNetwork implements IPeerNetwork {
 
 const realStorageRepo = (): StorageRepo => {
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((blockId: BlockId) => new BlockStorage(blockId, raw));
+	return new StorageRepo(raw);
 };
 
 /** Put BLOCK into storage at rev 1, so a pend at {@link COMMIT_REV} is an ordinary update. */

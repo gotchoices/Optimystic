@@ -1,7 +1,6 @@
 import { expect } from 'chai';
 import { toString as uint8ArrayToString } from 'uint8arrays';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
-import { BlockStorage } from '../../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
 import { makeCohortTopicChangeNotifier, attachCohortChangeBridge, selfAppliedTail, type ChangeBridgeSource } from '../../src/cohort-topic/change-bridge.js';
 import { buildCommitCert, createCommitCertStore, makeClusterCommitCertExtractor } from '../../src/cluster/commit-cert.js';
@@ -47,7 +46,7 @@ describe('cohort-topic: local change-notifier bridge', () => {
 
 	beforeEach(() => {
 		rawStorage = new MemoryRawStorage();
-		repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		repo = new StorageRepo(rawStorage);
 	});
 
 	// Pend-then-commit one insert through the real StorageRepo so the catch-all change feed fires
@@ -344,7 +343,7 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 
 	it('end-to-end: a stored cluster cert flows through the bridge unchanged on commit', async () => {
 		const rawStorage = new MemoryRawStorage();
-		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		const repo = new StorageRepo(rawStorage);
 		const store = createCommitCertStore();
 
 		// Stash the authoritative cert as the cluster member would, keyed by the action being committed.

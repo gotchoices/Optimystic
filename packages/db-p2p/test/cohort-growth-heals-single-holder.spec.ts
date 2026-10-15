@@ -37,7 +37,6 @@ import { makeSignedProof } from './support/commit-proof-fixtures.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import type { BlockArchive } from '../src/storage/struct.js';
@@ -258,9 +257,9 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 		const cStorage = new MemoryRawStorage();
-		const aRepo = new StorageRepo(id => new BlockStorage(id, aStorage));
-		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage));
-		const cRepo = new StorageRepo(id => new BlockStorage(id, cStorage));
+		const aRepo = new StorageRepo(aStorage);
+		const bRepo = new StorageRepo(bStorage);
+		const cRepo = new StorageRepo(cStorage);
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
 
 		const peerA = await makePeerId();

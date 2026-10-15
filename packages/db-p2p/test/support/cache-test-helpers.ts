@@ -5,7 +5,6 @@ import type { IRawStorage } from '../../src/storage/i-raw-storage.js';
 import type { StoreIdentity } from '../../src/storage/store-identity.js';
 import type { StoreDurability } from '../../src/storage/store-durability.js';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
-import { BlockStorage } from '../../src/storage/block-storage.js';
 
 export const makeBlock = (id: string, data?: Record<string, unknown>): IBlock => ({
 	header: { id: id as BlockId, type: 'test', collectionId: 'collection-1' as BlockId },
@@ -162,7 +161,7 @@ export const WRITE_METHODS = [
  * read of every known block after each commit. Insert on a block's first touch,
  * in-place update after; commit rev is a global counter. */
 export async function runColdStartWorkload(storage: IRawStorage): Promise<void> {
-	const repo = new StorageRepo(id => new BlockStorage(id, storage));
+	const repo = new StorageRepo(storage);
 	const blockIds = Array.from({ length: 6 }, (_, i) => `blk-${i}` as BlockId);
 	const inserted = new Set<BlockId>();
 
