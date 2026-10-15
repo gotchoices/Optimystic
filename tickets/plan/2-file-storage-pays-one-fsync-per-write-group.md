@@ -50,6 +50,8 @@ A redo log per store directory.
 
 `repro: static` — from reading `promote`, `deletePending` and `atomicWriteFile`; not reproduced with a power cut. The log closes it by construction: the rename and the unlink become entries of an atomic record. If the log is declined, the standalone fix is to fsync `pend/` and `actions/` after the promote rename and the directory after each unlink, two to three more fsyncs per block per commit.
 
+A third arm of the same defect (found reviewing `raw-storage-can-be-flushed`, `repro: static`): `atomicWriteFile` creates missing directories with a recursive `mkdir` and then syncs only the written file's own directory, never the parent that gained the new entry. A power cut can therefore drop a new block's `<blockId>/` (or its first `revs/`, `pend/`, `actions/`, `proofs/`, `blocks/`) together with every file synced inside it, while keeping later writes elsewhere. The checkpoint's "fsync every tree file and directory written since the last checkpoint" must include the parent of every directory the tree apply or replay created. The `NOTE:` at `FileStoreDriver.durability` lists all three arms; remove it when this lands.
+
 ## Requirements
 
 - Crash guarantees equal to or stronger than today's per-file syncing: what survives a power cut is a prefix of the writes, in order; a flushed group is all-or-nothing.

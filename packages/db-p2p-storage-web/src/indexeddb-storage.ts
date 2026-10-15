@@ -20,6 +20,9 @@ export class IndexedDBStoreDriver implements RawStoreDriver {
 	// Each write is one implicit transaction at the default durability, which current browsers
 	// treat as relaxed: it commits once the browser has the data, before the disk does. So a write
 	// survives the page or browser process crashing but not an operating-system crash or power cut.
+	// NOTE: nor do browsers promise that what survives such a crash is a prefix of relaxed
+	// transactions (flush contract rule 3). `mobile-and-browser-storage-keep-the-durability-window`
+	// owns both.
 	readonly durability: StoreDurability = 'process-crash';
 
 	// NOTE: identity is the HANDLE object, so two handles opened over the same IndexedDB database

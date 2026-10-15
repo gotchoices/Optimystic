@@ -36,6 +36,9 @@ const log = createLogger('storage:leveldb');
 export class LevelDBStoreDriver implements RawStoreDriver {
 	// LevelDB's default write options hand each write to the operating system without syncing it,
 	// so a write survives this process crashing but not an operating-system crash or power cut.
+	// NOTE: nor is what survives such a crash promised to be a prefix (flush contract rule 3): under
+	// default options LevelDB's recovery skips a damaged log record and keeps the records after it.
+	// `mobile-and-browser-storage-keep-the-durability-window` owns both.
 	readonly durability: StoreDurability = 'process-crash';
 
 	// NOTE: identity is the HANDLE object, so two handles opened over the same LevelDB PATH read

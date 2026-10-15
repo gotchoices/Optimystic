@@ -3,7 +3,7 @@ architecture: packages/db-p2p/docs/storage.md#invariants
 files: packages/db-p2p/src/storage/store-durability.ts, packages/db-p2p/src/storage/raw-store-driver.ts, packages/db-p2p/src/storage/i-raw-storage.ts, packages/db-p2p/src/storage/i-kv-store.ts, packages/db-p2p/src/storage/kv-raw-storage.ts, packages/db-p2p/src/storage/memory-store-driver.ts, packages/db-p2p/src/storage/cached-store-driver.ts, packages/db-p2p/src/storage/cached-raw-storage.ts, packages/db-p2p/src/index.ts, packages/db-p2p/src/rn.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/testing/raw-storage-conformance.ts, packages/db-p2p-storage-fs/src/file-storage.ts, packages/db-p2p-storage-rn/src/leveldb-storage.ts, packages/db-p2p-storage-web/src/indexeddb-storage.ts, packages/db-p2p-storage-ns/src/sqlite-storage.ts, packages/db-p2p-storage-fs/test/file-storage.spec.ts, packages/db-p2p-storage-rn/test/leveldb-storage.spec.ts, packages/db-p2p-storage-web/test/indexeddb-storage.spec.ts, packages/db-p2p-storage-ns/test/sqlite-storage.spec.ts, packages/db-p2p-storage-ns/test/node-sqlite-driver.ts, packages/db-p2p/test/mid-ddl-crash.spec.ts, packages/db-p2p/test/support/cache-test-helpers.ts, packages/db-p2p/test/cached-raw-storage.spec.ts, packages/db-p2p/test/storage-monitor.spec.ts, packages/quereus-plugin-optimystic/test/two-node-lagging-replica-multi-collection-commit.spec.ts, packages/db-p2p/docs/storage.md, packages/db-p2p/readme.md, packages/db-p2p-storage-fs/README.md, packages/db-p2p-storage-ns/README.md
 ----
 
-# Raw storage can be flushed — review handoff
+# Raw storage can be flushed
 
 GitHub #37. First half of the seam: the operation and its contract exist on every storage interface and backend. `storage-flushes-once-per-write-group` (prereq on this) makes `StorageRepo`, `applyInvalidation` and the under-replication ledger call it; `file-storage-pays-one-fsync-per-write-group` and `mobile-and-browser-storage-keep-the-durability-window` later give flush real work.
 
@@ -54,3 +54,27 @@ GitHub #37. First half of the seam: the operation and its contract exist on ever
 - Subclasses of `KvRawStorage` must never redeclare `durability` as a plain field. `useDefineForClassFields` is on, so the redeclaration would clobber the value the base constructor set (the same trap `CachedRawStorage` documents for `readCached`). None do; this is inspection-only.
 - The IndexedDB conformance cleanup still only closes the database; it never deletes it. That is pre-existing, and harmless under `fake-indexeddb`.
 - Test logs: `tickets/.logs/raw-storage-can-be-flushed.*.test.log`.
+
+## Review findings
+
+Read the diff of `ticket(implement): raw-storage-can-be-flushed` first, then the handoff above.
+
+**Checked, and nothing to change:**
+- Interface and forwarding: `flush` and `durability` are required on `RawStoreDriver` and `IRawStorage`, optional on `IKVStore`. `KvRawStorage`, `CachedStoreDriver` and `RawStorageDriverAdapter` copy `durability` once at construction and forward `flush`. No subclass of `KvRawStorage` redeclares `durability`, so the `useDefineForClassFields` trap the handoff named does not occur. `withReadCache` dedupe means two consumers flushing one shared store both reach the one inner driver, which rule 4 allows.
+- The start-up line: `logStorageDurability` runs once, right after `resolveStorage`, from one place, through an exhaustive `Record<StoreDurability, string>`.
+- Conformance case: it is registered only under `{ persistent: true }` and throws when no `reopen` is supplied, so it never quietly skips (backlog `debt-a-test-can-quietly-decide-not-to-run`). It covers every write kind the plan listed. The four harnesses close before reopening, and LevelDB has to, because it holds a lock on its directory. Moving the SQLite harness onto a file costs nothing measurable (59 cases in about 270 ms).
+- Tests: the one new case pins the contract the file backend's write log will have to keep. The test-double changes are forwarding the type checker requires. Nothing to cut.
+- The values: SQLite in WAL mode with `synchronous = NORMAL`, and LevelDB with `sync: false`, both survive a process crash and not an OS crash, so `'process-crash'` is right for each. IndexedDB at default durability gets the same value.
+- `rn.ts` export parity: the full db-p2p suite now passes, including the entry-parity spec the implementer had only re-run on its own.
+
+**Found and fixed in this pass (minor):**
+- The file backend's durability `NOTE:` missed a gap. `atomicWriteFile` creates missing directories with a recursive `mkdir`, then syncs only the written file's own directory and never the parent that gained the new entry. A power cut can therefore drop a new block's directory, and every synced file in it. The directory sync is also best-effort (a failure is ignored). I extended the `NOTE:` at `FileStoreDriver.durability`, the "file backend's gap" paragraph in `packages/db-p2p/docs/storage.md`, and the Durability section of `packages/db-p2p-storage-fs/README.md`. The same gap is appended as a third arm in `file-storage-pays-one-fsync-per-write-group`: its checkpoint must also sync the parent of every directory it creates.
+- Rule 3 (what survives any crash is a prefix) is not established for the LevelDB and IndexedDB backends under an OS crash. This is the gap the handoff flagged. LevelDB's recovery under default options skips a damaged log record and keeps reading the records after it, and browsers promise nothing about relaxed transactions. SQLite's write-ahead log stops at the first bad frame, so SQLite is fine. I added `NOTE:`s at `durability` on `LevelDBStoreDriver` and `IndexedDBStoreDriver`, and a "Rule 3 past the crashes a store names" paragraph to storage.md §6. I also appended the evidence to `mobile-and-browser-storage-keep-the-durability-window`, which already owns write order across a power cut. `repro: static` (from LevelDB's `DBImpl::RecoverLogFile`); not reproduced.
+
+**Major findings filed:** none. Both gaps above are already owned by planned tickets, and I added each as an arm there rather than filing a new ticket.
+
+**Tripwires:** none new beyond the two `NOTE:` additions above, which record known gaps with an owning ticket.
+
+**Left alone:** the IndexedDB conformance cleanup still never deletes its database. That predates this ticket and is harmless under `fake-indexeddb`.
+
+**Validation (this pass):** `yarn build`, `yarn lint` and `yarn lint:docs` are clean. db-p2p: 3310 passing, 70 pending. fs: 80 passing, 1 pending (the existing win32 skip). rn: 54. web: 53. ns: 59. I did not re-run `yarn typecheck`, because this pass changed only comments and docs. I did not run `yarn check:rn` or `yarn test:integration` either, as the handoff already noted.

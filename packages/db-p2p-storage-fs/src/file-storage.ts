@@ -64,9 +64,12 @@ export class FileStoreDriver implements RawStoreDriver {
 	 * NOTE: renames and unlinks are NOT directory-synced — `promote`'s rename, and the unlinks behind
 	 * `deletePending` / `deleteMaterialized` — so a power cut can lose a promote or a delete while
 	 * keeping the metadata write after it, which breaks the flush contract's prefix rule
-	 * (`RawStoreDriver.flush`) for those two kinds of write. On win32 no directory is synced at all
-	 * (`fsyncDir` in `atomic-write.ts` skips it there). `file-storage-pays-one-fsync-per-write-group`
-	 * closes that.
+	 * (`RawStoreDriver.flush`) for those two kinds of write. Nor is the parent of a directory a write
+	 * creates (`atomicWriteFile`'s recursive `mkdir` of a new `<blockId>/` or its `revs/`, `pend/`, …):
+	 * only the written file's own directory is synced, so a power cut can drop a new block's
+	 * directory with every synced file in it. The directory sync is best-effort (a failure is
+	 * ignored), and on win32 no directory is synced at all (`fsyncDir` in `atomic-write.ts` skips it
+	 * there). `file-storage-pays-one-fsync-per-write-group` closes all of these.
 	 */
 	readonly durability: StoreDurability = 'power-loss';
 

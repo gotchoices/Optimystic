@@ -16,6 +16,8 @@ Phones relax by the cohort-size formula in `durability-window-scales-with-cohort
 
 Read "Expected behaviour (under the decision's proposed answer)" below through this section.
 
+From the review of `raw-storage-can-be-flushed`: the flush contract's rule 3 (what survives any crash is a prefix) is not established today for LevelDB or IndexedDB under an operating-system crash. Besides the log-switch case, LevelDB's recovery under default options (`paranoid_checks = false`) skips a damaged log record and keeps reading the ones after it (`DBImpl::RecoverLogFile`, `repro: static`). SQLite's WAL stops at the first bad frame, so it is a prefix already. `NOTE:`s at `durability` on `LevelDBStoreDriver` and `IndexedDBStoreDriver`, and the "Rule 3 past the crashes a store names" paragraph in `packages/db-p2p/docs/storage.md`, record it; update or remove them when this lands.
+
 # Mobile and browser storage lose acknowledged writes on power loss
 
 Raised by GitHub #37 (kjeib), which noticed it for the React Native store; the browser and NativeScript stores are in the same state. Whether these backends must survive a power cut is the subject of `decide-what-a-node-must-have-on-disk-before-it-reports-holding-a-write`; under its proposed answer, and under `docs/correctness.md` Theorem 6 as written, they must.

@@ -250,9 +250,22 @@ it. The cache is write-through and holds no dirty state, so flushing it is flush
 driver underneath.
 
 **The file backend's gap.** Renames and unlinks are not directory-synced: `promote`'s rename,
-and the unlinks behind deleting a pending or a materialized record. A power cut can therefore
-lose a promote or a delete while keeping the metadata write that followed it, which rule 3
-forbids. The `NOTE:` at `FileStoreDriver` records it.
+and the unlinks behind deleting a pending or a materialized record. Nor is the parent of a
+directory a write creates (a new block's directory, or its first `revs/`, `pend/`, `actions/`,
+`proofs/` or `blocks/`): only the written file's own directory is synced, so a power cut can
+drop the new directory, and every synced file in it, while keeping a later write elsewhere. A
+power cut can therefore lose a promote, a delete or a new block's first records while keeping
+the metadata write that followed, which rule 3 forbids. The directory sync itself is
+best-effort, and a failure is ignored. The `NOTE:` at `FileStoreDriver` records it.
+
+**Rule 3 past the crashes a store names.** For the `'process-crash'` backends, rule 3 under an
+operating-system crash or power cut is not established today. SQLite's write-ahead log stops
+recovery at the first frame whose checksum fails, so what survives is a prefix; LevelDB under
+default options skips a damaged log record and keeps reading the records after it, and the
+browsers behind IndexedDB promise nothing about relaxed transactions. Raising those two
+backends to `'power-loss'` with the prefix rule kept is the work of
+`mobile-and-browser-storage-keep-the-durability-window`; the `NOTE:` at `durability` on
+`LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
 
 **Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
 channel at start-up naming what the resolved storage's flushed writes survive

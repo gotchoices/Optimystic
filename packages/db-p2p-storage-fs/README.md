@@ -89,10 +89,12 @@ a partial/torn one.
 
 Each value write fsyncs the new file, and on POSIX its directory, before it
 resolves, so `FileRawStorage` reports `durability: 'power-loss'` and its
-`flush()` has nothing left to do. One gap: a promote (a rename) and the deletes
-of pending and materialized records (unlinks) are not directory-synced, so a
-power cut can lose one of those while keeping a later metadata write. Windows
-syncs no directory at all. See the `NOTE:` at `FileStoreDriver` and
+`flush()` has nothing left to do. The gaps: a promote (a rename) and the
+deletes of pending and materialized records (unlinks) are not directory-synced,
+and neither is the parent of a directory a write creates (a new block's
+directory, or its first `revs/`, `pend/`, …), so a power cut can lose one of
+those while keeping a later metadata write. The directory sync is best-effort,
+and Windows syncs no directory at all. See the `NOTE:` at `FileStoreDriver` and
 [storage.md §6](../db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
 
 ## Identity
