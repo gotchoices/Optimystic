@@ -12,6 +12,8 @@ Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
 <!-- /resume-note -->
 
+Gardener note (2026-10-15): both earlier attempts finished the research and then hung while writing the implement tickets in one large output (the first as a bash heredoc that failed on quoting); the runner kills an agent that is silent for 10 minutes. The research in the second log (`.logs/…19-16-09-821Z.log`) is reusable; the agent planned three implement tickets, the first named `2-write-group-overlay-driver`. Write each implement ticket with its own Write tool call, never a heredoc, keep each under about 120 lines, and finish one before starting the next.
+
 # File storage pays one fsync per write group
 
 GitHub #37 (kjeib). Builds on the `flush()` seam from `storage-flushes-once-per-write-group`.
