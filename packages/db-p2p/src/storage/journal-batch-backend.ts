@@ -230,6 +230,8 @@ export class JournalBatchBackend implements BatchBackend {
 	 * commit, so a commit that waited in line past its own deadline is overdue and applies at once.
 	 */
 	commit(entries: readonly BatchEntry[], { syncWithinMs }: SinkCommitOptions): Promise<CommittedBatch> {
+		// NOTE: the same check as `FileWriteLog.commit` and `SqliteBatchBackend.commit` make; a fourth
+		// deferring sink should move it into `SyncDeadlines.deadlineFor` rather than copy it again.
 		if (!(syncWithinMs >= 0) || !Number.isFinite(syncWithinMs)) {
 			return Promise.reject(new RangeError(`syncWithinMs must be a finite number of milliseconds at or above 0, got ${syncWithinMs}`));
 		}
@@ -363,7 +365,7 @@ export class JournalBatchBackend implements BatchBackend {
 	 * waits on an apply the store will not make. Returns the error to throw.
 	 */
 	private latch(err: unknown): StoreFailedError {
-		this.fault ??= { cause: err instanceof StoreFailedError ? err.cause : err };
+		this.fault ??= { cause: err };
 		this.held.failAll(this.fault.cause);
 		return new StoreFailedError(this.fault.cause);
 	}

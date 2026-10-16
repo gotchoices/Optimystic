@@ -332,13 +332,11 @@ export class SqliteBatchBackend implements BatchBackend {
 
 	/**
 	 * Latch the backend failed on its first fault and reject every batch waiting for a sync that will
-	 * now never be made, so no caller waits on a `durable` for ever. Returns the error to throw,
-	 * carrying the fault underneath — never a `StoreFailedError` wrapping another.
+	 * now never be made, so no caller waits on a `durable` for ever. Returns the error to throw.
 	 */
 	private latch(err: unknown): StoreFailedError {
-		const cause = err instanceof StoreFailedError ? err.cause : err;
-		this.fault ??= { cause };
-		this.deadlines.failAll(cause);
+		this.fault ??= { cause: err };
+		this.deadlines.failAll(err);
 		return new StoreFailedError(this.fault.cause);
 	}
 }

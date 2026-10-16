@@ -42,18 +42,20 @@ const summary = (apply: MemoryJournalApply): [number[], number, readonly number[
 
 /**
  * A driver over a journal backend over `store`, with the backend's deadline timers caught for the
- * test to fire by hand and a clock that stands still, so a deadline is never due on its own; the
- * driver's own idle timer never fires. `open` builds another over the same store, as a restart would.
+ * test to fire by hand and a clock that moves only when the test calls `advance`, so a deadline is
+ * never due on its own; the driver's own idle timer never fires. `open` builds another over the
+ * same store, as a restart would.
  */
 function harness(store = new MemoryJournalStore()) {
+	let clock = 0;
 	const timers: { fn: () => void; ms: number; cancelled: boolean }[] = [];
 	const setTimer: SetTimer = (fn, ms) => {
 		const timer = { fn, ms, cancelled: false };
 		timers.push(timer);
 		return () => { timer.cancelled = true; };
 	};
-	const open = (): WriteGroupDriver => new WriteGroupDriver(new JournalBatchBackend(store, { setTimer, now: () => 0 }), { setTimer: neverFires });
-	return { store, timers, open, driver: open() };
+	const open = (): WriteGroupDriver => new WriteGroupDriver(new JournalBatchBackend(store, { setTimer, now: () => clock }), { setTimer: neverFires });
+	return { store, timers, open, driver: open(), advance: (ms: number) => { clock += ms; } };
 }
 
 /** Write one metadata value and flush with the window given (strict when absent). */
@@ -90,6 +92,30 @@ describe('JournalBatchBackend', () => {
 		expect(store.applied.map(summary)).to.deep.equal([[[1, 2], 2, []]]);
 		expect(text(await store.get(metadata('b1')))).to.equal('b1');
 		expect(text(await store.get(metadata('b2')))).to.equal('b2');
+	});
+
+	it('a relaxed commit that finds a held deadline passed applies everything held and itself at once, journaling nothing', async () => {
+		const { store, driver, advance } = harness();
+		await group(driver, 'b1', 1000);
+		advance(1001);
+		await group(driver, 'b2', 5000);
+
+		expect(seqs(store.appended), 'the overdue commit appended no record of its own').to.deep.equal([1]);
+		expect(store.applied.map(summary)).to.deep.equal([[[1, 2], 2, []]]);
+		await driver.whenDurable();
+		expect(text(await store.get(metadata('b2')))).to.equal('b2');
+	});
+
+	it('recovery deletes a record at or below the mark without applying it', async () => {
+		const { store, driver, open } = harness();
+		await group(driver, 'b1');
+		// What a store that lost the delete half of an atomic apply leaves behind: the mark says 1, and record 1 is still there.
+		await store.appendJournal({ seq: 1, entries: [{ key: metadata('b1'), value: bytes('stale') }] });
+
+		const fresh = open();
+		expect(text(await fresh.getMetadata(block('b1'))), 'the applied value stands').to.equal('b1');
+		expect(store.applied.map(summary)).to.deep.equal([[[1], 1, []], [[], 1, [1]]]);
+		expect(store.journalSeqs).to.deep.equal([]);
 	});
 
 	it('a power cut that loses a middle record keeps the groups before it and none after; the sequence continues after the prefix', async () => {

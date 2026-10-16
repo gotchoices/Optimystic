@@ -12,13 +12,19 @@ const log = createLogger('write-group');
  * dropped, so a store that lost a commit refuses everything until it is reopened.
  */
 export class StoreFailedError extends Error {
+	/** The fault underneath, never another `StoreFailedError`: see the constructor. */
 	readonly cause: unknown;
 
+	/**
+	 * A `cause` that is itself a `StoreFailedError` is unwrapped to its own cause, so one never wraps
+	 * another: a sink that latched itself throws its own, and the group above it latches on that.
+	 */
 	constructor(cause: unknown) {
-		const reason = cause instanceof Error ? cause.message : String(cause);
+		const fault = cause instanceof StoreFailedError ? cause.cause : cause;
+		const reason = fault instanceof Error ? fault.message : String(fault);
 		super(`store failed: a commit of its writes rejected (${reason}); every later write and flush is refused until the store is reopened`);
 		this.name = 'StoreFailedError';
-		this.cause = cause;
+		this.cause = fault;
 	}
 }
 
@@ -499,9 +505,7 @@ export class WriteGroup<K> {
 	 * error to throw or reject with.
 	 */
 	private latch(err: unknown): StoreFailedError {
-		// A sink that has already latched itself throws its own StoreFailedError; the group's cause is
-		// the fault underneath it, not a wrapper naming a wrapper.
-		this.fault ??= { cause: err instanceof StoreFailedError ? err.cause : err };
+		this.fault ??= { cause: err };
 		const failure = new StoreFailedError(this.fault.cause);
 		for (const record of this.notYetDurable.splice(0)) record.settled.reject(failure);
 		return failure;
