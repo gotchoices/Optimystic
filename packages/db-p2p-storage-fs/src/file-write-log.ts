@@ -207,6 +207,12 @@ export async function readFileIfExists(filePath: string): Promise<Uint8Array | u
  * Skipped outright on win32: there `fs.open(dir, 'r')` SUCCEEDS and only the following
  * `handle.sync()` fails with EPERM, so the open/close pair was guaranteed wasted work. Durability
  * is unchanged on win32 (the sync never succeeded there).
+ *
+ * NOTE: every error is swallowed, an I/O error included, and a checkpoint discards its sealed log
+ * on the strength of these syncs. A directory sync that fails with EIO therefore lets the log go
+ * while a directory entry it covered may not be durable. If that is ever seen, swallow only the
+ * codes a filesystem uses to refuse a directory sync (EINVAL, ENOTSUP, EISDIR, EPERM, EBADF) and
+ * ENOENT, and let the rest fail the checkpoint.
  */
 export async function fsyncDir(dir: string): Promise<void> {
 	if (process.platform === 'win32') return;
@@ -535,6 +541,10 @@ export class FileWriteLog {
 		const touched = emptyDirty();
 		const sealed = await this.replaySegment(this.sealedPath, touched);
 		if (sealed === 'stopped-short') {
+			// NOTE: the current log is discarded only by the truncation after the sealed segment is
+			// removed, so a crash between the two replays the current log alone on the next open. A
+			// sealed segment holds only synced records, so it stops short only when its bytes were
+			// damaged on disk; if that is ever seen, truncate the current log before removing it.
 			log('replay of %s stopped short, so %s was not applied', this.sealedPath, this.logPath);
 		} else {
 			await this.replaySegment(this.logPath, touched);
