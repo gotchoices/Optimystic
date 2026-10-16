@@ -49,3 +49,7 @@ rather than a mechanical fix:
 
 Both arms are dormant today: no build has shipped to real browsers, so no version-1
 database exists in the wild. They become real at the first release.
+
+## Arm 3 — version 3 adds the `journal` object store
+
+`browser-storage-syncs-by-the-window` bumps `DEFAULT_DB_VERSION` to 3 to add a `journal` object store, under the same `objectStoreNames.contains` guards. An upgrade test written for Arm 1 should open at version 1 (or 2), write, and reopen at the current version, asserting every store added since exists and the old value survived. Arm 2's blocked-upgrade hang applies to this bump the same way.
