@@ -34,7 +34,7 @@ export interface SyncDeadlinesOptions {
 /** The batches one sync covers, taken just before it starts. */
 export interface SyncCover<T> {
 	readonly items: readonly T[];
-	/** The sync succeeded: resolve each item's `durable` in order, log an overrun if it finished late. */
+	/** The sync succeeded: resolve each item's `durable` in order, log an overrun if it started late. */
 	settle(): void;
 	/** The sync failed: reject each item's `durable` with `StoreFailedError` carrying `cause`. */
 	fail(cause: unknown): void;
@@ -58,7 +58,7 @@ The payload `T` is whatever the owner's sync step needs: the file log's batches 
 
 The owner keeps its own serial queue and calls `take()` inside the queued sync step, so a sync covers exactly what was held when the step began. The helper does not queue anything itself.
 
-`window-overrun`: logged once per episode by `settle()` when the sync finished after the earliest deadline it covered, with the lateness in ms and the count of batches. An episode ends at the next on-time settle. Keep the message text the file log uses today, so `docs/debugging.md` stays right.
+`window-overrun`: logged once per episode when the sync STARTED after the earliest deadline it covered (measured at the start, not the finish, as the landed `FileWriteLog.reportOverrun` does and explains: the sync's own duration is the disk's, and a sync that starts at its deadline would otherwise always read as late; the timer-driven sync counts from the moment the timer fired, so timer slop is not read as lateness), with the lateness in ms and the count of batches. An episode ends at the next on-time sync, one covering no deadline included. Keep the message text the file log uses today, which `packages/db-p2p-storage-fs/README.md` *Durability* documents (`docs/debugging.md` does not list this package's channel).
 
 ## `FileWriteLog` uses it
 

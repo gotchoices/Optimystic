@@ -97,6 +97,7 @@ Both reporters on GitHub issue #8 found that turning debug logging on roughly do
 |------------------------------|--------------------------------|
 | `db-core`                    | `optimystic:db-core`           |
 | `db-p2p`                     | `optimystic:db-p2p`            |
+| `db-p2p-storage-fs`          | `optimystic:db-p2p-storage-fs` (its `write-log` lines are described in `packages/db-p2p-storage-fs/README.md`) |
 | `quereus-plugin-optimystic`  | `optimystic:quereus-plugin`    |
 
 ### db-core sub-namespaces

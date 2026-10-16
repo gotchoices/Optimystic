@@ -723,6 +723,10 @@ export class FileWriteLog {
 	 * the next sync that started on time, a sync covering no deadline included.
 	 */
 	private reportOverrun(lateness: number, batches: number): void {
+		// NOTE: a commit that arrives in the instant between a deadline and its timer firing syncs by
+		// backpressure and is late here by the timer's slop, a few ms, through no fault of the disk. One
+		// line per episode, and an on-time sync ends it; if the line ever proves noisy under steady
+		// load, ignore a lateness below the timer's granularity.
 		const late = lateness > 0;
 		if (late && !this.overrunning) {
 			log('window-overrun: a sync of %s started %dms after its deadline, covering %d batch(es); the disk is behind the window', this.basePath, lateness, batches);

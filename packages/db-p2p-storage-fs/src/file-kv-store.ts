@@ -18,7 +18,8 @@ const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
  * the same log a `FileRawStorage` over the same directory holds, so the two share one log, one
  * lock and one checkpoint. A `set` or `delete` resolves into memory, served from there to `get` and
  * `list`; `flush()` appends everything written since the last flush to the log as one record, synced
- * once. A write no flush reaches is flushed by the group's idle timer.
+ * before the flush resolves or within the window the flush allows (`FileWriteLog.commit`). A write
+ * no flush reaches is flushed by the group's idle timer.
  *
  * The constructor is synchronous and holds nothing: the log is acquired, the lock taken and the log
  * replayed on the first operation. `close()` flushes what is still held and releases this store's
@@ -76,7 +77,7 @@ export class FileKVStore implements IKVStore {
 		return [...keys];
 	}
 
-	/** Make every write resolved before this call durable: one log record, one sync. The contract is `RawStoreDriver.flush`'s. */
+	/** Make every write resolved before this call durable, at once or within `options.withinMs`: one log record, synced by then. The contract is `RawStoreDriver.flush`'s. */
 	flush(options?: FlushOptions): Promise<void> {
 		return this.group.flush(options);
 	}
