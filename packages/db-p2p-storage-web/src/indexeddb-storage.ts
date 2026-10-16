@@ -112,7 +112,7 @@ export type IndexedDBJournalStoreOptions = IndexedDBDurabilityOptions;
 export class IndexedDBJournalStore implements JournalStore {
 	// NOTE: in a browser that ignores `durability` this is `'process-crash'`, and there the backend
 	// journals nothing and applies every group at once as one relaxed transaction: a group lands
-	// whole, but nor do browsers promise that what survives an operating-system crash or power cut is
+	// whole, but browsers do not promise that what survives an operating-system crash or power cut is
 	// a prefix of relaxed transactions (flush contract rule 3). With strict transactions both hold,
 	// as the class doc says.
 	readonly durability: StoreDurability;

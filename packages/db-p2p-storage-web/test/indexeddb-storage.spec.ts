@@ -119,6 +119,23 @@ describe('IndexedDB store specifics', () => {
 		const ids = await store.listPendingActionIds('block-1' as BlockId);
 		expect(ids.sort()).to.deep.equal(['a', 'b']);
 	});
+
+	// `JournalStore.readJournal`'s contract: a record the store cannot read is left out, so recovery
+	// treats its number as a gap. A record is stored by structured clone with no codec, so the check
+	// is on its shape; a mark that is not a non-negative integer reads as 0.
+	it('readJournal leaves out a value that is not a record and reads a malformed mark as 0', async () => {
+		const store = new IndexedDBJournalStore(db, STRICT);
+		const key = { store: 'metadata', blockId: 'journaled' as BlockId } as const;
+		const record = (seq: number) => ({ seq, entries: [{ key, value: new Uint8Array([seq]) }] });
+		await store.appendJournal(record(1));
+		await db.put('journal', { seq: 2, entries: [{ key: { store: 'nowhere', blockId: 'x' }, value: new Uint8Array() }] } as never, 2);
+		await store.appendJournal(record(3));
+		await db.put('journal', 'not a number' as never, JOURNAL_MARK_KEY);
+
+		const { appliedThrough, records } = await store.readJournal();
+		expect(appliedThrough).to.equal(0);
+		expect(records.map(r => r.seq)).to.deep.equal([1, 3]);
+	});
 });
 
 // ---------------------------------------------------------------------------

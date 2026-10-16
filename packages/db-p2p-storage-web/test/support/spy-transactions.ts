@@ -20,11 +20,12 @@ export function spyTransactions(db: OptimysticWebDBHandle): { db: OptimysticWebD
 	// Typed loosely: idb declares `transaction` as overloaded generics a recording wrapper cannot restate, and a proxy trap returns `any` anyway.
 	const transaction = (stores: string | ArrayLike<string>, mode?: IDBTransactionMode, options?: IDBTransactionOptions): unknown => {
 		calls.push({
-			stores: typeof stores === 'string' ? [stores] : [...Array.from(stores)].sort(),
+			stores: typeof stores === 'string' ? [stores] : Array.from(stores).sort(),
 			mode: mode ?? 'readonly',
 			durability: options?.durability,
 		});
-		return (db.transaction as (...args: unknown[]) => unknown)(stores, mode, options);
+		// Called on the handle, not as a bare function: idb's wrapper unwraps `this` to reach the native database.
+		return Reflect.apply(db.transaction as (...args: unknown[]) => unknown, db, [stores, mode, options]);
 	};
 	const spied = new Proxy(db, {
 		get(target, prop) {
