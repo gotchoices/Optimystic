@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
-import { FileWriteLog, SYNCED_BATCH, assertFileWriteLogOptions, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
+import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type SinkCommitOptions, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
+import { FileWriteLog, assertFileWriteLogOptions, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
 /** The write group's `idleFlushMs` and the log's checkpoint settings; `setTimer` (test-only) arms both. */
 export type FileKVStoreOptions = WriteGroupOptions & FileWriteLogOptions;
@@ -35,9 +35,9 @@ export class FileKVStore implements IKVStore {
 		this.basePath = path.resolve(basePath);
 		this.options = options;
 		this.group = new WriteGroup<string>(key => key, {
-			commit: entries => this.commit(entries),
-			// Every committed batch is already synced (see `SYNCED_BATCH`), so there is nothing to hasten.
-			sync: () => Promise.resolve(),
+			commit: (entries, commitOptions) => this.commit(entries, commitOptions),
+			// A store that never committed holds no log, and so has nothing to hasten.
+			sync: () => this.log?.sync() ?? Promise.resolve(),
 		}, options);
 	}
 
@@ -97,11 +97,10 @@ export class FileKVStore implements IKVStore {
 		}
 	}
 
-	private async commit(entries: readonly WriteGroupEntry<string>[]): Promise<CommittedBatch> {
-		await this.shared().commit(entries.map(({ key, value }): WriteLogEntry => value === undefined
+	private commit(entries: readonly WriteGroupEntry<string>[], options: SinkCommitOptions): Promise<CommittedBatch> {
+		return this.shared().commit(entries.map(({ key, value }): WriteLogEntry => value === undefined
 			? { kind: 'delete', path: this.keyToRelative(key) }
-			: { kind: 'put', path: this.keyToRelative(key), value }));
-		return SYNCED_BATCH;
+			: { kind: 'put', path: this.keyToRelative(key), value }), options);
 	}
 
 	private shared(): FileWriteLog {

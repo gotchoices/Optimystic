@@ -15,13 +15,24 @@ import { interceptHandleSync, interceptRename, parkUnlink, withFailingWriteFile 
 
 // ---------------------------------------------------------------------------
 // The write-ahead log on its own: what a strict replay applies from a damaged log, what a commit
-// leaves behind when it fails at each of its two steps, the checkpoint, and the lock. Logs are hand-built from the
-// exported codec so a replay can be given records the store never applied — the shape a crash
-// between the sync and the apply leaves — without a real crash.
+// leaves behind when it fails at each of its two steps, the sync a relaxed commit defers, the
+// checkpoint, and the lock. Logs are hand-built from the exported codec so a replay can be given
+// records the store never applied — the shape a crash between the sync and the apply leaves —
+// without a real crash.
 // ---------------------------------------------------------------------------
 
 const put = (relative: string, text: string): WriteLogEntry => ({ kind: 'put', path: relative, value: Buffer.from(text) });
 const del = (relative: string): WriteLogEntry => ({ kind: 'delete', path: relative });
+/** A commit that syncs before it resolves — what every store's flush asks unless given a window. */
+const STRICT = { syncWithinMs: 0 };
+
+/** Whether the promise has settled, judged after every microtask queued so far has run. */
+async function isSettled(promise: Promise<unknown>): Promise<boolean> {
+	let settled = false;
+	promise.then(() => { settled = true; }, () => { settled = true; });
+	await new Promise(resolve => setImmediate(resolve));
+	return settled;
+}
 
 async function readText(base: string, relative: string): Promise<string | undefined> {
 	try {
@@ -151,14 +162,14 @@ describe('FileWriteLog commit failures', () => {
 
 	it('a batch whose tree write fails after its record is durable is rebuilt by the next open', async () => {
 		await withLog(base, async log => {
-			await log.commit([put('blk/meta.json', 'one')]);
+			await log.commit([put('blk/meta.json', 'one')], STRICT);
 			await withFailingWriteFile(async () => {
-				await assert.rejects(() => log.commit([put('blk/meta.json', 'two'), put('blk/revs/2.json', 'tx:2')]), StoreFailedError);
+				await assert.rejects(() => log.commit([put('blk/meta.json', 'two'), put('blk/revs/2.json', 'tx:2')], STRICT), StoreFailedError);
 			});
 			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one', 'the tree still holds the prior content');
 			assert.strictEqual(await readText(base, 'blk/revs/2.json'), undefined);
 			assert.ok(log.failed);
-			await assert.rejects(() => log.commit([put('blk/meta.json', 'three')]), StoreFailedError, 'latched: later commits are refused');
+			await assert.rejects(() => log.commit([put('blk/meta.json', 'three')], STRICT), StoreFailedError, 'latched: later commits are refused');
 		});
 
 		await withLog(base, async log => {
@@ -175,11 +186,11 @@ describe('FileWriteLog commit failures', () => {
 			await withLog(base, async log => {
 				await log.open();
 				failSync = true;
-				await assert.rejects(() => log.commit([put('blk/meta.json', 'lost')]), StoreFailedError);
+				await assert.rejects(() => log.commit([put('blk/meta.json', 'lost')], STRICT), StoreFailedError);
 				assert.strictEqual(await readText(base, 'blk/meta.json'), undefined, 'nothing was applied');
 				assert.ok(log.failed);
 				failSync = false;
-				await assert.rejects(() => log.commit([put('blk/meta.json', 'after')]), StoreFailedError, 'a retried sync is never trusted');
+				await assert.rejects(() => log.commit([put('blk/meta.json', 'after')], STRICT), StoreFailedError, 'a retried sync is never trusted');
 				assert.strictEqual(await readText(base, 'blk/meta.json'), undefined);
 			});
 		} finally {
@@ -212,7 +223,7 @@ describe('FileWriteLog checkpoint', () => {
 		try {
 			const log = FileWriteLog.acquire(base, { checkpointBytes: 1 });
 			try {
-				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')]);
+				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')], STRICT);
 				await firstSeal;
 			} finally {
 				await log.release();
@@ -234,8 +245,8 @@ describe('FileWriteLog checkpoint', () => {
 		};
 		const log = FileWriteLog.acquire(base, { setTimer });
 		try {
-			await log.commit([put('blk/meta.json', 'one')]);
-			await log.commit([put('blk/meta.json', 'two')]);
+			await log.commit([put('blk/meta.json', 'one')], STRICT);
+			await log.commit([put('blk/meta.json', 'two')], STRICT);
 			assert.strictEqual(armed.size, 1, 'the second append replaced the first one\'s timer');
 			const parked = parkUnlink(sealedPath());
 			try {
@@ -256,14 +267,14 @@ describe('FileWriteLog checkpoint', () => {
 		const parked = parkUnlink(sealedPath());
 		try {
 			await withLog(base, async log => {
-				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')]);
+				await log.commit([put('blk/meta.json', 'one'), put('blk/revs/1.json', 'tx:1')], STRICT);
 				const checkpointing = log.checkpoint();
 				await parked.reached;
-				await log.commit([put('blk/meta.json', 'two')]);
+				await log.commit([put('blk/meta.json', 'two')], STRICT);
 				parked.proceed(new Error('injected crash before the truncate'));
 				await assert.rejects(checkpointing, StoreFailedError);
 				assert.ok(log.failed);
-				await assert.rejects(() => log.commit([put('blk/meta.json', 'three')]), StoreFailedError, 'latched: later commits are refused');
+				await assert.rejects(() => log.commit([put('blk/meta.json', 'three')], STRICT), StoreFailedError, 'latched: later commits are refused');
 			});
 		} finally {
 			parked.restore();
@@ -287,10 +298,10 @@ describe('FileWriteLog checkpoint', () => {
 		const parked = parkUnlink(sealedPath());
 		try {
 			await withLog(base, async log => {
-				await log.commit([put('blk/meta.json', 'one')]);
+				await log.commit([put('blk/meta.json', 'one')], STRICT);
 				const checkpointing = log.checkpoint();
 				await parked.reached;
-				await log.commit([put('blk/revs/2.json', 'tx:2')]);
+				await log.commit([put('blk/revs/2.json', 'tx:2')], STRICT);
 				parked.proceed();
 				await checkpointing;
 				assert.ok(!(await sealedExists()));
@@ -316,6 +327,163 @@ describe('FileWriteLog checkpoint', () => {
 			assert.ok(!(await sealedExists()));
 			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)));
 		});
+	});
+});
+
+describe('FileWriteLog deferred sync', () => {
+	let base: string;
+	let syncs = 0;
+	let failSync = false;
+	let restoreSyncIntercept: () => void;
+	/** Every timer the log armed and has not cancelled, with its delay: the idle checkpoint's is `IDLE_MS`, the sync timer's is the window. */
+	let armed: { fn: () => void; ms: number }[] = [];
+	const IDLE_MS = 60_000;
+	const RELAXED = { syncWithinMs: 5000 };
+	const setTimer = (fn: () => void, ms: number): (() => void) => {
+		const timer = { fn, ms };
+		armed.push(timer);
+		return () => { armed = armed.filter(t => t !== timer); };
+	};
+	const syncTimers = (): { fn: () => void; ms: number }[] => armed.filter(t => t.ms < IDLE_MS);
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-wal-deferred-'));
+		armed = [];
+		syncs = 0;
+		failSync = false;
+		restoreSyncIntercept = interceptHandleSync(() => {
+			syncs += 1;
+			if (failSync) throw new Error('injected sync failure');
+		});
+	});
+
+	afterEach(async () => {
+		restoreSyncIntercept();
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	/** An opened log, with the open's own sync (the fresh header's) not counted. */
+	async function openLog(): Promise<FileWriteLog> {
+		const log = FileWriteLog.acquire(base, { setTimer, checkpointIdleMs: IDLE_MS });
+		await log.open();
+		syncs = 0;
+		return log;
+	}
+
+	it('relaxed commits share one sync, made when the deadline timer fires, and the tree is written only then', async () => {
+		const log = await openLog();
+		try {
+			const first = await log.commit([put('blk/meta.json', 'one')], RELAXED);
+			const second = await log.commit([put('blk/revs/1.json', 'tx:1')], RELAXED);
+			assert.strictEqual(syncs, 0, 'neither commit waited for the disk');
+			assert.strictEqual(decodeWriteLog(await logFileBytes(base)).batches.length, 2, 'both records are in the log');
+			assert.strictEqual(await readText(base, 'blk/meta.json'), undefined, 'the tree is untouched until the sync');
+			assert.strictEqual(await isSettled(first.durable), false);
+			assert.strictEqual(await isSettled(second.durable), false);
+			assert.strictEqual(syncTimers().length, 1, 'one timer, for the earliest deadline; the later deadline did not re-arm it');
+
+			const settledOrder: string[] = [];
+			void first.durable.then(() => settledOrder.push('first'));
+			void second.durable.then(() => settledOrder.push('second'));
+			syncTimers()[0]!.fn();
+			await Promise.all([first.durable, second.durable]);
+			assert.strictEqual(syncs, 1, 'one sync for both');
+			assert.deepStrictEqual(settledOrder, ['first', 'second']);
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one');
+			assert.strictEqual(await readText(base, 'blk/revs/1.json'), 'tx:1');
+			assert.strictEqual(syncTimers().length, 0, 'the sync disarmed the timer');
+		} finally {
+			await log.release();
+		}
+	});
+
+	it('a strict commit after relaxed ones syncs once and settles them all', async () => {
+		const log = await openLog();
+		try {
+			const first = await log.commit([put('blk/meta.json', 'one')], RELAXED);
+			const second = await log.commit([put('blk/revs/1.json', 'tx:1')], RELAXED);
+			const third = await log.commit([put('blk/revs/2.json', 'tx:2')], STRICT);
+			assert.strictEqual(syncs, 1);
+			for (const batch of [first, second, third]) assert.strictEqual(await isSettled(batch.durable), true);
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one');
+			assert.strictEqual(await readText(base, 'blk/revs/2.json'), 'tx:2');
+			assert.strictEqual(syncTimers().length, 0);
+		} finally {
+			await log.release();
+		}
+	});
+
+	it('a commit that finds an earlier deadline already passed syncs before it resolves, whatever its own window', async () => {
+		const log = await openLog();
+		try {
+			const overdue = await log.commit([put('blk/meta.json', 'one')], { syncWithinMs: 1 });
+			await new Promise(resolve => setTimeout(resolve, 10));
+			const relaxed = await log.commit([put('blk/revs/1.json', 'tx:1')], RELAXED);
+			assert.strictEqual(syncs, 1, 'the second commit made the sync the first was owed');
+			assert.strictEqual(await isSettled(overdue.durable), true);
+			assert.strictEqual(await isSettled(relaxed.durable), true, 'and its own batch went with it');
+			assert.strictEqual(syncTimers().length, 0);
+		} finally {
+			await log.release();
+		}
+	});
+
+	it('a relaxed commit survives a process crash: its record is in the log when the commit resolves, and a replay restores it', async () => {
+		const log = await openLog();
+		let heldByTheOperatingSystem: Buffer;
+		try {
+			await log.commit([put('blk/meta.json', 'one')], RELAXED);
+			assert.strictEqual(syncs, 0);
+			// A crash of this process keeps what the operating system holds of the log and loses the
+			// handle and the sync it owed, so the log's bytes as another reader sees them now are what
+			// the next open finds. Read them out and open a log over a copy, since the registry would
+			// hand this directory's live instance back.
+			heldByTheOperatingSystem = await logFileBytes(base);
+		} finally {
+			await log.release();
+		}
+		const survivor = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-wal-survivor-'));
+		try {
+			await fs.writeFile(path.join(survivor, WRITE_LOG_FILENAME), heldByTheOperatingSystem);
+			await withLog(survivor, async reopened => {
+				await reopened.open();
+				assert.strictEqual(await readText(survivor, 'blk/meta.json'), 'one', 'replay applied the unsynced record');
+			});
+		} finally {
+			await fs.rm(survivor, { recursive: true, force: true });
+		}
+	});
+
+	it('a checkpoint syncs and applies the waiting records before sealing', async () => {
+		const log = await openLog();
+		try {
+			const batch = await log.commit([put('blk/meta.json', 'one')], RELAXED);
+			await log.checkpoint();
+			assert.strictEqual(await isSettled(batch.durable), true);
+			assert.strictEqual(await readText(base, 'blk/meta.json'), 'one');
+			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)), 'the log is back to its header');
+			assert.strictEqual(syncTimers().length, 0);
+		} finally {
+			await log.release();
+		}
+	});
+
+	it('a deferred sync that fails rejects every waiting durable and latches the log', async () => {
+		const log = await openLog();
+		try {
+			const first = await log.commit([put('blk/meta.json', 'one')], RELAXED);
+			const second = await log.commit([put('blk/revs/1.json', 'tx:1')], RELAXED);
+			failSync = true;
+			syncTimers()[0]!.fn();
+			await assert.rejects(first.durable, StoreFailedError);
+			await assert.rejects(second.durable, StoreFailedError);
+			assert.ok(log.failed);
+			assert.strictEqual(await readText(base, 'blk/meta.json'), undefined, 'nothing reached the tree');
+			await assert.rejects(() => log.commit([put('blk/meta.json', 'two')], STRICT), StoreFailedError, 'latched: later commits are refused');
+		} finally {
+			failSync = false;
+			await log.release();
+		}
 	});
 });
 

@@ -3,7 +3,7 @@ import * as path from 'path';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { BatchBackend, BatchEntry, CommittedBatch, SinkCommitOptions, StoreDurability, StoreIdentity, StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
-import { FileWriteLog, SYNCED_BATCH, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
+import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
 const log = createLogger('storage:file');
 
@@ -68,7 +68,7 @@ const ACTION_SCOPED_DIRS: Record<ActionScopedStore, string> = {
  * never used (one `withReadCache` dedupes away) holds no handle and no lock.
  */
 export class FileBatchBackend implements BatchBackend {
-	/** A committed batch's record is synced to the log before the batch resolves; replay rebuilds the tree from it. */
+	/** A committed batch's record is synced to the log by the deadline its commit allowed, or before the commit resolves; replay rebuilds the tree from it. */
 	readonly durability: StoreDurability = 'power-loss';
 
 	readonly basePath: string;
@@ -232,15 +232,14 @@ export class FileBatchBackend implements BatchBackend {
 
 	// --- the one write ---
 
-	/** Syncs before resolving whatever `syncWithinMs` allows (see `SYNCED_BATCH`). */
-	async commit(entries: readonly BatchEntry[], _options: SinkCommitOptions): Promise<CommittedBatch> {
-		await this.shared().commit(entries.flatMap(entry => this.toLogEntries(entry)));
-		return SYNCED_BATCH;
+	/** One log record, synced within `syncWithinMs` (see `FileWriteLog.commit`); the `durable` returned is the log's. */
+	commit(entries: readonly BatchEntry[], options: SinkCommitOptions): Promise<CommittedBatch> {
+		return this.shared().commit(entries.flatMap(entry => this.toLogEntries(entry)), options);
 	}
 
-	/** Every committed batch is already synced, so there is nothing to hasten. */
+	/** Hasten the log's sync. A backend that never committed holds no log, and so has nothing to hasten. */
 	sync(): Promise<void> {
-		return Promise.resolve();
+		return this.log?.sync() ?? Promise.resolve();
 	}
 
 	async close(): Promise<void> {

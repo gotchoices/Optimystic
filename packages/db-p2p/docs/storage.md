@@ -252,13 +252,13 @@ does real work: `WriteGroupDriver`, whose flush is the sync, and the file backen
 (see *Writes that wait in memory* below); every other backend satisfies them trivially, and
 every store that cannot defer a sync treats `withinMs` as 0 and resolves `whenDurable()` at
 once. Only `WriteGroupDriver` honours `withinMs`, and only over a backend that defers its
-sync, which none does yet:
+sync, which today is the file backend alone:
 
 | Driver | What a write waits for today | What `flush()` does | `withinMs` | `durability` |
 |---|---|---|---|---|
 | `MemoryStoreDriver` | the in-memory map update | nothing | ignored | `'none'` |
 | `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`; a strict flush resolves when the batch is durable, a relaxed one when it is committed | the time left to the earliest deadline of the flushes sharing the seal is passed to the backend's `commit` as `syncWithinMs`; honoured only as far as the backend defers | the backend's |
-| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log, synced once per flush, then the tree written without waiting | treated as 0: every commit syncs before it resolves (`file-store-syncs-by-the-earliest-deadline` is what defers) | `'power-loss'` |
+| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
 | `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | ignored | `'process-crash'` |
 | `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | ignored | `'process-crash'` |
 | `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | ignored | `'process-crash'` |
@@ -312,17 +312,33 @@ rebuilds the store from the durable prefix alone.
 **The file backend.** `FileBatchBackend` commits each group through `FileWriteLog`
 (`packages/db-p2p-storage-fs/src/file-write-log.ts`): the batch is encoded as one record (a length,
 a CRC-32, then each put or delete with its path relative to the store directory) and appended to
-`<basePath>/write-ahead.log` with one `write` and one sync, and only then is each entry written to
-its canonical tree file — straight to the path, no temp file or rename — or unlinked, without
-syncing anything. A tree file therefore only ever holds content whose log record is durable, so
-what a crash leaves is the log's durable prefix plus whatever the tree held, and the next open
-replays the log in order (puts and deletes are idempotent), syncs every file and directory the
-replay touched, and truncates the log to its header before serving anything. Replay reads strictly:
-a torn final record, a record whose length runs past the end of the file, a CRC mismatch, or a header
-that is not this build's stops the read before that record, and the records before it are applied.
-Rule 3 holds by construction, since the log is one sequence of whole groups; a promote is two
-entries of one record, which is what makes it atomic and durable; and a new block's directory needs
-no sync of its own ahead of its files.
+`<basePath>/write-ahead.log` with one `write`. The record has reached the operating system then, so
+it survives a crash of this process from that moment: the next open's replay applies it. What the
+sync adds is surviving a power cut, and the log makes one sync cover many records
+(`FileWriteLog.commit`): a batch committed with `syncWithinMs` 0 is synced before its commit
+resolves, with every batch waiting ahead of it; one committed with a window resolves at once and
+waits in the log's `unsynced` list with its deadline, counted from the commit's call, and a timer
+armed for the earliest deadline runs the sync for everything waiting. A commit that finds the
+earliest waiting deadline already passed syncs before it resolves whatever its own window, so when
+the disk falls behind, writers wait for it rather than the window growing; a sync that started
+after a deadline it covered is logged once per episode as `window-overrun` on the
+`optimystic:db-p2p-storage-fs:write-log` channel. The sink's `sync()` (`FileWriteLog.sync`), which a
+strict flush with nothing to seal calls, runs the same step; a checkpoint's seal runs it first, so a
+sealed segment holds only synced records. Only after the sync is each entry written to its
+canonical tree file — straight to the path, no temp file or rename — or unlinked, without syncing
+anything, and only then does the batch's `durable` resolve, so the overlay above each store serves a
+batch until the tree holds it. A tree file therefore only ever holds content whose log record is
+durable, so what a crash leaves is the log's durable prefix plus whatever the tree held, and the
+next open replays the log in order (puts and deletes are idempotent), syncs every file and directory
+the replay touched, and truncates the log to its header before serving anything. Replay reads
+strictly: a torn final record, a record whose length runs past the end of the file, a CRC mismatch,
+or a header that is not this build's stops the read before that record, and the records before it
+are applied. Rule 3 holds by construction, since the log is one sequence of whole groups and a power
+cut that keeps a later page of it while losing an earlier one fails the earlier record's CRC, which
+ends the replay there; a promote is two entries of one record, which is what makes it atomic and
+durable; and a new block's directory needs no sync of its own ahead of its files. A failure of the
+sync step — the sync itself or a tree write after it — latches the log and rejects the `durable` of
+every batch it covered, so no flush waits for a sync the store will not make.
 
 The log keeps every file it wrote and every directory whose entries changed since the last
 checkpoint, and a checkpoint (`FileWriteLog.checkpoint`) spends that set to discard the log: it
@@ -1068,7 +1084,7 @@ const blockStorage = new BlockStorage(
 
 - **Directory Structure**: Organizes files for efficient access
 - **JSON Serialization**: Uses JSON for cross-platform compatibility
-- **One sync per write group**: the write-ahead log is synced once per flush; the tree is written without waiting
+- **One sync per strict write group, one per window otherwise**: the write-ahead log is synced before a strict flush resolves, and once by the earliest deadline for the groups whose flushes allowed a wait; the tree is written after the sync, without waiting for its own
 
 ### 3. Memory Management
 
