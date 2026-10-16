@@ -60,7 +60,7 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 interface OpenBackend {
 	storage: () => IRawStorage;
 	kvStore: IKVStore;
-	/** Releases what the node does not own: the two file stores, or the LevelDB handle, which the backend never closes. */
+	/** Releases what the node does not own: the two stores, and for LevelDB the handle they share, which neither store closes. */
 	close(): Promise<void>;
 }
 
@@ -86,11 +86,26 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 			};
 		}
 		case 'leveldb': {
+			// One storage and one key-value store over the handle, kept and closed here as the `fs`
+			// case keeps its two: each holds a group's writes until a flush, and closing is what
+			// applies what it still holds and disarms its timers before the handle goes away.
 			const db = await openClassicLevel(join(dataDir, layout.path));
+			const storage = new LevelDBRawStorage(db);
+			const kvStore = new LevelDBKVStore(db);
 			return {
-				storage: () => new LevelDBRawStorage(db),
-				kvStore: new LevelDBKVStore(db),
-				close: () => db.close(),
+				storage: () => storage,
+				kvStore,
+				close: async () => {
+					try {
+						await kvStore.close();
+					} finally {
+						try {
+							await storage.close();
+						} finally {
+							await db.close();
+						}
+					}
+				},
 			};
 		}
 	}

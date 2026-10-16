@@ -1,11 +1,33 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, identityForHandle, type FlushOptions, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
-import { drain, type LevelDBLike } from './leveldb-like.js';
+import {
+	JournalBatchBackend,
+	JournalRecordDecodeError,
+	KvRawStorage,
+	WriteGroupDriver,
+	decodeJournalRecord,
+	encodeJournalRecord,
+	identityForHandle,
+	type JournalBatchBackendOptions,
+	type JournalContents,
+	type JournalRecord,
+	type JournalStore,
+	type StoreDurability,
+	type StoreIdentity,
+	type StoreKey,
+	type WriteGroupOptions,
+} from '@optimystic/db-p2p';
+import { drain, type LevelDBLike, type LevelDBWriteBatchLike } from './leveldb-like.js';
 import {
 	TAG_PENDING,
 	actionIdFromKey,
 	blockEnvelopeRange,
 	blockIdFromMetadataKey,
+	decodeJournalMark,
+	encodeJournalMark,
+	isJournalMarkKey,
+	journalMarkKey,
+	journalRange,
+	journalRecordKey,
 	materializedKey,
 	metadataKey,
 	metadataRange,
@@ -13,33 +35,70 @@ import {
 	proofKey,
 	revisionFromKey,
 	revisionKey,
+	seqFromJournalKey,
 	transactionKey,
 } from './keys.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('storage:leveldb');
 
+/** The LevelDB key a `StoreKey` addresses: the tag-prefixed byte scheme of `keys.ts`, unchanged from the per-write driver before it. */
+function keyBytes(key: StoreKey): Uint8Array {
+	switch (key.store) {
+		case 'metadata':
+			return metadataKey(key.blockId);
+		case 'revisions':
+			return revisionKey(key.blockId, key.rev);
+		case 'proofs':
+			return proofKey(key.blockId, key.rev);
+		case 'pending':
+			return pendingKey(key.blockId, key.actionId);
+		case 'transactions':
+			return transactionKey(key.blockId, key.actionId);
+		case 'materialized':
+			return materializedKey(key.blockId, key.actionId);
+	}
+}
+
 /**
- * LevelDB {@link RawStoreDriver}: the six logical block-storage stores mapped
- * into a single ordered byte keyspace, partitioned by a leading tag byte (see
- * `./keys.ts`). LevelDB is already one ordered byte-keyspace, so this driver is
- * mostly key encoding — the tag-prefixed byte scheme in `keys.ts` stays in this
- * package; the kernel deals in logical keys.
+ * LevelDB {@link JournalStore}: the six logical block-storage stores mapped into a single ordered
+ * byte keyspace, partitioned by a leading tag byte (see `./keys.ts`), read exactly as the per-write
+ * driver before it read them, so data an earlier build wrote reads unchanged; and the journal under
+ * its own tag byte, which `JournalBatchBackend` drives.
  *
- * `KvRawStorage` now owns all JSON/UTF-8 serialization, so this driver only ever
- * reads/writes raw `Uint8Array` values — no `TextEncoder`/`TextDecoder` for
- * values, and no `JSON.parse`/`stringify`. A value round-trips as the exact bytes
- * the kernel wrote. Everything LevelDB-specific stays here: the tag-range scans
- * (drained snapshot-first before yielding, so a native iterator never straddles a
- * consumer's `await`), and the single `WriteBatch` that makes `promote` atomic.
+ * `KvRawStorage` owns all JSON/UTF-8 serialization, so this store only ever reads/writes raw
+ * `Uint8Array` values; a journal record is bytes too, through `encodeJournalRecord`. Everything
+ * LevelDB-specific stays here: the tag-range scans (drained snapshot-first before yielding, so a
+ * native iterator never straddles a consumer's `await`), and the one `WriteBatch` each journal
+ * write is.
+ *
+ * ### Why a group survives, and in order
+ *
+ * A LevelDB batch is atomic, but LevelDB syncs only its current log file, closes an old one
+ * unsynced when it switches, and under default options skips a damaged log record and keeps the
+ * ones after it, so a later write can survive a power cut while an earlier one is lost — which is
+ * why the backend journals (see `JournalBatchBackend`). Here an append is one unsynced batch
+ * putting the record under its sequence, and an apply is one batch over the data tags and the
+ * journal — every record's entries in order, the applied-through mark, and the delete of each
+ * record applied or discarded — written synced wherever the handle can sync (`canSync`). The apply
+ * carries every byte it applies, so its durability depends on no earlier batch, and the backend
+ * syncs each apply before the next starts: what a power cut leaves is a prefix of the groups, and
+ * `durability` is `'power-loss'`. Nothing this package writes bypasses a batch, so no unsynced
+ * direct write can sit in an old log file outside the journal's reach.
+ *
+ * `rn-leveldb` cannot sync today, so on a phone the store reports `'process-crash'` and the backend
+ * applies each group at once as one unsynced batch, never journaling: a group lands whole or not
+ * at all, and the ordering half of the contract arrives with the binding change and nothing here.
+ *
+ * The handle is shared with `LevelDBKVStore` and `loadOrCreateRNPeerKey`, so there is no `close`
+ * here: the host closes the handle after `storage.close()` has resolved.
  */
-export class LevelDBStoreDriver implements RawStoreDriver {
-	// LevelDB's default write options hand each write to the operating system without syncing it,
-	// so a write survives this process crashing but not an operating-system crash or power cut.
-	// NOTE: nor is what survives such a crash promised to be a prefix (flush contract rule 3): under
-	// default options LevelDB's recovery skips a damaged log record and keeps the records after it.
-	// `mobile-and-browser-storage-keep-the-durability-window` owns both.
-	readonly durability: StoreDurability = 'process-crash';
+export class LevelDBJournalStore implements JournalStore {
+	// NOTE: `'process-crash'` holds only while the handle cannot sync (flush contract rule 3 is then
+	// not kept across a power cut: LevelDB's recovery skips a damaged log record and keeps the ones
+	// after it, and no apply is synced). The synced path is built and tested over `classic-level`;
+	// `react-native-storage-syncs-once-rn-leveldb-can` is the binding change that turns it on.
+	readonly durability: StoreDurability;
 
 	// NOTE: identity is the HANDLE object, so two handles opened over the same LevelDB PATH read
 	// as two identities. Resolving that would mean naming the underlying on-disk path, which
@@ -48,6 +107,7 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 	private readonly identity: StoreIdentity;
 
 	constructor(private readonly db: LevelDBLike) {
+		this.durability = db.canSync ? 'power-loss' : 'process-crash';
 		this.identity = identityForHandle('leveldb-handle', db);
 	}
 
@@ -55,131 +115,29 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 		return this.identity;
 	}
 
-	// --- metadata ---
+	// --- reads: the applied stores ---
 
-	async getMetadata(blockId: BlockId): Promise<Uint8Array | undefined> {
-		return this.db.get(metadataKey(blockId));
+	async get(key: StoreKey): Promise<Uint8Array | undefined> {
+		return this.db.get(keyBytes(key));
 	}
 
-	async putMetadata(blockId: BlockId, value: Uint8Array): Promise<void> {
-		await this.db.put(metadataKey(blockId), value);
-	}
-
-	// --- revisions ---
-
-	async getRevision(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
-		return this.db.get(revisionKey(blockId, rev));
-	}
-
-	async putRevision(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
-		await this.db.put(revisionKey(blockId, rev), value);
-	}
-
-	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, Uint8Array]> {
+	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, Uint8Array][]> {
 		// Revs are encoded 8-byte big-endian (`revisionKey`), so byte order == numeric
 		// order and `revisionKey(blockId, hi)` is exactly the inclusive upper bound;
 		// LevelDB's upper bound is exclusive (`lt`), so use `lt = revisionKey(hi + 1)`.
 		const gte = revisionKey(blockId, lo);
 		const lt = revisionKey(blockId, hi + 1);
-		// Drain before yielding — a native LevelDB iterator must not stay open across
-		// the consumer's awaits (the kernel's drain-before-yield contract).
-		const entries = await drain(this.db.iterator({ gte, lt, reverse }));
-		for (const [key, value] of entries) {
-			yield [revisionFromKey(key), value];
-		}
+		// Drained before returning: a native LevelDB iterator must not stay open across the
+		// consumer's awaits (the kernel's drain-before-yield contract).
+		const entries = await drain(this.db.iterator({ gte, lt }));
+		return entries.map(([key, value]) => [revisionFromKey(key), value]);
 	}
 
-	// --- pending ---
-
-	async getPending(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
-		return this.db.get(pendingKey(blockId, actionId));
-	}
-
-	async putPending(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
-		await this.db.put(pendingKey(blockId, actionId), value);
-	}
-
-	async deletePending(blockId: BlockId, actionId: ActionId): Promise<void> {
-		await this.db.delete(pendingKey(blockId, actionId));
-	}
-
-	async *listPendingActionIds(blockId: BlockId): AsyncIterable<ActionId> {
+	async listPendingActionIds(blockId: BlockId): Promise<ActionId[]> {
 		const range = blockEnvelopeRange(TAG_PENDING, blockId);
-		// Drain before yielding, same rationale as rangeRevisions.
 		const entries = await drain(this.db.iterator({ gte: range.gte, lt: range.lt, keys: true }));
-		for (const [key] of entries) {
-			yield actionIdFromKey(key, blockId) as ActionId;
-		}
+		return entries.map(([key]) => actionIdFromKey(key, blockId) as ActionId);
 	}
-
-	// --- transactions ---
-
-	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
-		return this.db.get(transactionKey(blockId, actionId));
-	}
-
-	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
-		await this.db.put(transactionKey(blockId, actionId), value);
-	}
-
-	// --- proofs (own tag byte; no delete — see RawStoreDriver.getProof) ---
-
-	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
-		return this.db.get(proofKey(blockId, rev));
-	}
-
-	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
-		await this.db.put(proofKey(blockId, rev), value);
-	}
-
-	// --- materialized ---
-
-	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
-		return this.db.get(materializedKey(blockId, actionId));
-	}
-
-	async putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
-		await this.db.put(materializedKey(blockId, actionId), value);
-	}
-
-	// The kernel owns the put-or-delete branch of `saveMaterializedBlock`, so the
-	// driver exposes delete as a separate op.
-	async deleteMaterialized(blockId: BlockId, actionId: ActionId): Promise<void> {
-		await this.db.delete(materializedKey(blockId, actionId));
-	}
-
-	// --- promote (the only cross-key atomic op) ---
-
-	async promote(blockId: BlockId, actionId: ActionId): Promise<void> {
-		const pKey = pendingKey(blockId, actionId);
-		const value = await this.db.get(pKey);
-		if (!value) {
-			throw new Error(`Pending action ${actionId} not found for block ${blockId}`);
-		}
-		// The single `WriteBatch` IS the atomic move: a crash leaves either the
-		// pending or the committed entry, never both/neither.
-		const tKey = transactionKey(blockId, actionId);
-		await this.db
-			.batch()
-			.put(tKey, value)
-			.delete(pKey)
-			.write();
-	}
-
-	// --- flush ---
-
-	// No-op: no write here asks LevelDB to sync, so there is nothing for a flush to wait on yet.
-	// `mobile-and-browser-storage-keep-the-durability-window` gives it real work.
-	flush(_options?: FlushOptions): Promise<void> {
-		return Promise.resolve();
-	}
-
-	// Resolves at once for the same reason: no flush here ever leaves a sync pending.
-	whenDurable(): Promise<void> {
-		return Promise.resolve();
-	}
-
-	// --- optional passthroughs ---
 
 	async *listBlockIds(): AsyncIterable<BlockId> {
 		// Scan the whole TAG_METADATA keyspace; each metadata key is one distinct
@@ -217,31 +175,114 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 		}
 	}
 
+	// --- the journal ---
+
+	/** One unsynced batch: the record's bytes under its `seq`. `JournalStore.appendJournal`'s contract. */
+	async appendJournal(record: JournalRecord): Promise<void> {
+		await this.db.batch().put(journalRecordKey(record.seq), encodeJournalRecord(record)).write();
+	}
+
+	/**
+	 * One batch over the data tags and the journal, synced wherever the handle can sync: each
+	 * record's entries in order, then the mark, then the delete of every numbered record. A number
+	 * with no record present (a strict group's, never appended) deletes nothing.
+	 * `JournalStore.applyJournal`'s contract.
+	 */
+	async applyJournal(apply: readonly JournalRecord[], appliedThrough: number, discard: readonly number[]): Promise<void> {
+		const batch = this.db.batch();
+		for (const record of apply) {
+			putEntries(batch, record);
+		}
+		batch.put(journalMarkKey(), encodeJournalMark(appliedThrough));
+		for (const { seq } of apply) batch.delete(journalRecordKey(seq));
+		for (const seq of discard) batch.delete(journalRecordKey(seq));
+		await batch.write({ sync: this.db.canSync });
+	}
+
+	/**
+	 * One drained scan over the journal's tag: the mark and every numbered record, ascending (the
+	 * sequence is 8 bytes big-endian, so key order is sequence order). A record that does not
+	 * decode, or whose decoded number is not the one its key names, is left out, which recovery
+	 * treats as a gap; a mark that is not 8 bytes reads as 0. `JournalStore.readJournal`'s contract.
+	 */
+	async readJournal(): Promise<JournalContents> {
+		const range = journalRange();
+		const entries = await drain(this.db.iterator({ gte: range.gte, lt: range.lt }));
+		let appliedThrough = 0;
+		const records: JournalRecord[] = [];
+		for (const [key, value] of entries) {
+			if (isJournalMarkKey(key)) {
+				appliedThrough = this.readMark(value);
+			} else {
+				const record = this.readRecord(key, value);
+				if (record) records.push(record);
+			}
+		}
+		return { appliedThrough, records };
+	}
+
+	private readMark(value: Uint8Array): number {
+		const mark = decodeJournalMark(value);
+		if (mark === undefined || !Number.isSafeInteger(mark)) {
+			log('read-journal: the applied-through mark of %s is not a number this build can read (%d bytes) and reads as 0', this.identity, value.byteLength);
+			return 0;
+		}
+		return mark;
+	}
+
+	private readRecord(key: Uint8Array, value: Uint8Array): JournalRecord | undefined {
+		const seq = seqFromJournalKey(key);
+		try {
+			const record = decodeJournalRecord(value);
+			if (record.seq === seq) return record;
+			log('read-journal: a journal record of %s is numbered %d but filed under %s and is left out; recovery treats its number as missing', this.identity, record.seq, String(seq));
+			return undefined;
+		} catch (err) {
+			if (!(err instanceof JournalRecordDecodeError)) throw err;
+			log('read-journal: journal record %s of %s is not one this build can read and is left out (%s); recovery treats its number as missing', String(seq), this.identity, err.message);
+			return undefined;
+		}
+	}
+
 	// NOTE: intentionally NO close(). The `LevelDBLike` handle is shared with
 	// `LevelDBKVStore` and `loadOrCreateRNPeerKey` (one db per RN peer — see the
-	// README usage), so the driver must not own its lifecycle; closing it here
-	// would break the other two. Same rationale as the IndexedDB driver. The
-	// kernel never wires the optional close() regardless.
+	// README usage), so the store must not own its lifecycle; closing it here
+	// would break the other two. Same rationale as the IndexedDB store.
 }
 
+/** The record's entries onto the batch, in order: a put stores the value, a delete removes the key. */
+function putEntries(batch: LevelDBWriteBatchLike, record: JournalRecord): void {
+	for (const { key, value } of record.entries) {
+		const encoded = keyBytes(key);
+		if (value === undefined) batch.delete(encoded); else batch.put(encoded, value);
+	}
+}
+
+/** The write group's and the journal backend's options (`idleFlushMs`, `maxUnsyncedBytes`, the test-only `setTimer` and `now`). */
+export type LevelDBRawStorageOptions = WriteGroupOptions & JournalBatchBackendOptions;
+
 /**
- * LevelDB-backed {@link IRawStorage} for React Native peers, now a thin shell
- * over the shared {@link KvRawStorage} kernel driven by a {@link LevelDBStoreDriver}.
- * The public name/constructor (`new LevelDBRawStorage(db)`) is unchanged so
- * existing imports keep resolving; the kernel supplies the `IRawStorage` surface
- * and the driver supplies LevelDB behavior.
+ * LevelDB-backed {@link IRawStorage} for React Native peers: the shared {@link KvRawStorage}
+ * kernel over a {@link WriteGroupDriver} over a {@link JournalBatchBackend} over a
+ * {@link LevelDBJournalStore}. Every write resolves into the driver's in-memory overlay; `flush()`
+ * hands the group to the backend as one LevelDB batch — applied before the flush resolves, or,
+ * for a flush with a window on a handle that can sync, appended as one journal record and applied
+ * by the deadline. The public name/constructor (`new LevelDBRawStorage(db)`) is unchanged so
+ * existing imports keep resolving.
  *
- * `listBlockIds`/`getApproximateBytesUsed` are re-declared here as always-present
- * (the LevelDB driver always implements them, so the kernel constructor always
- * wires them) — the base declares them optional, but every RN consumer relies on
- * them.
+ * `listBlockIds`/`getApproximateBytesUsed`/`getStoreIdentity`/`close` are re-declared here as
+ * always-present (the store always implements the first three, so the backend, driver and kernel
+ * always wire them, and the driver always has a `close`) — the base declares them optional, but
+ * every RN consumer relies on them. `close()` applies what is still held and disarms the timers;
+ * it does not close the shared handle, which the host closes afterwards.
  */
 export class LevelDBRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
 	declare getStoreIdentity: () => StoreIdentity;
+	declare close: () => Promise<void>;
 
-	constructor(db: LevelDBLike) {
-		super(new LevelDBStoreDriver(db));
+	constructor(db: LevelDBLike, options: LevelDBRawStorageOptions = {}) {
+		super(new WriteGroupDriver(new JournalBatchBackend(new LevelDBJournalStore(db), options), options));
 	}
 }

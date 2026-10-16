@@ -68,11 +68,25 @@ const BACKENDS = {
 	leveldb: async dir => {
 		const layout = { backend: 'leveldb', path: 'leveldb' };
 		const db = await openClassicLevel(join(dir, layout.path));
+		const storage = new LevelDBRawStorage(db);
+		const kvStore = new LevelDBKVStore(db);
 		return {
 			layout,
-			storage: () => new LevelDBRawStorage(db),
-			kvStore: new LevelDBKVStore(db),
-			close: () => db.close(),
+			storage: () => storage,
+			kvStore,
+			// A build that holds a group's writes until a flush applies what it still holds on close, so
+			// the fixture holds every write and no journal record. Older builds have no `close` on either.
+			close: async () => {
+				try {
+					await kvStore.close?.();
+				} finally {
+					try {
+						await storage.close?.();
+					} finally {
+						await db.close();
+					}
+				}
+			},
 		};
 	},
 };

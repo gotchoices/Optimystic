@@ -53,12 +53,17 @@ describe('loadOrCreateRNPeerKey', () => {
 		// LevelDBKVStore tags keys with TAG_KV; identity uses TAG_IDENTITY. The
 		// two should be independent regardless of name overlap.
 		const kv = new LevelDBKVStore(handle.db, '');
-		await kv.set('peer-private-key', 'not-the-real-key');
-		const key = await loadOrCreateRNPeerKey(handle.db);
+		try {
+			await kv.set('peer-private-key', 'not-the-real-key');
+			await kv.flush();
+			const key = await loadOrCreateRNPeerKey(handle.db);
 
-		// KV value is unchanged...
-		expect(await kv.get('peer-private-key')).to.equal('not-the-real-key');
-		// ...and the identity helper still produced a valid Ed25519 key.
-		expect(peerIdFromPrivateKey(key).toString().length).to.be.greaterThan(0);
+			// KV value is unchanged...
+			expect(await kv.get('peer-private-key')).to.equal('not-the-real-key');
+			// ...and the identity helper still produced a valid Ed25519 key.
+			expect(peerIdFromPrivateKey(key).toString().length).to.be.greaterThan(0);
+		} finally {
+			await kv.close();
+		}
 	});
 });

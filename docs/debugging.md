@@ -99,6 +99,7 @@ Both reporters on GitHub issue #8 found that turning debug logging on roughly do
 | `db-p2p`                     | `optimystic:db-p2p`            |
 | `db-p2p-storage-fs`          | `optimystic:db-p2p-storage-fs` (its `write-log` lines are described in `packages/db-p2p-storage-fs/README.md`) |
 | `db-p2p-storage-web`         | `optimystic:db-p2p-storage-web` (`storage:indexeddb`: `read-journal` when an open found a journal record that is not one this build can read and left it out, which the `journal` row above then reports as a gap) |
+| `db-p2p-storage-rn`          | `optimystic:db-p2p-storage-rn` (`storage:leveldb`: `read-journal` when an open found a journal record it cannot trust — one that does not decode, or one filed under a key naming a different number — and left it out, which the `journal` row above then reports as a gap, or found an applied-through mark that is not 8 bytes and read it as 0) |
 | `quereus-plugin-optimystic`  | `optimystic:quereus-plugin`    |
 
 ### db-core sub-namespaces
