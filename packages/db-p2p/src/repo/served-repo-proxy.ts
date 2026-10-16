@@ -44,8 +44,10 @@ export function createServedRepoProxy(
 		},
 		async commit(request, options) {
 			// `target()` is already the plain `IRepo` seam: `StorageRepo.commit`'s extra optional
-			// proof parameter (`ICommitProofPersister`) would otherwise make the union's synthesized
-			// call signature reject a plain repo-level request. No proof flows through this member.
+			// apply parameter (`ILocalApply` — the proof to persist and the sync window) would
+			// otherwise make the union's synthesized call signature reject a plain repo-level
+			// request. Neither flows through this member, correctly: both are this node's own
+			// concern and never go on the wire.
 			return await target().commit(request, options);
 		},
 		async getBlockProof(blockId, rev) {

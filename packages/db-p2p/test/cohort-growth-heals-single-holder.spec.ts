@@ -84,7 +84,7 @@ const writeRevision = async (repo: StorageRepo, actionId: ActionId, rev: number,
 	};
 	// 4 approving peers against the 0.75 super-majority the receiving services below run.
 	const { proof } = await makeSignedProof(4, commit);
-	const committed = await repo.commit(commit, undefined, proof);
+	const committed = await repo.commit(commit, undefined, { proof });
 	expect(committed.success, `commit of ${actionId} must succeed`).to.equal(true);
 	expect(await repo.getBlockProof(BLOCK_ID, rev),
 		`the cohort proof for rev ${rev} must be retained, or the push it drives cannot be certified`)

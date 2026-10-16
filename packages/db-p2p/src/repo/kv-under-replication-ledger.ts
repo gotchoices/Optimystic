@@ -24,6 +24,15 @@ export type KvUnderReplicationLedgerOptions = {
 	/** Hard cap on outstanding entries; the oldest-recorded entry is evicted beyond it. Default
 	 *  {@link DEFAULT_UNDER_REPLICATION_MAX_ENTRIES}. Must be at least 1. */
 	maxEntries?: number;
+	/**
+	 * Awaited at the start of every `record`, before any write to the key-value store. The node wires
+	 * a strict flush of its block store, so a shortfall entry is never on disk ahead of the commit it
+	 * describes (write order 8 of `packages/db-p2p/docs/storage.md`, Invariant 6): the entry's store and
+	 * the block store are two durability domains with no prefix rule between them, and the commit's
+	 * own flush may have been given a window. A rejection makes `record` reject, which
+	 * `CoordinatorRepo.noteReplicationShortfall` logs per block and answers without `recordedBy`.
+	 */
+	beforeRecord?: () => Promise<void>;
 };
 
 const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unrouted'];
@@ -42,6 +51,7 @@ const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unr
  */
 export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	private readonly maxEntries: number;
+	private readonly beforeRecord: (() => Promise<void>) | undefined;
 	private readonly queues = new Map<BlockId, Promise<void>>();
 	private indexLoad: Promise<Set<BlockId>> | undefined;
 
@@ -51,9 +61,13 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 			throw new Error(`KvUnderReplicationLedger: maxEntries must be a positive integer, got ${maxEntries}`);
 		}
 		this.maxEntries = maxEntries;
+		this.beforeRecord = options?.beforeRecord;
 	}
 
 	async record(entry: UnderReplicatedEntry): Promise<void> {
+		// Ahead of the block's queue, not inside it: the hook syncs another store, and a flush there
+		// need not hold this block's other ledger operations behind the disk.
+		await this.beforeRecord?.();
 		const wrote = await this.serialized(entry.blockId, async () => {
 			const index = await this.index();
 			const existing = await this.read(entry.blockId);

@@ -17,7 +17,8 @@ import type { FretService } from "p2p-fret";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
-import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
+import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
@@ -379,6 +380,13 @@ interface ClusterMemberComponents {
 	 * via the un-injected expiration check. Widen the injection if a test needs to drive expiry too.
 	 */
 	now?: () => number;
+	/**
+	 * How long this member's apply of a consensus record may let its sync wait, from the size of the
+	 * cohort the record ran on (`durabilityWindowMs` in `../storage/durability-window.ts`, bound to
+	 * the node's policy by `createLibp2pNodeBase`, which hands the same function to `CoordinatorRepo`).
+	 * Absent → every apply is synced before it is reported, which is what every direct constructor gets.
+	 */
+	durabilityWindowFor?: DurabilityWindowFor;
 }
 
 export function clusterMember(components: ClusterMemberComponents): ClusterMember {
@@ -401,7 +409,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.deriveExpectedCluster,
 		components.now,
 		components.onBlockHolders,
-		components.createClusterClient
+		components.createClusterClient,
+		components.durabilityWindowFor
 	);
 }
 
@@ -599,7 +608,8 @@ export class ClusterMember implements ICluster {
 		private readonly deriveExpectedCluster?: DeriveExpectedClusterCallback,
 		now?: () => number,
 		private readonly onBlockHolders?: BlockHoldersSink,
-		createClusterClient?: (peerId: PeerId) => ICluster
+		createClusterClient?: (peerId: PeerId) => ICluster,
+		private readonly durabilityWindowFor?: DurabilityWindowFor
 	) {
 		this.now = now ?? ((): number => Date.now());
 		this.createClusterClient = createClusterClient
@@ -2696,9 +2706,9 @@ export class ClusterMember implements ICluster {
 	 * @pitfall **Check-then-act race** - The in-memory guard must be checked AND set
 	 * atomically (before any `await`) to prevent duplicate execution; JavaScript's
 	 * single-threaded nature makes that synchronous check-and-set atomic. The durable
-	 * marker, by contrast, is persisted only *after* apply succeeds — writing it eagerly
-	 * would leave a stuck marker on a caught fault or a crash mid-apply, silently dropping
-	 * the transaction on this member on redelivery.
+	 * marker, by contrast, is persisted only *after* apply succeeds and its writes are
+	 * power-loss durable — writing it eagerly would leave a stuck marker on a caught fault
+	 * or a crash mid-apply, silently dropping the transaction on this member on redelivery.
 	 *
 	 * @pitfall **Independent node storage** - Each node has its own storage. After consensus,
 	 * each node applies operations locally. Nodes must fetch missing blocks from cluster
@@ -2751,18 +2761,39 @@ export class ClusterMember implements ICluster {
 			throw err;
 		}
 
-		// Persist the durable marker only now that apply has actually succeeded. Writing it
-		// eagerly (before the loop) would leave a stuck marker on a caught fault OR a crash
-		// mid-apply, and on redelivery handleConsensus short-circuits at the async
-		// wasTransactionExecuted check — silently dropping the transaction on this member
-		// forever. The durable marker exists only for post-restart dedup (the in-memory map
-		// is empty after restart), and the narrow window between "apply succeeded" and
-		// "durable write landed" is safe to re-run on restart: re-applying an
-		// already-applied consensus transaction is idempotent (the "ahead" divergence path
+		// Persist the durable marker only now that apply has actually succeeded — and only once
+		// the apply itself is power-loss durable (markExecutedOnceDurable). Writing it eagerly
+		// (before the loop) would leave a stuck marker on a caught fault OR a crash mid-apply,
+		// and on redelivery handleConsensus short-circuits at the async wasTransactionExecuted
+		// check — silently dropping the transaction on this member forever. The durable marker
+		// exists only for post-restart dedup (the in-memory map is empty after restart), and
+		// the window between "apply succeeded" and "durable write landed" — the apply's whole
+		// durability window now, not a few writes — is safe to re-run on restart: re-applying
+		// an already-applied consensus transaction is idempotent (the "ahead" divergence path
 		// in applyConsensusOperation tolerates it as a no-op), so it converges rather than
 		// dropping. Fire-and-forget: a persist failure must not fail the apply that succeeded.
-		this.stateStore?.markExecuted(record.messageHash, executedAt)
-			.catch(err => log('cluster-member:persist-executed-error', { messageHash: record.messageHash, error: (err as Error).message }));
+		this.markExecutedOnceDurable(record.messageHash, executedAt);
+	}
+
+	/**
+	 * Write the durable executed marker once the apply it describes survives a power cut (write
+	 * order 8 of `docs/storage.md`, Invariant 6). The marker's store and the block store are two
+	 * durability domains with no prefix rule between them, so a marker on disk ahead of its apply
+	 * would make a redelivery after a power cut skip an apply the cut took back. The apply's groups
+	 * were flushed with the record's window ({@link syncWindowFor}), so `whenDurable()` waits that
+	 * window at most and never hastens the sync. A repo without `whenDurable` (a plain `IRepo`
+	 * double) has the marker written at once, as before the window existed. A rejection — the store
+	 * failed — logs and writes no marker; a process crash in between loses only the marker, which
+	 * redelivery re-applies idempotently (see {@link handleConsensus}).
+	 */
+	private markExecutedOnceDurable(messageHash: string, executedAt: number): void {
+		const stateStore = this.stateStore;
+		if (!stateStore) return;
+		const durable = this.storageRepo as IRepo & Partial<IDurableStorage>;
+		const applied = durable.whenDurable ? durable.whenDurable() : Promise.resolve();
+		void applied
+			.then(() => stateStore.markExecuted(messageHash, executedAt))
+			.catch(err => log('cluster-member:persist-executed-error', { messageHash, error: (err as Error).message }));
 	}
 
 	/**
@@ -2837,7 +2868,7 @@ export class ClusterMember implements ICluster {
 			return;
 		}
 		if ('pend' in operation) {
-			const result = await this.storageRepo.pend(operation.pend);
+			const result = await this.localApply().pend(operation.pend, undefined, { syncWithinMs: this.syncWindowFor(record) });
 			// Retain the verdict either way so the coordinator can hand the writer storage's real
 			// answer (see getExecutedPendResult). A refusal here is NOT local divergence the way a
 			// commit refusal is: pend-consensus confers no durability — a refusal carrying `pending`
@@ -2896,8 +2927,8 @@ export class ClusterMember implements ICluster {
 			// path — StorageRepo persists it only where the local materialization matches the declared
 			// digest (see persistProofIfContentMatches). A cheap projection (no hashing/signing).
 			// `undefined` for a v1 / unversioned record: its hashes bind no peer set, so it is never
-			// certifiable — logged so an operator can see why a cohort retains no proofs. The cast is the
-			// named ICommitProofPersister contract; a plain IRepo mock ignores the extra argument.
+			// certifiable — logged so an operator can see why a cohort retains no proofs. It rides down
+			// on the named ILocalApply contract (localApply); a plain IRepo mock ignores the extra argument.
 			const proof = buildBlockCommitProof(record);
 			if (proof === undefined) {
 				log('cluster-member:commit-proof-skipped', {
@@ -2924,6 +2955,21 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
+	/** The widened local-apply seam ({@link ILocalApply}); a plain `IRepo` double ignores the third argument. */
+	private localApply(): IRepo & ILocalApply {
+		return this.storageRepo as IRepo & ILocalApply;
+	}
+
+	/**
+	 * How long an apply of `record` may let its sync wait: the window for the cohort the record ran
+	 * on (`recordDurabilityWindowMs`), 0 without a window function. Every apply that runs on a
+	 * consensus record — pend and commit alike — flushes with it; a `get` or `cancel` operation
+	 * stays strict, since it is bookkeeping with no write a cohort is holding.
+	 */
+	private syncWindowFor(record: ClusterRecord): number {
+		return recordDurabilityWindowMs(this.durabilityWindowFor, record);
+	}
+
 	/**
 	 * Apply one consensus commit to local storage, tolerating every divergence shape the way the
 	 * doc comment on {@link applyConsensusOperation} describes and reconciling the behind ones.
@@ -2938,7 +2984,7 @@ export class ClusterMember implements ICluster {
 		const messageHash = record.messageHash;
 		let result: CommitResult;
 		try {
-			result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(commit, undefined, proof);
+			result = await this.localApply().commit(commit, undefined, { proof, syncWithinMs: this.syncWindowFor(record) });
 		} catch (err) {
 			// `StorageRepo.commit` throws (rather than returning success:false) when
 			// the pending action is missing — the canonical "behind" signal: this

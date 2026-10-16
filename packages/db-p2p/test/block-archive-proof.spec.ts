@@ -69,7 +69,7 @@ const landRevision = async (
 	}
 	const commit = makeCommit({ rev, actionId, blockDigests: { [BLOCK]: { digest: await canonicalBlockHash(block) } } });
 	const { proof } = await makeSignedProof(peers, commit);
-	expect((await repo.commit(commit, undefined, proof)).success).to.equal(true);
+	expect((await repo.commit(commit, undefined, { proof })).success).to.equal(true);
 	return proof;
 };
 

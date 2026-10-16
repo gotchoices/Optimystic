@@ -14,6 +14,7 @@ import {
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
 import type { IRawStorage } from "./i-raw-storage.js";
+import type { FlushOptions } from "./store-durability.js";
 import { BlockStorage } from "./block-storage.js";
 import { isReservationAgainst, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
@@ -155,16 +156,55 @@ export interface ICommitDigestPreviewer {
 }
 
 /**
- * The capability `ClusterMember.applyConsensusOperation` casts its `storageRepo` to when handing a
- * {@link BlockCommitProof} down the commit path. Named for the same reason as
- * {@link ICommitDigestPreviewer}: one definition of the widened contract, and something a repo
- * decorator can `implements` and forward. `IRepo.commit` takes two arguments; the third is
- * harmless at runtime for a plain `IRepo` implementation (the extra argument is ignored), so
- * callers cast rather than structurally probe — but a decorator that narrows back to `IRepo`
- * silently stops persisting proofs on that node.
+ * What a local apply carries beyond the `IRepo` request: the proof to persist beside a commit, and
+ * how long the group's sync may wait. Both are this node's own concern — the writer never sends
+ * them, and `served-repo-proxy.ts` forwards neither — so they ride on a third parameter rather
+ * than on the request.
  */
-export interface ICommitProofPersister {
-	commit(request: CommitRequest, options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult>;
+export interface StorageApplyOptions {
+	/** A commit's cohort proof, persisted where the local materialization matches the digest the commit declared (see {@link StorageRepo.commit}). Ignored by `pend`. */
+	readonly proof?: BlockCommitProof;
+	/**
+	 * How long after the group's flush its writes may stay exposed to the crashes the store's
+	 * `durability` names (`FlushOptions.withinMs`). Absent or 0: the group is synced before the call
+	 * returns. `ClusterMember` and `CoordinatorRepo` pass the durability window of the cohort a
+	 * consensus record ran on (`durabilityWindowMs` in `./durability-window.ts`); a write that ran no
+	 * consensus, or that only this machine holds, stays strict.
+	 */
+	readonly syncWithinMs?: number;
+}
+
+/**
+ * The capability `ClusterMember.applyConsensusOperation` and `CoordinatorRepo` cast their
+ * `storageRepo` to when applying a write locally with {@link StorageApplyOptions}. Named for the
+ * same reason as {@link ICommitDigestPreviewer}: one definition of the widened contract, and
+ * something a repo decorator can `implements` and forward. `IRepo.pend` and `IRepo.commit` take
+ * two arguments; the third is harmless at runtime for a plain `IRepo` implementation (the extra
+ * argument is ignored), so callers cast rather than structurally probe — but a decorator that
+ * narrows back to `IRepo` silently stops persisting proofs, and silently makes every apply strict,
+ * on that node.
+ */
+export interface ILocalApply {
+	pend(request: PendRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult>;
+	commit(request: CommitRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<CommitResult>;
+}
+
+/**
+ * The capability `ClusterMember.handleConsensus` probes its `storageRepo` for before writing the
+ * durable executed marker: `whenDurable()` resolves once every write covered by a flush that
+ * resolved before the call survives every crash the store names, and never hastens a sync (the
+ * contract on `RawStoreDriver.whenDurable`). A repo without it has the marker written at once.
+ */
+export interface IDurableStorage {
+	whenDurable(): Promise<void>;
+}
+
+/** `endGroup`'s default `wrote`: the group always has writes to flush. */
+const alwaysWrote = (): boolean => true;
+
+/** The flush a `pend` or `commit` group ends with: the caller's window, strict when none was given. */
+function groupFlush(apply: StorageApplyOptions | undefined): FlushOptions {
+	return { withinMs: apply?.syncWithinMs ?? 0 };
 }
 
 /**
@@ -223,7 +263,7 @@ export interface IHeldRevisionReader {
 	heldRevisions(blockIds: BlockId[]): Promise<Record<BlockId, ActionRev | null>>;
 }
 
-export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ICommitProofPersister, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader {
+export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ILocalApply, IDurableStorage, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader {
 	private readonly validatePend?: PendValidationHook;
 	private readonly unvalidatablePendPolicy: UnvalidatablePendPolicy;
 	/** Per-collection change listeners; empty sets are pruned on unsubscribe. */
@@ -324,25 +364,34 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	/**
-	 * Run one write group's latched work, then make it durable before the caller reports or emits.
+	 * Run one write group's latched work, then flush it before the caller reports or emits.
 	 * Every method here that writes block storage — `pend`, `commit`, `cancel`, `recoverBlock`,
 	 * `saveReplicatedBlock`, and a `get` that entered a write latch — ends through this, so each call
 	 * flushes the store exactly once, after `work` has released its latches: a concurrent group on the
 	 * same blocks is not held behind the disk, and several groups can share one sync (rule 4 of the
-	 * flush contract on `RawStoreDriver.flush`). Change events are emitted only after this resolves,
-	 * so nothing announces a commit this node could still lose.
+	 * flush contract on `RawStoreDriver.flush`).
 	 *
-	 * A throwing `work` is flushed too, since whatever landed before the fault must be durable before
-	 * anyone acts on the failure; the original error is rethrown and a flush error behind it is only
-	 * logged. When `work` returned, a rejected flush propagates: the caller reports nothing, and the
-	 * store refuses later writes until reopened (rule 5), so a retry cannot report success over
-	 * writes that may be gone.
+	 * `flush` is the group's deadline. Strict — absent, or `withinMs` 0 — means the writes survive
+	 * every crash the store names before this resolves, so nothing announces a commit this node could
+	 * still lose. Relaxed means they survive a process crash now and a power cut only once the window
+	 * has passed, while the change events still fire when this resolves: within the window a power
+	 * cut can take back a write this node announced and reported held, which is the accepted risk
+	 * the durability window's loss target prices (`durabilityWindowMs` in `./durability-window.ts`).
+	 * Only `pend` and `commit` pass a window, and only when their caller gave one. A deferred sync
+	 * that fails latches the store: the next group on this node fails and is logged, but the writer
+	 * answered inside the window was already told the write landed — the same accepted risk.
+	 *
+	 * A throwing `work` is flushed too, strictly whatever `flush` says, since whatever landed before
+	 * the fault must be durable before anyone acts on the failure; the original error is rethrown and
+	 * a flush error behind it is only logged. When `work` returned, a rejected flush propagates: the
+	 * caller reports nothing, and the store refuses later writes until reopened (rule 5), so a retry
+	 * cannot report success over writes that may be gone.
 	 *
 	 * `wrote` lets the hot read path skip the flush when it took no latch; every other group flushes
 	 * on every exit, refusals included, because an extra flush costs latency and a missed one costs
 	 * durability.
 	 */
-	private async endGroup<T>(work: () => Promise<T>, wrote: () => boolean = () => true): Promise<T> {
+	private async endGroup<T>(work: () => Promise<T>, wrote: () => boolean = alwaysWrote, flush?: FlushOptions): Promise<T> {
 		let result: T;
 		try {
 			result = await work();
@@ -353,12 +402,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			throw err;
 		}
 		if (wrote()) {
-			await this.storage.flush();
+			await this.storage.flush(flush);
 		}
 		return result;
 	}
 
-	/** {@link endGroup}'s flush after a fault: the fault is what the caller must see, so a flush error is logged, not thrown. */
+	/**
+	 * {@link endGroup}'s flush after a fault: the fault is what the caller must see, so a flush error
+	 * is logged, not thrown. Always strict: a group that threw is reported as a failure, and what
+	 * landed before the throw is synced before anyone acts on it.
+	 */
 	private async flushBehindFault(fault: unknown): Promise<void> {
 		try {
 			await this.storage.flush();
@@ -367,6 +420,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				fault instanceof Error ? fault.message : String(fault),
 				flushErr instanceof Error ? flushErr.message : String(flushErr));
 		}
+	}
+
+	/** See {@link IDurableStorage}: the store's own `whenDurable()`. */
+	whenDurable(): Promise<void> {
+		return this.storage.whenDurable();
 	}
 
 	/** Subscribe to full-replication events. See {@link IBlockDurabilityNotifier}. */
@@ -725,7 +783,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 	}
 
-	async pend(request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
+	async pend(request: PendRequest, _options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
 		// Re-check the transaction when a validation hook is configured — the unvalidatable-pend
 		// policy and the throwing-hook catch both live in the shared `checkPendValidation`, so this
 		// tier and the cluster tier cannot drift apart on what they refuse.
@@ -747,7 +805,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			};
 		}
 
-		return await this.endGroup(() => this.pendUnderLatches(request));
+		return await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));
 	}
 
 	/** {@link pend}'s write group: classify every block, then save, under one hold of their write latches. */
@@ -989,12 +1047,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * its `cancel` therefore still strands the record; that is pre-existing and orthogonal to the
 	 * divergence split above.
 	 */
-	async commit(request: CommitRequest, _options?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
+	async commit(request: CommitRequest, _options?: MessageOptions, apply?: StorageApplyOptions): Promise<CommitResult> {
 		log('commit actionId=%s rev=%d blockIds=%d', request.actionId, request.rev, request.blockIds.length);
-		const { result, collectionBlocks } = await this.endGroup(() => this.commitUnderLatches(request, proof));
-		// Notify after the critical section and the group's flush, for every block newly committed
-		// here — including those that landed before a mid-loop failure (alreadyDone / stale partitions
-		// never reach `collectionBlocks`).
+		const { result, collectionBlocks } = await this.endGroup(() => this.commitUnderLatches(request, apply?.proof), alwaysWrote, groupFlush(apply));
+		// Notify after the critical section and the group's flush — relaxed when `apply` gave a window,
+		// see `endGroup` — for every block newly committed here, including those that landed before a
+		// mid-loop failure (alreadyDone / stale partitions never reach `collectionBlocks`).
 		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
 		return result;
 	}

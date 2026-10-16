@@ -436,21 +436,21 @@ describe('BlockCommitProof', () => {
 			const commit = makeCommit({ [BLOCK]: { digest } });
 			const proof = stubProof(commit);
 			expect(proofDeclaredDigest(proof, claimFor(commit)), 'stub declares via the shared resolver').to.equal(digest);
-			expect((await repo.commit(commit, undefined, proof)).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.deep.equal(proof);
 		});
 
 		it('withholds the proof on a digest mismatch (the commit itself still lands)', async () => {
 			const { raw, repo } = await seededRepo();
 			const commit = makeCommit({ [BLOCK]: { digest: 'tampered-declaration' } });
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.equal(undefined);
 		});
 
 		it('withholds the proof when the commit op declares no digest', async () => {
 			const { raw, repo } = await seededRepo();
 			const commit = makeCommit();
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.equal(undefined);
 		});
 
@@ -466,7 +466,7 @@ describe('BlockCommitProof', () => {
 			expect(pended.success, 'delete pend must land').to.equal(true);
 			const commit = makeCommit({ [BLOCK]: { digest: 'any-declared-digest' } },
 				{ actionId: 'delete-action' as ActionId, rev: 2 });
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, 2)).to.equal(undefined);
 		});
 
@@ -478,7 +478,7 @@ describe('BlockCommitProof', () => {
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'nothing to back-fill yet').to.equal(undefined);
 
 			const proof = stubProof(commit);
-			expect((await repo.commit(commit, undefined, proof)).success, 'retry is an idempotent no-op').to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success, 'retry is an idempotent no-op').to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'retry back-fills the proof').to.deep.equal(proof);
 		});
 
@@ -499,7 +499,7 @@ describe('BlockCommitProof', () => {
 
 			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(block) } });
 			const proof = stubProof(commit);
-			expect((await repo.commit(commit, undefined, proof)).success, 'recover() rolls the block forward').to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success, 'recover() rolls the block forward').to.equal(true);
 			expect((await storage.getLatest())?.rev, 'latest reconciled to the durable rev').to.equal(1);
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'recovered block retains the proof').to.deep.equal(proof);
 		});

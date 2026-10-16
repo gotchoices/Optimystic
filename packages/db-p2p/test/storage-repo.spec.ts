@@ -3,6 +3,9 @@ import { StorageRepo, MISSING_BASE_REVISION_REASON, PEND_NOT_VALIDATABLE } from 
 import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
+import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
+import { MemoryBatchBackend } from '../src/testing/memory-batch-backend.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
@@ -3876,5 +3879,76 @@ describe('StorageRepo — every write group ends with one flush (storage.md Inva
 		}
 		expect((thrown as Error | undefined)?.message).to.equal('bad block');
 		expect(trace).to.deep.equal(['good:setLatest', 'flush']);
+	});
+});
+
+describe('StorageRepo — a commit applied with a window is reported before it is power-loss durable (storage.md Invariant 6)', () => {
+	/**
+	 * A repo over a backend that defers every sync a flush allows. A fresh driver per open: the
+	 * driver's overlay keeps serving a write until its batch is durable, so only a driver opened
+	 * after `powerLoss()` reads what the backend alone kept.
+	 */
+	const openRepo = (backend: MemoryBatchBackend): StorageRepo => new StorageRepo(new KvRawStorage(new WriteGroupDriver(backend)));
+
+	const insertRequest = (actionId: string, blockId: string): PendRequest => ({
+		actionId: actionId as ActionId,
+		transforms: makeInsertTransforms(blockId as BlockId, makeBlock(blockId)),
+		policy: 'c'
+	});
+
+	const commitRequest = (actionId: string, blockId: string) => ({
+		actionId: actionId as ActionId, blockIds: [blockId as BlockId], tailId: blockId as BlockId, rev: 1
+	});
+
+	/** Whether `whenDurable()` has resolved by the time a short delay has, i.e. whether anything is still deferred. */
+	const durableSoon = (repo: StorageRepo): Promise<boolean> => Promise.race([
+		repo.whenDurable().then(() => true),
+		delay(20).then(() => false)
+	]);
+
+	it('with a window the commit is answered and announced before its sync, and a power cut takes it back', async () => {
+		const backend = new MemoryBatchBackend({ deferSync: true });
+		const repo = openRepo(backend);
+		let announced = 0;
+		repo.onCollectionChange('collection-1' as BlockId, () => { announced++; });
+
+		// Synced before the window: a strict commit, so the power cut below has something to keep.
+		await repo.pend(insertRequest('a0', 'block-0'));
+		expect((await repo.commit(commitRequest('a0', 'block-0'))).success).to.equal(true);
+		expect(backend.committed.every(batch => batch.durable), 'a strict group is synced before it is answered').to.equal(true);
+		expect(announced).to.equal(1);
+
+		// Inside the window: pended and committed with five seconds to spare on each group.
+		await repo.pend(insertRequest('a1', 'block-1'), undefined, { syncWithinMs: 5000 });
+		const result = await repo.commit(commitRequest('a1', 'block-1'), undefined, { syncWithinMs: 5000 });
+		expect(result.success, 'the commit is answered success').to.equal(true);
+		expect(announced, 'the change event fired on the relaxed flush').to.equal(2);
+		const last = backend.committed[backend.committed.length - 1]!;
+		expect(last.durable, 'the batch the commit sealed is not yet synced').to.equal(false);
+		expect(last.syncWithinMs, 'the backend was told the time left to the window').to.be.above(0).and.at.most(5000);
+		expect(await durableSoon(repo), 'whenDurable() waits for the deferred sync').to.equal(false);
+
+		backend.powerLoss();
+		const reopened = openRepo(backend);
+		const after = await reopened.get({ blockIds: ['block-0' as BlockId, 'block-1' as BlockId] });
+		expect(after['block-0' as BlockId]!.state.latest?.rev, 'everything synced before the window survived').to.equal(1);
+		expect(after['block-1' as BlockId]!.state.latest, 'the window let the power cut take the commit back').to.equal(undefined);
+		expect(after['block-1' as BlockId]!.block).to.equal(undefined);
+	});
+
+	it('with no window the same commit is synced before it is answered and survives the power cut', async () => {
+		const backend = new MemoryBatchBackend({ deferSync: true });
+		const repo = openRepo(backend);
+
+		await repo.pend(insertRequest('a1', 'block-1'));
+		expect((await repo.commit(commitRequest('a1', 'block-1'))).success).to.equal(true);
+		expect(backend.committed.every(batch => batch.durable), 'a strict commit syncs before it is answered').to.equal(true);
+		expect(await durableSoon(repo), 'nothing is deferred').to.equal(true);
+
+		backend.powerLoss();
+		const reopened = openRepo(backend);
+		const after = await reopened.get({ blockIds: ['block-1' as BlockId] });
+		expect(after['block-1' as BlockId]!.state.latest?.rev).to.equal(1);
+		expect(after['block-1' as BlockId]!.block).to.not.equal(undefined);
 	});
 });

@@ -37,7 +37,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { CoordinatorRepo, type ICoordinatorClusterSeam } from '../src/repo/coordinator-repo.js';
 import type { CohortResolution } from '../src/repo/cluster-coordinator.js';
-import { MISSING_BASE_REVISION_REASON, isCommitNotDurableFailure, type ICommitProofPersister } from '../src/storage/storage-repo.js';
+import { MISSING_BASE_REVISION_REASON, isCommitNotDurableFailure, type ILocalApply, type StorageApplyOptions } from '../src/storage/storage-repo.js';
 import { buildBlockCommitProof, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 
@@ -88,11 +88,11 @@ const durableReports = (record: ClusterRecord, holders: number): { [peerId: stri
 
 /**
  * A storage repo whose commit does whatever `commit` says; everything else is inert. Typed as the
- * proof-carrying {@link ICommitProofPersister} overload — the one `CoordinatorRepo` actually calls
+ * apply-carrying {@link ILocalApply} overload — the one `CoordinatorRepo` actually calls
  * on this path — so a test can observe the proof argument instead of it vanishing into an
  * `IRepo`-shaped double that never declared it.
  */
-const makeStorageRepo = (commit: ICommitProofPersister['commit']): IRepo => ({
+const makeStorageRepo = (commit: ILocalApply['commit']): IRepo => ({
 	async get(gets: BlockGets, _o?: MessageOptions): Promise<GetBlockResults> {
 		return Object.fromEntries(gets.blockIds.map(id => [id, { state: {} }]));
 	},
@@ -109,9 +109,9 @@ const countingCommits = (storageRepo: IRepo): { repo: IRepo; commits: () => numb
 	return {
 		repo: {
 			...storageRepo,
-			async commit(r: CommitRequest, o?: MessageOptions, proof?: BlockCommitProof): Promise<CommitResult> {
+			async commit(r: CommitRequest, o?: MessageOptions, apply?: StorageApplyOptions): Promise<CommitResult> {
 				commits++;
-				return (storageRepo as IRepo & ICommitProofPersister).commit(r, o, proof);
+				return (storageRepo as IRepo & ILocalApply).commit(r, o, apply);
 			}
 		},
 		commits: () => commits
@@ -291,7 +291,7 @@ describe('CoordinatorRepo commit — the local fallback carries the consensus re
 	const commitWithProofCapture = (record: ClusterRecord) => {
 		const proofs: (BlockCommitProof | undefined)[] = [];
 		const repo = makeRepo(
-			makeStorageRepo(async (_request, _options, proof) => { proofs.push(proof); return { success: true, durability: localDurability() }; }),
+			makeStorageRepo(async (_request, _options, apply) => { proofs.push(apply?.proof); return { success: true, durability: localDurability() }; }),
 			record, durableReports(record, 3)
 		);
 		return { repo, proofs };

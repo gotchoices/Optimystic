@@ -14,6 +14,8 @@
  * docs/correctness.md, Theorem 6.
  */
 
+import type { ClusterRecord } from '@optimystic/db-core';
+
 /** Options for {@link resolveDurabilityWindowPolicy}; `NodeOptions.storageDurability`. */
 export interface StorageDurabilityOptions {
 	/** Whether this deployment's machines lose power and crash independently of each other. Default true. False makes every write sync before it is reported (two machines on one circuit, say). */
@@ -98,6 +100,23 @@ export function durabilityWindowMs(cohortSize: number, policy: DurabilityWindowP
 	}
 	const windowHours = Math.pow(policy.lossTarget / binomial(holders, mustLose), 1 / mustLose) / policy.lossRatePerHour;
 	return Math.floor(Math.min(windowHours * MS_PER_HOUR, policy.maxWindowMs));
+}
+
+/**
+ * The window a node applies a consensus record's write with, from the size of the cohort the record
+ * ran on. `createLibp2pNodeBase` binds {@link durabilityWindowMs} to the node's resolved policy and
+ * hands the one function to `ClusterMember` and `CoordinatorRepo`; absent, both apply strictly.
+ */
+export type DurabilityWindowFor = (cohortSize: number) => number;
+
+/**
+ * How long an apply of `record` may let its sync wait: `windowFor` of the cohort the record lists.
+ * `record.peers` is the signed cohort, this node included, so its size is the cohort size the window
+ * is priced for; the policy behind `windowFor` caps it at the declared `clusterSize`. 0 with no
+ * window function, so every direct constructor stays strict.
+ */
+export function recordDurabilityWindowMs(windowFor: DurabilityWindowFor | undefined, record: Pick<ClusterRecord, 'peers'>): number {
+	return windowFor?.(Object.keys(record.peers).length) ?? 0;
 }
 
 /** `C(n, k)` as a product of ratios; exact enough for the small cohort sizes this sees. */

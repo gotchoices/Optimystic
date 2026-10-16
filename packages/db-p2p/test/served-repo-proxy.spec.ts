@@ -38,7 +38,7 @@ const makeLocalStore = async () => {
 		blockDigests: { [BLOCK]: { digest: await canonicalBlockHash(block) } }
 	};
 	const { proof } = await makeSignedProof(3, commit);
-	expect((await repo.commit(commit, undefined, proof)).success).to.equal(true);
+	expect((await repo.commit(commit, undefined, { proof })).success).to.equal(true);
 	return { repo, proof };
 };
 

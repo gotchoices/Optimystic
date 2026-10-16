@@ -8,8 +8,12 @@ import type {
 import { canonicalBlockHash } from '@optimystic/db-core';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
+import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
+import { MemoryBatchBackend } from '../src/testing/memory-batch-backend.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import { coordinatorRepo, type CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import type { DurabilityWindowFor } from '../src/storage/durability-window.js';
 import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { verifyBlockCommitProofContent } from '../src/cluster/commit-proof.js';
@@ -67,16 +71,20 @@ interface HarnessOptions {
 	withLocalCluster?: boolean;
 	/** `findCluster` answers once per block (the responsibility check), then throws — the degraded-routing entry into the solo branch. */
 	unroutable?: boolean;
+	/** Store the repo over this backend, which defers every sync a flush allows, instead of plain memory storage. */
+	backend?: MemoryBatchBackend;
+	/** The node's durability window per cohort size, as `createLibp2pNodeBase` would hand it over. */
+	durabilityWindowFor?: DurabilityWindowFor;
 }
 
 const makeHarness = async (options: HarnessOptions = {}): Promise<Harness> => {
-	const { withLocalCluster = true, unroutable = false } = options;
+	const { withLocalCluster = true, unroutable = false, backend, durabilityWindowFor } = options;
 	const privateKey = await generateKeyPair('Ed25519');
 	const selfPeerId = peerIdFromPrivateKey(privateKey);
 	// ONE raw store shared by every BlockStorage this repo makes. The factory is called per block
 	// AND per operation, so constructing the store inside it gives pend and commit different
 	// storage and the commit dies on `Pending action ... not found`.
-	const raw = new MemoryRawStorage();
+	const raw = backend ? new KvRawStorage(new WriteGroupDriver(backend)) : new MemoryRawStorage();
 	const storageRepo = new StorageRepo(raw);
 	// A REAL ClusterMember, not a double: the solo path's proof must come out of the same delegate
 	// the production wiring exposes. The peer network is a dead stub — the solo short-circuit never
@@ -89,14 +97,12 @@ const makeHarness = async (options: HarnessOptions = {}): Promise<Harness> => {
 			privateKey
 		})
 		: undefined;
-	const coordinated = new CoordinatorRepo(
+	// Through the factory rather than the constructor, so the components a node passes are named.
+	const coordinated = coordinatorRepo(
 		makeKeyNetwork(makeClusterPeers([{ peerId: selfPeerId, privateKey }]), { failAfterFirstLookup: unroutable }),
 		((_p: PeerId) => ({} as unknown as ClusterClient)) as never,
-		storageRepo,
-		{ allowUnvalidatedSmallCluster: true },
-		member,
-		selfPeerId
-	);
+		{ allowUnvalidatedSmallCluster: true }
+	)({ storageRepo, localCluster: member, localPeerId: selfPeerId, durabilityWindowFor });
 	// `commit:solo-cohort` is the only signal that tells an operator a real cohort of one apart from
 	// a routing failure, so it is asserted rather than assumed. Replacing the private `debug` handle
 	// is the cheapest capture; nothing in the class reads it back.
@@ -214,6 +220,31 @@ describe('solo-cohort commit proof', function () {
 		expect(verdict.ok, `proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
 
 		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 0, soleIsSelf: false, quorum: 'unrouted' });
+	});
+
+	it('is synced before it is acknowledged, even on a node whose durability window is non-zero', async () => {
+		// The window is for a write a cohort agreed to and holds on a majority. A solo write is held
+		// by this machine alone, so a power cut inside a window would lose the only copy of a write
+		// the writer was told landed; the solo path therefore ignores the node's window.
+		const BLOCK_ID = 'block-solo-strict' as BlockId;
+		const COLLECTION_ID = 'solo-strict-collection' as BlockId;
+		const ACTION = 'action-solo-strict' as ActionId;
+		const backend = new MemoryBatchBackend({ deferSync: true });
+		const harness = await track({ backend, durabilityWindowFor: () => 5000 });
+
+		await pendAndCommit(harness, BLOCK_ID, ACTION, makeBlock(BLOCK_ID, COLLECTION_ID, 'strict'));
+
+		expect(backend.committed.length, 'the pend and the commit each sealed a batch').to.be.above(1);
+		expect(backend.committed.every(batch => batch.durable), 'every batch was synced before its group was answered').to.equal(true);
+		expect(backend.committed.every(batch => batch.syncWithinMs === 0), 'no group asked the backend to defer').to.equal(true);
+
+		// The crash the window prices: only what was synced survives, and the solo commit was.
+		backend.powerLoss();
+		const reopened = new StorageRepo(new KvRawStorage(new WriteGroupDriver(backend)));
+		const after = await reopened.get({ blockIds: [BLOCK_ID] });
+		expect(after[BLOCK_ID]!.state.latest?.rev, 'the solo commit survived the power cut').to.equal(1);
+		expect(after[BLOCK_ID]!.state.latest?.actionId).to.equal(ACTION);
+		expect(soloCohortLine(harness)).to.include({ cohortSize: 1, soleIsSelf: true, quorum: 'local' });
 	});
 
 	it('still commits successfully — retaining no proof — when no local cluster is wired', async () => {

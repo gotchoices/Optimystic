@@ -19,7 +19,7 @@ import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import type { StoreDurability } from './storage/store-durability.js';
-import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindowPolicy, type StorageDurabilityOptions } from './storage/durability-window.js';
+import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindowFor, type DurabilityWindowPolicy, type StorageDurabilityOptions } from './storage/durability-window.js';
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
@@ -834,8 +834,15 @@ export async function createLibp2pNodeBase(
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
 	logStorageDurability(rawStorage.durability, durabilityWindowPolicy);
+	// The one window function: the member's apply of a consensus record and the coordinator's own
+	// fallback apply flush with the window for the record's cohort, from the one resolved policy.
+	const durabilityWindowFor: DurabilityWindowFor = cohortSize => durabilityWindowMs(cohortSize, durabilityWindowPolicy);
 	const kvStore = resolveKvStore(options.kvStore);
-	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
+	// A shortfall entry describes a commit in the block store, whose flush may have been given a
+	// window; a strict flush of that store first keeps the entry off disk until the commit it names is
+	// on it (storage.md Invariant 6, write order 8). Nothing to sync after a solo commit, which was
+	// strict; one early sync for a `majority` commit that fell short, a degraded case.
+	const underReplicationLedger = new KvUnderReplicationLedger(kvStore, { beforeRecord: () => rawStorage.flush() });
 
 	// Placeholder restore callback, reassigned once the restoration coordinator exists after start.
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
@@ -1427,7 +1434,8 @@ export async function createLibp2pNodeBase(
 			onCommitCertificate,
 			onBlockHolders,
 			deriveExpectedCluster,
-			createClusterClient
+			createClusterClient,
+			durabilityWindowFor
 			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
 			// late-joiners (a liveness regression). Until that is tuned against live topology — and the
@@ -1549,7 +1557,8 @@ export async function createLibp2pNodeBase(
 			onBlockHolders,
 			// A `full` commit that settles a ledger entry announces it through the same callable the
 			// drain emits through, so a host hears one event per entry whichever of the two removed it.
-			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event)
+			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event),
+			durabilityWindowFor
 		});
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the

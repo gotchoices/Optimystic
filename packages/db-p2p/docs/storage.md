@@ -219,8 +219,9 @@ crash too). It is fixed when the store is constructed and never changes. A flush
 `withinMs` (`FlushOptions` in `packages/db-p2p/src/storage/store-durability.ts`): how long after
 the call the writes it covers may stay exposed to a crash the durability names — the caller
 trading a bounded window of exposure for a sync that waits. Absent or 0, the flush is *strict*
-and resolves only once the writes survive, which is what every caller asks today; otherwise it
-is *relaxed*. `whenDurable()` resolves once every write covered by a flush that resolved before
+and resolves only once the writes survive, which is what every caller asks except a node
+applying a write its cohort agreed to (see *Who calls `flush()`* below); otherwise it is
+*relaxed*. `whenDurable()` resolves once every write covered by a flush that resolved before
 the call survives every crash the durability names, and never hastens a sync. All three members
 are required, so a wrapper that forgets to forward one does not compile. `IKVStore` has an
 optional `flush` instead, because hosts implement that interface outside this repository; absent
@@ -376,12 +377,29 @@ node is about to report to another machine:
   `saveReplicatedBlock`, and a `get` that entered a block write latch (a read-driven
   promotion, or a coverage restore). The flush runs after the group's latches are released,
   so a concurrent group on the same blocks is not held behind the disk and several groups can
-  share one sync, and before the group's change events, so nothing announces a commit this
-  node could still lose. A group whose work throws is flushed before the error propagates, and
-  one fanned out per block (`get`, `cancel`) first waits for every block to settle, so the
-  flush covers a sibling block still writing when another failed; a
-  flush that rejects after the work returned makes the call throw and emit nothing. A `get`
-  that took no latch does not flush, so the plain read path costs nothing extra.
+  share one sync, and before the group's change events. A group whose work throws is flushed
+  before the error propagates, strictly whatever window it was given, and one fanned out per
+  block (`get`, `cancel`) first waits for every block to settle, so the flush covers a sibling
+  block still writing when another failed; a flush that rejects after the work returned makes
+  the call throw and emit nothing. A `get` that took no latch does not flush, so the plain
+  read path costs nothing extra.
+
+  Which groups carry a window. `pend` and `commit` take a third argument, `StorageApplyOptions`
+  in `packages/db-p2p/src/storage/storage-repo.ts`, whose `syncWithinMs` is the group's
+  `withinMs`; absent, the group is strict. A node passes a window only for an apply that runs
+  on a consensus record — `ClusterMember.applyConsensusOperation` for the pend and commit of
+  every record it applies, and `CoordinatorRepo` for its own fallback pend and commit after
+  consensus ran without its member — and the window is `durabilityWindowMs` in
+  `packages/db-p2p/src/storage/durability-window.ts` for the size of that record's cohort
+  (`recordDurabilityWindowMs`, from `record.peers`, this node included and capped by the policy
+  at the declared `clusterSize`), bound to the node's policy once by `createLibp2pNodeBase` and
+  handed to both as `durabilityWindowFor`. Every other group is strict: a solo pend or commit
+  (no consensus ran and only this machine holds the write), `cancel`, `recoverBlock`,
+  `saveReplicatedBlock`, a `get` that took a write latch, and a consensus `get` or `cancel`
+  operation — repair and bookkeeping, off the per-write hot path, and a replica a pusher counts
+  as held should not sit in a window. A member or coordinator built without `durabilityWindowFor`
+  applies strictly, and until a backend defers its sync (the table above) a window changes
+  nothing a node does.
 - `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls
   `InvalidationContext.flush` after releasing its latches and before appending the entry that
   names the compensating revisions, so an entry never names revisions the store lost. Nothing
@@ -406,6 +424,17 @@ later suffix of the resolved writes (rule 3): a vote built on a record's absence
 when the record is lost, and one built on its presence was a refusal. Likewise a second group
 on the same blocks can read the first's writes before they are durable and build on them;
 its own writes resolved later, so under rule 3 they cannot survive without the first's.
+
+A group flushed with a window stays visible longer: its change events fire when the flush
+resolves, which for a relaxed flush is once the writes survive a process crash, not a power
+cut. Within the window a power cut can take back a write this node announced to its
+subscribers and reported held to the coordinator, which is the accepted risk the window's
+loss target prices (`durabilityWindowMs` in `packages/db-p2p/src/storage/durability-window.ts`
+and [docs/correctness.md Theorem 6](../../../docs/correctness.md#theorem-6-durability)): the
+cohort acknowledged the write on a majority, and the window is sized so that the members a
+rival would need to out-vote are vanishingly unlikely to all lose power inside it. A deferred
+sync that fails latches the store (rule 5), so the next group on the node fails and is logged,
+but the writer answered inside the window was already told the write landed — the same risk.
 
 **The write orders crash recovery relies on.** Every backend's flush is reviewed against this
 list. Each holds today because every step is synced before the next starts; once a backend
@@ -439,8 +468,16 @@ syncs only at the flush, rule 3 is what holds them.
 8. **Across stores:** the durable executed marker (`markExecuted`, written by
    `ClusterMember.handleConsensus` in `packages/db-p2p/src/cluster/cluster-repo.ts`) after the
    apply it describes, and the under-replication entry after the commit it describes. Two
-   stores are two durability domains, with no prefix rule between them; these hold because
-   `StorageRepo` flushes before it returns and the second write is issued afterwards.
+   stores are two durability domains, with no prefix rule between them, and the apply's own
+   flush may have been given a window, so the second write waits for the first to survive a
+   power cut rather than merely for its flush: the marker is written by
+   `markExecutedOnceDurable` in `packages/db-p2p/src/cluster/cluster-repo.ts` once the block
+   store's `whenDurable()` resolves (the `IDurableStorage` capability of `StorageRepo`, which
+   never hastens the sync; a repo without it has the marker written at once, and a rejection
+   writes none), and the ledger entry is written after the strict flush of the block store
+   that `KvUnderReplicationLedger`'s `beforeRecord` hook runs, wired by `createLibp2pNodeBase`.
+   A process crash between the apply and its marker loses only the marker, and redelivery
+   re-applies idempotently.
 
 ## Core Components
 

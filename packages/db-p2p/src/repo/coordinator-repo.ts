@@ -11,7 +11,8 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
-import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ICommitProofPersister, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import type { ReconcileBlockCallback, BlockHoldersSink } from "../cluster/cluster-repo.js";
@@ -479,6 +480,14 @@ interface CoordinatorRepoComponents {
 	 * callable it hands the drain. Absent → a settled entry is removed silently, as before.
 	 */
 	onBlockDurabilityReached?: BlockDurabilitySink;
+	/**
+	 * How long this node's own apply of a write that ran consensus — the fallback pend and commit —
+	 * may let its sync wait, from the size of the cohort the record ran on (`durabilityWindowMs` in
+	 * `../storage/durability-window.ts`, bound to the node's policy by `createLibp2pNodeBase`, which
+	 * hands the same function to `ClusterMember`). The solo paths never use it: no consensus ran and
+	 * only this machine holds the write. Absent → every apply is synced before it is reported.
+	 */
+	durabilityWindowFor?: DurabilityWindowFor;
 }
 
 /**
@@ -516,7 +525,8 @@ export function coordinatorRepo(
 		components.proofAnchoring,
 		components.underReplicationLedger,
 		components.onBlockHolders,
-		components.onBlockDurabilityReached
+		components.onBlockDurabilityReached,
+		components.durabilityWindowFor
 	);
 }
 
@@ -683,7 +693,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly proofAnchoring?: ProofAnchoring,
 		private readonly underReplicationLedger?: IUnderReplicationLedger,
 		private readonly onBlockHolders?: BlockHoldersSink,
-		private readonly onBlockDurabilityReached?: BlockDurabilitySink
+		private readonly onBlockDurabilityReached?: BlockDurabilitySink,
+		private readonly durabilityWindowFor?: DurabilityWindowFor
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2455,9 +2466,11 @@ export class CoordinatorRepo implements IRepo {
 						: isConflictFailure(localPendResult) ? 'conflict' : 'fault',
 				cohortRefusals: Object.keys(cohortPendRefusals ?? {})
 			});
-			// Only call storageRepo if local cluster didn't already execute during consensus
+			// Only call storageRepo if local cluster didn't already execute during consensus. The
+			// record ran on the cohort, so this apply flushes with that cohort's window, as the
+			// member's own apply would have.
 			if (!localExecuted) {
-				const result = await this.storageRepo.pend(request, options);
+				const result = await this.localApply().pend(request, options, { syncWithinMs: this.syncWindowFor(record) });
 				this.log('coordinator-repo:pend-fallback-result', {
 					actionId: request.actionId,
 					success: result.success,
@@ -2571,6 +2584,8 @@ export class CoordinatorRepo implements IRepo {
 	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
 	 */
 	private async pendSolo(request: PendRequest, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+		// Strict, no `syncWithinMs`: no consensus ran, and only this machine holds the write, so it
+		// is synced before the writer is answered.
 		const result = await this.storageRepo.pend(request, options);
 		return result.success ? { ...result, durability: await this.soloCohortDurability(cohort, blockId) } : result;
 	}
@@ -3110,7 +3125,7 @@ export class CoordinatorRepo implements IRepo {
 			// ClusterMember.applyConsensusOperation takes with its own projection.
 			const consensusProof = buildBlockCommitProof(record);
 			try {
-				const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, consensusProof);
+				const result = await this.localApply().commit(request, options, { proof: consensusProof, syncWithinMs: this.syncWindowFor(record) });
 				if (result.success) {
 					// The gate above already admitted this shape: the remote holders plus this node
 					// (when it is in the cohort) form the majority, and this node now holds it.
@@ -3452,6 +3467,19 @@ export class CoordinatorRepo implements IRepo {
 		return cohortWriteDurability(durability, selfHolds, this.localPeerId?.toString());
 	}
 
+	/** The widened local-apply seam ({@link ILocalApply}); a plain `IRepo` double ignores the third argument. */
+	private localApply(): IRepo & ILocalApply {
+		return this.storageRepo as IRepo & ILocalApply;
+	}
+
+	/**
+	 * How long this node's own apply of a write that ran consensus on `record`'s cohort may let its
+	 * sync wait (`recordDurabilityWindowMs`), 0 without a window function.
+	 */
+	private syncWindowFor(record: ClusterRecord): number {
+		return recordDurabilityWindowMs(this.durabilityWindowFor, record);
+	}
+
 	/**
 	 * The solo short-circuit of {@link commit}: consensus never runs, so no ClusterRecord exists to
 	 * project a proof from — the lone member self-signs a one-peer proof instead (mintSoloCommitProof),
@@ -3500,10 +3528,12 @@ export class CoordinatorRepo implements IRepo {
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
 		// `undefined` when no local cluster is wired (direct constructors, unit-test doubles) —
-		// then the commit lands proof-less, exactly the pre-mint behavior. The cast is the named
-		// ICommitProofPersister contract; a plain IRepo double ignores the extra argument.
+		// then the commit lands proof-less, exactly the pre-mint behavior. It rides down on the
+		// named ILocalApply contract; a plain IRepo double ignores the extra argument. Strict, no
+		// `syncWithinMs`: no consensus ran, and only this machine holds the write, so it is synced
+		// before the writer is answered.
 		const proof = await this.localCluster?.mintSoloCommitProof?.(message);
-		const result = await (this.storageRepo as IRepo & ICommitProofPersister).commit(request, options, proof);
+		const result = await this.localApply().commit(request, options, { proof });
 		if (!result.success) return result;
 		// One self-approval arms the read-repair window only where the DECLARED cohort is also one
 		// — then no rival quorum can exist to be missed. At any larger declared size (including
