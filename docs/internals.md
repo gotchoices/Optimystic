@@ -1927,8 +1927,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   back to a local commit — which can diverge for reasons the caller is not responsible for. A
   thrown missing pend and a returned `missing-base-revision` refusal are treated identically: if
   the record shows a simple majority approved the commit **and a strict majority of the cohort
-  reports durably holding the revision** (`cohortCommitOutcomes`, the other members' post-reconcile
-  reports), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
+  reports holding the revision** (`cohortCommitOutcomes`, the other members' post-reconcile
+  reports; "holding" in the sense of
+  [correctness.md §1.2 Nodes](correctness.md#12-nodes), *Storage durability*), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
   replication converge this peer. Returning the refusal instead would surface a *landed*
   transaction as a stale loss, since db-core's `commitPhase` treats any returned `success:false`
   as a stale loss and its coordinator re-drives the refused collection — alone, even after a
