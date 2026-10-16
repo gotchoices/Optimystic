@@ -47,6 +47,11 @@ const REPLACE_ATTEMPTS = 3;
  * judges the lock stale and replaces it. Two processes starting over one directory at the same
  * instant is already the violation the lock exists to refuse; if that race is ever seen, judge an
  * unreadable lock by its age instead of replacing it at once.
+ * NOTE: the holder is identified by pid and hostname alone. A dead holder's pid reused by an
+ * unrelated process reads as live, and the open is refused until the lock file is removed by hand;
+ * a machine whose hostname changed between two starts reads its own live lock as another
+ * machine's and replaces it. Both need a start-time stamp in the lock to tell apart; add one if
+ * either is seen.
  */
 export async function acquireStoreLock(basePath: string): Promise<StoreLock> {
 	const lockPath = path.join(basePath, STORE_LOCK_FILENAME);

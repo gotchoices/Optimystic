@@ -1,5 +1,8 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+// NOTE: `zlib.crc32` exists from Node 22.2 (and 20.15); the repository declares no engine floor,
+// and this import is what sets it for this package. On an older Node it is `undefined` and the
+// first commit throws a TypeError. If an older Node must be supported, compute the CRC here.
 import { crc32 } from 'zlib';
 import { armUnrefTimer } from '@optimystic/db-core';
 import { StoreFailedError, type SetTimer, type StoreIdentity } from '@optimystic/db-p2p';
@@ -402,7 +405,9 @@ export class FileWriteLog {
 	 * Take the lock, replay the log into the tree, truncate it and hold it open. Memoized: the first
 	 * operation opens, every later one waits for that. A directory another live process holds throws
 	 * {@link StoreLockedError} from every operation; an I/O failure latches the log failed and throws
-	 * {@link StoreFailedError} from every operation.
+	 * {@link StoreFailedError} from every operation. Either outcome is kept for the life of the
+	 * instance, and the instance is shared by every store over the directory until each has released
+	 * it: to retry after the holder has exited, close those stores and open a new one.
 	 */
 	open(): Promise<void> {
 		return this.opening ??= this.openOnce();
@@ -568,7 +573,15 @@ export class FileWriteLog {
 
 	// --- apply ---
 
-	/** Write each entry to its canonical path, creating missing directories; record what the tree was given. */
+	/**
+	 * Write each entry to its canonical path, creating missing directories; record what the tree was given.
+	 *
+	 * NOTE: the write goes straight to the canonical path, so a reader of that path can see it
+	 * half-written. The committing store's own readers are served from its overlay until this
+	 * resolves, and the two store kinds over one directory never share a path, so only a second
+	 * store of the same kind over the same directory can read a torn file — a shape Invariant 5
+	 * already excludes. If that shape is ever supported, write through a temp file and rename.
+	 */
 	private async applyBatch(entries: readonly WriteLogEntry[], touched: DirtyPaths): Promise<void> {
 		for (const entry of entries) {
 			const target = path.join(this.basePath, entry.path);

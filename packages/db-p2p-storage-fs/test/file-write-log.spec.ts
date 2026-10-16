@@ -126,23 +126,14 @@ describe('FileWriteLog replay', () => {
 		});
 	});
 
+	// A store written by a build before the log (a tree and no log file) is opened by
+	// `packages/upgrade-check` over the fixtures real older releases wrote, so no case here restates it.
 	it('a file that is not a write-ahead log replays nothing and is replaced by a fresh header', async () => {
 		await writeLogFile(base, Buffer.from('not a log at all'));
 
 		await withLog(base, async log => {
 			await log.open();
 			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)));
-		});
-	});
-
-	it('a store written by a build before the log has none and opens over its tree unchanged', async () => {
-		await fs.mkdir(path.join(base, 'blk'), { recursive: true });
-		await fs.writeFile(path.join(base, 'blk', 'meta.json'), 'older build');
-
-		await withLog(base, async log => {
-			await log.open();
-			assert.strictEqual(await readText(base, 'blk/meta.json'), 'older build');
-			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)), 'a header-only log was created');
 		});
 	});
 });

@@ -257,6 +257,11 @@ export class FileBatchBackend implements BatchBackend {
 	 * path's entry plus, off win32 and when the id carries a colon, the pre-encode raw-colon sibling's,
 	 * so a deleted item cannot resurface through the read fallback in readActionScopedBytes — in the
 	 * log, so a replay removes the sibling too.
+	 *
+	 * NOTE: that sibling entry names a path with a colon, which only a POSIX build writes; a log
+	 * carrying one and moved unreplayed to a win32 machine replays it as an unlink of an NTFS
+	 * stream path, where anything but ENOENT fails the open. A store is not moved across platforms
+	 * mid-log today; if it ever is, have the replay skip a delete it cannot spell on this platform.
 	 */
 	private toLogEntries(entry: BatchEntry): WriteLogEntry[] {
 		const relative = this.relativePath(entry.key);

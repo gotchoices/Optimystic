@@ -50,19 +50,20 @@ describe('FileRawStorage syncs the disk once per write group', () => {
 	}
 
 	for (const n of [1, 8]) {
-		it(`a pend and a commit touching ${n} block(s) each issue at most one sync`, async () => {
+		it(`a pend and a commit touching ${n} block(s) each issue exactly one sync`, async () => {
 			const repo = await openRepo();
 			const blockIds = Array.from({ length: n }, (_, i) => `block-${i}` as BlockId);
 			const actionId = 'action-1' as ActionId;
 
 			const pended = await repo.pend({ actionId, transforms: insertTransforms(blockIds), policy: 'c' });
 			assert.strictEqual(pended.success, true);
-			assert.ok(syncs <= 1, `pend of ${n} block(s) issued ${syncs} syncs`);
+			// Exactly one, not at most one: a write path that stopped syncing altogether must fail here.
+			assert.strictEqual(syncs, 1, `pend of ${n} block(s) issued ${syncs} syncs`);
 
 			syncs = 0;
 			const committed = await repo.commit({ actionId, blockIds, tailId: blockIds[0]!, rev: 1 });
 			assert.strictEqual(committed.success, true, JSON.stringify(committed));
-			assert.ok(syncs <= 1, `commit of ${n} block(s) issued ${syncs} syncs`);
+			assert.strictEqual(syncs, 1, `commit of ${n} block(s) issued ${syncs} syncs`);
 		});
 	}
 
