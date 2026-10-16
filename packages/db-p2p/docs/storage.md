@@ -210,48 +210,62 @@ carry:
 
 ### 6. A write survives a crash once a `flush()` called after it has resolved
 
-Every `RawStoreDriver` and every `IRawStorage` has a `flush()` and a `durability`. The
-durability (`StoreDurability` in `packages/db-p2p/src/storage/store-durability.ts`) names
-which crashes a flushed write survives: `'none'` (nothing survives a restart),
-`'process-crash'` (this process crashing, but not an operating-system crash or power cut)
-or `'power-loss'` (a power cut or operating-system crash too). It is fixed when the store is
-constructed and never changes. Both members are required, so a wrapper that forgets to
-forward either does not compile. `IKVStore` has an optional `flush` instead, because hosts
-implement that interface outside this repository; absent means every write is already as
-durable as it will ever be when it resolves.
+Every `RawStoreDriver` and every `IRawStorage` has a `flush(options?)`, a `whenDurable()` and
+a `durability`. The durability (`StoreDurability` in
+`packages/db-p2p/src/storage/store-durability.ts`) names which crashes a flushed write
+survives: `'none'` (nothing survives a restart), `'process-crash'` (this process crashing, but
+not an operating-system crash or power cut) or `'power-loss'` (a power cut or operating-system
+crash too). It is fixed when the store is constructed and never changes. A flush may be given
+`withinMs` (`FlushOptions` in `packages/db-p2p/src/storage/store-durability.ts`): how long after
+the call the writes it covers may stay exposed to a crash the durability names — the caller
+trading a bounded window of exposure for a sync that waits. Absent or 0, the flush is *strict*
+and resolves only once the writes survive, which is what every caller asks today; otherwise it
+is *relaxed*. `whenDurable()` resolves once every write covered by a flush that resolved before
+the call survives every crash the durability names, and never hastens a sync. All three members
+are required, so a wrapper that forgets to forward one does not compile. `IKVStore` has an
+optional `flush` instead, because hosts implement that interface outside this repository; absent
+means every write is already as durable as it will ever be when it resolves.
 
 The contract, stated in full on `RawStoreDriver.flush` in
 `packages/db-p2p/src/storage/raw-store-driver.ts`:
 
 1. A write method resolves once its effect is visible to every later read in this process.
-2. Once a `flush()` called after the write resolved has itself resolved, the write survives
-   every crash this store's `durability` names.
+2. Once a `flush()` called after the write resolved has itself resolved, the write survives a
+   crash of this process; it survives every crash this store's `durability` names once
+   `withinMs` has passed since that flush was called (at once, for 0 or absent), or once a
+   `whenDurable()` called after the flush resolved has itself resolved.
 3. **What survives any crash is a prefix of the resolved writes, in the order they
-   resolved.** No write survives while one that resolved before it is lost.
+   resolved.** No write survives while one that resolved before it is lost. A deferred sync is
+   exactly when a power cut can take a suffix, so a caller that allows one relies on this rule.
 4. A `flush()` covers every write resolved before it was called, including writes made by
-   other callers; concurrent flushes may share one sync.
+   other callers; concurrent flushes may share one sync. A flush with `withinMs` 0 covers every
+   earlier deferred write too, so it hastens their sync.
 5. A rejected `flush()` is a storage fault. After one, the store rejects every later write
    and flush until it is reopened, because a retried sync can report success for data the
-   operating system already dropped.
+   operating system already dropped. A deferred sync that fails latches the store the same
+   way, is logged, and is reported by the next write, flush or `whenDurable()`.
 
 Rule 3 is what keeps the crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid
 once a backend stops syncing each write on its own. Rules 4 and 5 bind a store whose flush
 does real work: `WriteGroupDriver`, whose flush is the sync, and the file backend built on it
-(see *Writes that wait in memory* below); every other backend satisfies them trivially:
+(see *Writes that wait in memory* below); every other backend satisfies them trivially, and
+every store that cannot defer a sync treats `withinMs` as 0 and resolves `whenDurable()` at
+once. Only `WriteGroupDriver` honours `withinMs`, and only over a backend that defers its
+sync, which none does yet:
 
-| Driver | What a write waits for today | What `flush()` does | `durability` |
-|---|---|---|---|
-| `MemoryStoreDriver` | the in-memory map update | nothing | `'none'` |
-| `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`, resolving when that has | the backend's |
-| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log, synced once per flush, then the tree written without waiting | `'power-loss'` |
-| `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | `'process-crash'` |
-| `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | `'process-crash'` |
-| `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | `'process-crash'` |
+| Driver | What a write waits for today | What `flush()` does | `withinMs` | `durability` |
+|---|---|---|---|---|
+| `MemoryStoreDriver` | the in-memory map update | nothing | ignored | `'none'` |
+| `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`; a strict flush resolves when the batch is durable, a relaxed one when it is committed | the time left to the earliest deadline of the flushes sharing the seal is passed to the backend's `commit` as `syncWithinMs`; honoured only as far as the backend defers | the backend's |
+| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log, synced once per flush, then the tree written without waiting | treated as 0: every commit syncs before it resolves (`file-store-syncs-by-the-earliest-deadline` is what defers) | `'power-loss'` |
+| `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | ignored | `'process-crash'` |
+| `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | ignored | `'process-crash'` |
+| `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | ignored | `'process-crash'` |
 
 The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStorage` with every
-storage class built on it — report the durability of what they wrap and flush by flushing
-it. The cache is write-through and holds no dirty state, so flushing it is flushing the
-driver underneath.
+storage class built on it — report the durability of what they wrap, flush by flushing it with
+the same options, and answer `whenDurable()` with the wrapped store's. The cache is
+write-through and holds no dirty state, so flushing it is flushing the driver underneath.
 
 **Writes that wait in memory.** `WriteGroupDriver` in
 `packages/db-p2p/src/storage/write-group-driver.ts` is a `RawStoreDriver` over a `BatchBackend`
@@ -260,18 +274,36 @@ driver underneath.
 this driver every write of every store — metadata, revisions, pending, transactions, proofs,
 materialized, and the two entries a promote records — resolves at once, recorded in an
 in-memory overlay that point reads consult first and listings merge over the backend's rows.
-`flush()` seals the writes recorded so far into one batch and resolves when the backend has
-committed it; batches commit one at a time, in sequence (rule 3), a flush arriving while a
-commit is in flight waits for it and then shares the next commit with every other flush that
-arrived meanwhile (rule 4), and a rejected commit latches the driver failed, after which every
-write and flush throws `StoreFailedError` (rule 5) while reads keep serving the overlay. The
-key-agnostic part — overlay, open batch, commit chain, failure latch and idle timer — is
-`WriteGroup` in `packages/db-p2p/src/storage/write-group.ts`, which `FileKVStore` also uses
-over string keys. A write that no group flushes is flushed by the driver's own idle timer,
-`idleFlushMs` (default one second) after the first write of an open batch. `IRawStorage.close`,
-optional and wired by the kernel only when the driver has one, flushes once more and releases
-the backend; the conformance suite's reopen case closes the first store before opening the
-second, since a second store opened beside the first would otherwise read the first's memory.
+`flush()` seals the writes recorded so far into one batch and hands it to the backend's
+`commit`, which resolves once the batch is applied and survives a crash of this process and
+hands back a `durable` promise (`CommittedBatch` in `packages/db-p2p/src/storage/write-group.ts`)
+that settles once it survives every crash the durability names. A strict flush resolves on
+`durable`, a relaxed one on the commit. Every flush that shares one seal contributes its
+deadline, and the batch is committed with `syncWithinMs` the time left to the earliest of them,
+so a backend may defer the sync of a batch every flush of which allowed it; a strict flush with
+nothing to seal has the backend `sync()` whatever is committed and not yet durable. Batches
+commit one at a time, in sequence, and their `durable` settle in commit order (rule 3); a flush
+arriving while a commit is in flight waits for it and then shares the next commit with every
+other flush that arrived meanwhile (rule 4); and a rejected commit — or a deferred sync that
+rejects, which is logged once on `optimystic:db-p2p:write-group:error` since no caller is still
+waiting on it — latches the driver failed, after which every write, flush and `whenDurable()`
+throws `StoreFailedError` (rule 5) while reads keep serving the overlay. An overlay entry stays
+until its batch is durable, not merely committed, so a write a crash could still take back is
+never read from the backend alone; the overlay is bounded by `maxUnsyncedBytes`
+(`WriteGroupOptions` in `packages/db-p2p/src/storage/write-group.ts`, 64 MiB by default): a seal
+that would leave more than that not yet durable is committed with `syncWithinMs` 0 whatever its
+flushes asked. `whenDurable()` is the `durable` of the latest committed batch. The key-agnostic
+part — overlay, open batch, commit chain, deadlines, failure latch and idle timer — is
+`WriteGroup` in the same file, which `FileKVStore` also uses over string keys and which exposes
+`whenDurable()` there too. A write that no group flushes is flushed, strictly, by the driver's
+own idle timer, `idleFlushMs` (default one second) after the first write of an open batch.
+`IRawStorage.close`, optional and wired by the kernel only when the driver has one, flushes
+strictly once more — which syncs every deferred batch — and releases the backend; the
+conformance suite's reopen case closes the first store before opening the second, since a
+second store opened beside the first would otherwise read the first's memory. The test double
+for all of this is `MemoryBatchBackend` in `packages/db-p2p/src/testing/memory-batch-backend.ts`,
+whose `deferSync` option holds a batch not durable until a `sync()` and whose `powerLoss()`
+rebuilds the store from the durable prefix alone.
 
 **The file backend.** `FileBatchBackend` commits each group through `FileWriteLog`
 (`packages/db-p2p-storage-fs/src/file-write-log.ts`): the batch is encoded as one record (a length,

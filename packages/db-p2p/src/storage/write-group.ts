@@ -117,6 +117,7 @@ export const DEFAULT_IDLE_FLUSH_MS = 1000;
 export const DEFAULT_MAX_UNSYNCED_BYTES = 64 * 1024 * 1024;
 
 const byteLength = (value: OverlayValue | undefined): number => value ? value.byteLength : 0;
+const noop = (): void => undefined;
 
 /**
  * The key-agnostic half of group commit: writes are recorded in memory and resolve at once, and
@@ -305,6 +306,9 @@ export class WriteGroup<K> {
 		this.openSeq += 1;
 		const durable = deferred();
 		const committed = this.runCommit(batch, seq, this.syncWithinFor(deadlines), durable);
+		// A seal whose every flush is strict awaits `durable` alone, which the commit's rejection also
+		// reaches, so nothing would observe it on `committed`; this only marks it observed.
+		committed.catch(noop);
 		this.inFlight = committed;
 		return { committed, durable: durable.promise };
 	}

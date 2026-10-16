@@ -617,9 +617,10 @@ export function runRawStorageConformance(
 				// nothing about what reached the location.
 				// NOTE: `close` flushes too, so over a group-committing driver this case proves that flush
 				// OR close hands the writes to the location, never that flush alone does. Flush alone is
-				// `WriteGroupDriver`'s own spec (`backend.committed` after `flush()`), and the power-loss
-				// double planned by `storage-flush-takes-a-sync-deadline` is what can prove it for a real
-				// backend; add such a case there rather than weakening this one.
+				// `WriteGroupDriver`'s own spec (`backend.committed` after `flush()`), and what a strict
+				// flush alone makes survive a power cut is its power-loss cases over
+				// `MemoryBatchBackend({ deferSync: true })` (`powerLoss()`); add to those rather than
+				// weakening this one.
 				await storage.close?.();
 
 				const reopened = await harness.reopen();

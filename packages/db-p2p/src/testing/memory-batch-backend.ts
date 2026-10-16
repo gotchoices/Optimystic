@@ -105,11 +105,11 @@ export class MemoryBatchBackend implements BatchBackend {
 		return { durable: settle.promise };
 	}
 
-	/** Hasten: mark every committed batch durable, in commit order, resolving each `durable`. */
-	sync(): Promise<void> {
+	/** Hasten: mark every committed batch durable, in commit order, resolving each `durable`. Rejects, like a real store, once failed. */
+	async sync(): Promise<void> {
 		this.throwIfFailed();
 		this.syncs += 1;
-		return this.syncAll();
+		await this.syncAll();
 	}
 
 	/**

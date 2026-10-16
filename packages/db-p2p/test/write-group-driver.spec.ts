@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 import { runRawStorageConformance } from '../src/testing/raw-storage-conformance.js';
-import { MemoryBatchBackend, type MemoryCommittedBatch } from '../src/testing/memory-batch-backend.js';
+import { MemoryBatchBackend, type MemoryBatchBackendOptions, type MemoryCommittedBatch } from '../src/testing/memory-batch-backend.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
 import { StoreFailedError, type SetTimer } from '../src/storage/write-group.js';
@@ -30,6 +30,25 @@ runRawStorageConformance('WriteGroupDriver over memory', async () => {
 	};
 }, { persistent: true });
 
+// The same suite over the power-loss double, whose commits stay not durable until a sync. Every
+// flush the suite makes is strict, so each commit is synced before it resolves; what this
+// registration adds is the reopen case's `close` running over the deferring double. A relaxed
+// flush followed by `close` has its own case below ('close syncs the batches…').
+runRawStorageConformance('WriteGroupDriver over memory (deferred sync)', async () => {
+	const backend = new MemoryBatchBackend({ deferSync: true });
+	const opened: KvRawStorage[] = [];
+	const open = (): KvRawStorage => {
+		const storage = new KvRawStorage(new WriteGroupDriver(backend));
+		opened.push(storage);
+		return storage;
+	};
+	return {
+		storage: open(),
+		reopen: async () => open(),
+		cleanup: async () => { for (const storage of opened) await storage.close?.(); }
+	};
+}, { persistent: true });
+
 // --- The group commit itself ---
 
 const B = 'block' as BlockId;
@@ -39,11 +58,12 @@ const text = (b: Uint8Array | undefined): string | undefined => b === undefined 
 const neverFires: SetTimer = () => () => undefined;
 
 /** A backend whose next commit parks until `release()`; `started` resolves once that commit has begun. */
-function parkableBackend(): { backend: MemoryBatchBackend; park: () => Promise<void>; release: () => void } {
+function parkableBackend(options: Omit<MemoryBatchBackendOptions, 'beforeApply'> = {}): { backend: MemoryBatchBackend; park: () => Promise<void>; release: () => void } {
 	let gate: Promise<void> | undefined;
 	let open: (() => void) | undefined;
 	let reached: (() => void) | undefined;
 	const backend = new MemoryBatchBackend({
+		...options,
 		beforeApply: () => {
 			const held = gate;
 			gate = undefined;
@@ -266,5 +286,111 @@ describe('WriteGroupDriver', () => {
 		expect(overFull.storeIdentity!()).to.equal('memory-batch:test');
 		expect(typeof overFull.listBlockIds).to.equal('function');
 		expect(typeof overFull.approximateBytesUsed).to.equal('function');
+	});
+
+	// --- A flush with a deadline, over the power-loss double ---
+
+	const deferring = (): MemoryBatchBackend => new MemoryBatchBackend({ deferSync: true });
+	const settledOf = async (p: Promise<unknown>): Promise<'resolved' | 'rejected' | 'pending'> =>
+		Promise.race([p.then(() => 'resolved' as const, () => 'rejected' as const), delay(5).then(() => 'pending' as const)]);
+
+	it('a relaxed flush resolves before its batch is durable while reads still serve it, a strict one does not, and a power cut takes back the suffix', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata('a' as BlockId, bytes('A'));
+		await driver.flush();
+		await driver.putMetadata('b' as BlockId, bytes('B'));
+		await driver.flush({ withinMs: 5000 });
+
+		expect(backend.committed.map(b => [b.syncWithinMs === 0, b.durable])).to.deep.equal([[true, true], [false, false]]);
+		expect(text(await driver.getMetadata('b' as BlockId)), 'served from memory until durable').to.equal('B');
+		expect(await settledOf(driver.whenDurable()), 'nothing hastens the deferred sync').to.equal('pending');
+
+		backend.powerLoss();
+		const fresh = new WriteGroupDriver(backend, { setTimer: neverFires });
+		expect(text(await fresh.getMetadata('a' as BlockId)), 'the strict flush survived').to.equal('A');
+		expect(await fresh.getMetadata('b' as BlockId), 'the deferred batch did not').to.equal(undefined);
+	});
+
+	it('a strict flush with nothing open hastens the deferred batches with one sync and no commit, after which they survive a power cut', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata(B, bytes('B'));
+		await driver.flush({ withinMs: 5000 });
+		const whenDurable = driver.whenDurable();
+
+		await driver.flush();
+		expect(backend.syncs, 'one sync').to.equal(1);
+		expect(backend.committed, 'nothing re-committed').to.have.length(1);
+		expect(await settledOf(whenDurable)).to.equal('resolved');
+
+		backend.powerLoss();
+		expect(text(await new WriteGroupDriver(backend, { setTimer: neverFires }).getMetadata(B))).to.equal('B');
+	});
+
+	it('a durable promise that rejects latches the store: whenDurable rejects, and the next write and flush throw StoreFailedError carrying the cause', async () => {
+		const backend = new MemoryBatchBackend({ deferSync: true, beforeDurable: () => { throw new Error('sync lost'); } });
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata(B, bytes('held'));
+		await driver.flush({ withinMs: 5000 });
+		const whenDurable = driver.whenDurable();
+
+		// The deferred sync running — on a real backend, its deadline timer.
+		await backend.sync().then(() => undefined, () => undefined);
+		const durableFailure = await whenDurable.then(() => undefined, (err: unknown) => err);
+		expect(durableFailure).to.be.instanceOf(StoreFailedError);
+		for (const later of [driver.putMetadata(B, bytes('again')), driver.flush()]) {
+			const failed = await later.then(() => undefined, (err: unknown) => err);
+			expect(failed).to.be.instanceOf(StoreFailedError);
+			expect(((failed as StoreFailedError).cause as Error).message).to.equal('sync lost');
+		}
+		expect(text(await driver.getMetadata(B)), 'the overlay keeps serving what never became durable').to.equal('held');
+	});
+
+	it('a seal that would leave more than maxUnsyncedBytes not yet durable commits with syncWithinMs 0, whatever its flush asked', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires, maxUnsyncedBytes: 8 });
+		await driver.putMetadata('b1' as BlockId, bytes('12345'));
+		await driver.flush({ withinMs: 5000 });
+		expect(backend.committed[0]!.syncWithinMs, 'five bytes fit under the bound').to.be.greaterThan(0);
+
+		await driver.putMetadata('b2' as BlockId, bytes('67890'));
+		await driver.flush({ withinMs: 5000 });
+		expect(backend.committed[1]!.syncWithinMs, 'ten would not').to.equal(0);
+		expect(backend.committed.map(b => b.durable), 'the strict commit synced the earlier deferred batch too').to.deep.equal([true, true]);
+	});
+
+	it('a strict and a relaxed flush sharing one seal commit it with syncWithinMs 0, and both resolve', async () => {
+		const { backend, park, release } = parkableBackend({ deferSync: true });
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata('b1' as BlockId, bytes('1'));
+		const started = park();
+		const first = driver.flush({ withinMs: 5000 });
+		await started;
+
+		await driver.putMetadata('b2' as BlockId, bytes('2'));
+		const relaxed = driver.flush({ withinMs: 5000 });
+		await driver.putMetadata('b3' as BlockId, bytes('3'));
+		const strict = driver.flush();
+
+		release();
+		await Promise.all([first, relaxed, strict]);
+		expect(backend.committed.map(summary)).to.deep.equal([[['metadata', '1']], [['metadata', '2'], ['metadata', '3']]]);
+		expect(backend.committed.map(b => b.syncWithinMs === 0), 'the strict waiter decides the shared seal').to.deep.equal([false, true]);
+		expect(backend.committed.map(b => b.durable), 'and its sync covers the earlier deferred batch').to.deep.equal([true, true]);
+	});
+
+	it('close syncs the batches whose flushes allowed a deferred sync before closing the backend', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata(B, bytes('v'));
+		await driver.flush({ withinMs: 5000 });
+		expect(backend.committed[0]!.durable).to.equal(false);
+
+		await driver.close();
+		expect(backend.committed[0]!.durable).to.equal(true);
+		expect(backend.closed).to.equal(true);
+		backend.powerLoss();
+		expect(text(await new WriteGroupDriver(backend, { setTimer: neverFires }).getMetadata(B))).to.equal('v');
 	});
 });
