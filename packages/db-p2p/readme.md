@@ -463,7 +463,7 @@ this package) to match what an unconfigured node resolves to.
 
 ### How long a write may wait for its sync (`storageDurability`)
 
-A node may leave a storage write unsynced for a short window before forcing it onto disk; how long is computed per write from the size of the cohort the write's consensus ran on, as the longest wait for which every machine that would have to lose the write losing power within it stays less likely than the accepted loss chance (`durabilityWindowMs` in `src/storage/durability-window.ts`). A cohort of one always syncs first.
+A node may leave a storage write unsynced for a short window before forcing it onto disk; how long is computed per write from the size of the cohort the write's consensus ran on, as the longest wait for which every machine that would have to lose the write losing power within it stays less likely than the accepted loss chance (`durabilityWindowMs` in `src/storage/durability-window.ts`). A write only this machine holds — every solo pend and commit — is synced before it is reported. The formula, its table, and which writes carry a window are in [docs/storage.md §How long a write may wait for its sync](docs/storage.md#how-long-a-write-may-wait-for-its-sync); what an acknowledged write survives on each backend is in [§What an acknowledged write survives](docs/storage.md#what-an-acknowledged-write-survives).
 
 ```typescript
 const node = await createLibp2pNode({

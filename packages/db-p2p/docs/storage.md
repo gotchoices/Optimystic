@@ -371,14 +371,19 @@ second store opened beside a first does not see the first's unflushed writes.
 operating-system crash or power cut is not established today. SQLite's write-ahead log stops
 recovery at the first frame whose checksum fails, so what survives is a prefix; LevelDB under
 default options skips a damaged log record and keeps reading the records after it, and the
-browsers behind IndexedDB promise nothing about relaxed transactions. Raising those two
-backends to `'power-loss'` with the prefix rule kept is the work of
-`mobile-and-browser-storage-keep-the-durability-window`; the `NOTE:` at `durability` on
-`LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
+browsers behind IndexedDB promise nothing about relaxed transactions. Raising the three to
+`'power-loss'` with the prefix rule kept is the work of `nativescript-storage-syncs-by-the-window`,
+`browser-storage-syncs-by-the-window` and `react-native-storage-commits-groups-through-the-journal`
+(the last waits on `react-native-storage-syncs-once-rn-leveldb-can` to sync); the `NOTE:` at
+`durability` on `LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
 
 **Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
-channel at start-up naming what the resolved storage's flushed writes survive
-(`logStorageDurability` in `packages/db-p2p/src/libp2p-node-base.ts`).
+channel at start-up naming what the resolved storage's flushed writes survive and what the
+durability window means on it (`logStorageDurability` in
+`packages/db-p2p/src/libp2p-node-base.ts`): on a `'power-loss'` store, the window for each
+cohort size up to the declared `clusterSize` (at most ten), or that every write is synced
+first when failures are not independent; on a `'process-crash'` store, that it cannot sync, so
+a power cut may lose any write the operating system has not written out, whatever the window.
 
 Every persistent backend's conformance suite registers `{ persistent: true }`, which adds a
 case that flushes a write of every kind and reads each back through a fresh store over the
@@ -409,15 +414,14 @@ node is about to report to another machine:
   `packages/db-p2p/src/storage/durability-window.ts` for the size of that record's cohort
   (`recordDurabilityWindowMs`, from `record.peers`, this node included and capped by the policy
   at the declared `clusterSize`), bound to the node's policy once by `createLibp2pNodeBase` and
-  handed to both as `durabilityWindowFor`. Every other group is strict: a solo pend or commit
-  (no consensus ran and only this machine holds the write), `cancel`, `recoverBlock`,
-  `saveReplicatedBlock`, a `get` that took a write latch, and a consensus `get` or `cancel`
-  operation — repair and bookkeeping, off the per-write hot path, and a replica a pusher counts
-  as held should not sit in a window. A `pend` or `commit` given a window flushes with it on
-  every exit, a refusal included: what a refusal writes is at most a dropped pending record,
-  and the writer is told to retry, so nothing is announced on it. A member or coordinator
-  built without `durabilityWindowFor` applies strictly, and until a backend defers its sync
-  (the table above) a window changes nothing a node does.
+  handed to both as `durabilityWindowFor`. Every other group is strict; the table under
+  [How long a write may wait for its sync](#how-long-a-write-may-wait-for-its-sync) lists
+  them. Repair and bookkeeping are off the per-write hot path, and a replica a pusher counts as
+  held should not sit in a window. A `pend` or `commit` given a window flushes with it on every
+  exit, a refusal included: what a refusal writes is at most a dropped pending record, and the
+  writer is told to retry, so nothing is announced on it. A member or coordinator built without
+  `durabilityWindowFor` applies strictly, and on a backend that does not defer its sync (every
+  one but the file backend, the table above) a window changes nothing a node does.
 - `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls
   `InvalidationContext.flush` after releasing its latches and before appending the entry that
   names the compensating revisions, so an entry never names revisions the store lost. Nothing
@@ -453,10 +457,16 @@ cohort acknowledged the write on a majority, and the window is sized so that the
 rival would need to out-vote are vanishingly unlikely to all lose power inside it. A deferred
 sync that fails latches the store (rule 5), so the next group on the node fails and is logged,
 but the writer answered inside the window was already told the write landed — the same risk.
+What the window does not price is a holder that lost a write writing alone before its partner
+returns, which forks the collection; that residual is stated under
+[Theorem 6](../../../docs/correctness.md#theorem-6-durability).
 
 **The write orders crash recovery relies on.** Every backend's flush is reviewed against this
-list. Each holds today because every step is synced before the next starts; once a backend
-syncs only at the flush, rule 3 is what holds them.
+list. Under a crash of this process every persistent backend keeps every resolved write, so
+each order holds. Under a power cut the file backend, which syncs only at the flush or within
+its window, is held to them by rule 3: what survives is a prefix of the resolved writes, which
+never keeps a later step without an earlier one. On the `'process-crash'` backends they are not
+established across a power cut (*Rule 3 past the crashes a store names*, above).
 
 1. **Claim before record.** `BlockStorage.savePendingTransaction` writes the slot and base the
    record claims into the block's metadata before the pending record itself, so a crash
@@ -496,6 +506,85 @@ syncs only at the flush, rule 3 is what holds them.
    that `KvUnderReplicationLedger`'s `beforeRecord` hook runs, wired by `createLibp2pNodeBase`.
    A process crash between the apply and its marker loses only the marker, and redelivery
    re-applies idempotently.
+
+#### How long a write may wait for its sync
+
+A node lets a write's sync wait only where other machines also hold the write, and only as long
+as the size of the cohort that agreed to it allows. `durabilityWindowMs` in
+`packages/db-p2p/src/storage/durability-window.ts` computes that window `w` for a cohort of `n`
+members at the node's promise threshold `t` (`superMajorityThreshold`):
+
+- a rival write needs `a = ⌈t·n⌉` approvals to take the write's revision;
+- a write is acknowledged once at least `h = ⌊n/2⌋ + 1` members hold it (the acknowledgement
+  gate's strict majority, [docs/correctness.md §2](../../../docs/correctness.md#2-definitions));
+- so at least `m = max(1, a + h − n)` of those holders must lose the write before a rival can
+  gather its approvals, since every other approval comes from a member that never held it.
+
+With `p` the rate of power cuts and operating-system crashes per machine and `ε` the accepted
+chance of losing one acknowledged write, machines that fail independently lose the write with a
+chance of about `C(h, m)·(p·w)^m`, so `w = (ε / C(h, m))^(1/m) / p`, rounded down to whole
+milliseconds and capped at `maxWindowMs`. Four rules decide before the formula does:
+
+1. `n` is capped at the node's declared `clusterSize`, so a record listing more peers cannot buy a
+   longer window.
+2. `n ≤ 1` gives 0: no other machine holds the write.
+3. `m = 1` gives 0: one machine losing the write would be enough. At a threshold of one half or
+   below this is every cohort.
+4. `independentFailures: false` gives 0 for every write, for a deployment whose machines share a
+   failure (two machines on one circuit).
+
+The inputs are `NodeOptions.storageDurability` (`StorageDurabilityOptions`), filled and validated
+once at node construction by `resolveDurabilityWindowPolicy`, which throws a `RangeError` naming
+the field for an out-of-range value. The defaults: independent failures assumed, `p` one per
+machine per 30 days (`lossRatePerHour` 1/720), `ε` 10⁻⁹ (`lossTarget`), and a 5000 ms cap
+(`maxWindowMs`). At those and the default threshold of 0.75:
+
+| n | a | h | m | C(h, m) | formula | window |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 | 1 | — | — | 0 ms |
+| 2 | 2 | 2 | 2 | 1 | 82 s | 5000 ms |
+| 3 | 3 | 2 | 2 | 1 | 82 s | 5000 ms |
+| 4 | 3 | 3 | 2 | 3 | 47 s | 5000 ms |
+| 5 | 4 | 3 | 2 | 3 | 47 s | 5000 ms |
+| 6 | 5 | 4 | 3 | 4 | 1633 s | 5000 ms |
+| 7 | 6 | 4 | 3 | 4 | 1633 s | 5000 ms |
+| 8 | 6 | 5 | 3 | 10 | 1203 s | 5000 ms |
+| 9 | 7 | 5 | 3 | 10 | 1203 s | 5000 ms |
+| 10 | 8 | 6 | 4 | 15 | 7406 s | 5000 ms |
+
+So at the defaults the cap, not the loss target, sets every window from two members up; the
+formula binds only at a higher loss rate (`lossRatePerHour: 1` gives 113 ms at `n = 2` and 65 ms
+at `n = 4`). The window column and those two values are pinned by
+`packages/db-p2p/test/durability-window.spec.ts`.
+
+Which writes carry a window (mechanism under *Who calls `flush()`* above):
+
+| Write | Window |
+|---|---|
+| `pend` and `commit` of a consensus record, applied by `ClusterMember.applyConsensusOperation` | `w` for the record's cohort |
+| `CoordinatorRepo`'s own fallback `pend` and `commit` after consensus ran without its member | `w` for the record's cohort |
+| a solo `pend` or `commit` (`CoordinatorRepo.pendSolo`, `CoordinatorRepo.commitSolo`): only this machine holds the write | 0 |
+| `cancel`, `recoverBlock`, `saveReplicatedBlock`, a `get` that took a write latch, a consensus `get` or `cancel` operation | 0 |
+| a group whose work threw | 0, whatever it was given |
+| the under-replication entry, and the flush of the block store its `beforeRecord` runs first | 0 |
+| the durable executed marker (`markExecutedOnceDurable`) | none of its own: written once the block store's `whenDurable()` resolves |
+
+#### What an acknowledged write survives
+
+From the moment the write's flush resolves, per backend:
+
+| Backend | `durability` | Process crash | Power cut or operating-system crash |
+|---|---|---|---|
+| File (`FileBatchBackend`) | `'power-loss'` | survives at once | survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving |
+| React Native LevelDB (`LevelDBStoreDriver`) | `'process-crash'` | survives at once | survives whenever the operating system writes it out; the window cannot be kept, and the node says so at start |
+| Browser IndexedDB (`IndexedDBStoreDriver`) | `'process-crash'` | survives at once | as LevelDB |
+| NativeScript SQLite (`SqliteStoreDriver`) | `'process-crash'` | survives at once | as LevelDB, with a prefix surviving |
+| Memory (`MemoryStoreDriver`) | `'none'` | lost | lost |
+
+Each phone and browser row changes as its ticket lands (`nativescript-storage-syncs-by-the-window`,
+`browser-storage-syncs-by-the-window`, `react-native-storage-commits-groups-through-the-journal`
+and the blocked `react-native-storage-syncs-once-rn-leveldb-can`), and
+[docs/correctness.md §1.2](../../../docs/correctness.md#12-nodes) with it.
 
 ## Core Components
 
