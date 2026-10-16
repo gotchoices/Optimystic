@@ -1,12 +1,20 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
 import type { ActionId, BlockId } from '@optimystic/db-core';
+import type { JournalRecord } from '@optimystic/db-p2p';
+
+/**
+ * The key of the applied-through mark in the `journal` store. A string, where every record's key
+ * is a number: IndexedDB orders numbers before strings, so a key range over the numbers never
+ * reaches the mark.
+ */
+export const JOURNAL_MARK_KEY = 'applied-through';
 
 /**
  * IndexedDB schema for the Optimystic browser storage backend.
  *
  * The six block-storage stores keep their original object stores and compound
- * array keys, but their values are now opaque `Uint8Array` blobs: the shared
- * `KvRawStorage` kernel owns JSON (de)serialization, so `IndexedDBStoreDriver`
+ * array keys, but their values are opaque `Uint8Array` blobs: the shared
+ * `KvRawStorage` kernel owns JSON (de)serialization, so `IndexedDBJournalStore`
  * only ever hands IndexedDB kernel-encoded bytes. IndexedDB stores a
  * `Uint8Array` natively via structured clone and returns a `Uint8Array`, so the
  * bytes round-trip without a codec here.
@@ -21,7 +29,11 @@ import type { ActionId, BlockId } from '@optimystic/db-core';
  *   as `revisions`, deliberately NOT the action keyspace (an action id is caller-chosen,
  *   so no reserved id could be relied on).
  * - `materialized`: materialized block bytes keyed by `[blockId, actionId]`. Deleting
- *   the row is a driver `delete`, not a stored `undefined`.
+ *   the row is an entry of a write group with no value, not a stored `undefined`.
+ * - `journal`: the write groups appended and not yet applied to the six stores above, each a
+ *   `JournalRecord` stored by structured clone under its `seq` (no codec: the record's keys are
+ *   plain objects and its values `Uint8Array`s), and under {@link JOURNAL_MARK_KEY} the number of
+ *   the last record applied. `IndexedDBJournalStore` owns both; nothing else touches the store.
  * - `kv`: a generic string keyspace shared by `IndexedDBKVStore` and the
  *   identity helper. Identity keys are stored as raw `Uint8Array` blobs (under
  *   a separate logical store from string-only `IKVStore` data, but the same
@@ -52,6 +64,10 @@ export interface OptimysticWebDB extends DBSchema {
 		key: [BlockId, ActionId];
 		value: Uint8Array;
 	};
+	journal: {
+		key: number | typeof JOURNAL_MARK_KEY;
+		value: JournalRecord | number;
+	};
 	kv: {
 		key: string;
 		value: string | Uint8Array;
@@ -59,9 +75,11 @@ export interface OptimysticWebDB extends DBSchema {
 }
 
 export const DEFAULT_DB_NAME = 'optimystic';
-// Bumped to 2 when the `proofs` object store was added. The `upgrade` hook is guarded
-// by `objectStoreNames.contains`, so an existing v1 database gains only the new store.
-export const DEFAULT_DB_VERSION = 2;
+// Bumped to 2 when the `proofs` object store was added and to 3 for `journal`. The `upgrade` hook
+// is guarded by `objectStoreNames.contains`, so an existing database gains only the stores it
+// lacks (backlog `debt-indexeddb-version-upgrade-is-untested-and-unhandled` owns testing that, and
+// the open that another tab's older connection blocks).
+export const DEFAULT_DB_VERSION = 3;
 
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
 
@@ -95,6 +113,9 @@ export async function openOptimysticWebDb(
 			}
 			if (!db.objectStoreNames.contains('materialized')) {
 				db.createObjectStore('materialized');
+			}
+			if (!db.objectStoreNames.contains('journal')) {
+				db.createObjectStore('journal');
 			}
 			if (!db.objectStoreNames.contains('kv')) {
 				db.createObjectStore('kv');
