@@ -5,7 +5,7 @@ import * as path from 'path';
 // first commit throws a TypeError. If an older Node must be supported, compute the CRC here.
 import { crc32 } from 'zlib';
 import { armUnrefTimer } from '@optimystic/db-core';
-import { StoreFailedError, type CommittedBatch, type SetTimer, type SinkCommitOptions, type StoreIdentity } from '@optimystic/db-p2p';
+import { StoreFailedError, SyncDeadlines, type CommittedBatch, type SetTimer, type SinkCommitOptions, type StoreIdentity } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { acquireStoreLock, StoreLockedError, type StoreLock } from './store-lock.js';
 
@@ -321,35 +321,6 @@ function checkpointSettings(options: FileWriteLogOptions): CheckpointSettings {
 const noop = (): void => { };
 const emptyDirty = (): DirtyPaths => ({ files: new Set(), directories: new Set() });
 
-/** A promise with its settlement in hand, whose rejection nobody has to observe (see {@link settlement}). */
-interface Settlement {
-	readonly promise: Promise<void>;
-	readonly resolve: () => void;
-	readonly reject: (err: unknown) => void;
-}
-
-/**
- * The `durable` of an unsynced batch. Pre-observed, because its owner may never hold it: a strict
- * commit whose inline sync fails rejects the batch's `durable` and then throws, and the caller is
- * handed the throw, never the promise. (`WriteGroup` keeps the same shape in db-p2p's `deferred`,
- * which that package does not export.)
- */
-function settlement(): Settlement {
-	let resolve!: () => void;
-	let reject!: (err: unknown) => void;
-	const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
-	promise.catch(noop);
-	return { promise, resolve, reject };
-}
-
-/** A record appended and not yet synced: what the sync step writes to the tree once the record is durable, and who is waiting for that. */
-interface UnsyncedBatch {
-	readonly entries: readonly WriteLogEntry[];
-	/** When the batch must be durable by, counted from its commit's call; absent for a strict batch, whose deadline is the commit itself. */
-	readonly deadline: number | undefined;
-	readonly durable: Settlement;
-}
-
 /**
  * The write-ahead log of one store directory: `<basePath>/write-ahead.log`, every batch of writes
  * appended as one record, synced by the earliest deadline any batch was given, and applied to the
@@ -426,17 +397,13 @@ export class FileWriteLog {
 	private checkpointAgain = false;
 	private cancelIdleCheckpoint: (() => void) | undefined;
 	/**
-	 * Records appended and not yet synced, in log order, with what the sync step owes each. Emptied
-	 * by every sync step and by the latch. Bounded by the window: it holds what was committed since
-	 * the last sync, and the earliest deadline among them forces one.
+	 * Records appended and not yet synced, in log order, each held with the entries the sync step
+	 * writes to the tree and the `durable` it settles; with them the earliest deadline, the timer
+	 * armed for it, and the `window-overrun` episode. Emptied by every sync step and by the latch.
+	 * Bounded by the window: it holds what was committed since the last sync, and the earliest
+	 * deadline among them forces one.
 	 */
-	private unsynced: UnsyncedBatch[] = [];
-	/** The earliest deadline in {@link unsynced}; absent when nothing there has one. */
-	private earliestDeadline: number | undefined;
-	/** The timer armed for {@link earliestDeadline}, if one is; it enqueues the sync step when it fires. */
-	private syncTimer: { readonly deadline: number; readonly cancel: () => void } | undefined;
-	/** True from a late sync until the next on-time one; the overrun is logged when it begins (see {@link reportOverrun}). */
-	private overrunning = false;
+	private readonly unsynced: SyncDeadlines<readonly WriteLogEntry[]>;
 
 	private constructor(
 		readonly basePath: string,
@@ -447,6 +414,12 @@ export class FileWriteLog {
 	) {
 		this.logPath = path.join(basePath, WRITE_LOG_FILENAME);
 		this.sealedPath = path.join(basePath, SEALED_WRITE_LOG_FILENAME);
+		this.unsynced = new SyncDeadlines({
+			onDue: firedAt => this.syncInBackground(firedAt),
+			setTimer: settings.setTimer,
+			log,
+			subject: basePath,
+		});
 	}
 
 	/** True once an open, an append, an apply or a checkpoint failed; every later commit then throws {@link StoreFailedError}. */
@@ -482,6 +455,9 @@ export class FileWriteLog {
 	 *   sync step before it resolves, whatever its own window. When the disk falls behind, writers
 	 *   wait for it instead of the window quietly growing.
 	 *
+	 * The deadlines, the timer and the backpressure test are the rules of `SyncDeadlines`, from
+	 * `@optimystic/db-p2p`, which every store that defers its sync shares.
+	 *
 	 * The tree is written at the sync, not here, so a reader of the tree never sees a batch whose
 	 * record a power cut could still take; the overlay above each store serves the batch until its
 	 * `durable` resolves.
@@ -490,19 +466,16 @@ export class FileWriteLog {
 		if (!(syncWithinMs >= 0) || !Number.isFinite(syncWithinMs)) {
 			return Promise.reject(new RangeError(`syncWithinMs must be a finite number of milliseconds at or above 0, got ${syncWithinMs}`));
 		}
-		const deadline = syncWithinMs > 0 ? Date.now() + syncWithinMs : undefined;
+		const deadline = this.unsynced.deadlineFor(syncWithinMs);
 		return this.enqueue(async () => {
 			await this.open();
 			if (this.closed) throw new Error(`write-ahead log at ${this.basePath} is closed`);
 			this.throwIfFailed();
-			const batch = await this.append(entries, deadline);
-			if (deadline === undefined || this.deadlinePassed(Date.now())) {
-				await this.syncUnsynced();
-			} else {
-				this.armSyncTimer(deadline);
-			}
+			await this.append(entries);
+			const durable = this.unsynced.defer(entries, deadline);
+			if (this.unsynced.mustSyncNow(deadline)) await this.syncUnsynced();
 			this.scheduleCheckpoint();
-			return { durable: batch.durable.promise };
+			return { durable };
 		});
 	}
 
@@ -654,12 +627,16 @@ export class FileWriteLog {
 	// --- append and sync ---
 
 	/**
-	 * Append the batch as one record and hold it in {@link unsynced}. The record has reached the
-	 * operating system when this resolves, so it survives a crash of this process: the next open's
-	 * replay applies it. A failed append latches the log, and rejects every batch still waiting for
-	 * its sync, since no sync will ever be made for them.
+	 * Append the batch as one record. The record has reached the operating system when this
+	 * resolves, so it survives a crash of this process: the next open's replay applies it. A failed
+	 * append latches the log, and rejects every batch still waiting for its sync, since no sync will
+	 * ever be made for them.
+	 *
+	 * A checkpoint syncs the tree outside the queue, so its failure can latch the log while this
+	 * append is in flight. The commit is then refused like every later one, its record left to the
+	 * next open's replay: nothing would ever sync a batch held after the latch.
 	 */
-	private async append(entries: readonly WriteLogEntry[], deadline: number | undefined): Promise<UnsyncedBatch> {
+	private async append(entries: readonly WriteLogEntry[]): Promise<void> {
 		try {
 			const record = encodeWriteLogRecord(entries);
 			await writeAll(this.handle!, record);
@@ -667,17 +644,7 @@ export class FileWriteLog {
 		} catch (err) {
 			throw this.latch(err);
 		}
-		const batch: UnsyncedBatch = { entries, deadline, durable: settlement() };
-		this.unsynced.push(batch);
-		if (deadline !== undefined && (this.earliestDeadline === undefined || deadline < this.earliestDeadline)) {
-			this.earliestDeadline = deadline;
-		}
-		return batch;
-	}
-
-	/** Whether a waiting batch is already overdue at `now`: the backpressure test at {@link commit}. */
-	private deadlinePassed(now: number): boolean {
-		return this.earliestDeadline !== undefined && this.earliestDeadline <= now;
+		this.throwIfFailed();
 	}
 
 	/**
@@ -691,60 +658,22 @@ export class FileWriteLog {
 	 * write succeeded included: the records are durable and the next open's replay rebuilds the tree
 	 * from them, but a `durable` is a promise that this process finished the work, and it did not.
 	 *
-	 * `owedSince` is the moment the sync became due when that is later than the covered deadlines:
-	 * the timer's task passes the time the timer fired, so the operating system's own timer slop is
-	 * not read as the log running late (see {@link reportOverrun}). A sync covering no deadline — only
-	 * strict batches — is due at no particular moment, and so is never late.
+	 * `owedSince` is the moment the timer fired, when the timer's task runs this: `SyncDeadlines.take`
+	 * counts the sync's lateness from it rather than from a deadline the timer's own slop missed, and
+	 * the cover says `window-overrun` once per episode of syncs that started late.
 	 */
 	private async syncUnsynced(owedSince?: number): Promise<void> {
-		if (this.unsynced.length === 0) return;
-		const startedAt = Date.now();
-		const covered = this.unsynced;
-		const due = this.earliestDeadline === undefined ? undefined : Math.max(this.earliestDeadline, owedSince ?? -Infinity);
+		const cover = this.unsynced.take(owedSince);
+		if (cover.items.length === 0) return;
 		try {
 			await this.handle!.sync();
-			for (const batch of covered) await this.applyBatch(batch.entries, this.dirty);
+			for (const entries of cover.items) await this.applyBatch(entries, this.dirty);
 		} catch (err) {
-			throw this.latch(err);
+			const failure = this.latch(err);
+			cover.fail(err);
+			throw failure;
 		}
-		this.unsynced = [];
-		this.earliestDeadline = undefined;
-		this.disarmSyncTimer();
-		for (const batch of covered) batch.durable.resolve();
-		this.reportOverrun(due === undefined ? 0 : startedAt - due, covered.length);
-	}
-
-	/**
-	 * Once per episode, say that a sync started `lateness` ms after it was due. `lateness` counts from
-	 * the earliest deadline the sync covered (or from the timer firing for it) to the sync STARTING,
-	 * not finishing: the sync's own duration is the disk's, and no scheduling could have hidden it,
-	 * whereas a sync that started late waited for the queue — an earlier sync, an apply or a seal
-	 * that ran past the deadline — which is the disk falling behind the window. An episode ends at
-	 * the next sync that started on time, a sync covering no deadline included.
-	 */
-	private reportOverrun(lateness: number, batches: number): void {
-		// NOTE: a commit that arrives in the instant between a deadline and its timer firing syncs by
-		// backpressure and is late here by the timer's slop, a few ms, through no fault of the disk. One
-		// line per episode, and an on-time sync ends it; if the line ever proves noisy under steady
-		// load, ignore a lateness below the timer's granularity.
-		const late = lateness > 0;
-		if (late && !this.overrunning) {
-			log('window-overrun: a sync of %s started %dms after its deadline, covering %d batch(es); the disk is behind the window', this.basePath, lateness, batches);
-		}
-		this.overrunning = late;
-	}
-
-	/** Arm the sync timer for `deadline`, unless one is armed for a deadline no later. The sync step disarms it. */
-	private armSyncTimer(deadline: number): void {
-		if (this.syncTimer && this.syncTimer.deadline <= deadline) return;
-		this.disarmSyncTimer();
-		const cancel = this.settings.setTimer(() => this.syncInBackground(Date.now()), Math.max(0, deadline - Date.now()));
-		this.syncTimer = { deadline, cancel };
-	}
-
-	private disarmSyncTimer(): void {
-		this.syncTimer?.cancel();
-		this.syncTimer = undefined;
+		cover.settle();
 	}
 
 	/** The timer fired: run the sync step in the queue. Its failure has latched the log, so it is only logged here, like a background checkpoint's. */
@@ -760,11 +689,8 @@ export class FileWriteLog {
 	 */
 	private latch(err: unknown): StoreFailedError {
 		this.fault ??= { cause: err };
-		const failure = new StoreFailedError(err);
-		for (const batch of this.unsynced.splice(0)) batch.durable.reject(failure);
-		this.earliestDeadline = undefined;
-		this.disarmSyncTimer();
-		return failure;
+		this.unsynced.failAll(err);
+		return new StoreFailedError(err);
 	}
 
 	// --- apply ---
@@ -907,8 +833,8 @@ export class FileWriteLog {
 	private async shutDown(): Promise<void> {
 		this.closed = true;
 		this.disarmIdleCheckpoint();
-		// The final checkpoint's seal syncs whatever is still waiting (see `seal`); the timer has nothing left to do.
-		this.disarmSyncTimer();
+		// The final checkpoint's seal syncs whatever is still waiting (see `seal`), which disarms the
+		// sync timer; one that fires before then enqueues a sync step that covers it sooner.
 		await this.queue;
 		try {
 			// A failure of the checkpoint in flight has been logged by whatever started it, and has

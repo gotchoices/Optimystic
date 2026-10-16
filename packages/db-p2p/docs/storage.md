@@ -322,7 +322,10 @@ armed for the earliest deadline runs the sync for everything waiting. A commit t
 earliest waiting deadline already passed syncs before it resolves whatever its own window, so when
 the disk falls behind, writers wait for it rather than the window growing; a sync that started
 after a deadline it covered is logged once per episode as `window-overrun` on the
-`optimystic:db-p2p-storage-fs:write-log` channel. The sink's `sync()` (`FileWriteLog.sync`), which a
+`optimystic:db-p2p-storage-fs:write-log` channel. That bookkeeping — the waiting batches in order,
+the earliest deadline and its timer, the backpressure test and the overrun episode — is
+`SyncDeadlines` in `packages/db-p2p/src/storage/sync-deadlines.ts`, which every store that defers
+its sync shares; the log supplies only the sync step. The sink's `sync()` (`FileWriteLog.sync`), which a
 strict flush with nothing to seal calls, runs the same step; a checkpoint's seal runs it first, so a
 sealed segment holds only synced records. Only after the sync is each entry written to its
 canonical tree file — straight to the path, no temp file or rename — or unlinked, without syncing
