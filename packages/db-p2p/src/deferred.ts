@@ -12,6 +12,10 @@ const noop = (): void => undefined;
  * batch's durability that no strict flush or `whenDurable()` is waiting on — must not surface as an
  * unhandled rejection, while every awaiter still sees it.
  */
+// NOTE: every promise `WriteGroup.flush` returns is one of these or is pre-observed the same way,
+// so a `flush()` nobody awaits fails silently rather than as an unhandled rejection. Every caller
+// awaits today (`StorageRepo.endGroup`, `WriteGroup.close`, the idle timer with its own catch); if
+// one ever fires and forgets, log at that call site.
 export function deferred(): Deferred {
 	let resolve!: () => void;
 	let reject!: (err: unknown) => void;

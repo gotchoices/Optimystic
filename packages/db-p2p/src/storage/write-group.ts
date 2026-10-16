@@ -37,17 +37,28 @@ export interface CommittedBatch {
 	readonly durable: Promise<void>;
 }
 
+/** What a {@link WriteGroupSink.commit} is told beside its batch. */
+export interface SinkCommitOptions {
+	/**
+	 * How long the batch may wait for the sync that makes it survive every crash the store's
+	 * `durability` names: 0 means before the commit resolves, with `durable` already settled and
+	 * every earlier batch synced too. A sink that cannot defer treats every value as 0.
+	 */
+	readonly syncWithinMs: number;
+}
+
 /** The store under a {@link WriteGroup}: one write, `commit`, and the hasten that makes committed batches durable. */
 export interface WriteGroupSink<K> {
 	/**
-	 * Apply the sealed batch, in order, atomically, so that it survives a crash of this process, and
-	 * resolve. `syncWithinMs` is how long the batch may then wait for the sync that makes it survive
-	 * every crash the store's `durability` names: 0 means before resolving, with `durable` already
-	 * settled and every earlier batch synced too. A sink that cannot defer treats every value as 0.
+	 * Apply the sealed batch, in order, atomically, so that it survives a crash of this process where
+	 * `durability` names one, and resolve; then sync it within {@link SinkCommitOptions.syncWithinMs}.
 	 * A rejection latches the group failed.
 	 */
-	commit(entries: readonly WriteGroupEntry<K>[], options: { readonly syncWithinMs: number }): Promise<CommittedBatch>;
-	/** Hasten: resolve once every batch whose commit has resolved survives every crash `durability` names. */
+	commit(entries: readonly WriteGroupEntry<K>[], options: SinkCommitOptions): Promise<CommittedBatch>;
+	/**
+	 * Hasten: resolve once every batch whose commit had resolved when this was called survives every
+	 * crash `durability` names. A batch committed while it runs is not covered.
+	 */
 	sync(): Promise<void>;
 }
 
@@ -98,11 +109,23 @@ interface SealWaiter {
 	readonly waiter: Deferred;
 }
 
-/** A batch whose commit has resolved and whose `durable` has not yet settled. */
-interface CommittedRecord {
+/** A sealed batch, from its seal until it is durable. */
+interface Batch {
 	readonly seq: number;
+	/**
+	 * When it must be durable by: the earliest deadline among the flushes that sealed it, lowered
+	 * when a later flush that covers it, but sealed nothing, asked for sooner.
+	 */
+	deadline: number;
 	/** Resolved when the batch is durable; rejected with `StoreFailedError` when the group latches failed first. */
 	readonly settled: Deferred;
+}
+
+/** The sink's `sync()` running now, with the highest sequence it covers. */
+interface SyncInFlight {
+	/** The latest batch committed when the sink was called; a hasten for a later one needs a sync of its own. */
+	through: number;
+	done: Promise<void>;
 }
 
 /** The two points a sealed batch settles at: a relaxed flush resolves on the first, a strict one on the second. */
@@ -136,7 +159,8 @@ const noop = (): void => undefined;
  * and the batch is committed with `syncWithinMs` the time left to the earliest of them, so the sink
  * may defer the sync of a batch every flush of which allowed it. A relaxed flush resolves when the
  * commit has; a strict one when the batch is durable. With nothing to seal, a strict flush asks the
- * sink to `sync()` whatever is committed and not yet durable, and a relaxed one resolves at once.
+ * sink to `sync()` whatever is committed and not yet durable, and a relaxed one resolves at once,
+ * asking the same in the background when its deadline is sooner than those batches were given.
  *
  * Each overlay entry carries the sequence of the batch that holds it. When that batch's `durable`
  * settles, exactly the entries of that sequence are dropped: a key written again after the batch
@@ -161,15 +185,17 @@ export class WriteGroup<K> {
 	private openSeq = 1;
 	/** Value bytes the overlay holds, which is what `maxUnsyncedBytes` bounds. */
 	private unsyncedBytes = 0;
-	/** The commit running now, if any. */
-	private inFlight: Promise<void> | undefined;
+	/** The commit running now, if any, and the batch it carries. */
+	private inFlight: { readonly batch: Batch; readonly committed: Promise<void> } | undefined;
 	/** The flushes waiting for {@link inFlight} to settle before the open batch is sealed with their deadlines. */
 	private sealWaiters: SealWaiter[] | undefined;
 	/** Batches committed and not yet durable, in commit order. */
-	private readonly notYetDurable: CommittedRecord[] = [];
-	/** The sink's `sync()` running now, shared by every strict flush that hastens meanwhile. */
-	private syncInFlight: Promise<void> | undefined;
+	private readonly notYetDurable: Batch[] = [];
+	/** The sink's `sync()` running now, shared by every hasten it covers. */
+	private syncInFlight: SyncInFlight | undefined;
 	private fault: { cause: unknown } | undefined;
+	/** Whether the fault has been logged, which happens once, the first time nobody is awaiting it. */
+	private faultReported = false;
 	private cancelIdleFlush: (() => void) | undefined;
 	private readonly idleFlushMs: number;
 	private readonly maxUnsyncedBytes: number;
@@ -234,7 +260,8 @@ export class WriteGroup<K> {
 	 * Make every write recorded before this call durable, at once or within `options.withinMs`, by
 	 * committing the open batch. Rules 4 and 5 of the flush contract on `RawStoreDriver.flush`:
 	 *
-	 * - Nothing recorded and no commit in flight: a relaxed flush resolves at once; a strict one
+	 * - Nothing recorded and no commit in flight: a relaxed flush resolves at once, hastening the
+	 *   committed batches in the background if its deadline is sooner than theirs; a strict one
 	 *   resolves at once when every committed batch is durable, and otherwise has the sink `sync()`
 	 *   and resolves when the latest committed batch is durable.
 	 * - Nothing recorded while a commit is in flight: waits for it, since its batch holds every write
@@ -247,7 +274,7 @@ export class WriteGroup<K> {
 	flush(options?: FlushOptions): Promise<void> {
 		const withinMs = options?.withinMs ?? 0;
 		if (!(withinMs >= 0) || !Number.isFinite(withinMs)) {
-			throw new RangeError(`withinMs must be a finite number of milliseconds at or above 0, got ${withinMs}`);
+			return Promise.reject(new RangeError(`withinMs must be a finite number of milliseconds at or above 0, got ${withinMs}`));
 		}
 		return this.settle({ deadline: Date.now() + withinMs, strict: withinMs === 0 });
 	}
@@ -291,45 +318,48 @@ export class WriteGroup<K> {
 			const sealed = this.sealAndCommit([request.deadline]);
 			return request.strict ? sealed.durable : sealed.committed;
 		}
-		if (this.inFlight) {
-			return request.strict ? this.inFlight.then(() => this.hastenLatest()) : this.inFlight;
+		const committed = this.inFlight?.committed;
+		if (request.strict) {
+			return committed ? committed.then(() => this.hastenLatest()) : this.hastenLatest();
 		}
-		return request.strict ? this.hastenLatest() : Promise.resolve();
+		this.hastenBy(request.deadline);
+		return committed ?? Promise.resolve();
 	}
 
 	/** Seal the open batch and commit it. Precondition: no commit in flight. */
 	private sealAndCommit(deadlines: readonly number[]): Settlement {
 		this.disarmIdleFlush();
-		const batch = this.open;
-		const seq = this.openSeq;
+		const entries = this.open;
 		this.open = [];
+		const now = Date.now();
+		const batch: Batch = { seq: this.openSeq, deadline: this.deadlineFor(deadlines, now), settled: deferred() };
 		this.openSeq += 1;
-		const durable = deferred();
-		const committed = this.runCommit(batch, seq, this.syncWithinFor(deadlines), durable);
+		const committed = this.runCommit(entries, batch, Math.max(0, batch.deadline - now));
 		// A seal whose every flush is strict awaits `durable` alone, which the commit's rejection also
 		// reaches, so nothing would observe it on `committed`; this only marks it observed.
 		committed.catch(noop);
-		this.inFlight = committed;
-		return { committed, durable: durable.promise };
+		this.inFlight = { batch, committed };
+		return { committed, durable: batch.settled.promise };
 	}
 
 	/**
-	 * How long the sealed batch may wait for its sync: until the earliest deadline among the flushes
-	 * sharing the seal, or not at all when the overlay would otherwise hold more than
-	 * `maxUnsyncedBytes` of writes not yet durable.
+	 * When the sealed batch must be durable by: the earliest deadline among the flushes sharing the
+	 * seal, or now when the overlay would otherwise hold more than `maxUnsyncedBytes` of writes not
+	 * yet durable.
 	 */
-	private syncWithinFor(deadlines: readonly number[]): number {
-		if (this.unsyncedBytes > this.maxUnsyncedBytes) return 0;
-		return Math.max(0, Math.min(...deadlines) - Date.now());
+	private deadlineFor(deadlines: readonly number[], now: number): number {
+		return this.unsyncedBytes > this.maxUnsyncedBytes ? now : Math.min(...deadlines);
 	}
 
-	private async runCommit(batch: readonly OpenEntry<K>[], seq: number, syncWithinMs: number, durable: Deferred): Promise<void> {
+	private async runCommit(entries: readonly OpenEntry<K>[], batch: Batch, syncWithinMs: number): Promise<void> {
 		try {
-			const committed = await this.sink.commit(batch.map(open => open.entry), { syncWithinMs });
-			this.awaitDurable(batch, seq, committed.durable, durable);
+			const committed = await this.sink.commit(entries.map(open => open.entry), { syncWithinMs });
+			// A deferred sync that failed meanwhile has latched the group, and nothing resolves after a latch.
+			if (this.fault) throw new StoreFailedError(this.fault.cause);
+			this.awaitDurable(entries, batch, committed.durable);
 		} catch (err) {
 			const failure = this.latch(err);
-			durable.reject(failure);
+			batch.settled.reject(failure);
 			throw failure;
 		} finally {
 			// Cleared before this promise settles, so every waiter on it finds no commit in flight.
@@ -338,17 +368,16 @@ export class WriteGroup<K> {
 	}
 
 	/** Keep the batch readable from the overlay until the sink says it is durable; a rejection latches the group. */
-	private awaitDurable(batch: readonly OpenEntry<K>[], seq: number, durable: Promise<void>, settled: Deferred): void {
-		const record: CommittedRecord = { seq, settled };
-		this.notYetDurable.push(record);
+	private awaitDurable(entries: readonly OpenEntry<K>[], batch: Batch, durable: Promise<void>): void {
+		this.notYetDurable.push(batch);
 		durable.then(
 			() => {
-				this.dropDurable(batch, seq);
-				const at = this.notYetDurable.indexOf(record);
+				this.dropDurable(entries, batch.seq);
+				const at = this.notYetDurable.indexOf(batch);
 				if (at >= 0) this.notYetDurable.splice(at, 1);
-				settled.resolve();
+				batch.settled.resolve();
 			},
-			(err: unknown) => this.latchDurableFailure(err),
+			(err: unknown) => this.latchUnawaited(err),
 		);
 	}
 
@@ -371,19 +400,53 @@ export class WriteGroup<K> {
 		if (this.fault) return Promise.reject(new StoreFailedError(this.fault.cause));
 		const latest = this.notYetDurable[this.notYetDurable.length - 1];
 		if (!latest) return Promise.resolve();
-		return Promise.all([this.syncOnce(), latest.settled.promise]).then(() => undefined);
+		return Promise.all([this.syncThrough(latest.seq), latest.settled.promise]).then(() => undefined);
 	}
 
-	/** One `sink.sync()` at a time: strict flushes hastening while one runs share it. A rejection latches the group. */
-	private syncOnce(): Promise<void> {
-		if (!this.syncInFlight) {
-			const sync = this.sink.sync().then(
-				() => undefined,
-				(err: unknown) => { throw this.latch(err); },
-			);
-			this.syncInFlight = sync.finally(() => { this.syncInFlight = undefined; });
+	/**
+	 * A relaxed flush that seals nothing still covers every batch not yet durable, and rule 2 binds
+	 * them to its deadline. The sink was told each batch's deadline at its commit and has no way to
+	 * be told a sooner one, so when the latest batch's deadline is later than this flush's, the
+	 * batches are hastened now instead, behind the commit in flight if there is one, with nobody
+	 * waiting: the flush itself resolves as a relaxed one does. The sync comes early by at most the
+	 * difference between the two deadlines, which under one window per node never happens at all.
+	 */
+	private hastenBy(deadline: number): void {
+		const latest = this.inFlight?.batch ?? this.notYetDurable[this.notYetDurable.length - 1];
+		if (!latest || latest.deadline <= deadline) return;
+		latest.deadline = deadline;
+		(this.inFlight?.committed ?? Promise.resolve())
+			.then(() => this.hastenLatest())
+			.catch((err: unknown) => this.latchUnawaited(err));
+	}
+
+	/**
+	 * One `sink.sync()` at a time. A sync covers the batches committed when it began, so a hasten
+	 * shares the one in flight only when that covers its batch, and otherwise runs one after it. A
+	 * rejection latches the group.
+	 */
+	private syncThrough(seq: number): Promise<void> {
+		const running = this.syncInFlight;
+		if (running && running.through >= seq) return running.done;
+		const next: SyncInFlight = { through: seq, done: Promise.resolve() };
+		next.done = (running?.done ?? Promise.resolve())
+			.then(() => this.runSync(next))
+			.finally(() => { if (this.syncInFlight === next) this.syncInFlight = undefined; });
+		this.syncInFlight = next;
+		return next.done;
+	}
+
+	/** Call the sink once, noting the latest batch committed as it begins, which is what the sync covers. */
+	private async runSync(sync: SyncInFlight): Promise<void> {
+		if (this.fault) throw new StoreFailedError(this.fault.cause);
+		const latest = this.notYetDurable[this.notYetDurable.length - 1];
+		if (!latest) return;
+		sync.through = Math.max(sync.through, latest.seq);
+		try {
+			await this.sink.sync();
+		} catch (err) {
+			throw this.latch(err);
 		}
-		return this.syncInFlight;
 	}
 
 	/**
@@ -395,7 +458,7 @@ export class WriteGroup<K> {
 		if (!this.sealWaiters) {
 			const waiters: SealWaiter[] = [];
 			this.sealWaiters = waiters;
-			this.inFlight!.then(
+			this.inFlight!.committed.then(
 				() => {
 					this.sealWaiters = undefined;
 					this.settleWaiters(waiters);
@@ -445,15 +508,15 @@ export class WriteGroup<K> {
 	}
 
 	/**
-	 * A sync the sink deferred failed after the flushes it covered had resolved, so no caller is
-	 * waiting on the commit to hear of it: latch, and say so once on `write-group:error`. The next
-	 * write, flush or `whenDurable()` reports it.
+	 * A fault no caller is awaiting — a sync the sink deferred past the flushes it covered, or a
+	 * hasten made behind a relaxed flush — is latched and said once on `write-group:error`, since
+	 * the next write, flush or `whenDurable()` reports it but nothing else would.
 	 */
-	private latchDurableFailure(err: unknown): void {
-		const first = this.fault === undefined;
-		this.latch(err);
-		if (first) {
-			log.error('durable-failed: %s', err instanceof Error ? err.message : String(err));
+	private latchUnawaited(err: unknown): void {
+		const failure = this.latch(err);
+		if (!this.faultReported) {
+			this.faultReported = true;
+			log.error('store-failed: %s', failure.cause instanceof Error ? failure.cause.message : String(failure.cause));
 		}
 	}
 

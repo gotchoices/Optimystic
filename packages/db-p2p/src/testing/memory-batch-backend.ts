@@ -1,7 +1,7 @@
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import { canonicalStoreKey, type BatchBackend, type BatchEntry, type StoreKey } from '../storage/batch-backend.js';
 import type { StoreDurability } from '../storage/store-durability.js';
-import { StoreFailedError, type CommittedBatch } from '../storage/write-group.js';
+import { StoreFailedError, type CommittedBatch, type SinkCommitOptions } from '../storage/write-group.js';
 import { deferred, type Deferred } from '../deferred.js';
 
 export interface MemoryBatchBackendOptions {
@@ -93,7 +93,7 @@ export class MemoryBatchBackend implements BatchBackend {
 	 * Apply the batch to the maps at once, so reads reflect it, and record it. Without `deferSync`,
 	 * or with `syncWithinMs` 0, this and every earlier batch are durable before this resolves.
 	 */
-	async commit(entries: readonly BatchEntry[], { syncWithinMs }: { readonly syncWithinMs: number }): Promise<CommittedBatch> {
+	async commit(entries: readonly BatchEntry[], { syncWithinMs }: SinkCommitOptions): Promise<CommittedBatch> {
 		this.throwIfFailed();
 		await this.options.beforeApply?.(entries);
 		this.apply(entries);
@@ -169,9 +169,10 @@ export class MemoryBatchBackend implements BatchBackend {
 		return run;
 	}
 
+	/** Covers the batches committed when it begins, as a real sync does: one committed meanwhile waits for the next. */
 	private async drainUnsynced(): Promise<void> {
-		while (this.unsynced.length > 0) {
-			const { batch, settle } = this.unsynced.shift()!;
+		this.throwIfFailed();
+		for (const { batch, settle } of this.unsynced.splice(0)) {
 			try {
 				await this.options.beforeDurable?.(batch.entries);
 			} catch (err) {

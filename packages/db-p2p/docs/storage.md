@@ -231,9 +231,9 @@ The contract, stated in full on `RawStoreDriver.flush` in
 
 1. A write method resolves once its effect is visible to every later read in this process.
 2. Once a `flush()` called after the write resolved has itself resolved, the write survives a
-   crash of this process; it survives every crash this store's `durability` names once
-   `withinMs` has passed since that flush was called (at once, for 0 or absent), or once a
-   `whenDurable()` called after the flush resolved has itself resolved.
+   crash of this process where `durability` names one; it survives every crash `durability`
+   names once `withinMs` has passed since that flush was called (at once, for 0 or absent), or
+   once a `whenDurable()` called after the flush resolved has itself resolved.
 3. **What survives any crash is a prefix of the resolved writes, in the order they
    resolved.** No write survives while one that resolved before it is lost. A deferred sync is
    exactly when a power cut can take a suffix, so a caller that allows one relies on this rule.
@@ -281,12 +281,15 @@ that settles once it survives every crash the durability names. A strict flush r
 `durable`, a relaxed one on the commit. Every flush that shares one seal contributes its
 deadline, and the batch is committed with `syncWithinMs` the time left to the earliest of them,
 so a backend may defer the sync of a batch every flush of which allowed it; a strict flush with
-nothing to seal has the backend `sync()` whatever is committed and not yet durable. Batches
+nothing to seal has the backend `sync()` whatever is committed and not yet durable, and a relaxed
+one with nothing to seal does the same in the background when its deadline is sooner than those
+batches were given, since rule 2 binds them to it and the backend cannot be told a sooner
+deadline after the commit. Batches
 commit one at a time, in sequence, and their `durable` settle in commit order (rule 3); a flush
 arriving while a commit is in flight waits for it and then shares the next commit with every
-other flush that arrived meanwhile (rule 4); and a rejected commit — or a deferred sync that
-rejects, which is logged once on `optimystic:db-p2p:write-group:error` since no caller is still
-waiting on it — latches the driver failed, after which every write, flush and `whenDurable()`
+other flush that arrived meanwhile (rule 4); and a rejected commit — or a rejected sync no
+caller is waiting on, a deferred one or the hasten behind a relaxed flush, which is logged once
+on `optimystic:db-p2p:write-group:error` — latches the driver failed, after which every write, flush and `whenDurable()`
 throws `StoreFailedError` (rule 5) while reads keep serving the overlay. An overlay entry stays
 until its batch is durable, not merely committed, so a write a crash could still take back is
 never read from the backend alone; the overlay is bounded by `maxUnsyncedBytes`

@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import type { BlockId, ActionId } from '@optimystic/db-core';
-import type { BatchBackend, BatchEntry, CommittedBatch, StoreDurability, StoreIdentity, StoreKey } from '@optimystic/db-p2p';
+import type { BatchBackend, BatchEntry, CommittedBatch, SinkCommitOptions, StoreDurability, StoreIdentity, StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { FileWriteLog, SYNCED_BATCH, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
@@ -233,7 +233,7 @@ export class FileBatchBackend implements BatchBackend {
 	// --- the one write ---
 
 	/** Syncs before resolving whatever `syncWithinMs` allows (see `SYNCED_BATCH`). */
-	async commit(entries: readonly BatchEntry[], _options: { readonly syncWithinMs: number }): Promise<CommittedBatch> {
+	async commit(entries: readonly BatchEntry[], _options: SinkCommitOptions): Promise<CommittedBatch> {
 		await this.shared().commit(entries.flatMap(entry => this.toLogEntries(entry)));
 		return SYNCED_BATCH;
 	}

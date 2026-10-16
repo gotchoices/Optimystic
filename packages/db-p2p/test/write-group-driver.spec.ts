@@ -328,6 +328,51 @@ describe('WriteGroupDriver', () => {
 		expect(text(await new WriteGroupDriver(backend, { setTimer: neverFires }).getMetadata(B))).to.equal('B');
 	});
 
+	it('a strict flush does not share a sync that began before its batch committed', async () => {
+		let release!: () => void;
+		let reached!: () => void;
+		const parked = new Promise<void>(resolve => { release = resolve; });
+		const started = new Promise<void>(resolve => { reached = resolve; });
+		let syncsBegun = 0;
+		const backend = new MemoryBatchBackend({
+			deferSync: true,
+			beforeDurable: () => {
+				if (syncsBegun++ > 0) return undefined;
+				reached();
+				return parked;
+			},
+		});
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata('b1' as BlockId, bytes('1'));
+		await driver.flush({ withinMs: 5000 });
+		const first = driver.flush();
+		await started;
+
+		await driver.putMetadata('b2' as BlockId, bytes('2'));
+		await driver.flush({ withinMs: 5000 });
+		const second = driver.flush();
+
+		release();
+		await Promise.all([first, second]);
+		expect(backend.syncs, 'the second strict flush ran a sync of its own').to.equal(2);
+		expect(backend.committed.map(b => b.durable)).to.deep.equal([true, true]);
+	});
+
+	it('a relaxed flush that seals nothing hastens the committed batches when its deadline is sooner than theirs, and leaves them when it is not', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata('b1' as BlockId, bytes('1'));
+		await driver.flush({ withinMs: 5000 });
+		await driver.flush({ withinMs: 9000 });
+		await delay(0);
+		expect(backend.syncs, 'a later deadline binds nothing new').to.equal(0);
+
+		await driver.flush({ withinMs: 10 });
+		await driver.whenDurable();
+		expect(backend.syncs, 'a sooner deadline is met by a sync now').to.equal(1);
+		expect(backend.committed[0]!.durable).to.equal(true);
+	});
+
 	it('a durable promise that rejects latches the store: whenDurable rejects, and the next write and flush throw StoreFailedError carrying the cause', async () => {
 		const backend = new MemoryBatchBackend({ deferSync: true, beforeDurable: () => { throw new Error('sync lost'); } });
 		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
