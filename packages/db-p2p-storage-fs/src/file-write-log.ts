@@ -5,13 +5,20 @@ import * as path from 'path';
 // first commit throws a TypeError. If an older Node must be supported, compute the CRC here.
 import { crc32 } from 'zlib';
 import { armUnrefTimer } from '@optimystic/db-core';
-import { StoreFailedError, type SetTimer, type StoreIdentity } from '@optimystic/db-p2p';
+import { StoreFailedError, type CommittedBatch, type SetTimer, type StoreIdentity } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { acquireStoreLock, StoreLockedError, type StoreLock } from './store-lock.js';
 
 const log = createLogger('write-log');
 
 export const WRITE_LOG_FILENAME = 'write-ahead.log';
+
+/**
+ * What a write group's commit over this log hands back. `FileWriteLog.commit` syncs every record
+ * before it resolves, so a committed batch is already durable: the log never defers a sync, and
+ * treats every `syncWithinMs` as 0.
+ */
+export const SYNCED_BATCH: CommittedBatch = { durable: Promise.resolve() };
 
 /**
  * The log a checkpoint has sealed and is syncing the tree under. Present on disk only between a

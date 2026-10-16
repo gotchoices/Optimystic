@@ -2,11 +2,11 @@ import { expect } from 'chai';
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import { delay } from '@optimystic/db-core/test';
 import { runRawStorageConformance } from '../src/testing/raw-storage-conformance.js';
-import { MemoryBatchBackend } from '../src/testing/memory-batch-backend.js';
+import { MemoryBatchBackend, type MemoryCommittedBatch } from '../src/testing/memory-batch-backend.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
 import { StoreFailedError, type SetTimer } from '../src/storage/write-group.js';
-import type { BatchBackend, BatchEntry } from '../src/storage/batch-backend.js';
+import type { BatchBackend } from '../src/storage/batch-backend.js';
 import type { StoreIdentity } from '../src/storage/store-identity.js';
 import { collect } from './support/cache-test-helpers.js';
 
@@ -61,8 +61,8 @@ function parkableBackend(): { backend: MemoryBatchBackend; park: () => Promise<v
 	};
 }
 
-const summary = (batch: readonly BatchEntry[]): [string, string][] =>
-	batch.map(e => [e.key.store, e.value === undefined ? '<delete>' : text(e.value)!]);
+const summary = (batch: MemoryCommittedBatch): [string, string][] =>
+	batch.entries.map(e => [e.key.store, e.value === undefined ? '<delete>' : text(e.value)!]);
 
 describe('WriteGroupDriver', () => {
 	it('a write resolves before any commit and is served from memory; flush hands the group to one commit in resolution order', async () => {
@@ -250,7 +250,8 @@ describe('WriteGroupDriver', () => {
 			get: key => memory.get(key),
 			rangeRevisions: (blockId, lo, hi) => memory.rangeRevisions(blockId, lo, hi),
 			listPendingActionIds: blockId => memory.listPendingActionIds(blockId),
-			commit: entries => memory.commit(entries),
+			commit: (entries, options) => memory.commit(entries, options),
+			sync: () => memory.sync(),
 		};
 		const overBare = new WriteGroupDriver(bare);
 		expect(overBare.durability).to.equal('process-crash');

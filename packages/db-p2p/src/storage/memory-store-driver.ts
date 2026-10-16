@@ -1,6 +1,6 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
-import type { StoreDurability } from "./store-durability.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 
 /**
  * In-memory {@link RawStoreDriver}: the six logical block-storage stores as
@@ -147,8 +147,12 @@ export class MemoryStoreDriver implements RawStoreDriver {
 
 	// --- flush ---
 
-	// No-op: with durability 'none' there is nothing for a flush to protect.
-	flush(): Promise<void> {
+	// No-op: with durability 'none' there is nothing for a flush, or a deferred sync, to protect.
+	flush(_options?: FlushOptions): Promise<void> {
+		return Promise.resolve();
+	}
+
+	whenDurable(): Promise<void> {
 		return Promise.resolve();
 	}
 

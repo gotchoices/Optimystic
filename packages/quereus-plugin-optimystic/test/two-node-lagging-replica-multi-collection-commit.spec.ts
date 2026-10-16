@@ -36,7 +36,7 @@ import type {
 } from '@optimystic/db-core';
 import { CoordinatorPartialCommitError } from '@optimystic/db-core';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
-import type { BlockCommitProof, BlockMetadata, StoreDurability } from '@optimystic/db-p2p';
+import type { BlockCommitProof, BlockMetadata, FlushOptions, StoreDurability } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactors, type MeshOptions } from '@optimystic/db-p2p/testing';
 import { createMeshDbNode, type MeshDbNode } from './mesh-node-harness.js';
 
@@ -130,8 +130,11 @@ class LaggingRawStorage implements RawStorage {
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		if (!this.drop(blockId)) await this.inner.promotePendingTransaction(blockId, actionId);
 	}
-	flush(): Promise<void> {
-		return this.inner.flush();
+	flush(options?: FlushOptions): Promise<void> {
+		return this.inner.flush(options);
+	}
+	whenDurable(): Promise<void> {
+		return this.inner.whenDurable();
 	}
 	get durability(): StoreDurability {
 		return this.inner.durability;

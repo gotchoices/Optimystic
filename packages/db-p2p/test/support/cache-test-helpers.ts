@@ -3,7 +3,7 @@ import type { BlockId, ActionId, IBlock, Transforms } from '@optimystic/db-core'
 import type { RawStoreDriver } from '../../src/storage/raw-store-driver.js';
 import type { IRawStorage } from '../../src/storage/i-raw-storage.js';
 import type { StoreIdentity } from '../../src/storage/store-identity.js';
-import type { StoreDurability } from '../../src/storage/store-durability.js';
+import type { FlushOptions, StoreDurability } from '../../src/storage/store-durability.js';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
 
 export const makeBlock = (id: string, data?: Record<string, unknown>): IBlock => ({
@@ -136,9 +136,13 @@ export class CountingStoreDriver implements RawStoreDriver {
 		this.bump('promote');
 		return this.inner.promote(blockId, actionId);
 	}
-	async flush(): Promise<void> {
+	async flush(options?: FlushOptions): Promise<void> {
 		this.bump('flush');
-		return this.inner.flush();
+		return this.inner.flush(options);
+	}
+	async whenDurable(): Promise<void> {
+		this.bump('whenDurable');
+		return this.inner.whenDurable();
 	}
 	get durability(): StoreDurability {
 		return this.inner.durability;

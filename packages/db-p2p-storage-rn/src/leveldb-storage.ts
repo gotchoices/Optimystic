@@ -1,5 +1,5 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
-import { KvRawStorage, identityForHandle, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
+import { KvRawStorage, identityForHandle, type FlushOptions, type RawStoreDriver, type StoreDurability, type StoreIdentity } from '@optimystic/db-p2p';
 import { drain, type LevelDBLike } from './leveldb-like.js';
 import {
 	TAG_PENDING,
@@ -170,7 +170,12 @@ export class LevelDBStoreDriver implements RawStoreDriver {
 
 	// No-op: no write here asks LevelDB to sync, so there is nothing for a flush to wait on yet.
 	// `mobile-and-browser-storage-keep-the-durability-window` gives it real work.
-	flush(): Promise<void> {
+	flush(_options?: FlushOptions): Promise<void> {
+		return Promise.resolve();
+	}
+
+	// Resolves at once for the same reason: no flush here ever leaves a sync pending.
+	whenDurable(): Promise<void> {
 		return Promise.resolve();
 	}
 

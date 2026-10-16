@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { WriteGroup, type IKVStore, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
-import { FileWriteLog, assertFileWriteLogOptions, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
+import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
+import { FileWriteLog, SYNCED_BATCH, assertFileWriteLogOptions, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
 /** The write group's `idleFlushMs` and the log's checkpoint settings; `setTimer` (test-only) arms both. */
 export type FileKVStoreOptions = WriteGroupOptions & FileWriteLogOptions;
@@ -34,7 +34,11 @@ export class FileKVStore implements IKVStore {
 		assertFileWriteLogOptions(options);
 		this.basePath = path.resolve(basePath);
 		this.options = options;
-		this.group = new WriteGroup<string>(key => key, entries => this.commit(entries), options);
+		this.group = new WriteGroup<string>(key => key, {
+			commit: entries => this.commit(entries),
+			// Every committed batch is already synced (see `SYNCED_BATCH`), so there is nothing to hasten.
+			sync: () => Promise.resolve(),
+		}, options);
 	}
 
 	async get(key: string): Promise<string | undefined> {
@@ -72,9 +76,14 @@ export class FileKVStore implements IKVStore {
 		return [...keys];
 	}
 
-	/** Make every write resolved before this call durable: one log record, one sync. */
-	flush(): Promise<void> {
-		return this.group.flush();
+	/** Make every write resolved before this call durable: one log record, one sync. The contract is `RawStoreDriver.flush`'s. */
+	flush(options?: FlushOptions): Promise<void> {
+		return this.group.flush(options);
+	}
+
+	/** Resolves once every write covered by a flush that resolved before this call is durable; `RawStoreDriver.whenDurable`'s contract. */
+	whenDurable(): Promise<void> {
+		return this.group.whenDurable();
 	}
 
 	/** Flush what is still held, then release this store's reference to the directory's log. */
@@ -88,10 +97,11 @@ export class FileKVStore implements IKVStore {
 		}
 	}
 
-	private async commit(entries: readonly WriteGroupEntry<string>[]): Promise<void> {
+	private async commit(entries: readonly WriteGroupEntry<string>[]): Promise<CommittedBatch> {
 		await this.shared().commit(entries.map(({ key, value }): WriteLogEntry => value === undefined
 			? { kind: 'delete', path: this.keyToRelative(key) }
 			: { kind: 'put', path: this.keyToRelative(key), value }));
+		return SYNCED_BATCH;
 	}
 
 	private shared(): FileWriteLog {
