@@ -59,3 +59,32 @@ describe('SQLite transaction serialization on the shared connection', () => {
 		await db.close();
 	});
 });
+
+// A synced transaction raises `synchronous` to FULL for its own commit only: the connection is
+// shared with every store in the package, and left at FULL every later commit would pay for a sync
+// nobody asked for. `PRAGMA synchronous` reads 1 for NORMAL and 2 for FULL.
+describe('synced transactions on the shared connection', () => {
+	const synchronous = async (db: SqliteDb): Promise<unknown> => (await db.prepare('PRAGMA synchronous').get())?.synchronous;
+
+	it('restore NORMAL after the commit', async () => {
+		const db = await openTestDb();
+		try {
+			await db.transaction(async (tx) => { await tx.prepare(INSERT).run('synced', 'z'); }, { synced: true });
+			expect(await synchronous(db)).to.equal(1);
+			expect(await stored(db, 'synced')).to.equal('z');
+		} finally {
+			await db.close();
+		}
+	});
+
+	it('restore NORMAL after a rollback too', async () => {
+		const db = await openTestDb();
+		try {
+			const results = await Promise.allSettled([db.transaction(async () => { throw new Error('roll back'); }, { synced: true })]);
+			expect(results[0]!.status).to.equal('rejected');
+			expect(await synchronous(db)).to.equal(1);
+		} finally {
+			await db.close();
+		}
+	});
+});

@@ -73,11 +73,6 @@ export interface SqliteBatchBackendOptions {
 	readonly setTimer?: SetTimer;
 }
 
-/** The cover a sync step took, kept where a failure after the take can still reach it. */
-interface SyncStep {
-	cover?: SyncCover<undefined>;
-}
-
 /**
  * SQLite {@link BatchBackend}: the six logical block-storage stores mapped to the six relational
  * tables (`metadata`, `revisions`, `pending`, `transactions`, `proofs`, `materialized`) with their
@@ -286,20 +281,21 @@ export class SqliteBatchBackend implements BatchBackend {
 	 * counts the sync's lateness from it rather than from a deadline the timer's own slop missed.
 	 */
 	private async syncHeld(owedSince?: number, write?: (tx: SqliteTransaction) => Promise<number>): Promise<void> {
-		const step: SyncStep = {};
+		// Assigned inside the body, so a failure after the take still reaches the cover it took.
+		let cover: SyncCover<undefined> | undefined;
 		try {
 			await this.db.transaction(async (tx) => {
 				this.throwIfFailed();
 				const written = write ? await write(tx) : 0;
-				step.cover = this.deadlines.take(owedSince);
-				if (written === 0 && step.cover.items.length > 0) await bumpDurabilityMark(tx);
+				cover = this.deadlines.take(owedSince);
+				if (written === 0 && cover.items.length > 0) await bumpDurabilityMark(tx);
 			}, { synced: true });
 		} catch (err) {
 			const failure = this.latch(err);
-			step.cover?.fail(failure.cause);
+			cover?.fail(failure.cause);
 			throw failure;
 		}
-		step.cover?.settle();
+		cover?.settle();
 	}
 
 	/** The timer fired: run the sync step. Its failure has latched the backend, so it is only logged here. */

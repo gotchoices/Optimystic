@@ -7,7 +7,7 @@ import { openTestDb, openTestFileDb } from './node-sqlite-driver.js';
 import type { SqliteDb } from '../src/db.js';
 import { runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { BlockId, ActionId } from '@optimystic/db-core';
-import type { BlockMetadata, SetTimer } from '@optimystic/db-p2p';
+import { StoreFailedError, type BlockMetadata, type SetTimer } from '@optimystic/db-p2p';
 
 // ---------------------------------------------------------------------------
 // Shared parity suite. Proves SqliteRawStorage (KvRawStorage over
@@ -107,16 +107,24 @@ describe('SQLite sync by the window', () => {
 		armed(): number;
 		/** Fire every armed timer, as if its time had come. */
 		fireTimers(): void;
+		/** From now on, the connection refuses to go to `synchronous = FULL`: every sync fails with this error. */
+		failSyncs(error: Error): void;
 	}
 
 	async function open(): Promise<Harness> {
 		const executed: string[] = [];
+		let syncFailure: Error | undefined;
 		let timers: (() => void)[] = [];
 		const setTimer: SetTimer = (fn) => {
 			timers.push(fn);
 			return () => { timers = timers.filter(t => t !== fn); };
 		};
-		const db = await openTestDb({ onExec: sql => { executed.push(sql); } });
+		const db = await openTestDb({
+			onExec: sql => {
+				if (syncFailure && sql === 'PRAGMA synchronous = FULL') throw syncFailure;
+				executed.push(sql);
+			},
+		});
 		const storage = new SqliteRawStorage(db, { setTimer });
 		return {
 			db,
@@ -129,7 +137,18 @@ describe('SQLite sync by the window', () => {
 				timers = [];
 				for (const fn of due) fn();
 			},
+			failSyncs: (error) => { syncFailure = error; },
 		};
+	}
+
+	/** The rejection of `promise`, which must reject. */
+	async function rejection(promise: Promise<unknown>): Promise<unknown> {
+		try {
+			await promise;
+		} catch (err) {
+			return err;
+		}
+		throw new Error('expected a rejection');
 	}
 
 	/** Whether `promise` settles within a few ms; a rejection fails the test. */
@@ -185,6 +204,31 @@ describe('SQLite sync by the window', () => {
 			expect(await settles(h.storage.whenDurable()), 'everything flushed is durable').to.equal(true);
 		} finally {
 			await h.storage.close();
+			await h.db.close();
+		}
+	});
+
+	it('a failed deferred sync rejects the durables it covered and latches the store', async () => {
+		// Rule 5 of the flush contract: a sync that failed may have lost what the operating system
+		// already dropped, so the store refuses everything from then on rather than retry; the groups
+		// the failed sync covered were waiting on it, and must not wait for ever.
+		const h = await open();
+		try {
+			await twoRelaxedGroups(h);
+			const durable = h.storage.whenDurable();
+			const disk = new Error('disk gone');
+			h.failSyncs(disk);
+			h.fireTimers();
+
+			const refused = await rejection(durable);
+			expect(refused, 'the covered durable rejects with the store failure').to.be.instanceOf(StoreFailedError);
+			expect((refused as StoreFailedError).cause, 'carrying the fault underneath, not a wrapper').to.equal(disk);
+			expect(await h.storage.getMetadata(A), 'the overlay still serves what the store never synced').to.deep.equal(metaFor(1));
+			expect(await rejection(h.storage.flush()), 'every later flush is refused').to.be.instanceOf(StoreFailedError);
+			expect(await rejection(h.storage.saveMetadata(C, metaFor(3))), 'and every later write').to.be.instanceOf(StoreFailedError);
+			expect(h.armed(), 'the latch disarmed the deadline timer').to.equal(0);
+		} finally {
+			expect(await rejection(h.storage.close()), 'close reports the latch').to.be.instanceOf(StoreFailedError);
 			await h.db.close();
 		}
 	});

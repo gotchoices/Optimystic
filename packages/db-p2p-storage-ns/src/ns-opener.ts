@@ -128,12 +128,15 @@ class NSPluginStatement implements SqliteStatement {
 		// concurrency. A read issued while a write transaction is open on this same
 		// connection observes that transaction's UNCOMMITTED rows (read-your-connection
 		// semantics). Fine today: the one transaction writer of the block tables is
-		// `SqliteBatchBackend.commit`, and every row it is writing is served by the
-		// `WriteGroupDriver` overlay above it until the batch is durable, so no read of
-		// those rows reaches this connection while the transaction is open; the
-		// key-value store and the identity helper write other tables, by autocommit
-		// statements, and the sync's `durability_mark` row is read by nobody. If a reader
-		// of a batch's rows ever bypasses the overlay, serialize reads too.
+		// `SqliteBatchBackend.commit`, and every row it is writing is held by the
+		// `WriteGroupDriver` overlay above it until the batch is durable. A point read of
+		// such a row is answered by the overlay and never reaches this connection; a
+		// listing does reach it, and may see the batch's uncommitted rows, but merges the
+		// overlay over them, so it answers the same whether the transaction has committed
+		// or not (and a rolled-back batch latches the store). The key-value store and the
+		// identity helper write other tables, by autocommit statements, and the sync's
+		// `durability_mark` row is read by nobody. If a reader of a batch's rows ever
+		// bypasses the overlay, serialize reads too.
 		const row = await this.raw.get(this.sql, params);
 		if (row === null || row === undefined) return undefined;
 		return row as SqliteRow;

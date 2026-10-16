@@ -189,6 +189,10 @@ export const DEFAULT_DB_VERSION = 1;
  * - `durability_mark` → one row, bumped by `syncSqliteDb` (`sqlite-sync.ts`) so a
  *   sync that has no rows of its own to write still has a frame to commit.
  *
+ * NOTE: this package's SQL is uppercase throughout, predating the lowercase rule in
+ * AGENTS.md, and new statements have kept to it rather than mix cases within one file;
+ * convert the package in one pass rather than statement by statement.
+ *
  * NOTE: value columns changed TEXT→BLOB with the kernel refactor, but every
  * statement is `CREATE TABLE IF NOT EXISTS` — so a database file created by a
  * pre-refactor build keeps its old TEXT-column schema, and its rows hold JSON
