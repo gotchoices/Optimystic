@@ -416,8 +416,9 @@ describe('FileWriteLog deferred sync', () => {
 	it('a commit that finds an earlier deadline already passed syncs before it resolves, whatever its own window', async () => {
 		const log = await openLog();
 		try {
-			const overdue = await log.commit([put('blk/meta.json', 'one')], { syncWithinMs: 1 });
-			await new Promise(resolve => setTimeout(resolve, 10));
+			// Wide enough that the first commit's own append cannot outrun it, which would sync it inline.
+			const overdue = await log.commit([put('blk/meta.json', 'one')], { syncWithinMs: 100 });
+			await new Promise(resolve => setTimeout(resolve, 150));
 			const relaxed = await log.commit([put('blk/revs/1.json', 'tx:1')], RELAXED);
 			assert.strictEqual(syncs, 1, 'the second commit made the sync the first was owed');
 			assert.strictEqual(await isSettled(overdue.durable), true);

@@ -83,11 +83,6 @@ export class SyncDeadlines<T> {
 		this.now = options.now ?? Date.now;
 	}
 
-	/** How many batches are held for the next sync. */
-	get size(): number {
-		return this.held.length;
-	}
-
 	/**
 	 * The deadline of a batch whose commit is called now with this window: `syncWithinMs` from now,
 	 * or `undefined` for 0, a **strict** batch, whose deadline is the commit itself. The owner

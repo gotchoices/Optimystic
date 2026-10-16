@@ -472,6 +472,10 @@ export class FileWriteLog {
 			if (this.closed) throw new Error(`write-ahead log at ${this.basePath} is closed`);
 			this.throwIfFailed();
 			await this.append(entries);
+			// A checkpoint syncs the tree outside the queue, so its failure can latch the log while the
+			// append is in flight; the commit is then refused like every later one, its record left to the
+			// next open's replay. Checked with no await before `defer`, which throws once latched.
+			this.throwIfFailed();
 			const durable = this.unsynced.defer(entries, deadline);
 			if (this.unsynced.mustSyncNow(deadline)) await this.syncUnsynced();
 			this.scheduleCheckpoint();
@@ -631,10 +635,6 @@ export class FileWriteLog {
 	 * resolves, so it survives a crash of this process: the next open's replay applies it. A failed
 	 * append latches the log, and rejects every batch still waiting for its sync, since no sync will
 	 * ever be made for them.
-	 *
-	 * A checkpoint syncs the tree outside the queue, so its failure can latch the log while this
-	 * append is in flight. The commit is then refused like every later one, its record left to the
-	 * next open's replay: nothing would ever sync a batch held after the latch.
 	 */
 	private async append(entries: readonly WriteLogEntry[]): Promise<void> {
 		try {
@@ -644,7 +644,6 @@ export class FileWriteLog {
 		} catch (err) {
 			throw this.latch(err);
 		}
-		this.throwIfFailed();
 	}
 
 	/**
