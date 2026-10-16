@@ -1,7 +1,7 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
-import type { StoreDurability } from "./store-durability.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import {
 	defaultCachePool,
 	SharedCachePool,
@@ -289,10 +289,15 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 
 	/**
 	 * Flushing this wrapper is flushing the inner driver: the cache is write-through and holds no
-	 * dirty state, so every write it accepted already reached the inner driver.
+	 * dirty state, so every write it accepted already reached the inner driver. `whenDurable` is the
+	 * inner driver's for the same reason.
 	 */
-	flush(): Promise<void> {
-		return this.inner.flush();
+	flush(options?: FlushOptions): Promise<void> {
+		return this.inner.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.inner.whenDurable();
 	}
 
 	/** This store's live pool occupancy; pool-wide numbers come from `SharedCachePool.stats()`. */

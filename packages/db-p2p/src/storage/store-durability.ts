@@ -8,3 +8,16 @@
  * `storeIdentity`. See the flush contract on `RawStoreDriver.flush`.
  */
 export type StoreDurability = 'none' | 'process-crash' | 'power-loss';
+
+/**
+ * Options of `flush()` on `RawStoreDriver` and `IRawStorage`; the contract is on `RawStoreDriver.flush`
+ * in `packages/db-p2p/src/storage/raw-store-driver.ts`.
+ */
+export interface FlushOptions {
+	/**
+	 * How long after this call the writes it covers may stay exposed to a crash the store's
+	 * `durability` names. Absent or 0: the flush resolves only once they survive it (the contract
+	 * before this option). A store that cannot defer a sync treats every value as 0.
+	 */
+	readonly withinMs?: number;
+}

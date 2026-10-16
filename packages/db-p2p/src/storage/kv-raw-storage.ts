@@ -4,7 +4,7 @@ import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
-import type { StoreDurability } from "./store-durability.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -177,7 +177,11 @@ export class KvRawStorage implements IRawStorage {
 
 	// --- Flush (what a flush does is the driver's; see RawStoreDriver.flush for the contract) ---
 
-	flush(): Promise<void> {
-		return this.driver.flush();
+	flush(options?: FlushOptions): Promise<void> {
+		return this.driver.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.driver.whenDurable();
 	}
 }

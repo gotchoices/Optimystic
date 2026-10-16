@@ -1,6 +1,6 @@
 import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { RawStoreDriver } from './raw-store-driver.js';
-import type { StoreDurability } from './store-durability.js';
+import type { FlushOptions, StoreDurability } from './store-durability.js';
 import type { StoreIdentity } from './store-identity.js';
 import { canonicalStoreKey, type BatchBackend, type StoreKey } from './batch-backend.js';
 import { WriteGroup, type OverlayValue, type WriteGroupOptions } from './write-group.js';
@@ -8,15 +8,19 @@ import { WriteGroup, type OverlayValue, type WriteGroupOptions } from './write-g
 /**
  * A {@link RawStoreDriver} whose writes wait in memory until the group they belong to is flushed,
  * then reach the {@link BatchBackend} as one `commit` — the shared half of making a backend wait
- * for its disk once per write group instead of once per write.
+ * for its disk once per write group instead of once per write, or once per several groups when the
+ * flushes allow their sync to wait (`FlushOptions.withinMs`).
  *
  * Every write records its effect in the {@link WriteGroup}'s overlay and open batch and resolves
- * at once, so a write never waits for the disk; `flush()` is the group commit. Point reads consult
- * the overlay first (a delete there answers `undefined` without asking the backend), and listings
- * merge the overlay over the backend's rows: overlay puts added, overlay deletes removed, ordered
- * after merging. Every listing takes its overlay snapshot BEFORE awaiting the backend, because a
- * commit resolving in between moves entries from the overlay into the backend, and a backend
- * listing taken before that move with an overlay scan taken after it would miss them.
+ * at once, so a write never waits for the disk; `flush()` is the group commit, and `whenDurable()`
+ * is the group's. Point reads consult the overlay first (a delete there answers `undefined` without
+ * asking the backend), and listings merge the overlay over the backend's rows: overlay puts added,
+ * overlay deletes removed, ordered after merging. An entry stays in the overlay until its batch is
+ * durable, not merely committed, so over a backend that applies at commit and syncs later a write
+ * is briefly in both; every listing merge keys by record, so that duplicate collapses. Every
+ * listing takes its overlay snapshot BEFORE awaiting the backend, because a batch becoming durable
+ * in between drops entries from the overlay that a backend listing taken before that would not
+ * have had — or, for a backend that applies at its sync, would hold only from then on.
  *
  * `promote` is two entries of one batch, which is what makes it atomic and durable on a backend
  * whose `commit` is.
@@ -36,7 +40,7 @@ export class WriteGroupDriver implements RawStoreDriver {
 	private readonly group: WriteGroup<StoreKey>;
 
 	constructor(private readonly backend: BatchBackend, options: WriteGroupOptions = {}) {
-		this.group = new WriteGroup<StoreKey>(canonicalStoreKey, entries => backend.commit(entries), options);
+		this.group = new WriteGroup<StoreKey>(canonicalStoreKey, backend, options);
 		this.durability = backend.durability;
 		if (backend.storeIdentity) {
 			this.storeIdentity = () => backend.storeIdentity!();
@@ -156,8 +160,12 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	// --- flush / close ---
 
-	flush(): Promise<void> {
-		return this.group.flush();
+	flush(options?: FlushOptions): Promise<void> {
+		return this.group.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.group.whenDurable();
 	}
 
 	/** Flush the remainder once, then close the backend. A commit in flight is waited for first. */

@@ -1,6 +1,6 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { StoreIdentity } from "./store-identity.js";
-import type { StoreDurability } from "./store-durability.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 
 /**
  * Bytes-valued, per-logical-store driver surface. Each backend implements the
@@ -91,28 +91,43 @@ export interface RawStoreDriver {
 	promote(blockId: BlockId, actionId: ActionId): Promise<void>;
 
 	/**
-	 * Make every write that resolved before this call survive the crashes {@link durability} names.
+	 * Make every write that resolved before this call survive the crashes {@link durability} names,
+	 * at once or — `options.withinMs` — within a deadline the store may defer its sync to.
 	 *
 	 * ### The flush contract
 	 *
 	 * Stated once, here; `IRawStorage.flush` and `IKVStore.flush` hold to the same five rules.
 	 *
 	 * 1. A write method resolves once its effect is visible to every later read in this process.
-	 * 2. Once a `flush()` called after the write resolved has itself resolved, the write survives
-	 *    every crash this store's `durability` names.
+	 * 2. Once a `flush()` called after the write resolved has itself resolved, the write survives a
+	 *    crash of this process where `durability` names one; it survives every crash `durability`
+	 *    names once `withinMs` has passed since that flush was called (at once, for 0 or absent), or
+	 *    once a `whenDurable()` called after the flush resolved has itself resolved.
 	 * 3. **What survives any crash is a prefix of the resolved writes, in the order they resolved.**
 	 *    No write survives while one that resolved before it is lost. This is what keeps the
 	 *    crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid once writes stop being
-	 *    synced one at a time.
+	 *    synced one at a time — and a deferred sync is exactly when a power cut can take a suffix.
 	 * 4. A `flush()` covers every write resolved before it was called, including writes made by
-	 *    other callers; concurrent flushes may share one sync.
+	 *    other callers; concurrent flushes may share one sync. A flush with `withinMs` 0 covers
+	 *    every earlier deferred write too, so it hastens their sync.
 	 * 5. A rejected `flush()` is a storage fault. After one, the store rejects every later write and
 	 *    flush until it is reopened, because a retried sync can report success for data the
-	 *    operating system already dropped.
+	 *    operating system already dropped. A deferred sync that fails latches the store the same
+	 *    way, is logged, and is reported by the next write, flush or `whenDurable()`.
 	 *
-	 * Required, not optional, so a wrapper that forgets to forward it does not type-check.
+	 * A store that cannot defer a sync treats every `withinMs` as 0. Required, not optional, so a
+	 * wrapper that forgets to forward it does not type-check.
 	 */
-	flush(): Promise<void>;
+	flush(options?: FlushOptions): Promise<void>;
+
+	/**
+	 * Resolves once every write covered by a flush that resolved before this call survives every
+	 * crash {@link durability} names. It never hastens a sync: it waits for the deadline the flushes
+	 * were given, where a strict flush would sync at once. Rejects with `StoreFailedError` if the
+	 * store fails first. Required, like `flush` and `durability`: a wrapper that forgets to forward
+	 * it must not compile.
+	 */
+	whenDurable(): Promise<void>;
 
 	/**
 	 * What a write survives once a `flush()` called after it has resolved (see {@link flush}).

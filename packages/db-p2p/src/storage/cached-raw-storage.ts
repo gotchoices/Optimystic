@@ -5,7 +5,7 @@ import { KvRawStorage } from "./kv-raw-storage.js";
 import { CachedStoreDriver } from "./cached-store-driver.js";
 import type { SharedCachePool } from "./shared-cache-pool.js";
 import type { StoreIdentity } from "./store-identity.js";
-import type { StoreDurability } from "./store-durability.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -162,8 +162,12 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 
 	// --- flush ---
 
-	flush(): Promise<void> {
-		return this.inner.flush();
+	flush(options?: FlushOptions): Promise<void> {
+		return this.inner.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.inner.whenDurable();
 	}
 }
 
