@@ -615,6 +615,11 @@ export function runRawStorageConformance(
 				// Closed before the second store opens: over a backend that serves unflushed writes from
 				// memory, a second store opened beside the first would read the first's memory and prove
 				// nothing about what reached the location.
+				// NOTE: `close` flushes too, so over a group-committing driver this case proves that flush
+				// OR close hands the writes to the location, never that flush alone does. Flush alone is
+				// `WriteGroupDriver`'s own spec (`backend.committed` after `flush()`), and the power-loss
+				// double planned by `storage-flush-takes-a-sync-deadline` is what can prove it for a real
+				// backend; add such a case there rather than weakening this one.
 				await storage.close?.();
 
 				const reopened = await harness.reopen();

@@ -187,11 +187,14 @@ export interface RawStoreDriver {
 	// NOTE: forwarding each optional above is a WRITTEN contract for wrapper drivers, not an
 	// enforced one — a wrapper that forgets one silently reports the composition as less capable
 	// than it is, and for `readCached` that means a seam attaches a redundant second cache. Fine
-	// today: the only two wrapper drivers in the tree are `CachedStoreDriver` and
-	// `RawStorageDriverAdapter`, both forward deliberately (`CachedStoreDriver` withholds `close`
-	// on purpose, and says why at its site), and each has direct tests. If a THIRD wrapper driver
-	// appears, replace the per-wrapper tests with one shared conformance check that asserts
-	// forwarding of each optional, with an explicit per-wrapper exception list.
+	// today: the only two wrapper drivers over a `RawStoreDriver` are `CachedStoreDriver` and
+	// `RawStorageDriverAdapter`, both forward deliberately (`CachedStoreDriver` has a `close` of its
+	// own rather than a passthrough, and says why at its site), and each has direct tests.
+	// `WriteGroupDriver` forwards the same optionals but from a `BatchBackend`, not a driver, so a
+	// check over driver-wrapping-driver cannot cover it; it has its own direct test. If a THIRD
+	// wrapper over a `RawStoreDriver` appears, replace the per-wrapper tests with one shared
+	// conformance check that asserts forwarding of each optional, with an explicit per-wrapper
+	// exception list.
 	// `flush` and `durability` are REQUIRED for exactly that reason: a wrapper that forgot `flush`
 	// would resolve a flush without reaching the store underneath, and one that forgot
 	// `durability` would leave the composition's guarantee unstated, so the type checker refuses both.

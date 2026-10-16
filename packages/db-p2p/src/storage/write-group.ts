@@ -263,6 +263,10 @@ export class WriteGroup<K> {
 	}
 
 	/** Flush strictly once more, which syncs everything pending, and cancel the idle timer. The owner closes its store after this resolves. */
+	// NOTE: a write recorded after close() resolves is not refused: it sits in the overlay and the
+	// open batch with no idle timer, reachable only by another flush() or close(). No caller writes to
+	// a closed store today (`CachedStoreDriver.close` does not refuse either); if one ever does, add a
+	// closed state here that makes `record` throw, rather than re-arming the timer.
 	async close(): Promise<void> {
 		this.disarmIdleFlush();
 		await this.flush();

@@ -5,6 +5,15 @@ import type { StoreIdentity } from './store-identity.js';
 import { canonicalStoreKey, type BatchBackend, type StoreKey } from './batch-backend.js';
 import { WriteGroup, type OverlayValue, type WriteGroupOptions } from './write-group.js';
 
+/** The backend's ascending rows with the overlay's puts laid over and its deletes removed, ascending again. */
+function mergeRevisions(backendRows: readonly [number, Uint8Array][], held: ReadonlyMap<number, OverlayValue>): [number, Uint8Array][] {
+	const rows = new Map(backendRows);
+	for (const [rev, value] of held) {
+		if (value === null) rows.delete(rev); else rows.set(rev, value);
+	}
+	return [...rows].sort(([a], [b]) => a - b);
+}
+
 /**
  * A {@link RawStoreDriver} whose writes wait in memory until the group they belong to is flushed,
  * then reach the {@link BatchBackend} as one `commit` — the shared half of making a backend wait
@@ -75,11 +84,10 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, Uint8Array]> {
 		const held = this.heldRevisions(blockId, lo, hi);
-		const rows = new Map(await this.backend.rangeRevisions(blockId, lo, hi));
-		for (const [rev, value] of held) {
-			if (value === null) rows.delete(rev); else rows.set(rev, value);
-		}
-		const ordered = [...rows].sort(([a], [b]) => a - b);
+		const backendRows = await this.backend.rangeRevisions(blockId, lo, hi);
+		// The backend's rows are already ascending, so only a block the overlay holds revisions of
+		// pays for the merge and the sort; `materializeBlock` lists every block it reads.
+		const ordered = held.size === 0 ? [...backendRows] : mergeRevisions(backendRows, held);
 		if (reverse) ordered.reverse();
 		yield* ordered;
 	}
