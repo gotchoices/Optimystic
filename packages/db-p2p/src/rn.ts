@@ -50,6 +50,8 @@ export * from './storage/batch-backend.js';
 export * from './storage/write-group.js';
 export * from './storage/sync-deadlines.js';
 export * from './storage/write-group-driver.js';
+export * from './storage/journal-batch-backend.js';
+export * from './storage/journal-record-codec.js';
 export * from './storage/i-block-storage.js';
 export * from './storage/i-raw-storage.js';
 export * from './storage/struct.js';

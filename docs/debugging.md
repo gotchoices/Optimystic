@@ -128,7 +128,7 @@ its own sub-namespace so a single concern can be traced in isolation:
 
 ### db-p2p sub-namespaces
 
-`db-p2p` emits 53 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
+`db-p2p` emits 58 sub-namespaces under `optimystic:db-p2p:`. They are grouped below by subsystem;
 `DEBUG='optimystic:db-p2p:*'` turns on all of them at once. Rows marked *(peer-id suffixed)* append
 the owning node's peer id — see *Telling nodes apart in one process* below.
 
@@ -157,6 +157,7 @@ This table is checked against the code: `packages/db-p2p/test/logger.spec.ts` fa
 | `block-storage`       | Block-level pend/commit/cancel, per-revision save/skip, prune, latest-revision recovery, and refused restores |
 | `block-archive`       | Serving archived revisions: pinned-read skips that refuse to mislabel content, and commit-proof lookup failures or claim mismatches |
 | `write-group`         | A write group's idle flush failing (`idle-flush-failed`, with the backend's reason): the store is latched failed and refuses every later write and flush until it is reopened |
+| `journal`             | `JournalBatchBackend`, the journal under the browser and React Native stores: `recovery:gap` when an open found a journal record missing and discarded every record after it (the missing number, how many were discarded, how many before it were applied); `recovery:stale` on `:error` when records at or below the applied-through mark had to be deleted, which only a store that lost part of an atomic apply leaves behind; `apply-failed` on `:error` when the deadline timer's apply rejected (the store is latched failed and refuses every later write); and `window-overrun`, from the shared deadline helper, when an apply started after a deadline it covered (one line per episode) |
 | `storage:restoration` | Block restoration coordination: per-block restore success/failure with elapsed ms, peer query failures, solo-node skips |
 | `block-transfer`      | Rebalance block movement: per-block push/confirm/grow outcomes, retries, holder counts, and partition-detected bail-outs |
 | `block-transfer-service` | The inbound side of the same protocol: push/pull request and response sizes, certified-push accepts and rejects, persist failures, service start/stop |

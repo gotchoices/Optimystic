@@ -252,14 +252,15 @@ does real work: `WriteGroupDriver`, whose flush is the sync, and the file and Na
 SQLite backends built on it (see *Writes that wait in memory* below); every other backend
 satisfies them trivially, and every store that cannot defer a sync treats `withinMs` as 0 and
 resolves `whenDurable()` at once. Only `WriteGroupDriver` honours `withinMs`, and only over a
-backend that defers its sync, which today are the file backend and the NativeScript SQLite
-backend:
+backend that defers its sync: today the file backend and the NativeScript SQLite backend, and the
+journal backend (*The journal backend* below) once the browser and React Native stores land on it:
 
 | Driver | What a write waits for today | What `flush()` does | `withinMs` | `durability` |
 |---|---|---|---|---|
 | `MemoryStoreDriver` | the in-memory map update | nothing | ignored | `'none'` |
 | `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`; a strict flush resolves when the batch is durable, a relaxed one when it is committed | the time left to the earliest deadline of the flushes sharing the seal is passed to the backend's `commit` as `syncWithinMs`; honoured only as far as the backend defers | the backend's |
 | `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
+| `JournalBatchBackend` (`packages/db-p2p/src/storage/journal-batch-backend.ts`), under `WriteGroupDriver`, over a `JournalStore` the engine implements | nothing: it is recorded in memory and served from there | over a store that can sync: a strict flush is one synced apply of every journal record held plus the group itself; a relaxed one appends the group as one unsynced journal record and resolves, and the held records are applied in one synced apply by the earliest deadline among them. Over a store that cannot sync: one atomic apply per group, never journaled | honoured over a store that can sync: one apply covers every record appended since the last, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed; ignored over one that cannot | the store's: `'power-loss'` when it can sync an apply, else what the engine gives |
 | `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | ignored | `'process-crash'` |
 | `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | ignored | `'process-crash'` |
 | `SqliteBatchBackend` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | one SQLite transaction applying the batch, committed in write-ahead-log mode (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`); a strict flush commits it under `synchronous = FULL`, which syncs the log before the flush resolves, a relaxed one under `NORMAL`, and the log syncs by the earliest deadline among the batches waiting | honoured: one `FULL` commit — a strict batch's own, or the one-row commit the timer makes — covers every batch committed since the last sync, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed | `'power-loss'` |
@@ -371,6 +372,49 @@ per process, shared by reference count, so every store over one directory — `F
 two stores' commits never interleave within a record. Each keeps its own overlay, which is why a
 second store opened beside a first does not see the first's unflushed writes.
 
+**The journal backend.** `JournalBatchBackend` in
+`packages/db-p2p/src/storage/journal-batch-backend.ts` is the `BatchBackend` for an engine that
+writes a group atomically but cannot be trusted to keep write order across a power cut. IndexedDB
+can make one transaction durable but promises nothing about the order earlier relaxed transactions
+reach the disk; LevelDB syncs only its current log file, closes an old one unsynced when it switches
+to a new one, and under default options skips a damaged log record and keeps reading the ones after
+it. Either way a later write can survive while an earlier one is lost, which is what rule 3 forbids.
+The backend keeps the rule without relying on the engine's order by writing each relaxed group
+twice, through a `JournalStore` (same file) the engine implements beside its reads: `appendJournal`,
+one atomic unsynced write of the group as a journal record numbered by a sequence with no gaps, not
+applied to the stores reads come from; `applyJournal`, one atomic synced write that applies, in
+order, every record not yet applied — and, for a strict group, the group itself — sets the
+applied-through mark to the last of them, and deletes those records; and `readJournal`. The journal
+is a keyspace of the engine's own (an IndexedDB object store, a LevelDB tag byte) that the six
+block-storage stores never touch. When a group is applied is `SyncDeadlines`'s rules, the same as the
+file log's: a strict group, or one that finds its own or a held deadline already passed, is applied
+at once together with everything held; a relaxed one is appended and held with its deadline, counted
+from the commit's call, and the timer armed for the earliest deadline applies everything held. An
+apply carries every byte it applies, so its durability depends on nothing written before it, and
+every apply is synced before the next starts, so a later apply can never survive without an earlier
+one. Recovery at open reads the journal, deletes any record at or below the mark (an apply deleted
+those in the write that set the mark, so one is there only if the store lost part of an atomic
+write), applies the run of consecutive records after the mark, and discards everything after the
+first missing number, logging the gap on `optimystic:db-p2p:journal`. A record the engine lost — a
+damaged LevelDB log record, an IndexedDB transaction the browser did not keep, an unsynced old log
+file — is a missing number, so nothing after it is applied, and what survives is a prefix of the
+groups. The next sequence is one past the last applied, so a discarded number is reused only after
+the apply that deleted it. The overlay above serves a journaled group until its apply, so a reader
+never depends on the journal, and a held record's entries are the arrays the overlay's own bytes are
+held in, bounded with it by `maxUnsyncedBytes`. Over a store whose `durability` is below
+`'power-loss'` — an engine that cannot sync, such as today's React Native LevelDB binding — the
+backend journals nothing and applies each group at once as one atomic write: the atomicity half of
+the contract now, and the ordering half the moment the engine can sync, with nothing above it
+changing. A rejected store write latches the backend as a rejected commit latches the driver (rule
+5). For an engine that stores bytes, `encodeJournalRecord` and `decodeJournalRecord` in
+`packages/db-p2p/src/storage/journal-record-codec.ts` give a record one format — a version byte,
+the sequence, then each entry's key as JSON, a put-or-delete flag and the value — and a store that
+cannot decode a record leaves it out of `readJournal`, which recovery treats as a gap.
+`browser-storage-syncs-by-the-window` and `react-native-storage-commits-groups-through-the-journal`
+build the two stores; the test double is `MemoryJournalStore` in
+`packages/db-p2p/src/testing/memory-journal-store.ts`, whose `powerLoss` drops the journal records
+not yet applied, all or a chosen few, and keeps the applied stores.
+
 **Rule 3 past the crashes a store names.** The NativeScript SQLite backend (`SqliteBatchBackend`
 in `packages/db-p2p-storage-ns/src/sqlite-storage.ts`) needs no log of its own for it: SQLite's
 write-ahead log is one append-only file whose recovery stops at the first frame whose checksum
@@ -382,9 +426,9 @@ backends, rule 3 under an operating-system crash or power cut is not established
 under default options skips a damaged log record and keeps reading the records after it, and the
 browsers behind IndexedDB promise nothing about relaxed transactions. Raising them to
 `'power-loss'` with the prefix rule kept is the work of `browser-storage-syncs-by-the-window`
-and `react-native-storage-commits-groups-through-the-journal` (the last waits on
-`react-native-storage-syncs-once-rn-leveldb-can` to sync); the `NOTE:` at `durability` on
-`LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
+and `react-native-storage-commits-groups-through-the-journal`, both over the journal backend
+above (the last waits on `react-native-storage-syncs-once-rn-leveldb-can` to sync); the `NOTE:`
+at `durability` on `LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
 
 **Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
 channel at start-up naming what the resolved storage's flushed writes survive and what the

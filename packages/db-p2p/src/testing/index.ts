@@ -7,3 +7,4 @@
 // helper is ever added, give it a `src/testing/conformance/index.ts` barrel rather than a third subpath.
 export * from './mesh-harness.js';
 export * from './memory-batch-backend.js';
+export * from './memory-journal-store.js';

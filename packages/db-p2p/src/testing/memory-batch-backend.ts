@@ -1,8 +1,9 @@
 import type { BlockId, ActionId } from '@optimystic/db-core';
-import { canonicalStoreKey, type BatchBackend, type BatchEntry, type StoreKey } from '../storage/batch-backend.js';
+import type { BatchBackend, BatchEntry, StoreKey } from '../storage/batch-backend.js';
 import type { StoreDurability } from '../storage/store-durability.js';
 import { StoreFailedError, type CommittedBatch, type SinkCommitOptions } from '../storage/write-group.js';
 import { deferred, type Deferred } from '../deferred.js';
+import { MemoryStoreRows } from './memory-store-rows.js';
 
 export interface MemoryBatchBackendOptions {
 	/**
@@ -59,7 +60,7 @@ export class MemoryBatchBackend implements BatchBackend {
 	/** True once {@link close} ran. */
 	closed = false;
 
-	private readonly rows = new Map<string, { key: StoreKey; value: Uint8Array }>();
+	private readonly rows = new MemoryStoreRows();
 	/** Batches committed and not yet durable, in commit order. */
 	private readonly unsynced: Unsynced[] = [];
 	/** Syncs run one at a time, in order, on this chain; it never rejects. */
@@ -69,24 +70,15 @@ export class MemoryBatchBackend implements BatchBackend {
 	constructor(private readonly options: MemoryBatchBackendOptions = {}) {}
 
 	async get(key: StoreKey): Promise<Uint8Array | undefined> {
-		return this.rows.get(canonicalStoreKey(key))?.value;
+		return this.rows.get(key);
 	}
 
 	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, Uint8Array][]> {
-		const results: [number, Uint8Array][] = [];
-		for (let rev = lo; rev <= hi; rev++) {
-			const value = this.rows.get(canonicalStoreKey({ store: 'revisions', blockId, rev }))?.value;
-			if (value !== undefined) results.push([rev, value]);
-		}
-		return results;
+		return this.rows.rangeRevisions(blockId, lo, hi);
 	}
 
 	async listPendingActionIds(blockId: BlockId): Promise<ActionId[]> {
-		const ids: ActionId[] = [];
-		for (const { key } of this.rows.values()) {
-			if (key.store === 'pending' && key.blockId === blockId) ids.push(key.actionId);
-		}
-		return ids;
+		return this.rows.listPendingActionIds(blockId);
 	}
 
 	/**
@@ -96,7 +88,7 @@ export class MemoryBatchBackend implements BatchBackend {
 	async commit(entries: readonly BatchEntry[], { syncWithinMs }: SinkCommitOptions): Promise<CommittedBatch> {
 		this.throwIfFailed();
 		await this.options.beforeApply?.(entries);
-		this.apply(entries);
+		this.rows.apply(entries);
 		const batch: MemoryCommittedBatch = { entries, syncWithinMs, durable: false };
 		const settle = deferred();
 		this.committed.push(batch);
@@ -124,38 +116,19 @@ export class MemoryBatchBackend implements BatchBackend {
 		this.committed.push(...survived);
 		this.unsynced.length = 0;
 		this.rows.clear();
-		for (const batch of survived) this.apply(batch.entries);
+		for (const batch of survived) this.rows.apply(batch.entries);
 	}
 
 	async *listBlockIds(): AsyncIterable<BlockId> {
-		const ids: BlockId[] = [];
-		for (const { key } of this.rows.values()) {
-			if (key.store === 'metadata') ids.push(key.blockId);
-		}
-		yield* ids;
+		yield* this.rows.listBlockIds();
 	}
 
 	async approximateBytesUsed(): Promise<number> {
-		let total = 0;
-		for (const [canonical, { value }] of this.rows) {
-			total += canonical.length + value.byteLength;
-		}
-		return total;
+		return this.rows.approximateBytesUsed();
 	}
 
 	async close(): Promise<void> {
 		this.closed = true;
-	}
-
-	private apply(entries: readonly BatchEntry[]): void {
-		for (const { key, value } of entries) {
-			const canonical = canonicalStoreKey(key);
-			if (value === undefined) {
-				this.rows.delete(canonical);
-			} else {
-				this.rows.set(canonical, { key, value });
-			}
-		}
 	}
 
 	private throwIfFailed(): void {
