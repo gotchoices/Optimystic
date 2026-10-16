@@ -23,7 +23,7 @@ Every call runs on a native thread and returns a promise; blobs are bound and re
 - The open is asynchronous: await `db.ready`, or use `openOrCreateAsync` (`openOptimysticNSDb` in `src/ns-opener.ts`).
 - `threading` is ignored; `getVersion()` / `setVersion()` are async; `wrapDb` is gone.
 - Calls made on the same `db` during a `transaction` join it. That changes the ground under `NSPluginDbWrapper`'s connection mutex and its `transaction(fn)` (the deadlock and cross-rollback reasoning in `src/connection-mutex.ts` and the `SqliteDb.transaction` comment in `src/db.ts`); re-derive both rather than port them.
-- `SqliteStoreDriver.promote` and the per-block writes are natural `batch()` candidates.
+- `SqliteBatchBackend.commit` applies a whole write group as one transaction, a natural `batch()` candidate.
 
 ## Interaction
 

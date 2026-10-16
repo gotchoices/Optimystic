@@ -1,5 +1,5 @@
 import { ConnectionMutex } from './connection-mutex.js';
-import { applySchema, DEFAULT_DB_NAME, DEFAULT_DB_VERSION, type OptimysticNSDBHandle, type SqliteDb, type SqliteParam, type SqliteRow, type SqliteStatement, type SqliteTransaction } from './db.js';
+import { applySchema, runTransaction, DEFAULT_DB_NAME, DEFAULT_DB_VERSION, type OptimysticNSDBHandle, type SqliteDb, type SqliteParam, type SqliteRow, type SqliteStatement, type SqliteTransaction, type SqliteTransactionOptions } from './db.js';
 
 /**
  * Minimal subset of `@nativescript-community/sqlite`'s `Db` we depend on.
@@ -86,29 +86,15 @@ class NSPluginDbWrapper implements SqliteDb {
 		return new NSPluginStatement(this.raw, sql, this.mutex);
 	}
 
-	async transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>): Promise<T> {
-		return this.mutex.serialize(async () => {
-			// BEGIN IMMEDIATE takes the write lock up front rather than deferring
-			// it to the first write, so contention surfaces here and not mid-body.
-			await this.raw.execute('BEGIN IMMEDIATE');
-			try {
-				// Statements bound to the open transaction bypass the mutex — we
-				// already hold the slot; re-locking would deadlock.
-				const tx: SqliteTransaction = {
-					prepare: (sql: string) => new NSPluginStatement(this.raw, sql),
-				};
-				const result = await fn(tx);
-				await this.raw.execute('COMMIT');
-				return result;
-			} catch (err) {
-				try {
-					await this.raw.execute('ROLLBACK');
-				} catch {
-					// Swallow rollback failures so we surface the original error.
-				}
-				throw err;
-			}
-		});
+	async transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>, options?: SqliteTransactionOptions): Promise<T> {
+		return this.mutex.serialize(() => runTransaction(
+			{ execute: async (sql) => { await this.raw.execute(sql); } },
+			// Statements bound to the open transaction bypass the mutex — we
+			// already hold the slot; re-locking would deadlock.
+			{ prepare: (sql: string) => new NSPluginStatement(this.raw, sql) },
+			fn,
+			options,
+		));
 	}
 
 	async close(): Promise<void> {
@@ -141,11 +127,13 @@ class NSPluginStatement implements SqliteStatement {
 		// NOTE: reads run directly on the connection, unserialized, to preserve read
 		// concurrency. A read issued while a write transaction is open on this same
 		// connection observes that transaction's UNCOMMITTED rows (read-your-connection
-		// semantics). Fine today: the only transaction writer is same-block promote
-		// under the block's write latch, and cross-block reads are independent. If a future
-		// caller reads a block on this connection while another op's transaction on the
-		// same rows is mid-flight, it may see uncommitted state — serialize reads too if
-		// that ever matters.
+		// semantics). Fine today: the one transaction writer of the block tables is
+		// `SqliteBatchBackend.commit`, and every row it is writing is served by the
+		// `WriteGroupDriver` overlay above it until the batch is durable, so no read of
+		// those rows reaches this connection while the transaction is open; the
+		// key-value store and the identity helper write other tables, by autocommit
+		// statements, and the sync's `durability_mark` row is read by nobody. If a reader
+		// of a batch's rows ever bypasses the overlay, serialize reads too.
 		const row = await this.raw.get(this.sql, params);
 		if (row === null || row === undefined) return undefined;
 		return row as SqliteRow;

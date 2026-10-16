@@ -248,11 +248,12 @@ The contract, stated in full on `RawStoreDriver.flush` in
 
 Rule 3 is what keeps the crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid
 once a backend stops syncing each write on its own. Rules 4 and 5 bind a store whose flush
-does real work: `WriteGroupDriver`, whose flush is the sync, and the file backend built on it
-(see *Writes that wait in memory* below); every other backend satisfies them trivially, and
-every store that cannot defer a sync treats `withinMs` as 0 and resolves `whenDurable()` at
-once. Only `WriteGroupDriver` honours `withinMs`, and only over a backend that defers its
-sync, which today is the file backend alone:
+does real work: `WriteGroupDriver`, whose flush is the sync, and the file and NativeScript
+SQLite backends built on it (see *Writes that wait in memory* below); every other backend
+satisfies them trivially, and every store that cannot defer a sync treats `withinMs` as 0 and
+resolves `whenDurable()` at once. Only `WriteGroupDriver` honours `withinMs`, and only over a
+backend that defers its sync, which today are the file backend and the NativeScript SQLite
+backend:
 
 | Driver | What a write waits for today | What `flush()` does | `withinMs` | `durability` |
 |---|---|---|---|---|
@@ -261,7 +262,7 @@ sync, which today is the file backend alone:
 | `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
 | `LevelDBStoreDriver` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) | LevelDB accepting it under default write options, which do not sync | nothing | ignored | `'process-crash'` |
 | `IndexedDBStoreDriver` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`) | its implicit transaction committing at the default durability, which current browsers treat as relaxed | nothing | ignored | `'process-crash'` |
-| `SqliteStoreDriver` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`) | its statement committing in WAL mode under `synchronous = NORMAL` (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`) | nothing | ignored | `'process-crash'` |
+| `SqliteBatchBackend` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | one SQLite transaction applying the batch, committed in write-ahead-log mode (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`); a strict flush commits it under `synchronous = FULL`, which syncs the log before the flush resolves, a relaxed one under `NORMAL`, and the log syncs by the earliest deadline among the batches waiting | honoured: one `FULL` commit — a strict batch's own, or the one-row commit the timer makes — covers every batch committed since the last sync, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed | `'power-loss'` |
 
 The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStorage` with every
 storage class built on it — report the durability of what they wrap, flush by flushing it with
@@ -370,15 +371,20 @@ per process, shared by reference count, so every store over one directory — `F
 two stores' commits never interleave within a record. Each keeps its own overlay, which is why a
 second store opened beside a first does not see the first's unflushed writes.
 
-**Rule 3 past the crashes a store names.** For the `'process-crash'` backends, rule 3 under an
-operating-system crash or power cut is not established today. SQLite's write-ahead log stops
-recovery at the first frame whose checksum fails, so what survives is a prefix; LevelDB under
-default options skips a damaged log record and keeps reading the records after it, and the
-browsers behind IndexedDB promise nothing about relaxed transactions. Raising the three to
-`'power-loss'` with the prefix rule kept is the work of `nativescript-storage-syncs-by-the-window`,
-`browser-storage-syncs-by-the-window` and `react-native-storage-commits-groups-through-the-journal`
-(the last waits on `react-native-storage-syncs-once-rn-leveldb-can` to sync); the `NOTE:` at
-`durability` on `LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
+**Rule 3 past the crashes a store names.** The NativeScript SQLite backend (`SqliteBatchBackend`
+in `packages/db-p2p-storage-ns/src/sqlite-storage.ts`) needs no log of its own for it: SQLite's
+write-ahead log is one append-only file whose recovery stops at the first frame whose checksum
+fails, and under `synchronous = NORMAL` the log is synced before every checkpoint, so what a
+power cut leaves is a prefix of the committed transactions, and a batch is one transaction. Its
+sync is one commit under `synchronous = FULL`, which syncs the log and so every commit before
+it, the key-value store's and the identity helper's included. For the two `'process-crash'`
+backends, rule 3 under an operating-system crash or power cut is not established today: LevelDB
+under default options skips a damaged log record and keeps reading the records after it, and the
+browsers behind IndexedDB promise nothing about relaxed transactions. Raising them to
+`'power-loss'` with the prefix rule kept is the work of `browser-storage-syncs-by-the-window`
+and `react-native-storage-commits-groups-through-the-journal` (the last waits on
+`react-native-storage-syncs-once-rn-leveldb-can` to sync); the `NOTE:` at `durability` on
+`LevelDBStoreDriver` and on `IndexedDBStoreDriver` records it.
 
 **Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
 channel at start-up naming what the resolved storage's flushed writes survive and what the
@@ -466,8 +472,9 @@ returns, which forks the collection; that residual is stated under
 
 **The write orders crash recovery relies on.** Every backend's flush is reviewed against this
 list. Under a crash of this process every persistent backend keeps every resolved write, so
-each order holds. Under a power cut the file backend, which syncs only at the flush or within
-its window, is held to them by rule 3: what survives is a prefix of the resolved writes, which
+each order holds. Under a power cut the file and NativeScript SQLite backends, which sync only
+at the flush or within the window, are held to them by rule 3: what survives is a prefix of the
+resolved writes, which
 never keeps a later step without an earlier one. On the `'process-crash'` backends they are not
 established across a power cut (*Rule 3 past the crashes a store names*, above).
 
@@ -581,11 +588,11 @@ From the moment the write's flush resolves, per backend:
 | File (`FileBatchBackend`) | `'power-loss'` | survives at once | survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving |
 | React Native LevelDB (`LevelDBStoreDriver`) | `'process-crash'` | survives at once | survives whenever the operating system writes it out; the window cannot be kept, and the node says so at start |
 | Browser IndexedDB (`IndexedDBStoreDriver`) | `'process-crash'` | survives at once | as LevelDB |
-| NativeScript SQLite (`SqliteStoreDriver`) | `'process-crash'` | survives at once | as LevelDB, with a prefix surviving |
+| NativeScript SQLite (`SqliteBatchBackend`) | `'power-loss'` | survives at once | survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving |
 | Memory (`MemoryStoreDriver`) | `'none'` | lost | lost |
 
-Each phone and browser row changes as its ticket lands (`nativescript-storage-syncs-by-the-window`,
-`browser-storage-syncs-by-the-window`, `react-native-storage-commits-groups-through-the-journal`
+The React Native and browser rows change as their tickets land
+(`browser-storage-syncs-by-the-window`, `react-native-storage-commits-groups-through-the-journal`
 and the blocked `react-native-storage-syncs-once-rn-leveldb-can`), and
 [docs/correctness.md §1.2](../../../docs/correctness.md#12-nodes) with it.
 
@@ -680,8 +687,9 @@ the only cross-key atomic operation the kernel requires; each backend satisfies 
 with its native atomic primitive (batch / DB transaction / one write-ahead-log record).
 
 Every shipping backend uses this kernel today: in-memory (`MemoryStoreDriver`),
-IndexedDB, LevelDB, and SQLite each supply only a driver, and the filesystem
-backend supplies a `BatchBackend` (`FileBatchBackend`) under `WriteGroupDriver`. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
+IndexedDB and LevelDB each supply only a driver, and the filesystem and NativeScript SQLite
+backends each supply a `BatchBackend` (`FileBatchBackend`, `SqliteBatchBackend`) under
+`WriteGroupDriver`. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
 exported from the `./testing/conformance` entry — separate from `./testing` because
 it imports `chai`, which is a devDependency consumers never install) asserts every
 backend behaves identically against the shared kernel contract.

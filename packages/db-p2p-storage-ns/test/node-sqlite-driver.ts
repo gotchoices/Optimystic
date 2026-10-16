@@ -1,6 +1,15 @@
 import { DatabaseSync, type StatementSync } from 'node:sqlite';
 import { ConnectionMutex } from '../src/connection-mutex.js';
-import { applySchema, type SqliteDb, type SqliteParam, type SqliteRow, type SqliteStatement, type SqliteTransaction } from '../src/db.js';
+import { applySchema, runTransaction, type SqliteDb, type SqliteParam, type SqliteRow, type SqliteStatement, type SqliteTransaction, type SqliteTransactionOptions } from '../src/db.js';
+
+/** What a test may observe of the driver. */
+export interface TestDbOptions {
+	/**
+	 * Called with every statement the wrapper executes outside a prepared statement: each `exec`
+	 * body, and each transaction's pragmas, `BEGIN IMMEDIATE`, `COMMIT` and `ROLLBACK`.
+	 */
+	readonly onExec?: (sql: string) => void;
+}
 
 /**
  * Test-only `SqliteDb` driver backed by Node's built-in `node:sqlite`
@@ -16,10 +25,10 @@ class NodeSqliteWrapper implements SqliteDb {
 	private readonly mutex = new ConnectionMutex();
 	private closed = false;
 
-	constructor(private readonly db: DatabaseSync) {}
+	constructor(private readonly db: DatabaseSync, private readonly options: TestDbOptions = {}) {}
 
 	async exec(sql: string): Promise<void> {
-		await this.mutex.serialize(() => this.db.exec(sql));
+		await this.mutex.serialize(() => this.execute(sql));
 	}
 
 	prepare(sql: string): SqliteStatement {
@@ -27,27 +36,15 @@ class NodeSqliteWrapper implements SqliteDb {
 		return new NodeSqliteStatement(() => this.prepared(sql), this.mutex);
 	}
 
-	async transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>): Promise<T> {
-		return this.mutex.serialize(async () => {
-			this.db.exec('BEGIN IMMEDIATE');
-			try {
-				// Statements bound to the open transaction bypass the mutex — we
-				// already hold the slot; re-locking would deadlock.
-				const tx: SqliteTransaction = {
-					prepare: (sql: string) => new NodeSqliteStatement(() => this.prepared(sql)),
-				};
-				const result = await fn(tx);
-				this.db.exec('COMMIT');
-				return result;
-			} catch (err) {
-				try {
-					this.db.exec('ROLLBACK');
-				} catch {
-					// Swallow rollback errors so the original cause propagates.
-				}
-				throw err;
-			}
-		});
+	async transaction<T>(fn: (tx: SqliteTransaction) => Promise<T>, options?: SqliteTransactionOptions): Promise<T> {
+		return this.mutex.serialize(() => runTransaction(
+			{ execute: sql => this.execute(sql) },
+			// Statements bound to the open transaction bypass the mutex — we
+			// already hold the slot; re-locking would deadlock.
+			{ prepare: (sql: string) => new NodeSqliteStatement(() => this.prepared(sql)) },
+			fn,
+			options,
+		));
 	}
 
 	async close(): Promise<void> {
@@ -55,6 +52,11 @@ class NodeSqliteWrapper implements SqliteDb {
 		this.closed = true;
 		this.cache.clear();
 		this.db.close();
+	}
+
+	private execute(sql: string): void {
+		this.options.onExec?.(sql);
+		this.db.exec(sql);
 	}
 
 	private prepared(sql: string): StatementSync {
@@ -101,18 +103,15 @@ class NodeSqliteStatement implements SqliteStatement {
 	}
 }
 
-let counter = 0;
-
 /**
  * Open a fresh in-memory `SqliteDb` with the Optimystic schema applied.
  * Each call yields an isolated database — there is no shared file or shared
  * connection across calls.
  */
-export async function openTestDb(): Promise<SqliteDb> {
+export async function openTestDb(options: TestDbOptions = {}): Promise<SqliteDb> {
 	const raw = new DatabaseSync(':memory:');
-	const db = new NodeSqliteWrapper(raw);
+	const db = new NodeSqliteWrapper(raw, options);
 	await applySchema(db);
-	void ++counter;
 	return db;
 }
 
@@ -120,9 +119,9 @@ export async function openTestDb(): Promise<SqliteDb> {
  * Open a `SqliteDb` backed by the file at `path` (created if absent) with the
  * Optimystic schema applied, for tests that close and reopen the same database.
  */
-export async function openTestFileDb(path: string): Promise<SqliteDb> {
+export async function openTestFileDb(path: string, options: TestDbOptions = {}): Promise<SqliteDb> {
 	const raw = new DatabaseSync(path);
-	const db = new NodeSqliteWrapper(raw);
+	const db = new NodeSqliteWrapper(raw, options);
 	await applySchema(db);
 	return db;
 }

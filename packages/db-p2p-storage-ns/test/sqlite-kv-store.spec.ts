@@ -70,4 +70,25 @@ describe('SqliteKVStore', () => {
 		expect(row?.b_val).to.be.instanceOf(Uint8Array);
 		expect((row?.b_val as Uint8Array).length).to.equal(3);
 	});
+
+	it('flush() syncs once when something was written since the last flush, and not otherwise', async () => {
+		const executed: string[] = [];
+		const observed = await openTestDb({ onExec: sql => { executed.push(sql); } });
+		const store = new SqliteKVStore(observed, 'test:');
+		const syncs = () => executed.filter(sql => sql === 'PRAGMA synchronous = FULL').length;
+		try {
+			await store.flush();
+			expect(syncs(), 'nothing written yet').to.equal(0);
+			await store.set('k', 'v');
+			await store.flush();
+			expect(syncs(), 'the write is synced by one FULL commit').to.equal(1);
+			await store.flush();
+			expect(syncs(), 'nothing written since the last flush').to.equal(1);
+			await store.delete('k');
+			await store.flush();
+			expect(syncs(), 'a delete is a write').to.equal(2);
+		} finally {
+			await observed.close();
+		}
+	});
 });

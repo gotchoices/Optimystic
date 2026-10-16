@@ -1,12 +1,15 @@
 import { generateKeyPair, privateKeyFromProtobuf, privateKeyToProtobuf } from '@libp2p/crypto/keys';
 import type { PrivateKey } from '@libp2p/interface';
 import type { SqliteDb } from './db.js';
+import { syncSqliteDb } from './sqlite-sync.js';
 
 export const DEFAULT_PEER_KEY_NAME = 'peer-private-key';
 
 /**
  * Loads the persisted NativeScript peer's libp2p private key, or generates a
- * fresh Ed25519 key on first call and persists it.
+ * fresh Ed25519 key on first call, persists it, and syncs the database before
+ * returning it, so a power cut right after first start cannot give the node a
+ * different peer id next time. An existing key is read as it is.
  *
  * The key is stored as raw protobuf bytes in the `kv` table's `b_val` column
  * under `keyName`. SQLite stores BLOB natively, so there is no base64
@@ -30,5 +33,6 @@ export async function loadOrCreateNSPeerKey(
 	await db
 		.prepare('INSERT INTO kv (key, s_val, b_val) VALUES (?, NULL, ?) ON CONFLICT(key) DO UPDATE SET b_val = excluded.b_val')
 		.run(keyName, bytes);
+	await syncSqliteDb(db);
 	return key;
 }

@@ -1,75 +1,60 @@
 import { expect } from 'chai';
 import { openTestDb } from './node-sqlite-driver.js';
-import { SqliteRawStorage } from '../src/sqlite-storage.js';
-import type { ActionId, BlockId, BlockHeader, IBlock, Transform } from '@optimystic/db-core';
+import type { SqliteDb } from '../src/db.js';
 
 // Regression guard for st-nativescript-sqlite-transaction-mutex.
 //
-// The test driver (NodeSqliteWrapper) mirrors production ns-opener's transaction()
-// exactly — BEGIN/COMMIT/ROLLBACK on a single shared connection with no mutex — over a
-// REAL node:sqlite. Two concurrent transaction() bodies therefore nest on one connection:
+// The test driver (NodeSqliteWrapper) mirrors production ns-opener's transaction() exactly —
+// BEGIN/COMMIT/ROLLBACK on a single shared connection, serialized on the connection mutex — over a
+// REAL node:sqlite. Without the mutex two concurrent transaction() bodies nest on one connection:
 // the second BEGIN throws "cannot start a transaction within a transaction", and its catch
-// ROLLBACKs the FIRST transaction's still-open writes.
+// ROLLBACKs the FIRST transaction's still-open writes; and a plain write issued meanwhile lands
+// inside the open transaction and is rolled back with it.
 //
-// SKIPPED until the fix lands. The `describe.skip` KEEPS THIS SUITE RED-FREE for sibling
-// tickets in the pipeline while still handing the implement stage a ready assertion. The
-// implement stage must remove `.skip` and make it pass by serializing transaction() (and
-// plain writes) on the shared connection.
-//
-// Verified failing at fix time (unskipped): "two concurrent promotes ..." fails with
-//   promote outcomes: [ 'fulfilled', 'rejected' ] [ 'cannot start a transaction within a transaction' ]
+// Driven through `SqliteDb.transaction` directly, which is where the mutex lives: the block store
+// above it now commits a whole write group per transaction, so a test through the store would
+// exercise the overlay rather than the connection.
 
-const makeBlock = (id: string): IBlock => {
-	const header: BlockHeader = { id: id as BlockId, type: 'test', collectionId: 'c1' as BlockId };
-	return { header };
+const INSERT = 'INSERT INTO kv (key, s_val, b_val) VALUES (?, ?, NULL)';
+
+const stored = async (db: SqliteDb, key: string): Promise<string | undefined> => {
+	const row = await db.prepare('SELECT s_val FROM kv WHERE key = ?').get(key);
+	return row?.s_val as string | undefined;
 };
-const makeTransform = (id: string): Transform => ({ insert: makeBlock(id) });
 
 describe('SQLite transaction serialization on the shared connection', () => {
-	it('two concurrent promotes on disjoint blocks both survive', async () => {
+	it('two concurrent transactions on disjoint rows both commit', async () => {
 		const db = await openTestDb();
-		const storage = new SqliteRawStorage(db);
-		const aId = 'action-A' as ActionId;
-		const bId = 'action-B' as ActionId;
-		const blockA = 'block-A' as BlockId;
-		const blockB = 'block-B' as BlockId;
+		const write = (key: string) => db.transaction(async (tx) => {
+			await tx.prepare(INSERT).run(key, key);
+		});
 
-		await storage.savePendingTransaction(blockA, aId, makeTransform('block-A'));
-		await storage.savePendingTransaction(blockB, bId, makeTransform('block-B'));
+		// Each opens its own BEGIN/COMMIT. On an unserialized shared connection they nest and
+		// cross-rollback; serialized, both land.
+		const results = await Promise.allSettled([write('a'), write('b')]);
 
-		// Each promote opens its own BEGIN/COMMIT via db.transaction(). On an unserialized
-		// shared connection they nest and cross-rollback; serialized, both land.
-		const results = await Promise.allSettled([
-			storage.promotePendingTransaction(blockA, aId),
-			storage.promotePendingTransaction(blockB, bId),
-		]);
-
-		expect(results.filter(r => r.status === 'rejected'), 'no promote should fail').to.have.length(0);
-		expect(await storage.getTransaction(blockA, aId)).to.deep.equal(makeTransform('block-A'));
-		expect(await storage.getTransaction(blockB, bId)).to.deep.equal(makeTransform('block-B'));
-		expect(await storage.getPendingTransaction(blockA, aId)).to.equal(undefined);
-		expect(await storage.getPendingTransaction(blockB, bId)).to.equal(undefined);
+		expect(results.filter(r => r.status === 'rejected'), 'no transaction should fail').to.have.length(0);
+		expect(await stored(db, 'a')).to.equal('a');
+		expect(await stored(db, 'b')).to.equal('b');
 
 		await db.close();
 	});
 
-	it('a plain write concurrent with a transaction is neither lost nor rolled back with it', async () => {
+	it('a plain write concurrent with a transaction that rolls back is neither lost nor rolled back with it', async () => {
 		const db = await openTestDb();
-		const storage = new SqliteRawStorage(db);
-		const blockA = 'block-A' as BlockId;
-		const blockC = 'block-C' as BlockId;
 
-		// Promote a MISSING pending so the transaction genuinely rolls back, then assert a
-		// concurrent plain write for another block was not swept into (and lost by) that rollback.
 		const results = await Promise.allSettled([
-			storage.promotePendingTransaction(blockA, 'action-A' as ActionId), // rolls back: no pending
-			storage.savePendingTransaction(blockC, 'action-C' as ActionId, makeTransform('block-C')),
+			db.transaction(async (tx) => {
+				await tx.prepare(INSERT).run('doomed', 'x');
+				throw new Error('roll back');
+			}),
+			db.prepare(INSERT).run('plain', 'y'),
 		]);
 
-		// The promote is expected to reject (missing pending); the plain write must still succeed.
-		expect(results[1]!.status, 'plain write must not fail').to.equal('fulfilled');
-		expect(await storage.getPendingTransaction(blockC, 'action-C' as ActionId), 'C plain write durable')
-			.to.deep.equal(makeTransform('block-C'));
+		expect(results[0]!.status, 'the transaction rolls back').to.equal('rejected');
+		expect(results[1]!.status, 'the plain write must not fail').to.equal('fulfilled');
+		expect(await stored(db, 'doomed'), 'rolled back').to.equal(undefined);
+		expect(await stored(db, 'plain'), 'plain write durable').to.equal('y');
 
 		await db.close();
 	});
