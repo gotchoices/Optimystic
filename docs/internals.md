@@ -855,7 +855,7 @@ funnel for both the coordinated and direct paths, so it originates a per-collect
 StorageRepo.commit()                       # critical section (block locks held)
   → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
   → release locks (finally)
-  → storage.flush()                        # the write group is durable before anyone hears of it
+  → storage.flush()                        # strict, or with the cohort's window on a consensus apply (storage.md §6)
   → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
 StorageRepo.get()                          # read-driven promotion (context proves committed)
   → internalCommit() returns collectionId  # promotes a pending action that landed durably
@@ -2810,11 +2810,14 @@ await doWork();
 **Two markers, two lifetimes.** The *in-memory* guard above must be set eagerly (before
 any `await`) — it is the synchronous check-and-set that closes the concurrent apply-window
 race. The *durable* marker (`stateStore.markExecuted`), used only for post-restart dedup,
-is the opposite: it is written **after** `doWork()` (the apply loop) succeeds. Writing it
-eagerly would leave a stuck marker on a caught fault or a crash mid-apply, and on
+is the opposite: it is written **after** `doWork()` (the apply loop) succeeds, and only once
+the apply's own writes survive a power cut (`markExecutedOnceDurable` waits on the store's
+`whenDurable()`, since a consensus apply may flush with its cohort's durability window).
+Writing it eagerly would leave a stuck marker on a caught fault or a crash mid-apply, and on
 redelivery `handleConsensus` would short-circuit at the async `wasTransactionExecuted`
 check — silently dropping the transaction on that member forever. The window between
-"apply succeeded" and "durable write landed" is safe to re-run on restart because
+"apply succeeded" and "durable write landed" — the whole durability window now, not a few
+writes — is safe to re-run on restart because
 re-applying an already-applied consensus transaction is idempotent (the "ahead" divergence
 path in `applyConsensusOperation` tolerates it as a no-op).
 

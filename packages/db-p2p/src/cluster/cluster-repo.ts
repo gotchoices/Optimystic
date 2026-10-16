@@ -2790,6 +2790,10 @@ export class ClusterMember implements ICluster {
 		const stateStore = this.stateStore;
 		if (!stateStore) return;
 		const durable = this.storageRepo as IRepo & Partial<IDurableStorage>;
+		// NOTE: `whenDurable()` answers for the store's LATEST committed batch, not this apply's, so
+		// an unrelated relaxed group committed between the apply and this call extends the wait by at
+		// most one more window. Bounded and harmless while the marker is only post-restart dedup; if
+		// anything ever waits on the marker itself, have the apply return its own batch's `durable`.
 		const applied = durable.whenDurable ? durable.whenDurable() : Promise.resolve();
 		void applied
 			.then(() => stateStore.markExecuted(messageHash, executedAt))

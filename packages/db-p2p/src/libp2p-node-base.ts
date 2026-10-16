@@ -842,6 +842,10 @@ export async function createLibp2pNodeBase(
 	// window; a strict flush of that store first keeps the entry off disk until the commit it names is
 	// on it (storage.md Invariant 6, write order 8). Nothing to sync after a solo commit, which was
 	// strict; one early sync for a `majority` commit that fell short, a degraded case.
+	// NOTE: `noteReplicationShortfall` records every block of a commit concurrently, so this runs
+	// once per block; `WriteGroup` shares one sync among concurrent strict flushes with nothing to
+	// seal, and every production store runs over it. A backend that synced on every flush regardless
+	// would pay one sync per block here — coalesce in `noteReplicationShortfall` if one ever does.
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore, { beforeRecord: () => rawStorage.flush() });
 
 	// Placeholder restore callback, reassigned once the restoration coordinator exists after start.

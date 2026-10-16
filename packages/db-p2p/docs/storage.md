@@ -397,9 +397,11 @@ node is about to report to another machine:
   (no consensus ran and only this machine holds the write), `cancel`, `recoverBlock`,
   `saveReplicatedBlock`, a `get` that took a write latch, and a consensus `get` or `cancel`
   operation — repair and bookkeeping, off the per-write hot path, and a replica a pusher counts
-  as held should not sit in a window. A member or coordinator built without `durabilityWindowFor`
-  applies strictly, and until a backend defers its sync (the table above) a window changes
-  nothing a node does.
+  as held should not sit in a window. A `pend` or `commit` given a window flushes with it on
+  every exit, a refusal included: what a refusal writes is at most a dropped pending record,
+  and the writer is told to retry, so nothing is announced on it. A member or coordinator
+  built without `durabilityWindowFor` applies strictly, and until a backend defers its sync
+  (the table above) a window changes nothing a node does.
 - `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls
   `InvalidationContext.flush` after releasing its latches and before appending the entry that
   names the compensating revisions, so an entry never names revisions the store lost. Nothing
