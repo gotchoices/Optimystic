@@ -188,6 +188,10 @@ export class LevelDBJournalStore implements JournalStore {
 	 * with no record present (a strict group's, never appended) deletes nothing.
 	 * `JournalStore.applyJournal`'s contract.
 	 */
+	// NOTE: on a handle that cannot sync every group is applied this way, so each flush also puts the
+	// mark and deletes a record key that was never appended (a LevelDB tombstone): two small extra
+	// operations per flush, unmeasured. If flush cost on phones ever shows in profiles, have the
+	// backend hand the store only the numbers it appended, rather than every number applied.
 	async applyJournal(apply: readonly JournalRecord[], appliedThrough: number, discard: readonly number[]): Promise<void> {
 		const batch = this.db.batch();
 		for (const record of apply) {
