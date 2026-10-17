@@ -16,8 +16,10 @@ import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, 
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
+import { SchemaManager, checkConstraintToStored, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withoutCheckConstraint } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, findNamed } from './schema/catalog-only-change.js';
+import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
 import { withTagsOf } from './schema/tag-overlay.js';
@@ -271,6 +273,39 @@ type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => vo
 /** Quereus's CHECK shape and its ADD CONSTRAINT AST node, reached through exported types (neither is exported by name). */
 type RowConstraintSchema = TableSchema['checkConstraints'][number];
 type AddedConstraint = Extract<SchemaChangeInfo, { type: 'addConstraint' }>['constraint'];
+
+/**
+ * One catalog-only ALTER as `OptimysticModule.alterCatalogOnly` carries it out: the record object
+ * it changes (`kind` and `name`, which key the open batch's adopted changes), that object as this
+ * machine's engine holds it before and after the change (undefined: absent; record form), how the
+ * record is judged, and the edit — made to the record when the change is this machine's to write,
+ * and to the engine's catalog entry and the table instance's own schema whatever the record held.
+ */
+interface CatalogOnlyAlter {
+  /** What the statement does, for the missing-record error: `add CHECK constraint`. */
+  readonly operation: string;
+  readonly kind: CatalogObjectKind;
+  readonly name: string;
+  readonly before: CatalogObject | undefined;
+  readonly after: CatalogObject | undefined;
+  classify(record: StoredTableSchema): CatalogOnlyVerdict;
+  editRecord(record: StoredTableSchema): StoredTableSchema;
+  editSchema(schema: TableSchema): TableSchema;
+}
+
+/** `schema` without the CHECK named `name`, compared case-insensitively as Quereus compares constraint names. */
+function withoutCheck(schema: TableSchema, name: string | undefined): TableSchema {
+  const lower = name?.toLowerCase();
+  return {
+    ...schema,
+    checkConstraints: Object.freeze(schema.checkConstraints.filter(check => lower === undefined || check.name?.toLowerCase() !== lower)),
+  };
+}
+
+/** `schema` with `check` added, replacing a CHECK of that name — the rule {@link withCheckConstraint} applies to the record. */
+function withCheck(schema: TableSchema, check: RowConstraintSchema): TableSchema {
+  return { ...schema, checkConstraints: Object.freeze([...withoutCheck(schema, check.name).checkConstraints, check]) };
+}
 
 /**
  * Quereus's schema-only RENAME COLUMN, reproduced unchanged — the fallback its ALTER TABLE
@@ -3254,47 +3289,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Persist a CHECK that `ALTER TABLE … ADD CONSTRAINT` added, and carry it on this instance's
-   * own schema ({@link OptimysticModule.alterTable} builds `check` exactly as the engine
-   * registers it).
-   *
-   * Both halves are needed. The catalog record is all a restarted machine hydrates, so without
-   * the write it stops enforcing the CHECK. And this instance compares its own `tableSchema`
-   * against the record whenever it (re-)initializes, rewriting the record from `tableSchema` on
-   * a mismatch — so an instance that never learned of the CHECK would write it back out on its
-   * next re-open (after a failed `APPLY SCHEMA` batch commit, say).
-   *
-   * Schema-only, like the engine's own CHECK arm and Quereus's memory tables: existing rows are
-   * not validated against the new CHECK.
+   * Carry a catalog-only ALTER on this instance's own schema ({@link OptimysticModule.alterTable}
+   * hands over the same edit it makes to the engine's catalog entry). Needed even though the
+   * statement changed no row: this instance compares its own `tableSchema` against the record
+   * whenever it (re-)initializes and rewrites the record from it on a mismatch, so an instance
+   * that never learned of the change would undo it in the record on its next re-open (after a
+   * failed `APPLY SCHEMA` batch commit, say).
    */
-  async addCheckConstraint(check: RowConstraintSchema): Promise<void> {
-    // Initialized first so there is a record to extend: an instance whose record never landed
-    // (see markSchemaUnpersisted) re-persists it here, through the storage-adoption guard.
-    if (!this.isInitialized) {
-      await this.initialize();
-    }
-
-    const txnState = this.txnBridge.getCurrentTransaction();
-    // MUTATING path: read the catalog fresh, for the reason addIndex does.
-    const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName, txnState?.transactor);
-    if (!storedSchema) {
-      throw new Error(`Schema not found for Optimystic table '${this.schemaName}.${this.tableName}'. Cannot add CHECK constraint.`);
-    }
-    await this.schemaManager.storeStoredSchema(
-      this.schemaManager.withCheckConstraint(storedSchema, check),
-      txnState?.transactor,
-    );
-
-    // Only once the write is staged, so a refused write leaves this instance as it was. Same
-    // name rule as the record's (withCheckConstraint), so the two lists stay alike.
-    const name = check.name?.toLowerCase();
-    this.tableSchema = {
-      ...this.tableSchema,
-      checkConstraints: [
-        ...this.tableSchema.checkConstraints.filter(existing => name === undefined || existing.name?.toLowerCase() !== name),
-        check,
-      ],
-    };
+  applyCatalogOnlyEdit(edit: (schema: TableSchema) => TableSchema): void {
+    this.tableSchema = edit(this.tableSchema);
   }
 
   /**
@@ -3985,13 +3988,16 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * whose DROP staged a gravestone — nothing can re-persist those, so the failure log names
    * them; `deferred` the populated index trees of each manager's tables whose flush was
    * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
-   * it was deferred), with the table and index each belongs to.
+   * it was deferred), with the table and index each belongs to; `adopted` the catalog-only
+   * changes the apply found already in a record, so their undo stays off it (see
+   * {@link alterCatalogOnly}).
    */
   private schemaBatch?: {
     managers: Set<SchemaManager>;
     written: Map<SchemaManager, Set<string>>;
     dropped: Map<SchemaManager, Set<string>>;
     deferred: Map<SchemaManager, Map<Tree<string, IndexEntry>, { tableKey: string; indexName: string }>>;
+    adopted: AdoptedChanges;
   };
 
   /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
@@ -4072,10 +4078,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(schema));
       // Inside `apply schema` the save stages into the batch, so a failed batch commit must
       // mark the table unpersisted like any other table the batch altered.
-      if (this.schemaBatch) {
-        const written = this.schemaBatch.written.get(manager) ?? new Set<string>();
-        this.schemaBatch.written.set(manager, written.add(tableKey));
-      }
+      this.recordBatchEffect(manager, 'written', tableKey);
       const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
       this.catalogTagWrites = this.catalogTagWrites.then(() => this.saveTableTags(manager, tableKey, schema, transactor));
     } catch (error) {
@@ -4187,7 +4190,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       manager.beginBatch();
       managers.add(manager);
     }
-    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map() };
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted: new AdoptedChanges() };
   }
 
   /**
@@ -4310,27 +4313,21 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * checkpoint: a throw withdraws every catalog write the statement staged — and only those
    * — so a refused CREATE (the storage-adoption guard, or a failure later in doInitialize
    * after the schema already reached the overlay) leaves no record for the end-of-batch
-   * commit to persist. On success `tableKey` is recorded under `effect` for the table's
-   * manager (the `written` / `dropped` fields of `schemaBatch`). Outside a batch this is a
-   * plain call.
+   * commit to persist. On success `tableKey` is recorded under `effect` for `manager`, the
+   * table's catalog manager ({@link recordBatchEffect}) — taken rather than read off an instance,
+   * since a catalog-only ALTER on a hydrated table no statement has touched has none. Outside a
+   * batch this is a plain call.
    */
   private async underBatchCheckpoint<T>(
-    table: OptimysticVirtualTable,
+    manager: SchemaManager,
     effect: 'written' | 'dropped',
     tableKey: string,
     work: () => Promise<T>
   ): Promise<T> {
-    const batch = this.schemaBatch;
-    if (!batch) {
-      return work();
-    }
-    const manager = table.catalogManager;
     const checkpoint = manager.checkpointBatch();
     try {
       const result = await work();
-      const affected = batch[effect].get(manager) ?? new Set<string>();
-      affected.add(tableKey);
-      batch[effect].set(manager, affected);
+      this.recordBatchEffect(manager, effect, tableKey);
       return result;
     } catch (error) {
       if (checkpoint) {
@@ -4338,6 +4335,20 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
       throw error;
     }
+  }
+
+  /**
+   * Inside an open `APPLY SCHEMA` batch, record that `tableKey` (whose catalog record `manager`
+   * holds) was `written` or `dropped` by it — the lists {@link endSchemaBatch} recovers from when
+   * that manager's commit fails. Nothing outside a batch.
+   */
+  private recordBatchEffect(manager: SchemaManager, effect: 'written' | 'dropped', tableKey: string): void {
+    const batch = this.schemaBatch;
+    if (!batch) {
+      return;
+    }
+    const affected = batch[effect].get(manager) ?? new Set<string>();
+    batch[effect].set(manager, affected.add(tableKey));
   }
 
   /**
@@ -4419,7 +4430,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
     try {
-      await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+      await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
         await table.initialize();
         await table.ensureConnectionRegistered();
       });
@@ -4508,15 +4519,16 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * join an in-flight writer transaction) and never registers a connection.
    *
    * NOTE: a connect is not run under the open `APPLY SCHEMA` batch's per-statement
-   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, alterTable's CHECK arm
-   * and destroy — and the first-touch initialize of createIndex and that arm runs inside it —
-   * but not plain connects). A first touch of a hydrated table mid-apply whose persisted record
-   * differs from the hydrated shape re-persists it from here, and that write stays in the
-   * overlay if the statement then throws. One statement does reach this today: an ADD COLUMN
-   * of a NOT NULL column with no default makes Quereus read a row before alterTable refuses
-   * the arm. Fine while that stays rare — before the batch that write was committed before the
-   * throw anyway. If a mid-apply statement that commonly fails after its connect appears, wrap
-   * it too.
+   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, dropIndex, alterTable's
+   * catalog-only arms and destroy — and the first-touch initialize of createIndex and dropIndex
+   * runs inside it — but not plain connects). A first touch of a hydrated table mid-apply whose
+   * persisted record differs from the hydrated shape re-persists it from here, and that write
+   * stays in the overlay if the statement then throws. Two statements reach this today, both
+   * reading rows before alterTable runs: an ADD COLUMN of a NOT NULL column with no default
+   * (refused after the read), and ADD CONSTRAINT … CHECK, whose stored rows Quereus checks
+   * against the new CHECK (see the NOTE on `addCheckConstraint`). Fine while a failure after
+   * the connect stays rare — before the batch that write was committed before the throw anyway.
+   * If a mid-apply statement that commonly fails after its connect appears, wrap it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -4703,7 +4715,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // its connection the way connect's live path does (addIndex would initialize on its own,
     // but not register); if that initialize throws, the instance stays cached uninitialized
     // and the next touch retries, exactly as after a failed connect.
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+    await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
       if (fresh) {
         await table.initialize();
         await table.ensureConnectionRegistered();
@@ -4743,7 +4755,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     const { table, fresh } = resolved;
 
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+    await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
       if (fresh) {
         await table.initialize();
         await table.ensureConnectionRegistered();
@@ -4763,18 +4775,19 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * ALTER TABLE on an Optimystic table. The hook exists for ONE arm: a CHECK added by
-   * `ADD CONSTRAINT` — what `apply schema` emits when a later schema version declares a new
-   * named table-level CHECK — which must reach the table's catalog record
-   * ({@link OptimysticVirtualTable.addCheckConstraint}). Without the hook Quereus keeps such a
-   * CHECK in its in-memory catalog only, and a restarted machine that only hydrates stops
-   * enforcing it.
+   * ALTER TABLE on an Optimystic table. The hook exists for the arms that change nothing but the
+   * table's catalog record: a CHECK added by `ADD CONSTRAINT` and one removed by `DROP
+   * CONSTRAINT` — what `apply schema` emits when a later schema version adds, removes or changes
+   * the body of a named table-level CHECK — which must reach the record
+   * ({@link alterCatalogOnly}). Without the hook Quereus keeps such a change in its in-memory
+   * catalog only, and a restarted machine that only hydrates enforces the old CHECKs.
    *
    * Having the hook takes every other arm off Quereus's path for modules without one, so each
    * answers here as it did there: RENAME COLUMN renames schema-only
-   * ({@link renameColumnSchemaOnly}); the rest are refused as UNSUPPORTED in Quereus's own
-   * words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes UNSUPPORTED from here
-   * as "fall back to a rebuild", which it then refuses because this module has no `renameTable`.
+   * ({@link renameColumnSchemaOnly}); the rest — DROP CONSTRAINT of a UNIQUE or FOREIGN KEY
+   * included — are refused as UNSUPPORTED in Quereus's own words. ALTER PRIMARY KEY's final
+   * refusal is still Quereus's: it takes UNSUPPORTED from here as "fall back to a rebuild",
+   * which it then refuses because this module has no `renameTable`.
    *
    * NOTE: what does change is precedence. Quereus runs an arm's pre-dispatch checks only for a
    * module that has the hook, and those now come before these refusals — ADD COLUMN of a
@@ -4808,7 +4821,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     switch (change.type) {
       case 'addConstraint':
         return change.constraint.type === 'check'
-          ? await this.addCheckConstraint(db, tableSchema, change.constraint)
+          ? await this.addCheckConstraint(tableSchema, change.constraint)
           : refuse('ADD CONSTRAINT');
       case 'renameColumn':
         return renameColumnSchemaOnly(tableSchema, change.oldName, change.newName);
@@ -4816,8 +4829,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         return refuse('ALTER TABLE ADD COLUMN');
       case 'dropColumn':
         return refuse('ALTER TABLE DROP COLUMN');
-      case 'dropConstraint':
-        return refuse('ALTER TABLE DROP CONSTRAINT');
+      case 'dropConstraint': {
+        // Quereus has resolved the name to one constraint class (NOTFOUND / ambiguity raised) before calling.
+        const check = findNamed(tableSchema.checkConstraints, change.constraintName);
+        return check
+          ? await this.dropCheckConstraint(tableSchema, check, change.constraintName)
+          : refuse('ALTER TABLE DROP CONSTRAINT');
+      }
       case 'renameConstraint':
         return refuse('ALTER TABLE RENAME CONSTRAINT');
       case 'alterColumn':
@@ -4828,44 +4846,143 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * The CHECK arm of {@link alterTable}. The constraint is built by Quereus's own builder over
-   * the engine's catalog entry, exactly as its CHECK arm for a module without `alterTable` did,
-   * so an unnamed CHECK gets the same minted name. The table is resolved as {@link createIndex}
-   * resolves it — a hydrated table no statement has touched yet is instantiated and, inside the
-   * statement's batch checkpoint, initialized and registered — so the persisted write lands in
-   * an open `APPLY SCHEMA` batch and commits with the rest of the apply.
+   * The ADD CONSTRAINT … CHECK arm of {@link alterTable}, through {@link alterCatalogOnly}. The
+   * constraint is built by Quereus's own builder over the engine's catalog entry, exactly as its
+   * CHECK arm for a module without `alterTable` did, so an unnamed CHECK gets the same minted
+   * name. Enforced from the next statement; Quereus has already checked the stored rows against
+   * it before calling, and nothing here reads or rewrites a row.
+   *
+   * NOTE: accepted tradeoff — a record holding a CHECK of this name with another body is
+   * overwritten (local DDL wins, {@link withCheckConstraint}), so a machine applying an OLDER body
+   * over a newer one another machine committed puts the older one back, and if a later step of
+   * that apply fails, the undo of this owned write removes the CHECK from the record altogether.
+   * Reaching it takes two different upgrades of one table racing; revisit if hosts ever apply
+   * schema versions out of order.
+   *
+   * NOTE: Quereus's check of the stored rows is a `select` over the table, so on a hydrated table
+   * no statement has touched it builds the table instance before this arm runs — the first touch
+   * {@link alterCatalogOnly} itself avoids — and that instance's first initialize writes this
+   * machine's description of the table over a record another machine upgraded since this one
+   * hydrated (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
    */
-  private async addCheckConstraint(
-    db: Database,
-    tableSchema: TableSchema,
-    constraint: AddedConstraint
-  ): Promise<TableSchema> {
+  private addCheckConstraint(tableSchema: TableSchema, constraint: AddedConstraint): Promise<TableSchema> {
     const check = buildCheckConstraintSchema(
       constraint,
       tableSchema.checkConstraints.length,
       collectTableConstraintNames(tableSchema),
     );
+    const after = checkConstraintToStored(check);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'add CHECK constraint',
+      kind: 'check',
+      // buildCheckConstraintSchema always names the CHECK: it mints `check_<n>` for an unnamed one.
+      name: check.name!,
+      before: undefined,
+      after,
+      classify: record => classifyCheckChange(record, { op: 'add', after }),
+      editRecord: record => withCheckConstraint(record, check),
+      editSchema: schema => withCheck(schema, check),
+    });
+  }
 
+  /**
+   * The DROP CONSTRAINT arm of {@link alterTable} for a CHECK, through {@link alterCatalogOnly}:
+   * `check` is the engine's, matched by `name` case-insensitively. An unnamed CHECK is dropped by
+   * the name Quereus minted for it, which the record carries too.
+   */
+  private dropCheckConstraint(tableSchema: TableSchema, check: RowConstraintSchema, name: string): Promise<TableSchema> {
+    const before = checkConstraintToStored(check);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'drop CHECK constraint',
+      kind: 'check',
+      name,
+      before,
+      after: undefined,
+      classify: record => classifyCheckChange(record, { op: 'drop', before }),
+      editRecord: record => withoutCheckConstraint(record, name),
+      editSchema: schema => withoutCheck(schema, name),
+    });
+  }
+
+  /**
+   * Carry out one catalog-only ALTER ({@link CatalogOnlyAlter}): the change reaches the table's
+   * catalog record — or is found there already — and this machine's engine catalog and table
+   * instance. No row is read or written.
+   *
+   * The table's catalog manager is its instance's when one exists, else the one it would be built
+   * with, as {@link followTableTags} resolves it. A table with no instance is NOT instantiated: an
+   * instance built from this machine's catalog entry compares that entry with the record on its
+   * first initialize and rewrites the record on any difference, so on a machine that hydrated
+   * before another machine upgraded the table it would put the old description back
+   * (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record). An
+   * instance that exists but is not initialized is initialized first, inside the statement's batch
+   * checkpoint, so a record that never landed (`markSchemaUnpersisted`) is re-persisted before it
+   * is extended.
+   *
+   * The record is read fresh and judged ({@link CatalogOnlyAlter.classify}). An owned change is
+   * written under the batch checkpoint, so a throw withdraws it and a failed batch commit marks
+   * the table unpersisted; an adopted one writes nothing. Either way the instance and the engine's
+   * entry take the edit. The returned schema is built from the engine's entry, never the
+   * instance's, which differs from it on purpose (see {@link OptimysticVirtualTable.followSchemaTags}).
+   *
+   * Inside `apply schema` a change the record already held is recorded as adopted, and a later
+   * change that undoes it ({@link AdoptedChanges}) — Quereus unwinding the apply after a later step
+   * failed — changes this machine's engine catalog and instance only: the record holds what another
+   * machine committed, and undoing a change this machine did not make would remove it. Outside a
+   * batch no undo follows, so nothing is recorded.
+   */
+  private async alterCatalogOnly(tableSchema: TableSchema, change: CatalogOnlyAlter): Promise<TableSchema> {
     const { schemaName, name: tableName } = tableSchema;
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName, tableSchema);
-    if (!resolved) {
-      throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot add CHECK constraint.`);
-    }
-    const { table, fresh } = resolved;
+    const table = this.tables.get(tableKey);
+    const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(tableSchema));
+    const adopted = this.schemaBatch?.adopted;
+    const adoptedKey = adoptedChangeKey(tableKey, change.kind, change.name);
+    const undoesAdopted = adopted?.undoes(adoptedKey, change.after) ?? false;
 
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
-      if (fresh) {
-        await table.initialize();
-        await table.ensureConnectionRegistered();
+    const outcome = await this.underBatchCheckpoint(manager, 'written', tableKey, async () => {
+      await table?.initialize();
+      if (undoesAdopted) {
+        log('%s %s on %s: undoes a change this apply found already saved; this machine\'s catalog only', change.operation, change.name, tableKey);
+        return 'undone';
       }
-      await table.addCheckConstraint(check);
+      return await this.saveCatalogOnly(manager, tableSchema, change);
     });
+    table?.applyCatalogOnlyEdit(change.editSchema);
+    if (adopted) {
+      if (outcome === 'undone') {
+        adopted.release(adoptedKey);
+      } else if (outcome === 'adopted') {
+        adopted.adopt(adoptedKey, change.before);
+      }
+    }
+    return change.editSchema(tableSchema);
+  }
 
-    return {
-      ...tableSchema,
-      checkConstraints: Object.freeze([...tableSchema.checkConstraints, check]),
-    };
+  /** The record half of {@link alterCatalogOnly}: read the record fresh, judge it, and write an owned change. */
+  private async saveCatalogOnly(
+    manager: SchemaManager,
+    tableSchema: TableSchema,
+    change: CatalogOnlyAlter
+  ): Promise<'owned' | 'adopted'> {
+    const { schemaName, name: tableName } = tableSchema;
+    const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
+    const record = await manager.getSchemaFresh(schemaName, tableName, transactor);
+    if (!record) {
+      throw new Error(`Schema not found for Optimystic table '${schemaName}.${tableName}'. Cannot ${change.operation}.`);
+    }
+    const verdict = change.classify(record);
+    switch (verdict.kind) {
+      case 'refused':
+        throw new QuereusError(verdict.message, StatusCode.ERROR);
+      case 'owned':
+        await manager.storeStoredSchema(change.editRecord(record), transactor);
+        break;
+      case 'adopted':
+        log('%s %s on %s.%s: the catalog record already holds it; nothing written', change.operation, change.name, schemaName, tableName);
+        break;
+    }
+    return verdict.kind;
   }
 
   /**
@@ -5196,7 +5313,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       table.teardownChangeSubscription();
       table.forgetInCommitReports();
       try {
-        await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema());
+        await this.underBatchCheckpoint(table.catalogManager, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {
         // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
         // does leave the record LIVE past its own DROP, which blinds the

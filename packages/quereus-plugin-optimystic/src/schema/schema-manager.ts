@@ -682,6 +682,44 @@ export function withoutIndex(record: PersistedTableSchema, indexName: string): P
 	});
 }
 
+/** A CHECK as the catalog record stores it — the one conversion, shared by every path that writes one. */
+export function checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
+	return {
+		name: check.name,
+		expr: persistExpression(check.expr),
+		operations: check.operations,
+		deferrable: check.deferrable,
+		initiallyDeferred: check.initiallyDeferred,
+		defaultConflict: check.defaultConflict,
+		tags: copyTags(check.tags),
+	};
+}
+
+/**
+ * `stored` with `check` added: the persisted half of `ALTER TABLE … ADD CONSTRAINT … CHECK`. A
+ * CHECK already carrying that name, compared case-insensitively as Quereus compares constraint
+ * names, is replaced rather than doubled — the engine refuses a name its own catalog holds, so
+ * such a CHECK came from a writer this session's declaration never saw, and local DDL wins here as
+ * it does on every other schema write. List order is left to the write
+ * ({@link canonicalizeRecordOrder}).
+ */
+export function withCheckConstraint(stored: StoredTableSchema, check: RowConstraintSchema): StoredTableSchema {
+	const kept = withoutCheckConstraint(stored, check.name).checkConstraints ?? [];
+	return { ...stored, checkConstraints: [...kept, checkConstraintToStored(check)] };
+}
+
+/**
+ * `stored` without the CHECK named `name` (case-insensitive, the same name rule as
+ * {@link withCheckConstraint}): the persisted half of `ALTER TABLE … DROP CONSTRAINT` of a CHECK.
+ * An unnamed CHECK is dropped by the name Quereus minted for it, which the record carries too. The
+ * key is omitted when nothing is left, as {@link SchemaManager.tableSchemaToStored} omits it.
+ */
+export function withoutCheckConstraint(stored: StoredTableSchema, name: string | undefined): StoredTableSchema {
+	const lower = name?.toLowerCase();
+	const kept = (stored.checkConstraints ?? []).filter(check => lower === undefined || check.name?.toLowerCase() !== lower);
+	return { ...stored, checkConstraints: nonEmpty(kept) };
+}
+
 /**
  * The record a schema write produces: `incoming` (the caller's declaration, already in
  * persisted form) with its index list unioned against what the catalog holds
@@ -1673,7 +1711,7 @@ export class SchemaManager {
 			// Omitting it keeps this byte-identical with every schema persisted before quereus
 			// 4.19 moved the row count onto `statistics`, so the migration costs no rewrites.
 			uniqueConstraints: nonEmpty(uniqueConstraints),
-			checkConstraints: nonEmpty(schema.checkConstraints.map(check => this.checkConstraintToStored(check))),
+			checkConstraints: nonEmpty(schema.checkConstraints.map(checkConstraintToStored)),
 			foreignKeys: nonEmpty(schema.foreignKeys?.map(fk => this.foreignKeyToStored(fk))),
 			mutationContext: nonEmpty(schema.mutationContext?.map(variable => ({
 				name: variable.name,
@@ -1708,32 +1746,6 @@ export class SchemaManager {
 			pkDirection: col.pkDirection,
 			defaultConflict: col.defaultConflict,
 			tags: copyTags(col.tags),
-		};
-	}
-
-	/**
-	 * `stored` with `check` added: the persisted half of `ALTER TABLE … ADD CONSTRAINT … CHECK`
-	 * (see `OptimysticVirtualTable.addCheckConstraint`). A CHECK already carrying that name,
-	 * compared case-insensitively as Quereus compares constraint names, is replaced rather than
-	 * doubled — the engine refuses a name its own catalog holds, so such a CHECK came from a
-	 * writer this session's declaration never saw, and local DDL wins here as it does on every
-	 * other schema write. List order is left to the write ({@link canonicalizeRecordOrder}).
-	 */
-	withCheckConstraint(stored: StoredTableSchema, check: RowConstraintSchema): StoredTableSchema {
-		const name = check.name?.toLowerCase();
-		const kept = (stored.checkConstraints ?? []).filter(existing => name === undefined || existing.name?.toLowerCase() !== name);
-		return { ...stored, checkConstraints: [...kept, this.checkConstraintToStored(check)] };
-	}
-
-	private checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
-		return {
-			name: check.name,
-			expr: persistExpression(check.expr),
-			operations: check.operations,
-			deferrable: check.deferrable,
-			initiallyDeferred: check.initiallyDeferred,
-			defaultConflict: check.defaultConflict,
-			tags: copyTags(check.tags),
 		};
 	}
 
