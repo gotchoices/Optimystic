@@ -571,20 +571,24 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		expect(tableOf(third.db, 'app', 'N').tags).to.deep.equal({ b: true });
 	});
 
-	it('a tag-only apply schema saves the tag in its one catalog commit', async () => {
+	it('a tag-only apply schema after a restart saves the tag in its one catalog commit', async () => {
+		// The host's own upgrade path: restart, hydrate, apply the next version. No statement has
+		// touched the hydrated table, so the save goes through the module's no-instance branch.
 		const store = buildSharedLocalTransactor(new MemoryRawStorage());
-		const counting = countingTransactor(store);
-		const { db } = await openSession('era1', { 'local:era1': counting.transactor });
 		const version = (v: number) =>
 			`declare schema app { table N { id integer primary key, v text } with tags (version = ${v}) } apply schema app;`;
-		await db.exec(version(1));
+		const first = await openEra('era1', store);
+		await first.db.exec(version(1));
 
+		const counting = countingTransactor(store);
+		const { db, plugin } = await openSession('era2', { 'local:era2': counting.transactor });
+		await plugin.hydrate(db);
 		counting.counts.reset();
 		await db.exec(version(2));
 		expect(counting.counts.commit, "the tag rides the apply's one catalog commit").to.equal(1);
 
 		// Saved before the apply returned: nothing here waits for the catalog.
-		const later = await openEra('era2', store);
+		const later = await openEra('era3', store);
 		await later.plugin.hydrate(later.db);
 		expect(tableOf(later.db, 'app', 'N').tags).to.deep.equal({ version: 2 });
 	});

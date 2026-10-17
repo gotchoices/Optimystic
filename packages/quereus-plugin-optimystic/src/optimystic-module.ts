@@ -4058,6 +4058,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * saved and writes nothing. (A table rename, the one `table_modified` that changes the
    * name, is refused for this module's tables, so the schema's name is the key the table is
    * held under.)
+   *
+   * NOTE: each such structural event still costs one catalog read outside a batch (`ANALYZE`
+   * fires one per table). If that ever shows up, skip the save when the event's `oldObject`
+   * carries the same tags as `newObject` — giving up the re-save, on the next DDL, of tags an
+   * earlier failed save left out of the record.
    */
   private followTableTags(schema: TableSchema): void {
     const tableKey = `${schema.schemaName}.${schema.name}`.toLowerCase();
