@@ -11,14 +11,14 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, checkConstraintToStored, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withoutCheckConstraint } from './schema/schema-manager.js';
+import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
-import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, findNamed, withoutNamed } from './schema/catalog-only-change.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
@@ -273,6 +273,24 @@ type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => vo
 /** Quereus's CHECK shape and its ADD CONSTRAINT AST node, reached through exported types (neither is exported by name). */
 type RowConstraintSchema = TableSchema['checkConstraints'][number];
 type AddedConstraint = Extract<SchemaChangeInfo, { type: 'addConstraint' }>['constraint'];
+type AddColumnChange = Extract<SchemaChangeInfo, { type: 'addColumn' }>;
+type ColumnSchema = TableSchema['columns'][number];
+
+/**
+ * How a catalog-only ALTER moves the table's columns: one appended, or the one at `position`
+ * removed. A table instance rebuilds what it derived from its column list after either
+ * ({@link OptimysticVirtualTable.applyCatalogOnlyEdit}).
+ */
+type ColumnLayoutChange = { readonly kind: 'append' } | { readonly kind: 'remove'; readonly position: number };
+
+/**
+ * The column constraints a catalog-only ADD COLUMN accepts — none that would need a value written
+ * into the rows already stored (NOT NULL, DEFAULT, GENERATED), a key (PRIMARY KEY, UNIQUE), or the
+ * stored rows checked (CHECK, FOREIGN KEY). An inline CHECK, UNIQUE or FOREIGN KEY would also be
+ * installed by Quereus through a separate `addConstraint` call after the column, so refusing one
+ * here is what keeps a later failure from leaving the column half-installed.
+ */
+const CATALOG_ONLY_COLUMN_CONSTRAINTS: ReadonlySet<string> = new Set(['null', 'notNull', 'collate']);
 
 /**
  * One catalog-only ALTER as `OptimysticModule.alterCatalogOnly` carries it out: the record object
@@ -291,6 +309,8 @@ interface CatalogOnlyAlter {
   classify(record: StoredTableSchema): CatalogOnlyVerdict;
   editRecord(record: StoredTableSchema): StoredTableSchema;
   editSchema(schema: TableSchema): TableSchema;
+  /** How the change moves the table's columns; absent when it moves none. */
+  readonly layout?: ColumnLayoutChange;
 }
 
 /** `schema` without the CHECK named `name`, compared case-insensitively as Quereus compares constraint names. */
@@ -301,6 +321,39 @@ function withoutCheck(schema: TableSchema, name: string | undefined): TableSchem
 /** `schema` with `check` added, replacing a CHECK of that name — the rule {@link withCheckConstraint} applies to the record. */
 function withCheck(schema: TableSchema, check: RowConstraintSchema): TableSchema {
   return { ...schema, checkConstraints: Object.freeze([...withoutCheck(schema, check.name).checkConstraints, check]) };
+}
+
+/** `schema` with `column` appended — the rule {@link withColumn} applies to the record. */
+function withColumnAppended(schema: TableSchema, column: ColumnSchema): TableSchema {
+  const columns = Object.freeze([...schema.columns, column]);
+  return { ...schema, columns, columnIndexMap: buildColumnIndexMap(columns) };
+}
+
+/**
+ * `schema` without the column at `position`, every positional field renumbered over the slot —
+ * the rule {@link withoutColumn} applies to the record. Quereus's own `shiftSchemaIndicesForDrop`
+ * renumbers the key, indexes, UNIQUE constraints and FOREIGN KEYs; nothing it would remove can be
+ * present, since a column any of them covers is refused first. The generated-column bookkeeping is
+ * renumbered here as well: Quereus recomputes it for the engine's catalog entry after the module
+ * returns, but a table instance keeps the schema this produces.
+ */
+function withoutColumnAt(schema: TableSchema, position: number): TableSchema {
+  const shifted = shiftSchemaIndicesForDrop(schema, position);
+  const reposition = positionAfterRemoving(position);
+  return {
+    ...schema,
+    columns: shifted.columns,
+    columnIndexMap: buildColumnIndexMap(shifted.columns),
+    primaryKeyDefinition: shifted.primaryKeyDefinition,
+    indexes: schema.indexes === undefined ? undefined : shifted.indexes,
+    uniqueConstraints: shifted.uniqueConstraints,
+    foreignKeys: shifted.foreignKeys,
+    generatedColumnDependencies: schema.generatedColumnDependencies
+      ? new Map([...schema.generatedColumnDependencies].map(([generated, dependencies]) =>
+        [reposition(generated), dependencies.map(reposition)]))
+      : undefined,
+    generatedColumnTopoOrder: schema.generatedColumnTopoOrder?.map(reposition),
+  };
 }
 
 /**
@@ -911,16 +964,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
 
-      // NOTE: this is one of two paths on which doInitialize runs TWICE for a table —
-      // the upgrade after a provisional pass, and a retry after a failed attempt (see
+      // This is one of two paths on which doInitialize runs TWICE for a table — the
+      // upgrade after a provisional pass, and a retry after a failed attempt (see
       // initialize()) — so it replaces `rowCodec`/`indexManager` while a committed scan
-      // started off the provisional state may still be iterating (scans re-read both
-      // fields per row). A rerun that FAILS can no longer be seen half-applied (the
-      // publish above is one synchronous step), but a rerun that SUCCEEDS still swaps
-      // the fields under such a scan. Harmless while both passes resolve the same
-      // schema, which they do unless DDL changed the table in between; if concurrent
-      // DDL ever becomes real here, a scan must capture its codec and index manager as
-      // locals alongside its pinned views.
+      // started off the provisional state may still be iterating. A rerun that FAILS
+      // cannot be seen half-applied (the publish above is one synchronous step), and one
+      // that SUCCEEDS swaps the fields without reaching a running scan: every scan takes
+      // its codec and index manager once, at its start (runQuery), alongside its pinned
+      // views — which a catalog-only ADD or DROP COLUMN needs too, since it replaces both
+      // under a committed read the same way (republishColumnLayout).
       this.isProvisionallyInitialized = false;
       this.isInitialized = true;
 
@@ -1363,6 +1415,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.collection || !this.rowCodec || !this.indexManager) {
       throw new Error('Table not initialized');
     }
+    // The codec and index descriptors this scan decodes and seeks with, taken once: a catalog-only
+    // ADD or DROP COLUMN replaces both on the instance (republishColumnLayout), and a committed
+    // read runs outside the engine's exec lock, so one can land while this scan is iterating.
+    const rowCodec = this.rowCodec;
+    const indexManager = this.indexManager;
 
     try {
       // Parse the access strategy FIRST (all synchronous), so the committed arm
@@ -1395,7 +1452,7 @@ export class OptimysticVirtualTable extends VirtualTable {
 
       const mainTree = this.collection as unknown as Tree<string, RowData>;
       const indexTarget = scanIndexName !== undefined
-        ? this.resolveIndexTarget(scanIndexName)
+        ? this.resolveIndexTarget(indexManager, scanIndexName)
         : undefined;
 
       let mainRead: TreeReadView<string, RowData>;
@@ -1430,7 +1487,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // still reports what the seek had produced by then.
         const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0 } : undefined;
         try {
-          yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args, seek);
+          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, filterInfo.args, seek);
         } finally {
           if (seek !== undefined) {
             this.logIndexSeek(indexScan, mainTree, committed, seek);
@@ -1438,19 +1495,19 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
-        yield* this.executePointLookup(mainRead, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
       } else if (planType === 3) {
         // Range query on primary key (plan=3)
-        yield* this.executeRangeQuery(mainRead, filterInfo);
+        yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
       } else if (filterInfo.idxNum === 1) {
         // Legacy: Point lookup on primary key
-        yield* this.executePointLookup(mainRead, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
-        yield* this.executeRangeQuery(mainRead, filterInfo);
+        yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
       } else {
         // Full table scan
-        yield* this.executeTableScan(mainRead);
+        yield* this.executeTableScan(mainRead, rowCodec);
       }
     } catch (error) {
       // NOTE: a live read inside a doomed transaction can surface a concurrency
@@ -1477,15 +1534,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * is unknown. Synchronous, so {@link runQuery}'s committed arm can resolve it inside
    * the single view-building block.
    */
-  private resolveIndexTarget(indexName: string): IndexScanTarget {
-    if (!this.indexManager) {
-      throw new Error('Table not initialized');
-    }
+  private resolveIndexTarget(indexManager: IndexManager, indexName: string): IndexScanTarget {
     // Scan-time backstop of the maintained-index invariant (the plan-time guard is
     // OptimysticModule.assertIndexMaintained): a scan routed through an index this
     // table does not maintain must fail loudly, naming table and index, instead of
     // descending a stale tree and honestly returning too few rows.
-    const schema = this.indexManager.getIndexSchema(indexName);
+    const schema = indexManager.getIndexSchema(indexName);
     if (!schema) {
       throw new QuereusError(
         unmaintainedIndexMessage(
@@ -1496,7 +1550,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         StatusCode.ERROR,
       );
     }
-    const tree = this.indexManager.getIndexTree(indexName);
+    const tree = indexManager.getIndexTree(indexName);
     if (!tree) {
       throw new QuereusError(
         unmaintainedIndexMessage(
@@ -1674,10 +1728,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executePointLookup(
     read: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
     args: readonly unknown[],
   ): AsyncIterable<Row> {
-    if (!this.rowCodec) return;
-
     // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no
     // row matches — even though key EQUALITY is NULL-self-equal and a NULL-keyed row
     // really is stored under the NULL tag (key-encoding.ts). Without this guard the
@@ -1704,11 +1757,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Using only args[0] silently drops every PK column past the first, so a
     // composite-PK point lookup builds a key that can never match a stored row.
     // Seek args are the key-ordered tuple shape, not a row — see schema/key-tuples.ts.
-    const key = this.rowCodec.createPrimaryKey(
-      this.rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
+    const key = rowCodec.createPrimaryKey(
+      rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
     );
 
-    const row = await readRowAt(read, this.rowCodec, key);
+    const row = await readRowAt(read, rowCodec, key);
     if (row !== undefined) {
       yield row;
     }
@@ -1719,11 +1772,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executeRangeQuery(
     read: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
     _filterInfo: FilterInfo,
   ): AsyncIterable<Row> {
     // For now, fall back to full scan
     // TODO: Implement proper range queries based on filter args
-    yield* this.executeTableScan(read);
+    yield* this.executeTableScan(read, rowCodec);
   }
 
   /**
@@ -1734,14 +1788,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
+    indexManager: IndexManager,
     index: IndexScanSource,
     args: readonly unknown[],
     seek?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    const rowCodec = this.rowCodec;
-    const indexManager = this.indexManager;
-    if (!rowCodec || !indexManager) return;
-
     // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no row
     // matches — the same guard, for the same reason, that executePointLookup carries; read
     // its comment for why the engine leaves a dynamic NULL to the module (it folds only a
@@ -1848,9 +1900,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * simply never exercised for it (harmless). The read source is already
    * network-refreshed (live) or a snapshot (committed); this method never refreshes it.
    */
-  private async* executeTableScan(read: TreeReadView<string, RowData>): AsyncIterable<Row> {
-    if (!this.rowCodec) return;
-
+  private async* executeTableScan(read: TreeReadView<string, RowData>, rowCodec: RowCodec): AsyncIterable<Row> {
     const maxRetries = 5;
     let retryCount = 0;
     let lastKey: string | undefined;
@@ -1880,7 +1930,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             }
 
             const encodedRow = entry[1];
-            const row = this.rowCodec.decodeRow(encodedRow);
+            const row = rowCodec.decodeRow(encodedRow);
             yieldedKeys.add(key);
             lastKey = key;
             yield row;
@@ -3290,10 +3340,58 @@ export class OptimysticVirtualTable extends VirtualTable {
    * statement changed no row: this instance compares its own `tableSchema` against the record
    * whenever it (re-)initializes and rewrites the record from it on a mismatch, so an instance
    * that never learned of the change would undo it in the record on its next re-open (after a
-   * failed `APPLY SCHEMA` batch commit, say).
+   * failed `APPLY SCHEMA` batch commit, say). A change that moves the columns (`layout`) also
+   * rebuilds what the instance derived from them ({@link republishColumnLayout}).
    */
-  applyCatalogOnlyEdit(edit: (schema: TableSchema) => TableSchema): void {
-    this.tableSchema = edit(this.tableSchema);
+  applyCatalogOnlyEdit(edit: (schema: TableSchema) => TableSchema, layout?: ColumnLayoutChange): void {
+    const tableSchema = edit(this.tableSchema);
+    if (layout !== undefined) {
+      this.republishColumnLayout(tableSchema, layout);
+    }
+    this.tableSchema = tableSchema;
+  }
+
+  /**
+   * What an initialized instance derived from its column list, rebuilt for `tableSchema` after a
+   * catalog-only ADD or DROP COLUMN ({@link applyCatalogOnlyEdit}), in one synchronous step as
+   * {@link doInitialize}'s publish does. The row codec follows the new column list. After a DROP,
+   * every maintained index — declared and unique-enforcement alike — is renumbered over the removed
+   * slot; none covers it ({@link columnDropBlockers}), so the maintained set, the trees and their
+   * registration with the transaction bridge are all unchanged (tree names come from index and
+   * column names). A running scan keeps the codec and index descriptors it started with.
+   *
+   * Built from this instance's own schema, not from the catalog record: rows reach this instance
+   * positioned by this machine's engine, whose column list the instance mirrors, and the record can
+   * hold columns this engine has not seen (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
+   * An uninitialized instance has nothing derived yet; its first initialize builds from `tableSchema`.
+   */
+  private republishColumnLayout(tableSchema: TableSchema, layout: ColumnLayoutChange): void {
+    if (!this.rowCodec || !this.indexManager) {
+      return;
+    }
+    const rowCodec = new RowCodec(this.schemaManager.tableSchemaToStored(tableSchema), this.options.encoding);
+    if (layout.kind === 'remove') {
+      const reposition = positionAfterRemoving(layout.position);
+      const uniqueEnforcementIndexes = this.uniqueEnforcementIndexes.map(idx => repositionIndexColumns(idx, reposition));
+      this.indexManager.repositionColumns(reposition);
+      this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
+    }
+    this.rowCodec = rowCodec;
+  }
+
+  /**
+   * Why this instance cannot drop the column at `position` without rewriting stored data, as
+   * {@link columnDropBlockers} phrases it: what its own schema keys on the column, else any index
+   * tree it maintains over it. Mirrors the engine's catalog entry in the normal case; asked anyway,
+   * since {@link republishColumnLayout} cannot renumber a maintained tree that covers the column.
+   */
+  columnDropBlockers(position: number): string[] {
+    const own = columnDropBlockers(this.tableSchema, position);
+    if (own.length > 0 || !this.indexManager) {
+      return own;
+    }
+    const maintained = this.indexManager.getAllMaintainedIndexes();
+    return columnDropBlockers({ columns: this.tableSchema.columns, primaryKeyDefinition: [], indexes: maintained }, position);
   }
 
   /**
@@ -4781,24 +4879,27 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
   /**
    * ALTER TABLE on an Optimystic table. The hook exists for the arms that change nothing but the
-   * table's catalog record: a CHECK added by `ADD CONSTRAINT` and one removed by `DROP
-   * CONSTRAINT` — what `apply schema` emits when a later schema version adds, removes or changes
-   * the body of a named table-level CHECK — which must reach the record
-   * ({@link alterCatalogOnly}). Without the hook Quereus keeps such a change in its in-memory
-   * catalog only, and a restarted machine that only hydrates enforces the old CHECKs.
+   * table's catalog record ({@link alterCatalogOnly}): a CHECK added by `ADD CONSTRAINT` and one
+   * removed by `DROP CONSTRAINT`, a nullable column added by `ADD COLUMN` ({@link addColumn}) and
+   * a column no key, index or constraint uses removed by `DROP COLUMN` ({@link dropColumn}) — what
+   * `apply schema` emits when a later schema version changes a table that way. Each must reach the
+   * record: without the hook Quereus keeps such a change in its in-memory catalog only, and a
+   * restarted machine that only hydrates gets the old table back.
    *
    * Having the hook takes every other arm off Quereus's path for modules without one, so each
    * answers here as it did there: RENAME COLUMN renames schema-only
-   * ({@link renameColumnSchemaOnly}); the rest — DROP CONSTRAINT of a UNIQUE or FOREIGN KEY
-   * included — are refused as UNSUPPORTED in Quereus's own words. ALTER PRIMARY KEY's final
-   * refusal is still Quereus's: it takes UNSUPPORTED from here as "fall back to a rebuild",
-   * which it then refuses because this module has no `renameTable`.
+   * ({@link renameColumnSchemaOnly}); the rest — DROP CONSTRAINT of a UNIQUE or FOREIGN KEY, and
+   * the column shapes the two column arms do not accept, included — are refused as UNSUPPORTED in
+   * Quereus's own words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes
+   * UNSUPPORTED from here as "fall back to a rebuild", which it then refuses because this module
+   * has no `renameTable`.
    *
    * NOTE: what does change is precedence. Quereus runs an arm's pre-dispatch checks only for a
    * module that has the hook, and those now come before these refusals — ADD COLUMN of a
    * NOT NULL column with no default over a table with rows reports the missing default (after
-   * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed. Both are
-   * still refused and change nothing; only the message differs.
+   * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed, and DROP
+   * COLUMN of a column a CHECK or a generated column names reports that. All are still refused
+   * and change nothing; only the message differs.
    *
    * NOTE: Quereus's materialized-view reshape paths also call this hook, but only for a module
    * with `getBackingHost`, which this one lacks. If it ever gains it, those reshapes get these
@@ -4831,9 +4932,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       case 'renameColumn':
         return renameColumnSchemaOnly(tableSchema, change.oldName, change.newName);
       case 'addColumn':
-        return refuse('ALTER TABLE ADD COLUMN');
+        return await this.addColumn(db, tableSchema, change, refuse);
       case 'dropColumn':
-        return refuse('ALTER TABLE DROP COLUMN');
+        return await this.dropColumn(tableSchema, change.columnName);
       case 'dropConstraint': {
         // Quereus has resolved the name to one constraint class (NOTFOUND / ambiguity raised) before calling.
         const check = findNamed(tableSchema.checkConstraints, change.constraintName);
@@ -4910,6 +5011,107 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
+   * The ADD COLUMN arm of {@link alterTable}, through {@link alterCatalogOnly}, for a column that
+   * needs nothing written into the rows already stored: one that is nullable, has no DEFAULT, is
+   * not GENERATED and declares no inline CHECK, UNIQUE, FOREIGN KEY or key, appended at the end.
+   * Rows are stored keyed by column name ({@link RowCodec}), so a row written before the column
+   * existed reads it as NULL and no row is rewritten. An explicit COLLATE and column tags are
+   * accepted. Any other column is refused in Quereus's words for a module without the hook.
+   *
+   * The column is resolved exactly as Quereus's memory module resolves it — `columnDefToSchema`
+   * under the session's `default_column_nullability` and `default_collation` — so the column this
+   * machine saves is the one every machine running the same statement saves, and a second machine
+   * finds its own column already in the record ({@link classifyColumnChange}).
+   */
+  private addColumn(
+    db: Database,
+    tableSchema: TableSchema,
+    change: AddColumnChange,
+    refuse: (operation: string) => never
+  ): Promise<TableSchema> {
+    const column = columnDefToSchema(
+      change.columnDef,
+      db.options.getStringOption('default_column_nullability') === 'not_null',
+      db.options.getStringOption('default_collation'),
+      name => db.isCollationRegistered(name),
+    );
+    const appends = change.insertAtIndex === undefined || change.insertAtIndex === tableSchema.columns.length;
+    const needsNoRowWritten = !column.notNull && column.defaultValue === null && !column.generated && !column.primaryKey
+      && change.columnDef.constraints.every(constraint => CATALOG_ONLY_COLUMN_CONSTRAINTS.has(constraint.type));
+    if (!appends || !needsNoRowWritten) {
+      refuse('ALTER TABLE ADD COLUMN');
+    }
+    if (change.backfillEvaluator !== undefined) {
+      // Quereus builds one only from a DEFAULT or a generated expression, both refused above.
+      throw new QuereusError(
+        `ALTER TABLE ADD COLUMN '${column.name}' on Optimystic table '${tableSchema.name}' carried a per-row backfill for a column with no value source`,
+        StatusCode.INTERNAL,
+      );
+    }
+    const after = columnSchemaToStored(column);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'add column',
+      kind: 'column',
+      name: column.name,
+      before: undefined,
+      after,
+      classify: record => classifyColumnChange(record, { op: 'add', after }),
+      editRecord: record => withColumn(record, column),
+      editSchema: schema => withColumnAppended(schema, column),
+      layout: { kind: 'append' },
+    });
+  }
+
+  /**
+   * The DROP COLUMN arm of {@link alterTable}, through {@link alterCatalogOnly}, for a column
+   * nothing keys stored data on: not in the primary key, any index (declared, or a tree enforcing
+   * a UNIQUE constraint), any UNIQUE constraint or this table's own FOREIGN KEY, and not GENERATED
+   * ({@link columnDropBlockers}). Rows keep the dropped column's field until they are rewritten;
+   * nothing reads it. Quereus has already refused a column a CHECK, a DEFAULT, a generated
+   * expression, a partial index's predicate, another table's FOREIGN KEY or an assertion names.
+   *
+   * Judged here against this machine's catalog entry and table instance, and again against the
+   * fresh record ({@link classifyColumnChange}), which can hold an index another machine added that
+   * this machine has not hydrated.
+   *
+   * Quereus marks DROP COLUMN irreversible: a failed `apply schema` never re-adds the column. It
+   * runs here as an undo only as the undo of an ADD COLUMN, which {@link alterCatalogOnly} keeps off
+   * the record when that ADD was adopted.
+   *
+   * NOTE: accepted tradeoff — a later ADD COLUMN of a dropped name reads the values rows still
+   * carry under it, as they were stored (the row codec does not convert them to the new column's
+   * type), since no row is rewritten on the drop. Refusing the name would need a permanent list of
+   * dropped names in the record, and rewriting every row on the drop defeats catalog-only; a table
+   * re-declared with a different column list reads stale fields the same way. Revisit if a host
+   * needs to reuse a dropped column name.
+   */
+  private dropColumn(tableSchema: TableSchema, columnName: string): Promise<TableSchema> {
+    const position = tableSchema.columnIndexMap.get(columnName.toLowerCase());
+    if (position === undefined) {
+      // Quereus resolves the column before calling; kept as its own words in case it ever does not.
+      throw new QuereusError(`Column '${columnName}' not found in table '${tableSchema.name}'`, StatusCode.ERROR);
+    }
+    const column = tableSchema.columns[position]!;
+    const table = this.tables.get(`${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase());
+    const blockers = new Set([...columnDropBlockers(tableSchema, position), ...(table?.columnDropBlockers(position) ?? [])]);
+    if (blockers.size > 0) {
+      throw new QuereusError(dropColumnRefusal(tableSchema.name, column.name, [...blockers], 'engine'), StatusCode.UNSUPPORTED);
+    }
+    const before = columnSchemaToStored(column);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'drop column',
+      kind: 'column',
+      name: column.name,
+      before,
+      after: undefined,
+      classify: record => classifyColumnChange(record, { op: 'drop', before }),
+      editRecord: record => withoutColumn(record, column.name),
+      editSchema: schema => withoutColumnAt(schema, position),
+      layout: { kind: 'remove', position },
+    });
+  }
+
+  /**
    * Carry out one catalog-only ALTER ({@link CatalogOnlyAlter}): the change reaches the table's
    * catalog record — or is found there already — and this machine's engine catalog and table
    * instance. No row is read or written.
@@ -4957,7 +5159,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
       return await this.saveCatalogOnly(manager, tableSchema, change);
     }, outcome => outcome === 'owned' || initializesHere);
-    table?.applyCatalogOnlyEdit(change.editSchema);
+    table?.applyCatalogOnlyEdit(change.editSchema, change.layout);
     if (adopted) {
       if (outcome === 'undone') {
         adopted.release(adoptedKey);
@@ -4983,7 +5185,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const verdict = change.classify(record);
     switch (verdict.kind) {
       case 'refused':
-        throw new QuereusError(verdict.message, StatusCode.ERROR);
+        throw new QuereusError(verdict.message, verdict.code);
       case 'owned':
         await manager.storeStoredSchema(change.editRecord(record), transactor);
         break;

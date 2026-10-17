@@ -13,7 +13,7 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
-import { withoutNamed } from './catalog-only-change.js';
+import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
@@ -717,6 +717,98 @@ export function withCheckConstraint(stored: StoredTableSchema, check: RowConstra
  */
 export function withoutCheckConstraint(stored: StoredTableSchema, name: string | undefined): StoredTableSchema {
 	return { ...stored, checkConstraints: nonEmpty(withoutNamed(stored.checkConstraints ?? [], name)) };
+}
+
+/**
+ * A column as the catalog record stores it — the inverse of {@link SchemaManager.storedToColumnSchema},
+ * and the one conversion, shared by every path that writes one.
+ */
+export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
+	return {
+		name: col.name,
+		affinity: col.logicalType.name,
+		declaredType: col.declaredType,
+		notNull: col.notNull,
+		primaryKey: col.primaryKey,
+		pkOrder: col.pkOrder,
+		defaultValue: col.defaultValue ? persistExpression(col.defaultValue) : undefined,
+		collation: col.collation,
+		collationExplicit: col.collationExplicit ? true : undefined,
+		generated: col.generated,
+		generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
+		generatedStored: col.generatedStored,
+		pkDirection: col.pkDirection,
+		defaultConflict: col.defaultConflict,
+		tags: copyTags(col.tags),
+	};
+}
+
+/**
+ * `stored` with `column` appended: the persisted half of a catalog-only `ALTER TABLE … ADD COLUMN`.
+ * Appending moves no other column, so no positional field changes. No row is rewritten: rows are
+ * stored keyed by column name, and a row written before the column existed reads it as NULL.
+ */
+export function withColumn(stored: StoredTableSchema, column: ColumnSchema): StoredTableSchema {
+	return { ...stored, columns: [...stored.columns, columnSchemaToStored(column)] };
+}
+
+/**
+ * Renumbers a column position past the removal of the column at `removed`. Throws for `removed`
+ * itself: whatever still addresses the removed column must be refused before the column is
+ * removed ({@link columnDropBlockers}), never carried to a neighbour's position.
+ */
+export function positionAfterRemoving(removed: number): (position: number) => number {
+	return position => {
+		if (position === removed) {
+			throw new Error(`Column position ${removed} is being removed while something still addresses it`);
+		}
+		return position > removed ? position - 1 : position;
+	};
+}
+
+/** `index` with each column position passed through `reposition`. */
+export function repositionIndexColumns<T extends { columns: readonly StoredIndexColumn[] }>(
+	index: T,
+	reposition: (position: number) => number
+): T {
+	return { ...index, columns: index.columns.map(col => ({ ...col, index: reposition(col.index) })) };
+}
+
+/**
+ * `stored` without the column named `name` (case-insensitive): the persisted half of a
+ * catalog-only `ALTER TABLE … DROP COLUMN`. Every positional field is renumbered over the removed
+ * slot — the primary key, the resolved index columns (which {@link toPersistedSchema} turns into
+ * names, so a stale position would persist the wrong column's name), the UNIQUE constraints and
+ * FOREIGN KEYs, and the generated-column bookkeeping. `assertPositionsInRange` cannot catch a
+ * position that is in range but one off, so this is where that must be right. Unchanged when the
+ * record has no such column.
+ *
+ * Throws when anything in `stored` keys on the column ({@link columnDropBlockers}): the caller
+ * refuses that case first. No row is rewritten — a stored row keeps the dropped column's field,
+ * which nothing reads.
+ */
+export function withoutColumn(stored: StoredTableSchema, name: string): StoredTableSchema {
+	const position = positionOfNamed(stored.columns, name);
+	if (position === undefined) {
+		return stored;
+	}
+	const blockers = columnDropBlockers(stored, position);
+	if (blockers.length > 0) {
+		throw new Error(`Cannot remove column '${name}' from the catalog record of table '${stored.name}': ${blockers.join('; ')}`);
+	}
+	const reposition = positionAfterRemoving(position);
+	return {
+		...stored,
+		columns: stored.columns.filter((_, index) => index !== position),
+		primaryKeyDefinition: stored.primaryKeyDefinition.map(pk => ({ ...pk, index: reposition(pk.index) })),
+		indexes: stored.indexes.map(idx => repositionIndexColumns(idx, reposition)),
+		uniqueConstraints: stored.uniqueConstraints?.map(uc => ({ ...uc, columns: uc.columns.map(reposition) })),
+		foreignKeys: stored.foreignKeys?.map(fk => ({ ...fk, columns: fk.columns.map(reposition) })),
+		generatedColumnDependencies: stored.generatedColumnDependencies?.map(
+			([generated, dependencies]): [number, number[]] => [reposition(generated), dependencies.map(reposition)]
+		),
+		generatedColumnTopoOrder: stored.generatedColumnTopoOrder?.map(reposition),
+	};
 }
 
 /**
@@ -1694,7 +1786,7 @@ export class SchemaManager {
 		return canonicalizeRecordOrder({
 			name: schema.name,
 			schemaName: schema.schemaName,
-			columns: schema.columns.map(col => this.columnSchemaToStored(col)),
+			columns: schema.columns.map(columnSchemaToStored),
 			primaryKeyDefinition: schema.primaryKeyDefinition.map(pk => ({
 				index: pk.index,
 				desc: pk.desc,
@@ -1723,29 +1815,6 @@ export class SchemaManager {
 			generatedColumnDependencies: nonEmpty(generatedColumnDependencies),
 			generatedColumnTopoOrder: nonEmpty(schema.generatedColumnTopoOrder),
 		});
-	}
-
-	/**
-	 * Convert ColumnSchema to storable format — the inverse of {@link storedToColumnSchema}.
-	 */
-	private columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
-		return {
-			name: col.name,
-			affinity: col.logicalType.name,
-			declaredType: col.declaredType,
-			notNull: col.notNull,
-			primaryKey: col.primaryKey,
-			pkOrder: col.pkOrder,
-			defaultValue: col.defaultValue ? persistExpression(col.defaultValue) : undefined,
-			collation: col.collation,
-			collationExplicit: col.collationExplicit ? true : undefined,
-			generated: col.generated,
-			generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
-			generatedStored: col.generatedStored,
-			pkDirection: col.pkDirection,
-			defaultConflict: col.defaultConflict,
-			tags: copyTags(col.tags),
-		};
 	}
 
 	private foreignKeyToStored(fk: ForeignKeyConstraintSchema): StoredForeignKey {

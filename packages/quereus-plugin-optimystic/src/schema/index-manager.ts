@@ -11,6 +11,7 @@ import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
+import { repositionIndexColumns } from './schema-manager.js';
 import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
 import type { IndexColumnTuple, UnbrandedValues } from './key-tuples.js';
 
@@ -336,6 +337,25 @@ export class IndexManager {
 	 */
 	setSchema(schema: StoredTableSchema): void {
 		this.schema = schema;
+	}
+
+	/**
+	 * Renumber the column positions of every index this manager maintains — declared and
+	 * unique-enforcement alike — after the table's columns moved: the table instance's half of a
+	 * catalog-only `ALTER TABLE … DROP COLUMN`. The maintained set is unchanged, so no tree is
+	 * opened, closed or re-registered, and descriptors already handed out (a running scan's) keep
+	 * their old numbering. `reposition` throws for a removed column, which no maintained index may
+	 * cover.
+	 *
+	 * NOTE: deliberately not a {@link setSchema} from the record. The record can list an index
+	 * another machine added that this manager has no tree for, and a listed index with no tree
+	 * makes every staging path throw; and it can lack one this manager maintains.
+	 */
+	repositionColumns(reposition: (position: number) => number): void {
+		const indexes = this.schema.indexes.map(idx => repositionIndexColumns(idx, reposition));
+		const uniqueEnforcementIndexes = this.uniqueEnforcementIndexes.map(idx => repositionIndexColumns(idx, reposition));
+		this.schema = { ...this.schema, indexes };
+		this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
 	}
 
 	/**

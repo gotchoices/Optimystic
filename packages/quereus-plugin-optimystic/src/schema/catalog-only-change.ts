@@ -8,8 +8,9 @@
  * upgraded. Two rules settle what it does then, both pure and kept here so they can be tested
  * without a database:
  *
- * - {@link classifyCheckChange} compares the change against the record: a change the record
- *   already holds is *adopted* (nothing written), any other is *owned* (written).
+ * - {@link classifyCheckChange} and {@link classifyColumnChange} compare the change against the
+ *   record: a change the record already holds is *adopted* (nothing written), any other is
+ *   *owned* (written) — or, for a column, *refused* when the record contradicts it.
  * - {@link AdoptedChanges} remembers, for one `apply schema`, the changes this machine adopted, so
  *   that the engine's undo of one of them (Quereus unwinds an apply whose later step fails) is
  *   recognised and kept off the record: undoing a change this machine did not make would remove
@@ -21,25 +22,26 @@
  */
 
 import { structuralEquals } from '@optimystic/db-core';
-import type { StoredCheckConstraint, StoredTableSchema } from './schema-manager.js';
+import { StatusCode } from '@quereus/quereus';
+import type { StoredCheckConstraint, StoredColumnSchema, StoredTableSchema } from './schema-manager.js';
 
-/** A named, possibly tagged object of a catalog record: a CHECK constraint. */
+/** A named, possibly tagged object of a catalog record: a CHECK constraint or a column. */
 export interface CatalogObject {
 	readonly name?: string;
 	readonly tags?: unknown;
 }
 
 /** The kinds of record object a catalog-only arm changes. */
-export type CatalogObjectKind = 'check';
+export type CatalogObjectKind = 'check' | 'column';
 
 /**
  * What a catalog-only arm does to the record: write its edit (`owned`), write nothing because the
- * record already holds the change (`adopted`), or refuse the statement with `message`.
+ * record already holds the change (`adopted`), or refuse the statement with `message` under `code`.
  */
 export type CatalogOnlyVerdict =
 	| { readonly kind: 'owned' }
 	| { readonly kind: 'adopted' }
-	| { readonly kind: 'refused'; readonly message: string };
+	| { readonly kind: 'refused'; readonly message: string; readonly code: StatusCode };
 
 const OWNED: CatalogOnlyVerdict = { kind: 'owned' };
 const ADOPTED: CatalogOnlyVerdict = { kind: 'adopted' };
@@ -111,6 +113,128 @@ export function classifyCheckChange(record: StoredTableSchema, change: CheckChan
 	return held !== undefined && sameCatalogObject(held, change.before) ? OWNED : ADOPTED;
 }
 
+/**
+ * A column change as this machine's engine makes it: `add` appends `after`, `drop` removes the
+ * column the engine holds as `before`. Both in the record's form (`columnSchemaToStored`).
+ */
+export type ColumnChange =
+	| { readonly op: 'add'; readonly after: StoredColumnSchema }
+	| { readonly op: 'drop'; readonly before: StoredColumnSchema };
+
+/**
+ * A column change judged against `record`:
+ *
+ * | change | record holds | verdict |
+ * | --- | --- | --- |
+ * | add | no column of that name | owned: append it |
+ * | add | the same column | adopted |
+ * | add | a different column of that name | refused (`ERROR`): another machine's upgrade disagrees |
+ * | drop | the column, and nothing in the record keys on it | owned: remove it, whatever its definition |
+ * | drop | the column, with something in the record keying on it ({@link columnDropBlockers}) | refused (`UNSUPPORTED`) |
+ * | drop | no column of that name | adopted |
+ *
+ * A dropped column is removed whatever the record says it is: no host reuses a dropped name, so a
+ * column the record defines differently is still the column being dropped. What in the record
+ * keys on it is judged here because the record can hold what this engine has not seen — an index
+ * another machine added since this one hydrated, say.
+ */
+export function classifyColumnChange(record: StoredTableSchema, change: ColumnChange): CatalogOnlyVerdict {
+	if (change.op === 'add') {
+		const held = findNamed(record.columns, change.after.name);
+		if (held === undefined) {
+			return OWNED;
+		}
+		return sameCatalogObject(held, change.after)
+			? ADOPTED
+			: {
+				kind: 'refused',
+				code: StatusCode.ERROR,
+				message: `Cannot add column '${change.after.name}' to Optimystic table '${record.name}': the table's stored ` +
+					`description already has a different column of that name, saved by another machine whose schema ` +
+					`upgrade disagrees with this one. Retrying will not help.`,
+			};
+	}
+	const position = positionOfNamed(record.columns, change.before.name);
+	if (position === undefined) {
+		return ADOPTED;
+	}
+	const blockers = columnDropBlockers(record, position);
+	return blockers.length === 0
+		? OWNED
+		: { kind: 'refused', code: StatusCode.UNSUPPORTED, message: dropColumnRefusal(record.name, change.before.name, blockers, 'stored') };
+}
+
+/** The position of the entry of `items` named `name`, under {@link findNamed}'s name rule. */
+export function positionOfNamed(items: readonly CatalogObject[], name: string): number | undefined {
+	const lower = name.toLowerCase();
+	const position = items.findIndex(item => item.name?.toLowerCase() === lower);
+	return position < 0 ? undefined : position;
+}
+
+/**
+ * The positional parts of a table's description, in the shape a Quereus `TableSchema` and a
+ * catalog record (`StoredTableSchema`) share, so one rule judges both.
+ */
+export interface ColumnKeyedParts {
+	readonly columns: readonly { readonly name: string; readonly generated: boolean }[];
+	readonly primaryKeyDefinition: readonly { readonly index: number }[];
+	readonly indexes?: readonly { readonly name: string; readonly columns: readonly { readonly index: number }[] }[];
+	readonly uniqueConstraints?: readonly { readonly name?: string; readonly columns: readonly number[] }[];
+	readonly foreignKeys?: readonly { readonly name?: string; readonly columns: readonly number[] }[];
+	readonly generatedColumnDependencies?: Iterable<readonly [number, readonly number[]]>;
+}
+
+/**
+ * Why the column at `position` cannot be dropped by changing the table's description alone, one
+ * phrase each; empty when nothing stands in the way. A key, an index (declared, or a
+ * unique-enforcement tree), a UNIQUE constraint and a FOREIGN KEY all key stored data on the
+ * column's values, and a generated column's value is computed into its row — dropping any of them
+ * would need rows or trees rewritten.
+ *
+ * NOTE: expressions are not judged — a CHECK, a DEFAULT or a generated expression naming the
+ * column. Quereus refuses those against the engine's own catalog before the module is called; a
+ * record holding one this engine has not seen (another machine added it) would keep naming a
+ * column the record no longer has, and every machine that hydrates it would fail to plan writes to
+ * the table. Reaching that takes two different upgrades of one table racing; if hosts ever apply
+ * differing schema versions at once, judge the record's expressions here too.
+ */
+export function columnDropBlockers(parts: ColumnKeyedParts, position: number): string[] {
+	const blockers: string[] = [];
+	const named = (kind: string, name: string | undefined) => (name ? `${kind} '${name}'` : `a ${kind}`);
+	if (parts.columns[position]?.generated) {
+		blockers.push('it is a generated column');
+	}
+	if (parts.primaryKeyDefinition.some(pk => pk.index === position)) {
+		blockers.push('it is in the primary key');
+	}
+	for (const idx of parts.indexes ?? []) {
+		if (idx.columns.some(col => col.index === position)) blockers.push(`index '${idx.name}' covers it`);
+	}
+	for (const uc of parts.uniqueConstraints ?? []) {
+		if (uc.columns.includes(position)) blockers.push(`${named('UNIQUE constraint', uc.name)} covers it`);
+	}
+	for (const fk of parts.foreignKeys ?? []) {
+		if (fk.columns.includes(position)) blockers.push(`${named('foreign key', fk.name)} uses it`);
+	}
+	for (const [generated, dependencies] of parts.generatedColumnDependencies ?? []) {
+		if (generated !== position && dependencies.includes(position)) {
+			blockers.push(`generated column '${parts.columns[generated]?.name ?? `#${generated}`}' reads it`);
+		}
+	}
+	return blockers;
+}
+
+/**
+ * The refusal of a DROP COLUMN that {@link columnDropBlockers} stood in the way of. It starts with
+ * the text the engine gave before the module had an `alterTable` hook, so a caller matching that
+ * still matches. `stored` says the blockers are in the table's catalog record and not in this
+ * machine's own catalog: another machine's change this one has not seen.
+ */
+export function dropColumnRefusal(table: string, column: string, blockers: readonly string[], where: 'engine' | 'stored'): string {
+	const scope = where === 'stored' ? ` (in the table's stored description, saved by another machine)` : '';
+	return `Module for table '${table}' does not support ALTER TABLE DROP COLUMN of '${column}'${scope}: ${blockers.join('; ')}`;
+}
+
 /** The key {@link AdoptedChanges} files one object of one table under. */
 export function adoptedChangeKey(tableKey: string, kind: CatalogObjectKind, name: string): string {
 	return JSON.stringify([tableKey, kind, name.toLowerCase()]);
@@ -128,6 +252,10 @@ export function adoptedChangeKey(tableKey: string, kind: CatalogObjectKind, name
  * changed, so the add carries a body other than the one the drop removed. That is the case the
  * per-object stack exists for: on a machine that adopted both halves of a changed-body pair, the
  * unwind undoes the add, then the drop, each against its own entry.
+ *
+ * Columns take the same rule: the undo of an adopted ADD COLUMN is the DROP COLUMN that leaves the
+ * column absent, which is what the engine held before the add. A DROP COLUMN has no undo (Quereus
+ * marks it irreversible), so an adopted one is recorded and never matched.
  *
  * Changes this machine made itself are not recorded: their undo is judged against the record like
  * any change, and finds the record holding exactly what this machine wrote.

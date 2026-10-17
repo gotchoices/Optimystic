@@ -3,8 +3,10 @@
  *
  * The module implements Quereus's `alterTable` hook for the arms that change only the table's
  * catalog record: a named CHECK a later schema version adds or drops (`apply schema` emits
- * `ALTER TABLE … ADD CONSTRAINT … CHECK` and `… DROP CONSTRAINT`, the pair for a changed body) has
- * to reach the record, or a restarted machine enforces the old CHECKs. Implementing the hook takes
+ * `ALTER TABLE … ADD CONSTRAINT … CHECK` and `… DROP CONSTRAINT`, the pair for a changed body),
+ * and a nullable column it adds or a column nothing keys on that it drops, have to reach the
+ * record, or a restarted machine gets the old table back. No row is rewritten: rows are stored
+ * keyed by column name. Implementing the hook takes
  * every other arm off the engine's own "module has no `alterTable`" path, so the module answers
  * those too — with the refusal the engine gave before (same text, `UNSUPPORTED`), and for RENAME
  * COLUMN with the engine's schema-only rename.
@@ -23,7 +25,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { buildSharedLocalTransactor } from './shared-local-transactor.js';
+import { buildSharedLocalTransactor, countingTransactor, type TransactorCallCounts } from './shared-local-transactor.js';
 import { captureThrowMessage, queryAll } from './query-helpers.js';
 
 type PluginHandle = ReturnType<typeof register>;
@@ -46,6 +48,13 @@ const TABLES = `
 	create table main.p (id integer primary key);
 	create table main.t (id integer primary key, a integer null, c text null, constraint pos check (a > 0), constraint one_a unique (a));
 	insert into main.t (id, a, c) values (1, 5, 'x');
+	create table main.w (
+		id integer primary key, indexed text null, uniq text null, parent integer null,
+		twice integer null generated always as (id * 2),
+		constraint one_uniq unique (uniq), constraint to_p foreign key (parent) references p (id)
+	);
+	create index w_indexed on main.w (indexed);
+	insert into main.w (id, indexed, uniq) values (1, 'x', 'y');
 `;
 
 async function thrownBy(fn: () => Promise<unknown>): Promise<unknown> {
@@ -60,10 +69,25 @@ async function thrownBy(fn: () => Promise<unknown>): Promise<unknown> {
 describe('ALTER TABLE on an Optimystic table', function () {
 	this.timeout(20_000);
 
-	/** Every arm the module refuses, with the text Quereus gave for it before the module had an `alterTable` hook. */
-	const REFUSED: { arm: string; sql: string; message: string }[] = [
-		{ arm: 'ADD COLUMN', sql: 'alter table main.t add column b integer null', message: `Module for table 't' does not support ALTER TABLE ADD COLUMN` },
-		{ arm: 'DROP COLUMN', sql: 'alter table main.t drop column c', message: `Module for table 't' does not support ALTER TABLE DROP COLUMN` },
+	const ADD_COLUMN = `Module for table 't' does not support ALTER TABLE ADD COLUMN`;
+	const dropColumn = (column: string, why: string) => `Module for table 'w' does not support ALTER TABLE DROP COLUMN of '${column}': ${why}`;
+
+	/**
+	 * Every arm and shape the module refuses, with the text Quereus gave for it before the module had
+	 * an `alterTable` hook (a refused DROP COLUMN adds what keys on the column), and the table whose
+	 * catalog entry and rows must be left as they were.
+	 */
+	const REFUSED: { arm: string; sql: string; message: string; code?: StatusCode; table?: string }[] = [
+		{ arm: 'ADD COLUMN with a DEFAULT', sql: 'alter table main.t add column b integer null default 1', message: ADD_COLUMN },
+		{ arm: 'ADD COLUMN that is generated', sql: 'alter table main.t add column b integer null generated always as (a * 2)', message: ADD_COLUMN },
+		{ arm: 'ADD COLUMN with an inline CHECK', sql: 'alter table main.t add column b integer null check (b > 0)', message: ADD_COLUMN },
+		{ arm: 'ADD COLUMN with an inline UNIQUE', sql: 'alter table main.t add column b integer null unique', message: ADD_COLUMN },
+		{ arm: 'ADD COLUMN with an inline FOREIGN KEY', sql: 'alter table main.t add column b integer null references p (id)', message: ADD_COLUMN },
+		{ arm: 'DROP COLUMN of a primary-key column', sql: 'alter table main.w drop column id', message: `Cannot drop PRIMARY KEY column 'id'`, code: StatusCode.CONSTRAINT, table: 'w' },
+		{ arm: 'DROP COLUMN of an indexed column', sql: 'alter table main.w drop column indexed', message: dropColumn('indexed', `index 'w_indexed' covers it`), table: 'w' },
+		{ arm: 'DROP COLUMN of a UNIQUE column', sql: 'alter table main.w drop column uniq', message: dropColumn('uniq', `UNIQUE constraint 'one_uniq' covers it`), table: 'w' },
+		{ arm: 'DROP COLUMN of a FOREIGN KEY column', sql: 'alter table main.w drop column parent', message: dropColumn('parent', `foreign key 'to_p' uses it`), table: 'w' },
+		{ arm: 'DROP COLUMN of a generated column', sql: 'alter table main.w drop column twice', message: dropColumn('twice', 'it is a generated column'), table: 'w' },
 		{ arm: 'DROP CONSTRAINT of a UNIQUE', sql: 'alter table main.t drop constraint one_a', message: `Module for table 't' does not support ALTER TABLE DROP CONSTRAINT` },
 		{ arm: 'RENAME CONSTRAINT', sql: 'alter table main.t rename constraint pos to positive', message: `Module for table 't' does not support ALTER TABLE RENAME CONSTRAINT` },
 		{ arm: 'ALTER COLUMN', sql: 'alter table main.t alter column a set default 1', message: `Module for table 't' does not support ALTER COLUMN` },
@@ -76,19 +100,20 @@ describe('ALTER TABLE on an Optimystic table', function () {
 		},
 	];
 
-	for (const { arm, sql, message } of REFUSED) {
-		it(`refuses ${arm} as UNSUPPORTED, with the text it always had, and changes nothing`, async () => {
+	for (const { arm, sql, message, code = StatusCode.UNSUPPORTED, table = 't' } of REFUSED) {
+		it(`refuses ${arm}, with the text it always had, and changes nothing`, async () => {
 			const { db } = await openSession(buildSharedLocalTransactor(new MemoryRawStorage()));
 			await db.exec(TABLES);
-			const before = db.schemaManager.findTable('t', 'main');
+			const before = db.schemaManager.findTable(table, 'main');
+			const rows = await queryAll(db, `select * from main.${table}`);
 
 			const error = await thrownBy(() => db.exec(sql));
 			expect(error).to.be.instanceOf(QuereusError);
 			expect((error as QuereusError).message).to.include(message);
-			expect((error as QuereusError).code).to.equal(StatusCode.UNSUPPORTED);
+			expect((error as QuereusError).code).to.equal(code);
 
-			expect(db.schemaManager.findTable('t', 'main'), 'the catalog entry is untouched').to.equal(before);
-			expect(await queryAll(db, 'select id, a, c from main.t')).to.deep.equal([{ id: 1, a: 5, c: 'x' }]);
+			expect(db.schemaManager.findTable(table, 'main'), 'the catalog entry is untouched').to.equal(before);
+			expect(await queryAll(db, `select * from main.${table}`)).to.deep.equal(rows);
 		});
 	}
 
@@ -335,6 +360,162 @@ describe('ALTER TABLE on an Optimystic table', function () {
 			expect(saved.names).to.deep.equal(['pos']);
 			await saved.db.exec('insert into t (id, a) values (2, 0)');
 			expect(await captureThrowMessage(() => b.exec('insert into t (id, a) values (3, 0)'))).to.include('pos');
+		});
+	});
+
+	describe('ADD COLUMN and DROP COLUMN, which rewrite no row', () => {
+		/** What a session that only hydrates finds: the table's column names. */
+		async function savedColumns(store: ITransactor): Promise<{ db: Database; plugin: PluginHandle; names: string[] }> {
+			const session = await openSession(store);
+			await session.plugin.hydrate(session.db);
+			return { ...session, names: session.db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name) };
+		}
+
+		it('rows written under either column list read under the other, before and after a restart', async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const { db } = await openSession(store);
+			await db.exec(`create table main.t (id integer primary key, a integer null); insert into main.t values (1, 10), (2, 20);`);
+
+			await db.exec('alter table main.t add column b text null');
+			expect(await queryAll(db, 'select * from main.t order by id')).to.deep.equal([{ id: 1, a: 10, b: null }, { id: 2, a: 20, b: null }]);
+			await db.exec(`insert into main.t (id, a, b) values (3, 30, 'three')`);
+
+			const restarted = await savedColumns(store);
+			expect(restarted.names).to.deep.equal(['id', 'a', 'b']);
+			expect(await queryAll(restarted.db, 'select * from main.t order by id'))
+				.to.deep.equal([{ id: 1, a: 10, b: null }, { id: 2, a: 20, b: null }, { id: 3, a: 30, b: 'three' }]);
+
+			await restarted.db.exec('alter table main.t drop column b');
+			const withoutB = [{ id: 1, a: 10 }, { id: 2, a: 20 }, { id: 3, a: 30 }];
+			expect(await queryAll(restarted.db, 'select * from main.t order by id')).to.deep.equal(withoutB);
+			await restarted.db.exec('insert into main.t (id, a) values (4, 40)');
+
+			const again = await savedColumns(store);
+			expect(again.names).to.deep.equal(['id', 'a']);
+			expect(await queryAll(again.db, 'select * from main.t order by id')).to.deep.equal([...withoutB, { id: 4, a: 40 }]);
+		});
+
+		it('a drop renumbers the index, UNIQUE constraint and generated column after the dropped column', async () => {
+			// What `assertPositionsInRange` cannot see: a position one off is still in range. Rows written
+			// before and after the drop must both sit under the right key in every index tree.
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const { db, plugin } = await openSession(store);
+			await db.exec(`
+				create table main.t (
+					id integer primary key, a integer null, b integer null, c text null, d text null,
+					g text null generated always as (c || '-' || d), constraint one_d unique (d)
+				);
+				create index t_c on main.t (c);
+				insert into main.t (id, a, b, c, d) values (1, 1, 1, 'x', 'p'), (2, 2, 2, 'y', 'q');
+			`);
+
+			await db.exec('alter table main.t drop column a');
+
+			async function expectRenumbered(session: { db: Database; plugin: PluginHandle }, id: number, c: string, d: string): Promise<void> {
+				await session.db.exec(`insert into main.t (id, b, c, d) values (${id}, ${id}, '${c}', '${d}')`);
+				expect(await queryAll(session.db, `select id, g from main.t where c = '${c}'`)).to.deep.equal([{ id, g: `${c}-${d}` }]);
+				expect(await queryAll(session.db, `select id, g from main.t where c = 'x'`)).to.deep.equal([{ id: 1, g: 'x-p' }]);
+				expect(await captureThrowMessage(() => session.db.exec(`insert into main.t (id, b, c, d) values (${id + 100}, 0, 'w', 'q')`)))
+					.to.include('UNIQUE constraint failed');
+				for (const report of await session.plugin.verifyIndexes(session.db, 't')) {
+					expect(report.missing, `${report.index}: no missing entries`).to.deep.equal([]);
+					expect(report.orphaned, `${report.index}: no orphaned entries`).to.deep.equal([]);
+				}
+			}
+			await expectRenumbered({ db, plugin }, 3, 'z', 'r');
+
+			const restarted = await savedColumns(store);
+			expect(restarted.names).to.deep.equal(['id', 'b', 'c', 'd', 'g']);
+			await expectRenumbered(restarted, 4, 'v', 's');
+		});
+
+		describe('inside apply schema, on one machine and on two', () => {
+			const declared = (columns: string, constraints = '') =>
+				`declare schema main { table t { id integer primary key, a integer null${columns}${constraints} } } apply schema main;`;
+			const V1 = declared(', c text null');
+			/** Adds `b` and drops `c`. */
+			const V2 = declared(', b text null');
+			/** Its step (ADD CONSTRAINT) runs after ADD COLUMN and before DROP COLUMN; the module refuses it, and the apply fails there. */
+			const FAILING = ', constraint one_a unique (a)';
+
+			async function expectRestored(apply: () => Promise<unknown>): Promise<void> {
+				const error = (await thrownBy(apply)) as Error;
+				expect(error.message).to.include(`does not support ADD CONSTRAINT`);
+				expect(error.message, `a verified restore rethrows the step's own error`).to.not.match(/partially migrated|could not be restored/);
+			}
+
+			/** Machine `a` declared V1 and wrote a row; machine `b` hydrated that and read it, so its table instance exists. */
+			async function twoMachines(): Promise<{ store: ITransactor; a: Database; b: Database; bCounts: TransactorCallCounts }> {
+				const store = buildSharedLocalTransactor(new MemoryRawStorage());
+				const a = await openSession(store);
+				await a.db.exec(V1);
+				await a.db.exec(`insert into t (id, a, c) values (1, 5, 'x')`);
+				const counted = countingTransactor(store);
+				const b = await openSession(counted.transactor);
+				await b.plugin.hydrate(b.db);
+				expect(await queryAll(b.db, 'select * from t')).to.deep.equal([{ id: 1, a: 5, c: 'x' }]);
+				return { store, a: a.db, b: b.db, bCounts: counted.counts };
+			}
+
+			it('a failed apply undoes its ADD COLUMN, in the session, the table and the record', async () => {
+				const store = buildSharedLocalTransactor(new MemoryRawStorage());
+				const { db } = await openSession(store);
+				await db.exec(V1);
+				await db.exec(`insert into t (id, a, c) values (1, 5, 'x')`);
+
+				await expectRestored(() => db.exec(declared(', c text null, b text null', FAILING)));
+				expect(db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'c']);
+				await db.exec(`insert into t (id, a, c) values (2, 6, 'y')`);
+				expect(await queryAll(db, 'select * from t order by id')).to.deep.equal([{ id: 1, a: 5, c: 'x' }, { id: 2, a: 6, c: 'y' }]);
+				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'c']);
+			});
+
+			it('a second machine adopts a column upgrade already saved: it writes nothing, and its table reads the new columns', async () => {
+				const { store, a, b, bCounts } = await twoMachines();
+				await a.exec(V2);
+				await a.exec(`insert into t (id, a, b) values (2, 6, 'two')`);
+
+				bCounts.reset();
+				await b.exec(V2);
+				expect(bCounts.pend + bCounts.commit, 'nothing written').to.equal(0);
+				expect(await queryAll(b, 'select * from t order by id')).to.deep.equal([{ id: 1, a: 5, b: null }, { id: 2, a: 6, b: 'two' }]);
+				await b.exec(`insert into t (id, a, b) values (3, 7, 'three')`);
+
+				// A restart of either applies the same schema over its hydrated catalog and finds nothing to do.
+				const restarted = await savedColumns(store);
+				expect(restarted.names).to.deep.equal(['id', 'a', 'b']);
+				await restarted.db.exec(V2);
+				expect(await queryAll(restarted.db, 'select id, b from t order by id'))
+					.to.deep.equal([{ id: 1, b: null }, { id: 2, b: 'two' }, { id: 3, b: 'three' }]);
+			});
+
+			it('a second machine whose apply fails after adopting an ADD COLUMN leaves that column in the record', async () => {
+				const { store, a, b } = await twoMachines();
+				await a.exec(V2);
+				await a.exec(`insert into t (id, a, b) values (2, 6, 'two')`);
+
+				// `b` still holds `c` and lacks `b`. Its ADD COLUMN finds `b` saved and writes nothing; the
+				// undo of that ADD drops `b` from its own catalog and table only. Its DROP COLUMN `c` never ran.
+				await expectRestored(() => b.exec(declared(', b text null', FAILING)));
+				expect(b.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'c']);
+				expect(await queryAll(b, 'select * from t order by id')).to.deep.equal([{ id: 1, a: 5, c: 'x' }, { id: 2, a: 6, c: null }]);
+				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'b']);
+			});
+
+			it('two machines applying the same column upgrade at once both succeed, and the record holds it once', async () => {
+				const { store, a, b } = await twoMachines();
+
+				await Promise.all([a.exec(V2), b.exec(V2)]);
+
+				const saved = await savedColumns(store);
+				expect(saved.names).to.deep.equal(['id', 'a', 'b']);
+				for (const [id, db] of [[2, a], [3, b], [4, saved.db]] as const) {
+					await db.exec(`insert into t (id, a, b) values (${id}, ${id}, 'n${id}')`);
+				}
+				expect(await queryAll(saved.db, 'select * from t order by id')).to.deep.equal([
+					{ id: 1, a: 5, b: null }, { id: 2, a: 2, b: 'n2' }, { id: 3, a: 3, b: 'n3' }, { id: 4, a: 4, b: 'n4' },
+				]);
+			});
 		});
 	});
 });
