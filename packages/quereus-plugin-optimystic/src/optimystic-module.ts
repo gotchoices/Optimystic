@@ -18,7 +18,7 @@ import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withoutCheckConstraint } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
-import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, findNamed } from './schema/catalog-only-change.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, findNamed, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
@@ -295,11 +295,7 @@ interface CatalogOnlyAlter {
 
 /** `schema` without the CHECK named `name`, compared case-insensitively as Quereus compares constraint names. */
 function withoutCheck(schema: TableSchema, name: string | undefined): TableSchema {
-  const lower = name?.toLowerCase();
-  return {
-    ...schema,
-    checkConstraints: Object.freeze(schema.checkConstraints.filter(check => lower === undefined || check.name?.toLowerCase() !== lower)),
-  };
+  return { ...schema, checkConstraints: Object.freeze(withoutNamed(schema.checkConstraints, name)) };
 }
 
 /** `schema` with `check` added, replacing a CHECK of that name — the rule {@link withCheckConstraint} applies to the record. */
@@ -3791,6 +3787,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     return this.schemaManager;
   }
 
+  /** Whether the full initialization ({@link initialize}) has completed. */
+  get initialized(): boolean {
+    return this.isInitialized;
+  }
+
   /**
    * Forget that this table's schema is persisted. Called by the module when the end-of-batch
    * catalog commit of an `APPLY SCHEMA` failed after this table was created or gained an
@@ -4313,21 +4314,25 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * checkpoint: a throw withdraws every catalog write the statement staged — and only those
    * — so a refused CREATE (the storage-adoption guard, or a failure later in doInitialize
    * after the schema already reached the overlay) leaves no record for the end-of-batch
-   * commit to persist. On success `tableKey` is recorded under `effect` for `manager`, the
-   * table's catalog manager ({@link recordBatchEffect}) — taken rather than read off an instance,
-   * since a catalog-only ALTER on a hydrated table no statement has touched has none. Outside a
-   * batch this is a plain call.
+   * commit to persist. On success — when `staged` says the work's result may have staged a write —
+   * `tableKey` is recorded under `effect` for `manager`, the table's catalog manager
+   * ({@link recordBatchEffect}) — taken rather than read off an instance, since a catalog-only
+   * ALTER on a hydrated table no statement has touched has none. Outside a batch this is a plain
+   * call.
    */
   private async underBatchCheckpoint<T>(
     manager: SchemaManager,
     effect: 'written' | 'dropped',
     tableKey: string,
-    work: () => Promise<T>
+    work: () => Promise<T>,
+    staged: (result: T) => boolean = () => true
   ): Promise<T> {
     const checkpoint = manager.checkpointBatch();
     try {
       const result = await work();
-      this.recordBatchEffect(manager, effect, tableKey);
+      if (staged(result)) {
+        this.recordBatchEffect(manager, effect, tableKey);
+      }
       return result;
     } catch (error) {
       if (checkpoint) {
@@ -4940,6 +4945,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const adoptedKey = adoptedChangeKey(tableKey, change.kind, change.name);
     const undoesAdopted = adopted?.undoes(adoptedKey, change.after) ?? false;
 
+    // An adopted or undone change stages nothing, so it must not mark the table `written`: a failed
+    // batch commit would then re-persist this machine's description, which after an undo kept off
+    // the record is older than the record. The first-touch initialize can stage a write of its own.
+    const initializesHere = table !== undefined && !table.initialized;
     const outcome = await this.underBatchCheckpoint(manager, 'written', tableKey, async () => {
       await table?.initialize();
       if (undoesAdopted) {
@@ -4947,7 +4956,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         return 'undone';
       }
       return await this.saveCatalogOnly(manager, tableSchema, change);
-    });
+    }, outcome => outcome === 'owned' || initializesHere);
     table?.applyCatalogOnlyEdit(change.editSchema);
     if (adopted) {
       if (outcome === 'undone') {

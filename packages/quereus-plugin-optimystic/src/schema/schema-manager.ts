@@ -13,6 +13,7 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
+import { withoutNamed } from './catalog-only-change.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
@@ -715,9 +716,7 @@ export function withCheckConstraint(stored: StoredTableSchema, check: RowConstra
  * key is omitted when nothing is left, as {@link SchemaManager.tableSchemaToStored} omits it.
  */
 export function withoutCheckConstraint(stored: StoredTableSchema, name: string | undefined): StoredTableSchema {
-	const lower = name?.toLowerCase();
-	const kept = (stored.checkConstraints ?? []).filter(check => lower === undefined || check.name?.toLowerCase() !== lower);
-	return { ...stored, checkConstraints: nonEmpty(kept) };
+	return { ...stored, checkConstraints: nonEmpty(withoutNamed(stored.checkConstraints ?? [], name)) };
 }
 
 /**

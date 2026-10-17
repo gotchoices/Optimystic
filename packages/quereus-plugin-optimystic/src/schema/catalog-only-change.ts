@@ -62,6 +62,15 @@ export function findNamed<T extends CatalogObject>(items: readonly T[] | undefin
 	return items?.find(item => item.name?.toLowerCase() === lower);
 }
 
+/** `items` without the entry named `name`, under {@link findNamed}'s name rule; all of them when `name` is undefined. */
+export function withoutNamed<T extends CatalogObject>(items: readonly T[], name: string | undefined): T[] {
+	if (name === undefined) {
+		return [...items];
+	}
+	const lower = name.toLowerCase();
+	return items.filter(item => item.name?.toLowerCase() !== lower);
+}
+
 /**
  * Whether `a` and `b` are the same object, ignoring tags and the case of the name. Undefined
  * stands for "no such object", and only matches itself.
@@ -88,6 +97,11 @@ function comparable({ tags: _tags, name, ...rest }: CatalogObject): object {
  * | add | no CHECK of that name | owned: add it |
  * | add | the same CHECK | adopted |
  * | add | a different CHECK of that name | owned: replace it (local DDL wins) |
+ *
+ * NOTE: the third row is judged as the drop half of a changed-body pair. A direct `alter table …
+ * drop constraint` over a record whose CHECK another machine re-bodied is adopted too, so the
+ * record keeps that CHECK and a restart brings it back; if hosts ever issue imperative drops on
+ * shared tables, have that case owned outside `apply schema`.
  */
 export function classifyCheckChange(record: StoredTableSchema, change: CheckChange): CatalogOnlyVerdict {
 	if (change.op === 'add') {

@@ -3,7 +3,7 @@ prereq: bug-optimystic-table-tag-changes-lost-on-restart
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts (`alterTable`, `addCheckConstraint`, `dropCheckConstraint`, `alterCatalogOnly`, `saveCatalogOnly`, `CatalogOnlyAlter`, `withCheck` / `withoutCheck`, `underBatchCheckpoint`, `recordBatchEffect`, `OptimysticVirtualTable.applyCatalogOnlyEdit`), packages/quereus-plugin-optimystic/src/schema/catalog-only-change.ts (new: `classifyCheckChange`, `AdoptedChanges`, `sameCatalogObject`, `findNamed`), packages/quereus-plugin-optimystic/src/schema/schema-manager.ts (`checkConstraintToStored`, `withCheckConstraint`, `withoutCheckConstraint`), packages/quereus-plugin-optimystic/test/alter-table-arms.spec.ts, packages/quereus-plugin-optimystic/test/catalog-only-change.spec.ts, packages/quereus-plugin-optimystic/README.md, .release-notes.pending.md, tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record.md, tickets/backlog/bug-optimystic-failed-apply-on-a-second-machine-reverts-saved-tags.md
 ----
 
-# Catalog-only ALTER, part 1: DROP CONSTRAINT of a CHECK, and the two-machine rule — review handoff
+# Catalog-only ALTER, part 1: DROP CONSTRAINT of a CHECK, and the two-machine rule
 
 Origin: Sereus `../sereus/tickets/blocked/optimystic-catalog-only-alter-table.md` (gotchoices/sereus#46). The follow-on `catalog-only-add-and-drop-column` (still in `implement/`) adds the column arms on the helper built here.
 
@@ -54,3 +54,25 @@ Implemented instead (`AdoptedChanges`): each adopted change is recorded, per `(t
 ## For the column ticket
 
 `CatalogObjectKind` is `'check'` only; add `'column'`. `CatalogOnlyVerdict` already has a `refused` arm, which `saveCatalogOnly` raises as `ERROR` — nothing produces it yet. `sameCatalogObject` ignores tags and name case, which matches that ticket's column comparison. ADD COLUMN's undo (DROP COLUMN, `after` absent) matches an adopted ADD's entry (`before` absent) under the stack rule unchanged. The `.release-notes.pending.md` entry ("Optimystic tables accept catalog-only ALTER TABLE") is written for this ticket; that ticket finishes it.
+
+## Review findings
+
+Read the diff of `ticket(implement): catalog-only-drop-check-constraint` first, then the handoff above. Ran the package build, `typecheck`, eslint on the touched sources, `yarn lint:docs`, and the full package `test` (1031 passing, 14 pending, as before).
+
+**Checked, no change needed**
+- Correctness of `classifyCheckChange` against every row of the table, and of the `AdoptedChanges` stack (the deviation from the plan) by walking the owned pair, the doubly-adopted changed-body pair and its unwind, and mixed owned/adopted sequences: each undo restores the pre-step state and lands where it should (record or engine only).
+- `createSchemaManager` is cached per binding fingerprint and a manager created mid-apply joins the open batch, so the instance-less path of `alterCatalogOnly` writes into the same batch as everything else.
+- `underBatchCheckpoint` no longer short-circuits outside a batch; `checkpointBatch` returns undefined there and `recordBatchEffect` is a no-op, so behaviour outside `apply schema` is unchanged.
+- Docs: README (the CHECK paragraph, the refused-arms list, the corrected "stored rows are checked" sentence, the new Limitations bullet) and the pending release note match the code. `docs/internals.md` does not describe the ALTER hook and needs nothing.
+- Tests: the classification cases pin the specification's table on branching logic and the stack test pins the one non-obvious rule; the arm specs cover each use case in the handoff. None restate the implementation; none cut.
+
+**Fixed in this pass**
+- *Latent defect:* an adopted or undone change recorded the table as `written` in the batch, so a failed end-of-batch catalog commit would mark the table unpersisted and its next touch would re-persist this machine's (after an engine-only undo, older) description over the record. `underBatchCheckpoint` now takes an optional `staged` predicate, and `alterCatalogOnly` records `written` only for an owned change or when it ran the instance's first initialize (which can stage a write). New `OptimysticVirtualTable.initialized` getter for that. No test: the specs have no way to make the catalog commit fail. Updated the "second, narrower path" paragraph of `bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record` — the path stays open through the tag listener, which still marks every table whose tags an apply touched.
+- *DRY:* the case-insensitive "without the object named X" rule was written out in `withoutCheck` (module) and `withoutCheckConstraint` (schema-manager) beside `findNamed`; both now use one `withoutNamed` in `catalog-only-change.ts`.
+
+**Tripwires parked**
+- A direct (imperative, outside `apply schema`) `drop constraint` over a record whose CHECK another machine re-bodied is adopted, so the record keeps that CHECK and a restart brings it back — `NOTE:` on `classifyCheckChange`.
+
+**Major / filed** — none new. The handoff's own gaps stand as filed: `bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record` (now `repro: verified`, with the ADD CHECK row-check trigger) and `bug-optimystic-failed-apply-on-a-second-machine-reverts-saved-tags`. The implementer suggested promoting the first ahead of `catalog-only-add-and-drop-column`, since ADD COLUMN of a NOT NULL column also reads rows before dispatch; that is a human triage call and is left in backlog.
+
+**Not examined further** — RENAME COLUMN plus a CHECK drop in one apply (handoff gap; RENAME COLUMN persistence is its own backlog bug). File size of `optimystic-module.ts` (5364 lines, `wc -l`) is already tracked by `debt-optimystic-vtab-class-is-too-big-to-review`.
