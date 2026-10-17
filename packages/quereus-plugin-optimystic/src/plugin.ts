@@ -126,6 +126,17 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		onCommitFullyHeld: (listener: CommitFullyHeldListener) =>
 			txnBridge.onCommitFullyHeld(listener),
 		/**
+		 * Resolves once every tag change made so far on an Optimystic table is saved to the table's
+		 * catalog record — so a later `hydrate` restores it. A tag change made by `apply schema` is
+		 * saved before the apply returns; an imperative `alter … set|add|drop tags` (on a table, a
+		 * column, a named constraint or an index) returns BEFORE its save lands, because Quereus
+		 * applies it to its own catalog and only announces it to the plugin. A host that closes a
+		 * `Database` and reopens the same storage in this process awaits this (or `dispose()`) in
+		 * between; a process that exits right after such a statement can lose the change. A save
+		 * that fails is logged and the table keeps its old tags in storage. Never rejects.
+		 */
+		whenCatalogPersisted: () => optimysticModule.whenCatalogPersisted(),
+		/**
 		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
 		 * full-replication events (forgetting every commit still followed, see
 		 * `TransactionBridge.dispose`), and its LEASES on the raw-storage read caches behind
@@ -137,9 +148,11 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 * that store's cache warm for the process, and a later `Database` over the same store then
 		 * reads it instead of the backend. Anything that mutates the store behind Optimystic's
 		 * back between two `Database`s must dispose in between. See `withReadCache` in
-		 * `@optimystic/db-p2p`.
+		 * `@optimystic/db-p2p`. Waits for the tag changes still being saved first
+		 * (`whenCatalogPersisted`).
 		 */
 		dispose: async () => {
+			await optimysticModule.whenCatalogPersisted();
 			txnBridge.dispose();
 			await collectionFactory.dispose();
 		},

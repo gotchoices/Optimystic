@@ -8,6 +8,7 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
+import { structuralEquals } from '@optimystic/db-core';
 import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution, ForeignKeyConstraintSchema, SqlValue } from '@quereus/quereus';
 import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
@@ -15,6 +16,7 @@ import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
+import { copyTags, withTagsOf } from './tag-overlay.js';
 
 // IndexSchema type from TableSchema.indexes
 export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
@@ -476,6 +478,35 @@ function canonicalizeRecordOrder<T extends StoredTableSchema | PersistedTableSch
 	} as T;
 }
 
+/**
+ * `record` with its table-level `tags` key where a fresh write of the same declaration puts it,
+ * for the same reason {@link canonicalizeRecordOrder} exists: a record that gained tags through
+ * `alter table … set tags` must persist the bytes a machine that declared them persists. The keys
+ * pulled out below are every key a write puts AFTER `tags` — those
+ * {@link SchemaManager.tableSchemaToStored} emits after it (keep the two in step), then those a
+ * later write appends (`orphanedIndexes`, {@link mergePersistedSchemas}; a gravestone's
+ * `droppedAt`). Every other tag lives on a list element, where the converters put it last, which
+ * is where `withTagsOf` (`./tag-overlay.ts`) puts it.
+ */
+function withTableTagsPlaced(record: PersistedTableSchema): PersistedTableSchema {
+	if (record.tags === undefined) {
+		return record;
+	}
+	const {
+		tags, synthesizedPrimaryKey, generatedColumnDependencies, generatedColumnTopoOrder, orphanedIndexes, droppedAt,
+		...before
+	} = record;
+	return {
+		...before,
+		tags,
+		...(synthesizedPrimaryKey !== undefined && { synthesizedPrimaryKey }),
+		...(generatedColumnDependencies !== undefined && { generatedColumnDependencies }),
+		...(generatedColumnTopoOrder !== undefined && { generatedColumnTopoOrder }),
+		...(orphanedIndexes !== undefined && { orphanedIndexes }),
+		...(droppedAt !== undefined && { droppedAt }),
+	};
+}
+
 /** Column-name → position map over a record's own column list (names compare case-insensitively). */
 function columnPositions(columns: readonly StoredColumnSchema[]): Map<string, number> {
 	return new Map(columns.map((col, index) => [col.name.toLowerCase(), index]));
@@ -565,11 +596,6 @@ export function persistExpression(node: unknown): unknown {
 /** `items` when it has any, else undefined — so an empty list is OMITTED from the record. */
 function nonEmpty<T>(items: readonly T[] | undefined): T[] | undefined {
 	return items && items.length > 0 ? [...items] : undefined;
-}
-
-/** A copy of `tags` when it has any, else undefined — so tag-free objects carry no key. */
-function copyTags(tags: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
-	return tags && Object.keys(tags).length > 0 ? { ...tags } : undefined;
 }
 
 /**
@@ -1213,6 +1239,61 @@ export class SchemaManager {
 	}
 
 	/**
+	 * The tag-change write: the table's live record with every tag `source` can address replaced by
+	 * `source`'s ({@link withTagsOf}) — the save of an edit Quereus made to its own catalog alone
+	 * (`OptimysticModule`'s `table_modified` listener). Nothing but tags changes, so this neither
+	 * goes through the index union of {@link storeStoredSchema} nor needs it. Read and written the
+	 * way that method reads and writes (fresh from the catalog, or through the open batch's overlay,
+	 * staged there), and open-only on the catalog like {@link removeIndex}.
+	 *
+	 * `'unchanged'` when the record already carries those tags — the answer for every structural
+	 * `table_modified`, and for a second machine saving the same edit — and nothing is written.
+	 * `'no-record'` when the catalog holds no live record for the table (a gravestone, or a record
+	 * that never landed — `OptimysticVirtualTable.markSchemaUnpersisted`); nothing is written then
+	 * either, since a record's whole content cannot be made from tags.
+	 */
+	async persistTags(
+		schemaName: string,
+		tableName: string,
+		source: TableSchema,
+		transactor?: ITransactor
+	): Promise<'saved' | 'unchanged' | 'no-record'> {
+		const key = catalogKey(schemaName, tableName);
+		if (this.batch) {
+			const record = this.livePersistedEntry(await this.batch.readEntry(key, transactor));
+			const tagged = record && this.retagged(record, source);
+			if (tagged) {
+				this.batch.write(key, [key, tagged]);
+			}
+			return record ? (tagged ? 'saved' : 'unchanged') : 'no-record';
+		}
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return 'no-record';
+		}
+		await tree.update();
+		const path = await tree.find(key);
+		const record = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
+		if (!record) {
+			return 'no-record';
+		}
+		const tagged = this.retagged(record, source);
+		if (!tagged) {
+			return 'unchanged';
+		}
+		await tree.replace([[key, [key, tagged]]]);
+		// Cached only once the write landed, as storeStoredSchema does.
+		this.schemaCache.set(key, toStoredSchema(tagged));
+		return 'saved';
+	}
+
+	/** `record` carrying `source`'s tags, or undefined when it already does. */
+	private retagged(record: PersistedTableSchema, source: TableSchema): PersistedTableSchema | undefined {
+		const tagged = withTableTagsPlaced(withTagsOf(record, source));
+		return structuralEquals(tagged, record) ? undefined : tagged;
+	}
+
+	/**
 	 * ONE pass over every catalog entry, in key order — the shared walk behind
 	 * {@link listTables} and {@link findRecordForUri}, so the two cannot drift.
 	 * Open-only: a fresh install has no catalog at all and yields nothing rather
@@ -1599,6 +1680,7 @@ export class SchemaManager {
 				type: variable.logicalType.name,
 				notNull: variable.notNull,
 			}))),
+			// Every key below this one is placed after `tags` by withTableTagsPlaced as well.
 			tags: copyTags(schema.tags),
 			synthesizedPrimaryKey: schema.synthesizedPrimaryKey,
 			generatedColumnDependencies: nonEmpty(generatedColumnDependencies),

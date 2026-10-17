@@ -947,8 +947,13 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   whose wake is the same `notifyExternalChange` path — so a machine storing nothing
   of the table wakes too. The tag is read `=== true`, from the declaration and then
   from every `table_modified` the module hears (`OptimysticModule.followTagChanges`
-  → `OptimysticVirtualTable.followTags`), so `alter table … set tags` starts or stops
-  the watch on a running table. The vtab opens and closes the watch through one
+  → `OptimysticVirtualTable.followSchemaTags`), so `alter table … set tags` starts or stops
+  the watch on a running table. The same listener also saves the table's tags — table,
+  column, named constraint and index — to its catalog record
+  (`SchemaManager.persistTags` in
+  `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`), since Quereus applies
+  a tag change to its own catalog without calling the module, and `hydrate` rebuilds tags
+  from that record. The vtab opens and closes the watch through one
   serial queue, so a tag flipped while an open is in flight is applied after it. It
   needs a node built with `cohortTopic.enabled` (the plugin-level `cohort_topic` for
   a node the plugin builds); without one — or on a non-`network` transactor — the

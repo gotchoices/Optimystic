@@ -153,11 +153,12 @@ const CHECK_AFTER_BIG = 'constraint ZQtyBounded check (Qty < 1000000)';
  * unnamed CHECKs, a stored generated column, a foreign key with an action, column and table
  * tags, a table-level UNIQUE, a `with context` variable, a plain index, a partial index and a
  * partial unique index. `indexes` and `checks` swap in another version's index and named
- * table-level CHECK declarations.
+ * table-level CHECK declarations; `tagged: false` is a version declaring neither tag.
  */
 function everyFeatureDeclare(
 	indexes: readonly string[] = EVERY_FEATURE_INDEXES,
 	checks: readonly string[] = EVERY_FEATURE_CHECKS,
+	tagged = true,
 ): string {
 	return `
 	declare schema app {
@@ -167,13 +168,13 @@ function everyFeatureDeclare(
 			Name varchar(20) not null collate nocase,
 			Big bigint null default 0,
 			Score integer not null default (1 + 1),
-			Note text null default 'n/a' with tags (kind = 'memo'),
+			Note text null default 'n/a'${tagged ? ` with tags (kind = 'memo')` : ''},
 			Qty integer not null check (Qty > 0),
 			Total integer generated always as (Qty * 2) stored,
 			ManagerId text null references Managers (Id) on delete cascade,
 			${checks.map(check => `${check},`).join('\n\t\t\t')}
 			unique (Name)
-		} with context (ManagerKey text null) with tags (owner = 'app')
+		} with context (ManagerKey text null)${tagged ? ` with tags (owner = 'app')` : ''}
 		${indexes.join('\n\t\t')}
 	}
 `;
@@ -257,8 +258,9 @@ function earlierIndexVersions(): { label: string; indexes: string[] }[] {
 /**
  * Migrations of `app.Every` from an earlier version to a later one, each giving the existing
  * table something new: an index that sorts before the others, the `BigNonNegative` CHECK, both in
- * one apply, and that CHECK where it sorts between two others. Bare `declare schema` blocks;
- * callers append `apply schema app;`.
+ * one apply, that CHECK where it sorts between two others, and the table and column tags (which
+ * `apply schema` adds with `alter … set tags`, statements Quereus never hands the module). Bare
+ * `declare schema` blocks; callers append `apply schema app;`.
  */
 const MIGRATION_PATHS: readonly { label: string; from: string; to: string }[] = [
 	{
@@ -280,6 +282,11 @@ const MIGRATION_PATHS: readonly { label: string; from: string; to: string }[] = 
 		label: 'from a version without BigNonNegative, to one declaring it between two other CHECKs',
 		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES, [CHECK_BEFORE_BIG, CHECK_AFTER_BIG]),
 		to: everyFeatureDeclare(EVERY_FEATURE_INDEXES, [CHECK_BEFORE_BIG, ...EVERY_FEATURE_CHECKS, CHECK_AFTER_BIG]),
+	},
+	{
+		label: 'from a version without its table and column tags',
+		from: everyFeatureDeclare(EVERY_FEATURE_INDEXES, EVERY_FEATURE_CHECKS, false),
+		to: EVERY_FEATURE_DECLARE,
 	},
 ];
 
@@ -453,9 +460,11 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 		}
 	});
 
-	it('writes the same catalog record whichever earlier version a machine migrated from, when a later version adds a CHECK', async () => {
+	it('writes the same catalog record whichever earlier version a machine migrated from, when a later version adds a CHECK or tags', async () => {
 		// The same property for a named table-level CHECK: `apply schema` adds it to the existing
 		// table with ALTER TABLE ADD CONSTRAINT, which used to leave it out of the record altogether.
+		// Tags reach the record through a different door (the module saves what Quereus announces),
+		// and must land where a fresh declaration's do.
 		for (const { label, from, to } of MIGRATION_PATHS) {
 			const reference = await catalogAfter('era1', `${to} apply schema app;`);
 			expect(await catalogAfter('era2', `${from} apply schema app;`, ...SEED_EVERY, `${to} apply schema app;`), label)
@@ -507,6 +516,77 @@ describe('Warm restart: a hydrated table is the table its declaration creates', 
 			// Enforces `BigNonNegative` among the rest, restored by hydrate alone.
 			await expectEveryBehaves(hydrated.db);
 		}
+	});
+
+	it('keeps every tag an imperative ALTER changed, through a restart', async () => {
+		// Quereus applies a tag edit to its own catalog and never calls the module, so before the
+		// module saved what it announces, every edit below was gone after a restart. The trailing
+		// CREATE INDEX reads the record and writes it back whole in the same exec, with no wait
+		// between: it must see the record the tag saves left.
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		const writer = await openEra('era1', shared);
+		await writer.db.exec(`
+			declare schema app {
+				table T {
+					id integer primary key,
+					c text null with tags (unit = 'm'),
+					n text null,
+					constraint Positive check (id > 0) with tags (msg = 'positive', hint = 'id'),
+					constraint UniqueN unique (n) with tags (msg = 'dup')
+				} with tags (a = 1)
+				index ByC on T (c) with tags (purpose = 'search')
+			}
+			apply schema app;
+		`);
+		await writer.db.exec(`
+			alter table app.T set tags (a = 2);
+			alter table app.T alter column c set tags (unit = 'km');
+			alter table app.T alter constraint Positive drop tags (hint);
+			alter table app.T alter constraint UniqueN set tags (msg = 'taken');
+			alter index app.ByC set tags (purpose = 'lookup');
+			create index ByN on app.T (n);
+		`);
+		await writer.plugin.whenCatalogPersisted();
+
+		const restarted = await openEra('era1', shared);
+		await restarted.plugin.hydrate(restarted.db);
+		expect(declarationView(tableOf(restarted.db, 'app', 'T')))
+			.to.deep.equal(declarationView(tableOf(writer.db, 'app', 'T')));
+	});
+
+	it('saves a tag change on a hydrated table no statement has touched', async () => {
+		// A session that only hydrated holds no instance of the table, and `alter … set tags`
+		// does not make one: the change is heard and saved by the module alone.
+		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+		const writer = await openEra('era1', shared);
+		await writer.db.exec(`declare schema app { table N { id integer primary key } with tags (a = 1) } apply schema app;`);
+
+		const second = await openEra('era2', shared);
+		await second.plugin.hydrate(second.db);
+		await second.db.exec(`alter table app.N set tags (b = true)`);
+		await second.plugin.whenCatalogPersisted();
+
+		const third = await openEra('era3', shared);
+		await third.plugin.hydrate(third.db);
+		expect(tableOf(third.db, 'app', 'N').tags).to.deep.equal({ b: true });
+	});
+
+	it('a tag-only apply schema saves the tag in its one catalog commit', async () => {
+		const store = buildSharedLocalTransactor(new MemoryRawStorage());
+		const counting = countingTransactor(store);
+		const { db } = await openSession('era1', { 'local:era1': counting.transactor });
+		const version = (v: number) =>
+			`declare schema app { table N { id integer primary key, v text } with tags (version = ${v}) } apply schema app;`;
+		await db.exec(version(1));
+
+		counting.counts.reset();
+		await db.exec(version(2));
+		expect(counting.counts.commit, "the tag rides the apply's one catalog commit").to.equal(1);
+
+		// Saved before the apply returned: nothing here waits for the catalog.
+		const later = await openEra('era2', store);
+		await later.plugin.hydrate(later.db);
+		expect(tableOf(later.db, 'app', 'N').tags).to.deep.equal({ version: 2 });
 	});
 
 	it("never takes a hydrated table's encoding from the session's default args", async () => {

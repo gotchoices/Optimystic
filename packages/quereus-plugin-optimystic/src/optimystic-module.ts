@@ -20,6 +20,7 @@ import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniq
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
+import { withTagsOf } from './schema/tag-overlay.js';
 import { PhysicalType } from '@quereus/quereus';
 import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
@@ -489,7 +490,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   private changeSubscribed = false;
   /**
    * Whether the table's tags opt it into network change notification. Taken from the declaration,
-   * then kept current by the module on every `table_modified` of this table ({@link followTags}).
+   * then kept current by the module on every `table_modified` of this table ({@link followSchemaTags}).
    */
   private networkWatchTagged: boolean;
   /** Whether the table is in the span it watches over: from full initialization until DROP TABLE. */
@@ -1144,14 +1145,21 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * The module's hook for a `table_modified` of this table. Quereus applies a tag
-   * change (`alter table … set tags`, and the same statement `apply schema` emits
-   * for a tag-only change) to its own catalog without calling the module, so this
-   * is how the table learns of it: start or stop the network watch to match the
-   * new tags. Idempotent. A table not yet initialized only records the tags; its
-   * initialization opens the watch.
+   * change (`alter … set|add|drop tags` on the table, a column, a named constraint or
+   * an index, and the same statements `apply schema` emits for a tag-only change) to
+   * its own catalog without calling the module, so this is how the table learns of it.
+   * The new schema's tags are copied onto this instance's own `tableSchema` — only the
+   * tags, since `tableSchema` differs from the engine's object on purpose (UNIQUE
+   * constraints folded in from the record, indexes withheld after a failed batch
+   * commit) — so a re-initialize that rewrites the record from `tableSchema` writes the
+   * new tags rather than the old ones. Then the network watch is started or stopped to
+   * match. Idempotent. A table not yet initialized only records the tags; its
+   * initialization opens the watch. Saving the tags to the catalog record is the
+   * module's job, not this instance's: a hydrated table may have no instance at all.
    */
-  followTags(tags: Readonly<Record<string, SqlValue>> | undefined): void {
-    this.networkWatchTagged = wantsNetworkWatch(tags);
+  followSchemaTags(schema: TableSchema): void {
+    this.tableSchema = withTagsOf(this.tableSchema, schema);
+    this.networkWatchTagged = wantsNetworkWatch(this.tableSchema.tags);
     this.reconcileNetworkWatch();
   }
 
@@ -3793,7 +3801,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * The index list is refreshed from what the IndexManager maintains first: `tableSchema`
    * is the object CREATE TABLE handed over, and Quereus's CREATE INDEX REPLACES the engine's
    * TableSchema (`appendIndexToTableSchema` returns a new object) rather than mutating this
-   * one — so without the refresh the re-persist would drop every index added since.
+   * one — so without the refresh the re-persist would drop every index added since. The
+   * IndexManager's descriptors carry the tags each index was CREATED with, so the engine's
+   * current tags are copied back on afterwards; without that, the re-persist would undo an
+   * `alter index … set tags` the failed commit was carrying.
    *
    * `withheldIndexes` names indexes whose tree the batch deferred and then failed to land.
    * They are left out of the refresh, along with any UNIQUE constraint derived from them
@@ -3820,6 +3831,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             uc => uc.derivedFromIndex === undefined || !withheldIndexes.has(uc.derivedFromIndex),
           ),
         };
+      }
+      const current = this.db.schemaManager.findTable(this.tableName, this.schemaName);
+      if (current) {
+        this.tableSchema = withTagsOf(this.tableSchema, current);
       }
     }
     this.isInitialized = false;
@@ -3982,18 +3997,39 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
   private readonly followedDatabases = new WeakSet<Database>();
 
+  /**
+   * The tag saves {@link followTagChanges} has queued, one after another, so two tag statements
+   * in one exec land in order. Never rejects: each step catches and logs its own failure.
+   *
+   * Every hook that writes the catalog ({@link create}, {@link createIndex}, {@link dropIndex},
+   * {@link alterTable}, {@link destroy}) drains it ({@link whenCatalogPersisted}) at entry. Those
+   * writes read the record and write it back whole, so a read made before a queued save landed
+   * would put the old tags back; and inside `apply schema` the drain comes before the statement's
+   * batch checkpoint ({@link underBatchCheckpoint}), so a later statement that fails cannot
+   * withdraw an earlier one's save. Quereus runs statements one at a time and the listener fires
+   * during the statement that made the change, so draining at the next hook is enough. The lazy
+   * first-touch initialize does not drain: its record is built from the instance's `tableSchema`,
+   * which already carries the new tags, so whichever of the two writes lands second writes them.
+   * `beginSchemaBatch` and `endSchemaBatch` drain too.
+   */
+  private catalogTagWrites: Promise<void> = Promise.resolve();
+
   constructor(
     private collectionFactory: CollectionFactory,
     private txnBridge: TransactionBridge
   ) {}
 
+  /** Quereus registered this module on `db`: listen for its tag changes from the first statement. */
+  onRegister(db: Database): void {
+    this.followTagChanges(db);
+  }
+
   /**
-   * Listen, once per `Database`, for `table_modified` and hand a table this module holds
-   * its new tags ({@link OptimysticVirtualTable.followTags}). A tag change never reaches
-   * the module otherwise: Quereus swaps its own catalog entry and announces the swap.
-   * Tables of other modules miss the lookup. (A rename, the one `table_modified` that
-   * changes the name, is refused for this module's tables, so the event's name is the
-   * name the table is held under.)
+   * Listen, once per `Database`, for `table_modified` of this module's tables, and save the new
+   * tags. A tag change never reaches the module otherwise: Quereus swaps its own catalog entry
+   * and announces the swap (`commitTagUpdate` in `@quereus/quereus/src/schema/manager.ts`).
+   * Subscribed from {@link onRegister}, so a session that has only hydrated — no table
+   * instantiated yet — hears its first `alter table … set tags` too.
    */
   private followTagChanges(db: Database): void {
     if (this.followedDatabases.has(db)) {
@@ -4001,10 +4037,80 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     this.followedDatabases.add(db);
     db.schemaManager.getChangeNotifier().addListener(event => {
-      if (event.type === 'table_modified') {
-        this.tables.get(`${event.schemaName}.${event.objectName}`.toLowerCase())?.followTags(event.newObject.tags);
+      if (event.type === 'table_modified' && this.ownsTable(db, event.newObject)) {
+        this.followTableTags(event.newObject);
       }
     });
+  }
+
+  /** Whether `schema` is a table of this module, judged as the engine resolves its module. */
+  private ownsTable(db: Database, schema: TableSchema): boolean {
+    return (schema.vtabModule ?? db.schemaManager.getModule(schema.vtabModuleName)?.module) === this;
+  }
+
+  /**
+   * One `table_modified` of this module's table: the instance (when one exists) takes the new
+   * tags, and a save of them onto the table's catalog record joins {@link catalogTagWrites}.
+   * Synchronous, as Quereus's listeners are: nothing is awaited here. A table no statement has
+   * touched since hydrate has no instance and is saved through the manager it would be built
+   * with. Every structural `table_modified` (a renamed column, the engine's follow-up after
+   * CREATE INDEX or ADD CONSTRAINT) arrives here too, and its save finds the tags already
+   * saved and writes nothing. (A table rename, the one `table_modified` that changes the
+   * name, is refused for this module's tables, so the schema's name is the key the table is
+   * held under.)
+   */
+  private followTableTags(schema: TableSchema): void {
+    const tableKey = `${schema.schemaName}.${schema.name}`.toLowerCase();
+    try {
+      const table = this.tables.get(tableKey);
+      table?.followSchemaTags(schema);
+      const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(schema));
+      // Inside `apply schema` the save stages into the batch, so a failed batch commit must
+      // mark the table unpersisted like any other table the batch altered.
+      if (this.schemaBatch) {
+        const written = this.schemaBatch.written.get(manager) ?? new Set<string>();
+        this.schemaBatch.written.set(manager, written.add(tableKey));
+      }
+      const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
+      this.catalogTagWrites = this.catalogTagWrites.then(() => this.saveTableTags(manager, tableKey, schema, transactor));
+    } catch (error) {
+      log(`WARN: tag change on '${tableKey}' not saved: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** One step of {@link catalogTagWrites}: save `schema`'s tags onto the table's catalog record. */
+  private async saveTableTags(
+    manager: SchemaManager,
+    tableKey: string,
+    schema: TableSchema,
+    transactor: ITransactor | undefined
+  ): Promise<void> {
+    try {
+      const outcome = await manager.persistTags(schema.schemaName, schema.name, schema, transactor);
+      if (outcome === 'no-record') {
+        // An instance whose record never landed re-persists it, tags included, from its own
+        // `tableSchema` on its next touch (see markSchemaUnpersisted).
+        log(`tag change on '${tableKey}' not saved: the catalog holds no live record for the table`);
+      }
+    } catch (error) {
+      // NOTE: accepted tradeoff — a failed tag save is logged, not reported: Quereus has no channel back from a schema-change listener, the same as the store module; revisit if Quereus gives listeners an async or error-reporting seam.
+      log(`WARN: failed to save tag change on '${tableKey}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Resolves once every tag change heard so far is saved to its table's catalog record (or its
+   * save has failed and been logged). An imperative `alter … set|add|drop tags` returns before
+   * its save lands, because Quereus does not await its schema-change listeners; a tag change an
+   * `apply schema` makes lands before the apply returns. A host that closes a `Database` and
+   * reopens the same storage in this process waits on this (or `plugin.dispose()`) in between.
+   */
+  async whenCatalogPersisted(): Promise<void> {
+    let drained: Promise<void>;
+    do {
+      drained = this.catalogTagWrites;
+      await drained;
+    } while (drained !== this.catalogTagWrites);
   }
 
   /**
@@ -4065,6 +4171,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * makes an overlapping apply impossible, so a second begin is a wiring bug and throws.
    */
   async beginSchemaBatch(_db: Database, _schemaName: string): Promise<void> {
+    // A tag save already running reads and writes the catalog directly; let it land first, so
+    // the batch reads the record it wrote rather than putting the old tags back at commit.
+    await this.whenCatalogPersisted();
     if (this.schemaBatch) {
       throw new Error('Optimystic schema batch already open: beginSchemaBatch without a matching endSchemaBatch');
     }
@@ -4117,9 +4226,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * gravestone is lost with the commit, the catalog keeps its live record past the DROP (the next
    * hydrate resurrects it, and a later CREATE over the same URI is not checked against it — the
    * same failure direction as the unbatched, best-effort {@link destroy}), so the log names those
-   * tables too.
+   * tables too. A tag change on a hydrated table no statement has touched is listed with the
+   * re-persisting tables but has no instance to mark: the first statement that touches the table
+   * builds one from the engine's catalog entry, which carries the new tags, and its initialization
+   * writes them. A restart before that loses the change; the next `apply schema` then re-emits it.
    */
   async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
+    // The apply's tag changes stage into the batch, so they commit in its one catalog commit.
+    await this.whenCatalogPersisted();
     const batch = this.schemaBatch;
     if (!batch) {
       throw new Error('Optimystic schema batch is not open: endSchemaBatch without a matching beginSchemaBatch');
@@ -4262,7 +4376,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       return existing;
     }
 
-    this.followTagChanges(db);
     const tableOptions = options ?? this.parseTableSchema(tableSchema);
     const schemaManager = this.createSchemaManager(tableOptions);
     const table = new OptimysticVirtualTable(
@@ -4288,6 +4401,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     db: Database,
     tableSchema: TableSchema
   ): Promise<OptimysticVirtualTable> {
+    await this.whenCatalogPersisted();
     const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
 
     // Check if table already exists
@@ -4369,8 +4483,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   async verifyIndexes(db: Database, tableName: string, schemaName = 'main'): Promise<IndexIntegrityReport[]> {
     const catalogEntry = db.schemaManager.findTable(tableName, schemaName);
     if (catalogEntry) {
-      const owner = catalogEntry.vtabModule ?? db.schemaManager.getModule(catalogEntry.vtabModuleName)?.module;
-      if (owner !== this) {
+      if (!this.ownsTable(db, catalogEntry)) {
         throw new Error(
           `Cannot verify indexes of '${schemaName}.${tableName}': it is not an Optimystic table ` +
           `(module '${catalogEntry.vtabModuleName}').`,
@@ -4555,6 +4668,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     indexSchema: IndexSchema
   ): Promise<void> {
+    await this.whenCatalogPersisted();
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
 
@@ -4615,6 +4729,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     indexName: string
   ): Promise<void> {
+    await this.whenCatalogPersisted();
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
 
@@ -4676,6 +4791,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     change: SchemaChangeInfo
   ): Promise<TableSchema> {
+    await this.whenCatalogPersisted();
     const tableSchema = db.schemaManager.findTable(tableName, schemaName);
     if (!tableSchema) {
       throw new QuereusError(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot alter.`, StatusCode.ERROR);
@@ -5065,6 +5181,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     schemaName: string,
     tableName: string
   ): Promise<void> {
+    await this.whenCatalogPersisted();
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const table = this.tables.get(tableKey)
       ?? await this.instantiateForTeardown(db, schemaName, tableName);
