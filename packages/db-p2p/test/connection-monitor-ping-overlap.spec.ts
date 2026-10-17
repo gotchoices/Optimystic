@@ -38,7 +38,7 @@ import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { Libp2pConnectionMonitorInit } from '../src/connection-monitor.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
-import { DEFAULT_PING_HANDLER_TIMEOUT_MS, resolvePingHandlerTimeoutMs } from '../src/rpc-deadline.js';
+import { DEFAULT_PING_HANDLER_TIMEOUT_MS, LIBP2P_DEFAULT_PING_MAX_TIMEOUT_MS, resolvePingHandlerTimeoutMs } from '../src/rpc-deadline.js';
 
 /** Distinct per-spec so concurrent specs on network-scoped protocol ids cannot cross-talk. */
 const NETWORK = 'connection-monitor-ping-overlap';
@@ -77,6 +77,24 @@ function captureAbort(connection: Connection, since: number): AbortCapture {
 	return captured;
 }
 
+type NodeExtras = { connectionMonitor?: Libp2pConnectionMonitorInit; pingHandlerTimeoutMs?: number };
+
+/** A one-node network on this spec's protocol ids, recorded in `nodes` so `afterEach` stops it. */
+async function spawnInto(nodes: OptimysticNode[], extra: NodeExtras = {}): Promise<OptimysticNode> {
+	const node = await createLibp2pNode({
+		port: 0,
+		networkName: NETWORK,
+		bootstrapNodes: [],
+		fretProfile: 'edge',
+		clusterSize: 1,
+		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+		arachnode: { enableRingZulu: false },
+		...extra
+	});
+	nodes.push(node);
+	return node;
+}
+
 async function waitForAbort(captured: AbortCapture): Promise<AbortCapture> {
 	const deadline = Date.now() + OBSERVE_TIMEOUT_MS;
 	while (captured.error === undefined && Date.now() < deadline) {
@@ -90,21 +108,6 @@ describe('connectionMonitor — a ping that overlaps the previous one', function
 	this.timeout(60_000);
 
 	const nodes: OptimysticNode[] = [];
-
-	async function spawn(extra: { connectionMonitor?: Libp2pConnectionMonitorInit; pingHandlerTimeoutMs?: number } = {}): Promise<OptimysticNode> {
-		const node = await createLibp2pNode({
-			port: 0,
-			networkName: NETWORK,
-			bootstrapNodes: [],
-			fretProfile: 'edge',
-			clusterSize: 1,
-			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
-			arachnode: { enableRingZulu: false },
-			...extra
-		});
-		nodes.push(node);
-		return node;
-	}
 
 	/**
 	 * Make `node` a peer whose ping answer never comes: accept the stream, echo nothing, hold it
@@ -122,8 +125,8 @@ describe('connectionMonitor — a ping that overlaps the previous one', function
 
 	/** A dialer configured as given, connected to a listener that never answers a ping. */
 	async function connectToStalledPeer(connectionMonitor: Libp2pConnectionMonitorInit): Promise<AbortCapture> {
-		const dialer = await spawn({ connectionMonitor });
-		const listener = await spawn();
+		const dialer = await spawnInto(nodes, { connectionMonitor });
+		const listener = await spawnInto(nodes);
 		await stallPingAnswers(listener);
 
 		// Clocked from before the dial, not after it: the monitor's interval is already running when
@@ -176,12 +179,12 @@ describe('pingHandlerTimeoutMs — the answering side never fires first', functi
 	});
 
 	it('defaults strictly above a declared monitor deadline, and to the library value otherwise', () => {
-		for (const maxTimeout of [30_000, 3_000]) {
-			expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout } })).to.be.greaterThan(maxTimeout);
-		}
 		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout: 30_000 } })).to.equal(60_000);
+		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout: 3_000 } })).to.equal(DEFAULT_PING_HANDLER_TIMEOUT_MS);
 		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout: 2 ** 31 } })).to.equal(2 ** 31 - 1);
-		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { minTimeout: 30_000 } } as Libp2pConnectionMonitorInit)).to.equal(DEFAULT_PING_HANDLER_TIMEOUT_MS);
+		// libp2p caps the monitor at its own default `maxTimeout` when only `minTimeout` is declared, so
+		// that default — not the 10s library handler timeout — is the deadline to stay above.
+		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { minTimeout: 30_000 } })).to.equal(2 * LIBP2P_DEFAULT_PING_MAX_TIMEOUT_MS);
 		expect(resolvePingHandlerTimeoutMs(undefined, undefined)).to.equal(DEFAULT_PING_HANDLER_TIMEOUT_MS);
 	});
 
@@ -194,27 +197,8 @@ describe('pingHandlerTimeoutMs — the answering side never fires first', functi
 
 	it('aborts an inbound ping stream the pinger never closes at the declared timeout', async () => {
 		const handlerTimeout = 300;
-		const listener = await createLibp2pNode({
-			port: 0,
-			networkName: NETWORK,
-			bootstrapNodes: [],
-			fretProfile: 'edge',
-			clusterSize: 1,
-			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
-			arachnode: { enableRingZulu: false },
-			pingHandlerTimeoutMs: handlerTimeout
-		});
-		nodes.push(listener);
-		const dialer = await createLibp2pNode({
-			port: 0,
-			networkName: NETWORK,
-			bootstrapNodes: [],
-			fretProfile: 'edge',
-			clusterSize: 1,
-			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
-			arachnode: { enableRingZulu: false }
-		});
-		nodes.push(dialer);
+		const listener = await spawnInto(nodes, { pingHandlerTimeoutMs: handlerTimeout });
+		const dialer = await spawnInto(nodes);
 
 		// Clocked before the dial: the listener's timer starts when its handler runs, which can be
 		// fractionally before `dialProtocol` returns here, never before it was called.

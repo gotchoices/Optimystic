@@ -577,8 +577,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * connection — so a peer's {@link connectionMonitor} deadline is capped at THIS node's handler
 	 * timeout, the same shape as the `pingInterval` cap above, from the other end of the stream.
 	 *
-	 * Unset → twice `connectionMonitor.pingTimeout.maxTimeout` when that is declared (never below 10s,
-	 * never above 2^31 − 1), else 10s as before. That default assumes the peers pinging this node have
+	 * Unset → twice `connectionMonitor.pingTimeout.maxTimeout` when `pingTimeout` declares either bound
+	 * (libp2p's 60s default `maxTimeout` standing in when only `minTimeout` is declared; never below
+	 * 10s, never above 2^31 − 1), else 10s as before. That default assumes the peers pinging this node have
 	 * their monitor configured like this one — the same "both ends alike" assumption the
 	 * `connectionMonitor` advice makes. A declared value is used as given, never raised; one that is not
 	 * a finite number above zero, or is above 2^31 − 1, throws when the node is built.
