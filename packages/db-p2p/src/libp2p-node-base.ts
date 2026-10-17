@@ -53,7 +53,7 @@ import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
 import { buildSyncProtocol } from './sync/protocol.js';
-import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
+import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, resolvePingHandlerTimeoutMs, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
 import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
@@ -569,6 +569,26 @@ export type NodeOptions = ClusterPolicyOptions & {
 	connectionMonitor?: ConnectionMonitorInit;
 
 	/**
+	 * How long this node lets an INBOUND ping stream (`/ipfs/ping/1.0.0`) live before aborting it, in
+	 * milliseconds — `@libp2p/ping`'s `timeout`, which it otherwise fixes at 10s. The timer covers the
+	 * whole stream: the echo, waiting for the pinger to close its side, and the final close, so a slow
+	 * outbound queue on this node eats into it. When it fires first, this node resets the stream, the
+	 * pinging node's connection monitor cannot tell the reset from a dead peer, and it aborts the
+	 * connection — so a peer's {@link connectionMonitor} deadline is capped at THIS node's handler
+	 * timeout, the same shape as the `pingInterval` cap above, from the other end of the stream.
+	 *
+	 * Unset → twice `connectionMonitor.pingTimeout.maxTimeout` when that is declared (never below 10s,
+	 * never above 2^31 − 1), else 10s as before. That default assumes the peers pinging this node have
+	 * their monitor configured like this one — the same "both ends alike" assumption the
+	 * `connectionMonitor` advice makes. A declared value is used as given, never raised; one that is not
+	 * a finite number above zero, or is above 2^31 − 1, throws when the node is built.
+	 *
+	 * Cost: a stalled inbound ping stream is held up to this long, bounded per connection by
+	 * `@libp2p/ping`'s `maxInboundStreams`.
+	 */
+	pingHandlerTimeoutMs?: number;
+
+	/**
 	 * Explicit connection-manager deadlines, passed to libp2p unchanged. Each one set here overrides
 	 * the value derived from {@link NodeOptions.linkRoundTripMs}; a deployment that declares its link
 	 * round trip has no need to set any of them.
@@ -813,6 +833,7 @@ export async function createLibp2pNodeBase(
 	const bootstrapContactTimeoutMs = resolveBootstrapContactTimeoutMs(options.bootstrapContactTimeoutMs, linkDeadlines);
 	// One value for libp2p's connection manager and FRET's maintenance redial, so the two cannot drift.
 	const libp2pDialTimeoutMs = resolveLibp2pDialTimeoutMs(options.connectionManager?.dialTimeout, linkDeadlines);
+	const pingHandlerTimeoutMs = resolvePingHandlerTimeoutMs(options.pingHandlerTimeoutMs, options.connectionMonitor);
 
 	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
 	// gate and the repair corroboration floor resolve to different values when nothing is declared,
@@ -1020,7 +1041,8 @@ export async function createLibp2pNodeBase(
 			identifyPush: identifyPush({
 				protocolPrefix: `optimystic/${options.networkName}`
 			}),
-			// NOTE: constructed bare, so `@libp2p/ping`'s own `maxOutboundStreams: 1` is the outbound
+			// NOTE: constructed with only `timeout` (see {@link NodeOptions.pingHandlerTimeoutMs}), so
+			// `@libp2p/ping`'s own `maxOutboundStreams: 1` is still the outbound
 			// limit the registrar reports for `/ipfs/ping/1.0.0` to every caller on this node —
 			// including libp2p's connection monitor, which pings on that same protocol. That limit is
 			// what makes an overlapping ping abort the connection, and so what makes the deadline rule
@@ -1028,7 +1050,7 @@ export async function createLibp2pNodeBase(
 			// necessary. Raising it here would retire that rule, change what every node accepts from an
 			// application's own pings, and falsify `test/connection-monitor-ping-overlap.spec.ts` plus
 			// both documents it backs — re-check all three before doing so.
-			ping: ping(),
+			ping: ping({ timeout: pingHandlerTimeoutMs }),
 			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
 			// ones; AutoNAT learns this node's public reachability via peer dial-back.
 			// Both are always-on and depend on `identify` above. They are inert where

@@ -311,6 +311,43 @@ export function resolveLibp2pDialTimeoutMs(declared: number | undefined, deadlin
 		: validDeclaredMs('connectionManager.dialTimeout', declared, MAX_TIMER_DELAY_MS);
 }
 
+/**
+ * How long `@libp2p/ping` lets an inbound ping stream live before aborting it, on a node that neither
+ * declares one nor declares a connection-monitor deadline. Equal to `@libp2p/ping`'s own `TIMEOUT`,
+ * stated here so the fallback does not move with that package.
+ */
+export const DEFAULT_PING_HANDLER_TIMEOUT_MS = 10_000;
+
+/** The part of libp2p's `ConnectionMonitorInit` the ping handler timeout is derived from. */
+export type DeclaredPingDeadline = { pingTimeout?: { maxTimeout?: number } };
+
+/**
+ * The timeout this node's ping service puts on every inbound ping stream (`NodeOptions.pingHandlerTimeoutMs`).
+ *
+ * The answering side's timer runs over the whole stream — echo, waiting for the pinger to close, and
+ * the final close — and when it fires first it resets the stream, which the pinging node's connection
+ * monitor cannot tell from a dead peer, so it aborts the connection. So a deadline the pinger declares
+ * is capped at the answerer's handler timeout. Declared → used exactly as given, never raised (an
+ * embedder who sets it low has decided). Undeclared with `connectionMonitor.pingTimeout.maxTimeout`
+ * declared → twice that deadline (strictly above it, with room for the close), floored at the library
+ * default and capped at the 32-bit timer limit; this assumes the remote's monitor is configured like
+ * this node's. Otherwise → {@link DEFAULT_PING_HANDLER_TIMEOUT_MS}, today's behaviour.
+ *
+ * NOTE: an unconfigured libp2p monitor's adaptive deadline can rise toward its own 60 s default
+ * `maxTimeout` for one slow ping, so even a stock pair can in principle meet the 10 s handler cap; the
+ * undeclared default is left at 10 s on purpose. If stock-config deployments report reset-driven
+ * aborts (`aborting connection due to ping failure` with a stream reset or unexpected EOF), derive
+ * from libp2p's default max too.
+ */
+export function resolvePingHandlerTimeoutMs(declared: number | undefined, connectionMonitor: DeclaredPingDeadline | undefined): number {
+	if (declared !== undefined) return validDeclaredMs('pingHandlerTimeoutMs', declared, MAX_TIMER_DELAY_MS);
+	const monitorDeadline = connectionMonitor?.pingTimeout?.maxTimeout;
+	if (monitorDeadline === undefined || !Number.isFinite(monitorDeadline) || monitorDeadline <= 0) {
+		return DEFAULT_PING_HANDLER_TIMEOUT_MS;
+	}
+	return Math.min(MAX_TIMER_DELAY_MS, Math.max(DEFAULT_PING_HANDLER_TIMEOUT_MS, 2 * monitorDeadline));
+}
+
 function validDeclaredMs(field: string, declared: number, ceiling: number): number {
 	if (!Number.isFinite(declared) || declared <= 0 || declared > ceiling) {
 		throw new Error(

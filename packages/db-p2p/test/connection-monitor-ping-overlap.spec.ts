@@ -19,6 +19,11 @@
  * — and the patient arm that it landed no earlier than that deadline. Neither needs a timer to be
  * punctual.
  *
+ * A third bound comes from the answering end: `@libp2p/ping` aborts every inbound ping stream after
+ * its handler timeout, and the pinger's monitor reads that reset as a dead peer. The last describe
+ * pins that the node's default handler timeout is never the first deadline to fire
+ * (`resolvePingHandlerTimeoutMs`), and that `NodeOptions.pingHandlerTimeoutMs` reaches the service.
+ *
  * NOTE: this pins a libp2p/@libp2p/ping premise, not our own code — the docs it backs
  * (`NodeOptions.connectionMonitor`, and the readme's React Native section) tell deployments to set
  * `pingInterval` longer than `pingTimeout.minTimeout` precisely because of it. If a libp2p upgrade
@@ -33,6 +38,7 @@ import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { Libp2pConnectionMonitorInit } from '../src/connection-monitor.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
+import { DEFAULT_PING_HANDLER_TIMEOUT_MS, resolvePingHandlerTimeoutMs } from '../src/rpc-deadline.js';
 
 /** Distinct per-spec so concurrent specs on network-scoped protocol ids cannot cross-talk. */
 const NETWORK = 'connection-monitor-ping-overlap';
@@ -85,7 +91,7 @@ describe('connectionMonitor — a ping that overlaps the previous one', function
 
 	const nodes: OptimysticNode[] = [];
 
-	async function spawn(extra: { connectionMonitor?: Libp2pConnectionMonitorInit } = {}): Promise<OptimysticNode> {
+	async function spawn(extra: { connectionMonitor?: Libp2pConnectionMonitorInit; pingHandlerTimeoutMs?: number } = {}): Promise<OptimysticNode> {
 		const node = await createLibp2pNode({
 			port: 0,
 			networkName: NETWORK,
@@ -157,5 +163,71 @@ describe('connectionMonitor — a ping that overlaps the previous one', function
 		expect(error?.name, 'the pings still overlapped').to.not.equal(OVERLAP_ERROR);
 		expect(elapsedMs, `the peer was cut off after ${elapsedMs}ms, short of its ${deadline}ms deadline`)
 			.to.be.at.least(deadline);
+	});
+});
+
+describe('pingHandlerTimeoutMs — the answering side never fires first', function () {
+	this.timeout(30_000);
+
+	const nodes: OptimysticNode[] = [];
+
+	afterEach(async () => {
+		await Promise.allSettled(nodes.splice(0).map(node => node.stop()));
+	});
+
+	it('defaults strictly above a declared monitor deadline, and to the library value otherwise', () => {
+		for (const maxTimeout of [30_000, 3_000]) {
+			expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout } })).to.be.greaterThan(maxTimeout);
+		}
+		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout: 30_000 } })).to.equal(60_000);
+		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { maxTimeout: 2 ** 31 } })).to.equal(2 ** 31 - 1);
+		expect(resolvePingHandlerTimeoutMs(undefined, { pingTimeout: { minTimeout: 30_000 } } as Libp2pConnectionMonitorInit)).to.equal(DEFAULT_PING_HANDLER_TIMEOUT_MS);
+		expect(resolvePingHandlerTimeoutMs(undefined, undefined)).to.equal(DEFAULT_PING_HANDLER_TIMEOUT_MS);
+	});
+
+	it('uses a declared value as given and refuses an unusable one', () => {
+		expect(resolvePingHandlerTimeoutMs(300, { pingTimeout: { maxTimeout: 30_000 } })).to.equal(300);
+		for (const bad of [Number.NaN, Number.POSITIVE_INFINITY, 0, -1, 2 ** 31]) {
+			expect(() => resolvePingHandlerTimeoutMs(bad, undefined), String(bad)).to.throw(/pingHandlerTimeoutMs/);
+		}
+	});
+
+	it('aborts an inbound ping stream the pinger never closes at the declared timeout', async () => {
+		const handlerTimeout = 300;
+		const listener = await createLibp2pNode({
+			port: 0,
+			networkName: NETWORK,
+			bootstrapNodes: [],
+			fretProfile: 'edge',
+			clusterSize: 1,
+			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+			arachnode: { enableRingZulu: false },
+			pingHandlerTimeoutMs: handlerTimeout
+		});
+		nodes.push(listener);
+		const dialer = await createLibp2pNode({
+			port: 0,
+			networkName: NETWORK,
+			bootstrapNodes: [],
+			fretProfile: 'edge',
+			clusterSize: 1,
+			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
+			arachnode: { enableRingZulu: false }
+		});
+		nodes.push(dialer);
+
+		// Clocked before the dial: the listener's timer starts when its handler runs, which can be
+		// fractionally before `dialProtocol` returns here, never before it was called.
+		const sentAt = Date.now();
+		const stream = await dialer.dialProtocol(multiaddr(pickLocalTcpMultiaddr(listener)), PING_PROTOCOL);
+		stream.send(new Uint8Array(32));
+		// Read the echo and keep reading; the stream ends only when the listener's timer aborts it.
+		try {
+			for await (const _chunk of stream) { /* the echo, then nothing */ }
+		} catch { /* a reset is the expected end; the elapsed time is the assertion */ }
+		const elapsedMs = Date.now() - sentAt;
+
+		expect(elapsedMs, 'the listener aborted the stream before its handler timeout').to.be.at.least(handlerTimeout);
+		expect(elapsedMs, `the declared ${handlerTimeout}ms did not reach the ping service`).to.be.lessThan(DEFAULT_PING_HANDLER_TIMEOUT_MS / 2);
 	});
 });
