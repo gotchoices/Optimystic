@@ -22,6 +22,7 @@ import type { BlockDurabilitySink } from "./under-replication-drain.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
+import { SilentConsultHolds } from "./silent-consult-holds.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -500,6 +501,14 @@ interface CoordinatorRepoComponents {
 export type CoordinatorRepoConfig = Partial<ClusterConsensusConfig> & {
 	clusterSize?: number;
 	repairCorroborationClusterSize?: number;
+	/**
+	 * The first hold, in milliseconds, after a read-repair consult that a silent cohort peer left
+	 * unarmed; it doubles per consecutive such consult (see {@link SilentConsultHolds}). A node fills it
+	 * from `LinkDeadlines.retryBackoffBaseMs`, the declared link round trip. Default 0: no hold, the next
+	 * read consults again. A coordinator field, not a consensus one, because the cluster member never
+	 * consults.
+	 */
+	retryBackoffBaseMs?: number;
 };
 
 export function coordinatorRepo(
@@ -623,6 +632,13 @@ export class CoordinatorRepo implements IRepo {
 	 * named where the record lives, by a count that does not move with the coordinator.
 	 */
 	private readonly stuckReservations = new StuckReservationTracker(1000);
+	/**
+	 * Per block, how long a window-demanded consult waits after one a silent peer left unarmed — see
+	 * {@link SilentConsultHolds}. Its own collaborator for the reason {@link stuckReservations} is: it
+	 * is cleared by a different event (a clean consult, or any silent peer answering) than the
+	 * freshness entry it sits beside.
+	 */
+	private readonly silentConsultHolds: SilentConsultHolds;
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
@@ -733,6 +749,12 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
 		this.cohortQueryTimeoutMs = policy.cohortQueryTimeoutMs!;
 		this.reconcilePassTimeoutMs = reconcilePassTimeoutMs(this.cohortQueryTimeoutMs);
+		// Only the `'lazy'` window ever reads a hold, so any other mode places none — and logs none.
+		this.silentConsultHolds = new SilentConsultHolds({
+			baseMs: this.readRepairMode === 'lazy' ? cfg?.retryBackoffBaseMs ?? 0 : 0,
+			capMs: this.reconcilePassTimeoutMs,
+			now: () => this.now()
+		});
 		this.simpleMajorityThreshold = policy.simpleMajorityThreshold;
 		this.superMajorityThreshold = policy.superMajorityThreshold;
 		// Unlike the membership admission gate (which treats an absent assumedClusterSize as "unknown"
@@ -982,7 +1004,9 @@ export class CoordinatorRepo implements IRepo {
 
 		const passSeq = this.nextPassSeq();
 		try {
-			const { absence, currency } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
+			const { absence, currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
+			// A missing block consults on every read whatever the hold says, so its silences place none.
+			if (!isMissing) this.noteConsultOutcome(blockId, heldBySilence);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
 			// entry that lost its lineage answer would read to the asker as "could not say".
 			const refreshed = await this.storageRepo.get({
@@ -1261,12 +1285,24 @@ export class CoordinatorRepo implements IRepo {
 		this.log('cluster-tx:read-unconfirmed', { blockId, servedRev, claimedAheadRev: claimedRev });
 	}
 
-	/** Decide whether the read-repair policy wants us to consult the cluster for a present-but-possibly-stale block. */
+	/**
+	 * Decide whether the read-repair policy wants us to consult the cluster for a present-but-possibly-stale
+	 * block. In `'lazy'` mode a block held after a consult a silent peer left unarmed is not asked about
+	 * until its hold ends or that peer answers ({@link SilentConsultHolds}), whatever the window or the
+	 * sample rate would say. The hold gates nothing else: a floor still consults
+	 * ({@link floorDemandsConsult}), and a missing block never reaches here.
+	 *
+	 * NOTE: a missing block consults on every read, held or not, because its absence verdict depends on
+	 * the cohort. If missing-block consults to a silent cohort ever show up as read amplification, hold
+	 * the latest-query for them too, flagging the absence `'peers-unreachable'` as the last consult
+	 * concluded.
+	 */
 	private shouldReadRepair(blockId: BlockId): boolean {
 		switch (this.readRepairMode) {
 			case 'off': return false;
 			case 'paranoid': return true;
 			case 'lazy': {
+				if (this.silentConsultHolds.holds(blockId)) return false;
 				const lastSeen = this.lastSeenCommitMs.get(blockId)?.at;
 				if (lastSeen == null) return true;
 				if (this.now() - lastSeen > this.readRepairWindowMs) return true;
@@ -1440,11 +1476,39 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
 		try {
-			const { currency } = await this.fetchBlockFromCluster(blockId, context, localRev, floor, asker);
+			const { currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, context, localRev, floor, asker);
+			this.noteConsultOutcome(blockId, heldBySilence);
 			this.recordAheadClaim(blockId, currency, passSeq);
 			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId, context));
 		} catch (err) {
 			this.log('cluster-fetch:error', { blockId, background: true, error: (err as Error).message });
+		}
+	}
+
+	/**
+	 * Hold a held block's next window-demanded consult after one that silent peers left unarmed, or
+	 * forget the hold after one that ended any other way ({@link SilentConsultHolds}). Called by both
+	 * paths that consult for a held block, once the consult has concluded; a consult that THROWS calls
+	 * neither, since it refutes nothing — the doubt memo's rule.
+	 */
+	private noteConsultOutcome(blockId: BlockId, heldBySilence: readonly string[] | undefined): void {
+		if (heldBySilence === undefined) {
+			this.silentConsultHolds.clear(blockId);
+			return;
+		}
+		const hold = this.silentConsultHolds.noteSilentConsult(blockId, heldBySilence);
+		if (hold) this.log('cluster-fetch:consult-held', { blockId, ...hold });
+	}
+
+	/**
+	 * Tell the silent-consult holds that every remote peer with a vote on `record` answered this node:
+	 * a promise or a commit signature is that member answering a request, so a block held because the
+	 * member was silent is consulted again on its next read rather than when its hold runs out.
+	 */
+	private noteVotersAnswered(record: ClusterRecord): void {
+		const selfId = this.localPeerId?.toString();
+		for (const peerId of new Set([...Object.keys(record.promises), ...Object.keys(record.commits)])) {
+			if (peerId !== selfId) this.silentConsultHolds.noteAnswered(peerId);
 		}
 	}
 
@@ -1514,6 +1578,11 @@ export class CoordinatorRepo implements IRepo {
 	 * (see {@link askerStatementFor}); it only changes how that one peer's answer is obtained, in
 	 * {@link queryClusterForLatest}, and every decision below weighs the answer exactly as it would a
 	 * consulted one.
+	 *
+	 * `heldBySilence` names the silent peers at the one exit that leaves the window unarmed BECAUSE of
+	 * them — no corroboration, some peer silent — so the caller holds the next window-demanded consult
+	 * ({@link noteConsultOutcome}). Every other exit leaves it unset, the armed ones included: a window
+	 * already spaces those consults out.
 	 */
 	private async fetchBlockFromCluster(
 		blockId: BlockId,
@@ -1521,7 +1590,7 @@ export class CoordinatorRepo implements IRepo {
 		localRev?: number,
 		floor?: number,
 		asker?: AskerStatement
-	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict }> {
+	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict; heldBySilence?: readonly string[] }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
 
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
@@ -1584,6 +1653,7 @@ export class CoordinatorRepo implements IRepo {
 		}
 
 		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);
+		for (const peerId of answered) this.silentConsultHolds.noteAnswered(peerId);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
 		// another coordinator — is paid only while a peer is actually unreachable. Silence with
@@ -1672,8 +1742,13 @@ export class CoordinatorRepo implements IRepo {
 			// repeating.
 			if (deadlock === 'cohort-too-small') {
 				this.markBlocksSeen([blockId], floor);
+				return { absence, currency };
 			}
-			return { absence, currency };
+			// Left unarmed so a peer that recovers is heard, but held so the next read does not re-ask at
+			// once: on a slow link that is one consult per per-peer deadline, each queued behind the one
+			// that went unanswered. (A silent pass never yields `cohort-too-small` — see
+			// `classifyRepairDeadlock` — so no pass is both armed and held.)
+			return silent.length > 0 ? { absence, currency, heldBySilence: silent } : { absence, currency };
 		}
 
 		// The self answer is the sharper baseline (same storage, same context, read alongside the
@@ -2418,6 +2493,7 @@ export class CoordinatorRepo implements IRepo {
 
 		try {
 			const { record, localExecuted, localPendResult, cohortPendRefusals } = await this.coordinator.executeClusterTransaction(coordinatingBlockIds[0]!, message, options);
+			this.noteVotersAnswered(record);
 			// Who ACCEPTED the pending record — the cohort members whose promise vote approved it, plus
 			// or minus this node's own member per exit below. A pend's `confirmed` is not a commit's:
 			// accepting a pending record confers no storage durability (a pend that reached
@@ -2999,6 +3075,7 @@ export class CoordinatorRepo implements IRepo {
 
 		try {
 			const { record, localExecuted, localCommitResult, cohortCommitOutcomes } = await this.coordinator.executeClusterTransaction(blockIds[0]!, message, options);
+			this.noteVotersAnswered(record);
 			// Decided once for every success shape below (local-executed, local fallback, tolerated
 			// divergence): whether this commit's quorum is freshness evidence or merely a commit.
 			// NOTE: one verdict covers every block in `blockIds`, though it is measured against

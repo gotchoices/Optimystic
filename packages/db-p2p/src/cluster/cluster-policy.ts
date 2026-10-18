@@ -363,6 +363,10 @@ export function resolveCohortQueryTimeoutMs(declared: number | undefined): numbe
  * (`ClusterMember.withReconcileTimeout`). They shared one constant on purpose ("same operation, same
  * bound", docs/internals.md) and must not drift apart.
  *
+ * `CoordinatorRepo` also uses it as the longest hold before a held block is consulted again after a
+ * consult a silent peer left unarmed (`SilentConsultHolds` in `repo/silent-consult-holds.ts`), so the
+ * cap grows with the link as the per-peer budget does: 35 s at a 7 s budget.
+ *
  * The multiple is also why the per-peer field has a ceiling: the product is what reaches a timer, so
  * it is the number that must stay representable — see {@link MAX_COHORT_QUERY_TIMEOUT_MS}.
  */

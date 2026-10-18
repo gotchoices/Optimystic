@@ -156,7 +156,9 @@ export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
 	 * that went unanswered, doubling for each further coordinator tried. Exactly the declared round
 	 * trip, and 0 — no wait, every retry at once — when none is declared, with no floor: a node on the
 	 * LAN deadlines sends a retry over a link whose queue does not hold its predecessor back. The node
-	 * itself applies it nowhere, and `rpcDeadlines` does not move it.
+	 * applies it once itself, as its coordinator's first hold after a read-repair consult a silent
+	 * cohort peer left unarmed (`CoordinatorRepoConfig.retryBackoffBaseMs`). `rpcDeadlines` does not
+	 * move it.
 	 */
 	retryBackoffBaseMs: number;
 };
