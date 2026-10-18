@@ -5,7 +5,7 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { routingKeyForBlock } from '../src/network/routing-key.js'
-import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
+import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResult, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
 import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
@@ -263,22 +263,21 @@ describe('NetworkTransactor', () => {
     // this node's send queue to that peer, so its retry waits; a batch that ANSWERED is out of the
     // queue, so its retry goes at once. Each wait is distinguishable by its length: one base for a
     // chain that has tried one coordinator, two for one that has tried two.
-    it('in the second-chance round, a batch that threw waits and one answered unavailable does not', async () => {
+    it('in the second-chance round, a retry that answered unavailable goes on at once and the coordinator it replaced is not asked again', async () => {
       const net = new CountingKeyNetwork(['peer-A', 'peer-B', 'peer-C'])
       const blockId = 'slow-block' as BlockId
       const sleeps: number[] = []
+      const asked: string[] = []
+      const answer = (peer: string, entry: GetBlockResult) => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        asked.push(peer)
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = entry
+        return res
+      })
       const repos: Record<string, IRepo> = {
-        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
-        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
-          const res: GetBlockResults = {}
-          for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'peers-unreachable' }
-          return res
-        }),
-        'peer-C': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
-          const res: GetBlockResults = {}
-          for (const bid of blockIds) res[bid] = { state: {} }
-          return res
-        }),
+        'peer-A': makeGetOnlyRepo(async () => { asked.push('peer-A'); throw new Error('response timeout') }),
+        'peer-B': answer('peer-B', { state: {}, unavailable: 'peers-unreachable' }),
+        'peer-C': answer('peer-C', { state: {} }),
       }
 
       const networkTransactor = new NetworkTransactor({
@@ -292,10 +291,42 @@ describe('NetworkTransactor', () => {
 
       const result = await networkTransactor.get({ blockIds: [blockId] })
 
-      // A threw: `processBatches` re-batched it onto B after one base (100). In the round, A —
-      // still with no response — waits one base again before B; B, which answered, goes on to C
-      // at once (it would have waited two bases, having tried A and B).
-      expect(sleeps).to.deep.equal([100, 100])
+      // A threw: `processBatches` re-batched it onto B after one base (100). In the round only B is
+      // retried, and at once (it would have waited two bases, having tried A and B). A, already
+      // re-batched, is not retried — that re-ask used to cost a second wait and a second request to B.
+      expect(sleeps).to.deep.equal([100])
+      expect(asked).to.deep.equal(['peer-A', 'peer-B', 'peer-C'])
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    it('in the second-chance round, a batch that threw and was never re-batched waits before its retry', async () => {
+      const blockId = 'lookup-flake' as BlockId
+      const sleeps: number[] = []
+      // The first lookup past A fails (processBatches cannot re-batch A); the round's lookup succeeds.
+      let lookupsPastA = 0
+      class FlakyPastA extends CountingKeyNetwork {
+        override async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          if ((options?.excludedPeers ?? []).length > 0 && lookupsPastA++ === 0) throw new Error('No coordinator found')
+          return super.findCoordinator(key, options)
+        }
+      }
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
+        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => Object.fromEntries(blockIds.map(bid => [bid, { state: {} }]))),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: new FlakyPastA(['peer-A', 'peer-B']),
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(sleeps).to.deep.equal([100])
       expect(result[blockId]!.unavailable).to.equal(undefined)
     })
 

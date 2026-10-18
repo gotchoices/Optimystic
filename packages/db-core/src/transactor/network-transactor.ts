@@ -254,37 +254,38 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			return true;
 		};
 
-		// A block is settled by a batch whose response carries an entry for it that carries
-		// no doubt marker and does not fall below the caller's floor. An entry present with
-		// only `state` (no `block`) is an authoritative "absent", which settles the block —
-		// not a gap. An `unavailable` entry is the peer saying it could not find out whether
-		// the block EXISTS; an `unconfirmedAheadRev` entry is the peer saying it could not
-		// confirm the content it served is CURRENT (a cohort claim sits ahead of it,
-		// unsettled); a below-floor entry is the CALLER knowing the content is behind a
-		// revision it has already seen the log commit. None settles the block, so each earns
-		// the second-chance retry against a different coordinator.
-		const settledBy = (b: CoordinatorBatch<BlockId[], GetBlockResults>): BlockId[] => {
-			if (!hasValidResponse(b)) return [];
+		// A batch is answered when its response carries an entry for EVERY requested
+		// block id and none of those entries carries a doubt marker or falls below the
+		// caller's floor. An entry present with only `state` (no `block`) is an
+		// authoritative "absent", which counts as answered — not a gap. An `unavailable`
+		// entry is the peer saying it could not find out whether the block EXISTS; an
+		// `unconfirmedAheadRev` entry is the peer saying it could not confirm the content
+		// it served is CURRENT (a cohort claim sits ahead of it, unsettled); a below-floor
+		// entry is the CALLER knowing the content is behind a revision it has already seen
+		// the log commit. None counts as answered, so each earns the second-chance retry
+		// against a different coordinator.
+		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
+			if (!hasValidResponse(b)) return false;
 			const resp = b.request!.response! as GetBlockResults;
-			return b.payload.filter(bid => resp[bid] !== undefined
+			return b.payload.every(bid => resp[bid] !== undefined
 				&& resp[bid]!.unavailable === undefined
 				&& resp[bid]!.unconfirmedAheadRev === undefined
 				&& !belowFloor(bid, resp[bid]!));
 		};
-		const triedBatches = Array.from(allBatches(batches)) as CoordinatorBatch<BlockId[], GetBlockResults>[];
-		const settled = new Set(triedBatches.flatMap(settledBy));
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
-		// absent answer is not retried. Neither is a batch whose every block some OTHER
-		// batch settled: a first coordinator that threw was already re-batched by
-		// `processBatches`, and when that retry answered, asking again — after a fresh
-		// backoff wait — would only add a request and latency to a read that has its answer.
+		// absent answer is not retried. Neither is a batch `processBatches` already
+		// re-batched: a coordinator that threw has retries in the tree that carry the chain
+		// on with it excluded, and they are judged here in its place. Asking it again —
+		// after a fresh backoff wait, under the outstanding floor a whole request deadline
+		// when this node coordinates — would only add a request and latency. Skipping it also
+		// leaves the retried batches covering disjoint blocks, so no block is asked twice.
 		// NOTE: a 'cohort-unreachable' entry earns this retry like any other flagged entry,
 		// and on a genuinely isolated node the retry re-picks the same node (the
 		// findCoordinator:all-excluded path) and repeats the same futile consult. Fine
 		// today — one extra bounded consult on an already failing read. If isolated-node
 		// read latency ever matters, skip the retry for that reason rather than widening
-		// what settles a block.
+		// isAuthoritative.
 		// This is ONE extra round, not a loop: a below-floor answer that every reachable
 		// coordinator repeats survives the merge below as the highest revision anyone
 		// served, UNFLAGGED. Deliberate — a log entry is not proof its blocks landed, so a
@@ -292,19 +293,21 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// the below-floor content is the correct content and every machine agrees on it
 		// (see the accepted-tradeoff NOTE at `TransactorSource.mayRetain`). The reader
 		// judges it again and returns it uncached.
-		const retryable = triedBatches.filter(b => b.payload.some(bid => !settled.has(bid)));
+		const retryable = Array.from(allBatches(batches)).filter(b => !b.rebatched && !isAuthoritative(b));
 
 		if (retryable.length > 0 && Date.now() < expiration) {
 			log('get:retry retryable=%d', retryable.length);
-			// Fan out the per-batch retries concurrently. Each root batch builds its own
-			// excluded-peer set and attaches its own `subsumedBy`, so the retry rounds are
-			// independent per root and safe to run in parallel.
+			// Fan out the per-batch retries concurrently. Each retried batch builds its own
+			// excluded-peer set and attaches its own `subsumedBy`, and retried batches cover
+			// disjoint blocks (above), so the retry rounds are independent and safe to run in parallel.
 			// Only a batch with NO valid response (its request threw or timed out) waits before its
 			// retry: its frames are likely still in this node's send queue to that peer, and a retry
-			// sent at once would queue behind them. A batch that got a response which was not
-			// authoritative (an entry `unavailable`, `unconfirmedAheadRev`, below its floor, or
-			// missing) retries at once — its predecessor is out of the queue, so waiting would add
-			// latency and buy nothing. That narrows "wait before each retry" deliberately.
+			// sent at once would queue behind them. Such a batch reaches this round only when
+			// `processBatches` did not re-batch it: its retry lookup threw, or its wait did not fit
+			// the budget. A batch that got a response which was not authoritative (an entry
+			// `unavailable`, `unconfirmedAheadRev`, below its floor, or missing) retries at once —
+			// its predecessor is out of the queue, so waiting would add latency and buy nothing.
+			// That narrows "wait before each retry" deliberately.
 			const retryOutcomes = await Promise.allSettled(retryable.map(async b => {
 				const excluded = new Set<PeerId>([b.peerId, ...((b.excludedPeers ?? []) as PeerId[])]);
 				const retries = await createBatchesForPayload<BlockId[], GetBlockResults>(

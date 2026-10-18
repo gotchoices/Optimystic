@@ -45,6 +45,11 @@ export type RetryAttempt = {
 export function retryWaitMs(backoff: RetryBackoff, retry: RetryAttempt): number {
 	if (!(backoff.baseMs > 0)) return 0;
 	const doubled = backoff.baseMs * 2 ** Math.max(0, retry.attempt - 1);
+	// NOTE: the floor is as large as the failure was slow — a request that ran out a whole RPC dial
+	// deadline (33 s at a declared 3 s round trip, of a 132 s transaction budget) holds a retry this
+	// node coordinates back that long. `retryWaitWithinBudget` keeps the wait inside the budget, not
+	// small within it. If field logs show `retry ... waitMs` near the dial deadline costing operations
+	// their answer, cap the floor at a few round trips rather than dropping it.
 	return sendsThroughFailedPeersQueue(backoff, retry) ? Math.max(doubled, retry.outstandingMs) : doubled;
 }
 
@@ -94,6 +99,12 @@ export type CoordinatorBatch<TPayload, TResponse> = {
 	coordinatingBlockIds?: BlockId[];
 	/** How long this batch's request was outstanding before it failed, ms — set by {@link processBatches} on failure only. */
 	outstandingMs?: number;
+	/**
+	 * Set by {@link processBatches} when it re-batched this batch's failure onto other coordinators. The
+	 * retries sit in the ROOT batch's `subsumedBy` (not this one's) and carry this batch's peer in their
+	 * `excludedPeers`, so the chain has already moved past it.
+	 */
+	rebatched?: true;
 }
 
 /**
@@ -209,6 +220,7 @@ export async function processBatches<TPayload, TResponse>(
             excludedPeers,
             findCoordinator
         );
+        if (retries.length === 0) return;
         const waitMs = retryWaitWithinBudget(backoff, {
             attempt: excludedPeers.length,
             failedPeer: batch.peerId,
@@ -218,13 +230,13 @@ export async function processBatches<TPayload, TResponse>(
         if (waitMs === undefined) return;
         log('retry peer=%s excluded=%d waitMs=%d outstandingMs=%d', batch.peerId.toString(), excludedPeers.length, waitMs, outstandingMs);
         if (waitMs > 0) await retrySleep(backoff)(waitMs);
-        if (retries.length > 0 && expiration > Date.now()) {
-            const root = rootOf.get(batch) ?? batch;
-            root.subsumedBy = [...(root.subsumedBy ?? []), ...retries];
-            for (const r of retries) rootOf.set(r, root);
-            // Process retries, but ensure further failures also attach to the same root
-            await processSet(retries);
-        }
+        if (expiration <= Date.now()) return;
+        const root = rootOf.get(batch) ?? batch;
+        root.subsumedBy = [...(root.subsumedBy ?? []), ...retries];
+        for (const r of retries) rootOf.set(r, root);
+        batch.rebatched = true;
+        // Process retries, but ensure further failures also attach to the same root
+        await processSet(retries);
     };
 
     // Process a set of batches concurrently and enqueue retries flatly onto the root's subsumedBy list
