@@ -4,9 +4,10 @@
  * A consult for a held block that a silent cohort peer left unarmed is not re-sent on the very next
  * read: the block is held for one declared link round trip, doubling per consecutive silent consult
  * up to the reconcile pass bound, and released as soon as a silent peer answers anything
- * (`SilentConsultHolds`). These specs pin the three rules that make that true: a base of 0 keeps
- * today's re-ask-at-once behaviour, the hold doubles to its cap while carrying the same doubt marker a
- * read always carried, and an answer about another block releases it.
+ * (`SilentConsultHolds`). These specs pin the two rules that make that true: the hold doubles to its
+ * cap while carrying the same doubt marker a read always carried, and an answer about another block
+ * releases it. That a base of 0 keeps today's re-ask-at-once behaviour is pinned by "a silent partner
+ * never arms" in coordinator-repo-small-cohort-arming.spec.ts, which runs at the default base.
  */
 
 import { expect } from 'chai';
@@ -105,19 +106,6 @@ const heldMs = (captured: unknown[][]): number[] => captured
 	.map(args => (args[1] as { holdMs: number }).holdMs);
 
 describe('CoordinatorRepo silent-consult backoff', () => {
-
-	it('a base of 0 re-asks on the next read, as before', async () => {
-		const { repo, partners, askedOf, setClock } = await makeRepo(['silent'], {});
-
-		const captured = await captureLog('coordinator-repo', async () => {
-			await repo.get({ blockIds: [BLOCK_X] });
-			setClock(BASE_TIME + 1);
-			await repo.get({ blockIds: [BLOCK_X] });
-		});
-
-		expect(askedOf(partners[0]!), 'every read consults').to.equal(2);
-		expect(heldMs(captured), 'no hold is placed').to.deep.equal([]);
-	});
 
 	it('holds for one base, doubling per silent consult up to the reconcile pass bound, and the held read keeps its doubt', async () => {
 		// Partner A claims rev 5, which one voter cannot corroborate; B is silent. So each consult leaves

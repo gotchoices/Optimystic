@@ -1495,7 +1495,7 @@ export async function createLibp2pNodeBase(
 			{
 				// clusterSize is now part of consensusConfig (member + coordinator share one reference).
 				...consensusConfig,
-				// The coordinator's alone: the first hold after a read-repair consult a silent peer left unarmed.
+				// Read by the coordinator only: its first hold after a read-repair consult a silent peer left unarmed.
 				retryBackoffBaseMs: linkDeadlines.retryBackoffBaseMs
 			},
 			fretSvc,
