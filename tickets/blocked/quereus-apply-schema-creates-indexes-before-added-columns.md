@@ -4,7 +4,7 @@ files: ../quereus/packages/quereus/src/schema/schema-differ.ts (`generateMigrati
 difficulty: easy
 ----
 
-**Blocked: a dependency outside this repository.** Unblocks when a Quereus release orders `apply schema`'s index creates after its per-table alter block, and this repository's `@quereus/quereus` dependency is moved to it. Quereus is maintained alongside this repository, so a maintainer can make the upstream change.
+**Blocked: a dependency outside this repository.** Unblocks when a Quereus release orders `apply schema`'s index creates after its per-table alter block, and this repository's `@quereus/quereus` dependency is moved to it. Quereus is maintained alongside this repository, so a maintainer can make the upstream change. Filed there as `../quereus/tickets/fix/apply-schema-creates-indexes-before-added-columns.md` (quereus f595c9fa8, 2026-10-18), reproduced on the memory module at Quereus 4.20.2 with "Column 'b' not found in table 't'".
 
 # Quereus apply schema creates indexes before the columns it adds
 
