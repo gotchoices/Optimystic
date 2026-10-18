@@ -259,6 +259,77 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]!.unavailable).to.equal(undefined)
     })
 
+    // Ticket coordinator-and-read-retries-back-off: a batch whose request threw is likely still in
+    // this node's send queue to that peer, so its retry waits; a batch that ANSWERED is out of the
+    // queue, so its retry goes at once. Each wait is distinguishable by its length: one base for a
+    // chain that has tried one coordinator, two for one that has tried two.
+    it('in the second-chance round, a batch that threw waits and one answered unavailable does not', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B', 'peer-C'])
+      const blockId = 'slow-block' as BlockId
+      const sleeps: number[] = []
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
+        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+          const res: GetBlockResults = {}
+          for (const bid of blockIds) res[bid] = { state: {}, unavailable: 'peers-unreachable' }
+          return res
+        }),
+        'peer-C': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+          const res: GetBlockResults = {}
+          for (const bid of blockIds) res[bid] = { state: {} }
+          return res
+        }),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // A threw: `processBatches` re-batched it onto B after one base (100). In the round, A —
+      // still with no response — waits one base again before B; B, which answered, goes on to C
+      // at once (it would have waited two bases, having tried A and B).
+      expect(sleeps).to.deep.equal([100, 100])
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    it('does not ask again in the second-chance round about blocks a retried coordinator already settled', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'settled-block' as BlockId
+      const sleeps: number[] = []
+      let bGets = 0
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
+        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+          bGets++
+          const res: GetBlockResults = {}
+          for (const bid of blockIds) res[bid] = { state: {} }
+          return res
+        }),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      await networkTransactor.get({ blockIds: [blockId] })
+
+      // `processBatches`' own retry reached B, which answered authoritatively; the round leaves A alone.
+      expect(sleeps).to.deep.equal([100])
+      expect(bGets).to.equal(1)
+    })
+
     it('carries the unavailable flag through when every consulted peer is indeterminate', async () => {
       const peerA = 'peer-A'
       const peerB = 'peer-B'

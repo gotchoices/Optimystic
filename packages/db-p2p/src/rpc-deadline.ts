@@ -151,6 +151,14 @@ export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
 	 * start-up bootstrap dial, plus identify on the opened connection.
 	 */
 	bootstrapContactTimeoutMs: number;
+	/**
+	 * A host's `NetworkTransactorInit.retryBackoffBaseMs`: the first wait before a retry of a request
+	 * that went unanswered, doubling for each further coordinator tried. Exactly the declared round
+	 * trip, and 0 — no wait, every retry at once — when none is declared, with no floor: a node on the
+	 * LAN deadlines sends a retry over a link whose queue does not hold its predecessor back. The node
+	 * itself applies it nowhere, and `rpcDeadlines` does not move it.
+	 */
+	retryBackoffBaseMs: number;
 };
 
 /**
@@ -194,6 +202,8 @@ export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
  *   its 1000.
  * - dead connection: the dial deadline itself, the bound already placed on one connection open plus
  *   negotiation; it follows an explicit `rpcDeadlines.dialTimeoutMs` as the transfer budget does.
+ * - retry backoff base: one round trip, the time a retry waits so it stops lengthening the send queue
+ *   its predecessor is still in; the one value with no floor, 0 when undeclared (no wait).
  */
 const CONNECTION_ROUND_TRIPS = 10;
 const DIAL_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 1;
@@ -274,6 +284,7 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number, rpcDeadlines?: Pa
 		bootstrapContactTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, BOOTSTRAP_CONTACT_ROUND_TRIPS * roundTripMs),
 		hedgeDelayMs: Math.max(DEFAULT_STREAM_HEDGE_DELAY_MS, STREAM_HEDGE_ROUND_TRIPS * roundTripMs),
 		deadConnectionDelayMs: dialTimeoutMs,
+		retryBackoffBaseMs: roundTripMs,
 	};
 }
 

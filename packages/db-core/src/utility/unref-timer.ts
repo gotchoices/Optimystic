@@ -13,3 +13,8 @@ export function armUnrefTimer(fn: () => void, ms: number): () => void {
 	const handle = unrefTimer(setTimeout(fn, ms));
 	return (): void => clearTimeout(handle);
 }
+
+/** Resolve after `ms` on a timer that never holds a process open. The default behind the injectable `sleep` seams. */
+export function unrefDelay(ms: number): Promise<void> {
+	return new Promise<void>(resolve => { armUnrefTimer(resolve, ms); });
+}

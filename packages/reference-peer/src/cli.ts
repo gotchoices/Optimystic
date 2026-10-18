@@ -501,6 +501,9 @@ class PeerSession {
 				// within the overall budget instead of one stuck peer monopolizing
 				// it. The node's own derived value, so it follows its link declaration.
 				dialTimeoutMs: node.linkDeadlines.dialTimeoutMs,
+				// A retry waits one declared round trip, doubling, so it does not queue behind the
+				// request it replaces; no wait on an undeclared link.
+				retryBackoffBaseMs: node.linkDeadlines.retryBackoffBaseMs,
 				keyNetwork,
 				getRepo: (peerId) => {
 					return peerId.toString() === node.peerId.toString()

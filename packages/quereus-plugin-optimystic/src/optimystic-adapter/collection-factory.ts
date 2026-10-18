@@ -343,7 +343,7 @@ export class CollectionFactory {
     // The node's own derived deadlines, so a declared link round trip reaches every repo dial and
     // the budget around them. A node a host injected without building it through `createLibp2pNode`
     // carries none; it gets the undeclared ones.
-    const { dialTimeoutMs, transactionTimeoutMs } = node.linkDeadlines ?? resolveLinkDeadlines();
+    const { dialTimeoutMs, transactionTimeoutMs, retryBackoffBaseMs } = node.linkDeadlines ?? resolveLinkDeadlines();
 
     return new NetworkTransactor({
       // Four dial deadlines (30 s when undeclared): a dial to a dead coordinator that runs out its
@@ -366,6 +366,8 @@ export class CollectionFactory {
       // give this budget its own number of round trips.
       abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
       dialTimeoutMs,
+      // One declared round trip before a retry, doubling; 0 (no wait) on an undeclared link.
+      retryBackoffBaseMs,
       keyNetwork,
       getRepo,
       localChangeNotifier: blockChangeNotifier,

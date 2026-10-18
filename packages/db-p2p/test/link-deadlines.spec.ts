@@ -22,6 +22,8 @@ const UNDECLARED: LinkDeadlines = {
 	bootstrapContactTimeoutMs: 10_000,
 	hedgeDelayMs: 250,
 	deadConnectionDelayMs: 3000,
+	// No floor: a node that declared no round trip sends every retry at once.
+	retryBackoffBaseMs: 0,
 };
 
 describe('resolveLinkDeadlines', () => {
@@ -29,9 +31,9 @@ describe('resolveLinkDeadlines', () => {
 		expect(resolveLinkDeadlines()).to.deep.equal(UNDECLARED);
 	});
 
-	it('a round trip fast enough that no multiple exceeds its floor changes nothing', () => {
+	it('a round trip fast enough that no multiple exceeds its floor changes no deadline, and is the retry backoff base itself', () => {
 		// 100 ms: eleven round trips stay under the 3 s dial floor, and one and a half under the 250 ms hedge floor.
-		expect(resolveLinkDeadlines(100)).to.deep.equal(UNDECLARED);
+		expect(resolveLinkDeadlines(100)).to.deep.equal({ ...UNDECLARED, retryBackoffBaseMs: 100 });
 	});
 
 	it('a 3 s round trip scales each deadline by its own number of round trips', () => {
@@ -55,6 +57,8 @@ describe('resolveLinkDeadlines', () => {
 			hedgeDelayMs: 4500,
 			// The dial deadline: one connection open plus negotiation is already the bound on a dead connection.
 			deadConnectionDelayMs: 33_000,
+			// One round trip before a retry, doubling per further coordinator.
+			retryBackoffBaseMs: 3000,
 		});
 	});
 

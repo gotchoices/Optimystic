@@ -15,7 +15,7 @@ import { Log } from "../log/log.js";
 import { groupBy } from "../utility/groupby.js";
 import { routingKeyForBlock } from "../network/routing-key.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
-import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
+import { type CoordinatorBatch, type RetryBackoff, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload, retryWaitWithinBudget, retrySleep } from "../utility/batch-coordinator.js";
 import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
 import { OwedCancels, type OwedCancelClock } from "./owed-cancels.js";
 import { createLogger, verbose } from "../logger.js";
@@ -56,6 +56,18 @@ type NetworkTransactorInit = {
 	 */
 	localPeerId?: PeerId;
 	/**
+	 * The first wait, in ms, before a retry of a request that went unanswered: one declared link round
+	 * trip (`LinkDeadlines.retryBackoffBaseMs` on a db-p2p node), doubling for each further coordinator
+	 * the retry's chain tries, and never less than the failed request was outstanding when the retry
+	 * goes out through this node's own send queue to the same peer (`retryWaitMs` in
+	 * `utility/batch-coordinator.ts`). A request given up on at a deadline is usually still in that
+	 * queue, so a retry sent at once only lengthens it. Omit, or pass 0, on a node that declared no round
+	 * trip: every retry then goes out at once, as before the wait existed.
+	 */
+	retryBackoffBaseMs?: number;
+	/** Test seam for the retry waits; omit in production (an unref'd `setTimeout`). */
+	retrySleep?: (ms: number) => Promise<void>;
+	/**
 	 * Time for the re-sends of cancels this transactor could not discharge ({@link OwedCancels}).
 	 * Omit in production (`Date.now` and an unref'd `setTimeout`); a test injects a fake to fire the
 	 * re-send without waiting on the wall clock.
@@ -81,6 +93,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly localChangeNotifier: IBlockChangeNotifier | undefined;
 	/** `NetworkTransactorInit.localPeerId` as a string, the form cohort peer ids arrive in. */
 	private readonly localPeerId: string | undefined;
+	/** The pace of every retry this transactor sends: each {@link processBatches} call, and {@link get}'s retry round. */
+	private readonly retryBackoff: RetryBackoff;
 
 	/**
 	 * Per-transaction coordinator cache: `actionId → (blockId → resolved coordinator)`.
@@ -122,6 +136,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		this.getRepo = init.getRepo;
 		this.localChangeNotifier = init.localChangeNotifier;
 		this.localPeerId = init.localPeerId?.toString();
+		this.retryBackoff = { baseMs: init.retryBackoffBaseMs ?? 0, localPeerId: init.localPeerId, sleep: init.retrySleep };
 		this.owedCancels = new OwedCancels({
 			attempt: actionRef => this.resendOwedCancel(actionRef),
 			clock: init.owedCancelClock
@@ -193,7 +208,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
-				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' }),
+				this.retryBackoff
 			);
 		} catch (e) {
 			error = e as Error;
@@ -238,33 +254,37 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			return true;
 		};
 
-		// A batch is answered when its response carries an entry for EVERY requested
-		// block id and none of those entries carries a doubt marker or falls below the
-		// caller's floor. An entry present with only `state` (no `block`) is an
-		// authoritative "absent", which counts as answered — not a gap. An `unavailable`
-		// entry is the peer saying it could not find out whether the block EXISTS; an
-		// `unconfirmedAheadRev` entry is the peer saying it could not confirm the content
-		// it served is CURRENT (a cohort claim sits ahead of it, unsettled); a below-floor
-		// entry is the CALLER knowing the content is behind a revision it has already seen
-		// the log commit. None counts as answered, so each earns the second-chance retry
-		// against a different coordinator.
-		const isAuthoritative = (b: CoordinatorBatch<BlockId[], GetBlockResults>) => {
-			if (!hasValidResponse(b)) return false;
+		// A block is settled by a batch whose response carries an entry for it that carries
+		// no doubt marker and does not fall below the caller's floor. An entry present with
+		// only `state` (no `block`) is an authoritative "absent", which settles the block —
+		// not a gap. An `unavailable` entry is the peer saying it could not find out whether
+		// the block EXISTS; an `unconfirmedAheadRev` entry is the peer saying it could not
+		// confirm the content it served is CURRENT (a cohort claim sits ahead of it,
+		// unsettled); a below-floor entry is the CALLER knowing the content is behind a
+		// revision it has already seen the log commit. None settles the block, so each earns
+		// the second-chance retry against a different coordinator.
+		const settledBy = (b: CoordinatorBatch<BlockId[], GetBlockResults>): BlockId[] => {
+			if (!hasValidResponse(b)) return [];
 			const resp = b.request!.response! as GetBlockResults;
-			return b.payload.every(bid => resp[bid] !== undefined
+			return b.payload.filter(bid => resp[bid] !== undefined
 				&& resp[bid]!.unavailable === undefined
 				&& resp[bid]!.unconfirmedAheadRev === undefined
 				&& !belowFloor(bid, resp[bid]!));
 		};
+		const triedBatches = Array.from(allBatches(batches)) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+		const settled = new Set(triedBatches.flatMap(settledBy));
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
-		// absent answer is not retried.
+		// absent answer is not retried. Neither is a batch whose every block some OTHER
+		// batch settled: a first coordinator that threw was already re-batched by
+		// `processBatches`, and when that retry answered, asking again — after a fresh
+		// backoff wait — would only add a request and latency to a read that has its answer.
 		// NOTE: a 'cohort-unreachable' entry earns this retry like any other flagged entry,
 		// and on a genuinely isolated node the retry re-picks the same node (the
 		// findCoordinator:all-excluded path) and repeats the same futile consult. Fine
 		// today — one extra bounded consult on an already failing read. If isolated-node
 		// read latency ever matters, skip the retry for that reason rather than widening
-		// isAuthoritative.
+		// what settles a block.
 		// This is ONE extra round, not a loop: a below-floor answer that every reachable
 		// coordinator repeats survives the merge below as the highest revision anyone
 		// served, UNFLAGGED. Deliberate — a log entry is not proof its blocks landed, so a
@@ -272,15 +292,19 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// the below-floor content is the correct content and every machine agrees on it
 		// (see the accepted-tradeoff NOTE at `TransactorSource.mayRetain`). The reader
 		// judges it again and returns it uncached.
-		const retryable = Array.from(allBatches(batches)).filter(b =>
-			!isAuthoritative(b as any)
-		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+		const retryable = triedBatches.filter(b => b.payload.some(bid => !settled.has(bid)));
 
 		if (retryable.length > 0 && Date.now() < expiration) {
 			log('get:retry retryable=%d', retryable.length);
 			// Fan out the per-batch retries concurrently. Each root batch builds its own
 			// excluded-peer set and attaches its own `subsumedBy`, so the retry rounds are
 			// independent per root and safe to run in parallel.
+			// Only a batch with NO valid response (its request threw or timed out) waits before its
+			// retry: its frames are likely still in this node's send queue to that peer, and a retry
+			// sent at once would queue behind them. A batch that got a response which was not
+			// authoritative (an entry `unavailable`, `unconfirmedAheadRev`, below its floor, or
+			// missing) retries at once — its predecessor is out of the queue, so waiting would add
+			// latency and buy nothing. That narrows "wait before each retry" deliberately.
 			const retryOutcomes = await Promise.allSettled(retryable.map(async b => {
 				const excluded = new Set<PeerId>([b.peerId, ...((b.excludedPeers ?? []) as PeerId[])]);
 				const retries = await createBatchesForPayload<BlockId[], GetBlockResults>(
@@ -290,7 +314,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					Array.from(excluded),
 					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
 				);
-				if (retries.length > 0) {
+				if (retries.length > 0 && (hasValidResponse(b) || await this.waitedForReadRetry(b, excluded.size, retries, expiration))) {
 					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
 					await processBatches(
 						retries,
@@ -298,7 +322,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 						expiration,
-						(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
+						(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' }),
+						this.retryBackoff
 					);
 				}
 			}));
@@ -414,6 +439,27 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 
 		log('get:done blockIds=%d ms=%d', distinctBlockIds.length, Date.now() - t0);
 		return Object.fromEntries(resultEntries) as GetBlockResults;
+	}
+
+	/**
+	 * Waits out the backoff before {@link get}'s second-chance round re-sends `failed` — a batch with no
+	 * valid response — to `retries`, whose chain has tried `attempt` coordinators. False when the wait
+	 * would reach `expiration`: the retry is then not sent, and the batch keeps its own failure.
+	 */
+	private async waitedForReadRetry(
+		failed: CoordinatorBatch<BlockId[], GetBlockResults>,
+		attempt: number,
+		retries: CoordinatorBatch<BlockId[], GetBlockResults>[],
+		expiration: number
+	): Promise<boolean> {
+		const outstandingMs = failed.outstandingMs ?? 0;
+		const waitMs = retryWaitWithinBudget(this.retryBackoff, { attempt, failedPeer: failed.peerId, outstandingMs, retryPeers: retries.map(r => r.peerId) }, expiration);
+		if (waitMs === undefined) return false;
+		if (waitMs > 0) {
+			log('get:retry-wait peer=%s excluded=%d waitMs=%d outstandingMs=%d', failed.peerId.toString(), attempt, waitMs, outstandingMs);
+			await retrySleep(this.retryBackoff)(waitMs);
+		}
+		return true;
 	}
 
 	async getStatus(blockActions: ActionBlocks[]): Promise<BlockActionStatus[]> {
@@ -716,7 +762,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
 				expiration,
-				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options),
+				this.retryBackoff
 			);
 			// Cache resolved coordinators for follow-up commit to hit the same peers
 			try {
@@ -1150,7 +1197,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
-				async (blockId, options) => this.resolveCoordinator(blockId, options, actionId)
+				async (blockId, options) => this.resolveCoordinator(blockId, options, actionId),
+				this.retryBackoff
 			);
 		} catch (e) {
 			error = e as Error;
@@ -1405,7 +1453,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				mergeBlocks,
 				deadline,
-				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options),
+				this.retryBackoff
 			);
 		} catch (e) {
 			error = asError(e);
