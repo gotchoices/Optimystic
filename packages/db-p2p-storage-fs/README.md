@@ -73,7 +73,8 @@ top-level names do not collide: block data lives under `<blockId>/`
 subdirectories, while KV data lives under directories named by the first
 segment of each key (a `/`-separated key becomes nested subdirectories — e.g.
 `coordinator/key1` → `coordinator/key1.json`). Sharing is safe only as long as
-no block id equals a KV key's first segment; give them separate `basePath`s if
+no block id's first segment (a block id containing `/` nests the same way)
+equals a KV key's first segment; give them separate `basePath`s if
 you cannot guarantee that. The KV keys the node itself writes all start with a
 fixed literal segment (`under-replicated/`, `coordinator/`, `participant/`,
 `executed/` — db-p2p's `NODE_KV_NAMESPACES`), and `FileRawStorage.listBlockIds`

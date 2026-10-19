@@ -59,9 +59,10 @@ const PROOFS_DIR = 'proofs';
  * The directories a block keeps its own records in, skipped when the block listing walks below a
  * block directory (a block's directory can hold another block's: `.../Ledger/index/LedgerLatest`
  * sits inside `.../Ledger/`).
- * NOTE: a block whose id's last segment is one of these (`x/revs`) shares its directory with block
- * `x`'s own store on write — a limit of the raw-id layout, not of the listing; if such ids ever
- * occur, encode block-id segments in the layout.
+ * NOTE: a block id that extends another block's id with one of these segments (`x/revs`,
+ * `x/blocks/y`) lands inside block `x`'s own store directory — on write `x/revs` shares it outright,
+ * and the listing never yields either id. A limit of the raw-id layout; if such ids ever occur,
+ * encode block-id segments in the layout.
  */
 const BLOCK_STORE_DIRS: ReadonlySet<string> = new Set([...Object.values(ACTION_SCOPED_DIRS), REVISIONS_DIR, PROOFS_DIR]);
 
