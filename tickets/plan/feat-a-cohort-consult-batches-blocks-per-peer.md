@@ -26,3 +26,13 @@ The consults that still block a read are: a block this machine does not hold, a 
 A sync request that names several block ids and returns one answer per block (a new field or a new protocol version, with an older peer answering only the single-block form), a per-peer grouping step in front of the per-block passes in `CoordinatorRepo.get` that still lets one block's failure or silence flag only that block (the three-way contract of `ClusterLatestCallback`: claim, "holds nothing", silence), and the per-peer deadline (`cohortQueryTimeoutMs`) applied to the batch.
 
 Re-measure with the reporter's `classic-level-driver.mjs` after the stream-reuse ticket lands before promoting this.
+
+## Promoted 2026-10-19: GitHub #43
+
+GitHub [#43](https://github.com/gotchoices/Optimystic/issues/43) is the re-measure asked for above, from the idle side rather than the read-latency side: with a second cohort member, nearly every read of a held block past `readRepairWindowMs` becomes a background `sync` request, about 0.9 per `NetworkTransactor.get`. sereus's `message-cost-accounting` scenario (2026-10-19, `f22a8cb7`) counted 103–134 `sync` requests a minute between two idle machines of one party, and gotchoices/sereus#50's comment ~8 inbound requests a minute per strand on a Galaxy S7. The request count is now the cost that matters, on phones in particular. sereus is cutting its own idle reads (change-driven pollers), but app reads keep paying it.
+
+#43 adds two arms on the same consult path; plan them with this one, splitting into separate implement tickets if they land separately:
+
+1. **Per peer, not per block** (this ticket's original subject).
+2. **A revision-only consult.** Ask for (revision, action id, proof) and fetch bytes only when the peer is ahead. Today the answer is the full archive, with the block serialized twice (`block-archive.ts`: in `action.transform.insert` and in `block`), and most background consults on a quiet cohort answer "current".
+3. **Freshness from received commits.** `lastSeenCommitMs` is set only inside `CoordinatorRepo` (own coordinated commits, consult exits). A commit this node took part in as a cohort member, or a certified pushed block, leaves the block stale, so the next read of every block the other member wrote is a consult. Stamping on those writes is also where `debt-freshness-state-scattered-across-coordinator-repo` bites; read it first, and keep the absence-memo lesson in the comment above `readRepairBlock` (a memo must be cleared by every writer of local storage).
