@@ -9,6 +9,9 @@ RESUME: A prior agent run on this ticket did not complete.
 Read the log to see what was done. Resume where it left off.
 If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
 <!-- /resume-note -->
+<!-- gardener-note -->
+GARDENER (2026-10-19): the log named above is attempt 2, which was silent from its start (no tool call before the idle kill). The research is in attempt 1's log, `tickets/.logs/a-cold-read-reuses-the-consults-archives.implement.2026-10-19T17-21-50-735Z.log`, read it first rather than re-reading every file. Attempt 1 read code and tests for ~38 min, then went silent for 10 min, the same pattern as earlier timeouts where an agent composed one very large output. Write in small steps: one Edit or Write per file, no heredocs, no single edit spanning several files' worth of code, and run tests in the foreground so output keeps the idle timer alive.
+<!-- /gardener-note -->
 # A cold read reuses the consult's archives
 
 GitHub [#39](https://github.com/gotchoices/Optimystic/issues/39), arm 1. Arm 2 (open a collection's log ends once, open a table's trees concurrently) is the separate implement ticket `a-collection-open-reads-its-log-ends-once`; the two are independent.
