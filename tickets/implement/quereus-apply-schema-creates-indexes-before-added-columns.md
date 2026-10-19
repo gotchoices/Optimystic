@@ -4,7 +4,7 @@ files: ../quereus/packages/quereus/src/schema/schema-differ.ts (`generateMigrati
 difficulty: easy
 ----
 
-**Blocked: a dependency outside this repository.** Unblocks when a Quereus release orders `apply schema`'s index creates after its per-table alter block, and this repository's `@quereus/quereus` dependency is moved to it. Quereus is maintained alongside this repository, so a maintainer can make the upstream change. Filed there as `../quereus/tickets/fix/apply-schema-creates-indexes-before-added-columns.md` (quereus f595c9fa8, 2026-10-18), reproduced on the memory module at Quereus 4.20.2 with "Column 'b' not found in table 't'".
+**Was blocked on a dependency outside this repository; unblocked 2026-10-19, see below.** Unblocks when a Quereus release orders `apply schema`'s index creates after its per-table alter block, and this repository's `@quereus/quereus` dependency is moved to it. Quereus is maintained alongside this repository, so a maintainer can make the upstream change. Filed there as `../quereus/tickets/fix/apply-schema-creates-indexes-before-added-columns.md` (quereus f595c9fa8, 2026-10-18), reproduced on the memory module at Quereus 4.20.2 with "Column 'b' not found in table 't'".
 
 # Quereus apply schema creates indexes before the columns it adds
 
@@ -26,6 +26,13 @@ Emit `pushCreates(diff.indexesToCreate, 'index')` after the per-table alter bloc
 - Split index creates into "on existing columns" (early) and "on new columns" (late): more code for no benefit, since nothing in the alter block depends on a new index existing.
 
 Doing nothing leaves the workaround in place; the change is reversible and local to the differ.
+
+## Unblocked (2026-10-19)
+
+Quereus 4.20.3 is on npm (quereus 012c09757) and runs `apply schema`'s index creates after the per-table alter block. The local `../quereus` checkout is at that release; build it there first (`yarn build` in `../quereus`) if the stale-build guard asks.
+
+- Raise every `@quereus/quereus` range from `^4.20.1` to `^4.20.3`: the plugin and crypto plugin `devDependencies` and `peerDependencies` together, and their `engines.quereus`, as `yarn.config.cjs` requires; also `rn-bundle-check` and `upgrade-check`. Then run `yarn install` and `yarn lint:deps`.
+- Add a line to `.release-notes.pending.md` saying the plugins now require Quereus 4.20.3.
 
 ## Work in this repository once unblocked
 
