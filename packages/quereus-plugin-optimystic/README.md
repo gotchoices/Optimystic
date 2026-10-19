@@ -481,7 +481,6 @@ statement re-reads the row and decides again. See
 
   Use a fresh collection URI when re-creating a table whose old rows should not come back
 - A machine that hydrated before another machine changed a table's record, and then touches the table before re-hydrating, writes its own older description of the table back over the record on that first touch (a query, an insert, `create index`, and the check of stored rows Quereus runs for `alter table … add constraint … check`). The `CHECK` and column `ALTER` arms themselves do not touch the table, but in an `apply schema` that re-adds a `CHECK` on such a machine and then fails, this removes the other machine's `CHECK` from the record. Re-applying the schema on any machine that has the newer declaration puts it back
-- In one `apply schema`, Quereus creates a new index before it adds the columns the new version declares, so a version that adds a column together with an index on that column fails with `Column '…' not found` (on every module). Add the column in one version and its index in the next. Dropping an index together with its column works
 - Cross-collection transactions not yet supported
 
 ## Development

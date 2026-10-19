@@ -470,6 +470,27 @@ describe('ALTER TABLE on an Optimystic table', function () {
 				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'c']);
 			});
 
+			it('one version may add a column and an index on it: the index is maintained and both survive a restart', async () => {
+				// Quereus 4.20.3 creates a version's new indexes after its column changes.
+				const store = buildSharedLocalTransactor(new MemoryRawStorage());
+				const { db } = await openSession(store);
+				await db.exec(V1);
+				await db.exec(`insert into t (id, a, c) values (1, 5, 'x')`);
+
+				await db.exec('declare schema main { table t { id integer primary key, a integer null, c text null, b text null } index t_b on t (b) } apply schema main;');
+				await db.exec(`insert into t (id, a, c, b) values (2, 6, 'y', 'two')`);
+				expect(await queryAll(db, `select id from t where b = 'two'`)).to.deep.equal([{ id: 2 }]);
+
+				const restarted = await savedColumns(store);
+				expect(restarted.names).to.deep.equal(['id', 'a', 'c', 'b']);
+				await restarted.db.exec(`insert into t (id, a, c, b) values (3, 7, 'z', 'three')`);
+				expect(await queryAll(restarted.db, `select id from t where b = 'three'`)).to.deep.equal([{ id: 3 }]);
+				for (const report of await restarted.plugin.verifyIndexes(restarted.db, 't')) {
+					expect(report.missing, `${report.index}: no missing entries`).to.deep.equal([]);
+					expect(report.orphaned, `${report.index}: no orphaned entries`).to.deep.equal([]);
+				}
+			});
+
 			it('a second machine adopts a column upgrade already saved: it writes nothing, and its table reads the new columns', async () => {
 				const { store, a, b, bCounts } = await twoMachines();
 				await a.exec(V2);
