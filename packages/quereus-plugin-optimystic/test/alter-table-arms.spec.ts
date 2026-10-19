@@ -485,7 +485,9 @@ describe('ALTER TABLE on an Optimystic table', function () {
 				expect(restarted.names).to.deep.equal(['id', 'a', 'c', 'b']);
 				await restarted.db.exec(`insert into t (id, a, c, b) values (3, 7, 'z', 'three')`);
 				expect(await queryAll(restarted.db, `select id from t where b = 'three'`)).to.deep.equal([{ id: 3 }]);
-				for (const report of await restarted.plugin.verifyIndexes(restarted.db, 't')) {
+				const reports = await restarted.plugin.verifyIndexes(restarted.db, 't');
+				expect(reports.map(report => report.index)).to.include('t_b');
+				for (const report of reports) {
 					expect(report.missing, `${report.index}: no missing entries`).to.deep.equal([]);
 					expect(report.orphaned, `${report.index}: no orphaned entries`).to.deep.equal([]);
 				}
