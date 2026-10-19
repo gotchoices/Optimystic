@@ -139,10 +139,10 @@ export class FileKVStore implements IKVStore {
 		// namespace with FileRawStorage's <blockId>/ dirs. Safe while no block id equals a key's
 		// first segment — the node's keys all start with a fixed word (`under-replicated`,
 		// `coordinator`, `participant`, `executed`) — and if one ever could, give the two stores
-		// separate basePaths (see README Usage). FileRawStorage.listBlockIds also yields only root
-		// directories holding a meta.json, so a KV directory such as the under-replication ledger's
-		// `under-replicated/` is never enumerated as a block. Its bytes do count toward
-		// FileRawStorage.getApproximateBytesUsed.
+		// separate basePaths (see README Usage). FileRawStorage.listBlockIds walks the tree but skips
+		// these root namespaces (db-p2p's NODE_KV_NAMESPACES — a new namespace must be added there),
+		// so a KV key whose last segment is `meta` is never enumerated as a block. Their bytes do
+		// count toward FileRawStorage.getApproximateBytesUsed.
 		return path.join(this.basePath, ...key.split('/')) + '.json';
 	}
 }

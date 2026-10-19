@@ -500,6 +500,21 @@ export function runRawStorageConformance(
 			}
 		});
 
+		it('listBlockIds yields block ids containing `/`, including a block nested inside another', async function () {
+			const listBlockIds = storage.listBlockIds;
+			if (typeof listBlockIds !== 'function') {
+				this.skip();
+			} else {
+				// The shapes every named block takes: a table header, an index header whose id extends the
+				// table's, and the schema catalog.
+				const ids = ['default/app/Ledger', 'default/app/Ledger/index/LedgerLatest', 'optimystic/schema'];
+				for (const id of ids) {
+					await storage.saveMetadata(id as BlockId, { ranges: [], latest: undefined });
+				}
+				expect(new Set(await collect(listBlockIds.call(storage)))).to.deep.equal(new Set(ids));
+			}
+		});
+
 		it('listBlockIds yields nothing for an empty store', async function () {
 			const listBlockIds = storage.listBlockIds;
 			if (typeof listBlockIds !== 'function') {

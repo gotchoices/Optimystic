@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
 import type { BlockId, ActionId } from '@optimystic/db-core';
-import type { BatchBackend, BatchEntry, CommittedBatch, SinkCommitOptions, StoreDurability, StoreIdentity, StoreKey } from '@optimystic/db-p2p';
+import { NODE_KV_NAMESPACES, type BatchBackend, type BatchEntry, type CommittedBatch, type SinkCommitOptions, type StoreDurability, type StoreIdentity, type StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
@@ -50,6 +50,28 @@ const ACTION_SCOPED_DIRS: Record<ActionScopedStore, string> = {
 	transactions: 'actions',
 	materialized: 'blocks',
 };
+
+const METADATA_FILE = 'meta.json';
+const REVISIONS_DIR = 'revs';
+const PROOFS_DIR = 'proofs';
+
+/**
+ * The directories a block keeps its own records in, skipped when the block listing walks below a
+ * block directory (a block's directory can hold another block's: `.../Ledger/index/LedgerLatest`
+ * sits inside `.../Ledger/`).
+ * NOTE: a block whose id's last segment is one of these (`x/revs`) shares its directory with block
+ * `x`'s own store on write — a limit of the raw-id layout, not of the listing; if such ids ever
+ * occur, encode block-id segments in the layout.
+ */
+const BLOCK_STORE_DIRS: ReadonlySet<string> = new Set([...Object.values(ACTION_SCOPED_DIRS), REVISIONS_DIR, PROOFS_DIR]);
+
+/**
+ * The node's KV namespaces, which `FileKVStore` writes at the root when it shares this base path.
+ * Skipped by the listing so a KV key whose last segment is `meta` (stored as `meta.json`) is not
+ * read as a block, and so a startup scan does not walk `executed/`. A block id starting with one of
+ * these words already collides with the KV store on write (see `FileKVStore.keyToPath`).
+ */
+const ROOT_KV_NAMESPACES: ReadonlySet<string> = new Set(NODE_KV_NAMESPACES);
 
 /**
  * Filesystem {@link BatchBackend}: the six logical block-storage stores mapped to six paths under
@@ -178,50 +200,61 @@ export class FileBatchBackend implements BatchBackend {
 
 	async *listBlockIds(): AsyncIterable<BlockId> {
 		await this.open();
-		// The block layout is `basePath/<blockId>/{meta.json,revs/,pend/,actions/,proofs/,blocks/}`
-		// (see blockPath), so the direct children of basePath are the per-block directories and each
-		// directory NAME is the blockId (used raw, no encoding). Filter to directories so a stray file
-		// can't be mistaken for a block: `write-ahead.log` and `store.lock` sit at basePath root and
+		// A block id is used raw as a relative path (see blockPath), so an id containing `/` lives in
+		// nested directories: `default/app/Ledger` is `basePath/default/app/Ledger/meta.json`. So the
+		// listing walks the whole tree and yields every directory holding a meta.json, its path
+		// relative to basePath rebuilt with `/` (never path.sep, so a win32 host yields the id it was
+		// given). Intermediate directories (`default/`, `default/app/`) hold no meta.json: descended,
+		// not listed. Files are never descended, so `write-ahead.log` and `store.lock` at the root
 		// are skipped by that alone.
 		//
-		// A directory alone is NOT sufficient: pending a transform straight through this backend
-		// creates `<blockId>/pend/` — hence a root directory entry — via the apply's recursive mkdir,
-		// without writing meta.json. So we gate on meta.json existence: `meta.json` IS this backend's
-		// metadata store, so gating on it enumerates exactly the same population the metadata-keyed
-		// backends (sqlite/leveldb/indexeddb) get for free. That population is every block with ANY
-		// durable metadata — which on the node path INCLUDES a pend-only block, because
-		// `BlockStorage.savePendingTransaction` seeds metadata for a block that has none before
-		// storing the transform. Do not "improve" this into a committed-revision filter: reading and
-		// parsing every meta.json would turn a cheap access() sweep into a per-block read at startup
-		// (see the `listBlockIds` contract in i-raw-storage.ts). Existence (fs.access), not parse,
-		// matches key-existence semantics: a torn/corrupt meta.json still counts as a key, exactly as
-		// a corrupt value would in the other backends.
+		// Gating on meta.json — existence (fs.access), not parse — enumerates exactly the population
+		// the metadata-keyed backends (sqlite/leveldb/indexeddb) get for free: every block with ANY
+		// durable metadata. That INCLUDES a pend-only block on the node path, because
+		// `BlockStorage.savePendingTransaction` seeds metadata first; a pend straight through this
+		// backend creates `<blockId>/pend/` without meta.json and is not listed. Do not "improve" this
+		// into a committed-revision filter: parsing every meta.json would turn a cheap sweep into a
+		// per-block read at startup (see the `listBlockIds` contract in i-raw-storage.ts). A
+		// torn/corrupt meta.json still counts as a key, exactly as a corrupt value would elsewhere.
 		//
-		// ENOENT (basePath not created yet, or a dir without meta.json) maps to "not owned" — same
-		// discrimination as directoryByteSize. Any OTHER readdir/access error must surface:
-		// swallowing it would make the seed falsely report an empty store and under-protect data
-		// already on disk.
-		// NOTE: reads the whole root listing up front + one meta.json stat per block dir; if a store
-		// ever grows to millions of block subdirs and this becomes a startup-latency problem, page it
-		// (e.g. opendir cursor) — fine at current scale.
-		const entries = await fs.readdir(this.basePath, { withFileTypes: true })
+		// ENOENT (basePath not created yet, or a directory without meta.json) maps to "not there".
+		// Any OTHER readdir/access error surfaces: swallowing it would make the startup seed falsely
+		// report an empty store and under-protect data already on disk.
+		// NOTE: one readdir + one meta.json access per directory on the walk, yielded as it goes; if a
+		// store ever grows to millions of block directories and this becomes a startup-latency
+		// problem, page each listing (e.g. opendir cursor) — fine at current scale.
+		yield* this.walkBlockDirectories([]);
+	}
+
+	private async *walkBlockDirectories(segments: readonly string[]): AsyncIterable<BlockId> {
+		const dir = path.join(this.basePath, ...segments);
+		const isBlock = segments.length > 0 && await this.hasMetadataFile(dir);
+		if (isBlock) yield segments.join('/') as BlockId;
+		for (const name of await this.childDirectoryNames(dir)) {
+			if (isBlock && BLOCK_STORE_DIRS.has(name)) continue;
+			if (segments.length === 0 && ROOT_KV_NAMESPACES.has(name)) continue;
+			yield* this.walkBlockDirectories([...segments, name]);
+		}
+	}
+
+	private async childDirectoryNames(dir: string): Promise<string[]> {
+		const entries = await fs.readdir(dir, { withFileTypes: true })
 			.catch((err) => {
 				if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return [];
-				log('listBlockIds readdir failed for %s - %o', this.basePath, err);
+				log('listBlockIds readdir failed for %s - %o', dir, err);
 				throw err;
 			});
-		for (const entry of entries) {
-			if (!entry.isDirectory()) continue;
-			const blockId = entry.name as BlockId;
-			const hasMeta = await fs.access(this.metadataPath(blockId))
-				.then(() => true)
-				.catch((err) => {
-					if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
-					log('listBlockIds access failed for %s - %o', blockId, err);
-					throw err;
-				});
-			if (hasMeta) yield blockId;
-		}
+		return entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
+	}
+
+	private hasMetadataFile(dir: string): Promise<boolean> {
+		return fs.access(path.join(dir, METADATA_FILE))
+			.then(() => true)
+			.catch((err) => {
+				if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return false;
+				log('listBlockIds access failed for %s - %o', dir, err);
+				throw err;
+			});
 	}
 
 	/** The tree's bytes, the write-ahead log and the lock included: all of it is what the store occupies. */
@@ -286,11 +319,11 @@ export class FileBatchBackend implements BatchBackend {
 	private relativePath(key: StoreKey): string {
 		switch (key.store) {
 			case 'metadata':
-				return `${key.blockId}/meta.json`;
+				return `${key.blockId}/${METADATA_FILE}`;
 			case 'revisions':
-				return `${key.blockId}/revs/${key.rev}.json`;
+				return `${key.blockId}/${REVISIONS_DIR}/${key.rev}.json`;
 			case 'proofs':
-				return `${key.blockId}/proofs/${key.rev}.json`;
+				return `${key.blockId}/${PROOFS_DIR}/${key.rev}.json`;
 			case 'pending':
 			case 'transactions':
 			case 'materialized':
@@ -311,15 +344,15 @@ export class FileBatchBackend implements BatchBackend {
 	}
 
 	private metadataPath(blockId: BlockId): string {
-		return path.join(this.blockPath(blockId), 'meta.json');
+		return path.join(this.blockPath(blockId), METADATA_FILE);
 	}
 
 	private revisionPath(blockId: BlockId, rev: number): string {
-		return path.join(this.blockPath(blockId), 'revs', `${rev}.json`);
+		return path.join(this.blockPath(blockId), REVISIONS_DIR, `${rev}.json`);
 	}
 
 	private proofPath(blockId: BlockId, rev: number): string {
-		return path.join(this.blockPath(blockId), 'proofs', `${rev}.json`);
+		return path.join(this.blockPath(blockId), PROOFS_DIR, `${rev}.json`);
 	}
 
 	private actionScopedPath(store: ActionScopedStore, blockId: BlockId, actionId: ActionId, encoded = true): string {

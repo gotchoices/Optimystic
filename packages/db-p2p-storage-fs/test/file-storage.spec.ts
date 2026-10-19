@@ -344,6 +344,18 @@ describe('FileRawStorage.listBlockIds', () => {
 
 		assert.deepStrictEqual(await collect(storage), new Set(['real-block']));
 	});
+
+	it('does not list a shared KV store key whose last segment is `meta`', async () => {
+		const storage = stores.open(base);
+		const kv = stores.openKv(base);
+		await storage.saveMetadata('default/app/Ledger' as BlockId, meta(1));
+		// The under-replication ledger key for a block id ending in `/meta`: stored as `.../meta.json`.
+		await kv.set('under-replicated/default/app/meta', '{}');
+		await storage.flush();
+		await kv.flush();
+
+		assert.deepStrictEqual(await collect(storage), new Set(['default/app/Ledger']));
+	});
 });
 
 describe('FileKVStore over the write-ahead log', () => {

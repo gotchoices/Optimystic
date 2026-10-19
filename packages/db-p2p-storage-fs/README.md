@@ -75,9 +75,9 @@ segment of each key (a `/`-separated key becomes nested subdirectories — e.g.
 `coordinator/key1` → `coordinator/key1.json`). Sharing is safe only as long as
 no block id equals a KV key's first segment; give them separate `basePath`s if
 you cannot guarantee that. The KV keys the node itself writes all start with a
-fixed literal segment (`under-replicated/` for the ledger), and
-`FileRawStorage.listBlockIds` yields only directories that contain a
-`meta.json`, so a KV directory is never mistaken for a block. KV bytes do count
+fixed literal segment (`under-replicated/`, `coordinator/`, `participant/`,
+`executed/` — db-p2p's `NODE_KV_NAMESPACES`), and `FileRawStorage.listBlockIds`
+skips those root directories, so a KV key is never mistaken for a block. KV bytes do count
 toward `FileRawStorage.getApproximateBytesUsed` when the path is shared. Over
 one `basePath` the two share one log, one lock and one checkpoint.
 
@@ -95,6 +95,9 @@ Without a `kvStore`, the node falls back to an in-memory store and logs a
     actions/<id>.json        — committed Transform
     proofs/<rev>.json        — BlockCommitProof retained for that revision
     blocks/<id>.json         — materialized IBlock snapshot
+  <seg>/<seg>/               — a block id containing "/" (e.g. `default/app/Ledger`) nests one directory per segment
+    meta.json                — and holds the same files as above; it can contain another block's directory
+    index/<seg>/meta.json    —   (e.g. `default/app/Ledger/index/LedgerLatest`)
   <key-segment>/
     <key-segment>.json       — FileKVStore value; key "/" separators become subdirectories
   write-ahead.log            — groups written since the last checkpoint
