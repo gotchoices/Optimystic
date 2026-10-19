@@ -325,15 +325,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// wires up and the log-attach-time lines included — names the instance the same way
 		// post-construction ones do.
 		const instanceTag = Collection.newInstanceTag();
-		const { source, sourceCache, tracker, floors, header } = await Collection.probeHeader(transactor, id, instanceTag);
-		if (!header) {
+		const { source, sourceCache, tracker, floors, ends } = await Collection.probeHeader(transactor, id, instanceTag);
+		if (!ends) {
 			// Return before anything is staged: the tracker's transforms stay empty, so a caller
 			// that ignores the undefined cannot later sync a phantom collection into existence.
 			return undefined;
 		}
-		await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
+		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
 		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
-		collection.logTailId = header.tailId;
+		collection.logTailId = ends.header.tailId;
 		return collection;
 	}
 
@@ -346,10 +346,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	static async createOrOpen<TAction>(transactor: ITransactor, id: CollectionId, init: CollectionInitOptions<TAction>): Promise<Collection<TAction>> {
 		// Pre-construction for the same reason as in open(): see the comment there.
 		const instanceTag = Collection.newInstanceTag();
-		const { source, sourceCache, tracker, floors, header } = await Collection.probeHeader(transactor, id, instanceTag);
+		const { source, sourceCache, tracker, floors, ends } = await Collection.probeHeader(transactor, id, instanceTag);
 
-		if (header) {	// Collection already exists
-			await Collection.attachToLog<TAction>(source, transactor, tracker, id, instanceTag, header);
+		if (ends) {	// Collection already exists
+			await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
 		} else {	// Collection does not exist
 			log('collection:invented id=%s — no committed header found; staging a fresh empty collection', id);
 			const headerBlock = init.createHeaderBlock(id, tracker);
@@ -359,7 +359,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 
 		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
-		collection.logTailId = header?.tailId;
+		collection.logTailId = ends?.header.tailId;
 		return collection;
 	}
 
@@ -383,14 +383,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return tailId === undefined || rev === undefined ? undefined : { tailId, rev };
 	}
 
-	/** The per-instance read wiring every open path needs, plus the header probe result.
-	 * Shared by {@link open} and {@link createOrOpen} so the two cannot drift. */
+	/** The per-instance read wiring every open path needs, plus the collection's log ends — the
+	 * header, then the log tail block it names — read by {@link readLogEnds}, the reader every
+	 * refresh uses. Two requests: the tail id is known only from the header, so an open cannot ask
+	 * for both in one the way a refresh can. `ends` is `undefined` when the header is
+	 * authoritatively absent. Shared by {@link open} and {@link createOrOpen} so the two cannot drift.
+	 *
+	 * The header used to be probed through `source.tryGet`, an unpinned read on a handle with no
+	 * floors yet. That decided nothing {@link readLogEnds} does not decide — `answeredBlock(id, entry,
+	 * undefined)` is the whole of its verdict for such a read, so an unretrievable or doubted header
+	 * throws exactly as it did — except recording the header as a read dependency, which the walk's
+	 * first read of it through the handle's cache now records, at the revision it was served at
+	 * (see {@link attachToLog}). */
 	private static async probeHeader(transactor: ITransactor, id: CollectionId, instanceTag: string): Promise<{
 		source: TransactorSource<IBlock>,
 		sourceCache: CacheSource<IBlock>,
 		tracker: Tracker<IBlock>,
 		floors: BlockFloors,
-		header: CollectionHeaderBlock | undefined,
+		ends: LogEnds | undefined,
 	}> {
 		// Start with a context that has an infinite revision number to ensure that we always fetch the latest log information.
 		// One shared read-dependency collector feeds both the source (direct structural reads) and the cache (every
@@ -400,8 +410,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const source = new TransactorSource(id, transactor, undefined, collector, floors);
 		const sourceCache = new CacheSource(source, undefined, collector);
 		const tracker = new Tracker(sourceCache);
-		const header = await source.tryGet(id) as CollectionHeaderBlock | undefined;
-		return { source, sourceCache, tracker, floors, header };
+		const ends = await Collection.readLogEnds(transactor, id, undefined);
+		return { source, sourceCache, tracker, floors, ends };
 	}
 
 	/** A new handle's floors: none yet (opening walks no entries), wired to report every below-floor
@@ -419,21 +429,27 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Walk an existing collection's log and point the source at its latest action context.
 	 * A header we just probed successfully but whose log will not open is a fault, not an
-	 * absence — throw rather than let the collection read as empty. (The re-read goes through
-	 * the tracker/cache, so it can disagree with the probe when storage is flaky mid-open.) */
+	 * absence — throw rather than let the collection read as empty. (A header {@link keepLogEnds}
+	 * declines to keep is re-read through the tracker/cache, so it can disagree with the probe when
+	 * storage is flaky mid-open.) */
 	private static async attachToLog<TAction>(
 		source: TransactorSource<IBlock>,
-		transactor: ITransactor,
+		sourceCache: CacheSource<IBlock>,
 		tracker: Tracker<IBlock>,
+		floors: BlockFloors,
 		id: CollectionId,
 		/** The tag the calling open path minted for the Collection it is ABOUT to construct, so a
 		 * diagnostic emitted here carries the same instance name as every post-construction one. */
 		instanceTag: string,
-		header: CollectionHeaderBlock,
+		ends: LogEnds,
 	): Promise<void> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
-		Collection.bootstrapContext(source, header.tailId === undefined ? undefined : await Collection.readLogTail(transactor, header.tailId));
+		Collection.bootstrapContext(source, ends.tail);
+		// The walk starts from the header and the tail, which the probe just read: keep them, so the
+		// walk reads neither again. Its first read of each through the cache then records the read
+		// dependency the probe's own read of the header used to.
+		Collection.keepLogEnds(sourceCache, floors, source.actionContext, ends);
 
 		const collectionLog = await Log.open<Action<TAction>>(tracker, id);
 		if (!collectionLog) {
@@ -1063,7 +1079,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			anyConflicts = true;
 		}
 
-		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends.served);
+		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends);
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
@@ -1083,7 +1099,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Forget every block the refresh saw change, floor the ones a log entry names, adopt the
 	 * revision the log is at, and keep what the refresh already read
-	 * ({@link keepWhatTheRefreshRead}) — ONE synchronous step, which must stay free of any `await`.
+	 * ({@link keepLogEnds}) — ONE synchronous step, which must stay free of any `await`.
 	 *
 	 * Reads are not latched, so one can run while a refresh is under way. Forgetting a block while
 	 * this handle still reads at the revision it is LEAVING invites exactly the wrong re-read: the
@@ -1105,7 +1121,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		latest: GetFromResult<Action<TAction>> | undefined,
 		entryRevs: ReadonlyMap<ActionId, number>,
 		revertedBlockIds: BlockId[],
-		served: LogEnds['served'],
+		ends: LogEnds,
 	): void {
 		for (const entry of latest?.entries ?? []) {
 			this.sourceCache.clear(entry.blockIds);
@@ -1113,61 +1129,111 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 		this.sourceCache.clear(revertedBlockIds);
 		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
-		this.keepWhatTheRefreshRead(served);
+		Collection.keepLogEnds(this.sourceCache, this.floors, this.source.actionContext, ends);
 	}
 
-	/** Put the header and log tail block {@link readLogEnds} already fetched into this handle's own
+	/** Put the header and log tail block {@link readLogEnds} already fetched into a handle's own
 	 * cache, so the next read of either is a hit rather than a second fetch of a block just
-	 * received. Without it, a write that follows ANOTHER handle's commit fetches the log tail twice:
-	 * the refresh reads it, the walked entry names it (a commit's blocks include the log block its
-	 * entry was appended to) so the clear above drops it, and `Chain.add` then reads it again to
-	 * append this write's own entry.
+	 * received. Two sites, one rule:
+	 * - **An open** ({@link attachToLog}), before the walk: `Log.open` and the tail lookup behind
+	 *   the context start from exactly these two blocks, and would otherwise fetch both again.
+	 * - **A refresh that walked** ({@link forgetAndAdopt}). Without it, a write that follows ANOTHER
+	 *   handle's commit fetches the log tail twice: the refresh reads it, the walked entry names it
+	 *   (a commit's blocks include the log block its entry was appended to) so the clear drops it,
+	 *   and `Chain.add` then reads it again to append this write's own entry. Last in that one
+	 *   synchronous step, after BOTH clears — offering before either would simply be undone by it.
+	 *   An id that an invalidation reverted is therefore re-offered rather than left forgotten, which
+	 *   is sound because the revert is itself a commit and {@link readLogEnds} read unpinned: what it
+	 *   read already includes the revert.
 	 *
-	 * Last in {@link forgetAndAdopt}'s one synchronous step, after BOTH clears — offering before
-	 * either would simply be undone by it. An id that an invalidation reverted is therefore
-	 * re-offered rather than left forgotten, which is sound because the revert is itself a commit
-	 * and {@link readLogEnds} read unpinned: what it read already includes the revert.
+	 * Static, taking the cache, the floors and the context rather than `this`, because an open keeps
+	 * before the handle is constructed.
 	 *
-	 * An offer is made only when all three hold:
-	 * - **This handle holds a context.** With none adopted, every later read is unpinned and may
+	 * An offer is made only when all of these hold:
+	 * - **The handle holds a context.** With none adopted, every later read is unpinned and may
 	 *   legitimately be answered newer than what was read here, so there is nothing to judge the
 	 *   offer against.
 	 * - **The served revision is at or below the adopted one.** {@link readLogEnds} reads unpinned,
-	 *   so it can come back newer than the view this handle now reads at — exactly the
+	 *   so it can come back newer than the view the handle now reads at — exactly the
 	 *   `collection:context-short-of-tail` case. Serving that to a read pinned lower would fabricate
 	 *   a view that never existed. At or below the pin it is sound: a block whose newest content is
 	 *   at `rev <= context.rev` has the same content at `context.rev`.
 	 * - **The served revision meets any applicable floor.** A cache must never keep a below-floor
 	 *   answer.
+	 * - **For the header, nothing rewrote it after it was read** ({@link headerCurrentThroughTail}).
+	 *   "Newest at `rev`" above holds for each block at the moment it was read, and the header and
+	 *   the tail are not read at one moment.
 	 *
 	 * NOTE: the floor check lives here because {@link readLogEnds} reads around
 	 * {@link TransactorSource}, which is what applies floors on every other read — nothing else on
 	 * this path would apply one. It asks {@link BlockFloors.meetsApplicableFloor} rather than
 	 * spelling the comparison out, so it cannot drift from the one `answeredBelowFloor` makes, and
 	 * asks the non-reporting face because this is not an answer being served to a reader — the
-	 * `collection:block-below-floor` line would misdescribe it.
+	 * `collection:block-below-floor` line would misdescribe it. An opening handle has no floors yet,
+	 * so there the check passes by construction.
 	 *
-	 * Only this site seeds. The early return at {@link tailShowsNothingNewer} is deliberately left
-	 * alone: it fires when the log has not moved, and the cache is then already warm with the tail
-	 * (folded in by this handle's own commit, or kept from its last walk), so seeding there would
-	 * buy a fetch back only when the LRU had evicted it — at the cost of putting the one-synchronous-
-	 * step reasoning in a second place. */
+	 * The early return at {@link tailShowsNothingNewer} deliberately does not keep: it fires when
+	 * the log has not moved, and the cache is then already warm with the tail (folded in by this
+	 * handle's own commit, or kept from its last walk or its open), so keeping there would buy a
+	 * fetch back only when the LRU had evicted it — at the cost of putting the one-synchronous-step
+	 * reasoning in a second place. */
 	// NOTE: an offer whose revision equals what the cache already holds is still kept, so a walking
 	// refresh bumps the header's generation even when the header was neither cleared nor changed.
 	// Over-bumping is safe (see `CacheSource.bump`) and costs a re-materialize of that block on its
 	// next read; if that ever shows up, skip the offer when the cache already RETAINS the id at the
 	// same revision — but note it would then also stop correcting a cached block whose content was
 	// folded forward locally at that revision.
-	private keepWhatTheRefreshRead(served: LogEnds['served']): void {
-		const context = this.source.actionContext;
+	private static keepLogEnds(cache: CacheSource<IBlock>, floors: BlockFloors, context: ActionContext | undefined, ends: LogEnds): void {
 		if (context === undefined) {
 			return;
 		}
-		for (const [blockId, block, rev] of served) {
-			if (rev <= context.rev && this.floors.meetsApplicableFloor(blockId, context, rev)) {
-				this.sourceCache.offerServed(blockId, block, rev);
+		const headerId = ends.header.header.id;
+		const keepHeader = Collection.headerCurrentThroughTail(ends);
+		for (const [blockId, block, rev] of ends.served) {
+			if ((blockId !== headerId || keepHeader) && rev <= context.rev && floors.meetsApplicableFloor(blockId, context, rev)) {
+				cache.offerServed(blockId, block, rev);
 			}
 		}
+	}
+
+	/** Whether the header {@link readLogEnds} read is still the header at the revision of the tail
+	 * block it read — what {@link keepLogEnds}' revision test cannot see for the header.
+	 *
+	 * That test keeps a block served at or below the adopted revision because a block whose newest
+	 * content is at `rev` has the same content at every later revision. "Newest" held when the block
+	 * was read, and the header and the tail are not read at one moment: an open asks for the tail in
+	 * a second request, so does a refresh whose remembered tail is out of date, and even the
+	 * refresh's one batched request may be answered by two machines. A commit that lands between the
+	 * two reads and rewrites the header — a log roll-over (the header names the tail block) or a tree
+	 * whose root moved (a tree's header names its root) — leaves the context adopted from the tail
+	 * at that commit's revision while the header read before it is served there as if current. Kept,
+	 * the handle would read the tree through a root it no longer has, and a write that changes the
+	 * header again would be refused by storage's base guard and retried.
+	 *
+	 * Every commit and every invalidation appends an entry naming the blocks it changed, and only
+	 * ever on the tail block; starting a new tail block rewrites the header. So every commit above
+	 * the header's served revision sits in the tail block the header names, or past it. The header is
+	 * current through that tail when the tail is still the last block (no `nextId`, so nothing rolled
+	 * over since) and none of its entries above the header's revision changed the header. Otherwise
+	 * the header is not kept, and the next read of it goes to storage pinned at the adopted revision.
+	 *
+	 * Cautious by design: an entry above the ADOPTED revision refuses too, as does a header served by
+	 * a machine behind the log. Either costs one read of the header; neither keeps a wrong one. */
+	private static headerCurrentThroughTail(ends: LogEnds): boolean {
+		const tail = ends.tail?.block as LogBlock<unknown> | undefined;
+		const headerId = ends.header.header.id;
+		const headerRev = ends.served.find(([blockId]) => blockId === headerId)?.[2];
+		if (!tail || tail.nextId !== undefined || headerRev === undefined) {
+			return false;
+		}
+		return !tail.entries.some(entry => entry.rev > headerRev && Collection.entryChanges(entry, headerId));
+	}
+
+	/** Whether the log `entry` changed `blockId`: an action that wrote it, or an invalidation that
+	 * reverted it. A checkpoint changes no block but the log block it is appended to. */
+	private static entryChanges(entry: LogEntry<unknown>, blockId: BlockId): boolean {
+		return (entry.action?.blockIds.includes(blockId) ?? false)
+			|| (entry.invalidation?.reverted.some(reverted => reverted.blockId === blockId) ?? false);
 	}
 
 	/** The revision each action in `context` committed at, keyed by action id. `Log.getFrom` returns

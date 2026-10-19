@@ -110,6 +110,18 @@ describe('refresh read cost', () => {
 		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(1)
 	})
 
+	it('opening an existing tree costs two requests and fetches no block twice', async () => {
+		// The header, then the log tail it names: the tail id is only known from the header. The walk
+		// that adopts the log's context starts from those same two blocks, and reads them from the
+		// handle's cache rather than fetching each a second time.
+		const writer = await Tree.createOrOpen<number, Row>(net, 'open-cost', keyOf)
+		await writeRows(writer, 0, 5)
+
+		const { requests, fetchesPerBlock } = await net.cost(async () => { await Tree.createOrOpen<number, Row>(net, 'open-cost', keyOf) })
+		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(2)
+		expectNoBlockFetchedTwice(fetchesPerBlock)
+	})
+
 	it('the first refresh after opening, with nothing new, costs one request', async () => {
 		const writer = await Tree.createOrOpen<number, Row>(net, 'first-after-open', keyOf)
 		await writeRows(writer, 0, 5)

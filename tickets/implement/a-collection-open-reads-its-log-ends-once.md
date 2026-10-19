@@ -2,6 +2,13 @@ description: Opening a stored collection reads its header block and its newest l
 architecture: docs/internals.md#read-path-block-retrieval
 files: packages/db-core/src/collection/collection.ts (`open`, `createOrOpen`, `probeHeader`, `attachToLog`, `readLogEnds`, `keepWhatTheRefreshRead`, `bootstrapContext`), packages/db-core/src/transform/cache-source.ts (`offerServed`, read only), packages/db-core/test/refresh-read-cost.spec.ts, packages/quereus-plugin-optimystic/src/schema/index-manager.ts (`initialize`, `setUniqueEnforcementIndexes`), packages/quereus-plugin-optimystic/src/optimystic-module.ts (`doInitialize`: the collection open, `getSchema`, the index-manager calls), docs/internals.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-19T18:32:24.373Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\a-collection-open-reads-its-log-ends-once.implement.2026-10-19T18-32-24-373Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # A collection open reads its log ends once
 
 GitHub [#39](https://github.com/gotchoices/Optimystic/issues/39), arm 2. Arm 1 (a cold read asks each member once rather than twice) is the separate implement ticket `a-cold-read-reuses-the-consults-archives`; the two are independent.
