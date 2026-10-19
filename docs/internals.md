@@ -2082,7 +2082,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
 
   When a remembered peer never returns, FRET's own liveness is what ends the doubt, not a timer:
   once FRET marks the peer dead it leaves the cohort, the cohort shrinks to self, and the unflagged
-  absent answers again. Until then reads of blocks this node lacks fail with `'cohort-unreachable'`,
+  absent answers again. Since `p2p-fret` 1.2.0 that verdict waits longer for a peer this node has
+  watched stay up a long time: from 10 minutes of observed uptime it gets a grace of uptime / 12,
+  capped at 5 minutes by default (FRET's `maxDeadGraceMs`), so the doubt can outlast a departed
+  long-lived peer by that much. Until then reads of blocks this node lacks fail with `'cohort-unreachable'`,
   and creating a new collection through this node fails, because its header probe cannot be ruled
   absent. That is the cost the same process already paid, before any restart, when a partner went
   offline; persistence only stops a restart from erasing it. The revisit condition is recorded at
