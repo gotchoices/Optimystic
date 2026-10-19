@@ -2,6 +2,13 @@ description: When a machine reads a block it does not have, it asks another memb
 architecture: docs/transactions.md#read-consistency-and-staleness
 files: packages/db-p2p/src/repo/coordinator-repo.ts (`ClusterLatestCallback`, `ClusterLatestQuery`, `queryClusterForLatest`, `fetchBlockFromCluster`, `restoreCorroborated`, `AcquireBlockCallback`), packages/db-p2p/src/cluster/cluster-repo.ts (`ReconcileBlockCallback`), packages/db-p2p/src/cluster/reconcile-block.ts (`createReconcileBlock`, `fetchAnswer`), packages/db-p2p/src/libp2p-node-base.ts (`clusterLatestCallback`, `fetchArchiveFromPeer` and its NOTE), packages/db-p2p/src/testing/mesh-harness.ts (`clusterLatestCallback`, `makeFetchArchive`), packages/db-p2p/src/cohort-topic/commit-log-trust-anchor.ts (the `latestClaimFrom` adapter in `libp2p-node-base.ts`), packages/db-p2p/test/coordinator-repo-read-repair-content.spec.ts, docs/transactions.md, docs/internals.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-19T18:00:35.243Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\a-cold-read-reuses-the-consults-archives.implement.2026-10-19T18-00-35-242Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # A cold read reuses the consult's archives
 
 GitHub [#39](https://github.com/gotchoices/Optimystic/issues/39), arm 1. Arm 2 (open a collection's log ends once, open a table's trees concurrently) is the separate implement ticket `a-collection-open-reads-its-log-ends-once`; the two are independent.
