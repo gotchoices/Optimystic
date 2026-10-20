@@ -17,6 +17,14 @@ export interface RequestBatch<TRequest> {
 	/** Every block any request writes, each once, in request order. The first is the block a cohort is
 	 *  resolved for when nothing else names one. */
 	readonly blockIds: BlockId[];
+	/** Each block with the request that writes it, in request order — what a per-collection judgement
+	 *  of a block (its revision, base or action) reads. No block appears twice. */
+	readonly writes: readonly BlockWrite<TRequest>[];
+}
+
+export interface BlockWrite<TRequest> {
+	readonly request: TRequest;
+	readonly blockId: BlockId;
 }
 
 export type PendBatch = RequestBatch<PendRequest>;
@@ -33,7 +41,7 @@ export function commitBatchOf(requests: readonly CommitRequest[]): CommitBatch {
 }
 
 /** The blocks one pend request writes. */
-export function pendBlockIds(request: PendRequest): BlockId[] {
+function pendBlockIds(request: PendRequest): BlockId[] {
 	return blockIdsForTransforms(request.transforms);
 }
 
@@ -55,11 +63,13 @@ function batchOf<TRequest extends { actionId: ActionId }>(
 	if (fault !== undefined) {
 		throw new Error(`Malformed batch: ${fault}`);
 	}
+	const writes = requests.flatMap(request => [...new Set(blocksOf(request))].map(blockId => ({ request, blockId })));
 	return {
 		requests: requests as readonly [TRequest, ...TRequest[]],
 		operations,
 		actionId: requests[0]!.actionId,
-		blockIds: [...new Set(requests.flatMap(blocksOf))]
+		blockIds: writes.map(write => write.blockId),
+		writes
 	};
 }
 

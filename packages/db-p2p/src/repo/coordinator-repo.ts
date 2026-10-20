@@ -25,7 +25,7 @@ import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibil
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
-import { commitBatchOf, pendBatchOf, pendBlockIds, type CommitBatch, type PendBatch } from "./request-batch.js";
+import { commitBatchOf, pendBatchOf, type CommitBatch, type PendBatch } from "./request-batch.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -2814,27 +2814,22 @@ export class CoordinatorRepo implements IRepo {
 		// past their requested revision at different revisions, and it is the highest that the loser's
 		// next request has to clear (see `highestStaleAt`). Both the reported number and the reason
 		// prose name that block, and the revision its own request asked for, so they never disagree.
-		const requestedRevs = new Map<BlockId, number>();
-		const staleAt = highestStaleAt(batch.requests.flatMap(request => {
+		const staleAt = highestStaleAt(batch.writes.map(({ request, blockId }) => {
 			const requestedRev = request.rev;
-			if (requestedRev === undefined) return [];
-			return pendBlockIds(request).map(blockId => {
-				const latest = results[blockId]?.state.latest;
-				if (!latest || latest.rev < requestedRev) return undefined;
-				// Per-block self-exclusion (see {@link isOwnRevision}): our own durable half of a torn
-				// action is not a confirmed loss. Deliberately per-block, NOT the bail-entirely
-				// 'own-durable' shape of confirmCommitRivalAgainstLocal — a confirmed rival on ANOTHER
-				// block still confirms, and when none is confirmed anywhere the rejection stays a throw
-				// exactly as before. With the two pend-tier sites upstream fixed (StorageRepo.pend and
-				// ClusterMember.validatePendOperations) this shape should not reach here; mirrored so
-				// all three pend-tier checks agree.
-				if (isOwnRevision(latest, requestedRev, request.actionId)) return undefined;
-				requestedRevs.set(blockId, requestedRev);
-				return { blockId, rev: latest.rev };
-			});
+			const latest = results[blockId]?.state.latest;
+			if (requestedRev === undefined || !latest || latest.rev < requestedRev) return undefined;
+			// Per-block self-exclusion (see {@link isOwnRevision}): our own durable half of a torn
+			// action is not a confirmed loss. Deliberately per-block, NOT the bail-entirely
+			// 'own-durable' shape of confirmCommitRivalAgainstLocal — a confirmed rival on ANOTHER
+			// block still confirms, and when none is confirmed anywhere the rejection stays a throw
+			// exactly as before. With the two pend-tier sites upstream fixed (StorageRepo.pend and
+			// ClusterMember.validatePendOperations) this shape should not reach here; mirrored so
+			// all three pend-tier checks agree.
+			if (isOwnRevision(latest, requestedRev, request.actionId)) return undefined;
+			return { blockId, rev: latest.rev };
 		}));
 		if (staleAt) {
-			const requestedRev = requestedRevs.get(staleAt.blockId);
+			const requestedRev = batch.writes.find(write => write.blockId === staleAt.blockId)?.request.rev;
 			this.log('coordinator-repo:pend-stale-classified', {
 				actionId: batch.actionId,
 				blockId: staleAt.blockId,
@@ -2945,7 +2940,7 @@ export class CoordinatorRepo implements IRepo {
 		// (`ClusterMember.reservationRequestOf`); read it here under the same condition.
 		const readsBase = cohortCanMissAPend(peerCount, this.superMajorityThreshold);
 		try {
-			for (const { request, blockId } of batch.requests.flatMap(request => pendBlockIds(request).map(blockId => ({ request, blockId })))) {
+			for (const { request, blockId } of batch.writes) {
 				// The request's base for the block, read exactly as the refusing member read it (the
 				// malformed-base log line is that member's, so none is repeated here).
 				const reservation = readsBase
@@ -3619,9 +3614,7 @@ export class CoordinatorRepo implements IRepo {
 		// No answer built in this class names `torn` today — the writer's transactor derives it after
 		// every coordinator has answered — so this guards against a future producer, not a current one.
 		const torn = new Set(durability.torn ?? []);
-		const writes = batch.requests.flatMap(request => request.blockIds
-			.filter(blockId => !torn.has(blockId))
-			.map(blockId => ({ request, blockId })));
+		const writes = batch.writes.filter(({ blockId }) => !torn.has(blockId));
 		const outcomes = await Promise.allSettled(writes.map(({ request, blockId }) =>
 			this.noteBlockShortfall(ledger, request, blockId, durability, localHolds)));
 		outcomes.forEach((outcome, i) => {

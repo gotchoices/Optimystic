@@ -1,7 +1,7 @@
 description: A coordinating machine can now take one transaction's reservations, or its commits, for several collections in a single request and run them as one consensus vote with one answer, and that request travels over the network protocol. Nothing in the transaction layer sends one yet; the next ticket does.
 prereq: a-consensus-record-carries-several-collections-of-one-action
 architecture: docs/internals.md#one-commit-round-when-one-coordinator-covers-every-block
-files: packages/db-core/src/network/i-repo.ts, packages/db-p2p/src/repo/request-batch.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/batch-verdicts.ts, packages/db-p2p/src/repo/service.ts, packages/db-p2p/src/repo/client.ts, packages/db-p2p/src/repo/served-repo-proxy.ts, packages/db-p2p/src/repo/stated-holdings.ts, packages/db-p2p/src/testing/mesh-harness.ts, packages/db-core/src/network/stale-failure.ts, packages/db-p2p/test/coordinator-repo-batch-pend.spec.ts, packages/db-p2p/test/coordinator-repo-write-durability.spec.ts, docs/internals.md, packages/db-p2p/docs/repo.md, packages/db-core/docs/network.md, tickets/backlog/debt-multi-collection-retry-cannot-see-the-taken-revision.md
+files: packages/db-core/src/network/i-repo.ts, packages/db-p2p/src/repo/request-batch.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/cluster/batch-verdicts.ts, packages/db-p2p/src/repo/service.ts, packages/db-p2p/src/repo/client.ts, packages/db-p2p/src/repo/served-repo-proxy.ts, packages/db-p2p/src/repo/stated-holdings.ts, packages/db-p2p/src/testing/mesh-harness.ts, packages/db-core/src/network/stale-failure.ts, packages/db-p2p/test/coordinator-repo-batch.spec.ts, packages/db-p2p/test/coordinator-repo-write-durability.spec.ts, docs/internals.md, packages/db-p2p/docs/repo.md, packages/db-core/docs/network.md, tickets/backlog/debt-multi-collection-retry-cannot-see-the-taken-revision.md
 ----
 # A coordinator runs an action's collections as one record
 
@@ -32,7 +32,7 @@ Second of three tickets for GitHub #42 (first: `a-consensus-record-carries-sever
 
 ## Tests
 
-- **Added** `packages/db-p2p/test/coordinator-repo-batch-pend.spec.ts` — two-member mesh, `CoordinatorRepo.pendMany` of a table (latest 5, asks 6) and an index (rival at 4, asks 4) → `{ success: false, conflict: true, staleAt: { blockId: index tail, rev: 4 } }`. Pins the per-request revision reading, the one new branching logic. Mutation-checked: using the first request's `rev` for every block makes it fail (the rejection is thrown instead).
+- **Added** `packages/db-p2p/test/coordinator-repo-batch.spec.ts` (named `coordinator-repo-batch-pend.spec.ts` at implement; renamed in review when it gained the commit test) — two-member mesh, `CoordinatorRepo.pendMany` of a table (latest 5, asks 6) and an index (rival at 4, asks 4) → `{ success: false, conflict: true, staleAt: { blockId: index tail, rev: 4 } }`. Pins the per-request revision reading, the one new branching logic. Mutation-checked: using the first request's `rev` for every block makes it fail (the rejection is thrown instead).
 - **Changed** `coordinator-repo-write-durability.spec.ts` ("blocks a torn commit abandoned are not recorded") to hand `noteReplicationShortfall` a `commitBatchOf([...])`, its new parameter.
 - Every existing `CoordinatorRepo` spec now runs through the list path (single request = batch of one).
 
@@ -44,3 +44,29 @@ Validation: `yarn workspace @optimystic/db-p2p test` 3489 passing / 73 pending; 
 - **Spec-supplied `wrapRepo` wrappers do not forward the batch methods** — `aged-writer-slot-hold`, `reset-does-not-strand-its-own-pend`, `rival-superseded-only-by-a-writer-that-built-on-it`, `routing-key-convention-divergence`, `torn-commit-cancels-abandoned-blocks`, `test/util/node-count-mesh.ts` (db-p2p) and `two-node-lagging-replica-multi-collection-commit` (quereus plugin). Harmless now; once the writer batches, those specs will exercise the per-collection fallback instead. Whether each should forward (`forwardedBatchMethods`) is the next ticket's call per spec — some inject faults into `pend`/`commit` deliberately.
 - **Pend refused part-way leaves earlier requests' pending records** (solo and fallback paths): by design, the writer's refused-pend path cancels the whole action (`NetworkTransactor.pend`); the doc comment on `applyPendsInOrder` says so.
 - **Mixed builds**: an older coordinator answering a batch after reading only its first operation is a silent partial commit; only the `NOTE:` at `RepoClient.pendMany` records it (mixed versions are out of scope per AGENTS.md).
+
+## Review findings
+
+Read the implement diff (`ticket(implement): a-coordinator-runs-an-actions-collections-as-one-record`) before the handoff, then ran the code.
+
+**Checked, no defect found:**
+- Single-request equivalence. `pend` and `commit` now go through `pendMany([request])` / `commitMany([request])`. The record's message is still `[{ pend | commit: request }]`, so record hashes and proofs do not change. `pendSolo` now goes through `localApply()`, which is the same `storageRepo` object it used before. `foldPendResults` and `foldCommitResults` hand back a list of one unchanged. The one visible change is the `revs` log field, which the handoff notes.
+- `RepoService`: an empty `operations` array throws in `deriveMessageKey` exactly as `deriveBlockKey(operations[0])` did before. `checkRedirect` treats `pendMany` / `commitMany` as writes, so a thrown lookup aborts the stream. `runBatch` passes the same options the single-operation `pend` / `commit` branches pass. A batch whose other collections fall outside the first block's cohort is refused by `verifyResponsibility`, the same as a multi-block commit.
+- Per-request judgement. `classifyStaleRejection`, `corroborateHeldBlocks`, `commitRevisionHolder` and the ledger each judge a block against its own request's `rev`, base or action. `highestStaleAt` returns the candidate object itself, so `rivals.find(rival => rival.staleAt === staleAt)` is sound.
+- Proofs. `findClaimedCommitOp` in `packages/db-p2p/src/cluster/commit-proof.ts` searches every commit operation and matches each operation's own `rev`, so a solo proof minted over a whole batch, or a cluster proof, verifies for a block in any collection.
+- Wrappers. The only production `IRepo` wrappers are `createServedRepoProxy`, `stateHoldingsOnReads` and the harness's `arrivingFrom`, and all three forward the batch methods. The db-core `TestTransactor` wrappers are transactors, not repos.
+- The `confirmCommitRivalAgainstLocal` combination rule: a rival on any request beats `'own-durable'` on another. A writer that gets that conflict finishes the own-durable collection from its log entry when it refreshes, so no entry is duplicated. That path belongs to the accepted-tradeoff `NOTE:` at `commitThroughCluster`. No change.
+- Docs: `docs/internals.md` (§One commit round…, §Inbound Stream Authorization), `packages/db-p2p/docs/repo.md` and `packages/db-core/docs/network.md` all match the code. `yarn lint:docs` is clean.
+
+**Fixed in this pass (minor):**
+- DRY. Three coordinator sites each rebuilt the batch's (request, block) pairs inline, one of them in a single long `flatMap` loop header. `RequestBatch` now carries `writes` (each block with the request that writes it, computed once in `batchOf`), and `blockIds` is derived from it. `classifyStaleRejection`, `corroborateHeldBlocks` and `noteReplicationShortfall` use it, `classifyStaleRejection` no longer needs its side `Map`, and `pendBlockIds` is no longer exported.
+- Test coverage. Nothing exercised `commitMany` with more than one request, and the writer that would send one is blocked indefinitely (`a-transaction-pends-and-commits-its-collections-together`), so this path could have broken with nothing noticing. Added one test to `packages/db-p2p/test/coordinator-repo-batch.spec.ts` (renamed from `coordinator-repo-batch-pend.spec.ts`): a two-member mesh pends and commits a table and an index as one batch, and both members then hold each collection at its own requested revision. Mutation-checked: making `commitThroughCluster` send only the first operation makes it fail.
+
+**Major findings:** none. No tickets filed.
+
+**Tripwires:** none new. The two existing `NOTE:`s at `RepoClient.pendMany` (message size limit; an older coordinator reads only the first operation) stay as they are. The mixed-version question they raise now has its own decision ticket, `blocked/a-transaction-pends-and-commits-its-collections-together`.
+
+**Left as the handoff described:** spec-supplied `wrapRepo` wrappers that do not forward the batch methods (the next ticket decides per spec); no direct test of `RepoService.runBatch`, the malformed-batch refusal or `RepoClient.pendMany` over a real stream. The routing is plain branching that the code makes easy to check by reading; the end-to-end request-count spec in the next ticket will cover it.
+
+**Validation:** `yarn workspace @optimystic/db-p2p build` passes, eslint over the touched files is clean, `yarn workspace @optimystic/db-p2p test` gives 3490 passing / 73 pending, and `yarn lint:docs` is clean. Not run: the db-core and quereus-plugin suites (this pass touched only db-p2p internals that neither package imports) and `yarn test:integration`.
+
