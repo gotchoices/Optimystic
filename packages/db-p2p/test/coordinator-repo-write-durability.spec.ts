@@ -28,6 +28,7 @@ import type { ClusterClient } from '../src/cluster/client.js';
 import type { IUnderReplicationLedger, UnderReplicatedEntry } from '../src/repo/i-under-replication-ledger.js';
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
+import { commitBatchOf, type CommitBatch } from '../src/repo/request-batch.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 const BLOCK = 'block-write-durability' as BlockId;
@@ -526,9 +527,9 @@ describe('CoordinatorRepo — an acknowledged commit below full replication reco
 		// step directly, with the answer a future producer would hand it.
 		const repo = withClock(makeRepo(storageRepo(), self, { cohort: { resolved: true, peerIds: cohort }, ledger }));
 		const tornAnswer: WriteDurability = { quorum: 'majority', confirmed: 4, cohort: 4, unconfirmed: [], cohortPeerIds: cohort, torn: [BLOCK_2] };
-		const recording = repo as unknown as { noteReplicationShortfall(r: CommitRequest, d: WriteDurability, localHolds: boolean): Promise<void> };
+		const recording = repo as unknown as { noteReplicationShortfall(b: CommitBatch, d: WriteDurability, localHolds: boolean): Promise<void> };
 
-		await recording.noteReplicationShortfall(TWO_BLOCKS, tornAnswer, true);
+		await recording.noteReplicationShortfall(commitBatchOf([TWO_BLOCKS]), tornAnswer, true);
 
 		expect((await ledger.list()).map(e => e.blockId)).to.deep.equal([BLOCK]);
 	});

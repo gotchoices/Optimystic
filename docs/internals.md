@@ -570,7 +570,15 @@ verdict for the record, folded over them (`applyConsensusOperations` in
 `packages/db-p2p/src/cluster/cluster-repo.ts`). A pend record succeeds only when every collection's pend did;
 otherwise the first conflict-shaped refusal is its answer, so a refusal of any collection reaches the writer. A
 commit record succeeds only when this member holds every collection's revision, and a later reconcile of a
-behind member repeats only the collections it is missing. Members accept batches; no sender builds one yet.
+behind member repeats only the collections it is missing. A coordinator takes a batch in one request
+(`IRepo.pendMany` and `IRepo.commitMany`, carried by `RepoClient` and served by `RepoService`, which refuses a
+multi-operation message that is not a batch) and runs it as one record, answered together: success only if every
+collection's request was accepted. `CoordinatorRepo` runs a single `pend` or `commit` as a batch of one, so both
+share one path. Consensus runs on the cohort of the batch's first block, as for a single request. A refusal of any
+collection refuses the batch: a stale loss is confirmed against each collection's own requested revision, and a
+commit the cohort decided can be answered refused while some of its collections already sit on a majority, when
+members held only part of it (the accepted-tradeoff `NOTE:` at `CoordinatorRepo.commitThroughCluster`). No writer
+sends a batch yet.
 One pend record and one commit record per action is what brings a multi-collection write to the three requests
 a one-collection write costs, and it keeps the held-back pend delivery safe: a member that refuses any
 collection's pend late refuses the action's one commit record before anything of it is durable
@@ -2607,7 +2615,7 @@ Semantics:
 
 - **Absent predicate → today's behavior exactly.**  Each service holds `InboundStreamAuthorization | undefined`; when it is `undefined` the handler awaits nothing extra and no gate code runs.  This is the default.
 - **Supplied predicate → fail closed.**  Only a literal `true` allows the stream.  `false`, a throw, a rejection, expiry of the timeout, or an inbound connection with no resolvable remote peer id all **deny**, and denial aborts the stream *before* any frame is decoded or any operation executed.  Failures are logged (via the service's error logger), never swallowed.
-- **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (The `repo` protocol's `RepoMessage.operations` is an array, but the handler executes `operations[0]` only.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
+- **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (A `repo` message carries one operation, or a batch — one action's pends, or its commits, of several collections, run as one consensus record; either way it is one request per stream.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
 - **A stream is authorized when it opens, which can be well before its request.**  A node keeps one stream per peer and protocol negotiated ahead of its next request to that peer, for up to 30 s (`PreparedStreams` in `packages/db-p2p/src/network/prepared-streams.ts`), so an honest peer routinely holds an authorized stream open on this node with no request on it yet.  A peer the predicate stops admitting can therefore still deliver one request on each stream it already holds, until that stream's idle time runs out.  This is not a new exposure — any peer could always open a stream and hold it — but revoking a peer now takes full effect on these four protocols only once its held streams expire.  To cut a peer off at once, close its connections, or refuse it at the `connectionGater` as well.
 - **Peer id encoding**: the predicate receives `connection.remotePeer.toString()` — the libp2p base58btc/CIDv1 string (`12D3KooW…`).  Compare against that, never against a multiaddr or a raw public key.
 - **What a caller observes**: a stream reset.  Denial is deliberately *not* reported on the wire — telling an unauthorized peer "you are not a member" confirms membership state to exactly the party the embedder decided not to trust, and the four protocols have four different response shapes with no common error frame.  The denial is loud on the *denying* node instead: logged with peer id, protocol and reason, and the stream is aborted with an `UnauthorizedInboundStreamError` carrying `ERR_INBOUND_STREAM_UNAUTHORIZED`.

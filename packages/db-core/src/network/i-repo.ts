@@ -64,4 +64,17 @@ export type IRepo = {
 	pend(request: PendRequest, options?: MessageOptions): Promise<PendResult>;
 	cancel(actionRef: ActionBlocks, options?: MessageOptions): Promise<void>;
 	commit(request: RepoCommitRequest, options?: MessageOptions): Promise<CommitResult>;
+	/**
+	 * Pend every request as ONE consensus record. The requests are one action's (same action id), name
+	 * disjoint blocks, and are answered together: success only if every one was accepted, and then
+	 * `PendSuccess.blockIds` is the union of their blocks. A list that is empty, names two actions or
+	 * names one block twice is a sender's bug and throws.
+	 *
+	 * Optional: only a repo that coordinates consensus implements it (`CoordinatorRepo`, `RepoClient`
+	 * and the proxies in front of them). A member applies a batch one request at a time through
+	 * {@link pend}, so local storage does not.
+	 */
+	pendMany?(requests: readonly PendRequest[], options?: MessageOptions): Promise<PendResult>;
+	/** Commit every request as ONE consensus record, on the same terms as {@link pendMany}. */
+	commitMany?(requests: readonly RepoCommitRequest[], options?: MessageOptions): Promise<CommitResult>;
 }

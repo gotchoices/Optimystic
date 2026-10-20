@@ -1,5 +1,6 @@
 import type { ActionRev, BlockGets, BlockId, IRepo } from "@optimystic/db-core";
 import type { IHeldRevisionReader } from "../storage/storage-repo.js";
+import { forwardedBatchMethods } from "./request-batch.js";
 
 /**
  * The two halves of one exchange: a reader tells the coordinator it asks what the reader already holds
@@ -14,7 +15,8 @@ import type { IHeldRevisionReader } from "../storage/storage-repo.js";
 
 /**
  * Wrap the repo a reader uses to reach ANOTHER machine so every read it sends states what this node
- * holds of the blocks it names. Only `get` changes; the write operations pass through untouched.
+ * holds of the blocks it names. Only `get` changes; the write operations pass through untouched, the
+ * batch ones included when `remote` has them.
  *
  * Never wrap the reader's own coordinated repo: a read this node coordinates itself has no consult of
  * this node to replace (its own copy is the baseline, not a cohort answer).
@@ -44,7 +46,8 @@ export function stateHoldingsOnReads(remote: IRepo, local: IHeldRevisionReader):
 		},
 		async commit(request, options) {
 			return await remote.commit(request, options);
-		}
+		},
+		...forwardedBatchMethods(remote)
 	};
 }
 

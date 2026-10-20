@@ -41,13 +41,16 @@ export function isExpiryFailure(failure: WriteFailure): failure is ExpiredFailur
  * the transactor's aggregate meaningful: if a producer reported an arbitrary block instead of its
  * highest, taking the max across producers would still understate the constraint.
  *
- * NOTE: comparing revisions across blocks is only meaningful because one pend covers one
- * collection, so every candidate comes from the same revision counter. If a pend is ever allowed
- * to span collections, these numbers come from unrelated counters and selection must become
- * per-collection. `Collection.syncAttempts` now compares the winner against its OWN next revision
- * to decide whether a retry could differ (`SyncRevisionStalledError`), so a cross-collection
- * candidate would not merely muddy a diagnostic — it would fail a sync against an unrelated
- * counter.
+ * NOTE: comparing revisions across blocks is meaningful only within one collection, where every
+ * candidate comes from the same revision counter. A batch (`IRepo.pendMany` / `commitMany`) spans
+ * collections, and `CoordinatorRepo` still picks the highest across them, so its `staleAt` names the
+ * block — and so the collection — of one loser among several counters. That is harmless while the
+ * multi-collection coordinator, the only writer that sends a batch, does not read the number (backlog
+ * `debt-multi-collection-retry-cannot-see-the-taken-revision`). A consumer that compares it against a
+ * revision counter, as `Collection.syncAttempts` does against its OWN next revision to decide whether a
+ * retry could differ (`SyncRevisionStalledError`), must compare it against the counter of the
+ * collection owning `staleAt.blockId` — and once one does for a batch, selection must become
+ * per-collection.
  */
 export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): StaleFailure['staleAt'] {
 	let best: StaleFailure['staleAt'];

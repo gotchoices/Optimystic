@@ -1,7 +1,7 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
-import type { IKeyNetwork, IRepo, RepoMessage } from '@optimystic/db-core'
+import type { CommitResult, IKeyNetwork, IRepo, PendResult, RepoMessage } from '@optimystic/db-core'
 import { LruMap, blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { encodePeers, type RedirectPayload } from './redirect.js'
@@ -13,6 +13,7 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { registerProtocolHandler } from '../network/register-protocol-handler.js'
 import type { OptimysticNodeAttachments } from '../optimystic-node.js'
 import { RESPONSIBILITY_TTL_MS } from './responsibility.js'
+import { batchShapeFault, getAffectedBlockIds } from '../cluster/record-operations.js'
 
 // Define Components interface
 interface BaseComponents {
@@ -241,6 +242,18 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * The redirect routing key and op name for a whole message: its one operation's
+	 * ({@link deriveBlockKey}), or for a batch the first block it writes — the block
+	 * `CoordinatorRepo.pendMany` and `commitMany` resolve the batch's cohort for, since the repo protocol
+	 * hands the coordinator no coordinating list of its own.
+	 */
+	deriveMessageKey(message: RepoMessage): { blockKey: string | undefined, opName: string } {
+		const [first, ...rest] = message.operations
+		if (rest.length === 0) return this.deriveBlockKey(first)
+		return { blockKey: getAffectedBlockIds(message.operations)[0], opName: 'pend' in first ? 'pendMany' : 'commitMany' }
+	}
+
+	/**
 	 * Check if this node should redirect the request for a given key.
 	 * Returns a RedirectPayload if not responsible, null if should handle locally.
 	 * Also attaches the responsible peer ids to the message for downstream use.
@@ -297,6 +310,22 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * Run a batch — one action's pends, or its commits, of several collections — as one consensus record
+	 * on the coordinated repo. The message passed {@link batchShapeFault}, so every operation is the kind
+	 * of the first. A repo without the batch method cannot run it, and the throw aborts the stream: the
+	 * writer then sends the collections one request each.
+	 */
+	private async runBatch(message: RepoMessage): Promise<PendResult | CommitResult> {
+		const options = { expiration: message.expiration }
+		if ('pend' in message.operations[0]) {
+			if (!this.repo.pendMany) throw new Error('this node cannot run a batch of pends')
+			return await this.repo.pendMany(message.operations.flatMap(operation => 'pend' in operation ? [operation.pend] : []), options)
+		}
+		if (!this.repo.commitMany) throw new Error('this node cannot run a batch of commits')
+		return await this.repo.commitMany(message.operations.flatMap(operation => 'commit' in operation ? [operation.commit] : []), options)
+	}
+
+	/**
 	 * Handle incoming streams on the repo protocol
 	 */
 	private handleIncomingStream(stream: Stream, connection?: Connection): void {
@@ -308,10 +337,15 @@ export class RepoService implements Startable {
 				const decoded = new TextDecoder().decode(msg.subarray())
 				const message = JSON.parse(decoded) as RepoMessage
 
-				// Process each operation. Derive the redirect routing key once (keyed on the
-				// block the handler actually coordinates), redirect-check it, then dispatch.
+				// A message of several operations must be a batch; anything else is refused before any
+				// routing or execution — the throw aborts the stream, as for any other malformed request.
+				const shapeFault = batchShapeFault(message.operations)
+				if (shapeFault !== undefined) throw new Error(`Malformed batch: ${shapeFault}`)
+
+				// Derive the redirect routing key once (keyed on the block the handler actually
+				// coordinates), redirect-check it, then dispatch.
 				const operation = message.operations[0]
-				const { blockKey, opName } = this.deriveBlockKey(operation)
+				const { blockKey, opName } = this.deriveMessageKey(message)
 				const redirect = blockKey !== undefined
 					? await this.checkRedirect(blockKey, opName, message)
 					: null
@@ -319,6 +353,8 @@ export class RepoService implements Startable {
 				let response: any
 				if (redirect) {
 					response = redirect
+				} else if (message.operations.length > 1) {
+					response = await this.runBatch(message)
 				} else if ('get' in operation) {
 					// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
 					// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for

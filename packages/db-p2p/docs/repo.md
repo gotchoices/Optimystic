@@ -210,8 +210,11 @@ export type RepoMessage = {
 
 A message of more than one operation must be a batch: every operation a `pend`, or every one a
 `commit`, all naming one action, with no block in two operations. A cluster member refuses any other
-multi-operation record (`batchShapeFault` in `packages/db-p2p/src/cluster/record-operations.ts`); the
-repo protocol's handler still serves `operations[0]` only.
+multi-operation record (`batchShapeFault` in `packages/db-p2p/src/cluster/record-operations.ts`), and so
+does the repo protocol's handler, which aborts the stream. A batch that passes is handed to the coordinated
+repo's `pendMany` or `commitMany`, which run it as one consensus record and answer it with one result;
+`RepoClient.pendMany` and `RepoClient.commitMany` send one. Its redirect check is keyed on the batch's first
+block, the block the coordinator resolves its cohort for.
 
 One request per stream: the service answers the first frame and completes the generator, so a client
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and

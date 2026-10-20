@@ -48,9 +48,9 @@ export function foldPendResults(results: readonly PendResult[]): PendResult {
 	};
 }
 
-/** Retain a commit record's per-operation verdicts with their fold ({@link foldCommitVerdicts}). */
+/** Retain a commit record's per-operation verdicts with their fold ({@link foldCommitResults}). */
 export function retainedCommitVerdicts(operations: readonly CommitOperationVerdict[]): RetainedCommitVerdicts {
-	return { operations, folded: foldCommitVerdicts(operations.map(operation => operation.verdict)) };
+	return { operations, folded: foldCommitResults(operations.map(operation => operation.verdict)) };
 }
 
 /** Whether a commit operation's retained verdict is a refusal another reconcile may still turn. */
@@ -60,9 +60,10 @@ export function isBehindRefusal(operation: CommitOperationVerdict): boolean {
 
 /**
  * The record's commit verdict: a success only when every operation's durable verdict is one — the
- * member holds every collection's revision — and otherwise the first refusal.
+ * member holds every collection's revision — and otherwise the first refusal. `CoordinatorRepo` folds
+ * its own in-order applies of a batch the same way.
  */
-function foldCommitVerdicts(verdicts: readonly CommitResult[]): CommitResult {
+export function foldCommitResults(verdicts: readonly CommitResult[]): CommitResult {
 	const refusal = verdicts.find((verdict): verdict is WriteFailure => !verdict.success);
 	if (refusal !== undefined) {
 		return refusal;

@@ -1,5 +1,5 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, blockIdsForTransforms, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -11,10 +11,11 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
-import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
+import { foldCommitResults, foldPendResults } from "../cluster/batch-verdicts.js";
 import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { BlockArchive } from "../storage/struct.js";
@@ -24,6 +25,7 @@ import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibil
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
+import { commitBatchOf, pendBatchOf, pendBlockIds, type CommitBatch, type PendBatch } from "./request-batch.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -2499,9 +2501,15 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	async pend(request: PendRequest, options?: MessageOptions): Promise<PendResult> {
-		const allBlockIds = blockIdsForTransforms(request.transforms);
-		await this.verifyResponsibility(allBlockIds);
-		const result = await this.pendThroughCluster(request, allBlockIds, options);
+		return await this.pendMany([request], options);
+	}
+
+	/** {@link IRepo.pendMany}: one action's pends of several collections, run as one consensus record
+	 *  and answered together. {@link pend} is a list of one. */
+	async pendMany(requests: readonly PendRequest[], options?: MessageOptions): Promise<PendResult> {
+		const batch = pendBatchOf(requests);
+		await this.verifyResponsibility(batch.blockIds);
+		const result = await this.pendThroughCluster(batch, options);
 		// A pend the blocks ACCEPTED is the proof that no reservation is holding them any more — the
 		// only such proof this node gets without asking a question it has no reason to ask.
 		// Scope, honestly: this is NOT what re-arms the line for a later wedge. The holder comparison
@@ -2509,25 +2517,26 @@ export class CoordinatorRepo implements IRepo {
 		// since an action id is 16 random bytes minted per sync cycle (`Collection.syncInternal`). What
 		// forgetting buys is that a settled episode stops occupying an LRU slot it can only use to
 		// evict a live one — plus defence in depth if an action id ever does repeat.
-		if (result.success) this.clearStuckReservations(allBlockIds);
+		if (result.success) this.clearStuckReservations(batch.blockIds);
 		return result;
 	}
 
-	/** The cluster half of {@link pend}, after responsibility is verified: consensus, the local-verdict
-	 *  arms, and the catch that turns each optimistic-concurrency refusal into a retryable answer —
-	 *  the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError}) directly,
-	 *  and a validator rejection only through {@link classifyStaleRejection} — and an expiry into the
-	 *  non-retryable answer that names it. */
-	private async pendThroughCluster(request: PendRequest, allBlockIds: BlockId[], options?: MessageOptions): Promise<PendResult> {
-		const coordinatingBlockIds = options?.coordinatingBlockIds ?? allBlockIds;
+	/** The cluster half of {@link pendMany}, after responsibility is verified: consensus, the
+	 *  local-verdict arms, and the catch that turns each optimistic-concurrency refusal into a retryable
+	 *  answer — the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError})
+	 *  directly, and a validator rejection only through {@link classifyStaleRejection} — and an expiry
+	 *  into the non-retryable answer that names it. Every refusal, whichever request's blocks it came
+	 *  from, answers the whole batch. */
+	private async pendThroughCluster(batch: PendBatch, options?: MessageOptions): Promise<PendResult> {
+		const coordinatingBlockIds = options?.coordinatingBlockIds ?? batch.blockIds;
 
 		const cohort = await this.coordinator.resolveCohort(coordinatingBlockIds[0]!);
 		if (!cohort.resolved || cohort.peerIds.length <= 1) {
-			return await this.pendSolo(request, coordinatingBlockIds[0]!, cohort, options);
+			return await this.pendSolo(batch, coordinatingBlockIds[0]!, cohort, options);
 		}
 
 		const message: RepoMessage = {
-			operations: [{ pend: request }],
+			operations: batch.operations,
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT,
 			coordinatingBlockIds
 		};
@@ -2569,14 +2578,14 @@ export class CoordinatorRepo implements IRepo {
 					return local;
 				}
 				this.log('coordinator-repo:pend-remote-refusal', {
-					actionId: request.actionId,
+					actionId: batch.actionId,
 					peerId: remoteRefusal[0],
 					reason: remoteRefusal[1].reason
 				});
 				return remoteRefusal[1];
 			};
 			this.log('coordinator-repo:pend-cluster-complete', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				localExecuted,
 				localVerdict: localPendResult === undefined ? 'none'
 					: localPendResult.success ? 'success'
@@ -2587,9 +2596,9 @@ export class CoordinatorRepo implements IRepo {
 			// record ran on the cohort, so this apply flushes with that cohort's window, as the
 			// member's own apply would have.
 			if (!localExecuted) {
-				const result = await this.localApply().pend(request, options, { syncWithinMs: this.syncWindowFor(record) });
+				const result = await this.applyPendsInOrder(batch, options, { syncWithinMs: this.syncWindowFor(record) });
 				this.log('coordinator-repo:pend-fallback-result', {
-					actionId: request.actionId,
+					actionId: batch.actionId,
 					success: result.success,
 					hasMissing: !!(result as any).missing?.length,
 					hasPending: !!(result as any).pending?.length
@@ -2620,7 +2629,7 @@ export class CoordinatorRepo implements IRepo {
 				// have landed on the rest of the cohort. It still falls through to the rule below, so
 				// a sibling's refusal is not lost just because this node also had local trouble.
 				this.log('coordinator-repo:pend-local-fault-tolerated', {
-					actionId: request.actionId,
+					actionId: batch.actionId,
 					reason: localPendResult.reason
 				});
 			}
@@ -2632,11 +2641,11 @@ export class CoordinatorRepo implements IRepo {
 			return answerWithCohortRefusal({
 				success: true,
 				pending: [],
-				blockIds: allBlockIds,
+				blockIds: batch.blockIds,
 				durability: pendDurability(localPendResult === undefined ? undefined : false)
 			});
 		} catch (error) {
-			this.log('coordinator-repo:pend-error', { actionId: request.actionId, error: (error as Error).message });
+			this.log('coordinator-repo:pend-error', { actionId: batch.actionId, error: (error as Error).message });
 			// An expiry is returned, not thrown, and ahead of the stale classifier. Returned because a
 			// thrown pend aborts the repo stream, so a remote writer would see only a reset — and its
 			// transactor would re-pick another coordinator for a refusal every coordinator repeats.
@@ -2687,24 +2696,40 @@ export class CoordinatorRepo implements IRepo {
 				return { success: false, conflict: true, reason: error.message };
 			}
 			if (error instanceof BlocksHeldError) {
-				return await this.answerBlocksHeld(error, request, allBlockIds, cohort.peerIds.length);
+				return await this.answerBlocksHeld(error, batch, cohort.peerIds.length);
 			}
-			const stale = await this.classifyStaleRejection(error, request, allBlockIds);
+			const stale = await this.classifyStaleRejection(error, batch);
 			if (stale) return stale;
 			throw error;
 		}
 	}
 
 	/**
-	 * The solo short-circuit of {@link pend}: a cohort of at most one peer runs no consensus, and the
-	 * pend goes straight to local storage exactly as before. What changes is the answer's class —
+	 * The solo short-circuit of {@link pendMany}: a cohort of at most one peer runs no consensus, and the
+	 * pends go straight to local storage exactly as before. What changes is the answer's class —
 	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
 	 */
-	private async pendSolo(request: PendRequest, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+	private async pendSolo(batch: PendBatch, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
 		// Strict, no `syncWithinMs`: no consensus ran, and only this machine holds the write, so it
 		// is synced before the writer is answered.
-		const result = await this.storageRepo.pend(request, options);
+		const result = await this.applyPendsInOrder(batch, options);
 		return result.success ? { ...result, durability: await this.soloCohortDurability(cohort, blockId) } : result;
+	}
+
+	/**
+	 * Pend each request of `batch` into this node's own storage, in order, stopping at the first
+	 * refusal, which is the answer; otherwise the requests' successes folded into one. A refusal leaves
+	 * the earlier requests' pending records in place on purpose: the writer answered with a refused pend
+	 * cancels the whole action (`NetworkTransactor.pend`), so cancelling here would only duplicate that.
+	 */
+	private async applyPendsInOrder(batch: PendBatch, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
+		const results: PendResult[] = [];
+		for (const request of batch.requests) {
+			const result = await this.localApply().pend(request, options, apply);
+			results.push(result);
+			if (!result.success) break;
+		}
+		return foldPendResults(results);
 	}
 
 	/**
@@ -2766,44 +2791,52 @@ export class CoordinatorRepo implements IRepo {
 	 * anyway (it is only counted or logged). `conflict` conveys retryability directly instead.
 	 *
 	 * Confirmation is purely local: re-read the affected blocks from our own storage and require
-	 * `latest.rev >= request.rev`. The signed reject-reason text is never consulted — it is
-	 * free-form wire-visible prose and must not become control flow. Anything unconfirmed
-	 * (including read errors during confirmation) stays a throw, preserving fail-fast for
+	 * `latest.rev >= request.rev`, each block against the revision of the request that writes it —
+	 * every collection counts its revisions separately, so a batch's requests ask for different ones.
+	 * A confirmation on ANY request's blocks is the batch's answer. The signed reject-reason text is
+	 * never consulted — it is free-form wire-visible prose and must not become control flow. Anything
+	 * unconfirmed (including read errors during confirmation) stays a throw, preserving fail-fast for
 	 * genuine validation faults.
 	 */
-	private async classifyStaleRejection(error: unknown, request: PendRequest, blockIds: BlockId[]): Promise<StaleFailure | undefined> {
-		const requestedRev = request.rev;
-		if (!(error instanceof ValidatorRejectionError) || requestedRev === undefined) return undefined;
+	private async classifyStaleRejection(error: unknown, batch: PendBatch): Promise<StaleFailure | undefined> {
+		if (!(error instanceof ValidatorRejectionError) || batch.requests.every(request => request.rev === undefined)) return undefined;
 		let results: GetBlockResults;
 		try {
-			results = await this.storageRepo.get({ blockIds });
+			results = await this.storageRepo.get({ blockIds: batch.blockIds });
 		} catch (readError) {
 			this.log('coordinator-repo:pend-stale-classify-read-error', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				error: (readError as Error).message
 			});
 			return undefined;
 		}
-		// Scan EVERY block rather than stopping at the first confirmation: several of the request's
-		// blocks can be past the requested revision at different revisions, and it is the highest
-		// that the loser's next request has to clear (see `highestStaleAt`). Both the reported
-		// number and the reason prose name that block, so they never disagree.
-		const staleAt = highestStaleAt(blockIds.map(blockId => {
-			const latest = results[blockId]?.state.latest;
-			if (!latest || latest.rev < requestedRev) return undefined;
-			// Per-block self-exclusion (see {@link isOwnRevision}): our own durable half of a torn
-			// action is not a confirmed loss. Deliberately per-block, NOT the bail-entirely
-			// 'own-durable' shape of confirmCommitRivalAgainstLocal — a confirmed rival on ANOTHER
-			// block still confirms, and when none is confirmed anywhere the rejection stays a throw
-			// exactly as before. With the two pend-tier sites upstream fixed (StorageRepo.pend and
-			// ClusterMember.validatePendOperations) this shape should not reach here; mirrored so
-			// all three pend-tier checks agree.
-			if (isOwnRevision(latest, requestedRev, request.actionId)) return undefined;
-			return { blockId, rev: latest.rev };
+		// Scan EVERY block rather than stopping at the first confirmation: several of the blocks can be
+		// past their requested revision at different revisions, and it is the highest that the loser's
+		// next request has to clear (see `highestStaleAt`). Both the reported number and the reason
+		// prose name that block, and the revision its own request asked for, so they never disagree.
+		const requestedRevs = new Map<BlockId, number>();
+		const staleAt = highestStaleAt(batch.requests.flatMap(request => {
+			const requestedRev = request.rev;
+			if (requestedRev === undefined) return [];
+			return pendBlockIds(request).map(blockId => {
+				const latest = results[blockId]?.state.latest;
+				if (!latest || latest.rev < requestedRev) return undefined;
+				// Per-block self-exclusion (see {@link isOwnRevision}): our own durable half of a torn
+				// action is not a confirmed loss. Deliberately per-block, NOT the bail-entirely
+				// 'own-durable' shape of confirmCommitRivalAgainstLocal — a confirmed rival on ANOTHER
+				// block still confirms, and when none is confirmed anywhere the rejection stays a throw
+				// exactly as before. With the two pend-tier sites upstream fixed (StorageRepo.pend and
+				// ClusterMember.validatePendOperations) this shape should not reach here; mirrored so
+				// all three pend-tier checks agree.
+				if (isOwnRevision(latest, requestedRev, request.actionId)) return undefined;
+				requestedRevs.set(blockId, requestedRev);
+				return { blockId, rev: latest.rev };
+			});
 		}));
 		if (staleAt) {
+			const requestedRev = requestedRevs.get(staleAt.blockId);
 			this.log('coordinator-repo:pend-stale-classified', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				blockId: staleAt.blockId,
 				latestRev: staleAt.rev,
 				requestedRev
@@ -2857,15 +2890,15 @@ export class CoordinatorRepo implements IRepo {
 	 * WAIT on the holder rather than re-race it needs a typed field added here; never recover the ids
 	 * by parsing `reason`.
 	 */
-	private async answerBlocksHeld(error: BlocksHeldError, request: PendRequest, blockIds: BlockId[], peerCount: number): Promise<StaleFailure> {
-		const pending = await this.corroborateHeldBlocks(request, blockIds, peerCount);
+	private async answerBlocksHeld(error: BlocksHeldError, batch: PendBatch, peerCount: number): Promise<StaleFailure> {
+		const pending = await this.corroborateHeldBlocks(batch, peerCount);
 		if (pending.length === 0) {
 			// The member that refused is ahead of us — the normal shape under latency. Still a conflict:
 			// the refusal is signed, and the un-enriched answer is exactly the shape the lost-race arm
 			// returns. `noteStuckReservation` is deliberately not fed here; it counts refusals whose
 			// holder THIS node can name, and a guess would poison its holder comparison.
 			this.log('coordinator-repo:pend-held-uncorroborated', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				heldBy: error.heldBy
 			});
 			return { success: false, conflict: true, reason: error.message };
@@ -2876,9 +2909,9 @@ export class CoordinatorRepo implements IRepo {
 		// later would silently stop the counter and with it `coordinator-repo:stuck-reservation`.
 		// {@link reportRepairDeadlock} keeps its say-once bookkeeping outside its own log call for the
 		// same reason.
-		const distinctRefusedActions = this.noteStuckReservation(pending, request.actionId);
+		const distinctRefusedActions = this.noteStuckReservation(pending, batch.actionId);
 		this.log('coordinator-repo:pend-conflict-classified', {
-			actionId: request.actionId,
+			actionId: batch.actionId,
 			rivals: pending.map(p => `${p.blockId}:${p.actionId}`),
 			// How many distinct actions the most-refusing of this request's holders has now turned away
 			// (see {@link noteStuckReservation}). Carried on every classification, not just the stuck
@@ -2895,23 +2928,24 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * The rival unresolved actions THIS node's own storage says hold `blockIds`, excluding the request's
-	 * own action (a redelivered pend must not corroborate against itself). Empty when nothing is found
-	 * — including when the read itself fails, which is reported and then treated as "nothing to add",
-	 * since the caller's answer does not depend on it.
+	 * The rival unresolved actions THIS node's own storage says hold the batch's blocks, each block
+	 * judged against the request that writes it, excluding the batch's own action (a redelivered pend
+	 * must not corroborate against itself). Empty when nothing is found — including when the read
+	 * itself fails, which is reported and then treated as "nothing to add", since the caller's answer
+	 * does not depend on it.
 	 *
 	 * Carries no `transform`, which {@link ActionPending} allows and no consumer rebases from.
 	 *
 	 * Diagnostic enrichment only, never a gate: the refusal it corroborates was already cast and signed
 	 * by a member, and nothing here can turn an admission into a refusal or the reverse.
 	 */
-	private async corroborateHeldBlocks(request: PendRequest, blockIds: BlockId[], peerCount: number): Promise<ActionPending[]> {
+	private async corroborateHeldBlocks(batch: PendBatch, peerCount: number): Promise<ActionPending[]> {
 		const pending: ActionPending[] = [];
 		// The refusing member reads the request's base only in a cohort that can leave a member out
 		// (`ClusterMember.reservationRequestOf`); read it here under the same condition.
 		const readsBase = cohortCanMissAPend(peerCount, this.superMajorityThreshold);
 		try {
-			for (const blockId of blockIds) {
+			for (const { request, blockId } of batch.requests.flatMap(request => pendBlockIds(request).map(blockId => ({ request, blockId })))) {
 				// The request's base for the block, read exactly as the refusing member read it (the
 				// malformed-base log line is that member's, so none is repeated here).
 				const reservation = readsBase
@@ -2932,7 +2966,7 @@ export class CoordinatorRepo implements IRepo {
 			}
 		} catch (readError) {
 			this.log('coordinator-repo:pend-conflict-classify-read-error', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				error: (readError as Error).message
 			});
 			return [];
@@ -3059,22 +3093,35 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	async commit(request: CommitRequest, options?: MessageOptions): Promise<CommitResult> {
-		const blockIds = request.blockIds;
-		await this.verifyResponsibility(blockIds);
+		return await this.commitMany([request], options);
+	}
 
-		const cohort = await this.coordinator.resolveCohort(blockIds[0]!);
+	/**
+	 * {@link IRepo.commitMany}: one action's commits of several collections, run as one consensus record
+	 * and answered together. {@link commit} is a list of one. Consensus runs on the cohort of the batch's
+	 * first block — the first request's log tail, which every request lists first — exactly as a single
+	 * commit's does, and the other collections' blocks commit on that cohort too: the approximation a
+	 * multi-block commit already makes (backlog `debt-sender-side-coordinating-block-binding-is-unchecked`),
+	 * exact whenever the cohorts coincide, which they always do in a group small enough that every machine
+	 * is in every cohort.
+	 */
+	async commitMany(requests: readonly CommitRequest[], options?: MessageOptions): Promise<CommitResult> {
+		const batch = commitBatchOf(requests);
+		await this.verifyResponsibility(batch.blockIds);
+
+		const cohort = await this.coordinator.resolveCohort(batch.blockIds[0]!);
 		if (!cohort.resolved || cohort.peerIds.length <= 1) {
-			return await this.commitSolo(request, blockIds, cohort, options);
+			return await this.commitSolo(batch, cohort, options);
 		}
 		let answer: CommitResult;
 		try {
-			answer = await this.commitThroughCluster(request, cohort.peerIds.length, options);
+			answer = await this.commitThroughCluster(batch, cohort.peerIds.length, options);
 		} catch (error) {
-			const refusal = await this.latePendRefusalFor(request, 'threw');
+			const refusal = await this.latePendRefusalFor(batch, 'threw');
 			if (refusal !== undefined) return refusal;
 			throw error;
 		}
-		await this.latePendRefusalFor(request, answer.success ? 'acknowledged' : 'refused');
+		await this.latePendRefusalFor(batch, answer.success ? 'acknowledged' : 'refused');
 		return answer;
 	}
 
@@ -3092,12 +3139,14 @@ export class CoordinatorRepo implements IRepo {
 	 * `staleAt`), and a throw over a revision this node already holds under this action, which
 	 * {@link classifyCommitStaleRejection} keeps a throw on purpose.
 	 */
-	private async latePendRefusalFor(request: CommitRequest, settled: 'threw' | 'acknowledged' | 'refused'): Promise<WriteFailure | undefined> {
-		const refusal = firstPendRefusal(this.coordinator.takeLatePendRefusals(request.actionId, request.blockIds));
+	private async latePendRefusalFor(batch: CommitBatch, settled: 'threw' | 'acknowledged' | 'refused'): Promise<WriteFailure | undefined> {
+		// Taken once for the action over every collection's blocks, so a refusal reported for any one
+		// collection's pend answers the batch.
+		const refusal = firstPendRefusal(this.coordinator.takeLatePendRefusals(batch.actionId, batch.blockIds));
 		if (refusal === undefined) return undefined;
-		const answers = settled === 'threw' && await this.confirmCommitRivalAgainstLocal(request) !== 'own-durable';
+		const answers = settled === 'threw' && await this.confirmCommitRivalAgainstLocal(batch) !== 'own-durable';
 		this.log('coordinator-repo:commit-late-pend-refusal', {
-			actionId: request.actionId,
+			actionId: batch.actionId,
 			peerId: refusal[0],
 			reason: refusal[1].reason,
 			commit: settled,
@@ -3106,11 +3155,23 @@ export class CoordinatorRepo implements IRepo {
 		return answers ? refusal[1] : undefined;
 	}
 
-	/** The cluster half of {@link commit}, once the cohort is known to have more than one member. */
-	private async commitThroughCluster(request: CommitRequest, peerCount: number, options?: MessageOptions): Promise<CommitResult> {
-		const blockIds = request.blockIds;
+	/**
+	 * The cluster half of {@link commitMany}, once the cohort is known to have more than one member.
+	 *
+	 * NOTE: accepted tradeoff — the batch gets ONE answer, never one per collection. A record has one
+	 * consensus outcome, every member's verdict is folded over the record's collections, and the
+	 * durability gate counts members holding all of them, so a per-collection answer would claim a
+	 * precision the evidence does not have. The cost: when the cohort decided to commit and a member
+	 * held one collection but refused another, the whole batch is answered refused although the
+	 * collection it held may sit on a majority. The writer keeps every collection's attempt, and its refresh
+	 * between attempts finishes that collection from its own log entry (`Collection.completeOwnEntry`)
+	 * and re-pends the other — the path a refused one-collection commit already takes, at the price of
+	 * one refresh round in that rare shape. Revisit if that shape shows up as a measurable retry rate.
+	 */
+	private async commitThroughCluster(batch: CommitBatch, peerCount: number, options?: MessageOptions): Promise<CommitResult> {
+		const blockIds = batch.blockIds;
 		const message: RepoMessage = {
-			operations: [{ commit: request }],
+			operations: batch.operations,
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
 
@@ -3186,10 +3247,10 @@ export class CoordinatorRepo implements IRepo {
 				// of trusting the local re-read alone.
 				const localDurable = localCommitResult?.success === true;
 				if (localCommitResult !== undefined && !localCommitResult.success) {
-					const rival = await this.confirmCommitRivalAgainstLocal(request);
+					const rival = await this.confirmCommitRivalAgainstLocal(batch);
 					if (typeof rival === 'object') return rival;
 					this.log('coordinator-repo:commit-local-refusal-tolerated', {
-						actionId: request.actionId,
+						actionId: batch.actionId,
 						confirmation: rival ?? 'unconfirmed',
 						reason: localCommitResult.reason
 					});
@@ -3199,10 +3260,10 @@ export class CoordinatorRepo implements IRepo {
 				// LOWER than reality for such a member, never higher.
 				const durableHolders = durability.remoteHolders.length + (localDurable ? 1 : 0);
 				if (!isDurableMajority(durableHolders, durability.cohortPeerIds.length)) {
-					return this.refuseCommitNotDurable(request, durableHolders, durability, 'local-executed');
+					return this.refuseCommitNotDurable(batch, durableHolders, durability, 'local-executed');
 				}
 				if (armFreshness) this.markBlocksSeen(blockIds);
-				return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable, record);
+				return await this.acknowledgeCommit(batch, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable, record);
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
 			// local divergence when the cluster already reached consensus AND a durable majority of
@@ -3230,42 +3291,23 @@ export class CoordinatorRepo implements IRepo {
 			// is not responsible for it" placement the durability gate exists to prevent.
 			const selfInCohort = this.localPeerId !== undefined && this.localPeerId.toString() in record.peers;
 			if (!isDurableMajority(durability.remoteHolders.length + (selfInCohort ? 1 : 0), durability.cohortPeerIds.length)) {
-				return this.refuseCommitNotDurable(request, durability.remoteHolders.length, durability, 'fallback-skipped');
+				return this.refuseCommitNotDurable(batch, durability.remoteHolders.length, durability, 'fallback-skipped');
 			}
-			//
-			// Deliberately NOT self-signed here (unlike the solo short-circuit above): consensus for
-			// this commit ran on the cohort, so a one-peer minted proof would be a FALSE statement
-			// about the committing cohort. Thread the record's REAL proof instead —
-			// executeClusterTransaction resolves only after the record's promise/commit votes are
-			// populated, so the projection is genuine. Passed unconditionally, threshold or not:
-			// persistProofIfContentMatches retains it under the digest-match rule, and a record that
-			// never reached threshold simply yields a proof no verifier accepts — the same posture
-			// ClusterMember.consensusCommitProof takes with its own projection.
-			const consensusProof = buildBlockCommitProof(record);
-			try {
-				const result = await this.localApply().commit(request, options, { proof: consensusProof, syncWithinMs: this.syncWindowFor(record) });
-				if (result.success) {
-					// The gate above already admitted this shape: the remote holders plus this node
-					// (when it is in the cohort) form the majority, and this node now holds it.
-					// Storage's own `local` answer is replaced by the cohort's — this node counts exactly
-					// as the gate counted it, i.e. only when it is a cohort member.
-					if (armFreshness) this.markBlocksSeen(blockIds);
-					// The fallback commit landed every block, so this node holds them — whether or not
-					// it is a cohort member — and can source a push to whoever the class names as missing.
-					return await this.acknowledgeCommit(request, { ...result, durability: this.cohortWriteDurability(durability, selfInCohort) }, true, record);
-				}
-				if (isMissingBaseRevisionFailure(result) && clusterReachedCommitConsensus(record)) {
-					return await this.tolerateLocalCommitDivergence(request, blockIds, result.reason ?? MISSING_BASE_REVISION_REASON, armFreshness, durability);
-				}
-				return result;
-			} catch (err) {
-				if (clusterReachedCommitConsensus(record)) {
-					return await this.tolerateLocalCommitDivergence(request, blockIds, (err as Error).message, armFreshness, durability);
-				}
-				throw err;
+			const local = await this.applyCommitsAfterConsensus(batch, record, options);
+			if ('refused' in local) return local.refused;
+			if ('diverged' in local) {
+				return await this.tolerateLocalCommitDivergence(batch, local.diverged, armFreshness, durability);
 			}
+			// The gate above already admitted this shape: the remote holders plus this node (when it
+			// is in the cohort) form the majority, and this node now holds it. Storage's own `local`
+			// answer is replaced by the cohort's — this node counts exactly as the gate counted it,
+			// i.e. only when it is a cohort member.
+			if (armFreshness) this.markBlocksSeen(blockIds);
+			// The fallback commit landed every block, so this node holds them — whether or not it is
+			// a cohort member — and can source a push to whoever the class names as missing.
+			return await this.acknowledgeCommit(batch, { ...local.held, durability: this.cohortWriteDurability(durability, selfInCohort) }, true, record);
 		} catch (error) {
-			this.log('coordinator-repo:commit-error', { actionId: request.actionId, error: (error as Error).message });
+			this.log('coordinator-repo:commit-error', { actionId: batch.actionId, error: (error as Error).message });
 			// Returned for the reasons `pendThroughCluster` gives. Nothing of the commit applied: the
 			// cohort refused it at the promise round, before any member could apply.
 			if (error instanceof TransactionExpiredError) {
@@ -3291,7 +3333,7 @@ export class CoordinatorRepo implements IRepo {
 			// ValidatorRejectionError; classify it against local storage the way `pend` does, so the
 			// writer gets a clean retryable conflict instead of three verbatim re-drives and a hard
 			// failure.
-			const stale = await this.classifyCommitStaleRejection(error, request);
+			const stale = await this.classifyCommitStaleRejection(error, batch);
 			if (stale) return stale;
 			throw error;
 		}
@@ -3316,9 +3358,9 @@ export class CoordinatorRepo implements IRepo {
 	 *    `request.rev`: ours ⇒ bail, a rival's ⇒ confirmed loss, unknown/absent/fault ⇒ unconfirmed;
 	 *  - anything unconfirmed (including read errors) stays a throw — fail-fast for genuine faults.
 	 */
-	private async classifyCommitStaleRejection(error: unknown, request: CommitRequest): Promise<StaleFailure | undefined> {
+	private async classifyCommitStaleRejection(error: unknown, batch: CommitBatch): Promise<StaleFailure | undefined> {
 		if (!(error instanceof ValidatorRejectionError)) return undefined;
-		const rival = await this.confirmCommitRivalAgainstLocal(request);
+		const rival = await this.confirmCommitRivalAgainstLocal(batch);
 		// 'own-durable' and unconfirmed both stay a throw here: fail-fast for genuine faults, and a
 		// commit already durable under this action must never be answered `conflict` (the writer
 		// would rebase and re-append it — a duplicate entry).
@@ -3327,33 +3369,62 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * Shared confirmation core for the two commit-tier conversion sites ({@link classifyCommitStaleRejection}
-	 * and the locally-executed refusal check in {@link commit}): decide, from LOCAL storage only, who
-	 * holds the requested revision.
-	 *  - a confirmed RIVAL → the {@link StaleFailure} conflict answer (with `staleAt` = highest
-	 *    confirmed holder);
-	 *  - our OWN action durable at the requested revision → `'own-durable'` (callers must not answer
-	 *    `conflict` — the writer would rebase an already-landed action into a duplicate entry);
-	 *  - anything else (behind, truncated history, read faults, capability absent) → `undefined`,
-	 *    unconfirmed.
+	 * and the locally-executed refusal check in {@link commitThroughCluster}): decide, from LOCAL storage
+	 * only, who holds the requested revisions. Each request is judged on its own blocks against its own
+	 * revision ({@link commitRevisionHolder}), and the batch's answer is:
+	 *  - a RIVAL confirmed on any request's blocks → the {@link StaleFailure} conflict answer (with
+	 *    `staleAt` = the highest confirmed holder across requests);
+	 *  - our OWN action durable at the requested revision on every request → `'own-durable'` (callers
+	 *    must not answer `conflict` — the writer would rebase an already-landed action into a duplicate
+	 *    entry);
+	 *  - anything else (behind, truncated history, read faults, capability absent, a batch only partly
+	 *    own-durable) → `undefined`, unconfirmed.
 	 * The signed reject text / retained verdict prose is never consulted.
 	 */
-	private async confirmCommitRivalAgainstLocal(request: CommitRequest): Promise<StaleFailure | 'own-durable' | undefined> {
-		const blockIds = request.blockIds;
+	private async confirmCommitRivalAgainstLocal(batch: CommitBatch): Promise<StaleFailure | 'own-durable' | undefined> {
 		let results: GetBlockResults;
 		try {
-			results = await this.storageRepo.get({ blockIds });
+			results = await this.storageRepo.get({ blockIds: batch.blockIds });
 		} catch (readError) {
 			this.log('coordinator-repo:commit-stale-classify-read-error', {
-				actionId: request.actionId,
+				actionId: batch.actionId,
 				error: (readError as Error).message
 			});
 			return undefined;
 		}
+		const holders: CommitRevisionHolder[] = [];
+		for (const request of batch.requests) {
+			holders.push(await this.commitRevisionHolder(request, results));
+		}
+		if (holders.every(holder => holder === 'own-durable')) return 'own-durable';
+		const rivals = holders.filter((holder): holder is CommitRival => typeof holder === 'object');
+		const staleAt = highestStaleAt(rivals.map(rival => rival.staleAt));
+		if (!staleAt) return undefined;
+		const requestedRev = rivals.find(rival => rival.staleAt === staleAt)?.requestedRev;
+		this.log('coordinator-repo:commit-stale-classified', {
+			actionId: batch.actionId,
+			blockId: staleAt.blockId,
+			latestRev: staleAt.rev,
+			requestedRev
+		});
+		return {
+			success: false,
+			conflict: true,
+			reason: `stale commit: block ${staleAt.blockId} at rev ${staleAt.rev}, requested rev ${requestedRev}`,
+			staleAt
+		};
+	}
+
+	/**
+	 * Who holds ONE commit request's revision on its own blocks, read from `results` (this node's
+	 * storage) and, past it, from the revision index: `'own-durable'` the moment any block shows OUR
+	 * action durable at the requested revision, else the highest confirmed rival, else `undefined`.
+	 * Scans every block (same rule as the pend classifier) so the rival reported is the highest.
+	 */
+	private async commitRevisionHolder(request: CommitRequest, results: GetBlockResults): Promise<CommitRevisionHolder> {
 		const reader = this.storageRepo as IRepo & Partial<IRevisionActionReader>;
-		// Scan EVERY block (same rule as the pend classifier): report the highest confirmed rival
-		// revision, but bail the moment any block shows OUR action durable at the requested revision.
 		const rivalStales: ({ blockId: BlockId; rev: number } | undefined)[] = [];
-		for (const blockId of blockIds) {
+		for (const blockId of request.blockIds) {
 			const latest = results[blockId]?.state?.latest;
 			if (!latest || latest.rev < request.rev) continue;
 			if (latest.rev === request.rev) {
@@ -3388,26 +3459,15 @@ export class CoordinatorRepo implements IRepo {
 			// takenBy undefined (truncated history): unconfirmed for this block.
 		}
 		const staleAt = highestStaleAt(rivalStales);
-		if (!staleAt) return undefined;
-		this.log('coordinator-repo:commit-stale-classified', {
-			actionId: request.actionId,
-			blockId: staleAt.blockId,
-			latestRev: staleAt.rev,
-			requestedRev: request.rev
-		});
-		return {
-			success: false,
-			conflict: true,
-			reason: `stale commit: block ${staleAt.blockId} at rev ${staleAt.rev}, requested rev ${request.rev}`,
-			staleAt
-		};
+		return staleAt === undefined ? undefined : { staleAt, requestedRev: request.rev };
 	}
 
 	/**
-	 * A commit the cluster carried but this peer could not apply locally. Reported as success only
-	 * when a durable majority of the OTHER cohort members holds it (this node, having diverged, is
-	 * not a holder) — convergence then comes from replication (cohort reconcile, or read-driven
-	 * acquisition), not from replay here. Without that majority it is the durability gate's
+	 * A commit the cluster carried but this peer could not apply locally — any one of a batch's
+	 * requests diverging is enough, since this node then does not hold the whole record. Reported as
+	 * success only when a durable majority of the OTHER cohort members holds it (this node, having
+	 * diverged, is not a holder) — convergence then comes from replication (cohort reconcile, or
+	 * read-driven acquisition), not from replay here. Without that majority it is the durability gate's
 	 * retryable refusal: nothing is known to hold the revision. `armFreshness` says whether the
 	 * commit's quorum was strong enough ({@link commitQuorumRulesOutRivals}) for the read path to
 	 * treat the blocks as freshness-checked; a divergence tolerated on a downsized quorum leaves the
@@ -3415,18 +3475,63 @@ export class CoordinatorRepo implements IRepo {
 	 * freshness stamp belongs.
 	 */
 	private async tolerateLocalCommitDivergence(
-		request: CommitRequest, blockIds: BlockId[], detail: string, armFreshness: boolean, durability: CohortDurability
+		batch: CommitBatch, detail: string, armFreshness: boolean, durability: CohortDurability
 	): Promise<CommitResult> {
 		if (!isDurableMajority(durability.remoteHolders.length, durability.cohortPeerIds.length)) {
-			return this.refuseCommitNotDurable(request, durability.remoteHolders.length, durability, `fallback-diverged: ${detail}`);
+			return this.refuseCommitNotDurable(batch, durability.remoteHolders.length, durability, `fallback-diverged: ${detail}`);
 		}
-		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: request.actionId, error: detail });
-		if (armFreshness) this.markBlocksSeen(blockIds);
+		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: batch.actionId, error: detail });
+		if (armFreshness) this.markBlocksSeen(batch.blockIds);
 		// This node holds nothing: it is an UNCONFIRMED member when it is in the cohort (so the class
 		// is `majority`), and simply absent from the count when it is not (so the class can be `full`
 		// when every member confirmed). Both fall out of the one rule in `cohortWriteDurability`.
 		// Holding nothing, it is also no source for a push, so no shortfall is recorded here.
-		return await this.acknowledgeCommit(request, { success: true, durability: this.cohortWriteDurability(durability, false) }, false);
+		return await this.acknowledgeCommit(batch, { success: true, durability: this.cohortWriteDurability(durability, false) }, false);
+	}
+
+	/**
+	 * This node's own commit of every request of `batch`, in order, on the arm where its member did not
+	 * apply the record during consensus. A request that diverges — a thrown missing pend, or a returned
+	 * `missing-base-revision` refusal — is tolerated when the cohort reached commit consensus, and the
+	 * remaining requests are still applied, so this node holds as much of the record as it can; the
+	 * batch is then `diverged`, since this node does not hold all of it. Any other refusal stops the
+	 * loop and is the answer, as is a throw when the cohort did not reach consensus.
+	 *
+	 * Deliberately NOT self-signed (unlike the solo short-circuit): consensus ran on the cohort, so a
+	 * one-peer minted proof would be a FALSE statement about the committing cohort. The record's REAL
+	 * proof is threaded instead — executeClusterTransaction resolves only after the record's
+	 * promise/commit votes are populated, so the projection is genuine. Passed unconditionally,
+	 * threshold or not: persistProofIfContentMatches retains it under the digest-match rule, and a
+	 * record that never reached threshold simply yields a proof no verifier accepts — the same posture
+	 * ClusterMember.consensusCommitProof takes with its own projection.
+	 */
+	private async applyCommitsAfterConsensus(
+		batch: CommitBatch, record: ClusterRecord, options?: MessageOptions
+	): Promise<{ held: CommitSuccess } | { diverged: string } | { refused: WriteFailure }> {
+		const apply: StorageApplyOptions = { proof: buildBlockCommitProof(record), syncWithinMs: this.syncWindowFor(record) };
+		const consensusReached = clusterReachedCommitConsensus(record);
+		const held: CommitResult[] = [];
+		let diverged: string | undefined;
+		for (const request of batch.requests) {
+			let result: CommitResult;
+			try {
+				result = await this.localApply().commit(request, options, apply);
+			} catch (err) {
+				if (!consensusReached) throw err;
+				diverged ??= (err as Error).message;
+				continue;
+			}
+			if (result.success) {
+				held.push(result);
+			} else if (isMissingBaseRevisionFailure(result) && consensusReached) {
+				diverged ??= result.reason ?? MISSING_BASE_REVISION_REASON;
+			} else {
+				return { refused: result };
+			}
+		}
+		if (diverged !== undefined) return { diverged };
+		const folded = foldCommitResults(held);
+		return folded.success ? { held: folded } : { refused: folded };
 	}
 
 	/**
@@ -3441,9 +3546,9 @@ export class CoordinatorRepo implements IRepo {
 	 * is the consensus the commit ran on, absent for the solo short-circuit (no cohort ran, so no
 	 * holders to report).
 	 */
-	private async acknowledgeCommit(request: CommitRequest, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
-		if (localHolds && record !== undefined) this.reportBlockHolders(request, answer.durability, record);
-		const recorded = await this.noteReplicationShortfall(request, answer.durability, localHolds);
+	private async acknowledgeCommit(batch: CommitBatch, answer: CommitSuccess, localHolds: boolean, record?: ClusterRecord): Promise<CommitSuccess> {
+		if (localHolds && record !== undefined) this.reportBlockHolders(batch, answer.durability, record);
+		const recorded = await this.noteReplicationShortfall(batch, answer.durability, localHolds);
 		const self = this.localPeerId?.toString();
 		if (!recorded || self === undefined) return answer;
 		return { ...answer, durability: { ...answer.durability, recordedBy: self } };
@@ -3457,9 +3562,10 @@ export class CoordinatorRepo implements IRepo {
 	 * report can only misstate its own copy — a member already trusted with the commit. The members
 	 * the class names unconfirmed are reported as such, which withdraws any earlier record of them
 	 * (including the signer list this node's own member reported at apply), so they are pushed the
-	 * block. Never throws: the commit is already acknowledged.
+	 * block. One report covers every request of a batch: they ran on one cohort, so one answer describes
+	 * them all. Never throws: the commit is already acknowledged.
 	 */
-	private reportBlockHolders(request: CommitRequest, durability: WriteDurability, record: ClusterRecord): void {
+	private reportBlockHolders(batch: CommitBatch, durability: WriteDurability, record: ClusterRecord): void {
 		if (!this.onBlockHolders) return;
 		const self = this.localPeerId?.toString();
 		const unconfirmed = durability.unconfirmed ?? [];
@@ -3467,17 +3573,18 @@ export class CoordinatorRepo implements IRepo {
 			.filter(peerId => !unconfirmed.includes(peerId))
 			.filter(peerId => peerId === self || record.commits[peerId]?.type === 'approve');
 		try {
-			this.onBlockHolders({ blockIds: request.blockIds, holders, unconfirmed });
+			this.onBlockHolders({ blockIds: batch.blockIds, holders, unconfirmed });
 		} catch (err) {
-			this.log('coordinator-repo:block-holders-sink-error', { actionId: request.actionId, error: (err as Error).message });
+			this.log('coordinator-repo:block-holders-sink-error', { actionId: batch.actionId, error: (err as Error).message });
 		}
 	}
 
 	/**
 	 * Write down who is still missing an acknowledged commit, while this node still knows — the
 	 * cohort's answer is gone the moment the writer is answered, and the in-memory commit retry does
-	 * not survive a restart. One entry per block, all sharing this commit's one cohort answer
-	 * (consensus ran on `blockIds[0]`'s cohort for the whole request):
+	 * not survive a restart. One entry per block, at the revision and action of the request that wrote
+	 * it, all sharing this commit's one cohort answer (consensus ran on `blockIds[0]`'s cohort for the
+	 * whole batch):
 	 * - `full` settles any older entry for the block, whether or not this node holds it, and announces
 	 *   each entry it removed as a full-replication event — the copies it was waiting on are now on
 	 *   every member, at this commit's revision;
@@ -3504,7 +3611,7 @@ export class CoordinatorRepo implements IRepo {
 	 * ledger, and when any one block's recording failed: a writer told to wait on this node must
 	 * never wait on an event its ledger cannot produce.
 	 */
-	private async noteReplicationShortfall(request: CommitRequest, durability: WriteDurability, localHolds: boolean): Promise<boolean> {
+	private async noteReplicationShortfall(batch: CommitBatch, durability: WriteDurability, localHolds: boolean): Promise<boolean> {
 		const ledger = this.underReplicationLedger;
 		if (ledger === undefined) return false;
 		// Blocks a torn commit abandoned were cancelled and hold nothing at this revision: there is no
@@ -3512,20 +3619,23 @@ export class CoordinatorRepo implements IRepo {
 		// No answer built in this class names `torn` today — the writer's transactor derives it after
 		// every coordinator has answered — so this guards against a future producer, not a current one.
 		const torn = new Set(durability.torn ?? []);
-		const blockIds = request.blockIds.filter(blockId => !torn.has(blockId));
-		const outcomes = await Promise.allSettled(blockIds.map(blockId =>
+		const writes = batch.requests.flatMap(request => request.blockIds
+			.filter(blockId => !torn.has(blockId))
+			.map(blockId => ({ request, blockId })));
+		const outcomes = await Promise.allSettled(writes.map(({ request, blockId }) =>
 			this.noteBlockShortfall(ledger, request, blockId, durability, localHolds)));
 		outcomes.forEach((outcome, i) => {
 			if (outcome.status === 'fulfilled') return;
+			const { request, blockId } = writes[i]!;
 			this.log('coordinator-repo:under-replication-record-failed', {
 				actionId: request.actionId,
-				blockId: blockIds[i],
+				blockId,
 				rev: request.rev,
 				quorum: durability.quorum,
 				error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)
 			});
 		});
-		return blockIds.length > 0 && outcomes.every(outcome => outcome.status === 'fulfilled' && outcome.value);
+		return writes.length > 0 && outcomes.every(outcome => outcome.status === 'fulfilled' && outcome.value);
 	}
 
 	/** @returns whether an entry was recorded for the block — never for a settle or a skip. */
@@ -3621,7 +3731,8 @@ export class CoordinatorRepo implements IRepo {
 	 * through. With neither, the node is genuinely alone or has never identified another member of
 	 * its group.
 	 */
-	private async commitSolo(request: CommitRequest, blockIds: BlockId[], cohort: CohortResolution, options?: MessageOptions): Promise<CommitResult> {
+	private async commitSolo(batch: CommitBatch, cohort: CohortResolution, options?: MessageOptions): Promise<CommitResult> {
+		const blockIds = batch.blockIds;
 		const cohortPeerIds = cohort.resolved ? cohort.peerIds : [];
 		const peerCount = cohortPeerIds.length;
 		const soloDurability = await this.soloCohortDurability(cohort, blockIds[0]!);
@@ -3641,7 +3752,7 @@ export class CoordinatorRepo implements IRepo {
 		// coordinatingBlockIds at its choke point, so the solo artifact must carry it too or a
 		// solo proof's message is distinguishable from every other proof's.
 		const message: RepoMessage = {
-			operations: [{ commit: request }],
+			operations: batch.operations,
 			coordinatingBlockIds: [blockIds[0]!],
 			expiration: options?.expiration ?? Date.now() + this.DEFAULT_TIMEOUT
 		};
@@ -3649,9 +3760,10 @@ export class CoordinatorRepo implements IRepo {
 		// then the commit lands proof-less, exactly the pre-mint behavior. It rides down on the
 		// named ILocalApply contract; a plain IRepo double ignores the extra argument. Strict, no
 		// `syncWithinMs`: no consensus ran, and only this machine holds the write, so it is synced
-		// before the writer is answered.
+		// before the writer is answered. One proof covers the batch, as one record's proof does on
+		// the cluster path; each block's commit keeps it under the digest its own request declared.
 		const proof = await this.localCluster?.mintSoloCommitProof?.(message);
-		const result = await this.localApply().commit(request, options, { proof });
+		const result = await this.applyCommitsInOrder(batch, options, { proof });
 		if (!result.success) return result;
 		// One self-approval arms the read-repair window only where the DECLARED cohort is also one
 		// — then no rival quorum can exist to be missed. At any larger declared size (including
@@ -3661,7 +3773,23 @@ export class CoordinatorRepo implements IRepo {
 		// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
 		// consult storm bounded at one per window).
 		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
-		return await this.acknowledgeCommit(request, { ...result, durability: soloDurability }, true);
+		return await this.acknowledgeCommit(batch, { ...result, durability: soloDurability }, true);
+	}
+
+	/**
+	 * Commit each request of `batch` to this node's own storage, in order, stopping at the first
+	 * refusal, which is the answer; otherwise the requests' successes folded into one. A refusal leaves
+	 * the earlier requests committed: they are this action's own revisions, which a retry of the action
+	 * meets as already done (`isOwnRevision`).
+	 */
+	private async applyCommitsInOrder(batch: CommitBatch, options: MessageOptions | undefined, apply: StorageApplyOptions): Promise<CommitResult> {
+		const results: CommitResult[] = [];
+		for (const request of batch.requests) {
+			const result = await this.localApply().commit(request, options, apply);
+			results.push(result);
+			if (!result.success) break;
+		}
+		return foldCommitResults(results);
 	}
 
 	/**
@@ -3671,11 +3799,11 @@ export class CoordinatorRepo implements IRepo {
 	 * re-drive at a fresh revision — the path a conflict-shaped answer already puts it on. The
 	 * read-repair window is deliberately NOT armed: nothing about this commit is freshness evidence.
 	 */
-	private refuseCommitNotDurable(request: CommitRequest, durableHolders: number, durability: CohortDurability, arm: string): StaleFailure {
+	private refuseCommitNotDurable(batch: CommitBatch, durableHolders: number, durability: CohortDurability, arm: string): StaleFailure {
 		const cohortSize = durability.cohortPeerIds.length;
 		this.log('coordinator-repo:commit-not-durable', {
-			actionId: request.actionId,
-			rev: request.rev,
+			actionId: batch.actionId,
+			revs: batch.requests.map(request => request.rev),
 			durableHolders,
 			cohortSize,
 			remoteHolders: durability.remoteHolders,
@@ -3686,9 +3814,25 @@ export class CoordinatorRepo implements IRepo {
 		return {
 			success: false,
 			conflict: true,
-			reason: `${COMMIT_NOT_DURABLE_REASON}: ${durableHolders} of ${cohortSize} cohort member(s) report holding rev ${request.rev} of action ${request.actionId} (${arm})`
+			reason: `${COMMIT_NOT_DURABLE_REASON}: ${durableHolders} of ${cohortSize} cohort member(s) report holding ${describeRevisions(batch)} of action ${batch.actionId} (${arm})`
 		};
 	}
+}
+
+/** A rival confirmed holding one commit request's revision: its highest such block, and the revision
+ *  that request asked for. */
+interface CommitRival {
+	readonly staleAt: NonNullable<StaleFailure['staleAt']>;
+	readonly requestedRev: number;
+}
+
+/** What one commit request's blocks say about who holds its revision — see `CoordinatorRepo.commitRevisionHolder`. */
+type CommitRevisionHolder = 'own-durable' | CommitRival | undefined;
+
+/** The revisions a commit batch asks for, as prose: `rev 5` for one request, `revs 5, 3` for several. */
+function describeRevisions(batch: CommitBatch): string {
+	const revs = batch.requests.map(request => request.rev);
+	return revs.length === 1 ? `rev ${revs[0]}` : `revs ${revs.join(', ')}`;
 }
 
 /**

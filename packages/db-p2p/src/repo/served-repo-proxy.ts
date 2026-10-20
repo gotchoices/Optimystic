@@ -16,6 +16,9 @@ import type { ArchiveServingRepo, ProofRetainingRepo } from "../storage/block-ar
  *
  *  - The four `IRepo` members go to the COORDINATED repo once one exists, falling back to local
  *    storage before assembly finishes — a client request must get cluster-coordinated semantics.
+ *    The two batch members go to the coordinated repo too, and have no fallback: running a batch as
+ *    one record is a coordinator's job, so before assembly finishes they throw, and the writer sends
+ *    the collections one request each.
  *  - {@link ArchiveServingRepo.getBlockProof} goes UNCONDITIONALLY to local storage. A peer
  *    answering a repair fetch reports the proof IT retained, the same reason the read behind it
  *    passes `skipClusterFetch`; one that re-asked its cohort would launder another peer's evidence
@@ -49,6 +52,16 @@ export function createServedRepoProxy(
 			// request. Neither flows through this member, correctly: both are this node's own
 			// concern and never go on the wire.
 			return await target().commit(request, options);
+		},
+		async pendMany(requests, options) {
+			const repo = coordinated();
+			if (!repo?.pendMany) throw new Error('no coordinator is assembled on this node to run a batch of pends');
+			return await repo.pendMany(requests, options);
+		},
+		async commitMany(requests, options) {
+			const repo = coordinated();
+			if (!repo?.commitMany) throw new Error('no coordinator is assembled on this node to run a batch of commits');
+			return await repo.commitMany(requests, options);
 		},
 		async getBlockProof(blockId, rev) {
 			return await local.getBlockProof(blockId, rev);

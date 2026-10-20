@@ -20,6 +20,7 @@ import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer }
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { stateHoldingsOnReads } from '../repo/stated-holdings.js';
+import { forwardedBatchMethods } from '../repo/request-batch.js';
 import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {
@@ -862,6 +863,7 @@ function arrivingFrom(repo: IRepo, asker: string): IRepo {
 		get: (blockGets, options) => repo.get(blockGets, { ...options, asker }),
 		pend: (request, options) => repo.pend(request, options),
 		cancel: (actionRef, options) => repo.cancel(actionRef, options),
-		commit: (request, options) => repo.commit(request, options)
+		commit: (request, options) => repo.commit(request, options),
+		...forwardedBatchMethods(repo)
 	};
 }

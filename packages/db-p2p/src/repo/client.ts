@@ -8,6 +8,7 @@ import { ProtocolClient } from "../protocol-client.js";
 import type { RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { commitBatchOf, pendBatchOf } from "./request-batch.js";
 
 export class RepoClient extends ProtocolClient implements IRepo {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
@@ -45,6 +46,28 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			[{ commit: request }],
 			options
 		);
+	}
+
+	/**
+	 * Every request in one message, which the coordinator runs as one consensus record and answers
+	 * together (`IRepo.pendMany`). A list that is not a batch throws here, before anything is sent.
+	 *
+	 * NOTE: one message carries every collection's transforms, and in session mode each request's own
+	 * copy of the validation payload. A SQL write's collections are a handful, well inside the repo
+	 * protocol's frame limit (`MAX_BLOCK_MESSAGE_BYTES`); a transaction wide enough to reach it would be
+	 * refused whole, and the writer should then split it.
+	 * NOTE: a coordinator on a build that predates batches reads only the first operation, and answers
+	 * as if the others had not been sent — a commit that silently leaves collections behind. Mixed
+	 * builds are out of scope today; a rollout that must run them has to gate batches on the
+	 * coordinator's version.
+	 */
+	async pendMany(requests: readonly PendRequest[], options: MessageOptions): Promise<PendResult> {
+		return this.processRepoMessage<PendResult>(pendBatchOf(requests).operations, options);
+	}
+
+	/** {@link pendMany}'s commit twin (`IRepo.commitMany`); the same two NOTEs apply. */
+	async commitMany(requests: readonly CommitRequest[], options: MessageOptions): Promise<CommitResult> {
+		return this.processRepoMessage<CommitResult>(commitBatchOf(requests).operations, options);
 	}
 
 	private extractCorrelationId(operations: RepoMessage['operations']): string | undefined {
