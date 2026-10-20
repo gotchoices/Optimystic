@@ -8,6 +8,7 @@ import type { Action, ActionHandler, BlockId, BlockStore, IBlock, ITransactor, B
 import { BlockUnavailableError, BlockPossiblyStaleError, SlotHoldAfterLosses } from '../src/index.js'
 import debug from 'debug'
 import { captureCollectionLog } from './capture-log.js'
+import { EntriesPerBlock } from '../src/chain/chain.js'
 
 interface TestAction {
   value: string
@@ -1778,18 +1779,25 @@ describe('Collection', () => {
     })
 
     /**
-     * Serves the header block on the first read and hides it from every read afterwards.
-     * `open` probes the header directly, then re-reads it through the tracker/cache to open
-     * the log — so this reproduces storage that goes unavailable between those two reads.
+     * Serves the header block on the first read and hides it from every read afterwards, running
+     * `between` once after that first read is answered and before it is returned. `open` reads the
+     * header, then the log tail it names, and keeps both for the walk; it re-reads the header
+     * through the tracker/cache only when it declines to keep its copy, as it does when a commit
+     * between the two reads rolled the log over. So this reproduces storage that goes unavailable
+     * between those two reads of the header.
      */
     class VanishingHeaderTransactor implements ITransactor {
       private headerReads = 0
-      constructor(private readonly inner: TestTransactor, private readonly headerId: string) {}
+      constructor(private readonly inner: TestTransactor, private readonly headerId: string, private readonly between: () => Promise<void>) {}
 
       async get(blockGets: BlockGets): Promise<GetBlockResults> {
         const results = await this.inner.get(blockGets)
-        if (blockGets.blockIds.includes(this.headerId) && this.headerReads++ > 0) {
-          delete results[this.headerId]
+        if (blockGets.blockIds.includes(this.headerId)) {
+          if (this.headerReads++ > 0) {
+            delete results[this.headerId]
+          } else {
+            await this.between()
+          }
         }
         return results
       }
@@ -1801,10 +1809,16 @@ describe('Collection', () => {
 
     it('should throw, not read empty, when a probed header\'s log will not open', async () => {
       const created = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
-      await created.act({ type: 'set', data: { value: 'committed', timestamp: 1 } })
-      await created.updateAndSync()
+      const commit = async (timestamp: number) => {
+        await created.act({ type: 'set', data: { value: 'committed', timestamp } })
+        await created.updateAndSync()
+      }
+      // Fill the first log block, so the commit between the open's two reads starts a new one.
+      for (let i = 1; i <= EntriesPerBlock; i++) {
+        await commit(i)
+      }
 
-      const vanishing = new VanishingHeaderTransactor(transactor, collectionId)
+      const vanishing = new VanishingHeaderTransactor(transactor, collectionId, () => commit(EntriesPerBlock + 1))
       await expect(Collection.open<TestAction>(vanishing, collectionId, initOptions))
         .to.be.rejectedWith(`Log not found for collection ${collectionId}`)
     })
@@ -2078,7 +2092,7 @@ describe('Collection', () => {
     })
 
     // A refresh KEEPS the header and log tail it just read, so the write that follows does not
-    // fetch the tail a second time (`Collection.keepWhatTheRefreshRead`). That keep is sound only
+    // fetch the tail a second time (`Collection.keepLogEnds`). That keep is sound only
     // at or below the revision the walk adopted: `readLogEnds` reads UNPINNED, so a walk landing
     // short leaves a tail whose content is newer than the view this handle now reads at, and
     // serving it from cache would fabricate a view that never existed — and would label it with a

@@ -766,10 +766,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       //
       // Built as a LOCAL, and published with the codec and index manager below only
       // once every await has succeeded — see the note at that publish point.
-      const collection = await this.collectionFactory.createOrGetCollection(
-        this.options,
-        txnState || undefined
-      );
+      //
+      // Opened together with the catalog read: neither reads the other's result, and each
+      // waits on its own network round trips.
+      const [collection, persistedSchema] = await Promise.all([
+        this.collectionFactory.createOrGetCollection(this.options, txnState || undefined),
+        this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor),
+      ]);
 
       // Resolve which schema to honour as the table's effective shape:
       //   - xCreate (DDL provided columns): keep the local DDL schema and
@@ -785,7 +788,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       // `this.tableSchema.columns.length` — the load arm below populates that list, so
       // reading it here would send a re-run (a retry after a failed attempt, or the
       // provisional→full upgrade) down the DDL-wins arm instead.
-      const persistedSchema = await this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor);
       let storedSchema: StoredTableSchema;
 
       if (this.declaredColumns) {
@@ -921,18 +923,13 @@ export class OptimysticVirtualTable extends VirtualTable {
         (indexName, transactor) => this.openIndexTree(indexName, transactor)
       );
 
-      await indexManager.initialize(txnState?.transactor);
-
       // Give every point-enforceable secondary UNIQUE constraint a backing index tree
       // so probeUniqueConstraint can probe it instead of full-scanning the table per
-      // DML row (an O(N) scan per row -> O(log n) point probe). Must run BEFORE
-      // registerCollections so the synthesized trees are present in getIndexTrees()
-      // when the bridge snapshots this table's collections.
+      // DML row (an O(N) scan per row -> O(log n) point probe). Opened with the declared
+      // index trees, BEFORE registerCollections, so the synthesized trees are present in
+      // getIndexTrees() when the bridge snapshots this table's collections.
       const uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
-      await indexManager.setUniqueEnforcementIndexes(
-        uniqueEnforcementIndexes,
-        txnState?.transactor,
-      );
+      await indexManager.initialize(txnState?.transactor, uniqueEnforcementIndexes);
 
       // Publish the rebuilt state in ONE synchronous step, after the last await.
       // doInitialize runs more than once for a table — the upgrade after a

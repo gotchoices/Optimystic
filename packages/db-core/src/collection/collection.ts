@@ -1024,8 +1024,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// the entry walk and the invalidation walk each start again from the header and the tail, and
 		// would otherwise fetch both every time. The seed came from UNPINNED reads and is served to
 		// reads pinned at the tail's claim, which is sound: the tail's content at its own claimed
-		// revision is that pinned view, and the header changes only when the tail block fills, which
-		// Chain.getTail already tolerates by following `nextId` from whichever tail the header names.
+		// revision is that pinned view, and the only part of the header a log walk reads — where the
+		// chain starts and ends — changes only when the tail block fills, which Chain.getTail already
+		// tolerates by following `nextId` from whichever tail the header names. (The rest of the header,
+		// a tree's root for one, is not read here; the handle's own cache keeps the header only under
+		// the stricter rule in {@link keepLogEnds}.)
 		// NOTE: the cache keeps its default size (128 blocks, about 4,000 log entries). The entry walk
 		// reads every log block back to the head (no checkpoints), newest first, so past that size
 		// the newest blocks are evicted first and the invalidation walk fetches them again. If logs
@@ -2285,11 +2288,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * letting that walk stop short, read the known tail in its own request instead.
 	 *
 	 * `tailFloor` (see {@link updateInternal}) goes on whichever request reads the tail — never on
-	 * the header, which is rewritten only when the tail rolls over, so its revision says nothing about
-	 * the collection's. It is not raised into the handle's {@link floors}: a standing floor on the tail
-	 * id this handle remembers would be wrong once that tail rolls over, because a filled tail's last
-	 * revision is the roll-over's, below the floor, so every later read of it (the chain walk, the
-	 * invalidation walk) would be judged too old for the life of the handle.
+	 * the header, which is rewritten only when the tail rolls over or the collection changes it
+	 * itself (a tree's root moving), so its revision says nothing about the collection's. It is not
+	 * raised into the handle's {@link floors}: a standing floor on the tail id this handle remembers
+	 * would be wrong once that tail rolls over, because a filled tail's last revision is the
+	 * roll-over's, below the floor, so every later read of it (the chain walk, the invalidation walk)
+	 * would be judged too old for the life of the handle.
 	 *
 	 * @returns undefined when the header is authoritatively absent. */
 	private static async readLogEnds(transactor: ITransactor, id: CollectionId, knownTailId: BlockId | undefined, tailFloor?: number): Promise<LogEnds | undefined> {

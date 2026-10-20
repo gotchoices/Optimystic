@@ -72,7 +72,7 @@ A **write** pays that same refresh plus what the write itself needs: one request
 nothing else has committed since this handle last looked, two when another handle has.
 The second is the leaf the other writer changed, which has to be re-read. There is no
 third, because the refresh KEEPS the header and log tail it just read in the collection's
-own cache (`Collection.keepWhatTheRefreshRead`, the last move of
+own cache (`Collection.keepLogEnds`, the last move of
 `Collection.forgetAndAdopt`'s one synchronous step). Without it the tail is fetched twice
 per contended write: the walked entry names the log tail — a commit's blocks include the
 log block its entry was appended to — so the clear beside that entry drops the tail, and
@@ -83,6 +83,19 @@ the view the handle now reads at, and serving that would fabricate a view that n
 existed), and for anything under a floor that applies — checked at the seed itself
 (`BlockFloors.applicableTo`), because this path reads around `TransactorSource`, which is
 what applies floors on every other read.
+
+**Opening** a collection reads the same two blocks once each, with the same reader
+(`Collection.readLogEnds`) — the header, then the tail it names, in two requests, since the
+tail id is known only from the header — and keeps them in the new handle's cache by the same
+rule, so the walk that adopts the log's revision reads neither again. An open costs two
+requests; opening, the first refresh and one point read cost four. The header gets one more
+condition at both sites, because it and the tail are not read at one moment: a commit landing
+between the two reads that rewrote the header — a log roll-over, or a tree's root moving, since
+a tree's header names its root — would leave a header older than the revision the tail was
+adopted at. So the header is kept only when the tail read is still the last log block and none
+of its entries above the header's revision changed the header
+(`Collection.headerCurrentThroughTail` in `packages/db-core/src/collection/collection.ts`);
+otherwise its next read goes to storage, pinned at the adopted revision.
 
 A suspected gap — that `count(*)` alone skipped the pull and so a count-only
 consumer never saw a peer's appends — was investigated and **empirically

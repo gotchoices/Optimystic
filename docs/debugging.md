@@ -343,8 +343,9 @@ index holds only its own rows" symptom while leaving the main table fine — a f
 of lines separates from "the index collection was absent from the commit".
 
 **The collection id in these lines IS the collection's header block id.** `CollectionId` is a
-`BlockId` (`packages/db-core/src/collection/struct.ts`), and `Collection.probeHeader` reads the
-header with `source.tryGet(id)` — the collection id used directly as a block id. So two nodes
+`BlockId` (`packages/db-core/src/collection/struct.ts`), and `Collection.readLogEnds`, which every
+open and refresh starts from, asks for the header under the collection id itself — the
+collection id used directly as a block id. So two nodes
 naming the same id are addressing the same header block; identity cannot fork, and there is
 nothing to gain by printing a block id separately (do not go looking for one — a collection id is
 simply its URI with `tree://` stripped). What CAN differ between two nodes is the revision each is

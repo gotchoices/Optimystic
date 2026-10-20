@@ -3,11 +3,32 @@ import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { KeyRange, KeyBound } from '../src/btree/index.js'
 import { isTransformsEmpty, copyTransforms } from '../src/index.js'
+import type { BlockGets, GetBlockResults } from '../src/index.js'
 
 interface TestEntry {
   key: number
   value: string
   metadata?: Record<string, unknown>
+}
+
+/** Runs a callback once, after the next read of a header block alone has been answered and before
+ *  that answer is returned: the gap between an open's header read and the tail read it makes next. */
+class HeaderReadGapTransactor extends TestTransactor {
+  private gap?: { headerId: string, run: () => Promise<void> }
+
+  inGapAfterHeaderRead(headerId: string, run: () => Promise<void>): void {
+    this.gap = { headerId, run }
+  }
+
+  override async get(gets: BlockGets): Promise<GetBlockResults> {
+    const results = await super.get(gets)
+    const gap = this.gap
+    if (gap && gets.blockIds.length === 1 && gets.blockIds[0] === gap.headerId) {
+      this.gap = undefined
+      await gap.run()
+    }
+    return results
+  }
 }
 
 describe('Tree', () => {
@@ -543,6 +564,31 @@ describe('Tree', () => {
       const verifier = (await Tree.open<number, TestEntry>(net, id, e => e.key))!
       expect(await verifier.get(3)).to.deep.equal({ key: 3, value: 'three' })
       expect(await verifier.get(1)).to.deep.equal({ key: 1, value: 'one' })
+    })
+
+    it('should read every row when a commit that moves the root lands between the open\'s two reads', async () => {
+      // An open reads the header, then the log tail it names, and keeps both in the new handle's
+      // cache. A commit landing between the two reads leaves the context adopted from the tail at
+      // that commit's revision while the header was read before it. A tree's header names its root,
+      // so a commit that splits the root rewrites the header without rolling the log over: kept, the
+      // stale copy would send every read through the old root, which now holds part of the tree.
+      const net = new HeaderReadGapTransactor()
+      const id = 'open-across-root-split'
+      const capacity = 4
+      const row = (key: number): [number, TestEntry] => [key, { key, value: `v${key}` }]
+      const rootOf = async () => ((await net.get({ blockIds: [id] }))[id]?.block as { rootId?: string } | undefined)?.rootId
+
+      const writer = await Tree.createOrOpen<number, TestEntry>(net, id, e => e.key, undefined, capacity)
+      await writer.replace([1, 2, 3].map(row))
+      const rootBefore = await rootOf()
+
+      net.inGapAfterHeaderRead(id, async () => { await writer.replace([4, 5, 6, 7, 8, 9].map(row)) })
+      const opened = (await Tree.open<number, TestEntry>(net, id, e => e.key, undefined, capacity))!
+      expect(await rootOf(), 'the commit in the gap moved the root').to.not.equal(rootBefore)
+
+      for (let key = 1; key <= 9; ++key) {
+        expect(await opened.get(key), `row ${key}`).to.deep.equal(row(key)[1])
+      }
     })
   })
 })

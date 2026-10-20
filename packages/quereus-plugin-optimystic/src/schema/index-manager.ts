@@ -233,13 +233,12 @@ export class IndexManager {
 	) {}
 
 	/**
-	 * Initialize all indexes for the table
+	 * Open a tree for every declared index and for each of `uniqueEnforcement` (see
+	 * {@link setUniqueEnforcementIndexes}), all at once.
 	 */
-	async initialize(transactor?: ITransactor): Promise<void> {
-		for (const index of this.schema.indexes) {
-			const tree = await this.indexTreeFactory(index.name, transactor);
-			this.indexTrees.set(index.name, tree);
-		}
+	async initialize(transactor: ITransactor | undefined, uniqueEnforcement: StoredIndexSchema[]): Promise<void> {
+		this.uniqueEnforcementIndexes = uniqueEnforcement;
+		await this.openTrees([...this.schema.indexes, ...uniqueEnforcement], transactor);
 	}
 
 	/**
@@ -253,24 +252,32 @@ export class IndexManager {
 
 	/**
 	 * Replace the set of unique-enforcement index descriptors and open a tree for each
-	 * that does not already have one. Called once during table init AFTER
-	 * {@link initialize}, with the descriptors the vtab synthesized for every
-	 * point-enforceable UNIQUE constraint that lacks a declared backing index. The
-	 * trees land in the same `indexTrees` map as declared indexes, so
-	 * {@link getIndexTrees} (and thus the vtab's dirty-marking / bridge registration)
-	 * includes them with no further wiring.
+	 * that does not already have one. The descriptors are the ones the vtab synthesized
+	 * for every point-enforceable UNIQUE constraint that lacks a declared backing index:
+	 * table init hands its set to {@link initialize}, and a `DROP INDEX` that leaves such a
+	 * constraint without its declared backing index calls this with the enlarged set
+	 * (`reassignUniqueEnforcement` in the vtab). The trees land in the same
+	 * `indexTrees` map as declared indexes, so {@link getIndexTrees} (and thus the vtab's
+	 * dirty-marking / bridge registration) includes them with no further wiring.
 	 */
 	async setUniqueEnforcementIndexes(
 		descriptors: StoredIndexSchema[],
 		transactor?: ITransactor
 	): Promise<void> {
 		this.uniqueEnforcementIndexes = descriptors;
-		for (const descriptor of descriptors) {
-			if (!this.indexTrees.has(descriptor.name)) {
-				const tree = await this.indexTreeFactory(descriptor.name, transactor);
-				this.indexTrees.set(descriptor.name, tree);
-			}
-		}
+		await this.openTrees(descriptors, transactor);
+	}
+
+	/**
+	 * Open, concurrently, a tree for each of `descriptors` that has none yet. The trees are
+	 * registered in descriptor order once every open has resolved, so the order of
+	 * {@link getIndexTrees} — which the bridge registers collections in — never depends on
+	 * which open finished first. When one open fails, none is registered.
+	 */
+	private async openTrees(descriptors: StoredIndexSchema[], transactor: ITransactor | undefined): Promise<void> {
+		const unopened = descriptors.filter(descriptor => !this.indexTrees.has(descriptor.name));
+		const trees = await Promise.all(unopened.map(descriptor => this.indexTreeFactory(descriptor.name, transactor)));
+		unopened.forEach((descriptor, i) => this.indexTrees.set(descriptor.name, trees[i]!));
 	}
 
 	/**

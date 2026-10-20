@@ -157,7 +157,7 @@ async update() {
     this.raiseFloors(entry, revisionOf(entry));
   }
   this.source.actionContext = latest?.context;   // monotonic in the real code (advanceContext)
-  this.keepWhatTheRefreshRead(ends.served);      // at or below the adopted revision, and above any floor
+  Collection.keepLogEnds(this.sourceCache, this.floors, this.source.actionContext, ends);  // at or below the adopted revision, above any floor; the header only if still current
 
   // 5. Replay local actions on the ADOPTED state — after step 4, never before it
   if (anyConflicts) {
@@ -172,7 +172,7 @@ Key aspects of the update process:
 
 - **Incremental**: Only fetches changes since the last known revision
 - **Conflict-aware**: Detects when local and remote changes affect the same blocks
-- **Selective caching**: Only invalidates cache for affected blocks, and the collection header and log tail block the refresh itself read are KEPT rather than fetched again. A write that follows another handle's commit otherwise fetches the log tail twice — once in the refresh, and again when `Chain.add` reads the tail to append its own entry, the walked entry having dropped it from the cache in between. The keep is made only at or below the revision the walk adopted (`readLogEnds` reads unpinned, so it can come back newer than the view the handle now reads at) and only above any floor that applies, since nothing else on that path applies one
+- **Selective caching**: Only invalidates cache for affected blocks, and the collection header and log tail block the refresh itself read are KEPT rather than fetched again. A write that follows another handle's commit otherwise fetches the log tail twice — once in the refresh, and again when `Chain.add` reads the tail to append its own entry, the walked entry having dropped it from the cache in between. The keep is made only at or below the revision the walk adopted (`readLogEnds` reads unpinned, so it can come back newer than the view the handle now reads at) and only above any floor that applies, since nothing else on that path applies one. The header is kept only when nothing can have rewritten it since it was read — the tail read is still the last log block and none of its entries above the header's revision changed the header — because the two blocks are not read at one moment. Opening a collection keeps the same two blocks by the same rule, so its walk reads neither again
 - **Too-old answers are not kept**: Each invalidated block is remembered with the revision of the log entry that changed it. If the re-read is then answered with older content — a storage node that has not caught up — the reader still gets it, but the cache does not keep it, so the next read asks again (see "A block re-read after a refresh can be answered too old" in [internals.md](../../../docs/internals.md#a-block-re-read-after-a-refresh-can-be-answered-too-old-and-is-never-remembered))
 - **Action replay**: Re-applies local actions on the updated state to resolve conflicts
 

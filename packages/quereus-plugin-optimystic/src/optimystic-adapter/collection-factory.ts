@@ -54,6 +54,13 @@ export class CollectionFactory {
    */
   private nodeTagValue = randomNodeTag();
   private transactors = new Map<string, ITransactor>();
+  /**
+   * Transactor constructions still in flight, by the key {@link transactors} will hold them under.
+   * A table's first initialization opens its collection and reads the catalog together, and both
+   * resolve the same transactor: without this, each would miss {@link transactors} and build its
+   * own — two libp2p nodes, or two `local` stores neither of which sees the other's writes.
+   */
+  private transactorsInFlight = new Map<string, Promise<ITransactor>>();
   private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
@@ -195,7 +202,9 @@ export class CollectionFactory {
   }
 
   /**
-   * Get or create a transactor (with caching)
+   * Get or create a transactor (with caching). Concurrent callers for one key share a single
+   * construction ({@link transactorsInFlight}); a construction that fails is not remembered, so
+   * the next caller tries again.
    */
   async getOrCreateTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const transactorKey = this.getTransactorKey(options);
@@ -204,9 +213,17 @@ export class CollectionFactory {
       return this.transactors.get(transactorKey)!;
     }
 
-    const transactor = await this.createTransactor(options);
-    this.transactors.set(transactorKey, transactor);
-    return transactor;
+    let inFlight = this.transactorsInFlight.get(transactorKey);
+    if (!inFlight) {
+      inFlight = this.createTransactor(options)
+        .then(transactor => {
+          this.transactors.set(transactorKey, transactor);
+          return transactor;
+        })
+        .finally(() => this.transactorsInFlight.delete(transactorKey));
+      this.transactorsInFlight.set(transactorKey, inFlight);
+    }
+    return await inFlight;
   }
 
   /**
