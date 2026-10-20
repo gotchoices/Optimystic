@@ -188,4 +188,22 @@ describe('a consensus record carrying several collections of one action', () => 
 		expect(blocks[INDEX_TAIL]?.state?.latest).to.deep.equal({ actionId: ACTION, rev: INDEX_REV });
 		expect(member.getExecutedCommitResult(promised.messageHash)?.success).to.equal(true);
 	});
+
+	it('answers a refused commit record when this member cannot hold one collection', async () => {
+		// This member never saw the table's pend — only the index's — and has no peer to reconcile
+		// from. The table's commit is the FIRST operation, so a member keeping the last operation's
+		// verdict would report the index's success and count toward the durability gate for a
+		// revision it does not hold.
+		const [, indexPend] = batchPends();
+		if (indexPend && 'pend' in indexPend) expect((await storage.pend(indexPend.pend)).success).to.equal(true);
+		const promised = await member.update(await freshRecord(batchCommits()));
+		expect(promised.promises[self.peerId.toString()]?.type).to.equal('approve');
+
+		await member.update(await decidedByOther(promised));
+
+		const blocks = await storage.get({ blockIds: [TABLE_TAIL, INDEX_TAIL] });
+		expect(blocks[INDEX_TAIL]?.state?.latest, 'the index committed').to.deep.equal({ actionId: ACTION, rev: INDEX_REV });
+		expect(blocks[TABLE_TAIL]?.state?.latest?.rev, 'the table did not').to.equal(TABLE_REV - 1);
+		expect(member.getExecutedCommitResult(promised.messageHash)?.success, 'one collection not held refuses the record').to.equal(false);
+	});
 });
