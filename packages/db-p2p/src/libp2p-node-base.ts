@@ -26,7 +26,7 @@ import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js'
 import { answerFromArchiveResponse, claimFromConsultAnswer, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
-import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type CohortCommitAppliedSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
@@ -1441,6 +1441,13 @@ export async function createLibp2pNodeBase(
 			return { peers: peers ?? {}, confidence };
 		};
 
+		// A consensus commit the member applies — whichever node coordinated it — marks its blocks
+		// freshly checked in the coordinator's read-repair window, by the rule the coordinator's own
+		// commits stamp under (`CoordinatorRepo.noteCohortCommitApplied`). Late-bound because the member
+		// is built before the coordinator it reports to; bound right after the coordinator below.
+		let cohortCommitAppliedTarget: CohortCommitAppliedSink | undefined;
+		const onCohortCommitApplied: CohortCommitAppliedSink = (applied) => cohortCommitAppliedTarget?.(applied);
+
 		clusterImpl = clusterMember({
 			storageRepo,
 			peerNetwork: keyNetwork,
@@ -1456,6 +1463,7 @@ export async function createLibp2pNodeBase(
 			reconcileBlock,
 			onCommitCertificate,
 			onBlockHolders,
+			onCohortCommitApplied,
 			deriveExpectedCluster,
 			createClusterClient,
 			durabilityWindowFor
@@ -1592,7 +1600,7 @@ export async function createLibp2pNodeBase(
 			return { answers };
 		};
 
-		coordinatedRepo = coordinatorRepoFactory({
+		const coordinator = coordinatorRepoFactory({
 			storageRepo,
 			localCluster: clusterImpl,
 			localPeerId: node.peerId,
@@ -1613,6 +1621,8 @@ export async function createLibp2pNodeBase(
 			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event),
 			durabilityWindowFor
 		});
+		coordinatedRepo = coordinator;
+		cohortCommitAppliedTarget = (applied) => coordinator.noteCohortCommitApplied(applied);
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
 		// coordinator (what declares a transaction committed on that super-majority) MUST run the same
@@ -1621,13 +1631,13 @@ export async function createLibp2pNodeBase(
 		// HERE at construction. See `assertSuperMajorityCoupling`.
 		assertSuperMajorityCoupling(
 			clusterImpl as import('./cluster/cluster-repo.js').ClusterMember,
-			coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo
+			coordinator
 		);
 
 		// Recover persisted transaction state before accepting new requests
 		if (options.transactionStateStore) {
 			await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
-			await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
+			await coordinator.recoverTransactions();
 		}
 
 		// --- Shared owned-block set for the resilience monitors ---

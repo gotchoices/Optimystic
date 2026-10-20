@@ -26,7 +26,7 @@ import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
-import { createMesh } from '../src/testing/mesh-harness.js';
+import { createMesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const captureCoordinatorLog = (fn: () => Promise<void>): Promise<unknown[][]> =>
 	captureLog('coordinator-repo', fn);
@@ -1235,6 +1235,26 @@ describe('CoordinatorRepo read-repair', () => {
 
 		for (const holder of holders) expect(mesh.consultRequests(reader!, holder), 'one request per peer, not one per block').to.equal(1);
 		for (const id of blockIds) expect(result[id]?.block, `${id} acquired from the answers`).to.not.equal(undefined);
+	});
+
+	it('a member that applied a commit another machine coordinated reads it inside the window without a consult', async () => {
+		// GitHub #43: on a two-member group the member that did not coordinate a write asked the writer,
+		// on its next read of each block, whether anything was newer than what the writer had just sent.
+		const mesh = await createMesh(2, { responsibilityK: 2, clusterPolicy: { repairCorroborationClusterSize: 2 } });
+		const [writer, member] = mesh.nodes as [MeshNode, MeshNode];
+		const written: BlockId = 'block-written-by-the-other-machine';
+		const transforms = { inserts: { [written]: { header: { id: written, type: 'test', collectionId: 'collection-1' } } }, updates: {}, deletes: [] };
+		expect((await writer.coordinatorRepo.pend({ actionId: 'a-write', rev: 1, transforms, policy: 'c' })).success, 'pend').to.equal(true);
+		expect((await writer.coordinatorRepo.commit({ actionId: 'a-write', blockIds: [written], tailId: written, rev: 1 })).success, 'commit').to.equal(true);
+
+		const captured = await captureCoordinatorLog(async () => {
+			const result = await member.coordinatorRepo.get({ blockIds: [written] });
+			await member.coordinatorRepo.settleHeldBlockConsults();
+			expect(result[written]?.state?.latest, 'the member holds the write').to.deep.equal({ actionId: 'a-write', rev: 1 });
+		});
+
+		expect(hasTag(captured, 'cluster-tx:read-repair-triggered'), 'no consult started').to.equal(false);
+		expect(mesh.consultRequests(member, writer), 'the writer is not asked about its own write').to.equal(0);
 	});
 
 	describe('a read from a cohort member that says what it holds', () => {

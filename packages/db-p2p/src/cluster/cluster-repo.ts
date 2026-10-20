@@ -247,6 +247,23 @@ export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => vo
  */
 export type BlockHoldersSink = (holders: BlockHolders) => void;
 
+/** A consensus commit this member now holds durably: its blocks, and the record's commit-approval
+ *  count over the cohort it ran on — what `CoordinatorRepo.noteCohortCommitApplied` weighs. */
+export interface CohortCommitApplied {
+	blockIds: readonly BlockId[];
+	approvals: number;
+	cohortSize: number;
+}
+
+/**
+ * Sink for each consensus commit this member durably applied, whichever node coordinated it — fed to
+ * this node's coordinator so its read-repair window counts the member's copy freshly checked by the rule
+ * its own commits stamp under (`CoordinatorRepo.noteCohortCommitApplied`). Fired where the
+ * {@link BlockHoldersSink} is: on a durable apply, and on the later success of a behind-refused commit's
+ * reconcile; never on a refusal. Optional; a throwing sink is isolated + logged.
+ */
+export type CohortCommitAppliedSink = (applied: CohortCommitApplied) => void;
+
 /**
  * Applies a consensus-ordered {@link InvalidateRequest} to local storage — the deterministic
  * reversal every member runs once consensus on the invalidation is reached. The implementation
@@ -372,6 +389,8 @@ interface ClusterMemberComponents {
 	onCommitCertificate?: CommitCertificateSink;
 	/** Receives who holds each consensus commit this member durably applied; see {@link BlockHoldersSink}. */
 	onBlockHolders?: BlockHoldersSink;
+	/** Receives each consensus commit this member durably applied, with its approvals; see {@link CohortCommitAppliedSink}. */
+	onCohortCommitApplied?: CohortCommitAppliedSink;
 	/** Applies a consensus-ordered invalidation to local storage; see {@link InvalidationApplySink}. */
 	onInvalidate?: InvalidationApplySink;
 	/** Layer-2 arbitrator-set recompute for invalidation verification; see {@link RecomputeArbitratorSetCapability}. */
@@ -428,7 +447,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.now,
 		components.onBlockHolders,
 		components.createClusterClient,
-		components.durabilityWindowFor
+		components.durabilityWindowFor,
+		components.onCohortCommitApplied
 	);
 }
 
@@ -451,6 +471,13 @@ export const CONFLICT_STALE_THRESHOLD_MS = 2000;
  */
 function isMissingPendingActionError(err: unknown): boolean {
 	return err instanceof Error && /pending action .+ not found/i.test(err.message);
+}
+
+/** The cohort members (`record.peers`) that signed an approving commit vote on `record`. */
+function approvingCommitSigners(record: ClusterRecord): string[] {
+	return Object.entries(record.commits)
+		.filter(([peerId, vote]) => vote.type === 'approve' && peerId in record.peers)
+		.map(([peerId]) => peerId);
 }
 
 /**
@@ -625,7 +652,8 @@ export class ClusterMember implements ICluster {
 		now?: () => number,
 		private readonly onBlockHolders?: BlockHoldersSink,
 		createClusterClient?: (peerId: PeerId) => ICluster,
-		private readonly durabilityWindowFor?: DurabilityWindowFor
+		private readonly durabilityWindowFor?: DurabilityWindowFor,
+		private readonly onCohortCommitApplied?: CohortCommitAppliedSink
 	) {
 		this.now = now ?? ((): number => Date.now());
 		this.createClusterClient = createClusterClient
@@ -3136,17 +3164,22 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Retain a commit record's per-operation durable verdicts and their fold as this member's verdict
-	 * for the record (see {@link executedCommitResults}), and report the committed holders of each
-	 * operation that now succeeds and did not in `previous`. Shared by the consensus apply (nothing
-	 * previous) and {@link reconcileRefusedCommit} so both leave the same state behind.
+	 * for the record (see {@link executedCommitResults}), and report each operation that now succeeds
+	 * and did not in `previous` — its committed holders, and that this member holds it. Shared by the
+	 * consensus apply (nothing previous) and {@link reconcileRefusedCommit} so both leave the same
+	 * state behind.
 	 */
 	private retainCommitVerdicts(record: ClusterRecord, operations: readonly CommitOperationVerdict[], previous?: readonly CommitOperationVerdict[]): void {
 		this.executedCommitResults.set(record.messageHash, retainedCommitVerdicts(operations));
-		operations.forEach((operation, index) => {
-			if (operation.verdict.success && previous?.[index]?.verdict.success !== true) {
-				this.reportBlockHolders(record, operation.commit);
-			}
-		});
+		const nowHeld = operations.filter((operation, index) => operation.verdict.success && previous?.[index]?.verdict.success !== true);
+		if (nowHeld.length === 0) {
+			return;
+		}
+		const signers = approvingCommitSigners(record);
+		for (const { commit } of nowHeld) {
+			this.reportBlockHolders(commit, signers);
+			this.reportCohortCommitApplied(record, commit, signers.length);
+		}
 	}
 
 	/**
@@ -3364,23 +3397,36 @@ export class ClusterMember implements ICluster {
 	/**
 	 * Tell the {@link BlockHoldersSink} which cohort members hold a commit this member just
 	 * durably applied. A member learns nothing about the others' storage at apply time, so the
-	 * evidence is the record's approving commit signers: each is a cohort member that signed to apply
-	 * this commit. A signer that then failed to apply is wrongly recorded, which only spares it a
-	 * rebalance push; its own reconcile, read-repair, and — on the coordinating node — the
-	 * coordinator's durability-checked report (which lands after this one and overrides it) still
-	 * reach it.
+	 * evidence is the record's approving commit signers (`holders`, from {@link approvingCommitSigners}):
+	 * each is a cohort member that signed to apply this commit. A signer that then failed to apply is
+	 * wrongly recorded, which only spares it a rebalance push; its own reconcile, read-repair, and — on
+	 * the coordinating node — the coordinator's durability-checked report (which lands after this one
+	 * and overrides it) still reach it.
 	 */
-	private reportBlockHolders(record: ClusterRecord, commit: CommitRequest): void {
+	private reportBlockHolders(commit: CommitRequest, holders: string[]): void {
 		if (!this.onBlockHolders) {
 			return;
 		}
-		const holders = Object.entries(record.commits)
-			.filter(([peerId, vote]) => vote.type === 'approve' && peerId in record.peers)
-			.map(([peerId]) => peerId);
 		try {
 			this.onBlockHolders({ blockIds: commit.blockIds, holders });
 		} catch (err) {
 			log('cluster-member:block-holders-sink-error', { actionId: commit.actionId, error: (err as Error).message });
+		}
+	}
+
+	/**
+	 * Tell the {@link CohortCommitAppliedSink} that this member now durably holds `commit`, with the
+	 * record's approving commit signers counted over the cohort the record ran on — the evidence this
+	 * node's coordinator stamps its read-repair window by, as it does after a commit it coordinated.
+	 */
+	private reportCohortCommitApplied(record: ClusterRecord, commit: CommitRequest, approvals: number): void {
+		if (!this.onCohortCommitApplied) {
+			return;
+		}
+		try {
+			this.onCohortCommitApplied({ blockIds: commit.blockIds, approvals, cohortSize: Object.keys(record.peers).length });
+		} catch (err) {
+			log('cluster-member:cohort-commit-applied-sink-error', { actionId: commit.actionId, error: (err as Error).message });
 		}
 	}
 

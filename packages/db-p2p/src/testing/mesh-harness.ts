@@ -552,7 +552,11 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// Absent by default: `undefined` here is identical to omitting the field, and
 			// `validatePendOperations` then skips the validation step entirely.
 			validator: options.validatorFactory?.(index, peerId),
-			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders)),
+			// Production shape (`libp2p-node-base`): the member's consensus applies stamp its own node's
+			// read-repair window. Read at call time, so it reaches the coordinator built after this member,
+			// and after a restart the rebuilt one.
+			onCohortCommitApplied: (applied) => meshNode.coordinatorRepo.noteCohortCommitApplied(applied)
 		});
 	};
 

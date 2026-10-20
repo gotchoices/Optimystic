@@ -16,7 +16,7 @@ import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/d
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { foldCommitResults, foldPendResults } from "../cluster/batch-verdicts.js";
-import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives } from "../cluster/cluster-repo.js";
+import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives, CohortCommitApplied } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { BlockArchive } from "../storage/struct.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
@@ -953,8 +953,10 @@ export class CoordinatorRepo implements IRepo {
 		// #20, ticket drop-the-settled-absence-memo): a cohort-of-one memo outlived the view it was
 		// settled under, and a node whose view then grew served a block another coordinator had just
 		// committed as never created. Cohort-member writes (`ClusterRepo` → storage) never pass
-		// through this class, so nothing here could clear such a memo either. Revisit only with a memo
-		// bound to the cohort view it was settled under AND cleared by every writer of local storage;
+		// through this class — their consensus commits are only reported to it, for the freshness stamp
+		// (`noteCohortCommitApplied`), and pushed replicas not even that — so nothing here could clear
+		// such a memo either. Revisit only with a memo bound to the cohort view it was settled under
+		// AND cleared by every writer of local storage;
 		// `coordinator-repo-absence-write-bypass.spec.ts` is the gate, and backlog
 		// `feat-a-cohort-member-remembers-a-settled-absence` holds the design notes.
 		if (this.clusterLatestCallback && !skipClusterFetch) {
@@ -1420,7 +1422,7 @@ export class CoordinatorRepo implements IRepo {
 	 * floor does not consult again inside the window; omitted (a commit, or a pass not asked one) it
 	 * clears any floor recorded before — see {@link FreshnessStamp}.
 	 */
-	private markBlocksSeen(blockIds: BlockId[], floor?: number): void {
+	private markBlocksSeen(blockIds: readonly BlockId[], floor?: number): void {
 		const now = this.now();
 		for (const id of blockIds) {
 			this.lastSeenCommitMs.set(id, floor === undefined ? { at: now } : { at: now, floorConsulted: floor });
@@ -1453,6 +1455,35 @@ export class CoordinatorRepo implements IRepo {
 	private commitQuorumRulesOutRivals(approvals: number, observedCohortSize: number): boolean {
 		const fullCohortSize = Math.max(observedCohortSize, this.repairCorroborationClusterSize);
 		return approvals > fullCohortSize / 2;
+	}
+
+	/**
+	 * A consensus commit this node's own cluster member durably applied, whichever node coordinated it
+	 * (`ClusterMember`'s `onCohortCommitApplied`). Its blocks are marked freshly checked under the rule
+	 * this node's own commits are marked under ({@link commitQuorumRulesOutRivals}: the record's commit
+	 * approvals over the full cohort); below that bar nothing is marked and the next read consults as
+	 * before. Without it a
+	 * member of a two-machine group never stamped the blocks the other machine wrote, and its next read
+	 * of each asked the machine that had just sent it whether anything was newer (GitHub #43). Like the
+	 * commit-path stamps it records no floor, so it clears one recorded earlier: a commit is newer
+	 * evidence than any floor consulted under before it.
+	 *
+	 * The one writer of the stamp from outside this class, which is safe where an outside writer of an
+	 * absence memo was not (the NOTE on the cohort reconciliation in {@link get}): an absence memo says
+	 * "nothing is here", which any write to local storage falsifies, so every writer would have to clear
+	 * it. A stamp says "this copy matched the cohort at a past moment"; a later local write only makes
+	 * the copy newer, never staler, so no writer needs to clear it.
+	 *
+	 * NOTE: accepted tradeoff — a replica received by push (`BlockTransferService.handlePush`) is NOT
+	 * stamped, so its first read past the push consults once. A push carries the revision its SENDER
+	 * holds, and the under-replication drain and the growth push deliver it whenever this node becomes
+	 * reachable, possibly long after newer revisions committed without it: its proof says that revision
+	 * was committed once, not that nothing newer exists now, whereas a commit stamp is sound because
+	 * "now" is the moment the majority committed. Revisit if pushes dominate a profile, with a stamp
+	 * gated on the push's proof being for a revision the sender committed within the window.
+	 */
+	noteCohortCommitApplied(applied: CohortCommitApplied): void {
+		if (this.commitQuorumRulesOutRivals(applied.approvals, applied.cohortSize)) this.markBlocksSeen(applied.blockIds);
 	}
 
 	/**
