@@ -1,8 +1,9 @@
 import { expect } from 'chai';
 import {
-	latestClaimFromArchive, servableProof, serveBlockArchive, serveConsultAnswer, singleRevisionArchive,
-	type ArchiveServingRepo
+	claimFromConsultAnswer, fitConsultContent, latestClaimFromArchive, servableProof, serveBlockArchive, serveConsultAnswer,
+	singleRevisionArchive, type ArchiveServingRepo
 } from '../src/storage/block-archive.js';
+import type { SyncBlockAnswer } from '../src/sync/protocol.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { verifyBlockCommitProofClaim, verifyBlockCommitProofContent, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
@@ -361,6 +362,31 @@ describe('block archive commit proof', () => {
 			}
 
 			expect(await serveConsultAnswer(repo, OTHER_BLOCK, { rev: 2, actionId: ACTION_2 }), 'repo holds nothing').to.deep.equal({});
+		});
+	});
+
+	describe('fitConsultContent', () => {
+		it('keeps the first block\'s bytes whatever their size, and serves a later one past the budget as its claim and proof', async () => {
+			const { proof: proofA } = await makeSignedProof(3, makeCommit());
+			const { proof: proofB } = await makeSignedProof(3, makeCommit({ blockIds: [OTHER_BLOCK], tailId: OTHER_BLOCK }));
+			const first = singleRevisionArchive(BLOCK, { rev: 1, actionId: ACTION }, makeBlock(BLOCK), proofA);
+			const second = singleRevisionArchive(OTHER_BLOCK, { rev: 1, actionId: ACTION }, makeBlock(OTHER_BLOCK), proofB);
+			const answers: [BlockId, SyncBlockAnswer][] = [[BLOCK, { archive: first }], [OTHER_BLOCK, { archive: second }], ['block-3' as BlockId, {}]];
+
+			const fitted = fitConsultContent(answers, 1);
+
+			expect(fitted[0], 'the first block carrying bytes keeps them').to.deep.equal(answers[0]);
+			const [, sized] = fitted[1]!;
+			expect(sized.contentOmitted).to.equal('size');
+			expect(sized.archive!.range, 'its own revision').to.deep.equal([1, 2]);
+			expect(soleEntry(sized.archive!).block, 'no block').to.equal(undefined);
+			expect(soleEntry(sized.archive!).action.transform.insert, 'no transform copy').to.equal(undefined);
+			expect(soleEntry(sized.archive!).proof, 'its proof still rides').to.deep.equal(proofB);
+			// The asker must not reuse it as the peer's archive: unlike 'held', the peer may be ahead.
+			expect(claimFromConsultAnswer(sized)).to.deep.equal({ rev: 1, actionId: ACTION, proof: proofB });
+			expect(fitted[2], 'holds nothing passes through').to.deep.equal(answers[2]);
+
+			expect(fitConsultContent(answers, MAX_BLOCK_MESSAGE_BYTES), 'within budget, nothing is left out').to.deep.equal(answers);
 		});
 	});
 

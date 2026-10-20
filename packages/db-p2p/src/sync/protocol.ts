@@ -8,8 +8,20 @@ import type { BlockArchive } from '../storage/struct.js';
  * allowing nodes to request missing blocks from cluster peers or storage rings.
  */
 export interface SyncRequest {
-	/** Block ID to retrieve */
+	/**
+	 * Block ID to retrieve: the first (or only) block asked. With {@link blockIds}, MUST equal
+	 * `blockIds[0]`, so a server on an older build — which reads only this field — answers the first
+	 * block.
+	 */
 	blockId: BlockId;
+
+	/**
+	 * Every block a latest-revision consult asks about, in order, {@link blockId} first, at most
+	 * `MAX_CONSULT_BATCH_BLOCKS` (`protocol-limits.ts`). Requires {@link held} (possibly empty); the
+	 * server then answers each in {@link SyncResponse.answers}. A server on an older build ignores it
+	 * and answers `blockId` alone, which the asker tells apart by the missing `answers`.
+	 */
+	blockIds?: BlockId[];
 
 	/**
 	 * Optional specific revision to retrieve.
@@ -50,10 +62,13 @@ export interface SyncRequest {
 }
 
 /**
- * Why a block's bytes were left out of a {@link SyncBlockAnswer}. `'held'`: the asker already holds
- * the revision served, or a newer one.
+ * Why a block's bytes were left out of a {@link SyncBlockAnswer}.
+ *  - `'held'`: the asker already holds the revision served, or a newer one.
+ *  - `'size'`: the bytes would have pushed the response past its content budget
+ *    (`CONSULT_RESPONSE_CONTENT_BUDGET_BYTES`). Unlike `'held'`, this peer may be AHEAD of the asker,
+ *    so the asker must ask it again for the content if it needs it.
  */
-export type SyncContentOmitted = 'held';
+export type SyncContentOmitted = 'held' | 'size';
 
 /** One block's answer to a request that carried {@link SyncRequest.held}. */
 export interface SyncBlockAnswer {
@@ -82,7 +97,10 @@ export interface SyncResponse {
 	/** Peer ID of responder (for tracking/metrics) */
 	responderId?: string;
 
-	/** Present whenever the request carried {@link SyncRequest.held}: one answer per asked block. */
+	/**
+	 * Present whenever the request carried {@link SyncRequest.held}: one answer per asked block — each
+	 * of {@link SyncRequest.blockIds} up to the batch cap, or `blockId` alone without it.
+	 */
 	answers?: Record<BlockId, SyncBlockAnswer>;
 }
 

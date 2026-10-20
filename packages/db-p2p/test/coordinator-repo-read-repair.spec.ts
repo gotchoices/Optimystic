@@ -26,6 +26,7 @@ import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
+import { createMesh } from '../src/testing/mesh-harness.js';
 
 const captureCoordinatorLog = (fn: () => Promise<void>): Promise<unknown[][]> =>
 	captureLog('coordinator-repo', fn);
@@ -1216,6 +1217,24 @@ describe('CoordinatorRepo read-repair', () => {
 
 		expect(mostOpenAtOnce, 'both blocks\' consults in flight at once').to.equal(blockIds.length);
 		for (const id of blockIds) expect(result[id]?.state?.latest).to.deep.equal(held);
+	});
+
+	it('asks each cohort peer about every block of a read in one request', async () => {
+		// GitHub #43 counts `sync` requests between idle machines. The refresh every live query runs
+		// reads two blocks, so a request per block per peer doubled that count for nothing.
+		const mesh = await createMesh(3, { responsibilityK: 3 });
+		const [reader, ...holders] = mesh.nodes;
+		const blockIds: BlockId[] = ['block-header', 'block-log-tail'];
+		const inserts = Object.fromEntries(blockIds.map(id => [id, { header: { id, type: 'test', collectionId: 'collection-1' } }]));
+		for (const holder of holders) {
+			expect((await holder.storageRepo.pend({ actionId: 'a-two-blocks', transforms: { inserts, updates: {}, deletes: [] }, policy: 'c' })).success).to.equal(true);
+			expect((await holder.storageRepo.commit({ actionId: 'a-two-blocks', tailId: blockIds[0]!, rev: 1, blockIds })).success).to.equal(true);
+		}
+
+		const result = await reader!.coordinatorRepo.get({ blockIds });
+
+		for (const holder of holders) expect(mesh.consultRequests(reader!, holder), 'one request per peer, not one per block').to.equal(1);
+		for (const id of blockIds) expect(result[id]?.block, `${id} acquired from the answers`).to.not.equal(undefined);
 	});
 
 	describe('a read from a cohort member that says what it holds', () => {

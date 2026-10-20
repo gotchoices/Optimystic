@@ -4,10 +4,10 @@ import { buildSyncProtocol, type SyncBlockAnswer, type SyncRequest, type SyncRes
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
-import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
-import { serveBlockArchive, serveConsultAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { fitConsultContent, serveBlockArchive, serveConsultAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -150,13 +150,20 @@ export class SyncService implements Startable {
 
 	/**
 	 * The answer to a latest-revision consult that said what the asker holds (`SyncRequest.held`):
-	 * always `success`, with the block's answer in `answers` — an answer without an archive is this
-	 * node holding nothing, and the bytes ride only when this node is ahead of the asker
-	 * (`serveConsultAnswer`). `rev` is ignored: a consult is always unpinned.
+	 * always `success`, with each asked block's answer in `answers` — an answer without an archive is
+	 * this node holding nothing, and the bytes ride only when this node is ahead of the asker
+	 * (`serveConsultAnswer`) and fit the response's content budget (`fitConsultContent`). `rev` is
+	 * ignored: a consult is always unpinned.
+	 *
+	 * The blocks are served one after another. A consult names a handful at most, each a local read.
 	 */
 	private async answerConsult(request: SyncRequest, responderId: string | undefined): Promise<SyncResponse> {
-		const held = request.held?.[request.blockId];
-		return { success: true, answers: { [request.blockId]: await this.buildConsultAnswer(request.blockId, held) }, responderId };
+		const served: Array<[BlockId, SyncBlockAnswer]> = [];
+		for (const blockId of consultedBlockIds(request)) {
+			served.push([blockId, await this.buildConsultAnswer(blockId, request.held?.[blockId])]);
+		}
+		const answers = Object.fromEntries(fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES));
+		return { success: true, answers, responderId };
 	}
 
 	/** One block's consult answer; a local serve fault reads as "holds nothing", as {@link buildArchive}'s does. */
@@ -193,6 +200,16 @@ export class SyncService implements Startable {
 			return undefined;
 		}
 	}
+}
+
+/**
+ * The blocks a consult asks about: `blockIds` when the asker sent a list, else `blockId` alone —
+ * distinct, and only the first {@link MAX_CONSULT_BATCH_BLOCKS}. An honest asker never sends more,
+ * and a block left unanswered reads to it as silence, never as "holds nothing".
+ */
+function consultedBlockIds(request: SyncRequest): BlockId[] {
+	const asked = Array.isArray(request.blockIds) ? request.blockIds : [request.blockId];
+	return [...new Set(asked.filter((id): id is BlockId => typeof id === 'string'))].slice(0, MAX_CONSULT_BATCH_BLOCKS);
 }
 
 /**

@@ -1,6 +1,6 @@
 import type { ActionContext, ActionRev, BlockId, IBlock, IRepo } from "@optimystic/db-core";
 import type { BlockArchive } from "./struct.js";
-import type { SyncBlockAnswer } from "../sync/protocol.js";
+import type { SyncBlockAnswer, SyncContentOmitted, SyncResponse } from "../sync/protocol.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
 
@@ -134,8 +134,10 @@ export function latestClaimFromArchive(archive: BlockArchive): CertifiedActionRe
  * above the asker's (`createReconcileBlock` reads it as behind). Reusing it is what keeps a peer that
  * answered from being asked twice. An omission reason that can apply to a peer AHEAD of the asker
  * must not be reused that way — the acquisition would then have no bytes from a peer that holds the
- * revision it needs — so any reason other than `'held'` (one a newer peer sends) returns the claim
- * without the archive, and the acquisition asks that peer for the content.
+ * revision it needs — so any reason other than `'held'` returns the claim without the archive, and
+ * the acquisition asks that peer for the content (`fetchArchiveFromPeer`). `'size'` is such a reason:
+ * a batched answer leaves a block's bytes out to stay under its content budget whether or not the
+ * peer is ahead ({@link fitConsultContent}). So is any reason a newer peer sends.
  */
 export function claimFromConsultAnswer(answer: SyncBlockAnswer): (CertifiedActionRev & { archive?: BlockArchive }) | undefined {
 	if (!answer.archive) return undefined;
@@ -143,6 +145,50 @@ export function claimFromConsultAnswer(answer: SyncBlockAnswer): (CertifiedActio
 	if (!claim) return undefined;
 	if (answer.contentOmitted !== undefined && answer.contentOmitted !== 'held') return claim;
 	return { ...claim, archive: answer.archive };
+}
+
+/**
+ * The consult answer a peer on a build that predates `SyncRequest.held` gave, read out of its
+ * single-archive response: that archive, full bytes and all, or holds-nothing when it served none
+ * (`success: false` is its "Block not found in local storage"). One function so the single and the
+ * batched consult read an older peer alike.
+ */
+export function answerFromArchiveResponse(response: SyncResponse): SyncBlockAnswer {
+	return response.success && response.archive ? { archive: response.archive } : {};
+}
+
+/**
+ * Fit a batched consult response's block bytes into `budgetBytes`, in request order: an answer
+ * carrying bytes keeps them while the running total of the JSON-encoded size of the archives kept
+ * with bytes stays within the budget — and the first one always keeps them, so a one-block consult
+ * is answered exactly as before. Every other answer carrying bytes is reduced to its claim and proof
+ * ({@link withoutContent}, `'size'`). Answers without bytes pass through untouched.
+ *
+ * Measuring encodes each archive carrying bytes once more than sending it does — an accepted cost:
+ * a peer sends bytes only when it is ahead of the asker, which is rare on a settled cohort.
+ */
+export function fitConsultContent(
+	answers: ReadonlyArray<readonly [BlockId, SyncBlockAnswer]>,
+	budgetBytes: number
+): Array<[BlockId, SyncBlockAnswer]> {
+	const encoder = new TextEncoder();
+	let spent = 0;
+	let carried = 0;
+	return answers.map(([blockId, answer]): [BlockId, SyncBlockAnswer] => {
+		if (!answer.archive || answer.contentOmitted !== undefined) return [blockId, answer];
+		const size = encoder.encode(JSON.stringify(answer.archive)).byteLength;
+		if (carried > 0 && spent + size > budgetBytes) return [blockId, withoutContent(blockId, answer, 'size')];
+		carried++;
+		spent += size;
+		return [blockId, answer];
+	});
+}
+
+/** `answer` reduced to its claim and the proof for it, the bytes left out for `reason`. */
+function withoutContent(blockId: BlockId, answer: SyncBlockAnswer, reason: SyncContentOmitted): SyncBlockAnswer {
+	const claim = answer.archive ? latestClaimFromArchive(answer.archive) : undefined;
+	if (!claim) return answer;
+	return { archive: singleRevisionArchive(blockId, claim, undefined, claim.proof), contentOmitted: reason };
 }
 
 /**

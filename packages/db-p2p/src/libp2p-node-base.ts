@@ -23,7 +23,7 @@ import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindo
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
-import { claimFromConsultAnswer, latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
+import { answerFromArchiveResponse, claimFromConsultAnswer, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
@@ -37,7 +37,7 @@ import { Libp2pKeyPeerNetwork, type BootstrapContactOptions, type NetworkStatePe
 import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
@@ -54,7 +54,8 @@ import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
 import { buildSyncProtocol } from './sync/protocol.js';
 import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, resolvePingHandlerTimeoutMs, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
-import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
+import type { ClusterLatestAnswer, ClusterLatestCallback } from './repo/coordinator-repo.js';
+import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
@@ -1553,29 +1554,42 @@ export async function createLibp2pNodeBase(
 			// this build answers in `answers` either way, and sends the bytes only when it is ahead.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
 				options => syncClient.requestBlock({ blockId, rev: undefined, held: held ? { [blockId]: held } : {} }, options));
-			if (response.answers) {
-				const answer = response.answers[blockId];
-				// An answer map that leaves out the asked block is malformed, not "holds nothing": reject, so
-				// the coordinator counts the peer silent rather than reading an absent claim into it.
-				if (!answer) throw new Error(`consult answer from ${peerId.toString()} omits block ${blockId}`);
-				// The archive is attached even when its bytes were left out as 'held', so the acquisition does
-				// not ask this peer again — safe only because such a peer is never ahead of this node; the
-				// reasoning, and why any other omission reason must not be reused, is at `claimFromConsultAnswer`.
-				return claimFromConsultAnswer(answer);
-			}
 			// A peer on an older build ignores `held` and answers with the original single archive, full bytes.
-			if (response.success && response.archive) {
-				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
-				// re-read inline here — it reads the claim and its proof out of ONE revision entry,
-				// so a serving peer cannot pair a proof with a revision it does not certify. The archive
-				// rides along so an acquisition that follows restores from it instead of asking again.
-				const claim = latestClaimFromArchive(response.archive);
-				if (claim) return { ...claim, archive: response.archive };
+			const answer = response.answers ? response.answers[blockId] : answerFromArchiveResponse(response);
+			// An answer map that leaves out the asked block is malformed, not "holds nothing": reject, so
+			// the coordinator counts the peer silent rather than reading an absent claim into it.
+			if (!answer) throw new Error(`consult answer from ${peerId.toString()} omits block ${blockId}`);
+			return claimFromConsultAnswer(answer);
+		};
+
+		// The same consult for several blocks of one read in one request (`ConsultRound` in
+		// `repo/consult-round.ts`), under the same budget and three-way contract as the single callback
+		// above, which still asks this node itself and the blocks an older peer answers one at a time.
+		// Each block's answer is projected by the same function as there (`claimFromConsultAnswer`): the
+		// claim and its proof, read out of ONE revision entry so a serving peer cannot pair a proof with
+		// a revision it does not certify, and the archive the acquisition that follows reuses instead of
+		// asking again. That archive is attached even when its bytes were left out as 'held' — safe only
+		// because such a peer is never ahead of this node — and not when they were left out as 'size',
+		// where the peer may be ahead; the reasoning is at `claimFromConsultAnswer`.
+		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks) => {
+			const blockIds = asks.map(ask => ask.blockId);
+			const held: Record<BlockId, ActionRev> = {};
+			for (const ask of asks) if (ask.held) held[ask.blockId] = ask.held;
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix, linkDeadlines);
+			// No try/catch, as above: a dial or protocol failure rejects, and every block asked reads silent.
+			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
+				options => syncClient.requestBlock({ blockId: blockIds[0]!, blockIds, held, rev: undefined }, options));
+			if (!response.answers) {
+				// A peer on a build that predates `held` answered the first block alone, the original way.
+				return { answers: new Map([[blockIds[0]!, claimFromConsultAnswer(answerFromArchiveResponse(response))]]), unbatched: true };
 			}
-			// The peer DID answer, without data: `success:false` is the sync service's "Block not
-			// found in local storage", and an archive with no usable revisions holds nothing either
-			// way. Both are absent claims, not silence.
-			return undefined;
+			const answers = new Map<BlockId, ClusterLatestAnswer | undefined>();
+			for (const blockId of blockIds) {
+				const answer = response.answers[blockId];
+				// A block the answer map leaves out stays out, so the round reads that block alone as silent.
+				if (answer) answers.set(blockId, claimFromConsultAnswer(answer));
+			}
+			return { answers };
 		};
 
 		coordinatedRepo = coordinatorRepoFactory({
@@ -1583,6 +1597,7 @@ export async function createLibp2pNodeBase(
 			localCluster: clusterImpl,
 			localPeerId: node.peerId,
 			clusterLatestCallback,
+			clusterLatestBatchCallback,
 			// Read-driven acquisition shares the commit path's reconcile callback verbatim: same bounded
 			// archive fetch, same (rev, actionId) and content quorums, same monotonic saveReplicatedBlock
 			// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort

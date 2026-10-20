@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
@@ -15,7 +15,10 @@ import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
-import { claimFromConsultAnswer, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
+import { claimFromConsultAnswer, fitConsultContent, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
+import type { SyncBlockAnswer } from '../sync/protocol.js';
+import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES } from '../protocol-limits.js';
+import type { ClusterLatestBatchCallback } from '../repo/consult-round.js';
 import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
@@ -292,7 +295,27 @@ export interface Mesh {
 	 * Reachability (`failures`) is untouched: a node that was unreachable stays unreachable.
 	 */
 	restart(node: MeshNode): void;
+	/**
+	 * How many latest-revision consult requests `asker`'s coordinator has sent `target` — each one
+	 * `sync` request in production, whether it named one block or several. A node asking itself is
+	 * not a request (production reads its own storage) and is not counted. Counts survive a restart.
+	 */
+	consultRequests(asker: MeshNode, target: MeshNode): number;
 }
+
+/**
+ * One block's consult answer from `target`, read straight from its `StorageRepo`. Read under the
+ * asker's context first, as this harness always has: it lets the sibling promote a pending the context
+ * proves committed before it answers. Then answered by the SAME rule a real peer's sync service applies
+ * (`serveConsultAnswer`): the claim, its proof (through `servableProof`), and the block's bytes only
+ * when the sibling is ahead of `held`. A harness that answered by its own rule would let every
+ * mesh-tier test exercise a path real peers do not have.
+ */
+const consultAnswerOf = async (target: MeshNode, blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined): Promise<SyncBlockAnswer> => {
+	const result = await target.storageRepo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
+	if (!result[blockId]?.state?.latest) return {};
+	return await serveConsultAnswer(target.storageRepo, blockId, held);
+};
 
 /**
  * One cohort peer's archive for a block, read straight from the sibling's `StorageRepo` — the mesh
@@ -409,6 +432,16 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// member, consumed again by the coordinator, so it is stashed here keyed by peer id rather than
 	// widened onto the public `MeshNode` type.
 	const reconcileByPeer = new Map<string, ReconcileBlockCallback>();
+	/** Consult requests sent, by asker then target peer id — read through {@link Mesh.consultRequests}. */
+	const consultCounts = new Map<string, Map<string, number>>();
+	const countConsult = (asker: PeerId, target: PeerId): void => {
+		if (asker.equals(target)) return;
+		let byTarget = consultCounts.get(asker.toString());
+		if (!byTarget) consultCounts.set(asker.toString(), byTarget = new Map());
+		byTarget.set(target.toString(), (byTarget.get(target.toString()) ?? 0) + 1);
+	};
+	const consultRequests = (asker: MeshNode, target: MeshNode): number =>
+		consultCounts.get(asker.peerId.toString())?.get(target.peerId.toString()) ?? 0;
 	/** What outlives a node instance, by peer id: the raw storage it was built over, and its index
 	 *  (`validatorFactory` is invoked with it again on restart). */
 	const durableByPeer = new Map<string, { rawStorage: IRawStorage; index: number }>();
@@ -578,29 +611,35 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?, held?): Promise<ClusterLatestAnswer | undefined> => {
+		/**
+		 * One request reaching `peerId`: counted, then refused when this node was restarted or the peer
+		 * is silent. Silence REJECTS, mirroring what a dial failure does to the production callbacks — the
+		 * coordinator must count it as "did not answer", never as an absent claim (a resolved `undefined`
+		 * remains the peer answering "I hold nothing").
+		 */
+		const reachConsulted = (peerId: PeerId): MeshNode | undefined => {
 			if (lifetime.stopped) throw stoppedError();
-			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
-			// production callback — the coordinator must count this as "did not answer", never as
-			// an absent claim (a resolved `undefined` remains the peer answering "I hold nothing").
+			countConsult(node.peerId, peerId);
 			if (failures.silentPeers?.has(peerId.toString())) {
 				throw new Error(`Peer ${peerId.toString()} is silent`);
 			}
-			const target = nodes.find(n => n.peerId.equals(peerId));
-			if (!target) return undefined;
-			// Read under the asker's context first, as this harness always has: it lets the sibling promote
-			// a pending the context proves committed before it answers.
-			const result = await target.storageRepo.get(
-				{ blockIds: [blockId], context },
-				{ skipClusterFetch: true } as any
-			);
-			if (!result[blockId]?.state?.latest) return undefined;
-			// Then answered by the SAME rule a real peer's sync service applies (`serveConsultAnswer`), and
-			// projected by the SAME function production's callback uses (`claimFromConsultAnswer`): the
-			// claim, its proof (through `servableProof`), and the archive the acquisition then reuses —
-			// without the block's bytes when the sibling is not ahead of `held`. A harness that answered
-			// by its own rule would let every mesh-tier test exercise a path real peers do not have.
-			return claimFromConsultAnswer(await serveConsultAnswer(target.storageRepo, blockId, held));
+			return nodes.find(n => n.peerId.equals(peerId));
+		};
+		// Each answer is projected by the SAME function production's callbacks use (`claimFromConsultAnswer`):
+		// the claim, its proof, and the archive the acquisition then reuses.
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?, held?): Promise<ClusterLatestAnswer | undefined> => {
+			const target = reachConsulted(peerId);
+			return target ? claimFromConsultAnswer(await consultAnswerOf(target, blockId, context, held)) : undefined;
+		};
+		// Serves each block as a real peer's sync service serves a batched consult, content budget included.
+		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks, context?) => {
+			const target = reachConsulted(peerId);
+			const served: Array<[BlockId, SyncBlockAnswer]> = [];
+			for (const { blockId, held } of asks) {
+				served.push([blockId, target ? await consultAnswerOf(target, blockId, context, held) : {}]);
+			}
+			const fitted = fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES);
+			return { answers: new Map(fitted.map(([blockId, answer]) => [blockId, claimFromConsultAnswer(answer)])) };
 		};
 		// The node's own (partition-aware) key-network view — the SAME instance the member's admission
 		// derivation reads, matching real Libp2pKeyPeerNetwork behavior.
@@ -636,6 +675,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			localCluster: node.clusterMember,
 			localPeerId: node.peerId,
 			clusterLatestCallback,
+			clusterLatestBatchCallback,
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
@@ -693,7 +733,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		buildCoordinator(node, lifetime);
 	};
 
-	return { nodes, failures, keyNetwork, restart };
+	return { nodes, failures, keyNetwork, restart, consultRequests };
 }
 
 /**

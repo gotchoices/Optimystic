@@ -31,3 +31,22 @@ export const MAX_CONTROL_MESSAGE_BYTES = 1 * 1024 * 1024; // 1 MiB
  * this cap from it.
  */
 export const MAX_BLOCK_MESSAGE_BYTES = 8 * 1024 * 1024; // 8 MiB
+
+/**
+ * The most blocks one latest-revision consult request names (`SyncRequest.blockIds`). An asker
+ * splits a longer list into several requests; a server answers only this many of a longer list and
+ * leaves the rest unanswered, which the asker reads as silence for those blocks. A read rarely names
+ * more than a handful of blocks, and this many ids plus their held revisions is a few KB against
+ * {@link MAX_CONTROL_MESSAGE_BYTES}.
+ */
+export const MAX_CONSULT_BATCH_BLOCKS = 32;
+
+/**
+ * How many bytes of block content one consult response may carry across all its blocks, measured as
+ * the JSON-encoded size of each archive that carries bytes. A block whose bytes would pass it is
+ * answered with its claim and proof alone (`SyncContentOmitted` `'size'`), except the first block
+ * carrying bytes, which always does — so a one-block consult is answered exactly as before. Half of
+ * {@link MAX_BLOCK_MESSAGE_BYTES}, the cap the asker reads the response under, leaving the rest for
+ * claims, proofs and framing.
+ */
+export const CONSULT_RESPONSE_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES / 2;
