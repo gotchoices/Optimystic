@@ -27,6 +27,7 @@ import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
 import { commitBatchOf, pendBatchOf, type CommitBatch, type PendBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
+import { withDeadline } from "../with-deadline.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -58,20 +59,6 @@ function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined)
  * steadily under normal load, raise it or queue the deferred blocks instead of dropping them.
  */
 const MAX_HELD_BLOCK_CONSULTS = 16;
-
-/**
- * Reject if `promise` has not settled within `ms`. The timer is cleared on either outcome, so no
- * handle outlives the race (hence no `unref`, which does not exist off Node).
- */
-function withDeadline<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const deadline = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
-	});
-	return Promise.race([promise, deadline]).finally(() => {
-		if (timer !== undefined) clearTimeout(timer);
-	});
-}
 
 /**
  * What one round of polling the cohort learned about a block: the revision the OTHER
@@ -1508,6 +1495,7 @@ export class CoordinatorRepo implements IRepo {
 		return new ConsultRound({
 			batch: this.clusterLatestBatchCallback,
 			single: this.clusterLatestCallback,
+			deadlineMs: this.cohortQueryTimeoutMs,
 			selfId: this.localPeerId?.toString(),
 			context,
 			log: this.log
@@ -2087,9 +2075,15 @@ export class CoordinatorRepo implements IRepo {
 	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext, held?: ActionRev, asker?: AskerStatement, seat?: ConsultSeat): Promise<ClusterLatestQuery> {
 		const selfId = this.localPeerId?.toString();
 		const standIn = this.askerStandIn(peerIds, blockId, selfId, asker);
+		// Through a seat the round applies the deadline itself, from when it SENDS the request: a question
+		// registered early waits for the other passes' cohort lookups, and that wait is not the peer's.
 		const askPeer: (peerIdStr: string) => Promise<ClusterLatestAnswer | undefined> = seat
 			? peerIdStr => seat.ask(peerIdStr, blockId, held)
-			: peerIdStr => this.clusterLatestCallback!(peerIdFromString(peerIdStr), blockId, context, held);
+			: peerIdStr => withDeadline(
+				this.clusterLatestCallback!(peerIdFromString(peerIdStr), blockId, context, held),
+				this.cohortQueryTimeoutMs,
+				`latest query to ${peerIdStr}`
+			);
 		// Query peers in parallel for their latest revision. Each query is DEADLINED (rejects), not
 		// raced-to-undefined: a peer that blows the deadline lands in the silent set below exactly
 		// like a dial failure, because a slow peer and a peer claiming "I hold nothing" must produce
@@ -2101,15 +2095,9 @@ export class CoordinatorRepo implements IRepo {
 		// `cluster-fetch:peers-silent` against peers that are healthy and answering everything else,
 		// raise `clusterPolicy.cohortQueryTimeoutMs` rather than softening the deadline back into an
 		// absent claim.
-		// NOTE: through a seat, the deadline starts when the question is registered, not when the round
-		// sends it, so the other seats' cohort lookups are spent out of it. They are local, except that
-		// one block's `findCluster` can wait out the bounded bootstrap-contact wait
-		// (`bootstrapContactImminent` in `libp2p-key-network.ts`) and so eat into every other question of
-		// the round. If a round's consults ever time out together right after start, start the deadline
-		// at send instead.
 		const asked = peerIds.map(async (peerIdStr): Promise<ClusterLatestAnswer | undefined> => {
 			if (peerIdStr === standIn?.peerId) return standIn.held;
-			return await withDeadline(askPeer(peerIdStr), this.cohortQueryTimeoutMs, `latest query to ${peerIdStr}`);
+			return await askPeer(peerIdStr);
 		});
 		// Each callback above registered its question before its first await, so all are registered.
 		seat?.ready();

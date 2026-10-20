@@ -3,6 +3,7 @@ import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { MAX_CONSULT_BATCH_BLOCKS } from "../protocol-limits.js";
 import type { Logger } from "../logger.js";
+import { withDeadline } from "../with-deadline.js";
 import type { ClusterLatestAnswer, ClusterLatestCallback } from "./coordinator-repo.js";
 
 /** One block a consult asks a peer about, with what this node holds of it, when it holds anything. */
@@ -55,6 +56,12 @@ export interface ConsultRoundDeps {
 	batch: ClusterLatestBatchCallback;
 	/** Asks self, and the blocks an older peer did not answer in its batch. */
 	single: ClusterLatestCallback;
+	/**
+	 * The per-peer consult deadline, counted from when the round sends each request — not from when a
+	 * question was registered, since the wait for the other seats is not the peer's. A request that
+	 * blows it reads as silence for every block it named.
+	 */
+	deadlineMs: number;
 	selfId?: string;
 	context?: ActionContext;
 	log: Logger;
@@ -85,9 +92,14 @@ type AskEntry = [BlockId, PendingAsk];
  * cohort lookup, so no fixed tick is sure to catch them all, and a timer would add latency to every
  * one-block read. The barrier adds none — a round of one seat sends the moment that seat is ready.
  *
- * Every question settles: from the peer's answer, as silence when the request failed or left its
- * block out, or from the single-block callback for self and for the blocks an older peer did not
- * answer.
+ * Every question settles: from the peer's answer, as silence when the request failed, missed its
+ * deadline or left its block out, or from the single-block callback for self and for the blocks an
+ * older peer did not answer.
+ *
+ * The cost of the barrier is that a seat still looking up its cohort holds back every other seat's
+ * requests. The lookups are local and bounded — the longest is `findCluster`'s bounded wait for
+ * bootstrap contact (`bootstrapContactImminent` in `libp2p-key-network.ts`) — and the per-peer
+ * deadline starts at send, so the wait delays a read without making any peer read as silent.
  */
 export class ConsultRound {
 	private readonly byPeer = new Map<string, Map<BlockId, PendingAsk>>();
@@ -154,7 +166,7 @@ export class ConsultRound {
 		let reply: ConsultBatchAnswer;
 		try {
 			const asks = chunk.map(([blockId, { held }]): ConsultAsk => held ? { blockId, held } : { blockId });
-			reply = await this.deps.batch(peerIdFromString(peerId), asks, this.deps.context);
+			reply = await this.withinDeadline(peerId, this.deps.batch(peerIdFromString(peerId), asks, this.deps.context));
 		} catch (error) {
 			// The peer could not be asked: silent for every block it was asked about.
 			for (const [, pending] of chunk) void settle(pending, Promise.reject(error));
@@ -173,8 +185,12 @@ export class ConsultRound {
 	/** Ask `peerId` about each block of `entries` on its own request, all at once. */
 	private askEachSingly(peerId: string, entries: AskEntry[]): void {
 		for (const [blockId, pending] of entries) {
-			void settle(pending, (async () => this.deps.single(peerIdFromString(peerId), blockId, this.deps.context, pending.held))());
+			void settle(pending, (async () => this.withinDeadline(peerId, this.deps.single(peerIdFromString(peerId), blockId, this.deps.context, pending.held)))());
 		}
+	}
+
+	private withinDeadline<T>(peerId: string, request: Promise<T>): Promise<T> {
+		return withDeadline(request, this.deps.deadlineMs, `latest query to ${peerId}`);
 	}
 }
 

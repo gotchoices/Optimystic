@@ -25,7 +25,7 @@ interface Harness {
 }
 
 /** A round whose batch answers from `reply(peer, asks)` and whose single answers every block at rev 1. */
-const makeRound = (reply: (peer: string, asks: readonly ConsultAsk[]) => ConsultBatchAnswer | Promise<ConsultBatchAnswer>, selfId?: string): Harness => {
+const makeRound = (reply: (peer: string, asks: readonly ConsultAsk[]) => ConsultBatchAnswer | Promise<ConsultBatchAnswer>, selfId?: string, deadlineMs = 1_000): Harness => {
 	const batchCalls: Harness['batchCalls'] = [];
 	const singleCalls: Harness['singleCalls'] = [];
 	const batch: ClusterLatestBatchCallback = async (peerId, asks) => {
@@ -36,7 +36,7 @@ const makeRound = (reply: (peer: string, asks: readonly ConsultAsk[]) => Consult
 		singleCalls.push({ peer: peerId.toString(), blockId, ...(held ? { held } : {}) });
 		return claim(1);
 	};
-	const round = new ConsultRound({ batch, single, selfId, log: createLogger('coordinator-repo') });
+	const round = new ConsultRound({ batch, single, deadlineMs, selfId, log: createLogger('coordinator-repo') });
 	return { round, batchCalls, singleCalls };
 };
 
@@ -78,6 +78,36 @@ describe('ConsultRound', () => {
 
 		expect(await answer).to.deep.equal(claim(7));
 		expect(batchCalls).to.have.length(1);
+	});
+
+	it('starts the deadline when the round sends, not when a question was registered', async () => {
+		// One block's pass can spend a while in its cohort lookup (the bounded bootstrap-contact wait)
+		// while another's questions are registered and waiting; that wait is not the peer's silence.
+		const p = await newPeer();
+		const { round } = makeRound(answerAll, undefined, 20);
+		const early = round.join();
+		const late = round.join();
+		round.close();
+
+		const answer = early.ask(p, 'block-a');
+		early.ready();
+		await new Promise(resolve => setTimeout(resolve, 60));
+		late.ready();
+
+		expect(await answer).to.deep.equal(claim(7));
+	});
+
+	it('reads a peer that does not answer within the deadline as silent', async () => {
+		const p = await newPeer();
+		const { round } = makeRound(() => new Promise<ConsultBatchAnswer>(() => undefined), undefined, 20);
+		const seat = round.join();
+		round.close();
+
+		const answer = seat.ask(p, 'block-a');
+		seat.ready();
+
+		const [settled] = await Promise.allSettled([answer]);
+		expect(settled?.status).to.equal('rejected');
 	});
 
 	it('reads every block of a request that failed as silent', async () => {
