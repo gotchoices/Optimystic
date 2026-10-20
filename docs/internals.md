@@ -283,8 +283,8 @@ names a different tail). Without it, a coordinator behind the rival answered the
 the writer already held, the refresh moved nowhere, and the write ended in `SyncRevisionStalledError`
 with the revision it needed one hop away. Three choices keep it narrow:
 
-- **The header carries none.** It is rewritten only when the tail rolls over, so its revision says
-  nothing about the collection's.
+- **The header carries none.** It is rewritten only when the tail rolls over or the collection
+  changes it itself (a tree's root moving), so its revision says nothing about the collection's.
 - **It lasts one refresh.** It is never raised into the handle's `BlockFloors`: a standing floor on the
   tail id the handle remembers would be wrong once that tail fills, since a filled tail's last revision
   is the roll-over's, below the floor, and every later read of it — the chain walk, the invalidation

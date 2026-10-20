@@ -60,6 +60,9 @@ export class CollectionFactory {
    * resolve the same transactor: without this, each would miss {@link transactors} and build its
    * own — two libp2p nodes, or two `local` stores neither of which sees the other's writes.
    */
+  // NOTE: dispose()/clearCache() do not touch this map, so a construction in flight across them
+  // still lands in `transactors` afterwards (as the old await-then-set did). If a host ever
+  // disposes while a table is mid-initialization, drop in-flight results that settle after dispose.
   private transactorsInFlight = new Map<string, Promise<ITransactor>>();
   private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
