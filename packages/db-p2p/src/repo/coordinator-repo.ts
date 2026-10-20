@@ -1462,9 +1462,9 @@ export class CoordinatorRepo implements IRepo {
 	 * (`ClusterMember`'s `onCohortCommitApplied`). Its blocks are marked freshly checked under the rule
 	 * this node's own commits are marked under ({@link commitQuorumRulesOutRivals}: the record's commit
 	 * approvals over the full cohort); below that bar nothing is marked and the next read consults as
-	 * before. Without it a
-	 * member of a two-machine group never stamped the blocks the other machine wrote, and its next read
-	 * of each asked the machine that had just sent it whether anything was newer (GitHub #43). Like the
+	 * before. Without it a member of a two-machine group never stamped the blocks the other machine
+	 * wrote, and its next read of each asked the machine that had just sent it whether anything was
+	 * newer (GitHub #43). Like the
 	 * commit-path stamps it records no floor, so it clears one recorded earlier: a commit is newer
 	 * evidence than any floor consulted under before it.
 	 *
@@ -1481,6 +1481,16 @@ export class CoordinatorRepo implements IRepo {
 	 * was committed once, not that nothing newer exists now, whereas a commit stamp is sound because
 	 * "now" is the moment the majority committed. Revisit if pushes dominate a profile, with a stamp
 	 * gated on the push's proof being for a revision the sender committed within the window.
+	 *
+	 * NOTE: the stamp's "now" is the member's apply, which is the commit's moment only for the delivery
+	 * consensus made. A member that missed it gets the record from the coordinator's commit-broadcast
+	 * retry or carried on a later request — up to the retry span later (about 8 s at the
+	 * `commitBroadcastRetry*` defaults), or up to the record's expiration when a restarted coordinator
+	 * resumes the broadcast — and a cohort of four or more can commit a newer revision without it
+	 * meanwhile, so an unfloored read here serves the older revision as checked for up to one window past
+	 * that late apply. Narrow (a missed delivery, a newer commit inside the span, a read without a floor),
+	 * so left alone; if it is ever observed, have the member report only applies of a record it received
+	 * during its consensus round, not a retried or carried delivery.
 	 */
 	noteCohortCommitApplied(applied: CohortCommitApplied): void {
 		if (this.commitQuorumRulesOutRivals(applied.approvals, applied.cohortSize)) this.markBlocksSeen(applied.blockIds);
