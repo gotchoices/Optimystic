@@ -1,5 +1,6 @@
 import type { ActionContext, ActionRev, BlockId, IBlock, IRepo } from "@optimystic/db-core";
 import type { BlockArchive } from "./struct.js";
+import type { SyncBlockAnswer } from "../sync/protocol.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
 
@@ -35,6 +36,12 @@ const log = createLogger('block-archive');
  * which is why no test drives a refusal end to end through `RestorationCoordinator`. If a second
  * producer ever appears (a multi-revision or sparse archive, say), that contract stops being
  * trivially true and needs a test pinning the two ends together.
+ *
+ * NOTE: when the block rides, it rides twice — as `action.transform.insert` and as `block`. The
+ * restore wire depends on the transform copy (`BlockStorage.saveRestored` stores `action.transform`,
+ * and `noDivergentRewrite` compares it), so it stays. Fine while consults mostly omit the bytes
+ * (`serveConsultAnswer`); if acquisition or restore traffic ever dominates, serve the content once
+ * and rebuild the other copy on receipt.
  */
 export function singleRevisionArchive(
 	blockId: BlockId,
@@ -117,6 +124,28 @@ export function latestClaimFromArchive(archive: BlockArchive): CertifiedActionRe
 }
 
 /**
+ * The claim one block's consult answer ({@link serveConsultAnswer}) carries, with the archive it was
+ * read from, or `undefined` when the peer holds nothing — an answer, never silence.
+ *
+ * The archive rides along so an acquisition that follows reuses it instead of asking the peer again
+ * (`ConsultedArchives` in `cluster/cluster-repo.ts`), and that holds for an archive whose bytes were
+ * left out as `'held'` too: such a peer's revision is at or below the asker's own, so it is never a
+ * candidate for the acquisition's content quorum, which takes only a corroborated revision strictly
+ * above the asker's (`createReconcileBlock` reads it as behind). Reusing it is what keeps a peer that
+ * answered from being asked twice. An omission reason that can apply to a peer AHEAD of the asker
+ * must not be reused that way — the acquisition would then have no bytes from a peer that holds the
+ * revision it needs — so any reason other than `'held'` (one a newer peer sends) returns the claim
+ * without the archive, and the acquisition asks that peer for the content.
+ */
+export function claimFromConsultAnswer(answer: SyncBlockAnswer): (CertifiedActionRev & { archive?: BlockArchive }) | undefined {
+	if (!answer.archive) return undefined;
+	const claim = latestClaimFromArchive(answer.archive);
+	if (!claim) return undefined;
+	if (answer.contentOmitted !== undefined && answer.contentOmitted !== 'held') return claim;
+	return { ...claim, archive: answer.archive };
+}
+
+/**
  * What {@link serveBlockArchive} needs of the repo it reads: `IRepo`, plus — OPTIONALLY — the
  * revision-keyed commit-proof accessor `StorageRepo` implements.
  *
@@ -173,19 +202,9 @@ export type ProofRetainingRepo = IRepo & Required<Pick<ArchiveServingRepo, 'getB
  * signatures.
  */
 export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: BlockId, rev?: number): Promise<BlockArchive | undefined> {
-	// `ActionContext` is `{ committed, rev, actionId? }` — nothing else. `committed: []` claims no
-	// uncommitted-but-known action, and omitting `actionId` is what keeps this off `StorageRepo`'s
-	// pending-overlay path, so the read is purely "the highest COMMITTED revision at or below `rev`".
-	const context: ActionContext | undefined = rev !== undefined ? { rev, committed: [] } : undefined;
-	const result = await repo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
-	const entry = result[blockId];
-	const latest = entry?.state?.latest;
-	if (!latest) return undefined;
-	// The revision the content in hand IS. A repo that reports `materialized` (`StorageRepo`) has
-	// served the highest committed revision at or below the pin, and that — never `state.latest`,
-	// the repo's NEWEST revision — is the archive's label. A repo that does not report it (a plain
-	// `IRepo`) can only be describing its latest.
-	const served = entry.materialized ?? latest;
+	const servable = await readServable(repo, blockId, rev);
+	if (!servable) return undefined;
+	const { served, latest, block, proof } = servable;
 	// Fail closed rather than mislabel. A served revision ABOVE the pin is never a right answer:
 	// either the repo could not say what it materialized and its latest is newer than what was
 	// asked for (so the bytes may be pinned or may not — and the only label in hand is wrong for
@@ -199,8 +218,78 @@ export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: Block
 			blockId, served.rev, rev, latest.rev);
 		return undefined;
 	}
+	return singleRevisionArchive(blockId, served, block, proof);
+}
+
+/**
+ * Answer one block of a latest-revision consult that said what the asker holds
+ * (`SyncRequest.held`): the claim and its proof always, the block's bytes only when this repo
+ * holds something the asker does not.
+ *
+ *  - holds nothing → `{}`;
+ *  - the asker holds nothing, the served revision is above `held.rev`, or it equals `held.rev`
+ *    under a different action id (a fork between the two copies, whose repair needs this copy's
+ *    content) → the full archive, as {@link serveBlockArchive} serves it;
+ *  - otherwise — served below `held.rev`, or equal under the same action id → the archive with the
+ *    proof but without the block, and `contentOmitted: 'held'`.
+ *
+ * Bytes are left out only when this repo is NOT ahead of the asker, so an omitted block is never
+ * content the asker's acquisition would need: the read path acquires only a corroborated revision
+ * strictly above its own (`CoordinatorRepo.fetchBlockFromCluster`).
+ *
+ * Always unpinned — a consult asks for the latest — so the pinned-read refusal in
+ * {@link serveBlockArchive} has nothing to refuse here. The read itself is shared with it
+ * ({@link readServable}), so the two answers cannot drift on what is served or how it is labelled.
+ */
+export async function serveConsultAnswer(repo: ArchiveServingRepo, blockId: BlockId, held: ActionRev | undefined): Promise<SyncBlockAnswer> {
+	const servable = await readServable(repo, blockId);
+	if (!servable) return {};
+	const { served, block, proof } = servable;
+	if (askerHoldsServed(served, held)) {
+		return { archive: singleRevisionArchive(blockId, served, undefined, proof), contentOmitted: 'held' };
+	}
+	return { archive: singleRevisionArchive(blockId, served, block, proof) };
+}
+
+/**
+ * Whether the asker already holds the revision served, or a newer one. Stated positively, so a
+ * `held` the asker sent without a usable revision (missing, `null` or `NaN` off the wire) fails both
+ * comparisons and gets the bytes rather than losing them.
+ */
+function askerHoldsServed(served: ActionRev, held: ActionRev | undefined): boolean {
+	if (!held) return false;
+	return served.rev < held.rev || (served.rev === held.rev && served.actionId === held.actionId);
+}
+
+/** What one block-repair answer serves: the revision the content is, the repo's newest, the content and its proof. */
+interface Servable {
+	served: ActionRev;
+	latest: ActionRev;
+	block: IBlock | undefined;
+	proof: BlockCommitProof | undefined;
+}
+
+/**
+ * The read every block-repair answer is built from, or `undefined` when the repo holds no revision
+ * of the block. One function so {@link serveBlockArchive} and {@link serveConsultAnswer} cannot
+ * drift on how the served revision is labelled or which proof rides with it.
+ */
+async function readServable(repo: ArchiveServingRepo, blockId: BlockId, rev?: number): Promise<Servable | undefined> {
+	// `ActionContext` is `{ committed, rev, actionId? }` — nothing else. `committed: []` claims no
+	// uncommitted-but-known action, and omitting `actionId` is what keeps this off `StorageRepo`'s
+	// pending-overlay path, so the read is purely "the highest COMMITTED revision at or below `rev`".
+	const context: ActionContext | undefined = rev !== undefined ? { rev, committed: [] } : undefined;
+	const result = await repo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
+	const entry = result[blockId];
+	const latest = entry?.state?.latest;
+	if (!latest) return undefined;
+	// The revision the content in hand IS. A repo that reports `materialized` (`StorageRepo`) has
+	// served the highest committed revision at or below the pin, and that — never `state.latest`,
+	// the repo's NEWEST revision — is the archive's label. A repo that does not report it (a plain
+	// `IRepo`) can only be describing its latest.
+	const served = entry.materialized ?? latest;
 	const proof = await servableProof(repo, blockId, served);
-	return singleRevisionArchive(blockId, served, entry.block, proof);
+	return { served, latest, block: entry.block, proof };
 }
 
 /**
@@ -216,10 +305,10 @@ export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: Block
  *    every receiver an artifact that cannot verify. Logged loudly, because it means a proof was
  *    written under a key its content contradicts.
  *
- * Exported for the SAME reason {@link singleRevisionArchive} is: the mesh test harness answers the
- * latest-revision consult out of a sibling's repo directly rather than over the sync protocol, and
- * a harness that attached proofs by a different rule than a real peer would let every mesh-tier
- * test silently exercise a path production does not have.
+ * Exported for the SAME reason {@link singleRevisionArchive} is: a node answers the latest-revision
+ * consult about itself out of its own repo rather than over the sync protocol (the self
+ * short-circuit in `libp2p-node-base.ts`), and a self answer that attached proofs by a different
+ * rule than a peer's would let the two answers weigh differently.
  */
 export async function servableProof(
 	repo: ArchiveServingRepo, blockId: BlockId, latest: ActionRev

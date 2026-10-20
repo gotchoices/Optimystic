@@ -23,7 +23,7 @@ import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindo
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
-import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
+import { claimFromConsultAnswer, latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
@@ -1511,7 +1511,7 @@ export async function createLibp2pNodeBase(
 		// paths verify it before weighing it (the shared layer in `cluster/certified-claims.ts`):
 		// the coordinator's certifyClaim pass in `queryClusterForLatest`, and reconcile's
 		// certification pass in `cluster/reconcile-block.ts`.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?, held?) => {
 			// Self-read short-circuit: dialling self via SyncClient is a round trip
 			// with no remote on the other end, and on nodes without listen addresses
 			// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
@@ -1549,8 +1549,21 @@ export async function createLibp2pNodeBase(
 			// fixed at a few seconds whatever the declared round trip. Fine while a coordinator's cohort
 			// members are also its consensus peers. If a node ever has to read from a peer nothing else
 			// dials, size this budget for a cold open.
+			// Always the form that says what this node holds — an empty map meaning "nothing" — so a peer on
+			// this build answers in `answers` either way, and sends the bytes only when it is ahead.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
-				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
+				options => syncClient.requestBlock({ blockId, rev: undefined, held: held ? { [blockId]: held } : {} }, options));
+			if (response.answers) {
+				const answer = response.answers[blockId];
+				// An answer map that leaves out the asked block is malformed, not "holds nothing": reject, so
+				// the coordinator counts the peer silent rather than reading an absent claim into it.
+				if (!answer) throw new Error(`consult answer from ${peerId.toString()} omits block ${blockId}`);
+				// The archive is attached even when its bytes were left out as 'held', so the acquisition does
+				// not ask this peer again — safe only because such a peer is never ahead of this node; the
+				// reasoning, and why any other omission reason must not be reused, is at `claimFromConsultAnswer`.
+				return claimFromConsultAnswer(answer);
+			}
+			// A peer on an older build ignores `held` and answers with the original single archive, full bytes.
 			if (response.success && response.archive) {
 				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
 				// re-read inline here — it reads the claim and its proof out of ONE revision entry,
@@ -2145,6 +2158,9 @@ export async function createLibp2pNodeBase(
 			const commitLogAnchor = new CommitLogTrustAnchor({
 				membersAt: rootGroupAt,
 				// The anchor reads only the claim and its proof, so it is not handed the archive to hold.
+				// NOTE: it says nothing of what this node holds, so a peer sends the block's bytes, which are
+				// thrown away here. Fine — it runs once per distant root certificate, not per read; if anchor
+				// lookups ever show in request accounting, give the request a claims-only mode.
 				latestClaimFrom: async (peerIdStr, blockId) => {
 					const answer = await clusterLatestCallback(peerIdFromString(peerIdStr), blockId);
 					if (!answer) return undefined;

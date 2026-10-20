@@ -1,4 +1,4 @@
-import type { BlockId } from '@optimystic/db-core';
+import type { ActionRev, BlockId } from '@optimystic/db-core';
 import type { BlockArchive } from '../storage/struct.js';
 
 /**
@@ -35,6 +35,35 @@ export interface SyncRequest {
 	 * Values: 'ring-zulu', 'ring-0', 'ring-N', etc.
 	 */
 	requestingTier?: string;
+
+	/**
+	 * What the asker holds of each block it asks about: its newest committed `(rev, actionId)`. A
+	 * block missing from the map is one the asker holds nothing of. Present → the server answers in
+	 * {@link SyncResponse.answers} and may leave a block's content out (see {@link SyncBlockAnswer}).
+	 * Absent → the original single-archive answer, exactly as before.
+	 *
+	 * Telling a cohort member what the asker holds extends it no new trust: echoing the asker's
+	 * revision back gains a lying peer nothing it could not get by answering "holds nothing", since
+	 * both read to the asker as "nothing ahead".
+	 */
+	held?: Record<BlockId, ActionRev>;
+}
+
+/**
+ * Why a block's bytes were left out of a {@link SyncBlockAnswer}. `'held'`: the asker already holds
+ * the revision served, or a newer one.
+ */
+export type SyncContentOmitted = 'held';
+
+/** One block's answer to a request that carried {@link SyncRequest.held}. */
+export interface SyncBlockAnswer {
+	/**
+	 * The archive served; absent → this peer holds nothing of the block. With `contentOmitted`, the
+	 * archive's revision entry carries no `block` and no `action.transform.insert`, but still carries
+	 * the commit proof for the revision served.
+	 */
+	archive?: BlockArchive;
+	contentOmitted?: SyncContentOmitted;
 }
 
 /**
@@ -52,6 +81,9 @@ export interface SyncResponse {
 
 	/** Peer ID of responder (for tracking/metrics) */
 	responderId?: string;
+
+	/** Present whenever the request carried {@link SyncRequest.held}: one answer per asked block. */
+	answers?: Record<BlockId, SyncBlockAnswer>;
 }
 
 /** Sync protocol prefix - namespaced under db-p2p */

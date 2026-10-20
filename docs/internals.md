@@ -1684,7 +1684,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   (see [transactions.md](transactions.md#read-consistency-and-staleness)), so the two
   paths heal by identical rules. The read path also hands it the archives its consult already
   received (`ConsultedArchives` in `packages/db-p2p/src/cluster/cluster-repo.ts`), so a peer that
-  answered the consult is not asked again; the commit path passes none. It does **not** trust a single peer: the target `(rev, actionId)` must be
+  answered the consult is not asked again; the commit path passes none. A peer that was not ahead
+  of the reader answered the consult with its claim and proof but not the block's bytes
+  (`serveConsultAnswer` in `packages/db-p2p/src/storage/block-archive.ts`); its archive is reused as a
+  claim only, which is all it can be, since that peer is behind the revision being acquired. It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
   hash byte-identically across a quorum, before it persists (`cluster/reconcile-block.ts`
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`

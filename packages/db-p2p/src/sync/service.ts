@@ -1,12 +1,13 @@
 import type { Connection, Startable } from '@libp2p/interface';
-import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
+import type { ActionRev, BlockId } from '@optimystic/db-core';
+import { buildSyncProtocol, type SyncBlockAnswer, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
 import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
-import { serveBlockArchive, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { serveBlockArchive, serveConsultAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -101,16 +102,9 @@ export class SyncService implements Startable {
 							request.rev ?? 'latest'
 						);
 
-						const archive = await self.buildArchive(
-							request.blockId,
-							request.rev,
-							request.includePending,
-							request.maxRevisions
-						);
-
-						const response: SyncResponse = archive
-							? { success: true, archive, responderId: stream.id ?? stream.stream?.id }
-							: { success: false, error: 'Block not found in local storage' };
+						const response = request.held !== undefined
+							? await self.answerConsult(request, stream.id ?? stream.stream?.id)
+							: await self.answerArchive(request, stream.id ?? stream.stream?.id);
 
 						self.log(
 							'[Ring Zulu] %s sync request for block %s',
@@ -139,6 +133,40 @@ export class SyncService implements Startable {
 				try { actualStream.abort(error instanceof Error ? error : new Error(String(error))); } catch { /* ignore */ }
 			}
 		})();
+	}
+
+	/** The original single-archive answer, for a request that did not say what the asker holds. */
+	private async answerArchive(request: SyncRequest, responderId: string | undefined): Promise<SyncResponse> {
+		const archive = await this.buildArchive(
+			request.blockId,
+			request.rev,
+			request.includePending,
+			request.maxRevisions
+		);
+		return archive
+			? { success: true, archive, responderId }
+			: { success: false, error: 'Block not found in local storage' };
+	}
+
+	/**
+	 * The answer to a latest-revision consult that said what the asker holds (`SyncRequest.held`):
+	 * always `success`, with the block's answer in `answers` — an answer without an archive is this
+	 * node holding nothing, and the bytes ride only when this node is ahead of the asker
+	 * (`serveConsultAnswer`). `rev` is ignored: a consult is always unpinned.
+	 */
+	private async answerConsult(request: SyncRequest, responderId: string | undefined): Promise<SyncResponse> {
+		const held = request.held?.[request.blockId];
+		return { success: true, answers: { [request.blockId]: await this.buildConsultAnswer(request.blockId, held) }, responderId };
+	}
+
+	/** One block's consult answer; a local serve fault reads as "holds nothing", as {@link buildArchive}'s does. */
+	private async buildConsultAnswer(blockId: BlockId, held: ActionRev | undefined): Promise<SyncBlockAnswer> {
+		try {
+			return await serveConsultAnswer(this.repo, blockId, held);
+		} catch (error) {
+			this.log.error('Error building consult answer for block %s:', blockId, error);
+			return {};
+		}
 	}
 
 	/**

@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import {
-	latestClaimFromArchive, servableProof, serveBlockArchive, singleRevisionArchive,
+	latestClaimFromArchive, servableProof, serveBlockArchive, serveConsultAnswer, singleRevisionArchive,
 	type ArchiveServingRepo
 } from '../src/storage/block-archive.js';
 import type { BlockArchive } from '../src/storage/struct.js';
@@ -327,6 +327,40 @@ describe('block archive commit proof', () => {
 				expect(archive.range, `requested ${requested}: latest is at or below the pin`).to.deep.equal([4, 5]);
 				expect(soleEntry(archive).action.actionId).to.equal(ACTION);
 			}
+		});
+	});
+
+	describe('serveConsultAnswer', () => {
+		it('sends the block\'s bytes only when the asker holds nothing, or something older or forked', async () => {
+			const { repo } = makeRepo();
+			await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
+			const proof = await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
+
+			const cases: { name: string; held: ActionRev | undefined; bytes: boolean }[] = [
+				{ name: 'asker holds nothing', held: undefined, bytes: true },
+				{ name: 'served above held', held: { rev: 1, actionId: ACTION }, bytes: true },
+				{ name: 'equal revision, different action (a fork)', held: { rev: 2, actionId: 'action-fork' as ActionId }, bytes: true },
+				{ name: 'equal revision, same action', held: { rev: 2, actionId: ACTION_2 }, bytes: false },
+				{ name: 'served below held', held: { rev: 3, actionId: 'action-3' as ActionId }, bytes: false }
+			];
+			for (const { name, held, bytes } of cases) {
+				const answer = await serveConsultAnswer(repo, BLOCK, held);
+				const entry = soleEntry(answer.archive!);
+				// The claim and its proof ride in every shape, so a certified claim stays certified without bytes.
+				expect(answer.archive!.range, `${name}: served revision`).to.deep.equal([2, 3]);
+				expect(entry.action.actionId, `${name}: served action`).to.equal(ACTION_2);
+				expect(entry.proof, `${name}: proof`).to.deep.equal(proof);
+				if (bytes) {
+					expect(answer.contentOmitted, `${name}: nothing omitted`).to.equal(undefined);
+					expect(entry.block, `${name}: bytes`).to.deep.equal(makeBlock(BLOCK, 'two'));
+				} else {
+					expect(answer.contentOmitted, `${name}: omitted`).to.equal('held');
+					expect(entry.block, `${name}: no block`).to.equal(undefined);
+					expect(entry.action.transform.insert, `${name}: no transform copy`).to.equal(undefined);
+				}
+			}
+
+			expect(await serveConsultAnswer(repo, OTHER_BLOCK, { rev: 2, actionId: ACTION_2 }), 'repo holds nothing').to.deep.equal({});
 		});
 	});
 

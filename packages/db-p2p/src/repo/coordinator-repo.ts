@@ -466,8 +466,12 @@ export type ClusterLatestAnswer = CertifiedActionRev & { readonly archive?: Bloc
  * swallowing them into `undefined` (see the implementations in `libp2p-node-base` and the mesh
  * harness's `silentPeers` failure knob). Slowness needs no handling here — the caller deadlines
  * each query and treats expiry as silence.
+ *
+ * `held` is what this node holds of the block (the `state.latest` its own read loaded), when it
+ * holds anything. A peer that is not ahead of it may answer with the claim and its proof alone,
+ * leaving the bytes out (`SyncRequest.held`); the claim is weighed exactly as before.
  */
-export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<ClusterLatestAnswer | undefined>;
+export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext, held?: ActionRev) => Promise<ClusterLatestAnswer | undefined>;
 
 interface CoordinatorRepoComponents {
 	storageRepo: IRepo;
@@ -989,8 +993,9 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private async readRepairBlock(blockId: BlockId, blockGets: BlockGets, results: GetBlockResults, options?: MessageOptions): Promise<void> {
 		const localEntry = results[blockId];
-		const localRev = localEntry?.state?.latest?.rev;
-		const isMissing = !localEntry?.state?.latest;
+		const held = localEntry?.state?.latest;
+		const localRev = held?.rev;
+		const isMissing = !held;
 		// The asker's floor for this block, when it sent one (`BlockGets.floors`). For a present
 		// block it is a second trigger for the consult below, never a verdict on the answer: a copy
 		// still below the floor after the pass is served exactly as any other, labelled with its
@@ -1020,7 +1025,7 @@ export class CoordinatorRepo implements IRepo {
 			// The trigger line is logged only when a consult actually starts: a read that lands while the
 			// block's pass is still running, or past the cap, consulted nobody, and the line's one-per-consult
 			// reading (docs/debugging.md) is what the issue #8 count relied on.
-			if (this.startHeldBlockConsult(blockId, blockGets.context, localRev, floor, asker)) {
+			if (this.startHeldBlockConsult(blockId, blockGets.context, held, floor, asker)) {
 				this.logRepairTriggered(blockId, localRev, 'window', true, floor);
 			}
 			// Served from the local copy, stamped from the unsettled-claim memo as it stands: what moves
@@ -1033,7 +1038,7 @@ export class CoordinatorRepo implements IRepo {
 
 		const passSeq = this.nextPassSeq();
 		try {
-			const { absence, currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, blockGets.context, localRev, floor, asker);
+			const { absence, currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, blockGets.context, held, floor, asker);
 			// A missing block consults on every read whatever the hold says, so its silences place none.
 			if (!isMissing) this.noteConsultOutcome(blockId, heldBySilence);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
@@ -1482,17 +1487,17 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * `asker` and `floor` are captured from the triggering read — the floor only so the stamp records
 	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
-	 * for this consult, not the floor — and `localRev` is what that read served, which is the baseline
-	 * the pass measures its outcome against.
+	 * for this consult, not the floor — and `held` is what that read loaded, which is the baseline
+	 * the pass measures its outcome against and what the consult tells each peer this node holds.
 	 */
-	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined): boolean {
+	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined): boolean {
 		if (this.heldBlockConsults.has(blockId)) return false;
 		if (this.heldBlockConsults.size >= MAX_HELD_BLOCK_CONSULTS) {
 			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: this.heldBlockConsults.size });
 			return false;
 		}
 		const passSeq = this.nextPassSeq();
-		const pass = this.runHeldBlockConsult(blockId, context, localRev, floor, asker, passSeq)
+		const pass = this.runHeldBlockConsult(blockId, context, held, floor, asker, passSeq)
 			.finally(() => this.heldBlockConsults.delete(blockId));
 		this.heldBlockConsults.set(blockId, pass);
 		return true;
@@ -1503,12 +1508,12 @@ export class CoordinatorRepo implements IRepo {
 	 * in {@link readRepairBlock}, minus the absence verdict (the block is held). Never rejects: an error
 	 * is logged and the memo stands, since a thrown consult refutes nothing — as on the blocking path.
 	 */
-	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, localRev: number | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
+	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number): Promise<void> {
 		try {
-			const { currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, context, localRev, floor, asker);
+			const { currency, heldBySilence } = await this.fetchBlockFromCluster(blockId, context, held, floor, asker);
 			this.noteConsultOutcome(blockId, heldBySilence);
 			this.recordAheadClaim(blockId, currency, passSeq);
-			this.logRepairOutcome(blockId, localRev, await this.readLocalRev(blockId, context));
+			this.logRepairOutcome(blockId, held?.rev, await this.readLocalRev(blockId, context));
 		} catch (err) {
 			this.log('cluster-fetch:error', { blockId, background: true, error: (err as Error).message });
 		}
@@ -1570,8 +1575,10 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * One repair pass for a block: ask the cohort what it holds, and converge onto that if it is
-	 * ahead of `localRev` — the revision the caller's read already loaded, and the baseline every
-	 * decision below is measured against.
+	 * ahead of `held` — the revision the caller's read already loaded, and the baseline every
+	 * decision below is measured against. It is also what the consult tells each peer this node
+	 * holds, so a peer not ahead of it answers without the block's bytes
+	 * ({@link ClusterLatestCallback}).
 	 *
 	 * Returns the two things `get` needs beyond the storage side effects:
 	 *  - `absence` — the verdict on this node's local absence of the block (see
@@ -1616,11 +1623,12 @@ export class CoordinatorRepo implements IRepo {
 	private async fetchBlockFromCluster(
 		blockId: BlockId,
 		context?: ActionContext,
-		localRev?: number,
+		held?: ActionRev,
 		floor?: number,
 		asker?: AskerStatement
 	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict; heldBySilence?: readonly string[] }> {
 		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+		const localRev = held?.rev;
 
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
 		const peerIds = peers ? Object.keys(peers) : [];
@@ -1681,7 +1689,7 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'unasked', currency: { kind: 'no-evidence' } };
 		}
 
-		const { corroborated, corroboration, local, silent, answered, claims, consulted, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);
+		const { corroborated, corroboration, local, silent, answered, claims, consulted, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, held, asker);
 		for (const peerId of answered) this.silentConsultHolds.noteAnswered(peerId);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
@@ -2018,8 +2026,11 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * The peer that sent this read is not asked when its statement may stand in for its answer
 	 * ({@link askerStandIn}): the answer then comes from the request, and is weighed like any other.
+	 *
+	 * `held` is passed to every peer asked, so one that is not ahead of this node answers without
+	 * the block's bytes; see {@link ClusterLatestCallback}.
 	 */
-	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext, asker?: AskerStatement): Promise<ClusterLatestQuery> {
+	private async queryClusterForLatest(peerIds: string[], blockId: BlockId, context?: ActionContext, held?: ActionRev, asker?: AskerStatement): Promise<ClusterLatestQuery> {
 		const selfId = this.localPeerId?.toString();
 		const standIn = this.askerStandIn(peerIds, blockId, selfId, asker);
 		// Query peers in parallel for their latest revision. Each query is DEADLINED (rejects), not
@@ -2038,7 +2049,7 @@ export class CoordinatorRepo implements IRepo {
 				if (peerIdStr === standIn?.peerId) return standIn.held;
 				const peerId = peerIdFromString(peerIdStr);
 				return await withDeadline(
-					this.clusterLatestCallback!(peerId, blockId, context),
+					this.clusterLatestCallback!(peerId, blockId, context, held),
 					this.cohortQueryTimeoutMs,
 					`latest query to ${peerIdStr}`
 				);

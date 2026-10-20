@@ -217,10 +217,12 @@ export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, co
  * learned: the archive the peer served, or `undefined` when it served none (it holds nothing, or was
  * silent). A peer ABSENT from the map is one the reconcile must still ask.
  *
- * Supplied only by the read path (`CoordinatorRepo.restoreCorroborated`), whose consult made the same
- * `requestBlock({ blockId, rev: undefined })` request of the same peers moments earlier. Asking again
- * adds no corroboration — the rev quorum would be taken over the same answers — and a peer silent in
- * the consult is not given a second deadline to wait out.
+ * Supplied only by the read path (`CoordinatorRepo.restoreCorroborated`), whose consult asked the same
+ * peers for their latest revision moments earlier. Asking again adds no corroboration — the rev quorum
+ * would be taken over the same answers — and a peer silent in the consult is not given a second
+ * deadline to wait out. An archive here may carry no block when the peer left its bytes out because it
+ * was not ahead of this node (`claimFromConsultAnswer` in `storage/block-archive.ts`); such a peer is
+ * behind the revision being acquired, which is the only thing the reconcile reads from it.
  */
 export type ConsultedArchives = ReadonlyMap<string, BlockArchive | undefined>;
 

@@ -15,7 +15,7 @@ import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
-import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
+import { claimFromConsultAnswer, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
 import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
@@ -578,7 +578,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ClusterLatestAnswer | undefined> => {
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?, held?): Promise<ClusterLatestAnswer | undefined> => {
 			if (lifetime.stopped) throw stoppedError();
 			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
 			// production callback — the coordinator must count this as "did not answer", never as
@@ -588,24 +588,19 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			}
 			const target = nodes.find(n => n.peerId.equals(peerId));
 			if (!target) return undefined;
+			// Read under the asker's context first, as this harness always has: it lets the sibling promote
+			// a pending the context proves committed before it answers.
 			const result = await target.storageRepo.get(
 				{ blockIds: [blockId], context },
 				{ skipClusterFetch: true } as any
 			);
-			const latest = result[blockId]?.state?.latest;
-			if (!latest) return undefined;
-			// The commit proof rides along exactly as it does in production, and through the SAME
-			// lookup `serveBlockArchive` uses (`servableProof`) rather than a hand-rolled one — a
-			// harness that attached proofs by its own rule would let every mesh-tier test exercise a
-			// certification path real peers do not have, or miss one they do. Production reads the
-			// proof out of the served archive; the harness reads the sibling's repo directly, so
-			// sharing the lookup is what keeps the two answers identical.
-			const proof = await servableProof(target.storageRepo, blockId, latest);
-			// Production's consult answer carries the archive it was read from, which the acquisition
-			// then reuses instead of fetching; attach the one `makeFetchArchive` would serve this peer
-			// (unpinned, as production's request is), so mesh specs exercise that reuse.
-			const archive = await serveBlockArchive(target.storageRepo, blockId);
-			return { ...latest, ...(proof ? { proof } : {}), ...(archive ? { archive } : {}) };
+			if (!result[blockId]?.state?.latest) return undefined;
+			// Then answered by the SAME rule a real peer's sync service applies (`serveConsultAnswer`), and
+			// projected by the SAME function production's callback uses (`claimFromConsultAnswer`): the
+			// claim, its proof (through `servableProof`), and the archive the acquisition then reuses —
+			// without the block's bytes when the sibling is not ahead of `held`. A harness that answered
+			// by its own rule would let every mesh-tier test exercise a path real peers do not have.
+			return claimFromConsultAnswer(await serveConsultAnswer(target.storageRepo, blockId, held));
 		};
 		// The node's own (partition-aware) key-network view — the SAME instance the member's admission
 		// derivation reads, matching real Libp2pKeyPeerNetwork behavior.
