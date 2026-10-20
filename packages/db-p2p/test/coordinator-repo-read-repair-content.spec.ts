@@ -13,7 +13,7 @@
  *
  * It now does — for a stale block AND for one it had never seen. The last spec pins the
  * boundary that keeps that affordable: a block no peer claims corroborates nothing, so it
- * never reaches the archive fetch.
+ * never reaches the acquisition.
  */
 
 import { expect } from 'chai';
@@ -29,7 +29,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import type { BlockArchive, RestoreCallback } from '../src/storage/struct.js';
-import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
+import { CoordinatorRepo, type AcquireBlockCallback, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
 import { createReconcileBlock } from '../src/cluster/reconcile-block.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
@@ -140,31 +140,42 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		const peerB = await makePeerId();
 		const cluster = makeClusterPeers([peerA, peerB]);
 
-		// Production-shaped callback: self short-circuits to local storage, A answers from
-		// the archive it would have served over the sync protocol.
+		// Every request B makes of A — the consult's and the acquisition's alike, which over the sync
+		// protocol are the same request — so a spec can price a read in requests.
+		let requestsToA = 0;
+		const requestFromA = async (blockId: BlockId): Promise<BlockArchive | undefined> => {
+			requestsToA++;
+			return await serveArchive(aRepo, blockId);
+		};
+
+		// Production-shaped callback: self short-circuits to local storage, A answers with the claim
+		// read out of the archive it would have served over the sync protocol, and that archive.
 		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context) => {
 			if (peerId.equals(peerB)) {
 				const local = await bRepo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as never);
 				return local[blockId]?.state?.latest;
 			}
-			return latestFromArchive(await serveArchive(aRepo, blockId));
+			const archive = await requestFromA(blockId);
+			const claim = latestFromArchive(archive);
+			return claim ? { ...claim, archive } : undefined;
 		};
 
-		// Counts the archive fetches the acquisition path costs, so a spec can assert that a
-		// genuinely-absent block pays for none.
-		let archiveFetches = 0;
-		const acquireBlockFromCohort = createReconcileBlock({
+		const reconcile = createReconcileBlock({
 			selfPeerId: peerB.toString(),
-			fetchArchive: async (peerIdStr, blockId) => {
-				archiveFetches++;
-				return peerIdStr === peerA.toString() ? await serveArchive(aRepo, blockId) : undefined;
-			},
+			fetchArchive: async (peerIdStr, blockId) =>
+				peerIdStr === peerA.toString() ? await requestFromA(blockId) : undefined,
 			saveReplicatedBlock: (blockId, block, source, verifiedProof) =>
 				bRepo.saveReplicatedBlock(blockId, block, source, verifiedProof),
 			simpleMajorityThreshold: 0.51,
 			superMajorityThreshold: 0.75,
 			repairCorroborationClusterSize: 2
 		});
+		// Counts acquisition passes, so a spec can assert that a genuinely-absent block starts none.
+		let acquisitions = 0;
+		const acquireBlockFromCohort: AcquireBlockCallback = async (blockId, committed, cohortPeerIds, consulted) => {
+			acquisitions++;
+			await reconcile(blockId, committed, cohortPeerIds, consulted);
+		};
 
 		const bCoordinator = new CoordinatorRepo(
 			makeKeyNetwork(cluster),
@@ -180,7 +191,7 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 			acquireBlockFromCohort
 		);
 
-		return { aRepo, bRepo, bStorage, bCoordinator, archiveFetches: () => archiveFetches };
+		return { aRepo, bRepo, bStorage, bCoordinator, requestsToA: () => requestsToA, acquisitions: () => acquisitions };
 	};
 
 	it('sanity: the two nodes really are diverged before the read', async () => {
@@ -290,6 +301,20 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	});
 
 	/**
+	 * GitHub #39: a joiner's cold read asked its peer for each missing block twice — once for the
+	 * consult, then the identical request again for the acquisition. The consult's answer already
+	 * carries the archive, so the acquisition restores from it.
+	 */
+	it('a block it has never seen costs one request to the peer that holds it', async () => {
+		const { bRepo, bCoordinator, requestsToA } = await buildDivergedPair({ seedB: false });
+
+		const served = await bCoordinator.get({ blockIds: [BLOCK_ID] });
+		expect(payloadOf(served[BLOCK_ID]?.block)).to.equal('v2');
+		expect((await bRepo.get({ blockIds: [BLOCK_ID] }))[BLOCK_ID]?.state?.latest?.rev).to.equal(2);
+		expect(requestsToA(), 'the acquisition reuses the consult\'s archive').to.equal(1);
+	});
+
+	/**
 	 * A forward revision no local promotion can reach must be an ABSENCE, not a read failure.
 	 *
 	 * B holds metadata for the block (seeded by a pend of some unrelated action) but no committed
@@ -355,8 +380,8 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 	 * corroborated and `fetchBlockFromCluster` returns before the acquisition step — the absence stays
 	 * as cheap as it was, priced at the latest-query round trip that already happened.
 	 */
-	it('never fetches an archive for a block no peer claims', async () => {
-		const { bCoordinator, archiveFetches } = await buildDivergedPair();
+	it('never runs the acquisition for a block no peer claims', async () => {
+		const { bCoordinator, requestsToA, acquisitions } = await buildDivergedPair();
 		const absentId = 'block-nobody-has' as BlockId;
 
 		const captured = await captureLog('coordinator-repo', async () => {
@@ -365,11 +390,12 @@ describe('CoordinatorRepo read-repair CONTENT convergence', function () {
 		});
 
 		expect(hasTag(captured, 'cluster-fetch:no-quorum'), 'nothing corroborated the id').to.equal(true);
-		expect(archiveFetches(), 'a genuine absence costs no archive fetch').to.equal(0);
+		expect(acquisitions(), 'a genuine absence runs no acquisition').to.equal(0);
+		expect(requestsToA(), 'and costs only the consult').to.equal(1);
 
 		// Control on the counter itself: a zero above must mean "the absence declined early", not
-		// "nothing is wired to this counter". The same fixture's corroborable block does fetch.
+		// "nothing is wired to this counter". The same fixture's corroborable block does acquire.
 		await bCoordinator.get({ blockIds: [BLOCK_ID] });
-		expect(archiveFetches(), 'a corroborated block does reach the archive fetch').to.be.greaterThan(0);
+		expect(acquisitions(), 'a corroborated block does reach the acquisition').to.be.greaterThan(0);
 	});
 });

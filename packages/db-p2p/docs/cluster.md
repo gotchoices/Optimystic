@@ -1140,7 +1140,9 @@ deadlines on that path:
   `packages/db-p2p/src/repo/coordinator-repo.ts`), where a miss puts the peer in the `silent` set, and
 - the archive fetch the acquisition runs (`fetchArchiveFromPeer` in
   `packages/db-p2p/src/libp2p-node-base.ts`), where a miss resolves to "that peer holds nothing" and
-  the pass moves on.
+  the pass moves on. On the read path this fetch runs only for a peer the consult has no archive
+  from: the consult's request already returned each answering peer's archive, and the acquisition
+  restores from those (`ConsultedArchives` in `packages/db-p2p/src/cluster/cluster-repo.ts`).
 
 Each is the whole budget for its request: dial, protocol negotiation, request and reply all share it,
 and nothing inside the request is shorter. Both run through `withinRequestBudget` in

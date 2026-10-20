@@ -19,6 +19,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
+import type { BlockArchive } from "../storage/struct.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
@@ -205,8 +206,22 @@ function verdictOf(result: { valid: boolean; reason?: string }): PromiseVerdict 
  * @param blockId       the under-replicated block to restore
  * @param committed     the committed `(actionId, rev)` agreed by consensus
  * @param cohortPeerIds cohort members to pull from (self already excluded)
+ * @param consulted     answers already in hand, so those peers are not asked again; see
+ *                      {@link ConsultedArchives}. The commit path passes none.
  */
-export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, cohortPeerIds: string[]) => Promise<void>;
+export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, cohortPeerIds: string[], consulted?: ConsultedArchives) => Promise<void>;
+
+/**
+ * Per cohort peer, what a latest-revision consult that ran just before this reconcile already
+ * learned: the archive the peer served, or `undefined` when it served none (it holds nothing, or was
+ * silent). A peer ABSENT from the map is one the reconcile must still ask.
+ *
+ * Supplied only by the read path (`CoordinatorRepo.restoreCorroborated`), whose consult made the same
+ * `requestBlock({ blockId, rev: undefined })` request of the same peers moments earlier. Asking again
+ * adds no corroboration — the rev quorum would be taken over the same answers — and a peer silent in
+ * the consult is not given a second deadline to wait out.
+ */
+export type ConsultedArchives = ReadonlyMap<string, BlockArchive | undefined>;
 
 /**
  * Sink for the {@link CommitCert} this member assembled at consensus, fired once per committed action

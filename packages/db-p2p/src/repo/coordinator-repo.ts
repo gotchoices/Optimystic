@@ -15,8 +15,9 @@ import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_R
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
-import type { ReconcileBlockCallback, BlockHoldersSink } from "../cluster/cluster-repo.js";
+import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives } from "../cluster/cluster-repo.js";
 import type { CertifiedActionRev } from "../storage/block-archive.js";
+import type { BlockArchive } from "../storage/struct.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
 import type { BlockDurabilitySink } from "./under-replication-drain.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
@@ -128,6 +129,24 @@ interface ClusterLatestQuery {
 	 * downstream may re-vote off these.
 	 */
 	claims: readonly RevClaim[];
+	/**
+	 * What this consult heard from each cohort peer, in the form an acquisition consumes, so the
+	 * acquisition that may follow asks only the peers the consult has no usable answer from:
+	 *
+	 * | consult outcome for the peer                    | in the map  |
+	 * |-------------------------------------------------|-------------|
+	 * | a claim carrying the archive it was read from   | the archive |
+	 * | "holds nothing" (a resolved `undefined`)        | `undefined` |
+	 * | silent (rejected, or past the per-peer deadline)| `undefined` |
+	 * | a claim with no archive (the asker's stand-in, a test double) | absent |
+	 * | this node                                       | absent      |
+	 *
+	 * A silent peer is recorded as having served nothing rather than left to be asked again: the
+	 * consult reached its corroboration without it, and re-asking would make the acquisition wait out
+	 * one more per-peer deadline for an answer that rarely comes. The next consult hears it if it
+	 * recovers.
+	 */
+	consulted: ConsultedArchives;
 	/**
 	 * Why this pass's corroboration decline is provably PERMANENT, when it is (see
 	 * {@link DeadlockReason}). Computed fresh on EVERY declining pass — the once-per-episode
@@ -425,8 +444,16 @@ interface LocalClusterWithExecutionTracking extends ICluster {
 export type { CertifiedActionRev } from "../storage/block-archive.js";
 
 /**
+ * One cohort peer's consult answer: its claim, and the archive the claim was read out of when the
+ * transport fetched one. The archive lets an acquisition that follows restore from this answer
+ * instead of asking the peer again (see {@link CoordinatorRepo.restoreCorroborated}). Optional: an
+ * answer without one (the self short-circuit, a test double) is simply asked again.
+ */
+export type ClusterLatestAnswer = CertifiedActionRev & { readonly archive?: BlockArchive };
+
+/**
  * Callback to query a cluster peer for their latest revision of a block. Three-way contract:
- *  - resolves a `CertifiedActionRev` — the peer answered and holds the block at that revision;
+ *  - resolves a `ClusterLatestAnswer` — the peer answered and holds the block at that revision;
  *  - resolves `undefined` — the peer answered and holds NOTHING (an absent claim);
  *  - REJECTS — the peer could not be asked at all (dial failure, protocol error).
  *
@@ -438,7 +465,7 @@ export type { CertifiedActionRev } from "../storage/block-archive.js";
  * harness's `silentPeers` failure knob). Slowness needs no handling here — the caller deadlines
  * each query and treats expiry as silence.
  */
-export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<CertifiedActionRev | undefined>;
+export type ClusterLatestCallback = (peerId: PeerId, blockId: BlockId, context?: ActionContext) => Promise<ClusterLatestAnswer | undefined>;
 
 interface CoordinatorRepoComponents {
 	storageRepo: IRepo;
@@ -1652,7 +1679,7 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'unasked', currency: { kind: 'no-evidence' } };
 		}
 
-		const { corroborated, corroboration, local, silent, answered, claims, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);
+		const { corroborated, corroboration, local, silent, answered, claims, consulted, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, asker);
 		for (const peerId of answered) this.silentConsultHolds.noteAnswered(peerId);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
@@ -1805,7 +1832,7 @@ export class CoordinatorRepo implements IRepo {
 		}
 
 		// Corroborated revision is ahead of ours — converge onto it.
-		const rev = await this.restoreCorroborated(blockId, corroborated, baselineRev, peerIds);
+		const rev = await this.restoreCorroborated(blockId, corroborated, baselineRev, peerIds, consulted);
 
 		// Log the OUTCOME, not the attempt. Logging `synced` unconditionally reported hundreds of
 		// phantom convergences per run and made a real replication defect invisible for two debugging
@@ -1832,10 +1859,11 @@ export class CoordinatorRepo implements IRepo {
 		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
 		// missing locally never consults the window (`get` consults on every read of a missing block,
 		// before `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment
-		// that never set `assumedClusterSize`, where the content quorum can never be met — re-fetches an
-		// archive on every read of that block. Correct, and self-limiting once the cohort can agree; if
-		// it ever shows as read amplification, gate the acquisition step (not the latest-query) on the
-		// same window rather than remembering the absence (GitHub issue #20).
+		// that never set `assumedClusterSize`, where the content quorum can never be met — re-runs on
+		// every read of that block. It costs the consult only: the acquisition restores from the
+		// archives the consult already received (`consulted`). If it ever shows as read amplification,
+		// gate the acquisition step (not the latest-query) on the same window rather than remembering
+		// the absence (GitHub issue #20).
 		// NOTE: the asker's floor is recorded here whether or not the pass converged. So a floor the
 		// cohort corroborates but this node could not ACQUIRE (a content-quorum decline) waits out one
 		// window together with the failed acquisition: the same floor does not re-trigger inside it, the
@@ -1875,12 +1903,19 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * Cohort peer ids are passed straight through: the callback filters self out and caps its own
 	 * corroboration quorum by how many peers could answer at all.
+	 *
+	 * `consulted` is what the consult already heard from each peer ({@link ClusterLatestQuery.consulted}),
+	 * so acquisition asks only the peers it has no usable answer from — none, against a production cohort
+	 * that answered. Re-asking added no corroboration: the acquisition's rev quorum over the same answers
+	 * selects the revision the consult did, and the content gate and certification still run on the
+	 * bytes. What it does give up is a peer silent in the consult answering the acquisition, deliberately.
 	 */
 	private async restoreCorroborated(
 		blockId: BlockId,
 		corroborated: ActionRev,
 		baselineRev: number | undefined,
-		cohortPeerIds: string[]
+		cohortPeerIds: string[],
+		consulted: ConsultedArchives
 	): Promise<number | undefined> {
 		const promoted = await this.promoteCorroborated(blockId, corroborated);
 		if (isAdvanceOver(promoted, baselineRev)) {
@@ -1903,7 +1938,7 @@ export class CoordinatorRepo implements IRepo {
 			// stall ceiling rather than a typical cost. Preserving that ratio is exactly what the `max`
 			// in `reconcilePassTimeoutMs` is for; do not shorten the bound to speed up a slow read.
 			await withDeadline(
-				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds),
+				this.acquireBlockFromCohort(blockId, corroborated, cohortPeerIds, consulted),
 				this.reconcilePassTimeoutMs,
 				`block acquisition for ${blockId}`
 			);
@@ -1997,7 +2032,7 @@ export class CoordinatorRepo implements IRepo {
 		// raise `clusterPolicy.cohortQueryTimeoutMs` rather than softening the deadline back into an
 		// absent claim.
 		const latestResults = await Promise.allSettled(
-			peerIds.map(async (peerIdStr): Promise<CertifiedActionRev | undefined> => {
+			peerIds.map(async (peerIdStr): Promise<ClusterLatestAnswer | undefined> => {
 				if (peerIdStr === standIn?.peerId) return standIn.held;
 				const peerId = peerIdFromString(peerIdStr);
 				return await withDeadline(
@@ -2028,6 +2063,7 @@ export class CoordinatorRepo implements IRepo {
 		let local: CertifiedActionRev | undefined;
 		const claims: RevClaim[] = [];
 		const silent: string[] = [];
+		const consulted = new Map<string, BlockArchive | undefined>();
 		// `allSettled` preserves input order, so results correlate to `peerIds` by index — a
 		// rejected entry carries no payload of its own, and its peer id is what `silent` records.
 		for (let i = 0; i < latestResults.length; i++) {
@@ -2037,7 +2073,10 @@ export class CoordinatorRepo implements IRepo {
 				// Silence: the callback rejected or the deadline expired. Never a claim. Self is
 				// excluded — its short-circuit reads local storage, and a local read error is not a
 				// cohort peer being unreachable.
-				if (peerIdStr !== selfId) silent.push(peerIdStr);
+				if (peerIdStr !== selfId) {
+					silent.push(peerIdStr);
+					consulted.set(peerIdStr, undefined);
+				}
 				continue;
 			}
 			const value = result.value;
@@ -2045,6 +2084,8 @@ export class CoordinatorRepo implements IRepo {
 				local = value;
 				continue;
 			}
+			// A claim without its archive leaves the peer out of the map, to be asked by the acquisition.
+			if (!value || value.archive) consulted.set(peerIdStr, value?.archive);
 			if (!value) continue; // responded, holds nothing — an absent claim, not silence
 			// The proof rides along here and is verified BELOW (certifyClaim) before selection reads
 			// the claim set: presence proves nothing — the peer chose what to attach — but a proof
@@ -2157,7 +2198,7 @@ export class CoordinatorRepo implements IRepo {
 			// cost of re-opening the stale-serve window for the proof-less honest majority.
 			const uncorroboratedRev = claims.length > 0 ? Math.max(...claims.map(c => c.rev)) : undefined;
 			return {
-				local, silent, answered, claims,
+				local, silent, answered, claims, consulted,
 				...(uncorroboratedRev !== undefined ? { uncorroboratedRev } : {}),
 				...(deadlock !== undefined ? { deadlock } : {})
 			};
@@ -2185,7 +2226,7 @@ export class CoordinatorRepo implements IRepo {
 				voters: selected.supporters.length,
 				...(selected.certified ? { certified: true as const } : {})
 			},
-			local, silent, answered, claims
+			local, silent, answered, claims, consulted
 		};
 	}
 

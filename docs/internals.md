@@ -1646,7 +1646,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and
   runs it once the cohort has corroborated a revision the reader cannot promote locally
   (see [transactions.md](transactions.md#read-consistency-and-staleness)), so the two
-  paths heal by identical rules. It does **not** trust a single peer: the target `(rev, actionId)` must be
+  paths heal by identical rules. The read path also hands it the archives its consult already
+  received (`ConsultedArchives` in `packages/db-p2p/src/cluster/cluster-repo.ts`), so a peer that
+  answered the consult is not asked again; the commit path passes none. It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
   hash byte-identically across a quorum, before it persists (`cluster/reconcile-block.ts`
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`

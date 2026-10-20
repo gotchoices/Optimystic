@@ -2,7 +2,7 @@ import type { ActionId, ActionRev, BlockId, IBlock } from "@optimystic/db-core";
 import { canonicalBlockHash } from "@optimystic/db-core";
 import type { BlockArchive } from "../storage/struct.js";
 import { maxArchiveRevision } from "../storage/block-archive.js";
-import type { BlockHoldersSink, ReconcileBlockCallback } from "./cluster-repo.js";
+import type { BlockHoldersSink, ConsultedArchives, ReconcileBlockCallback } from "./cluster-repo.js";
 import type { IPeerReputation } from "../reputation/types.js";
 import { PenaltyReason } from "../reputation/types.js";
 import {
@@ -115,7 +115,8 @@ export interface ReconcileBlockDeps {
  * NOTE: `no-archive` deliberately conflates "the peer holds nothing" with "the peer is unreachable" —
  * that conflation is in `fetchArchive`'s contract, and the production wiring
  * (`libp2p-node-base.fetchArchiveFromPeer`) swallows every dial failure and timeout into the same
- * `undefined`. The read path does separate the two (`CoordinatorRepo`'s `silent` set). If a
+ * `undefined`, and a peer the read path's consult found silent arrives here the same way (see
+ * {@link ConsultedArchives}). The read path does separate the two (`CoordinatorRepo`'s `silent` set). If a
  * reconcile-side decline ever needs that distinction, widen `fetchArchive` to report unreachability
  * rather than trying to infer it here.
  */
@@ -150,13 +151,18 @@ function toCandidate(peerId: string, archive: BlockArchive, committedRev: number
  * unreachable peer, but a raw `Promise.all` over the cohort would let a single rejecting fetch
  * discard the answers every other peer already gave — turning a heal the cohort could complete
  * into a decline. One peer's failure costs only that peer's vote.
+ *
+ * A peer the consult already answered for is not asked again: its answer is read from `consulted`,
+ * and weighed exactly as a fetched archive would be (see {@link ConsultedArchives}).
  */
 async function fetchAnswer(
 	deps: ReconcileBlockDeps,
 	peerId: string,
 	blockId: BlockId,
-	committedRev: number
+	committedRev: number,
+	consulted: ConsultedArchives | undefined
 ): Promise<PeerAnswer> {
+	if (consulted?.has(peerId)) return answerFrom(peerId, consulted.get(peerId), committedRev);
 	let archive: BlockArchive | undefined;
 	try {
 		archive = await deps.fetchArchive(peerId, blockId);
@@ -164,6 +170,11 @@ async function fetchAnswer(
 		log('reconcile:fetch-error', { blockId, peerId, error: (err as Error).message });
 		return { kind: 'error' };
 	}
+	return answerFrom(peerId, archive, committedRev);
+}
+
+/** What one peer's archive, or its lack of one, says about the revision being healed. */
+function answerFrom(peerId: string, archive: BlockArchive | undefined, committedRev: number): PeerAnswer {
 	if (!archive) return { kind: 'no-archive' };
 	const candidate = toCandidate(peerId, archive, committedRev);
 	return candidate ? { kind: 'claim', candidate } : { kind: 'behind' };
@@ -342,12 +353,12 @@ function penalizeContradictingContent(
  * or churn/rebalance pass tries again.
  */
 export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCallback {
-	return async (blockId, committed, cohortPeerIds) => {
+	return async (blockId, committed, cohortPeerIds, consulted) => {
 		const targets = cohortPeerIds.filter(id => id !== deps.selfPeerId);
 		if (targets.length === 0) return;
 
 		const answers = await Promise.all(
-			targets.map(peerId => fetchAnswer(deps, peerId, blockId, committed.rev))
+			targets.map(peerId => fetchAnswer(deps, peerId, blockId, committed.rev, consulted))
 		);
 		const candidates = answers.flatMap(a => a.kind === 'claim' ? [a.candidate] : []);
 		const tally = (kind: PeerAnswer['kind']) => answers.filter(a => a.kind === kind).length;

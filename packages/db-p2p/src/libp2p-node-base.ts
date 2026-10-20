@@ -1367,13 +1367,8 @@ export async function createLibp2pNodeBase(
 		// A timed-out fetch resolves to "no archive", exactly as a peer that holds nothing does — the
 		// pass moves on to the next peer. Only the number is configurable; the contract is unchanged.
 		//
-		// NOTE: this is the SAME request `clusterLatestCallback` already made of the same peer — both ask
-		// `requestBlock({ blockId, rev: undefined })` and get the whole archive back; the consult just
-		// projects the claim out of it and drops the bytes. So a read that goes on to repair pays two
-		// identical round trips per peer rather than one, which is invisible on a LAN and is a second
-		// `cohortQueryTimeoutMs` per peer on a relayed link. If read-repair latency on slow links ever
-		// needs cutting, carry the consult's archive through to the acquisition instead of shortening
-		// either deadline.
+		// The read path's acquisition reaches this only for a peer its consult has no archive from:
+		// the consult made this same request and hands its archives on (`ConsultedArchives`).
 		const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
 			let peerId: ReturnType<typeof peerIdFromString>;
 			try {
@@ -1504,7 +1499,7 @@ export async function createLibp2pNodeBase(
 		);
 
 		// Create callback for querying cluster peers for their latest block revision. Three-way
-		// contract (see ClusterLatestCallback): a CertifiedActionRev is the peer's claim, a resolved
+		// contract (see ClusterLatestCallback): a ClusterLatestAnswer is the peer's claim, a resolved
 		// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
 		// coordinator counts it as "did not answer" and refuses to report an authoritative absent
 		// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
@@ -1559,9 +1554,10 @@ export async function createLibp2pNodeBase(
 			if (response.success && response.archive) {
 				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
 				// re-read inline here — it reads the claim and its proof out of ONE revision entry,
-				// so a serving peer cannot pair a proof with a revision it does not certify.
+				// so a serving peer cannot pair a proof with a revision it does not certify. The archive
+				// rides along so an acquisition that follows restores from it instead of asking again.
 				const claim = latestClaimFromArchive(response.archive);
-				if (claim) return claim;
+				if (claim) return { ...claim, archive: response.archive };
 			}
 			// The peer DID answer, without data: `success:false` is the sync service's "Block not
 			// found in local storage", and an archive with no usable revisions holds nothing either
@@ -2148,7 +2144,13 @@ export async function createLibp2pNodeBase(
 			// proof names. `docs/reactivity.md` §Authentication and integrity.
 			const commitLogAnchor = new CommitLogTrustAnchor({
 				membersAt: rootGroupAt,
-				latestClaimFrom: (peerIdStr, blockId) => clusterLatestCallback(peerIdFromString(peerIdStr), blockId),
+				// The anchor reads only the claim and its proof, so it is not handed the archive to hold.
+				latestClaimFrom: async (peerIdStr, blockId) => {
+					const answer = await clusterLatestCallback(peerIdFromString(peerIdStr), blockId);
+					if (!answer) return undefined;
+					const { archive: _archive, ...claim } = answer;
+					return claim;
+				},
 				thresholds: proofThresholds(consensusConfig.superMajorityThreshold),
 				hash: createRingHash(),
 			});

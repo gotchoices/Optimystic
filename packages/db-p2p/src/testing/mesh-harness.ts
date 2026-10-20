@@ -16,7 +16,7 @@ import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
-import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
+import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { stateHoldingsOnReads } from '../repo/stated-holdings.js';
@@ -577,7 +577,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<CertifiedActionRev | undefined> => {
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<ClusterLatestAnswer | undefined> => {
 			if (lifetime.stopped) throw stoppedError();
 			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
 			// production callback — the coordinator must count this as "did not answer", never as
@@ -600,7 +600,11 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// proof out of the served archive; the harness reads the sibling's repo directly, so
 			// sharing the lookup is what keeps the two answers identical.
 			const proof = await servableProof(target.storageRepo, blockId, latest);
-			return proof ? { ...latest, proof } : latest;
+			// Production's consult answer carries the archive it was read from, which the acquisition
+			// then reuses instead of fetching; attach the one `makeFetchArchive` would serve this peer
+			// (unpinned, as production's request is), so mesh specs exercise that reuse.
+			const archive = await serveBlockArchive(target.storageRepo, blockId);
+			return { ...latest, ...(proof ? { proof } : {}), ...(archive ? { archive } : {}) };
 		};
 		// The node's own (partition-aware) key-network view — the SAME instance the member's admission
 		// derivation reads, matching real Libp2pKeyPeerNetwork behavior.
