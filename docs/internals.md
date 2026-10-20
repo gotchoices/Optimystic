@@ -561,6 +561,21 @@ operation is a promise round and a decision, and the pend's decision rides on th
 (see *Both consensus rounds carry the coordinator's own member's vote*). A write spanning several
 collections costs 4 per collection, and a tail round plus a sweep costs more again.
 
+A consensus record can carry several collections of one action — a **batch** (`RepoMessage` in
+`packages/db-core/src/network/repo-protocol.ts`): all pends or all commits, one action id, no block named by
+two operations, and each collection keeping its own request (revision, tail, bases, digests). A member refuses
+any other multi-operation record as a fault of the record (`batchShapeFault` in
+`packages/db-p2p/src/cluster/record-operations.ts`), applies a batch's operations one at a time, and keeps ONE
+verdict for the record, folded over them (`applyConsensusOperations` in
+`packages/db-p2p/src/cluster/cluster-repo.ts`). A pend record succeeds only when every collection's pend did;
+otherwise the first conflict-shaped refusal is its answer, so a refusal of any collection reaches the writer. A
+commit record succeeds only when this member holds every collection's revision, and a later reconcile of a
+behind member repeats only the collections it is missing. Members accept batches; no sender builds one yet.
+One pend record and one commit record per action is what brings a multi-collection write to the three requests
+a one-collection write costs, and it keeps the held-back pend delivery safe: a member that refuses any
+collection's pend late refuses the action's one commit record before anything of it is durable
+(`mayDeferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
+
 What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
 first whatever order the request lists (`tailFirst`), stops at the first failure, and makes every whole-batch
@@ -786,8 +801,8 @@ whether it forked or the other two are simply lagging, and refusing it would bre
 lagging-cohort repair this mint exists for. Closing that needs evidence a claim does not carry today
 (`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`). See *The certified exception* below.
 
-**Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
-consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
+**Persistence and retention.** `ClusterMember.applyConsensusCommits` builds the proof once per
+consensus record (membership-v2 records only) and passes it into every commit operation's `StorageRepo.commit`, which
 applies one rule after materializing: **a member persists the proof only when its own
 materialization matches the digest the commit op declared** — otherwise it stores nothing and
 logs `commit:proof-digest-mismatch` (or `commit:proof-undeclared` when the op declared no digest
@@ -1597,7 +1612,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other
   mid-commit fault (`success:false` with a bare `reason`, no `missing`) is propagated so
   `handleConsensus` rolls back the executed marker and rethrows — same as an unexpected
-  *thrown* fault (`applyCommitToStorage`, called from `applyConsensusOperation`). Whatever shape the
+  *thrown* fault (`applyCommitToStorage`, called from `applyConsensusCommits`). Whatever shape the
   apply took, the member then retains ONE post-reconcile durable verdict for the commit
   (`durableCommitVerdict`): storage's own success, or — after the reconcile a refusal triggered — a
   fresh check that every committed block records the commit's revision under its action (the
@@ -2845,7 +2860,7 @@ check — silently dropping the transaction on that member forever. The window b
 "apply succeeded" and "durable write landed" — the whole durability window now, not a few
 writes — is safe to re-run on restart because
 re-applying an already-applied consensus transaction is idempotent (the "ahead" divergence
-path in `applyConsensusOperation` tolerates it as a no-op).
+path in `applyCommitToStorage` tolerates it as a no-op).
 
 ### 5. Latch Deadlocks
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.

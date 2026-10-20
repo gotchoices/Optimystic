@@ -1097,7 +1097,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 *    record, so the cancel is a no-op there;
 	 *  - it did not land ⇒ the cancel is exactly the repair;
 	 *  - its consensus is still in flight and lands AFTER the cancel ⇒ the member meets a missing
-	 *    pend, which `ClusterMember.applyConsensusOperation` already treats as "behind" divergence and
+	 *    pend, which `ClusterMember.applyCommitToStorage` already treats as "behind" divergence and
 	 *    cures by reconciling the block from a cohort peer.
 	 *
 	 * Confirmed blocks are excluded only to skip a pointless consensus round — cancelling one would

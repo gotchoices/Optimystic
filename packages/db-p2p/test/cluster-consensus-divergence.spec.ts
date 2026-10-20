@@ -486,7 +486,7 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 /**
  * Ticket: consensus-pend-refusal-commit-tier-verify2 (member-side commit-verdict retention).
  *
- * `ClusterMember.applyConsensusOperation` retains local storage's CommitResult per messageHash
+ * `ClusterMember.applyConsensusOperations` retains local storage's CommitResult per messageHash
  * (`getExecutedCommitResult`) so the coordinator can detect when the 'ahead' tolerance above
  * swallowed a refusal whose real cause was a rival action holding the requested revision. The
  * missing-pend behind path deliberately retains NOTHING (no CommitResult exists there), and a

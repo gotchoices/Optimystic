@@ -182,3 +182,10 @@ It was not simply filtered, because the draw must be identical on every honest n
 - **Alternative:** filter in the hook and accept that nodes whose predicates differ draw different arbitrators; a verify-path recompute would then need the predicate's answers as part of what it reconstructs, which the anchoring work would have to carry.
 
 Expected behaviour: on a node with a membership predicate, a refused peer is never drawn as an arbitrator and never sent a challenge.
+
+
+## A dispute over a batch reverses only its first collection (added by `a-consensus-record-carries-several-collections-of-one-action`, 2026-10-20)
+
+A consensus record can now carry a batch: the commits of several collections written by one action, each its own commit operation with its own revision, log tail and blocks (`RepoMessage` in `packages/db-core/src/network/repo-protocol.ts`). Members accept such records; the sending side follows in `a-transaction-pends-and-commits-its-collections-together`. `DisputeService.extractInvalidationTarget` in `packages/db-p2p/src/dispute/dispute-service.ts` returns the FIRST commit operation it finds, so a `challenger-wins` ruling over a batch record originates one `InvalidateRequest` for the first collection only — its blocks, its revision, its log — and leaves the action's other collections committed. The same first-operation target is hashed into the challenge (`computeChallengeTargetHash`) and into the invalidation certificate (`computeTargetHash`), which is why this is not a one-line loop: one certificate target per record cannot verify several per-collection requests.
+
+Expected behaviour: a proven-invalid batch is reversed in every collection it wrote. Settle, before going live, how the certificate binds several targets — one target per commit operation signed into the vote, or one target naming every operation that the apply side splits per collection — and have `maybeInvalidate` originate one invalidation per collection. Dormant until disputes are enabled and a sender builds batches, so it belongs here rather than in its own ticket.

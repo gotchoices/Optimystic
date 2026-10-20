@@ -25,7 +25,7 @@
  *
  * Storage is REAL (`StorageRepo` over `MemoryRawStorage`), so a member pend lands as a genuine
  * pending-only record and `StorageRepo.get` reports it exactly as production does (`{ state: {} }`
- * with no context). The cluster-member write path (`ClusterRepo.applyConsensusOperation`) calls
+ * with no context). The cluster-member write path (`ClusterRepo.applyConsensusOperations`) calls
  * `storageRepo.pend` / `storageRepo.commit` directly, which is what the unit tier does here; the
  * mesh tier at the bottom drives the real member through a real coordinator.
  *
@@ -219,7 +219,7 @@ describe('CoordinatorRepo never serves a stale absent after a write that bypasse
 
 	describe('unit: the cohort view stays self-only', () => {
 		it('a cohort-member pend lands inside the window and the next read consults', async () => {
-			// `ClusterRepo.applyConsensusOperation` calls `storageRepo.pend` directly, so no clearing hook
+			// `ClusterRepo.applyConsensusOperations` calls `storageRepo.pend` directly, so no clearing hook
 			// in `CoordinatorRepo` could see it, and at beta.3 the next read served the memo. On a
 			// self-only view the ANSWER is the same absent either way; what this pins is that the read
 			// consulted, which is what lets the cases below see a grown cohort.

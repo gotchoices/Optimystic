@@ -513,7 +513,7 @@ describe('BlockCommitProof', () => {
 		/**
 		 * Drive a FULLY-SIGNED v2 record through a real member backed by a pend-seeded StorageRepo.
 		 * With every promise and commit already signed (2 peers -- both must sign both rounds), update()
-		 * goes straight to Consensus and applyConsensusOperation hands the proof down the commit path.
+		 * goes straight to Consensus and applyConsensusOperations hands the proof down the commit path.
 		 */
 		const consensusCommit = async (declaredDigest: string) => {
 			const raw = new MemoryRawStorage();

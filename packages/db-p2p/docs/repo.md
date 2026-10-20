@@ -194,18 +194,24 @@ Once promise super-majority is reached, the coordinator drives the commit phase.
 All network communication uses the `RepoMessage` format:
 
 ```typescript
+export type RepoOperation =
+	{ get: BlockGets } |
+	{ pend: PendRequest } |
+	{ cancel: { actionRef: ActionBlocks } } |
+	{ commit: CommitRequest } |
+	{ invalidate: InvalidateRequest };
+
 export type RepoMessage = {
-	operations: [
-		{ get: BlockGets } |
-		{ pend: PendRequest } |
-		{ cancel: { actionRef: ActionBlocks } } |
-		{ commit: CommitRequest } |
-		{ invalidate: InvalidateRequest }
-	],
+	operations: [RepoOperation, ...RepoOperation[]],
 	expiration?: number,
 	coordinatingBlockIds?: string[],
 };
 ```
+
+A message of more than one operation must be a batch: every operation a `pend`, or every one a
+`commit`, all naming one action, with no block in two operations. A cluster member refuses any other
+multi-operation record (`batchShapeFault` in `packages/db-p2p/src/cluster/record-operations.ts`); the
+repo protocol's handler still serves `operations[0]` only.
 
 One request per stream: the service answers the first frame and completes the generator, so a client
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and

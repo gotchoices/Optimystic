@@ -23,7 +23,8 @@ import type { BlockArchive } from "../storage/struct.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
-import { getAffectedBlockIds } from "./record-operations.js";
+import { batchShapeFault, getAffectedBlockIds } from "./record-operations.js";
+import { foldPendResults, isBehindRefusal, retainedCommitVerdicts, type CommitOperationVerdict, type RetainedCommitVerdicts } from "./batch-verdicts.js";
 import { operationsConflict, resolveRace } from "./race-resolution.js";
 import { buildBlockCommitProof, mintSoloCommitProof, type BlockCommitProof } from "./commit-proof.js";
 import { reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveSlotHoldWindowMs } from "./cluster-policy.js";
@@ -459,29 +460,27 @@ export class ClusterMember implements ICluster {
 	private activeTransactions: Map<string, TransactionState> = new Map();
 	// Track executed consensus transactions to prevent duplicate execution (messageHash -> executedAt timestamp)
 	private executedTransactions: Map<string, number> = new Map();
-	// Local storage's verdict for a pend operation applied during consensus (messageHash -> PendResult).
-	// Retained so the coordinator can return storage's real answer instead of fabricating success —
-	// a pend that every member refused (rival pending action, or the revision already taken) must
-	// reach the writer as a conflict, not a win. Pruned alongside executedTransactions (same TTL).
+	// Local storage's verdict for a pend record applied during consensus (messageHash -> PendResult),
+	// folded over a batch's operations (foldPendResults). Retained so the coordinator can return
+	// storage's real answer instead of fabricating success — a pend that every member refused (rival
+	// pending action, or the revision already taken) must reach the writer as a conflict, not a win.
+	// Pruned alongside executedTransactions (same TTL).
 	private executedPendResults: Map<string, PendResult> = new Map();
-	// This member's POST-RECONCILE durable verdict for a COMMIT operation applied during consensus
-	// (messageHash -> CommitResult): whether local storage holds the committed revision under the
-	// record's action once the apply — and any behind-reconcile it triggered — has run. Two readers,
-	// which must see the same answer: the coordinating node reads its own member's directly
-	// (getExecutedCommitResult), every other member's reaches the coordinator on the response record
-	// (withOwnApplyOutcome → ClusterRecord.applyOutcomes[peer].commit). Together they feed the
-	// durability gate in CoordinatorRepo.commit, which acknowledges a commit only when a majority of
-	// the cohort reports holding it — consensus votes were never evidence of storage. A retained
-	// refusal also lets the coordinator detect when the ahead-divergence tolerance in
-	// applyConsensusOperation swallowed a refusal whose real cause was a RIVAL action holding the
-	// requested revision. Pruned alongside executedTransactions (same TTL).
-	private executedCommitResults: Map<string, CommitResult> = new Map();
-	// The messageHashes whose retained commit refusal above has the BEHIND shape (missing pend or
-	// missing base — this member held no usable revision), as opposed to the ahead shape, which must
-	// never be reconciled downward. Recorded from the apply branch that produced the refusal rather
-	// than read back from its prose. Only these are eligible for reconcileRefusedCommit. Same TTL,
-	// pruning and rollback as executedCommitResults.
-	private behindCommitRefusals: Set<string> = new Set();
+	// This member's POST-RECONCILE durable verdict for each COMMIT operation of a record applied during
+	// consensus, and their fold (messageHash -> RetainedCommitVerdicts): whether local storage holds
+	// each committed revision under the record's action once the apply — and any behind-reconcile it
+	// triggered — has run. Two readers of the fold, which must see the same answer: the coordinating
+	// node reads its own member's directly (getExecutedCommitResult), every other member's reaches the
+	// coordinator on the response record (withOwnApplyOutcome → ClusterRecord.applyOutcomes[peer].commit).
+	// Together they feed the durability gate in CoordinatorRepo.commit, which acknowledges a commit only
+	// when a majority of the cohort reports holding it — consensus votes were never evidence of storage.
+	// A retained refusal also lets the coordinator detect when the ahead-divergence tolerance in
+	// applyCommitToStorage swallowed a refusal whose real cause was a RIVAL action holding the
+	// requested revision. Each operation also records whether its refusal had the BEHIND shape (missing
+	// pend or missing base — this member held no usable revision), as opposed to the ahead shape, which
+	// must never be reconciled downward; only those are eligible for reconcileRefusedCommit. Pruned
+	// alongside executedTransactions (same TTL).
+	private executedCommitResults: Map<string, RetainedCommitVerdicts> = new Map();
 	// Conflict-shaped pend refusals this member's storage produced at consensus-apply, keyed by the
 	// refused action's id rather than by messageHash, then by each block the refused pend named. The
 	// messageHash-keyed map above cannot serve the commit-promise guard: a commit is a DIFFERENT
@@ -683,7 +682,6 @@ export class ClusterMember implements ICluster {
 		this.cleanupQueue.length = 0;
 		this.executedPendResults.clear();
 		this.executedCommitResults.clear();
-		this.behindCommitRefusals.clear();
 		this.refusedPendActions.clear();
 	}
 
@@ -696,8 +694,9 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Local storage's verdict for the pend operation this member applied at consensus for
-	 * `messageHash`, when one was retained. The coordinator reads this so the answer a writer gets
+	 * Local storage's verdict for the pend record this member applied at consensus for
+	 * `messageHash`, when one was retained — for a batch, the fold of its operations' verdicts
+	 * (`foldPendResults`). The coordinator reads this so the answer a writer gets
 	 * is the answer storage gave — the cluster path must not fabricate a success the single-node
 	 * path (`CoordinatorRepo.pend`'s `peerCount <= 1` short-circuit) would never produce. Absent for
 	 * transactions carrying no pend operation, for transactions applied before this member restarted
@@ -711,9 +710,9 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Commit-shaped sibling of {@link getExecutedPendResult}: this member's post-reconcile durable
-	 * verdict for a commit operation applied during consensus, when it retained one — `success: true`
-	 * iff local storage holds the committed revision under the record's action for every block the
-	 * commit named, after the apply and any behind-reconcile it triggered. `CoordinatorRepo.commit`
+	 * verdict for a commit record applied during consensus, when it retained one — `success: true`
+	 * iff local storage holds the committed revision under the record's action for every block every
+	 * commit operation named, after the apply and any behind-reconcile it triggered. `CoordinatorRepo.commit`
 	 * reads it after a locally-executed commit-consensus, both as this node's own contribution to the
 	 * durable-holder count its durability gate needs, and — for a retained refusal whose cause a
 	 * local re-read confirms as a rival holding the requested revision — as the trigger for a
@@ -721,7 +720,7 @@ export class ClusterMember implements ICluster {
 	 * absent for pre-restart applies, pruned on the executed-transaction TTL.
 	 */
 	getExecutedCommitResult(messageHash: string): CommitResult | undefined {
-		return this.executedCommitResults.get(messageHash);
+		return this.executedCommitResults.get(messageHash)?.folded;
 	}
 
 	/**
@@ -1002,7 +1001,7 @@ export class ClusterMember implements ICluster {
 	 */
 	private withOwnApplyOutcome(record: ClusterRecord): ClusterRecord {
 		const pend = this.executedPendResults.get(record.messageHash);
-		const commit = this.executedCommitResults.get(record.messageHash);
+		const commit = this.executedCommitResults.get(record.messageHash)?.folded;
 		const own: MemberApplyOutcome = {
 			...(this.executedTransactions.has(record.messageHash) ? { executed: true } : {}),
 			...(pend !== undefined && !pend.success && isConflictFailure(pend) ? { pend } : {}),
@@ -1155,6 +1154,14 @@ export class ClusterMember implements ICluster {
 		const expectedHash = await this.computeMessageHash(record);
 		if (expectedHash !== record.messageHash) {
 			throw new Error(`Message hash mismatch: expected=${expectedHash}, received=${record.messageHash}`);
+		}
+
+		// A message of several operations must be a batch (`RepoMessage.operations`). Anything else —
+		// mixed kinds, two actions, one block in two operations — is a fault of the record, which no
+		// honest coordinator builds, not a verdict this member votes on.
+		const shapeFault = batchShapeFault(record.message.operations);
+		if (shapeFault !== undefined) {
+			throw new Error(`Malformed batch: ${shapeFault}`);
 		}
 
 		// Validate signatures
@@ -2120,6 +2127,10 @@ export class ClusterMember implements ICluster {
 	private noteStaleLoss(record: ClusterRecord, pendRequest: PendRequest, blockIds: BlockId[]): void {
 		if (this.slotHoldWindowMs === 0) return;
 		// One record is one loss, however many times it is delivered (see {@link countedStaleLosses}).
+		// NOTE: for a batch that is also one grant, on the blocks of the first operation found stale;
+		// the action's other collections get no hold, so a quick rival on one of them can still beat
+		// the aged batch. If aged multi-collection writers are ever seen starving, grant on every block
+		// the record's pend operations name.
 		if (this.countedStaleLosses.has(record.messageHash)) return;
 		this.countedStaleLosses.set(record.messageHash, true);
 		const losses = (this.staleLosses.get(pendRequest.actionId) ?? 0) + 1;
@@ -2236,7 +2247,7 @@ export class ClusterMember implements ICluster {
 	 * check every caught-up member would abstain (the content-digest check below abstains for
 	 * update-only transforms whose base moved) and the loser could reach commit-consensus for a
 	 * write no member will ever durably store (its apply is refused stale and tolerated as 'ahead'
-	 * divergence — see `applyConsensusOperation`).
+	 * divergence — see `applyCommitToStorage`).
 	 *
 	 * Same "must run on the promise round" rule as {@link validateCommitOperations}: the
 	 * commit-round vote is deliberately blind, so promise votes are the only ones that carry
@@ -2753,15 +2764,13 @@ export class ClusterMember implements ICluster {
 		this.executedTransactions.set(record.messageHash, executedAt);
 
 		try {
-			for (const operation of record.message.operations) {
-				await this.applyConsensusOperation(record, operation);
-			}
+			await this.applyConsensusOperations(record);
 		} catch (err) {
 			// A genuinely unexpected fault (e.g. storage I/O) — roll back the in-memory
 			// marker so a corrected retry can re-run, and propagate so the caller learns
 			// the real cause. The durable marker was never written (it lands only after
 			// apply succeeds, below), so there is nothing to roll back. Recoverable local
-			// divergence is absorbed inside applyConsensusOperation and never reaches here.
+			// divergence is absorbed inside applyCommitToStorage and never reaches here.
 			// A retained pend verdict rolls back with the marker: it belongs to an apply
 			// that is now considered not-executed, and a re-run will retain a fresh one.
 			// The actionId-keyed refusals for this record's pend operations go with it — leaving
@@ -2769,7 +2778,6 @@ export class ClusterMember implements ICluster {
 			this.executedTransactions.delete(record.messageHash);
 			this.executedPendResults.delete(record.messageHash);
 			this.executedCommitResults.delete(record.messageHash);
-			this.behindCommitRefusals.delete(record.messageHash);
 			for (const operation of record.message.operations) {
 				if ('pend' in operation) this.retirePendRefusal(operation.pend);
 			}
@@ -2785,7 +2793,7 @@ export class ClusterMember implements ICluster {
 		// the window between "apply succeeded" and "durable write landed" — the apply's whole
 		// durability window now, not a few writes — is safe to re-run on restart: re-applying
 		// an already-applied consensus transaction is idempotent (the "ahead" divergence path
-		// in applyConsensusOperation tolerates it as a no-op), so it converges rather than
+		// in applyCommitToStorage tolerates it as a no-op), so it converges rather than
 		// dropping. Fire-and-forget: a persist failure must not fail the apply that succeeded.
 		this.markExecutedOnceDurable(record.messageHash, executedAt);
 	}
@@ -2830,10 +2838,10 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Applies one consensus-approved operation to local storage.
+	 * Applies a consensus-approved record's operations to local storage, one at a time.
 	 *
 	 * By the time we reach here the cluster has *already* reached consensus, so the
-	 * operation is authoritative cluster-wide. A failure applying it to THIS member's
+	 * record is authoritative cluster-wide. A failure applying it to THIS member's
 	 * local store therefore does not mean the operation is invalid — it means our
 	 * local state has diverged from the agreed history:
 	 *
@@ -2875,103 +2883,152 @@ export class ClusterMember implements ICluster {
 	 * member retains one post-reconcile durable verdict for it ({@link durableCommitVerdict}) and
 	 * reports it to the coordinator, whose durability gate (`CoordinatorRepo.commit`) acknowledges
 	 * the writer only when a majority of the cohort reports holding the revision.
+	 *
+	 * A record of several operations is a batch (`RepoMessage.operations`, checked in
+	 * {@link validateRecord}): the several collections of one action, all pends or all commits. Each
+	 * operation is applied on its own, exactly as a one-operation record's would be, and the record
+	 * retains ONE verdict folded over them ({@link applyConsensusPends}, {@link applyConsensusCommits}),
+	 * because both readers of a retained verdict answer for the record, not for an operation.
 	 */
-	private async applyConsensusOperation(record: ClusterRecord, operation: RepoMessage['operations'][number]): Promise<void> {
-		const messageHash = record.messageHash;
-		if ('get' in operation) {
-			await this.storageRepo.get(operation.get);
-			return;
+	private async applyConsensusOperations(record: ClusterRecord): Promise<void> {
+		const { operations } = record.message;
+		const pends = operations.flatMap(operation => 'pend' in operation ? [operation.pend] : []);
+		const commits = operations.flatMap(operation => 'commit' in operation ? [operation.commit] : []);
+		if (pends.length > 0) {
+			await this.applyConsensusPends(record, pends);
 		}
-		if ('cancel' in operation) {
-			await this.storageRepo.cancel(operation.cancel.actionRef);
-			return;
+		if (commits.length > 0) {
+			await this.applyConsensusCommits(record, commits);
 		}
-		if ('pend' in operation) {
-			const result = await this.localApply().pend(operation.pend, undefined, { syncWithinMs: this.syncWindowFor(record) });
-			// Retain the verdict either way so the coordinator can hand the writer storage's real
-			// answer (see getExecutedPendResult). A refusal here is NOT local divergence the way a
-			// commit refusal is: pend-consensus confers no durability — a refusal carrying `pending`
-			// (a rival's unresolved action holds the blocks) or `missing` (the requested revision is
-			// already committed) is the optimistic-concurrency verdict, and swallowing it acknowledged
-			// writes that no member stored.
-			this.executedPendResults.set(messageHash, result);
-			// Second, actionId-keyed retention for the commit tier: this same refusal must still be
-			// findable when THIS action's commit record (a different messageHash) arrives for a
-			// promise vote, so a member cannot co-sign the commit of a pend it just refused. Only
-			// conflict-shaped refusals are kept — a bare-reason fault is local trouble, not evidence
-			// that a rival holds the blocks, and must not veto the cohort's commit.
-			if (!result.success && isConflictFailure(result)) {
-				// `Date.now()`, not the injected `this.now()`: the prune sweep and the executed-marker
-				// timestamps this retention shares a TTL with are both on the wall clock, and a mixed
-				// pair would prune on the first sweep (or never) under an injected clock.
-				this.retainPendRefusal(operation.pend, Date.now());
-			} else if (result.success) {
-				// A later apply of the SAME action that storage accepted retires the refusal: the
-				// retention means "the last thing my storage said about this action's pend was no",
-				// and a stale yes-then-no would veto the commit of an action this member now holds
-				// pended, whenever any unrelated rival happens to sit on one of its blocks.
-				this.retirePendRefusal(operation.pend);
+		for (const operation of operations) {
+			if ('get' in operation) {
+				await this.storageRepo.get(operation.get);
+			} else if ('cancel' in operation) {
+				await this.storageRepo.cancel(operation.cancel.actionRef);
+			} else if ('invalidate' in operation) {
+				await this.applyConsensusInvalidation(record, operation.invalidate);
 			}
-			if (!result.success) {
-				log('cluster-member:consensus-pend-diverged', {
-					messageHash,
-					actionId: operation.pend.actionId,
-					reason: result.reason,
-					hasMissing: !!result.missing?.length,
-					hasPending: !!result.pending?.length
-				});
-			}
-			return;
 		}
-		if ('commit' in operation) {
-			const commit = operation.commit;
-			// Capture the consensus commit cert BEFORE applying to storage: StorageRepo.commit emits the
-			// CollectionChangeEvent synchronously at the end of the call below, and the reactivity bridge
-			// resolves the cert from that event — so it must already be retained when commit() returns.
-			//
-			// The commit-vote signed preimage is computed HERE, before the synchronous capture+commit
-			// sequence below: it is the exact bytes each approving signer endorsed
-			// (`utf8(commitHash + ":approve")`), reproduced from this already-validated `record` (its
-			// commit signatures were verified against the same `computeCommitHash`). Reactivity sets a
-			// notification's `digest` from it so a subscriber's threshold-verify over `digest` succeeds.
-			// The one `await` happens before `captureCommitCert` runs, so the cert is still retained
-			// synchronously before `commit()` emits its change event (do not move this past the commit).
-			// Gated on the sink: with no reactivity wired the preimage has no consumer, so a sink-less
-			// node pays neither the extra `sha256` nor the extra microtask — the true zero-cost default.
-			if (this.onCommitCertificate) {
-				const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
-				this.captureCommitCert(record, commit.actionId, commitSignedPayload);
-			}
-			// Project the consensus record into a durable BlockCommitProof and hand it down the commit
-			// path — StorageRepo persists it only where the local materialization matches the declared
-			// digest (see persistProofIfContentMatches). A cheap projection (no hashing/signing).
-			// `undefined` for a v1 / unversioned record: its hashes bind no peer set, so it is never
-			// certifiable — logged so an operator can see why a cohort retains no proofs. It rides down
-			// on the named ILocalApply contract (localApply); a plain IRepo mock ignores the extra argument.
-			const proof = buildBlockCommitProof(record);
-			if (proof === undefined) {
-				log('cluster-member:commit-proof-skipped', {
-					messageHash,
-					actionId: commit.actionId,
-					membershipVersion: record.membershipVersion
-				});
-			}
+	}
+
+	/**
+	 * Apply a record's pend operations and retain their folded verdict ({@link foldPendResults}), so
+	 * the coordinator can hand the writer storage's real answer (see getExecutedPendResult). A
+	 * refusal here is NOT local divergence the way a commit refusal is: pend-consensus confers no
+	 * durability — a refusal carrying `pending` (a rival's unresolved action holds the blocks) or
+	 * `missing` (the requested revision is already committed) is the optimistic-concurrency verdict,
+	 * and swallowing it acknowledged writes that no member stored. In a batch, a refusal of any
+	 * collection's pend is the record's answer, whichever operation it came from.
+	 */
+	private async applyConsensusPends(record: ClusterRecord, pends: readonly PendRequest[]): Promise<void> {
+		const results: PendResult[] = [];
+		for (const pend of pends) {
+			results.push(await this.applyConsensusPend(record, pend));
+		}
+		this.executedPendResults.set(record.messageHash, foldPendResults(results));
+	}
+
+	/** Apply one pend operation of a consensus record to storage, keeping its per-block refusal. */
+	private async applyConsensusPend(record: ClusterRecord, pend: PendRequest): Promise<PendResult> {
+		const result = await this.localApply().pend(pend, undefined, { syncWithinMs: this.syncWindowFor(record) });
+		// Second, actionId-keyed retention for the commit tier: this same refusal must still be
+		// findable when THIS action's commit record (a different messageHash) arrives for a
+		// promise vote, so a member cannot co-sign the commit of a pend it just refused. Only
+		// conflict-shaped refusals are kept — a bare-reason fault is local trouble, not evidence
+		// that a rival holds the blocks, and must not veto the cohort's commit. Kept per block, so a
+		// batch's accepted collections never retire the refusal of a refused one.
+		if (!result.success && isConflictFailure(result)) {
+			// `Date.now()`, not the injected `this.now()`: the prune sweep and the executed-marker
+			// timestamps this retention shares a TTL with are both on the wall clock, and a mixed
+			// pair would prune on the first sweep (or never) under an injected clock.
+			this.retainPendRefusal(pend, Date.now());
+		} else if (result.success) {
+			// A later apply of the SAME action that storage accepted retires the refusal: the
+			// retention means "the last thing my storage said about this action's pend was no",
+			// and a stale yes-then-no would veto the commit of an action this member now holds
+			// pended, whenever any unrelated rival happens to sit on one of its blocks.
+			this.retirePendRefusal(pend);
+		}
+		if (!result.success) {
+			log('cluster-member:consensus-pend-diverged', {
+				messageHash: record.messageHash,
+				actionId: pend.actionId,
+				reason: result.reason,
+				hasMissing: !!result.missing?.length,
+				hasPending: !!result.pending?.length
+			});
+		}
+		return result;
+	}
+
+	/**
+	 * Apply a record's commit operations and retain each one's POST-RECONCILE durable verdict with
+	 * their fold (see getExecutedCommitResult and withOwnApplyOutcome): what this member's storage
+	 * holds NOW, after any behind-reconcile the apply triggered — not what the first apply attempt
+	 * said. A member that pulled the revision from a cohort peer is a durable holder and reports one;
+	 * a member that could not is not, whichever shape its refusal took. The coordinator's durability
+	 * gate counts these verdicts — its own member's through getExecutedCommitResult, every other
+	 * member's off the response record — and the two readers must see the same answer, hence one
+	 * folded verdict, computed once, retained here for both.
+	 *
+	 * The commit cert and the commit proof belong to the record, not to an operation: a batch names
+	 * one action, so the one cert captured before the first operation's storage commit resolves for
+	 * every collection's change event, and the one proof is handed to every operation's commit.
+	 */
+	private async applyConsensusCommits(record: ClusterRecord, commits: readonly CommitRequest[]): Promise<void> {
+		const actionId = commits[0]!.actionId;
+		await this.captureConsensusCommitCert(record, actionId);
+		const proof = this.consensusCommitProof(record, actionId);
+		const operations: CommitOperationVerdict[] = [];
+		for (const commit of commits) {
 			const { applied, behind } = await this.applyCommitToStorage(record, commit, proof);
-			// Retain the POST-RECONCILE durable verdict (see getExecutedCommitResult and
-			// withOwnApplyOutcome): what this member's storage holds NOW, after any behind-reconcile the
-			// apply triggered — not what the first apply attempt said. A member that pulled the
-			// revision from a cohort peer is a durable holder and reports one; a member that could not
-			// is not, whichever shape its refusal took. The coordinator's durability gate counts these
-			// verdicts — its own member's through getExecutedCommitResult, every other member's off the
-			// response record — and the two readers must see the same answer, hence one verdict,
-			// computed once, retained here for both.
-			this.retainCommitVerdict(record, commit, await this.durableCommitVerdict(commit, applied), behind);
+			operations.push({ commit, verdict: await this.durableCommitVerdict(commit, applied), behind });
+		}
+		this.retainCommitVerdicts(record, operations);
+	}
+
+	/**
+	 * Capture the consensus commit cert BEFORE applying anything to storage: StorageRepo.commit emits
+	 * the CollectionChangeEvent synchronously at the end of the call, and the reactivity bridge
+	 * resolves the cert from that event — so it must already be retained when the first commit()
+	 * returns, and therefore for every later one.
+	 *
+	 * The commit-vote signed preimage is computed here, before the capture: it is the exact bytes each
+	 * approving signer endorsed (`utf8(commitHash + ":approve")`), reproduced from this
+	 * already-validated `record` (its commit signatures were verified against the same
+	 * `computeCommitHash`). Reactivity sets a notification's `digest` from it so a subscriber's
+	 * threshold-verify over `digest` succeeds. The one `await` happens before `captureCommitCert`
+	 * runs, so the cert is retained before any `commit()` emits its change event (do not move this
+	 * past the first commit). Gated on the sink: with no reactivity wired the preimage has no
+	 * consumer, so a sink-less node pays neither the extra `sha256` nor the extra microtask — the true
+	 * zero-cost default.
+	 */
+	private async captureConsensusCommitCert(record: ClusterRecord, actionId: ActionId): Promise<void> {
+		if (!this.onCommitCertificate) {
 			return;
 		}
-		if ('invalidate' in operation) {
-			await this.applyConsensusInvalidation(record, operation.invalidate);
-			return;
+		const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
+		this.captureCommitCert(record, actionId, commitSignedPayload);
+	}
+
+	/**
+	 * Project the consensus record into a durable BlockCommitProof to hand down the commit path —
+	 * StorageRepo persists it only where the local materialization matches the declared digest (see
+	 * persistProofIfContentMatches). A cheap projection (no hashing/signing). `undefined` for a v1 /
+	 * unversioned record: its hashes bind no peer set, so it is never certifiable — logged so an
+	 * operator can see why a cohort retains no proofs. It rides down on the named ILocalApply contract
+	 * (localApply); a plain IRepo mock ignores the extra argument.
+	 */
+	private consensusCommitProof(record: ClusterRecord, actionId: ActionId): BlockCommitProof | undefined {
+		const proof = buildBlockCommitProof(record);
+		if (proof === undefined) {
+			log('cluster-member:commit-proof-skipped', {
+				messageHash: record.messageHash,
+				actionId,
+				membershipVersion: record.membershipVersion
+			});
 		}
+		return proof;
 	}
 
 	/** The widened local-apply seam ({@link ILocalApply}); a plain `IRepo` double ignores the third argument. */
@@ -2991,7 +3048,7 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Apply one consensus commit to local storage, tolerating every divergence shape the way the
-	 * doc comment on {@link applyConsensusOperation} describes and reconciling the behind ones.
+	 * doc comment on {@link applyConsensusOperations} describes and reconciling the behind ones.
 	 * `applied` is storage's own result — or, for the thrown missing-pend shape, which produces no
 	 * `CommitResult` at all, a refusal built from the throw — so {@link durableCommitVerdict} works
 	 * from one uniform shape. `behind` is true exactly when one of the two behind branches ran, which
@@ -3076,19 +3133,18 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Retain `verdict` as this member's durable verdict for `record`'s commit (see
-	 * {@link executedCommitResults}), remember whether a refusal was the behind shape, and — once the
-	 * verdict is a success — report the committed holders. Shared by the consensus apply and
-	 * {@link reconcileRefusedCommit} so both leave the same state behind.
+	 * Retain a commit record's per-operation durable verdicts and their fold as this member's verdict
+	 * for the record (see {@link executedCommitResults}), and report the committed holders of each
+	 * operation that now succeeds and did not in `previous`. Shared by the consensus apply (nothing
+	 * previous) and {@link reconcileRefusedCommit} so both leave the same state behind.
 	 */
-	private retainCommitVerdict(record: ClusterRecord, commit: CommitRequest, verdict: CommitResult, behind: boolean): void {
-		this.executedCommitResults.set(record.messageHash, verdict);
-		if (verdict.success) {
-			this.behindCommitRefusals.delete(record.messageHash);
-			this.reportBlockHolders(record, commit);
-		} else if (behind) {
-			this.behindCommitRefusals.add(record.messageHash);
-		}
+	private retainCommitVerdicts(record: ClusterRecord, operations: readonly CommitOperationVerdict[], previous?: readonly CommitOperationVerdict[]): void {
+		this.executedCommitResults.set(record.messageHash, retainedCommitVerdicts(operations));
+		operations.forEach((operation, index) => {
+			if (operation.verdict.success && previous?.[index]?.verdict.success !== true) {
+				this.reportBlockHolders(record, operation.commit);
+			}
+		});
 	}
 
 	/**
@@ -3103,31 +3159,34 @@ export class ClusterMember implements ICluster {
 	 * record. The holder's copy carries the cohort's commit proof, so the existing certified
 	 * single-holder path adopts it; no new trust is involved.
 	 *
-	 * Does nothing unless the retained verdict for `record.messageHash` is a behind refusal; in
-	 * particular an ahead-shaped refusal (`missing`) is never reconciled downward. Recomputes and
-	 * re-retains the durable verdict afterwards, so `getExecutedCommitResult` then answers a success
-	 * when the revision landed. Bounded by the same per-block reconcile timeout and never throws.
+	 * Reconciles only the commit operations whose own retained verdict is a behind refusal; in
+	 * particular an ahead-shaped refusal (`missing`) is never reconciled downward, and an operation
+	 * already durable here is left alone. Recomputes those operations' durable verdicts and re-retains
+	 * the fold afterwards, so `getExecutedCommitResult` then answers a success once every collection's
+	 * revision landed. Bounded by the same per-block reconcile timeout and never throws.
 	 */
 	async reconcileRefusedCommit(record: ClusterRecord): Promise<void> {
 		const messageHash = record.messageHash;
-		const refused = this.executedCommitResults.get(messageHash);
-		if (refused === undefined || refused.success || !this.behindCommitRefusals.has(messageHash)) {
+		const retained = this.executedCommitResults.get(messageHash);
+		if (retained === undefined || !retained.operations.some(isBehindRefusal)) {
 			return;
 		}
-		const operation = record.message.operations.find((op): op is { commit: CommitRequest } => 'commit' in op);
-		if (operation === undefined) {
-			return;
-		}
-		const commit = operation.commit;
-		log('cluster-member:consensus-commit-reconcile-again', { messageHash, actionId: commit.actionId, rev: commit.rev });
-		await this.reconcileDivergentCommit(record, commit);
-		const verdict = await this.durableCommitVerdict(commit, refused);
+		const operations = await Promise.all(retained.operations.map(operation =>
+			isBehindRefusal(operation) ? this.reconcileCommitOperation(record, operation) : operation));
 		// The apply's retention may have been pruned or rolled back while the reconcile ran; never
 		// resurrect it.
-		if (this.executedCommitResults.get(messageHash) !== refused) {
+		if (this.executedCommitResults.get(messageHash) !== retained) {
 			return;
 		}
-		this.retainCommitVerdict(record, commit, verdict, true);
+		this.retainCommitVerdicts(record, operations, retained.operations);
+	}
+
+	/** One more reconcile of a behind-refused commit operation, with its recomputed durable verdict. */
+	private async reconcileCommitOperation(record: ClusterRecord, operation: CommitOperationVerdict): Promise<CommitOperationVerdict> {
+		const { commit } = operation;
+		log('cluster-member:consensus-commit-reconcile-again', { messageHash: record.messageHash, actionId: commit.actionId, rev: commit.rev });
+		await this.reconcileDivergentCommit(record, commit);
+		return { ...operation, verdict: await this.durableCommitVerdict(commit, operation.verdict) };
 	}
 
 	/**
@@ -3184,7 +3243,7 @@ export class ClusterMember implements ICluster {
 	 * capture the invalidation's commit cert (for reactivity reuse) → delegate the compensating write +
 	 * durable log append to the injected {@link InvalidationApplySink}.
 	 *
-	 * Like every other branch of {@link applyConsensusOperation}, a failure here is tolerated rather
+	 * Like every other branch of {@link applyConsensusOperations}, a failure here is tolerated rather
 	 * than thrown — a throw would reset the cluster stream. A forged/sub-threshold certificate is
 	 * rejected (and never reaches the sink); a sink fault is logged and its dedup marker rolled back
 	 * so a re-broadcast can retry. The durable, authoritative dedup is the invalidation log entry the
@@ -3232,7 +3291,7 @@ export class ClusterMember implements ICluster {
 
 		// Capture the invalidation's own commit cert — the threshold signature the cohort produced for
 		// THIS consensus-ordered `invalidate` op (over `computeCommitHash(record)`), the reversal analogue
-		// of the commit-cert capture in {@link applyConsensusOperation}. Reactivity reuses it bit-for-bit
+		// of the commit-cert capture in {@link captureConsensusCommitCert}. Reactivity reuses it bit-for-bit
 		// as the invalidation notification's `sig` (never re-signed). Keyed on the deterministic
 		// {@link invalidationActionId} the invalidation's change event also carries, so the bridge's
 		// cert extractor resolves it. Gated on the sink — a node with no reactivity wired pays nothing.
@@ -3544,7 +3603,6 @@ export class ClusterMember implements ICluster {
 				this.executedTransactions.delete(messageHash);
 				this.executedPendResults.delete(messageHash);
 				this.executedCommitResults.delete(messageHash);
-				this.behindCommitRefusals.delete(messageHash);
 			}
 		}
 		// Prune actionId-keyed pend refusals on the same TTL as the verdicts they were derived from.

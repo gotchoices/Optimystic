@@ -13,10 +13,18 @@ export function conflictPendRefusalOf(outcome: MemberApplyOutcome | undefined): 
 	return pend !== undefined && !pend.success && isConflictFailure(pend) ? pend : undefined;
 }
 
-/** Each of a message's pend operations, as its action id and the blocks it pends. */
+/**
+ * Each action a message pends, with every block its pend operations name. A batch pends several
+ * collections under one action, and a member's report answers for the whole record, so its refusal
+ * is held once under all of the batch's blocks — a commit of any of those collections takes it.
+ */
 function pendsOf(message: RepoMessage): { actionId: ActionId; blockIds: BlockId[] }[] {
-	return message.operations.flatMap(op =>
-		'pend' in op ? [{ actionId: op.pend.actionId, blockIds: blockIdsForTransforms(op.pend.transforms) }] : []);
+	const byAction = new Map<ActionId, BlockId[]>();
+	for (const op of message.operations) {
+		if (!('pend' in op)) continue;
+		byAction.set(op.pend.actionId, [...(byAction.get(op.pend.actionId) ?? []), ...blockIdsForTransforms(op.pend.transforms)]);
+	}
+	return [...byAction].map(([actionId, blockIds]) => ({ actionId, blockIds }));
 }
 
 /** A conflict-shaped pend refusal a member reported after the pend's writer was answered. */

@@ -3240,7 +3240,7 @@ export class CoordinatorRepo implements IRepo {
 			// populated, so the projection is genuine. Passed unconditionally, threshold or not:
 			// persistProofIfContentMatches retains it under the digest-match rule, and a record that
 			// never reached threshold simply yields a proof no verifier accepts — the same posture
-			// ClusterMember.applyConsensusOperation takes with its own projection.
+			// ClusterMember.consensusCommitProof takes with its own projection.
 			const consensusProof = buildBlockCommitProof(record);
 			try {
 				const result = await this.localApply().commit(request, options, { proof: consensusProof, syncWithinMs: this.syncWindowFor(record) });

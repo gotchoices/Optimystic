@@ -138,7 +138,7 @@ class MockRepo implements IRepo {
 /**
  * MockRepo whose `pend` throws a transient fault the first `throwCount` times it is
  * called (before recording the call), then behaves like MockRepo. Models a transient
- * storage I/O fault inside applyConsensusOperation so handleConsensus reaches its catch.
+ * storage I/O fault inside applyConsensusOperations so handleConsensus reaches its catch.
  */
 class ThrowOncePendRepo extends MockRepo {
 	throwCount: number;
@@ -1520,7 +1520,7 @@ describe('ClusterMember', () => {
 
 			// Drive to consensus: the phase fixpoint takes a single-peer record through promise →
 			// commit → consensus in ONE delivery, where throwingRepo.pend throws →
-			// applyConsensusOperation throws → handleConsensus rolls back the in-memory guard and
+			// applyConsensusOperations throws → handleConsensus rolls back the in-memory guard and
 			// rethrows out of this first update.
 			let threw = false;
 			try {

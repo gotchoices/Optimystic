@@ -951,7 +951,7 @@ export async function createLibp2pNodeBase(
 	const cohortWantK = options.cohortTopic?.wantK ?? 16;
 	// When enabled, the cluster member records the consensus commit cert into this store synchronously,
 	// BEFORE `storageRepo.commit` emits the change event the bridge's extractor resolves it from (see
-	// cluster-repo.ts §applyConsensusOperation). Created early because the sink must be passed into
+	// cluster-repo.ts §captureConsensusCommitCert). Created early because the sink must be passed into
 	// `clusterMember(...)` below. Composed with any caller-supplied `onCommitCertificate` so both fire.
 	const certStore: CommitCertStore | undefined = cohortEnabled ? createCommitCertStore() : undefined;
 	const onCommitCertificate: CommitCertificateSink | undefined = certStore

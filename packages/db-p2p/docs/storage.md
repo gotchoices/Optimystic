@@ -489,7 +489,7 @@ node is about to report to another machine:
   Which groups carry a window. `pend` and `commit` take a third argument, `StorageApplyOptions`
   in `packages/db-p2p/src/storage/storage-repo.ts`, whose `syncWithinMs` is the group's
   `withinMs`; absent, the group is strict. A node passes a window only for an apply that runs
-  on a consensus record — `ClusterMember.applyConsensusOperation` for the pend and commit of
+  on a consensus record — `ClusterMember.applyConsensusOperations` for the pend and commit of
   every record it applies, and `CoordinatorRepo` for its own fallback pend and commit after
   consensus ran without its member — and the window is `durabilityWindowMs` in
   `packages/db-p2p/src/storage/durability-window.ts` for the size of that record's cohort
@@ -643,7 +643,7 @@ Which writes carry a window (mechanism under *Who calls `flush()`* above):
 
 | Write | Window |
 |---|---|
-| `pend` and `commit` of a consensus record, applied by `ClusterMember.applyConsensusOperation` | `w` for the record's cohort |
+| `pend` and `commit` of a consensus record, applied by `ClusterMember.applyConsensusOperations` | `w` for the record's cohort |
 | `CoordinatorRepo`'s own fallback `pend` and `commit` after consensus ran without its member | `w` for the record's cohort |
 | a solo `pend` or `commit` (`CoordinatorRepo.pendSolo`, `CoordinatorRepo.commitSolo`): only this machine holds the write | 0 |
 | `cancel`, `recoverBlock`, `saveReplicatedBlock`, a `get` that took a write latch, a consensus `get` or `cancel` operation | 0 |

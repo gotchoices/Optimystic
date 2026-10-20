@@ -1418,11 +1418,16 @@ export class ClusterCoordinator {
 	 * Whether the consensus delivery of `record` to `awaiting` may wait for the action's commit to carry
 	 * it ({@link deferPendDelivery}). Every condition protects something:
 	 * - every operation is a pend its writer marked the action's only reservation
-	 *   (`PendRequest.soleReservation`), so its commit is one commit, sent to this node: a member that
-	 *   refuses the pend when it finally applies it refuses that commit, before anything of the action
-	 *   is durable, and the commit answers the writer with the refusal ({@link takeLatePendRefusals}).
-	 *   A pend of a write spanning several collections or coordinators is delivered at once, because its
-	 *   late refusal could surface after a sibling's commit landed;
+	 *   (`PendRequest.soleReservation`), so the record carries every reservation of the action — one
+	 *   collection, or a batch of all of them — and its commit is one record, sent to this node. The
+	 *   other member applies the whole pend record before it votes on that commit record; if its
+	 *   storage refuses any operation's pend, the refusal is kept for that operation's blocks, and the
+	 *   member refuses to co-sign the commit record, which names those blocks
+	 *   (`ClusterMember.validateCommitAgainstRefusedPend`). So nothing of the action is durable, and the
+	 *   commit answers the writer with the refusal ({@link takeLatePendRefusals}). A pend whose action
+	 *   also travels in other pend records — a write spanning several collections in separate records,
+	 *   or several coordinators — is delivered at once, because its late refusal could surface after
+	 *   another record's commit landed;
 	 * - the cohort is two members: there this node's stored pending record answers any rival with a
 	 *   `held` vote that alone denies it the promise bar, which is what makes the deferral window safe
 	 *   (the first NOTE at {@link deferPendDelivery}). At the default thresholds only a two-member cohort

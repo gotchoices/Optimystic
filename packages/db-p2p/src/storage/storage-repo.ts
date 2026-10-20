@@ -175,7 +175,7 @@ export interface StorageApplyOptions {
 }
 
 /**
- * The capability `ClusterMember.applyConsensusOperation` and `CoordinatorRepo` cast their
+ * The capability `ClusterMember.applyConsensusOperations` and `CoordinatorRepo` cast their
  * `storageRepo` to when applying a write locally with {@link StorageApplyOptions}. Named for the
  * same reason as {@link ICommitDigestPreviewer}: one definition of the widened contract, and
  * something a repo decorator can `implements` and forward. `IRepo.pend` and `IRepo.commit` take
@@ -1023,7 +1023,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * Commit a previously-pended action across its blocks, under the block write latches.
 	 *
 	 * **Divergence vs genuine fault.** When the batch cannot be completed, the reason decides what
-	 * happens to the pending records the pend left behind. `ClusterMember.applyConsensusOperation`
+	 * happens to the pending records the pend left behind. `ClusterMember.applyCommitToStorage`
 	 * makes the same split one layer up — it *tolerates* a divergence (and reconciles every
 	 * `commit.blockIds` entry from a cohort peer) but *propagates* a genuine fault for retry — so this
 	 * method must agree with it:
@@ -1703,7 +1703,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * declaration, so a hostile writer cannot flip the arm by attaching a bogus base.
 	 *
 	 * Refusing is cheap and self-healing: refuseMissingBase throws MissingBaseRevisionError, which
-	 * commit() classifies as divergence and ClusterMember.applyConsensusOperation maps to "behind",
+	 * commit() classifies as divergence and ClusterMember.applyCommitToStorage maps to "behind",
 	 * running reconcileDivergentCommit to pull the committed revision from a cohort peer. The writer's
 	 * retry then lands on a healed base. A hostile writer naming a junk numeric base — on the pend or
 	 * on the commit — can force refusals and reconcile churn, but never a fork.

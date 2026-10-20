@@ -133,13 +133,15 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 	}
 
   /**
-   * Record a coordinator-affinity hint for the block this record's op is
-   * coordinated on, so a follow-up op can dial `peerId` directly.
+   * Record a coordinator-affinity hint for the block each of this record's ops
+   * is coordinated on, so a follow-up op can dial `peerId` directly.
    *
-   * The op lives at `record.message.operations[0]` — `record.message` is a
+   * The ops live at `record.message.operations` — `record.message` is a
    * RepoMessage `{ operations: [...] }`, NOT a bare `{ commit }`/`{ pend }`.
    * Reading `record.message.commit`/`.pend` (the old code) always saw
    * `undefined`, so this hint was dead code and never recorded anything.
+   * A batch carries one op per collection, and the follow-up commit asks for
+   * each collection's blocks, so every op gets its hint.
    *
    * Commit anchors on blockIds[0] (where CoordinatorRepo runs consensus +
    * verifyResponsibility), not tailId. Pend anchors on a real block id
@@ -147,12 +149,11 @@ export class ClusterClient extends ProtocolClient implements ICluster {
    * ClusterClient only ever carries commit/pend.
    */
   private recordCoordinatorForRecordIfSupported(record: ClusterRecord, peerId: PeerId): void {
-    const op = record.message.operations[0]
-    if (!op) return
-    let id: string | undefined
-    if ('commit' in op) id = op.commit.blockIds[0]
-    else if ('pend' in op) id = blockIdsForTransforms(op.pend.transforms)[0]
-    if (id == null) return
-    this.recordCoordinatorHint(id, peerId)
+    for (const op of record.message.operations) {
+      let id: string | undefined
+      if ('commit' in op) id = op.commit.blockIds[0]
+      else if ('pend' in op) id = blockIdsForTransforms(op.pend.transforms)[0]
+      if (id != null) this.recordCoordinatorHint(id, peerId)
+    }
   }
 }

@@ -385,7 +385,7 @@ private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> 
 
 When majority consensus is reached, the transaction is executed. Execution is guarded by a synchronous check-and-set on `executedTransactions` to prevent duplicate execution — JavaScript's single-threaded event loop makes this atomic as long as the guard runs before the first `await`.
 
-The real `handleConsensus` lives on `ClusterMember` in `packages/db-p2p/src/cluster/cluster-repo.ts` (not in `cluster-coordinator.ts` — that is the *coordinator* side). The snippet below is a simplification: current code delegates the per-operation dispatch to `applyConsensusOperation` and, after the loop succeeds and its writes are power-loss durable (`markExecutedOnceDurable`), writes a durable executed-marker via `stateStore.markExecuted` for post-restart dedup.
+The real `handleConsensus` lives on `ClusterMember` in `packages/db-p2p/src/cluster/cluster-repo.ts` (not in `cluster-coordinator.ts` — that is the *coordinator* side). The snippet below is a simplification: current code delegates the per-operation dispatch to `applyConsensusOperations` and, after the loop succeeds and its writes are power-loss durable (`markExecutedOnceDurable`), writes a durable executed-marker via `stateStore.markExecuted` for post-restart dedup.
 
 ```typescript
 private async handleConsensus(record: ClusterRecord): Promise<void> {
