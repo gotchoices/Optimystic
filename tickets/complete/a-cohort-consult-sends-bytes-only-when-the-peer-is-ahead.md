@@ -42,12 +42,31 @@ Run and green:
 - `tsc --noEmit` (db-p2p), `eslint` on every changed file, `yarn lint:docs` — clean.
 - Note for the reviewer: running db-p2p with `--grep "read-repair"` makes `member-leaves-and-returns.spec.ts` phase 4 fail with `Cannot read properties of undefined (reading 'blockIds')` — the grep selects phase 4 without the earlier phases that set its state. The file passes whole (10 passing). Not related to this change.
 
-## Known gaps — please probe
+## Review findings
 
-- **Mixed versions are verified by inspection only.** No fixture runs two builds in one cohort (`debt-no-scenario-runs-two-builds-in-one-cohort`). Older server → no `answers` → old path; older asker → no `held` → `serveBlockArchive` unchanged.
-- **`claimFromConsultAnswer`'s "other omission reason → no archive" branch has no test.** The ticket asked for no new tests beyond the serving table; it is three lines and only reachable from a newer peer today.
-- **`held` is `state.latest`, not `materialized`.** For a read pinned below the block's latest, `held` is still the node's newest revision. That is the right comparison (the consult asks for the peer's latest, and the acquisition baseline is the node's latest), but worth a second look.
-- **Safety argument depends on the baseline.** Omitted ⇒ peer rev ≤ `held.rev` ≤ `baselineRev` (`local?.rev ?? held.rev`; the self answer is read after `held` and storage `latest` only moves forward), and acquisition runs only for `corroborated.rev > baselineRev`. If anything ever lets the self answer report a lower revision than `held`, an omitted archive could be reused for a revision that needs bytes.
-- **Proof lookup now runs before the pinned-read refusal** in `serveBlockArchive` (the shared read includes it). That refusal is unreachable for a `StorageRepo` (it always reports `materialized`), so it costs one extra proof read on a path production does not take.
-- **Bytes saved were not measured.** The motivation figure (103–134 `sync` requests/minute between two idle machines) is Sereus's; no test counts response bytes.
-- `fetchArchiveFromPeer` (acquisition and commit-path reconcile) still sends the old request with no `held`, so it always gets bytes — intended, since it is fetching content.
+Reviewed the diff of `ticket(implement): a-cohort-consult-sends-bytes-only-when-the-peer-is-ahead` before the handoff, then the handoff's "known gaps" one by one.
+
+**Checked, and correct:**
+- **Safety of reusing an omitted-bytes archive.** Traced end to end: a peer omits bytes only when its served revision ≤ `held.rev`; the acquisition baseline is `local?.rev ?? held.rev`, and the self answer reads storage `state.latest` after `held` was read, which only moves forward, so baseline ≥ `held.rev`; acquisition runs only for `corroborated.rev > baselineRev`; `reconcile-block.ts` `answerFrom` → `toCandidate` therefore classifies every omitted peer as `behind` (its max revision is below `committedRev`), so it never enters the revision or content quorum at the acquired revision. Same weight it had when it sent bytes.
+- **`held` is `state.latest`, not `materialized`** — right: the consult is unpinned and the acquisition baseline is the node's newest revision, so a read pinned below latest does not change what the peer should compare against.
+- **Unmaterializable local copy** (`latest` present, no bytes): peers at the same revision now omit bytes, but the read path never acquired at an equal revision before either (`local-current` exit), so no regression.
+- **Wire robustness** on both ends: `held` as `null`, a non-object, a `__proto__` block id, a missing/`NaN`/string `rev` — every shape either gets the bytes or reads as "holds nothing", never loses a claim it should keep. A malformed `answers` entry reads as "holds nothing"; a missing one rejects (silence). A `contentOmitted` of `null` or an unknown value drops the archive so the acquisition re-asks — conservative.
+- **No new trust.** A peer that is ahead and lies with `contentOmitted: 'held'` gets no more than it could before by serving an archive with no `block` (the deleted-block shape).
+- **Mixed versions** by inspection: older server ignores `held` → no `answers` → old path; older asker sends no `held` → `answerArchive` unchanged.
+- **Mesh harness** answers through `serveConsultAnswer` + `claimFromConsultAnswer`, so mesh specs exercise the production rule; the extra context read it keeps is test-only cost.
+- **Docs**: `docs/transactions.md` (new *A consult says what this node holds* paragraph and step 2), `docs/internals.md` (*A behind member actively reconciles*), the `ConsultedArchives` and `servableProof` doc comments — all match the code. Also checked `docs/debugging.md` and `packages/db-p2p/docs/*.md`: neither describes the sync request shape, so nothing stale there.
+
+**Tests.** The one added test (`block-archive-proof.spec.ts` › `serveConsultAnswer`) is a table over the serving rule's branches — real branching on a named contract; kept. Nothing cut. The untested "any omission reason other than `'held'` drops the archive" branch in `claimFromConsultAnswer` is unreachable until the sibling `a-cohort-consult-asks-each-peer-about-all-its-blocks-at-once` adds `'size'`, whose ticket already specifies a test for that path; no test added here.
+
+**Runs:** `yarn workspace @optimystic/db-p2p test` — 3491 passing, 73 pending. db-p2p `test:integration` — 50 passing, 2 pending (real TCP `sync` requests, so the `answers` path ran). `tsc --noEmit` (db-p2p), `eslint` on every changed file, `yarn lint:docs` — clean. The quereus-plugin integration suite was not re-run (the implementer ran it green; nothing in it depends on code this review changed, since none was changed).
+
+**Found, not acted on (minor, considered):**
+- The proof lookup now runs before `serveBlockArchive`'s pinned-read refusal (shared `readServable`). One extra proof read on an arm a `StorageRepo` never reaches; not worth splitting the shared read.
+- `SyncService` logs a consult answer as "Fulfilled" even when this node holds nothing (the consult path always returns `success: true`). Debug-level wording only; left.
+- `coordinator-repo.ts` is 3950 lines (`wc -l`) and `libp2p-node-base.ts` 2535; this change added a few lines to each. Structure debt is already tracked in `debt-freshness-state-scattered-across-coordinator-repo`; nothing new filed.
+
+**Tripwires:** the two `NOTE:`s the implementer added stand as the record — the `CommitLogTrustAnchor` adapter that still gets bytes it discards (`libp2p-node-base.ts`), and the block riding twice in `singleRevisionArchive` (`storage/block-archive.ts`). No new tripwires.
+
+**Not measured:** bytes saved per consult. The motivation figure is Sereus's; no test counts response bytes.
+
+**Tickets filed:** none — no finding met the filing bar.
