@@ -1,10 +1,10 @@
 import type { Connection, Libp2p, PeerId, Startable } from '@libp2p/interface';
-import type { BlockDurabilityReachedEvent, BlockId, IKeyNetwork } from '@optimystic/db-core';
-import { routingKeyForBlock } from '@optimystic/db-core';
+import type { BlockId, CollectionId, IKeyNetwork } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
 import type { IUnderReplicationLedger, SatisfyOutcome, UnderReplicatedEntry } from './i-under-replication-ledger.js';
+import { resolveOwedPeers, takeConfirmedCopies, type BlockDurabilitySink, type Owed } from './owed-copies.js';
 import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
@@ -50,13 +50,8 @@ export const DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG: UnderReplicationDrainConfig
 	maxAttempts: 5
 };
 
-/**
- * The one method the drain may call on the node's storage repo: emit a full-replication event.
- * Handed in as a function, exactly as the cluster side receives a `CommitCertificateSink`, so the
- * drain has no way to reach anything else on the repo. `CoordinatorRepo` is handed the same
- * callable, for the entries a `full` commit settles — the event's other producer.
- */
-export type BlockDurabilitySink = (event: BlockDurabilityReachedEvent) => void;
+// Defined beside the shared confirmed-copy rule; re-exported so the package barrel still publishes it.
+export type { BlockDurabilitySink } from './owed-copies.js';
 
 /**
  * The push primitive, already bound to this node's own store, dialer and protocol prefix — the
@@ -113,12 +108,6 @@ export interface DrainPassResult {
 	/** Peers newly abandoned for a block this pass. */
 	abandoned: number;
 }
-
-/** Who an entry still owes a copy to, or that it owes nobody because the node is alone. */
-type Owed =
-	| { kind: 'solo' }
-	| { kind: 'unresolved' }
-	| { kind: 'peers'; peerIds: string[]; named: boolean };
 
 const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
 	trigger, entries: 0, examined: 0, deferred: 0, solo: 0, waiting: 0, pushed: 0, cleared: 0, dropped: 0, abandoned: 0
@@ -377,7 +366,7 @@ export class UnderReplicationDrain implements Startable {
 	}
 
 	private async drainEntry(entry: UnderReplicatedEntry, pushable: Set<string>, counts: DrainPassResult): Promise<void> {
-		const owed = await this.owedPeers(entry);
+		const owed = await resolveOwedPeers(entry, this.deps.libp2p.peerId.toString(), this.deps.keyNetwork);
 		if (owed.kind === 'solo') {
 			counts.solo++;
 			return;
@@ -417,12 +406,10 @@ export class UnderReplicationDrain implements Startable {
 		}
 
 		if (outcome.confirmed.length > 0) {
-			const status = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev);
+			const status = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev, outcome.collectionId);
 			if (status === 'cleared') {
 				counts.cleared++;
 				this.forgetBlock(entry.blockId);
-				// After the deletion, never before: a listener that re-reads the ledger sees it gone.
-				this.deps.emit({ blockIds: [entry.blockId], rev: entry.rev, actionId: entry.actionId, collectionId: outcome.collectionId });
 				return;
 			}
 			if (status === 'absent') {
@@ -440,31 +427,21 @@ export class UnderReplicationDrain implements Startable {
 	}
 
 	/**
-	 * Take the confirmed peers off the entry. An entry that could not name its members is named now,
-	 * at its own revision, with the cohort resolved for this push — so `satisfy` has a set to shrink.
-	 * Both writes carry the revision guard: a newer shortfall recorded while the push was in flight
-	 * is left alone (`name` touches only its own revision; `satisfy` keeps a higher one), and neither
-	 * recreates an entry a concurrent `settle` removed mid-push.
-	 *
-	 * An entry settled mid-push by a `full` commit is gone by the time `satisfy` runs, which reports it
-	 * `absent` rather than `cleared`: the commit that settled it announced it, so this drain does not.
-	 *
-	 * @returns `cleared` when this call removed the entry (its last missing member confirmed), `absent`
-	 * when it was already gone, `owed` when it still stands.
+	 * Take the confirmed peers off the entry, and fire the event when that cleared it — the rule an
+	 * embedder's report follows too (`takeConfirmedCopies`). An entry settled mid-push by a `full`
+	 * commit comes back `absent`, not `cleared`: the commit that settled it announced it.
 	 */
 	private async recordConfirmed(
-		entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number
+		entry: UnderReplicatedEntry, owed: Owed & { kind: 'peers' }, confirmed: string[], heldRev: number,
+		collectionId: CollectionId | undefined
 	): Promise<SatisfyOutcome['status']> {
-		if (!owed.named) {
-			await this.deps.ledger.name(entry.blockId, entry.rev, owed.peerIds);
-		}
-		const outcome = await this.deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
-		if (outcome.status === 'cleared') {
+		const status = await takeConfirmedCopies(this.deps, entry, owed, confirmed, heldRev, collectionId);
+		if (status === 'cleared') {
 			log('entry:cleared block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
-		} else if (outcome.status === 'absent') {
+		} else if (status === 'absent') {
 			log('entry:settled-elsewhere block=%s rev=%d action=%s', entry.blockId, entry.rev, entry.actionId);
 		}
-		return outcome.status;
+		return status;
 	}
 
 	/** Log each refusal so "cannot place" reads differently from "cannot reach", and count the round. */
@@ -505,26 +482,6 @@ export class UnderReplicationDrain implements Startable {
 		peers.add(peerId);
 		log('peer:abandoned block=%s peer=%s after=%d rounds (until it reconnects)', blockId, peerId, count);
 		return true;
-	}
-
-	/**
-	 * Who the entry still owes. Named members are taken as recorded. An unknown set re-resolves the
-	 * cohort NOW; a cohort of this node alone is `solo` — not a failure, not an attempt.
-	 */
-	private async owedPeers(entry: UnderReplicatedEntry): Promise<Owed> {
-		const selfId = this.deps.libp2p.peerId.toString();
-		if (entry.missingPeerIds.length > 0) {
-			return { kind: 'peers', peerIds: entry.missingPeerIds.filter(peerId => peerId !== selfId), named: true };
-		}
-		let cluster: Awaited<ReturnType<IKeyNetwork['findCluster']>>;
-		try {
-			cluster = await this.deps.keyNetwork.findCluster(routingKeyForBlock(entry.blockId));
-		} catch (err) {
-			log('cohort:unresolved block=%s err=%s', entry.blockId, err instanceof Error ? err.message : String(err));
-			return { kind: 'unresolved' };
-		}
-		const members = Object.keys(cluster).filter(peerId => peerId !== selfId);
-		return members.length === 0 ? { kind: 'solo' } : { kind: 'peers', peerIds: members, named: false };
 	}
 
 	/**

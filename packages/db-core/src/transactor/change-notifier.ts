@@ -89,9 +89,10 @@ export function isBlockChangeNotifier(x: unknown): x is IBlockChangeNotifier {
  * names as `WriteDurability.recordedBy`. An answer without `recordedBy` is a write no node is
  * tracking, and no event should be expected for it. That node fires the event when its record of a
  * block's shortfall is removed, which happens two ways, each firing exactly once per record: the
- * node's push of the missing copies empties it (the event carries the record's own `rev` and
- * `actionId`), or a later commit of the block that every member confirmed settles it (the event
- * carries that later commit's `rev` and `actionId`).
+ * missing copies are confirmed — by the node's own push, or by the embedder reporting a copy it
+ * delivered itself — and empty it (the event carries the record's own `rev` and `actionId`), or a
+ * later commit of the block that every member confirmed settles it (the event carries that later
+ * commit's `rev` and `actionId`).
  *
  * **Keyed by block, deliberately, never by action.** The node's record of what is still owed (the
  * under-replication ledger) keeps ONE entry per block, at the block's highest under-replicated
@@ -115,7 +116,8 @@ export type BlockDurabilityReachedEvent = {
 	 *  fully replicated commit that settled it. See the note above on superseded writes. */
 	readonly actionId: ActionId;
 	/** Best-effort; absent when the collection could not be resolved from the block's header, and
-	 *  always when a settling commit fired the event (the coordinator does not read the block). */
+	 *  always when a settling commit fired the event (the coordinator does not read the block) or an
+	 *  embedder's report cleared the entry (`reportBlockHeld` on a db-p2p node reads no block either). */
 	readonly collectionId?: CollectionId;
 };
 

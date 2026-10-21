@@ -20,6 +20,7 @@ import {
 	UnderReplicationDrain, type BoundBlockPusher, type DrainLibp2p, type UnderReplicationDrainConfig, type UnderReplicationDrainDeps
 } from '../src/repo/under-replication-drain.js';
 import type { UnderReplicatedEntry } from '../src/repo/i-under-replication-ledger.js';
+import { recordHeldCopy, type HeldCopyDeps } from '../src/repo/owed-copies.js';
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
@@ -473,6 +474,43 @@ describe('UnderReplicationDrain', () => {
 
 			expect(pass).to.include({ cleared: 1 });
 			expect(events[0]).to.include({ rev: 5 });
+		});
+	});
+
+	describe('an embedder report', () => {
+		const heldCopyDeps = (): HeldCopyDeps => ({ ledger, keyNetwork, selfId: self.toString(), emit: deps.emit });
+
+		it('clears an entry that could not name its members, and the next pass pushes nothing', async () => {
+			const drain = await startDrain();
+			const entry = entryFor(BLOCK_A, { quorum: 'local' });
+			await ledger.record(entry);
+			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerX.toString()]);
+
+			const outcome = await recordHeldCopy(heldCopyDeps(), BLOCK_A, entry.rev, peerX.toString());
+
+			expect(outcome).to.equal('cleared');
+			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
+			expect(events.map(e => e.blockIds)).to.deep.equal([[BLOCK_A]]);
+			libp2p.connect(peerX, { emit: false });
+			await drain.checkNow();
+			expect(pusher.calls, 'nothing left to push').to.deep.equal([]);
+			expect(events.length, 'no second event').to.equal(1);
+		});
+
+		it('leaves the entry unnamed when the cohort does not contain the reported peer', async () => {
+			const drain = await startDrain();
+			const entry = entryFor(BLOCK_A, { quorum: 'local' });
+			await ledger.record(entry);
+			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerY.toString()]);
+
+			const outcome = await recordHeldCopy(heldCopyDeps(), BLOCK_A, entry.rev, peerX.toString());
+
+			expect(outcome).to.equal('not-owed');
+			expect(await ledger.get(BLOCK_A)).to.deep.equal(entry);
+			expect(events).to.deep.equal([]);
+			libp2p.connect(peerY, { emit: false });
+			await drain.checkNow();
+			expect(pusher.calls, 'the drain still owes the cohort its copy').to.deep.equal([{ blockId: BLOCK_A, peerIds: [peerY.toString()] }]);
 		});
 	});
 

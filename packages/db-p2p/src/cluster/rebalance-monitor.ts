@@ -67,7 +67,7 @@ export interface GrowthOutcome {
 /**
  * Peers evidenced to hold a block, reported by a node that holds it too — so the block needs neither
  * a pull (this node has it) nor a push to those peers (they have it). See
- * {@link RebalanceMonitor.recordBlockHolders} for the four producers and what each one's evidence is.
+ * {@link RebalanceMonitor.recordBlockHolders} for the five producers and what each one's evidence is.
  */
 export interface BlockHolders {
 	blockIds: readonly string[]
@@ -85,7 +85,7 @@ export interface BlockHolders {
 	/**
 	 * Cohort members the commit's coordinator knows did NOT confirm holding the revision. Withdraws
 	 * any earlier record of them as holders, so the growth arm pushes them the block. Only the
-	 * coordinator producer names any: the other three learn about holders, never about non-holders.
+	 * coordinator producer names any: the other four learn about holders, never about non-holders.
 	 */
 	unconfirmed?: readonly string[]
 }
@@ -396,7 +396,7 @@ export class RebalanceMonitor implements Startable {
 	 * reports nothing for a block it failed to store, so the co-holder claim is only ever made by a
 	 * node that holds the block itself.
 	 *
-	 * Four producers, each reporting evidence it gathered by a different route:
+	 * Five producers, each reporting evidence it gathered by a different route:
 	 *
 	 *  - `ClusterMember`, after a durable consensus apply — the record's approving commit signers.
 	 *  - `CoordinatorRepo`, on acknowledging a cohort commit it holds — the confirmed members that
@@ -404,6 +404,9 @@ export class RebalanceMonitor implements Startable {
 	 *  - `BlockTransferService.handlePush`, per accepted block — the peer that pushed it.
 	 *  - `createReconcileBlock`, after a successful restore — the peers whose archives corroborated
 	 *    the revision that was restored.
+	 *  - The embedder, through `reportBlockHeld` on the node — a peer it delivered the block to itself
+	 *    (Sereus's join catch-up, for one). Unlike the other four, this node may not hold the block;
+	 *    evidence for a block the monitor does not track is dropped at the next check.
 	 *
 	 * Without this, every block arriving by any of those routes has no growth memory, so the next
 	 * check reports the whole cohort grown and pushes the block back to the peers that already hold
@@ -411,7 +414,7 @@ export class RebalanceMonitor implements Startable {
 	 *
 	 * How far the evidence is trusted: a pushing peer's claim to hold the block it pushed is its own
 	 * word, as is a receiving peer's report that it persisted a push, which `recordGrowthOutcome`
-	 * already accepts as confirmation. The cost of a lie is one cohort member that does not get a
+	 * already accepts as confirmation — and an embedder's report is that same reply, relayed. The cost of a lie is one cohort member that does not get a
 	 * copy it would otherwise get, re-detected whenever that peer leaves the cohort and rejoins, or
 	 * whenever a commit touches the block.
 	 *

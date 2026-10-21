@@ -20,7 +20,7 @@ import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives, Cohor
 import type { CertifiedActionRev } from "../storage/block-archive.js";
 import type { BlockArchive } from "../storage/struct.js";
 import type { IUnderReplicationLedger } from "./i-under-replication-ledger.js";
-import type { BlockDurabilitySink } from "./under-replication-drain.js";
+import type { BlockDurabilitySink } from "./owed-copies.js";
 import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibility.js";
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";

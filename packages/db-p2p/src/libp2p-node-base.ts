@@ -48,6 +48,7 @@ import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
 import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
+import { recordHeldCopy, type HeldCopyDeps } from './repo/owed-copies.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
@@ -964,11 +965,11 @@ export async function createLibp2pNodeBase(
 		: options.onCommitCertificate;
 
 	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither
-	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Four
+	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Five
 	// producers report through this one sink: the cluster member after a durable consensus apply, the
 	// coordinator on acknowledging a cohort commit, the block-transfer service for the peer that
-	// pushed an accepted replica, and the reconcile closure for the peers that corroborated a
-	// restored revision.
+	// pushed an accepted replica, the reconcile closure for the peers that corroborated a restored
+	// revision, and the embedder through `node.reportBlockHeld`.
 	//
 	// Declared HERE, above `libp2pOptions`, rather than beside the member and coordinator below: the
 	// `blockTransfer` service factory lives inside `libp2pOptions` and is evaluated at `createLibp2p`,
@@ -1777,6 +1778,23 @@ export async function createLibp2pNodeBase(
 		(node as any).underReplicationDrain = underReplicationDrain;
 		(node as any).underReplicationLedger = underReplicationLedger;
 
+		// --- Embedder holder reports (`node.reportBlockHeld`, attached with the host surface below) ---
+		// Outside the drain's `enabled` gate: disabling the drain stops pushing, not recording, and the
+		// ledger half needs only the ledger, the key network and the repo's event sink, all built above
+		// unconditionally. The rebalance half goes through the same late-bound sink as the other
+		// producers, so it is a no-op wherever no monitor was built.
+		const heldCopyDeps: HeldCopyDeps = {
+			ledger: underReplicationLedger,
+			keyNetwork,
+			selfId: node.peerId.toString(),
+			emit: (event) => storageRepo.emitBlockDurabilityReached(event)
+		};
+		const reportBlockHeld: OptimysticNodeAttachments['reportBlockHeld'] = async (blockId, rev, peerId) => {
+			// First, because it is synchronous and never throws: the monitor hears it even when the ledger rejects.
+			onBlockHolders({ blockIds: [blockId], holders: [peerId] });
+			await recordHeldCopy(heldCopyDeps, blockId, rev, peerId);
+		};
+
 		// Initialize Arachnode ring membership and restoration
 		const enableArachnode = options.arachnode?.enableRingZulu ?? true;
 		if (enableArachnode) {
@@ -2149,6 +2167,7 @@ export async function createLibp2pNodeBase(
 			// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
 			peerPrivateKey: nodePrivateKey,
 			linkDeadlines,
+			reportBlockHeld,
 		};
 		Object.assign(node, attachments);
 

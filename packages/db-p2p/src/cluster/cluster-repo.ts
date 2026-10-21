@@ -239,10 +239,11 @@ export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => vo
 /**
  * Sink for peers evidenced to hold a block this node's own storage also holds — fed to the rebalance
  * monitor so it neither pushes the block back to a peer that already has it nor pulls a copy it
- * already holds (see `RebalanceMonitor.recordBlockHolders`). Four producers fire it: the member
+ * already holds (see `RebalanceMonitor.recordBlockHolders`). Five producers fire it: the member
  * after applying a consensus commit, `CoordinatorRepo.commit` when it acknowledges one,
- * `BlockTransferService.handlePush` for the peer that pushed an accepted replica, and
- * `createReconcileBlock` for the peers that corroborated a restored revision. Optional; a throwing
+ * `BlockTransferService.handlePush` for the peer that pushed an accepted replica,
+ * `createReconcileBlock` for the peers that corroborated a restored revision, and the embedder
+ * through the node's `reportBlockHeld`. Optional; a throwing
  * sink is isolated + logged (it must never break consensus, a writer's answer, or a push reply).
  */
 export type BlockHoldersSink = (holders: BlockHolders) => void;
