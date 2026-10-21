@@ -1,8 +1,9 @@
 /**
  * DCUtR direct-upgrade integration spec.
  *
- * `createLibp2pNodeBase` wires the always-on `@libp2p/dcutr` service (see
- * `libp2p-node-base.ts`). DCUtR's job: when two NAT'd peers first meet through a
+ * `createLibp2pNodeBase` wires the `@libp2p/dcutr` service on every node that advertises an
+ * address another machine could dial directly (see `holePunchingWanted` in
+ * `src/network/hole-punching.ts`). DCUtR's job: when two NAT'd peers first meet through a
  * circuit relay, it coordinates a direct TCP open and upgrades the relayed
  * connection to a direct one — demoting the relay from a permanent data path to a
  * momentary signaling/bootstrap channel.
@@ -48,9 +49,11 @@
  *   bash:        RUN_LONG_TESTS=1 yarn workspace @optimystic/db-p2p test --grep "DCUtR"
  *   strong (bash): RUN_DCUTR_HOLEPUNCH=1 DCUTR_HOST=203.0.113.7 yarn workspace @optimystic/db-p2p test --grep "DCUtR"
  *
- * The always-run `node-service-set.spec.ts` independently guards that `services.dcutr` /
- * `services.autoNAT` are wired (it asserts the whole service key set), so neither test here
- * re-checks service presence.
+ * The always-run `node-service-set.spec.ts` independently guards the service key set: `autoNAT` on
+ * every node, `dcutr` only on a node with a directly dialable address. So neither test here
+ * re-checks service presence. The loopback smoke's peers bind only `127.0.0.1` plus a circuit
+ * listener, so they run WITHOUT dcutr — which that test does not need, since it asserts only the
+ * relayed connection. The strong test binds a non-private `DCUTR_HOST`, so its peers keep it.
  */
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';

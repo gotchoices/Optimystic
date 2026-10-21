@@ -43,6 +43,7 @@ import { networkManagerService, type NetworkManagerService } from './network/net
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
 import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
+import { holePunchingWanted } from './network/hole-punching.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
@@ -257,6 +258,20 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * `{ reservations: { applyDefaultLimit: false } }` to lift the cap.
 	 */
 	relayServerInit?: CircuitRelayServerInit;
+	/**
+	 * Whether this node runs libp2p's hole-punching service (`@libp2p/dcutr`), which tries to turn a
+	 * relayed connection into a direct one.
+	 *  - Unset: automatic. The node runs it only when its advertised addresses
+	 *    ({@link NodeOptions.announceAddrs}, else {@link NodeOptions.listenAddrs} plus
+	 *    {@link NodeOptions.appendAnnounceAddrs}) include one another machine could dial directly
+	 *    — not a circuit address, and a DNS name or a non-loopback IP (`holePunchingWanted` in
+	 *    `network/hole-punching.ts`). A relay-only or loopback-only node leaves it out: hole punching
+	 *    can never succeed for it, and costs three relayed streams per relayed connection.
+	 *  - `true`: always run it. For a relay-only node that peers with public addresses regularly
+	 *    reach through a relay, so it can dial those peers directly.
+	 *  - `false`: never run it.
+	 */
+	holePunching?: boolean;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
 	storage?: RawStorageProvider;
 	/**
@@ -945,6 +960,17 @@ export async function createLibp2pNodeBase(
 	const relayPlan = planRelayListenAddrs(options.listenAddrs ?? defaults.listenAddrs);
 	assertRelayAddrsAdvertisable(relayPlan.supervisedRelays, options.announceAddrs);
 	const listenAddrs = relayPlan.listenAddrs;
+	const holePunching = holePunchingWanted({
+		holePunching: options.holePunching,
+		listenAddrs,
+		announceAddrs: options.announceAddrs,
+		appendAnnounceAddrs: options.appendAnnounceAddrs
+	});
+	if (!holePunching) {
+		wiringLog(options.holePunching === false
+			? 'hole punching off: NodeOptions.holePunching is false'
+			: 'hole punching off: no directly dialable listen or announce address');
+	}
 	const transports = options.transports ?? defaults.transports;
 
 	// --- cohort-topic substrate activation (opt-in; default off → today's bare behavior, zero cost) ---
@@ -1054,12 +1080,23 @@ export async function createLibp2pNodeBase(
 			// application's own pings, and falsify `test/connection-monitor-ping-overlap.spec.ts` plus
 			// both documents it backs — re-check all three before doing so.
 			ping: ping({ timeout: pingHandlerTimeoutMs }),
-			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
-			// ones; AutoNAT learns this node's public reachability via peer dial-back.
-			// Both are always-on and depend on `identify` above. They are inert where
-			// the transport can't hole-punch or dial back (e.g. browser/WS-only), which
-			// is acceptable — they neither throw nor break the build in that case.
-			dcutr: dcutr(),
+			// DCUtR (hole punching) upgrades a relayed node↔node connection to a direct one. It runs
+			// only on a node that advertises an address another machine could dial directly
+			// (`holePunchingWanted`, overridden by `NodeOptions.holePunching`). Any other node —
+			// relay-only, or listening only on loopback — can never complete dcutr's relayed exchange,
+			// which needs a dialable address from both sides; the side that received the relayed
+			// connection still makes three attempts at it: three wasted streams per relayed connection.
+			// Leaving the service out on one side silences the pair, since dcutr starts only toward a
+			// peer that advertises it too.
+			// NOTE: accepted tradeoff — a node left without dcutr by the rule also loses the one
+			// upgrade that can work for it: when a peer with a public address reaches it through a
+			// relay, it would have dialed that peer directly. `holePunching: true` restores that per
+			// node; revisit if relay-only nodes are found staying on relayed links to public peers that
+			// could have been direct.
+			...(holePunching ? { dcutr: dcutr() } : {}),
+			// AutoNAT learns this node's public reachability through peer dial-back. It depends on
+			// `identify` above and stays on every node: on a relay-only node it has nothing to confirm,
+			// but nothing measured shows it costing streams there. Gate it by the same rule if it does.
 			autoNAT: autoNAT(),
 			// NOTE: no `pubsub` service. `@chainsafe/libp2p-gossipsub` (currently at 14.1.2, the newest
 			// published version) is built against `@libp2p/interface@^2` — its `Stream` still expects
