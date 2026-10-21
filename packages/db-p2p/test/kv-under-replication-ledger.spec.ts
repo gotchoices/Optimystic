@@ -216,7 +216,7 @@ describe('KvUnderReplicationLedger', () => {
 			await ledger.record(entry());
 			await ledger.satisfy(BLOCK_A, ['peer-x']);
 
-			expect(await ledger.satisfy(BLOCK_A, ['peer-y'])).to.deep.equal({ status: 'cleared' });
+			expect(await ledger.satisfy(BLOCK_A, ['peer-y'])).to.deep.equal({ status: 'cleared', entry: entry({ missingPeerIds: ['peer-y'] }) });
 
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
 			expect(await ledger.list()).to.deep.equal([]);
@@ -245,7 +245,7 @@ describe('KvUnderReplicationLedger', () => {
 		it('a copy of the same or a NEWER revision than the entry records satisfies it', async () => {
 			await ledger.record(entry({ rev: 5, missingPeerIds: ['peer-x', 'peer-y'] }));
 			expect(await ledger.satisfy(BLOCK_A, ['peer-x'], 5)).to.deep.equal({ status: 'owed', entry: entry({ rev: 5, missingPeerIds: ['peer-y'] }) });
-			expect(await ledger.satisfy(BLOCK_A, ['peer-y'], 7)).to.deep.equal({ status: 'cleared' });
+			expect(await ledger.satisfy(BLOCK_A, ['peer-y'], 7)).to.deep.equal({ status: 'cleared', entry: entry({ rev: 5, missingPeerIds: ['peer-y'] }) });
 			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
 		});
 

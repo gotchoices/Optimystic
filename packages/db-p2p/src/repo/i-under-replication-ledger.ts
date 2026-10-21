@@ -32,7 +32,9 @@ export type UnderReplicatedEntry = {
 /**
  * What {@link IUnderReplicationLedger.satisfy} found and did:
  * - `owed` — the entry still stands, as `entry` (changed or not);
- * - `cleared` — THIS call removed it: its last missing member confirmed;
+ * - `cleared` — THIS call removed it: its last missing member confirmed. `entry` is the entry as it
+ *   stood when removed, which can be a newer one than the caller read before the call — the event
+ *   it owes names that entry's revision and action;
  * - `absent` — there was no entry to satisfy, most often because a `full` commit settled it while
  *   the copy was in flight.
  * `cleared` and `absent` both leave the block with no entry; they are told apart because each of the
@@ -41,7 +43,7 @@ export type UnderReplicatedEntry = {
  */
 export type SatisfyOutcome =
 	| { readonly status: 'owed'; readonly entry: UnderReplicatedEntry }
-	| { readonly status: 'cleared' }
+	| { readonly status: 'cleared'; readonly entry: UnderReplicatedEntry }
 	| { readonly status: 'absent' };
 
 /**

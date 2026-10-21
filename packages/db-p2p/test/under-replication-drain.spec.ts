@@ -20,7 +20,7 @@ import {
 	UnderReplicationDrain, type BoundBlockPusher, type DrainLibp2p, type UnderReplicationDrainConfig, type UnderReplicationDrainDeps
 } from '../src/repo/under-replication-drain.js';
 import type { UnderReplicatedEntry } from '../src/repo/i-under-replication-ledger.js';
-import { recordHeldCopy, type HeldCopyDeps } from '../src/repo/owed-copies.js';
+import { recordHeldCopy, takeConfirmedCopies, type HeldCopyDeps } from '../src/repo/owed-copies.js';
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
@@ -511,6 +511,17 @@ describe('UnderReplicationDrain', () => {
 			libp2p.connect(peerY, { emit: false });
 			await drain.checkNow();
 			expect(pusher.calls, 'the drain still owes the cohort its copy').to.deep.equal([{ blockId: BLOCK_A, peerIds: [peerY.toString()] }]);
+		});
+
+		it('announces the newer shortfall a copy of that revision cleared, not the entry read before it', async () => {
+			const read = entryFor(BLOCK_A, { rev: 5, missingPeerIds: [peerX.toString()] });
+			const newer = entryFor(BLOCK_A, { rev: 6, actionId: 'action-newer', missingPeerIds: [peerX.toString()] });
+			await ledger.record(newer);
+
+			const status = await takeConfirmedCopies(heldCopyDeps(), read, { kind: 'peers', peerIds: [peerX.toString()], named: true }, [peerX.toString()], 6);
+
+			expect(status).to.equal('cleared');
+			expect(events.map(e => [e.rev, e.actionId])).to.deep.equal([[6, 'action-newer']]);
 		});
 	});
 

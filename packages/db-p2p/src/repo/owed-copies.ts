@@ -66,9 +66,11 @@ export async function resolveOwedPeers(
  * recreates an entry a concurrent `settle` removed meanwhile.
  *
  * When THIS call removed the entry (`cleared`), the full-replication event fires — after the
- * deletion, never before, so a listener that re-reads the ledger sees it gone. An entry settled
- * meanwhile by a `full` commit is reported `absent` and fires nothing: the commit that settled it
- * announced it.
+ * deletion, never before, so a listener that re-reads the ledger sees it gone — naming the entry
+ * `satisfy` removed, not `entry`: a newer shortfall recorded while the copy was in flight and
+ * satisfied by a copy of that newer revision is the one cleared, and a host following the newer
+ * write waits for its revision. An entry settled meanwhile by a `full` commit is reported `absent`
+ * and fires nothing: the commit that settled it announced it.
  *
  * @returns `cleared` when this call removed the entry (its last missing member confirmed), `absent`
  * when it was already gone, `owed` when it still stands.
@@ -84,11 +86,22 @@ export async function takeConfirmedCopies(
 	if (!owed.named) {
 		await deps.ledger.name(entry.blockId, entry.rev, owed.peerIds);
 	}
-	const { status } = await deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
-	if (status === 'cleared') {
-		deps.emit({ blockIds: [entry.blockId], rev: entry.rev, actionId: entry.actionId, collectionId });
+	const outcome = await deps.ledger.satisfy(entry.blockId, confirmed, heldRev);
+	if (outcome.status === 'cleared') {
+		const removed = outcome.entry;
+		deps.emit({ blockIds: [removed.blockId], rev: removed.rev, actionId: removed.actionId, collectionId });
 	}
-	return status;
+	return outcome.status;
+}
+
+/**
+ * Refuse a reported revision that is not one: every revision comparison is false against `NaN`, so
+ * a `NaN` would pass the older-copy check and `satisfy`'s guard alike and clear any entry.
+ */
+export function assertReportedRevision(rev: number): void {
+	if (!Number.isSafeInteger(rev) || rev < 0) {
+		throw new RangeError(`reportBlockHeld: rev must be a non-negative integer, got ${rev}`);
+	}
 }
 
 /**
@@ -101,9 +114,10 @@ export async function takeConfirmedCopies(
  * than `rev` → `owed`, untouched. An unnamed entry is named only when `peerId` is in the block's
  * resolved cohort, because naming freezes the set the drain pushes to, and the report is evidence
  * about `peerId` alone. The event fired for an entry this clears carries no `collectionId`: nothing
- * here reads the block.
+ * here reads the block. `rev` is checked by {@link assertReportedRevision}.
  */
 export async function recordHeldCopy(deps: HeldCopyDeps, blockId: BlockId, rev: number, peerId: string): Promise<HeldCopyOutcome> {
+	assertReportedRevision(rev);
 	if (peerId === deps.selfId) return 'not-owed';
 	const entry = await deps.ledger.get(blockId);
 	if (!entry) return 'absent';

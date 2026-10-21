@@ -427,6 +427,9 @@ export class RebalanceMonitor implements Startable {
 	 */
 	recordBlockHolders(report: BlockHolders): void {
 		if (!this.running) return
+		// NOTE: evidence for a block this node does not track waits here until the next check drops it,
+		// so the map grows with reports between checks; only the embedder's `reportBlockHeld` can name
+		// untracked blocks. If an embedder reports in bulk for blocks this node never held, drop them here.
 		for (const blockId of report.blockIds) {
 			let evidence = this.holderEvidence.get(blockId)
 			if (!evidence) {

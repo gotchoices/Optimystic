@@ -161,7 +161,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 			if (remaining.length === 0) {
 				await this.remove(blockId);
 				wrote = true;
-				return { status: 'cleared' };
+				return { status: 'cleared', entry: existing };
 			}
 			if (remaining.length === existing.missingPeerIds.length) return { status: 'owed', entry: existing };
 			const updated: UnderReplicatedEntry = { ...existing, missingPeerIds: remaining };

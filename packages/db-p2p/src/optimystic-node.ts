@@ -75,7 +75,8 @@ export interface OptimysticNodeAttachments {
 	 * `peerId` is `PeerId.toString()`, the `12D3KooW…` form. Works with the under-replication drain
 	 * disabled: that option stops pushing, not recording.
 	 *
-	 * Resolves once the ledger has been updated. Rejects only on a fault reading or writing the ledger
+	 * Resolves once the ledger has been updated. Rejects with a `RangeError`, having recorded nothing,
+	 * when `rev` is not a non-negative integer; otherwise only on a fault reading or writing the ledger
 	 * (a node that has stopped may have closed its store). Reporting this node's own peer id does nothing.
 	 */
 	reportBlockHeld(blockId: BlockId, rev: number, peerId: string): Promise<void>;

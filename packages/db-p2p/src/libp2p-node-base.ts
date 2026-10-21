@@ -48,7 +48,7 @@ import { BlockTransferCoordinator } from './cluster/block-transfer.js';
 import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
 import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
-import { recordHeldCopy, type HeldCopyDeps } from './repo/owed-copies.js';
+import { assertReportedRevision, recordHeldCopy, type HeldCopyDeps } from './repo/owed-copies.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
@@ -1790,7 +1790,9 @@ export async function createLibp2pNodeBase(
 			emit: (event) => storageRepo.emitBlockDurabilityReached(event)
 		};
 		const reportBlockHeld: OptimysticNodeAttachments['reportBlockHeld'] = async (blockId, rev, peerId) => {
-			// First, because it is synchronous and never throws: the monitor hears it even when the ledger rejects.
+			// Ahead of both halves, so a malformed report reaches neither.
+			assertReportedRevision(rev);
+			// Before the ledger, because it is synchronous and never throws: the monitor hears it even when the ledger rejects.
 			onBlockHolders({ blockIds: [blockId], holders: [peerId] });
 			await recordHeldCopy(heldCopyDeps, blockId, rev, peerId);
 		};
