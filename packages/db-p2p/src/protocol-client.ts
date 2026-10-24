@@ -278,9 +278,10 @@ export class ProtocolClient {
 				(source) => lpDecode(source, { maxDataLength }),
 				async function* (source) {
 					for await (const data of source) {
-						const decoded = new TextDecoder().decode(data.subarray());
-						const parsed = JSON.parse(decoded);
-						yield parsed;
+						// A service answers a `void` operation with `JSON.stringify(undefined)`, which encodes as a
+						// zero-length frame. No JSON value serializes to an empty string, so an empty frame is
+						// exactly a `void` reply.
+						yield data.byteLength === 0 ? undefined : JSON.parse(new TextDecoder().decode(data.subarray()));
 					}
 				}
 			) as AsyncIterable<T>;

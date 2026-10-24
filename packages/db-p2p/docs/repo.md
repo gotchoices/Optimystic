@@ -222,6 +222,12 @@ One request per stream: the service answers the first frame and completes the ge
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and
 closes. A second frame queued on the same stream is never read.
 
+`cancel` answers `void`, which the service encodes as `JSON.stringify(undefined)` — a zero-length
+frame. The client reads a zero-length frame as `undefined` rather than parsing it (the decode stage
+in `ProtocolClient.exchange`, `packages/db-p2p/src/protocol-client.ts`, which every protocol client
+shares); no JSON value serializes to an empty string, so the empty frame is exactly a `void` reply. A
+cancel that fails is still a failure: the service aborts the stream and the client's read rejects.
+
 `invalidate` is the one operation the repo protocol does not serve. It reaches a node only through
 consensus on the cluster protocol (`ClusterRecord.message`, applied by `cluster/cluster-repo.ts`);
 `RepoService` dispatches `get` / `pend` / `cancel` / `commit` only, so an `invalidate` sent directly
