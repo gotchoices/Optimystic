@@ -30,6 +30,16 @@ import type { ConsultRound } from "./consult-round.js";
  * they reuse the archives the consult already returned (`ConsultedArchives`) and open no stream. If
  * acquisitions after a large round ever show stream-limit resets on the answering peer, bound
  * acquisitions separately.
+ *
+ * NOTE: the slots count the requests a round sends a peer that answers batched. A peer on a build that
+ * predates `SyncRequest.held` answers only a chunk's first block, and the round asks it each remaining
+ * block on a request of its own, all at once (`ConsultRound.askEachSingly`), so against such a peer one
+ * large read can open more streams than the slots admit. If mixed-version deployments show stream-limit
+ * resets there, bound how many single-block requests a round sends such a peer at once.
+ *
+ * NOTE: one read can start at most 16 × 32 = 512 passes, and past that defers the tail of its
+ * `blockIds` in the same order on every such read, the starvation this count fixed below 512. No reader
+ * names that many blocks today; if one does, rotate which blocks a read starts first.
  */
 export const MAX_HELD_BLOCK_CONSULT_SLOTS = 16;
 
