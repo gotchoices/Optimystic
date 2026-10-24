@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
@@ -134,6 +134,13 @@ export interface MeshOptions {
 	 * coordinator runs on the resolved policy alone.
 	 */
 	coordinatorConfig?: Partial<ClusterConsensusConfig>;
+	/**
+	 * Passed to every node's `StorageRepo` as `changeHoldMs` — how long a per-collection change event
+	 * is held while another collection of the same action is still pending on that node; `0` disables
+	 * the hold. Omitted → the production default. A spec that wants to observe the gap the hold closes
+	 * (a watcher woken for a table before its index landed) sets `0`.
+	 */
+	changeHoldMs?: number;
 }
 
 export interface MeshFailureConfig {
@@ -173,8 +180,12 @@ export interface MeshFailureConfig {
 	 *
 	 * A coordinator's OWN member is invoked in process, never through this path — as in production,
 	 * where `ClusterCoordinator.updateMember` calls it directly — so the hook never sees it.
+	 *
+	 * May return a promise, which the delivery awaits before it proceeds: that is how a spec holds one
+	 * record's arrival at a member for as long as it needs — one collection's commit lagging another's
+	 * at that member, as a relayed link does — while every other delivery goes through at once.
 	 */
-	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord, carried: readonly ClusterRecord[]) => void;
+	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord, carried: readonly ClusterRecord[]) => void | Promise<void>;
 	/**
 	 * A record carried to a member (see {@link onClusterDelivery}) that this answers true for is lost on
 	 * the way: the rest of the request arrives, and the member answers that one not delivered, so it stays
@@ -500,7 +511,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	const buildMember = (meshNode: MeshNode, lifetime: NodeLifetime): void => {
 		const { peerId, privateKey } = meshNode;
 		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
-		const storageRepo = new StorageRepo(rawStorage);
+		const storageRepo = new StorageRepo(rawStorage, options.changeHoldMs === undefined ? undefined : { changeHoldMs: options.changeHoldMs });
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
 		// reader holds a corroborated revision it cannot promote locally, pull the committed revision
@@ -568,8 +579,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			throw new Error(`Unknown peer: ${targetPeerId.toString()}`);
 		}
 		const targetStr = targetPeerId.toString();
-		const reach = (record: ClusterRecord, carried: readonly ClusterRecord[]): void => {
-			failures.onClusterDelivery?.(targetStr, record, carried);
+		// Awaits the spec's hook, so a delivery it holds arrives when it says and not before.
+		const reach = async (record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<void> => {
+			await failures.onClusterDelivery?.(targetStr, record, carried);
 			if (failures.failingPeers?.has(targetStr)) {
 				throw new Error(`Peer ${targetStr} is unreachable`);
 			}
@@ -585,7 +597,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		};
 		return {
 			async update(record: ClusterRecord): Promise<ClusterRecord> {
-				reach(record, []);
+				await reach(record, []);
 				return await answerFrom(record);
 			},
 			// The member side runs the SAME loop `ClusterService` does, so carried records are applied
@@ -594,7 +606,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// redirect steps have nothing to do. An older build ignores the carried records, which then
 			// read as not delivered.
 			async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
-				reach(record, carried);
+				await reach(record, carried);
 				const arriving = carryUnaware() ? [] : carried.filter(owed => failures.dropCarried?.(targetStr, owed) !== true);
 				const outcomes = await applyCarriedRecords(arriving, { cluster: target.clusterMember, selfId: targetStr, log: carriedLog });
 				return { answer: await answerFrom(record), carried: readCarriedOutcomes(carried, outcomes) };
@@ -823,6 +835,23 @@ export interface BuildTransactorOptions {
 	 * therefore all of the production code after the injection — untouched.
 	 */
 	wrapRepo?: (repo: IRepo, node: MeshNode) => IRepo;
+	/**
+	 * Give each node's transactor its node's `storageRepo` as `localChangeNotifier`, as production gives
+	 * it `node.blockChangeNotifier`, so a subscription through the transactor
+	 * (`NetworkTransactor.onCollectionChange`) hears the commits that node's storage applies. Off by
+	 * default: the subscription is then an inert no-op, as it always was here. Only meaningful with
+	 * `buildNetworkTransactors`; a transactor that runs on no node has no storage to listen to.
+	 */
+	notifyLocalChanges?: boolean;
+	/**
+	 * A node's transactor answers a READ's `findCoordinator` (`intent: 'read'`) with its own node
+	 * whenever that node is in the key's cohort and not excluded, deferring to the mesh key network
+	 * otherwise — what `selfReadVerdict` does on a real node, so a spec can see what a machine reads
+	 * from its OWN replica. Off by default: reads then route by ring proximity, and a spec that relies
+	 * on a read reaching a particular remote coordinator keeps doing so. Only meaningful with
+	 * `buildNetworkTransactors`.
+	 */
+	selfFirstReads?: boolean;
 }
 
 /**
@@ -843,13 +872,13 @@ export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptio
  * node is in a block's cohort and ties another member on coverage, it
  * coordinates the write itself. Reads and retries still route by proximity.
  *
- * NOTE: production differs for reads — a node in a block's cohort answers its own reads from its own
- * replica whenever its self-coordination guard allows (`selfReadVerdict` in
- * `Libp2pKeyPeerNetwork`), so mesh specs exercise the remote-coordinator read path for keys whose
- * nearest node is another member, and no mesh spec exercises the self-first path (the real-socket
- * `routing-key-convention-divergence.integration.spec.ts` does). If a mesh spec needs that path, give
- * each node's transactor a key network whose read picks `localNode` when it is in the key's cohort
- * and not excluded — expect specs that rely on reads reaching a particular coordinator to move.
+ * NOTE: production differs for reads by default — a node in a block's cohort answers its own reads
+ * from its own replica whenever its self-coordination guard allows (`selfReadVerdict` in
+ * `Libp2pKeyPeerNetwork`), while a mesh transactor routes reads by ring proximity, so most mesh specs
+ * exercise the remote-coordinator read path for keys whose nearest node is another member. A spec
+ * that needs a node to read its own replica opts in with `selfFirstReads`; it is not the default
+ * because specs that rely on a read reaching a particular coordinator would move. The real-socket
+ * `routing-key-convention-divergence.integration.spec.ts` exercises production's own path.
  */
 export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
 	const transactors = new Map<string, ITransactor>();
@@ -869,14 +898,40 @@ function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: 
 		abortOrCancelTimeoutMs: options.abortOrCancelTimeoutMs ?? 5_000,
 		// NOTE: every transactor, `localNode`'s included, reads the unpartitioned shared view, not `localNode.keyNetwork`;
 		// no spec drives `partitionSides` through a node's transactor today. If one does, pass the node's own view.
-		keyNetwork: mesh.keyNetwork,
+		keyNetwork: options.selfFirstReads && localNode ? selfFirstReadKeyNetwork(mesh.keyNetwork, localNode) : mesh.keyNetwork,
 		getRepo: (peerId: DbPeerId) => {
 			const repo = repoByPeer.get(peerId.toString());
 			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
 			return repo;
 		},
-		localPeerId: localNode?.peerId
+		localPeerId: localNode?.peerId,
+		// Resolved per call rather than bound to the repo instance: `Mesh.restart` gives a node a new one.
+		...(options.notifyLocalChanges && localNode ? { localChangeNotifier: changeNotifierOf(localNode) } : {})
 	});
+}
+
+/** `node`'s storage as an `IBlockChangeNotifier`, read at subscribe time so a restarted node's new repo is the one listened to. */
+function changeNotifierOf(node: MeshNode): IBlockChangeNotifier {
+	return { onCollectionChange: (collectionId, listener) => node.storageRepo.onCollectionChange(collectionId, listener) };
+}
+
+/**
+ * `shared` with reads answered by `self` whenever `self` is in the key's cohort and not excluded — the
+ * mesh stand-in for `selfReadVerdict` (see `BuildTransactorOptions.selfFirstReads`). Writes, and reads
+ * that excluded `self` or whose cohort leaves it out, go to `shared` unchanged.
+ */
+function selfFirstReadKeyNetwork(shared: IKeyNetwork, self: MeshNode): IKeyNetwork {
+	const selfStr = self.peerId.toString();
+	return {
+		async findCoordinator(key, options) {
+			const excluded = options?.excludedPeers?.some(peer => peer.toString() === selfStr) ?? false;
+			if (options?.intent === 'read' && !excluded && selfStr in await shared.findCluster(key)) {
+				return self.peerId;
+			}
+			return await shared.findCoordinator(key, options);
+		},
+		findCluster: key => shared.findCluster(key)
+	};
 }
 
 /**

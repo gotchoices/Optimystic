@@ -9,7 +9,7 @@ import { MemoryBatchBackend } from '../src/testing/memory-batch-backend.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
-import { delay } from '@optimystic/db-core/test';
+import { delay, waitFor } from '@optimystic/db-core/test';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -1829,6 +1829,64 @@ describe('StorageRepo', () => {
 			expect(aEvents[0]!.collectionId).to.equal('collection-A');
 			expect(aEvents[0]!.blockIds).to.deep.equal(['block-a']);
 			expect(bEvents.length).to.equal(0);
+		});
+	});
+
+	describe('change notification — a hold while another collection of the action is still pending', () => {
+		// Two collections pended under ONE action id in two `pend` calls — what a transaction writing a
+		// table and its index sends a member — then committed one call at a time, as a member applies them.
+		const pendBoth = async (target: StorageRepo): Promise<void> => {
+			await target.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-a' as BlockId, makeBlockInCollection('block-a', 'collection-A')), policy: 'c' });
+			await target.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-b' as BlockId, makeBlockInCollection('block-b', 'collection-B')), policy: 'c' });
+		};
+		const commitOne = (target: StorageRepo, blockId: string) =>
+			target.commit({ actionId: 'a1' as ActionId, blockIds: [blockId as BlockId], tailId: blockId as BlockId, rev: 1 });
+		/** Both collections' per-collection events in the order they fired, and the catch-all feed. */
+		const observe = (target: StorageRepo): { fired: CollectionChangeEvent[]; any: CollectionChangeEvent[] } => {
+			const fired: CollectionChangeEvent[] = [];
+			const any: CollectionChangeEvent[] = [];
+			target.onCollectionChange('collection-A' as BlockId, e => fired.push(e));
+			target.onCollectionChange('collection-B' as BlockId, e => fired.push(e));
+			target.onAnyCollectionChange(e => any.push(e));
+			return { fired, any };
+		};
+
+		it("holds the first collection's event while the second is pending, then fires both in order when the second lands", async () => {
+			const { fired, any } = observe(repo);
+			await pendBoth(repo);
+
+			expect((await commitOne(repo, 'block-a')).success).to.equal(true);
+			expect(fired.map(e => e.collectionId), "the per-collection listener waits for the action's other collection").to.deep.equal([]);
+			expect(any.map(e => e.collectionId), 'the catch-all feed is never held').to.deep.equal(['collection-A']);
+
+			expect((await commitOne(repo, 'block-b')).success).to.equal(true);
+			expect(fired.map(e => e.collectionId), 'the held event, then the closing commit\'s own').to.deep.equal(['collection-A', 'collection-B']);
+			expect(fired[0]!.blockIds).to.deep.equal(['block-a']);
+			expect(any.map(e => e.collectionId)).to.deep.equal(['collection-A', 'collection-B']);
+		});
+
+		it("releases the held event when the writer cancels the other collection's pend", async () => {
+			const { fired } = observe(repo);
+			await pendBoth(repo);
+			await commitOne(repo, 'block-a');
+			expect(fired).to.have.length(0);
+
+			await repo.cancel({ actionId: 'a1' as ActionId, blockIds: ['block-b' as BlockId] });
+
+			expect(fired.map(e => e.collectionId)).to.deep.equal(['collection-A']);
+		});
+
+		it('releases a held event when changeHoldMs elapses with the other collection still pending', async () => {
+			const bounded = new StorageRepo(rawStorage, { changeHoldMs: 40 });
+			const { fired } = observe(bounded);
+			await pendBoth(bounded);
+			await commitOne(bounded, 'block-a');
+			expect(fired).to.have.length(0);
+
+			await waitFor(() => fired.length === 1, { description: 'the hold timer released the event' });
+
+			expect(fired[0]!.collectionId).to.equal('collection-A');
+			expect(await bounded.pendingClaimOf('block-b' as BlockId, 'a1' as ActionId), 'the other collection is still pending').to.not.equal(undefined);
 		});
 	});
 

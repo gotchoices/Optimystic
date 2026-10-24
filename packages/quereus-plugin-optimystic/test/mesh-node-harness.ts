@@ -16,13 +16,21 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
-import { createMesh, buildNetworkTransactors, type Mesh } from '@optimystic/db-p2p/testing';
+import { createMesh, buildNetworkTransactors, type BuildTransactorOptions, type Mesh, type MeshOptions } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
 
 export type Plugin = ReturnType<typeof register>;
 
 /** One mesh node's SQL surface: its own `Database` plus the plugin instance bound to it. */
 export type MeshDbNode = { db: Database; plugin: Plugin };
+
+/**
+ * The opt-in wiring a spec may ask of its mesh, each off by default so no other spec changes: the
+ * two transactor options that make a node hear its own storage's commits and read its own replica
+ * (`BuildTransactorOptions.notifyLocalChanges` / `selfFirstReads`), and the storage change hold's
+ * bound (`MeshOptions.changeHoldMs`; `0` disables it).
+ */
+export type MockMeshOptions = Pick<BuildTransactorOptions, 'notifyLocalChanges' | 'selfFirstReads'> & Pick<MeshOptions, 'changeHoldMs'>;
 
 /** A running mock mesh, plus the lookup from node index to that node's transactor. */
 export interface MockMesh {
@@ -51,13 +59,15 @@ export interface MockMesh {
  * which any cohort of 2+ clears. `size: 1` never reaches the gate (solo short-circuit in
  * `CoordinatorRepo`). Specs here don't need to re-derive this arithmetic.
  */
-export async function startMockMesh(size: number): Promise<MockMesh> {
+export async function startMockMesh(size: number, options: MockMeshOptions = {}): Promise<MockMesh> {
+	const { changeHoldMs, ...transactorOptions } = options;
 	const mesh = await createMesh(size, {
 		responsibilityK: size,
 		clusterSize: size,
 		superMajorityThreshold: 0.67,
+		...(changeHoldMs === undefined ? {} : { changeHoldMs }),
 	});
-	const transactors = buildNetworkTransactors(mesh);
+	const transactors = buildNetworkTransactors(mesh, transactorOptions);
 	return {
 		mesh,
 		transactorFor(index: number): ITransactor {

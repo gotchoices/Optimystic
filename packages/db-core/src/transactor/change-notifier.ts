@@ -67,10 +67,18 @@ export type CommitCert = {
 
 export interface IBlockChangeNotifier {
 	/**
-	 * Subscribe to commits that mutate the given collection. Returns an
-	 * idempotent unsubscribe. Listeners are invoked AFTER the commit's critical
-	 * section (locks released), synchronously in commit order; a throwing
-	 * listener must not break the commit or other listeners (log + continue).
+	 * Subscribe to commits that mutate the given collection. Returns an idempotent unsubscribe.
+	 * Listeners are invoked AFTER the commit's critical section (locks released), in commit order,
+	 * never from inside it; a throwing listener must not break the commit or other listeners (log +
+	 * continue).
+	 *
+	 * A listener may be invoked later than the call that landed the change: a transaction that
+	 * writes several collections (a table and its indexes) commits each as its own request under one
+	 * action id, and a node's storage holds one collection's event while another collection of the
+	 * same action is still pending there, releasing it when that collection lands, is cancelled, or
+	 * a bound elapses (`StorageRepo.emitCollectionChanges` in
+	 * `packages/db-p2p/src/storage/storage-repo.ts`). So an event may arrive from a later call of
+	 * the storage, or from a timer. Every change still produces exactly one event.
 	 */
 	onCollectionChange(collectionId: CollectionId, listener: CollectionChangeListener): () => void;
 }

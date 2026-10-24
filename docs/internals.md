@@ -913,9 +913,11 @@ StorageRepo.get()                          # read-driven promotion (context prov
 ```
 
 - Subscribe via `onCollectionChange(collectionId, listener)` → idempotent unsubscribe.
-- Events fire **after** locks release and the write group's flush, synchronously in commit order, fire-and-forget
+- Events fire **after** locks release and the write group's flush, in commit order, fire-and-forget
   (never awaited); a throwing listener is isolated + logged. Ordering across concurrent
-  commits / across collections is **not** guaranteed.
+  commits / across collections is **not** guaranteed. A per-collection event can fire later than
+  the call that landed it — see the hold below; the catch-all feed (`onAnyCollectionChange`) always
+  fires at the end of that call.
 - **Emission guarantee (Option A — emit eagerly):** a `CollectionChangeEvent` fires
   once for every block that becomes **durably committed** on this node, regardless of
   whether the enclosing `commit()` ultimately reports `success: false`, and regardless
@@ -925,9 +927,55 @@ StorageRepo.get()                          # read-driven promotion (context prov
   retry rolls `N` forward and emits for it), and (b) a pending action promoted during a
   `get()` whose `context` proves it committed. Idempotent `alreadyDone` re-landings and
   stale partitions never emit, so each `pending → committed` transition emits exactly
-  once. The consumer does coarse whole-table invalidation, where over-firing costs only
-  a re-query but a missed wake serves a stale view indefinitely — hence the asymmetry
-  favors liveness.
+  once — once, and for the per-collection feed possibly later than the landing, never
+  twice and never not at all. The consumer does coarse whole-table invalidation, where
+  over-firing costs only a re-query but a missed wake serves a stale view indefinitely —
+  hence the asymmetry favors liveness.
+- **A collection's wake waits for the action's other collections pending here.** A SQL
+  table and each of its indexes are separate collections, and a transaction writing a row
+  pends and commits each as its own consensus record under one action id
+  (`TransactionCoordinator.pendPhase` and `commitPhase` in
+  `packages/db-core/src/transaction/coordinator.ts`), so a member applies them as separate
+  `StorageRepo.commit` calls, a few hundred milliseconds apart on a relayed link. A watcher
+  woken by the table's event read the index from this node's own replica before the index's
+  commit had applied, and found nothing; the index's own event wakes nobody (GitHub #47). The
+  writer pends every collection before committing any, so at the moment the table's commit
+  applies here this node already holds the index's **pending record under the same action id**,
+  and that is the signal: `StorageRepo.emitCollectionChanges` holds an action's per-collection
+  events while the action has an open **pend group** here — the blocks one `StorageRepo.pend`
+  call saved for it, one collection's reservation — and releases them, in the order held and
+  ahead of the releasing call's own events, when the action's last open group closes. A group
+  closes when a block of it lands here (a commit, a read-driven promotion in `get`, or a replica
+  of the action's revision through `saveReplicatedBlock`), when the writer's `cancel` names its
+  blocks, or when a check after another collection of the action landed finds none of its blocks
+  still holding the pending record. Groups rather than blocks, because a group already partly
+  landed is the SAME collection mid-commit — the tail-then-sweep path, a mid-loop throw — whose
+  eager emission (case (a) above) stays as it is; only another collection's untouched reservation
+  holds a wake. The bookkeeping is pure state in `ActionChangeHold`
+  (`packages/db-p2p/src/storage/action-change-hold.ts`); the storage reads and the timer stay in
+  `StorageRepo`. What it costs: a single-collection action has one group, which its own commit
+  closes by landing — no storage read, no delay, no timer. After a write group of a
+  multi-collection action ends with groups still open, each open group costs one unlatched read
+  of a pending record. A held event is released at the latest `changeHoldMs` after it was first
+  held (`StorageRepoOptions.changeHoldMs`, default `DEFAULT_CHANGE_HOLD_MS`, 10 s; `0` disables
+  the hold), through one unref'd timer per action, so a writer that died between its commits
+  costs a late wake rather than one that never comes. In memory only, capped (an evicted action's
+  events are released, never dropped), with actions that pended and vanished aged out; a restart
+  forgets every hold, which only means the next commit of an action pended before it wakes at
+  once. Two residuals are accepted and recorded at their sites: a pend delivered to a member
+  after another collection of the action already committed and emitted there holds nothing for
+  that earlier event (`notePendGroup`), and a collection that lands after the timer released
+  fires only its own listeners (`armHoldTimer` — the tripwire is to have the vtab subscribe to its
+  index collections too if gaps beyond `changeHoldMs` are ever seen). Nothing is held for an
+  action with no pend group here — one pended before a restart, an `inv:` invalidation, a
+  collection in this node's cohort whose sibling collection is not (larger groups; such a node
+  behaves as before). The catch-all feed is never held: cohort-topic origination resolves a
+  commit certificate by action id alone, so a table event released after the index record's
+  certificate had been stored would hand it the wrong record's certificate (backlog
+  `bug-a-commit-cert-is-looked-up-by-action-alone`), and neither tail-rotation detection nor the
+  owned-block feed wants a delay. Pinned by the "a hold while another collection of the action is
+  still pending" cases in `packages/db-p2p/test/storage-repo.spec.ts` and end to end by
+  `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts`.
 - Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
   `OptimysticNodeAttachments` (`db-p2p/src/optimystic-node.ts`), which `createLibp2pNode`'s
   return type carries, so reading it needs no cast. `NetworkTransactor`
@@ -958,8 +1006,23 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   `header.collectionId` stamped on every block (`TransactorSource.createBlockHeader`)
   and therefore the `CollectionChangeEvent.collectionId`. Index sub-collections
   (`<uri>/index/<name>`) carry their own ids and are NOT separately watched —
-  whole-table invalidation re-queries them anyway. The schema tree
-  (`tree://optimystic/schema`) is skipped (schema writes aren't data-watch events).
+  whole-table invalidation re-queries them anyway. What makes that re-query see the
+  indexes is storage, not the subscription: a node holds the table's event until every
+  other collection of the same action pending there has landed (see *A collection's wake
+  waits for the action's other collections pending here* above), so the wake arrives when
+  the table and its indexes agree, possibly later than the table's own commit applied.
+  The schema tree (`tree://optimystic/schema`) is skipped (schema writes aren't
+  data-watch events).
+- **The network watch has the same shape, and is not held.** Origination fires on the
+  root group member when the TABLE's commit applies there (`selfAppliedTail` over the
+  catch-all feed, which is never held), so a network notification can reach a subscriber
+  before the index's commit has applied anywhere, and the watch service's tick
+  (`ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts`)
+  compares only the table's tail revision, so it never wakes again for that commit. On a
+  subscriber that also stores the collections — every member of a group no larger than a
+  cohort, the two-member case — the network wake is an early over-wake and the held storage
+  wake that follows is consistent. A subscriber that stores nothing of the table still has
+  the gap; that is backlog `feat-a-network-watch-wake-sees-the-whole-commit`.
 - **Coarse invalidation.** `notifyExternalChange` fires every matching watcher as
   a global whole-table change: `full` watches fire with empty hits, `rows`/
   `rowsByGroup` watches surface their registered literals as possibly-changed.

@@ -1128,7 +1128,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Scope decisions:
    *   - Only the MAIN-table collection is watched. Index sub-collections
    *     (`<uri>/index/<name>`) mutate under the same actionId but carry their
-   *     own collection id; whole-table invalidation re-queries them anyway.
+   *     own collection id; whole-table invalidation re-queries them anyway. The
+   *     re-query reads the indexes too, so the storage layer holds the table's
+   *     event on a node until every other collection of the same action that is
+   *     pending there has landed (`StorageRepo.emitCollectionChanges`); a wake
+   *     therefore sees the table and its indexes together, possibly later than the
+   *     table's own commit applied.
    *   - The plugin-global schema tree (`tree://optimystic/schema`) is skipped —
    *     schema writes are not data-watch events.
    *

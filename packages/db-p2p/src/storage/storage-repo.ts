@@ -24,8 +24,17 @@ import { acquireBlockWriteLatches, withBlockWriteLatch, type BlockWriteLatch } f
 import { createLogger } from "../logger.js";
 import { cloneDecoded } from "./raw-store-codec.js";
 import { checkPendValidation } from "../pend-validation.js";
+import { ActionChangeHold, type PendGroup } from "./action-change-hold.js";
+import { armUnrefTimer } from "../unref-timer.js";
 
 const log = createLogger('storage-repo');
+
+/**
+ * Default for {@link StorageRepoOptions.changeHoldMs}: long enough to cover the relayed links on which
+ * one action's collections were seen landing a few hundred milliseconds apart, with margin, and under
+ * the 30 s tick of the network watch service, so a hold that lapses still wakes before the next tick.
+ */
+export const DEFAULT_CHANGE_HOLD_MS = 10_000;
 
 /**
  * Stable, greppable prefix on the failure reason a commit carries when this node cannot materialize
@@ -128,6 +137,15 @@ export type StorageRepoOptions = {
 	 * single operator field rather than letting a deployment set them apart.
 	 */
 	unvalidatablePendPolicy?: UnvalidatablePendPolicy;
+	/**
+	 * How long a per-collection change event of an action may be held while another collection of
+	 * the same action is still pending on this node — see {@link StorageRepo.emitCollectionChanges}
+	 * and `./action-change-hold.ts`. A held event is released at the latest this many milliseconds
+	 * after it was first held, so a writer that died between its commits costs a late wake rather
+	 * than one that never comes. Default {@link DEFAULT_CHANGE_HOLD_MS}; `0` disables holding
+	 * entirely, and every event fires at the end of the call that landed it, as before the hold.
+	 */
+	changeHoldMs?: number;
 };
 
 /**
@@ -274,12 +292,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 *  reached every cohort member. See {@link IBlockDurabilityNotifier}. */
 	private readonly durabilityListeners = new Set<BlockDurabilityListener>();
 	private readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
+	/**
+	 * Per-action pend groups and held per-collection events (see {@link emitCollectionChanges});
+	 * `undefined` when `changeHoldMs` is 0. In memory only: a restart forgets every hold, so the next
+	 * commit of an action pended before the restart wakes at once, as every commit did before the hold.
+	 */
+	private readonly changeHold: ActionChangeHold | undefined;
+	private readonly changeHoldMs: number;
+	/** The cancel of the timer bounding each action's hold, armed at its first held event. */
+	private readonly holdTimers = new Map<ActionId, () => void>();
 
 	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
 		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
 		this.createBlockStorage = blockId => factory(blockId, storage);
 		this.validatePend = options?.validatePend;
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
+		this.changeHoldMs = options?.changeHoldMs ?? DEFAULT_CHANGE_HOLD_MS;
+		this.changeHold = this.changeHoldMs > 0 ? new ActionChangeHold() : undefined;
 	}
 
 	/**
@@ -325,30 +354,198 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	/**
-	 * Fire one {@link CollectionChangeEvent} per distinct collection that was
-	 * newly committed. Called AFTER the commit critical section (locks released),
-	 * fire-and-forget synchronous; a throwing listener is isolated and logged. Each event reaches
-	 * both that collection's {@link onCollectionChange} subscribers and every
-	 * {@link onAnyCollectionChange} catch-all subscriber.
+	 * Fire one {@link CollectionChangeEvent} per distinct collection that was newly committed —
+	 * `collectionBlocks` is every block that landed in the calling write group, grouped by collection.
+	 * Called AFTER the critical section (locks released) and the group's flush; a throwing listener is
+	 * isolated and logged. Each event reaches every {@link onAnyCollectionChange} catch-all
+	 * subscriber at once, and that collection's {@link onCollectionChange} subscribers at once OR
+	 * later:
+	 *
+	 * **The per-collection half is held while another collection of the same action is still
+	 * pending here.** A transaction writing several collections commits each as its own request
+	 * under one action id, so this node applies them in separate calls; a watcher woken by the first
+	 * would read the others before they landed. Its pend groups (`./action-change-hold.ts`: the
+	 * blocks each `pend` call saved for the action) are the signal: a group is closed when a block of
+	 * it lands in this call, and otherwise by reading whether any of its blocks still holds the
+	 * action's pending record ({@link closeAbandonedGroups}). While a group stays open the events are
+	 * held; when the action's last group closes — in this call, a later one, or a `cancel` — the held
+	 * events fire in the order they were held, ahead of the closing call's own, to the listener set
+	 * current at that moment. A hold is bounded by `changeHoldMs` ({@link armHoldTimer}). An action
+	 * with no pend group here (one pended before a restart, an `inv:` invalidation, a single
+	 * collection whose one group this very call closes) is dispatched at once with no storage read.
+	 *
+	 * The catch-all feed is never held: it feeds cohort-topic origination, whose commit certificate
+	 * is looked up by action id alone and would be the wrong record's once a later collection's
+	 * certificate had been stored (backlog `bug-a-commit-cert-is-looked-up-by-action-alone`), and
+	 * tail-rotation detection and the owned-block feed, none of which wants a delay.
 	 *
 	 * `tailId` is the `CommitRequest.tailId` on the commit path; `undefined` on read-driven
-	 * promotions (the get/emitPromotions path has no commit request). A single commit is for one
+	 * promotions and replica landings, which have no commit request. A single commit is for one
 	 * collection's chain in practice, so all events from one commit share the same `tailId`.
 	 */
-	private emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number, tailId?: BlockId): void {
-		const hasCatchAll = this.anyChangeListeners.size > 0;
-		for (const [collectionId, blockIds] of collectionBlocks) {
-			const listeners = this.changeListeners.get(collectionId);
-			if ((!listeners || listeners.size === 0) && !hasCatchAll) {
-				continue;
+	private async emitCollectionChanges(collectionBlocks: Map<CollectionId, BlockId[]>, actionId: ActionId, rev: number, tailId?: BlockId): Promise<void> {
+		const events = Array.from(collectionBlocks, ([collectionId, blockIds]): CollectionChangeEvent => ({ collectionId, blockIds, actionId, rev, tailId }));
+		const hold = this.changeHold;
+		if (hold !== undefined && hold.knows(actionId)) {
+			hold.closeGroups(actionId, events.flatMap(event => event.blockIds));
+		}
+		if (hold === undefined || !hold.hasOpenGroups(actionId)) {
+			// The common case, and the same order as before the hold existed: this call closed the
+			// action's last group (or it never had one), so whatever was held fires first, then this
+			// call's own events, each to its collection's listeners and then to the catch-all.
+			if (hold !== undefined) {
+				this.releaseHeld(actionId);
 			}
-			const event: CollectionChangeEvent = { collectionId, blockIds, actionId, rev, tailId };
-			if (listeners && listeners.size > 0) {
-				this.fireChangeListeners(listeners, event);
+			for (const event of events) {
+				this.firePerCollection(event);
+				this.fireCatchAll(event);
 			}
-			if (hasCatchAll) {
-				this.fireChangeListeners(this.anyChangeListeners, event);
+			return;
+		}
+		for (const event of events) {
+			this.fireCatchAll(event);
+		}
+		await this.closeAbandonedGroups(actionId);
+		if (!hold.hasOpenGroups(actionId)) {
+			this.releaseHeld(actionId);
+			for (const event of events) {
+				this.firePerCollection(event);
 			}
+			return;
+		}
+		for (const event of events) {
+			if (hold.hold(actionId, event)) {
+				this.armHoldTimer(actionId);
+			}
+			log('change-hold:held actionId=%s collection=%s openGroups=%d', actionId, event.collectionId, hold.openGroups(actionId).length);
+		}
+	}
+
+	/**
+	 * Close every still-open pend group of `actionId` none of whose blocks holds the action's pending
+	 * record any more: cancelled under a different block list, dropped as unpromotable, replaced by a
+	 * replica of a later revision. One unlatched read per block until a record is found, so an open
+	 * group whose collection is genuinely still pending costs one read. Runs only after a write group
+	 * of the action ended with groups still open, never on the single-collection path. A record this
+	 * node cannot read keeps its group open — the hold's timer bounds the cost of being wrong that way,
+	 * where closing on a fault could wake a watcher early.
+	 */
+	private async closeAbandonedGroups(actionId: ActionId): Promise<void> {
+		const hold = this.changeHold!;
+		for (const group of hold.openGroups(actionId)) {
+			if (!(await this.anyStillPending(group, actionId))) {
+				hold.closeGroup(actionId, group);
+			}
+		}
+	}
+
+	/** Whether any block of `group` still holds `actionId`'s pending record. */
+	private async anyStillPending(group: PendGroup, actionId: ActionId): Promise<boolean> {
+		for (const blockId of group.blockIds) {
+			try {
+				if (await this.createBlockStorage(blockId).getPendingTransaction(actionId) !== undefined) {
+					return true;
+				}
+			} catch (err) {
+				log('change-hold:pending-unreadable actionId=%s blockId=%s error=%s', actionId, blockId,
+					err instanceof Error ? err.message : String(err));
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Record the blocks a successful {@link pend} saved for `actionId` as one pend group, and sweep
+	 * actions a vanished writer left behind. An action evicted at capacity has its held events
+	 * released here — late, never dropped.
+	 *
+	 * NOTE: a pend delivered to this node AFTER another collection of the same action already
+	 * committed and emitted here holds nothing for that earlier event: it was not held, and this
+	 * group holds only the events that follow. Accepted residual — the writer pends every collection
+	 * before committing any, so this needs a record owed to this member and delivered late.
+	 */
+	private notePendGroup(actionId: ActionId, saved: readonly BlockId[]): void {
+		const hold = this.changeHold;
+		if (hold === undefined) {
+			return;
+		}
+		const now = Date.now();
+		hold.ageOut(now);
+		const evicted = hold.notePendGroup(actionId, saved, now);
+		if (evicted !== undefined) {
+			log('change-hold:evicted actionId=%s released=%d', evicted.actionId, evicted.held.length);
+			this.cancelHoldTimer(evicted.actionId);
+			this.fireReleased(evicted.held);
+		}
+	}
+
+	/**
+	 * A writer's {@link cancel} of `blockIds` closes every pend group of `actionId` they belong to
+	 * without a read — the records are gone — and releases the action's held events when that was its
+	 * last open group. A cancel has no events of its own.
+	 */
+	private noteCancelled(actionId: ActionId, blockIds: readonly BlockId[]): void {
+		const hold = this.changeHold;
+		if (hold === undefined || !hold.knows(actionId)) {
+			return;
+		}
+		hold.closeGroups(actionId, blockIds);
+		if (!hold.hasOpenGroups(actionId)) {
+			this.releaseHeld(actionId);
+		}
+	}
+
+	/**
+	 * Bound `actionId`'s hold: when the timer fires, its held events are released and the action is
+	 * forgotten, groups and all, so a wake is late in the pathological case (a writer that died between
+	 * its commits) rather than never. Unref'd, so a pending hold keeps no process or test alive.
+	 *
+	 * NOTE: a collection of the action that lands AFTER this timer released fires only its own
+	 * collection's listeners, so the table's watchers are not woken a second time for it, and a
+	 * lookup through that collection at the released wake can still miss. Fine while every gap stays
+	 * under `changeHoldMs`; if gaps beyond it are ever seen, have the vtab also subscribe to its
+	 * index collections (wake the table on any of them) rather than lengthening the hold.
+	 */
+	private armHoldTimer(actionId: ActionId): void {
+		this.cancelHoldTimer(actionId);
+		this.holdTimers.set(actionId, armUnrefTimer(() => {
+			this.holdTimers.delete(actionId);
+			const held = this.changeHold!.release(actionId);
+			log('change-hold:expired actionId=%s released=%d holdMs=%d', actionId, held.length, this.changeHoldMs);
+			this.fireReleased(held);
+		}, this.changeHoldMs));
+	}
+
+	private cancelHoldTimer(actionId: ActionId): void {
+		this.holdTimers.get(actionId)?.();
+		this.holdTimers.delete(actionId);
+	}
+
+	/** Release `actionId`'s held events to their collections' listeners, in the order held, and forget the action. */
+	private releaseHeld(actionId: ActionId): void {
+		this.cancelHoldTimer(actionId);
+		this.fireReleased(this.changeHold!.release(actionId));
+	}
+
+	private fireReleased(events: readonly CollectionChangeEvent[]): void {
+		for (const event of events) {
+			this.firePerCollection(event);
+		}
+	}
+
+	/** Dispatch `event` to its collection's current {@link onCollectionChange} subscribers, if any. */
+	private firePerCollection(event: CollectionChangeEvent): void {
+		const listeners = this.changeListeners.get(event.collectionId);
+		if (listeners !== undefined && listeners.size > 0) {
+			this.fireChangeListeners(listeners, event);
+		}
+	}
+
+	/** Dispatch `event` to the {@link onAnyCollectionChange} catch-all subscribers, if any. */
+	private fireCatchAll(event: CollectionChangeEvent): void {
+		if (this.anyChangeListeners.size > 0) {
+			this.fireChangeListeners(this.anyChangeListeners, event);
 		}
 	}
 
@@ -674,7 +871,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// parallel reads complete and the group's flush, so emission stays outside the per-block
 		// work and never announces a promotion this node could still lose, matching commit's
 		// ordering. No-op when nothing was promoted.
-		this.emitPromotions(promotions);
+		await this.emitPromotions(promotions);
 
 		if (lineageOf !== undefined) {
 			await this.answerLineage(results, lineageOf);
@@ -762,7 +959,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * at its own `(actionId, rev)`, so group by `(actionId, rev)` and route each group
 	 * through {@link emitCollectionChanges} once.
 	 */
-	private emitPromotions(promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[]): void {
+	private async emitPromotions(promotions: { collectionId: CollectionId, blockId: BlockId, actionId: ActionId, rev: number }[]): Promise<void> {
 		if (promotions.length === 0) {
 			return;
 		}
@@ -779,7 +976,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			group.collectionBlocks.set(collectionId, list);
 		}
 		for (const { actionId, rev, collectionBlocks } of groups.values()) {
-			this.emitCollectionChanges(collectionBlocks, actionId, rev);
+			await this.emitCollectionChanges(collectionBlocks, actionId, rev);
 		}
 	}
 
@@ -805,11 +1002,19 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			};
 		}
 
-		return await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));
+		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));
+		if (result.success) {
+			this.notePendGroup(request.actionId, saved);
+		}
+		return result;
 	}
 
-	/** {@link pend}'s write group: classify every block, then save, under one hold of their write latches. */
-	private async pendUnderLatches(request: PendRequest): Promise<PendResult> {
+	/**
+	 * {@link pend}'s write group: classify every block, then save, under one hold of their write
+	 * latches. Returns the result to report and `saved`, the blocks pass 2 wrote a pending record for —
+	 * the action's pend group here (see {@link notePendGroup}); empty on every refusal.
+	 */
+	private async pendUnderLatches(request: PendRequest): Promise<{ result: PendResult, saved: BlockId[] }> {
 		// Already deduped: `blockIdsForTransforms` builds its result through a Set. So the pass-2 save
 		// loop below cannot write one block twice, and the echoed `blockIds` carries no duplicate.
 		const blockIds = blockIdsForTransforms(request.transforms);
@@ -946,32 +1151,38 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			if (staleCount > 0) {
 				log('pend:stale actionId=%s stale=%d missing=%d', request.actionId, staleCount, missing.length);
 				return {
-					success: false,
-					conflict: true,
-					missing,
-					...(staleAt === undefined ? {} : { staleAt })
+					result: {
+						success: false,
+						conflict: true,
+						missing,
+						...(staleAt === undefined ? {} : { staleAt })
+					},
+					saved: []
 				};
 			}
 
 			if (pendings.length > 0) {
 				if (request.policy === 'f') {	// Fail on pending actions
-					return { success: false, conflict: true, pending: pendings };
+					return { result: { success: false, conflict: true, pending: pendings }, saved: [] };
 				} else if (request.policy === 'r') {	// Return populated pending actions
 					return {
-						success: false,
-						conflict: true,
-						pending: await Promise.all(pendings.map(async action => {
-							const blockStorage = this.createBlockStorage(action.blockId);
-							return {
-								blockId: action.blockId,
-								actionId: action.actionId,
-								// The fallback stays: a rival enumerated on a block we hold cannot be promoted
-								// out from under us mid-hold, but a partially-overlapping pend can still have
-								// promoted one on a block outside this hold.
-								transform: (await blockStorage.getPendingTransaction(action.actionId))
-									?? (await blockStorage.getTransaction(action.actionId))!
-							}
-						}))
+						result: {
+							success: false,
+							conflict: true,
+							pending: await Promise.all(pendings.map(async action => {
+								const blockStorage = this.createBlockStorage(action.blockId);
+								return {
+									blockId: action.blockId,
+									actionId: action.actionId,
+									// The fallback stays: a rival enumerated on a block we hold cannot be promoted
+									// out from under us mid-hold, but a partially-overlapping pend can still have
+									// promoted one on a block outside this hold.
+									transform: (await blockStorage.getPendingTransaction(action.actionId))
+										?? (await blockStorage.getTransaction(action.actionId))!
+								}
+							}))
+						},
+						saved: []
 					};
 				}
 			}
@@ -984,6 +1195,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// method's listPendingTransactions scan, and `ClusterMember.validatePendOperations`) refuse
 			// every future writer against. They still ride in the returned `blockIds` so `cancel`
 			// covers them (deleting an absent pending is a no-op that writes no metadata).
+			const saved: BlockId[] = [];
 			for (const blockId of blockIds) {
 				if (satisfied.has(blockId)) {
 					continue;
@@ -992,16 +1204,20 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				const blockTransform = transformForBlockId(request.transforms, blockId);
 				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev,
 					declaredBaseFor(request.baseRevs, blockId, blockTransform), latches.get(blockId)!);
+				saved.push(blockId);
 			}
 
 			// This layer answers for one machine's storage and nothing else: `local`, with no cohort
 			// view. The coordinator above it replaces this with the cohort's answer on every cluster path.
 			return {
-				success: true,
-				pending: pendings,
-				blockIds,
-				durability: localDurability()
-			} as PendSuccess;
+				result: {
+					success: true,
+					pending: pendings,
+					blockIds,
+					durability: localDurability()
+				} as PendSuccess,
+				saved
+			};
 		} finally {
 			// Releases on every path, including the early returns above and the
 			// `Missing action … for block …` throw inside pass 1.
@@ -1017,6 +1233,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				return withBlockWriteLatch(blockId, latch => blockStorage.deletePendingTransaction(actionRef.actionId, latch));
 			}));
 		});
+		this.noteCancelled(actionRef.actionId, actionRef.blockIds);
 	}
 
 	/**
@@ -1052,8 +1269,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		const { result, collectionBlocks } = await this.endGroup(() => this.commitUnderLatches(request, apply?.proof), alwaysWrote, groupFlush(apply));
 		// Notify after the critical section and the group's flush — relaxed when `apply` gave a window,
 		// see `endGroup` — for every block newly committed here, including those that landed before a
-		// mid-loop failure (alreadyDone / stale partitions never reach `collectionBlocks`).
-		this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
+		// mid-loop failure (alreadyDone / stale partitions never reach `collectionBlocks`). Awaited: on
+		// the one path that reads storage (another collection of the action still pending here) the
+		// reads are local and unlatched, and the commit still returns with its events dispatched or held.
+		await this.emitCollectionChanges(collectionBlocks, request.actionId, request.rev, request.tailId);
 		return result;
 	}
 
@@ -1428,7 +1647,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// re-origination downstream (the change bridge's `selfAppliedTail` gate never originates a
 		// tail-less event).
 		if (landed) {
-			this.emitCollectionChanges(
+			await this.emitCollectionChanges(
 				new Map([[landed.collectionId, [blockId]]]),
 				landed.actionId,
 				landed.rev,
