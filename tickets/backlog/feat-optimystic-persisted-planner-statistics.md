@@ -90,3 +90,12 @@ make the partiality explicit.
   planned cost/rows for a subsequent query.
 - Multi-node — two nodes computing stats for the same collection must not corrupt each
   other's persisted stats.
+
+## Arm: someone has now complained — GitHub #44 (added 2026-10-24, plan pass of `joins-over-optimystic-tables-get-the-plans-memory-tables-get`)
+
+The `tradeoffs:` line above says no one has complained about the plans. GitHub #44 is that complaint: a filtered join over two small Optimystic tables ran as a per-row lookup loop, 10–30× slower than the same SQL on memory tables. The immediate cause was the un-analyzed fallback of 1,000,000 rows, which the implement ticket above replaces with the memory module's 1000; with `analyze`, the plan was already right.
+
+What that ticket does not fix, and what makes this one matter more than it looked: real application tables are planned on the fallback for their whole life. Quereus's `auto_analyze` refreshes a table only after `auto_analyze_min_mutations` (500 by default) rows changed *in the current process*, and statistics vanish on restart, so a phone app whose tables hold a few hundred rows written across many sessions never gets statistics at all. Rows another node wrote are never counted either. Two shapes that would close it, for whoever plans this:
+
+- **Persist what `analyze` collects** (`saveStatistics` on the vtab, read back at hydration), as this ticket already describes — covers tables someone analyzed once.
+- **Size the table itself** at plan time: Quereus lets a module substitute its own count into `request.estimatedRows` when the catalog has none (`@quereus/quereus/docs/module-authoring.md`, and `sizeRequestFromLiveCount` in `quereus-store`'s `store-module.ts` for a module that does). `getBestAccessPlan` is synchronous and `Tree.getCount` walks every leaf, so this needs a count cached on the table instance — taken at initialization, adjusted by local writes, refreshed by the pull every read already does. Covers never-analyzed tables, which is the #44 case.
