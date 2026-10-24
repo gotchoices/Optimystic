@@ -43,6 +43,11 @@ export const PEER_RECORD_TTL_MS = 60_000;
 /**
  * Most peers held. The set is the peers FRET hands out plus the bootstrap peers, so this is a guard
  * against an unbounded ring, not a working limit.
+ *
+ * NOTE: `servingPeersOutside` in `libp2p-key-network.ts` reads a record for every peer ever seen
+ * serving this network (`rememberedServing`, which only grows in process) on each solo write. If that
+ * set ever outgrows this bound, those reads evict each other and every solo write re-reads them all;
+ * prune `rememberedServing` (its own NOTE says how) before raising this.
  */
 export const PEER_RECORD_MAX_ENTRIES = 1024;
 
