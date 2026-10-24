@@ -272,4 +272,34 @@ describe('reactivity / collection watch', () => {
 			expect(changes.get(id)! - before.get(id)!, `wakes of ${id}`).to.equal(id === 'app/b' ? 1 : 0);
 		}
 	});
+
+	it('a collection whose earlier tick is still queued behind its registration sits later ticks out', async () => {
+		const service = new HeldRegistrationService();
+		const ticks: Array<() => void> = [];
+		const watch = new ReactivityCollectionWatch({
+			service,
+			profile: coreProfile(),
+			quorumRatio: 0.75,
+			subscribers: new ReactivitySubscriberRegistry(),
+			scheduleRotation: () => {},
+			setTimer: (fn) => { ticks.push(fn); return () => {}; },
+		});
+		const { reader, calls } = tailReader(() => ({ tailId: OLD_TAIL, revision: 1 }));
+		watch.watch({ collectionId: COLLECTION, tails: reader, onChange: () => {} });
+		await settle();
+		calls.length = 0;
+
+		for (let tick = 0; tick < 3; ++tick) {
+			ticks[ticks.length - 1]!();
+			await settle();
+		}
+		expect(calls, 'only the first tick read while the registration held the queue').to.have.length(1);
+
+		service.registrations[0]!.resolve();
+		await settle();
+		calls.length = 0;
+		ticks[ticks.length - 1]!();
+		await settle();
+		expect(calls, 'the tick reads again once the queued answer was applied').to.deep.equal([[COLLECTION]]);
+	});
 });

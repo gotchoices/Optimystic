@@ -139,17 +139,17 @@ describe('Network change notification for a tagged table over real libp2p', func
 	/** Count the tail reads the watch service makes through `transactor`, until the returned restore runs. */
 	function countTailReads(transactor: ITransactor): { reads: { started: number; finished: number }; restore: () => void } {
 		const reads = { started: 0, finished: 0 };
-		const original = Collection.readCommittedTail;
-		Collection.readCommittedTail = async (through, id, knownTailId) => {
+		const original = Collection.readCommittedTails;
+		Collection.readCommittedTails = async (through, queries) => {
 			const counted = through === transactor;
 			if (counted) reads.started++;
 			try {
-				return await original.call(Collection, through, id, knownTailId);
+				return await original.call(Collection, through, queries);
 			} finally {
 				if (counted) reads.finished++;
 			}
 		};
-		return { reads, restore: () => { Collection.readCommittedTail = original; } };
+		return { reads, restore: () => { Collection.readCommittedTails = original; } };
 	}
 
 	it("wakes a tagged table's watch when another machine commits, and leaves an untagged sibling asleep", async () => {

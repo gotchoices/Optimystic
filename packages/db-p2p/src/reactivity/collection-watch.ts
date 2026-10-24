@@ -177,6 +177,8 @@ interface Subscription {
 	lastTailId?: BlockId;
 	/** Stamp of the newest tail read applied; an answer stamped below it is older and is dropped. */
 	appliedReadStamp: number;
+	/** A tick's renewal and answer are queued here and the answer has not been applied; later ticks skip it until it has. */
+	tickQueued: boolean;
 	closed: boolean;
 	/** Tail of the serial work queue. */
 	work: Promise<void>;
@@ -290,6 +292,7 @@ export class ReactivityCollectionWatch {
 			listeners: new Set(),
 			lastSeenRevision: 0,
 			appliedReadStamp: 0,
+			tickQueued: false,
 			closed: false,
 			work: Promise.resolve(),
 			reAnchorQueued: false,
@@ -386,14 +389,19 @@ export class ReactivityCollectionWatch {
 	 * its subscription's queue — wake the listeners if the revision is above the last one they were woken for, and
 	 * follow the tail if the registration is not where its root is, which is also how a registration that failed is
 	 * retried. Settles when the reads have, not when the follows have, so one subscription's slow registration walk
-	 * does not hold back every other collection's next tick.
+	 * does not hold back every other collection's next tick. A subscription still working through an earlier tick's
+	 * renewal and answer sits this tick out, so a queue slower than the tick interval does not grow by a tick's steps
+	 * each interval.
 	 */
 	private async tick(): Promise<void> {
-		const subs = [...this.subscriptions.values()];
-		for (const sub of subs) {
-			void this.enqueue(sub, () => this.renew(sub));
+		const groups = this.byReader([...this.subscriptions.values()].filter((sub) => !sub.tickQueued));
+		for (const group of groups.values()) {
+			for (const sub of group) {
+				sub.tickQueued = true;
+				void this.enqueue(sub, () => this.renew(sub));
+			}
 		}
-		await Promise.all([...this.byReader(subs)].map(([reader, group]) => this.readGroup(reader, group)));
+		await Promise.all([...groups].map(([reader, group]) => this.readGroup(reader, group)));
 	}
 
 	private async renew(sub: Subscription): Promise<void> {
@@ -425,15 +433,19 @@ export class ReactivityCollectionWatch {
 	/** The tick's one read of every tail in `group`, through the reader they share. A rejected read is no news for the whole group. */
 	private async readGroup(reader: CollectionTailReader, group: ReadonlyArray<Subscription>): Promise<void> {
 		const stamp = this.nextReadStamp();
-		let answers: ReadonlyMap<string, CollectionTailAnswer>;
+		let answers: ReadonlyMap<string, CollectionTailAnswer> | undefined;
 		try {
 			answers = await reader.readTails(group.map((sub) => this.queryFor(sub)));
 		} catch (err) {
 			log("tick tail read failed for %d collection(s) (no news this tick): %o", group.length, err);
-			return;
 		}
 		for (const sub of group) {
-			void this.enqueue(sub, () => this.followAnswer(sub, stamp, answers.get(sub.collectionId)));
+			void this.enqueue(sub, async () => {
+				sub.tickQueued = false;
+				if (answers !== undefined) {
+					await this.followAnswer(sub, stamp, answers.get(sub.collectionId));
+				}
+			});
 		}
 	}
 

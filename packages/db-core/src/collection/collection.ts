@@ -2412,7 +2412,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Unpinned reads of `blockIds` in ONE request, each block's answer kept apart. When that
 	 * request throws, each block is read in a request of its own — concurrently — so the failure
-	 * lands on the blocks it belongs to and every other block still answers. */
+	 * lands on the blocks it belongs to and every other block still answers.
+	 *
+	 * NOTE: the fallback is unbounded — two gets per collection at once, only after a failed
+	 * request. Fine for the tens of tables a host watches; if callers ever name hundreds, read the
+	 * fallback in bounded batches. */
 	private static async readAttributed(transactor: ITransactor, blockIds: BlockId[]): Promise<AttributedReads> {
 		if (blockIds.length === 0) {
 			return new Map();
