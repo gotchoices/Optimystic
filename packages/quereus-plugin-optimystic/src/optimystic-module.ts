@@ -11,7 +11,7 @@ import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-conn
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
@@ -4010,6 +4010,12 @@ class OptimysticCommittedTable extends VirtualTable {
   }
 }
 
+/** Rows assumed for a table nobody has analyzed — Quereus's memory and store modules' default. */
+const UNKNOWN_TABLE_ROWS = 1000;
+
+/** Fraction of a table one equality tuple is assumed to match when `analyze` statistics cannot say. */
+const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
+
 /**
  * Optimystic Virtual Table Module
  */
@@ -5206,29 +5212,29 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableInfo: TableSchema,
     request: BestAccessPlanRequest
   ): BestAccessPlanResult {
-    // Quereus 4.19 retired the flat `TableSchema.estimatedRows` this used to read. The row
-    // count now reaches a module through the REQUEST — `rule-select-access-path` passes the
-    // catalog's number down as `request.estimatedRows`, `undefined` when the table has never
-    // been ANALYZEd — which is also the field a module that can size itself would substitute
-    // its own count into. Reading the request rather than `tableInfo.statistics` directly is
-    // what keeps this module's answer consistent with the plan costed around it.
+    // The row count reaches a module through the REQUEST: `rule-select-access-path` passes the
+    // catalog's `analyze` figure down as `request.estimatedRows`, `undefined` when nobody has
+    // analyzed the table. `??`, not `||`: a measured 0 is an empty table and is priced as one.
     //
-    // `||` rather than `??`, matching the shipped memory module's `request.estimatedRows || 1000`:
-    // it collapses an ANALYZEd-empty table (a real 0) into the default. Quereus documents that
-    // collapse at its own `|| default` sites and calls it harmless — any plan over 0 rows is
-    // cheap either way — so this stays deliberately identical to the reference implementation
-    // rather than quietly diverging from it.
+    // An unknown size must be the SAME number for every access to this table. Quereus takes an
+    // index seek's row count from this answer but a sequential scan's from the catalog, which
+    // for an un-analyzed table is unknown and becomes the join rule's own default. A fallback
+    // larger than the engine's put the two sides of a join on different scales: a filtered seek
+    // reported 1000× the rows of the unfiltered scan of a table of equal unknown size, and the
+    // join planned as a nested loop issuing one seek per outer row (GitHub #44). 1000 is the
+    // last-resort default Quereus's memory and store modules both use.
     //
-    // NOTE: the default is 1,000,000 where the memory module uses 1,000. Unchanged here on
-    // purpose: it predates this migration, it biases an unanalyzed table toward index seeks
-    // (the right instinct for a distributed store where a full scan is a network cost), and
-    // retuning it is a costing decision that wants its own measurement, not a drive-by.
-    const tableRowCount = request.estimatedRows || 1000000;
+    // NOTE: if full scans of a network-backed table should look costlier than local ones, say so
+    // through a per-read cost (`expectedLatencyMs`, whose absence is explained at the
+    // `concurrencyMode` doc on this class) or by sizing the table (backlog
+    // `feat-optimystic-persisted-planner-statistics`) — never by inflating this row count, which
+    // every join and aggregate above the access reads as cardinality.
+    const tableRowCount = request.estimatedRows ?? UNKNOWN_TABLE_ROWS;
     const tableScanCost = Math.max(1000, tableRowCount);
 
     // Track best plan found
     let bestCost = tableScanCost;
-    let bestRows = tableRowCount;
+    let bestRows = Math.max(1, tableRowCount);
     let bestHandledFilters: boolean[] = request.filters.map(() => false);
     let bestOrdering: OrderingSpec[] | undefined = undefined;
     let bestIsSet = false;
@@ -5289,7 +5295,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // optimystic-tree-comparator-lexicographic-missort).
         const selectivity = 0.25;
         const rangeCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
-        const rangeRows = Math.floor(tableRowCount * selectivity);
+        const rangeRows = Math.max(1, Math.floor(tableRowCount * selectivity));
 
         if (rangeCost < bestCost) {
           bestCost = rangeCost;
@@ -5301,13 +5307,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
     }
 
-    // Check secondary indexes if we haven't found a PK equality match
-    if (bestCost > 10 && tableInfo.indexes && tableInfo.indexes.length > 0) {
+    // Secondary indexes only when no full primary-key equality made this a point seek. A fully
+    // matched unique index prices within a fraction of that seek, and the primary key must win
+    // regardless of how close the two costs come.
+    if (!fullPkEquality && tableInfo.indexes && tableInfo.indexes.length > 0) {
       for (const index of tableInfo.indexes) {
         // Try to match constraints to this index
         const indexColumns = index.columns.map(col => col.index);
-        let selectivity = 1.0;
-        let matchedFilterIndices: number[] = [];
+        const matchedFilterIndices: number[] = [];
 
         // Check if we have equality constraints on the index columns
         for (let colIdx = 0; colIdx < indexColumns.length; colIdx++) {
@@ -5321,9 +5328,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
             if (filter.columnIndex === indexCol && filter.op === '=') {
               matchedFilterIndices.push(i);
               foundEq = true;
-              // Each equality constraint reduces selectivity
-              const colSelectivity = 0.1; // Heuristic selectivity estimate
-              selectivity *= colSelectivity;
               break;
             }
           }
@@ -5336,25 +5340,29 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
         // Calculate cost and rows for this index
         if (matchedFilterIndices.length > 0) {
-          const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
-          const indexRows = Math.max(1, Math.floor(tableRowCount * selectivity));
+          const seekColumns = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
+          // A prefix of a unique index is not unique.
+          const uniqueSeek = matchedFilterIndices.length === indexColumns.length && this.enforcesUniqueness(index);
+          const matchedRows = uniqueSeek ? 1 : tableRowCount * this.equalityTupleSelectivity(tableInfo, seekColumns);
+          const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + matchedRows;
+          const indexRows = Math.max(1, Math.floor(matchedRows));
 
           // If this index is better than what we have, use it
           if (indexCost < bestCost) {
             bestCost = indexCost;
             bestRows = indexRows;
             bestHandledFilters = request.filters.map((_, idx) => matchedFilterIndices.includes(idx));
-            // Note: IndexSchema doesn't have unique property in quereus 0.4.8, so we can't determine uniqueness
-            bestIsSet = false;
+            bestIsSet = uniqueSeek;
             bestIndexName = index.name;
-            bestSeekColumnIndexes = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
-            bestExplains = `Index seek on ${index.name} ` +
-              `(selectivity: ${selectivity.toFixed(4)}, cost: ${indexCost.toFixed(2)})`;
+            bestSeekColumnIndexes = seekColumns;
+            bestExplains = `${uniqueSeek ? 'Unique index' : 'Index'} seek on ${index.name} ` +
+              `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`;
 
-            // Check if ORDER BY matches index order
-            if (request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)) {
-              bestOrdering = [...request.requiredOrdering];
-            }
+            // Cleared when this index cannot deliver it, so an ordering an earlier,
+            // costlier index could deliver is never promised for this one.
+            bestOrdering = request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)
+              ? [...request.requiredOrdering]
+              : undefined;
           }
         }
       }
@@ -5414,6 +5422,41 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         StatusCode.ERROR,
       );
     }
+  }
+
+  /**
+   * The fraction of the table one equality tuple over `eqColumns` is expected to match, by the
+   * rule Quereus's memory and store modules use, so the backends agree and a seek's `rows`
+   * matches what the engine would estimate for the same predicate: `1 / max(distinctCount, 1)`
+   * per column, combined by the engine's own `combineConjunctive`.
+   *
+   * Without `analyze` statistics for every column the whole tuple takes
+   * {@link EQ_SELECTIVITY_WITHOUT_STATS} — never a measured factor mixed with the constant. A
+   * snapshot with `rowCount` 0 (taken while the table was empty) counts as none: its
+   * `distinctCount`s of 0 would read as "every row matches". `columnStats` is keyed by the
+   * lowercase current column name, so a column added since the snapshot simply has no entry.
+   */
+  private equalityTupleSelectivity(tableInfo: TableSchema, eqColumns: readonly number[]): number {
+    const stats = tableInfo.statistics;
+    if (!stats || stats.rowCount <= 0) return EQ_SELECTIVITY_WITHOUT_STATS;
+
+    const factors: number[] = [];
+    for (const colIdx of eqColumns) {
+      const name = tableInfo.columns[colIdx]?.name;
+      const colStats = name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
+      if (!colStats) return EQ_SELECTIVITY_WITHOUT_STATS;
+      factors.push(1 / Math.max(colStats.distinctCount, 1));
+    }
+    return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
+  }
+
+  /**
+   * True when an equality on every column of `index` matches at most one row. A partial
+   * unique index (`create unique index … where …`) does not qualify: this module enforces no
+   * partial UNIQUE (see {@link OptimysticVirtualTable.resolveSecondaryUniqueDecision}).
+   */
+  private enforcesUniqueness(index: IndexSchema): boolean {
+    return (index.unique ?? false) && index.predicate === undefined;
   }
 
   /**
