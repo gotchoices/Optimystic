@@ -1,5 +1,5 @@
 /**
- * Inbound-message size caps for the db-p2p consensus protocols.
+ * Framed-message size caps for the db-p2p consensus protocols.
  *
  * Every inbound stream handler frames its wire data with length-prefixed
  * encoding (`it-length-prefixed`) and `JSON.parse`s each frame. Passing one of
@@ -9,28 +9,45 @@
  * JSON per frame. Mirrors the existing precedent
  * `DEFAULT_MAX_MESSAGE_BYTES = 1024 * 1024` in
  * `packages/db-core/src/cohort-topic/wire/codec.ts`.
+ *
+ * Outbound, `ProtocolClient.processMessage` refuses to send a request larger than the cap its server
+ * decodes under (`ProcessMessageOptions.maxRequestBytes`), so an oversized request fails locally, by
+ * name, rather than as a remote stream reset.
  */
 
+import { MAX_TRANSACTION_BYTES } from '@optimystic/db-core';
+
 /**
- * Max size (bytes) of a single inbound framed message on a *control-plane*
- * protocol — cluster records, dispute votes, sync requests. These carry a peer
- * set + signatures + small metadata, never bulk block data.
+ * Max size (bytes) of a single framed message on a *control-plane* protocol: what carries a peer set,
+ * signatures and small metadata, never a transaction's transforms or bulk block data. Inbound, the
+ * sync request (`SyncService`) decodes under it; outbound, the client reads the dispute vote and
+ * resolution ack under it, and a `SyncClient` sends no request larger.
  */
 export const MAX_CONTROL_MESSAGE_BYTES = 1 * 1024 * 1024; // 1 MiB
 
 /**
- * Max size (bytes) of a single inbound framed message on a *block-carrying*
- * protocol — repo operations (pend/commit transforms + block bodies),
- * block-transfer push payloads (base64-inflated block data, multiple per
- * request), and the block-bearing responses those protocols return.
- *
- * NOTE: the repo enforces no hard per-block byte ceiling today, so this is a
- * heuristic. If a legitimate block/transform can exceed this, the transfer will
- * be rejected — raise this constant (or thread a config override) rather than
- * removing the cap. If the repo later grows a real max-block constant, derive
- * this cap from it.
+ * What a block-carrying frame holds beyond the transaction's own pend: the repo message envelope, a
+ * cluster record's peer map (addresses capped at 8 per peer), its promise and commit signatures and
+ * apply outcomes, and a commit record carried alongside a held-back pend record on the action's first
+ * commit request (`ClusterClient.updateCarrying`).
  */
-export const MAX_BLOCK_MESSAGE_BYTES = 8 * 1024 * 1024; // 8 MiB
+export const TRANSACTION_ENVELOPE_RESERVE_BYTES = 512 * 1024; // 512 KiB
+
+/**
+ * Max size (bytes) of a single framed message on a *block-carrying* protocol, in both directions:
+ *
+ * - repo (`RepoService`, `RepoClient`) — pend/commit transforms, block bodies in get responses;
+ * - cluster (`ClusterService`, `ClusterClient`) — a pend record carries the transaction's transforms,
+ *   and the member echoes that record back with its vote;
+ * - dispute challenge (`DisputeProtocolService`) — the challenge carries the disputed cluster record;
+ * - block-transfer (`BlockTransferService`, `BlockTransferClient`) — base64-inflated block data;
+ * - sync responses (`SyncClient`) — block archives.
+ *
+ * Derived from the per-transaction limit, so a transaction a writer is allowed to send fits every frame
+ * it travels in: the writer → coordinator request, the coordinator → member record, and the member's
+ * echoed answer.
+ */
+export const MAX_BLOCK_MESSAGE_BYTES = MAX_TRANSACTION_BYTES + TRANSACTION_ENVELOPE_RESERVE_BYTES; // 8 MiB
 
 /**
  * The most blocks one latest-revision consult request names (`SyncRequest.blockIds`). An asker

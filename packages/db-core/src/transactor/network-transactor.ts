@@ -4,6 +4,7 @@ import { highestStaleAt, isConflictFailure, isExpiryFailure } from "../network/s
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
+import { assertTransactionFits } from "../network/transaction-size.js";
 import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
@@ -724,6 +725,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	async pend(blockAction: PendRequest): Promise<PendResult> {
+		// Refused before anything is sent, so no cancel is owed. The whole transaction is judged, not
+		// each coordinator's share: a share is a subset, so a whole that fits means every share does.
+		assertTransactionFits([blockAction]);
 		const t0 = Date.now();
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {
 			const filteredTransform = transformForBlockId(payload, blockId);

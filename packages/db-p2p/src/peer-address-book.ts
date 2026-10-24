@@ -18,10 +18,12 @@ export const MAX_MERGED_ADDRS_PER_PEER = 8
  * A record's peer map is NOT self-limiting: `ClusterService.processOperation` learns from it
  * before `checkRedirect` and before `cluster.update` validates a single signature, and inbound
  * stream authorization is opt-in (`authorizeInboundStream` is undefined by default), so the map
- * is attacker-authored at that point. One 1 MiB control message (`MAX_CONTROL_MESSAGE_BYTES`)
- * holds on the order of a thousand fabricated `{ id, multiaddrs, publicKey }` entries, each of
- * which would otherwise become a persisted peerStore record. Real cohorts are `clusterSize`
- * peers — single digits — so this is generous margin, not a functional limit.
+ * is attacker-authored at that point. One cluster frame (`MAX_BLOCK_MESSAGE_BYTES`, 8 MiB, since a
+ * pend record carries a transaction's transforms) holds on the order of ten thousand fabricated
+ * `{ id, multiaddrs, publicKey }` entries — eight times the thousand or so the 1 MiB control cap it
+ * was once decoded under held — each of which would otherwise become a persisted peerStore record.
+ * Real cohorts are `clusterSize` peers — single digits — so this is generous margin, not a
+ * functional limit.
  */
 export const MAX_LEARNED_PEERS_PER_RECORD = 64
 

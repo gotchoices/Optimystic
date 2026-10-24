@@ -4,6 +4,7 @@ import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
+import { TransactionTooLargeError } from "../network/transaction-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
 import { TornActionError } from "../collection/struct.js";
@@ -101,6 +102,9 @@ type CoordinationResult =
 		/** Present when a pend or a commit was refused because the transaction had expired by the
 		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
 		expired?: TransactionExpiredError;
+		/** Present when a pend was refused before it was sent because it was too large to send: the
+		 * error the commit surfaces, never a stale loss. */
+		tooLarge?: TransactionTooLargeError;
 	};
 
 /** What a successful commit wrote: `written` folded into one report, or `undefined` when it holds
@@ -905,6 +909,9 @@ export class TransactionCoordinator {
 			if (coordResult.expired !== undefined) {
 				throw coordResult.expired;
 			}
+			if (coordResult.tooLarge !== undefined) {
+				throw coordResult.tooLarge;
+			}
 			throw new Error(`Transaction commit failed: ${coordResult.error}`);
 		}
 
@@ -1593,7 +1600,7 @@ export class TransactionCoordinator {
 		superclusterNominees: ReadonlySet<PeerId> | null
 	): Promise<
 		| { success: true; pendedBlockIds: Map<CollectionId, BlockId[]> }
-		| { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError }
+		| { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TransactionTooLargeError }
 	> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
@@ -1630,7 +1637,9 @@ export class TransactionCoordinator {
 		let anyConflict = false;
 		let anyHard = false;
 		// An expiry is a hard failure too, and is carried whole: it is the error the commit surfaces.
+		// So is a pend too large to send.
 		let expired: TransactionExpiredError | undefined;
+		let tooLarge: TransactionTooLargeError | undefined;
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
@@ -1641,6 +1650,7 @@ export class TransactionCoordinator {
 				if (outcome.reason instanceof PendRejectedError && outcome.reason.conflict) anyConflict = true;
 				else anyHard = true;
 				if (outcome.reason instanceof TransactionExpiredError) expired ??= outcome.reason;
+				if (outcome.reason instanceof TransactionTooLargeError) tooLarge ??= outcome.reason;
 			}
 		}
 
@@ -1650,7 +1660,11 @@ export class TransactionCoordinator {
 			// only those started before the failure. Cancels are best-effort (cancelPhase
 			// swallows their errors) so they cannot mask the original pend failure.
 			await this.cancelPhase(actionId, pendedBlockIds);
-			return { success: false, error: failure, staleLoss: anyConflict && !anyHard, ...(expired === undefined ? {} : { expired }) };
+			return {
+				success: false, error: failure, staleLoss: anyConflict && !anyHard,
+				...(expired === undefined ? {} : { expired }),
+				...(tooLarge === undefined ? {} : { tooLarge }),
+			};
 		}
 
 		return { success: true, pendedBlockIds };

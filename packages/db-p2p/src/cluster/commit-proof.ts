@@ -23,8 +23,8 @@ import { toString as uint8ArrayToString } from "uint8arrays/to-string";
  *
  * **Measured size**: 4578 bytes serialized for a 10-peer cohort signing a two-block fully-signed
  * commit (`JSON.stringify(proof).length`, pinned by the "size" test in `test/commit-proof.spec.ts`).
- * It rides inside sync responses bounded by `MAX_CONTROL_MESSAGE_BYTES` (1 MiB), which already carry
- * whole blocks, so proof size is a rounding error there.
+ * It rides inside sync responses and block-transfer pushes, both framed under `MAX_BLOCK_MESSAGE_BYTES`
+ * (8 MiB), which already carry whole blocks, so proof size is a rounding error there.
  */
 export type BlockCommitProof = {
 	v: 1;

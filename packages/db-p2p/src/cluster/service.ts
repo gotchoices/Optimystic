@@ -6,7 +6,7 @@ import type { ICluster, ClusterRecord } from '@optimystic/db-core';
 import { encodePeers, type RedirectPayload } from '../repo/redirect.js';
 import { toClusterErrorEnvelope } from './cluster-error.js';
 import { mergeRecordPeerAddresses, publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js';
-import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createLogger, type Logger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
@@ -326,7 +326,9 @@ export class ClusterService implements Startable {
 				if (this.authorization && await this.authorization.deny(stream, peerId?.toString())) return;
 				const responses = pipe(
 					stream,
-					(source) => lpDecode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
+					// A pend record carries the transaction's transforms: block cap, the same one the writer's
+					// request to the coordinator was decoded under.
+					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 					processStream.bind(this),
 					(source) => lpEncode(source)
 				);

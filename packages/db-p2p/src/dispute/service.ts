@@ -2,7 +2,7 @@ import { pipe } from 'it-pipe';
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed';
 import type { Startable, Stream, Connection, StreamHandler } from '@libp2p/interface';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeMessage } from './types.js';
 import type { DisputeService } from './dispute-service.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
@@ -109,7 +109,8 @@ export class DisputeProtocolService implements Startable {
 			try {
 				const responses = pipe(
 					stream,
-					(source) => lpDecode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
+					// A challenge carries the disputed cluster record, transforms included: block cap.
+					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 					processStream.bind(this),
 					(source) => lpEncode(source)
 				);

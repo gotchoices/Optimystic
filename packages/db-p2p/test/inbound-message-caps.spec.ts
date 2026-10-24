@@ -10,7 +10,7 @@ import { RepoService } from '../src/repo/service.js';
 import { DisputeProtocolService } from '../src/dispute/service.js';
 import { SyncService } from '../src/sync/service.js';
 import { BlockTransferService, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
-import { ClusterClient } from '../src/cluster/client.js';
+import { DisputeClient } from '../src/dispute/client.js';
 import { SyncClient } from '../src/sync/client.js';
 import { MAX_CONTROL_MESSAGE_BYTES, MAX_BLOCK_MESSAGE_BYTES } from '../src/protocol-limits.js';
 
@@ -119,18 +119,35 @@ function oversizedFrame(declaredLength: number): Uint8Array {
 
 describe('inbound message caps', () => {
 	describe('cluster service', () => {
-		it('aborts the stream on an oversized frame (declared > control cap)', async () => {
+		it('aborts the stream on an oversized frame (declared > block cap)', async () => {
 			const stub = { calls: 0, async update(r: any) { stub.calls++; return r; } };
 			const { registrar, getHandler } = capturingRegistrar();
 			const service = new ClusterService({ registrar, cluster: stub as any }, {});
 			await service.start();
 
-			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
+			const mock = makeMockStream([oversizedFrame(MAX_BLOCK_MESSAGE_BYTES + 1)]);
 			getHandler()(mock.stream as any, { remotePeer: await makePeerId() } as any);
 			await mock.finished;
 
 			expect(mock.isAborted(), 'oversized frame must abort the stream').to.equal(true);
 			expect(stub.calls, 'oversized frame must never reach cluster.update').to.equal(0);
+		});
+
+		it('applies the block cap, not the control cap: a pend record above 4 MiB (within block cap) is not rejected', async () => {
+			// GitHub #35: a pend record carries the transaction's transforms, and the cluster service
+			// used to decode it under the 1 MiB control cap, so every remote member refused a write the
+			// repo protocol had just accepted. Above the library's 4 MiB default as well, so the cap must
+			// actually be the block cap.
+			const stub = { async update(r: any) { return r; } };
+			const { registrar, getHandler } = capturingRegistrar();
+			const service = new ClusterService({ registrar, cluster: stub as any }, {});
+			await service.start();
+
+			const mock = makeMockStream([oversizedFrame(LIBRARY_DEFAULT_MAX_BYTES + 1)]);
+			getHandler()(mock.stream as any, { remotePeer: await makePeerId() } as any);
+			await mock.finished;
+
+			expect(mock.isAborted(), 'a frame within the block cap must not be rejected').to.equal(false);
 		});
 
 		it('processes only the first of two requests on one stream', async () => {
@@ -220,13 +237,15 @@ describe('inbound message caps', () => {
 	});
 
 	describe('dispute service', () => {
-		it('aborts the stream on an oversized frame (declared > control cap)', async () => {
+		it('aborts the stream on an oversized frame (declared > block cap)', async () => {
+			// A challenge carries the disputed cluster record, transforms included, so the dispute
+			// service decodes under the block cap the cluster service does.
 			const disputeService = { calls: 0, async handleChallenge() { disputeService.calls++; return { verdict: 'ok' }; }, handleResolution() { } };
 			const { registrar, getHandler } = capturingRegistrar();
 			const service = new DisputeProtocolService({ registrar, disputeService: disputeService as any }, {});
 			await service.start();
 
-			const mock = makeMockStream([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
+			const mock = makeMockStream([oversizedFrame(MAX_BLOCK_MESSAGE_BYTES + 1)]);
 			getHandler()(mock.stream as any, { remotePeer: await makePeerId() } as any);
 			await mock.finished;
 
@@ -332,10 +351,10 @@ describe('inbound message caps', () => {
 			// not reject, and surface "No response received" instead.
 			const peerId = await makePeerId();
 			const network = frameRespondingNetwork([oversizedFrame(MAX_CONTROL_MESSAGE_BYTES + 1)]);
-			const client = ClusterClient.create(peerId, network, '/optimystic/test');
+			const client = DisputeClient.create(peerId, network, '/optimystic/test');
 
 			let caught: unknown;
-			try { await client.update({} as any, 0); } catch (e) { caught = e; }
+			try { await client.sendChallenge({ disputeId: 'd1' } as any); } catch (e) { caught = e; }
 			expect(caught, 'an oversized response must reject the caller').to.be.instanceOf(Error);
 			expect((caught as Error).message, 'must reject at the length-prefix cap').to.match(/Message length too long/);
 		});

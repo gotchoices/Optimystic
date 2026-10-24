@@ -44,13 +44,35 @@ export class ResponseTimeoutError extends Error {
 	}
 }
 
+/**
+ * Thrown, before any stream is opened, for a request that encodes to more than the cap its server
+ * decodes requests under ({@link ProcessMessageOptions.maxRequestBytes}). Sending it would only have
+ * the remote reset the stream at the length prefix, which the caller cannot tell from a peer that went
+ * silent. `.code === MESSAGE_TOO_LARGE_ERROR_CODE`.
+ */
+export const MESSAGE_TOO_LARGE_ERROR_CODE = 'MESSAGE_TOO_LARGE';
+
+export class MessageTooLargeError extends Error {
+	readonly code = MESSAGE_TOO_LARGE_ERROR_CODE;
+	constructor(peer: string, readonly protocol: string, readonly bytes: number, readonly limit: number) {
+		super(`message too large: peer=${peer} protocol=${protocol} encodes to ${bytes} bytes, over the ${limit}-byte request limit`);
+		this.name = 'MessageTooLargeError';
+	}
+}
+
 /** What a {@link ProtocolClient} subclass may bound one request by. */
 export type ProcessMessageOptions = {
 	signal?: AbortSignal;
 	correlationId?: string;
 	dialTimeoutMs?: number;
 	responseTimeoutMs?: number;
+	/** The largest reply frame read; a larger one rejects at its length prefix. Defaults to `MAX_BLOCK_MESSAGE_BYTES`. */
 	maxDataLength?: number;
+	/**
+	 * The largest request sent: the cap the server decodes requests under. A larger request throws
+	 * {@link MessageTooLargeError} before any stream is opened. Absent means unchecked.
+	 */
+	maxRequestBytes?: number;
 };
 
 /** Whether any byte of the reply has arrived on a stream, which decides whether a request may be re-sent. */
@@ -107,6 +129,10 @@ export class ProtocolClient {
 	 * protocol the pool serves already tolerates re-delivery, since the batch retries in
 	 * `NetworkTransactor` re-send requests today. A failure after a reply byte, and a failure of the
 	 * re-send, propagate unchanged.
+	 *
+	 * The message is encoded once, before any stream is opened: a request over
+	 * `options.maxRequestBytes` throws {@link MessageTooLargeError} without dialing, and the re-send
+	 * sends the same bytes.
 	 */
 	protected async processMessage<T>(
 		message: unknown,
@@ -114,19 +140,31 @@ export class ProtocolClient {
 		options?: ProcessMessageOptions
 	): Promise<T> {
 		const t0 = Date.now();
+		const request = this.encodeRequest(message, protocol, options);
 		const stream = await this.openRequestStream(protocol, options);
 		// The response deadline starts once the first stream is open; a re-send runs inside what is left of it.
 		const responseTimeoutMs = options?.responseTimeoutMs;
 		const responseDeadline = responseTimeoutMs && responseTimeoutMs > 0 ? Date.now() + responseTimeoutMs : undefined;
 		const progress: ExchangeProgress = { replyStarted: false };
 		try {
-			return await this.exchange<T>(stream, message, protocol, options, t0, responseDeadline, progress);
+			return await this.exchange<T>(stream, request, protocol, options, t0, responseDeadline, progress);
 		} catch (err) {
 			if (!this.mayResend(stream, progress, err, options)) throw err;
 			log('prepared:resend peer=%s protocol=%s reason=%s%s', this.peerId.toString(), protocol, errorLabel(err), cidSuffix(options));
 			const resendStream = await this.openRequestStream(protocol, options);
-			return await this.exchange<T>(resendStream, message, protocol, options, t0, responseDeadline, { replyStarted: false });
+			return await this.exchange<T>(resendStream, request, protocol, options, t0, responseDeadline, { replyStarted: false });
 		}
+	}
+
+	/** `message` as the bytes one request frame carries, refused with {@link MessageTooLargeError} when over `options.maxRequestBytes`. */
+	private encodeRequest(message: unknown, protocol: string, options?: ProcessMessageOptions): Uint8Array {
+		const request = new TextEncoder().encode(JSON.stringify(message));
+		const limit = options?.maxRequestBytes;
+		if (limit !== undefined && request.byteLength > limit) {
+			log('request:too-large peer=%s protocol=%s bytes=%d limit=%d%s', this.peerId.toString(), protocol, request.byteLength, limit, cidSuffix(options));
+			throw new MessageTooLargeError(this.peerId.toString(), protocol, request.byteLength, limit);
+		}
+		return request;
 	}
 
 	/**
@@ -204,13 +242,13 @@ export class ProtocolClient {
 	}
 
 	/**
-	 * Send the request on `stream`, read the first reply, and close the stream. `progress` records
+	 * Send the encoded `request` on `stream`, read the first reply, and close the stream. `progress` records
 	 * whether any reply byte arrived, which is what decides whether a failed prepared stream may be
 	 * re-sent. `t0` is when the request began, for the timings it logs.
 	 */
 	private async exchange<T>(
 		stream: Libp2pStream,
-		message: unknown,
+		request: Uint8Array,
 		protocol: string,
 		options: ProcessMessageOptions | undefined,
 		t0: number,
@@ -248,7 +286,7 @@ export class ProtocolClient {
 
 			// Send the request using length-prefixed encoding
 			const encoded = pipe(
-				[new TextEncoder().encode(JSON.stringify(message))],
+				[request],
 				lpEncode
 			);
 			for await (const chunk of encoded) {

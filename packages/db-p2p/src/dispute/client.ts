@@ -1,7 +1,7 @@
 import type { PeerId, IPeerNetwork } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
-import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { MAX_BLOCK_MESSAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { DisputeChallenge, DisputeResolution, ArbitrationVote, DisputeMessage } from './types.js';
 
 /**
@@ -41,7 +41,9 @@ export class DisputeClient extends ProtocolClient {
 			const response = await this.processMessage<{ type: 'vote'; vote: ArbitrationVote }>(
 				message,
 				this.protocol,
-				{ signal: controller?.signal, dialTimeoutMs: this.rpcDeadlines.dialTimeoutMs, maxDataLength: MAX_CONTROL_MESSAGE_BYTES }
+				// The challenge carries the disputed cluster record, transforms included, so it is sent under
+				// the block cap the service decodes under; the vote that answers it is small.
+				{ signal: controller?.signal, dialTimeoutMs: this.rpcDeadlines.dialTimeoutMs, maxDataLength: MAX_CONTROL_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES }
 			);
 			return response.vote;
 		} finally {
@@ -57,7 +59,7 @@ export class DisputeClient extends ProtocolClient {
 		await this.processMessage<{ type: 'ack' }>(
 			message,
 			this.protocol,
-			{ ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES },
+			{ ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES },
 		);
 	}
 }

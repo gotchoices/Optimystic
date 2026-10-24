@@ -53,9 +53,9 @@ export class RepoClient extends ProtocolClient implements IRepo {
 	 * together (`IRepo.pendMany`). A list that is not a batch throws here, before anything is sent.
 	 *
 	 * NOTE: one message carries every collection's transforms, and in session mode each request's own
-	 * copy of the validation payload. A SQL write's collections are a handful, well inside the repo
-	 * protocol's frame limit (`MAX_BLOCK_MESSAGE_BYTES`); a transaction wide enough to reach it would be
-	 * refused whole, and the writer should then split it.
+	 * copy of the validation payload. Together they are held to the per-transaction limit
+	 * (`MAX_TRANSACTION_BYTES`, checked by the coordinator's `pendMany`), which sits below the repo
+	 * protocol's frame limit (`MAX_BLOCK_MESSAGE_BYTES`) by the envelope reserve.
 	 * NOTE: a coordinator on a build that predates batches reads only the first operation, and answers
 	 * as if the others had not been sent — a commit that silently leaves collections behind. Mixed
 	 * builds are out of scope today; a rollout that must run them has to gate batches on the
@@ -136,8 +136,10 @@ export class RepoClient extends ProtocolClient implements IRepo {
 				signal: combinedSignal,
 				correlationId,
 				dialTimeoutMs: options?.dialTimeoutMs,
-				// A get response carries block data → block cap (not control).
+				// A get response carries block data, and a pend request a transaction's transforms; the
+				// server decodes requests under the same block cap.
 				maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
+				maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES,
 			})
 		} finally {
 			clearTimeout(timer)

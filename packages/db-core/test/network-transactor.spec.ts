@@ -6,7 +6,7 @@ import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { routingKeyForBlock } from '../src/network/routing-key.js'
 import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResult, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
-import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError, MAX_TRANSACTION_BYTES, TransactionTooLargeError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -1006,6 +1006,36 @@ describe('NetworkTransactor', () => {
         // Restore the node for future tests
         firstNode!.transactor.available = true
       }
+    })
+
+    it('refuses a transaction too large to send, by name, before asking any coordinator', async () => {
+      const contacted: string[] = []
+      const keyNetwork: IKeyNetwork = {
+        async findCoordinator() { contacted.push('findCoordinator'); throw new Error('no coordinator lookup expected') },
+        async findCluster() { contacted.push('findCluster'); throw new Error('no cohort lookup expected') },
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork,
+        getRepo: () => { contacted.push('getRepo'); throw new Error('no repo expected') },
+      })
+      const blockId = generateBlockId()
+      const pendRequest: PendRequest = {
+        actionId: generateRandomActionId(),
+        transforms: { inserts: {}, updates: { [blockId]: [['entries', 0, 0, ['x'.repeat(MAX_TRANSACTION_BYTES)]]] }, deletes: [] },
+        policy: 'r'
+      }
+
+      let refusal: unknown
+      try { await networkTransactor.pend(pendRequest) } catch (err) { refusal = err }
+
+      expect(refusal).to.be.instanceOf(TransactionTooLargeError)
+      const tooLarge = refusal as TransactionTooLargeError
+      expect(tooLarge.limit).to.equal(MAX_TRANSACTION_BYTES)
+      expect(tooLarge.bytes).to.be.greaterThan(tooLarge.limit)
+      expect(tooLarge.message).to.contain('MAX_TRANSACTION_BYTES')
+      expect(contacted, 'nothing was looked up or sent').to.deep.equal([])
     })
   })
 

@@ -1,5 +1,5 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError, assertTransactionFits } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -2607,6 +2607,11 @@ export class CoordinatorRepo implements IRepo {
 	 *  and answered together. {@link pend} is a list of one. */
 	async pendMany(requests: readonly PendRequest[], options?: MessageOptions): Promise<PendResult> {
 		const batch = pendBatchOf(requests);
+		// The writer's own transactor checks this before sending; this is for a writer that did not
+		// (a custom transactor, a direct repo client). Every collection's request rides in the one
+		// record, so they are judged together. Solo cohorts too: the limit must not depend on how many
+		// machines the cohort has, or a write that commits alone fails once a second machine joins.
+		assertTransactionFits(requests);
 		await this.verifyResponsibility(batch.blockIds);
 		const result = await this.pendThroughCluster(batch, options);
 		// A pend the blocks ACCEPTED is the proof that no reservation is holding them any more — the

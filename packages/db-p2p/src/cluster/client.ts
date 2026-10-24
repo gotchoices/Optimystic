@@ -1,5 +1,5 @@
 import type { PeerId, IPeerNetwork, ICluster, ClusterRecord, CarriedOutcome } from '@optimystic/db-core';
-import { blockIdsForTransforms } from '@optimystic/db-core';
+import { blockIdsForTransforms, jsonEncodedBytes } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
@@ -7,15 +7,10 @@ import type { RedirectPayload } from '../repo/redirect.js';
 import { mergeRecordPeerAddresses } from '../peer-address-book.js';
 import { createLogger } from '../logger.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
-import { MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import { readCarriedOutcomes } from './carried-records.js';
 
 const log = createLogger('cluster-client');
-
-/** The UTF-8 size of `message` as `ProtocolClient` frames it: JSON. */
-function encodedBytes(message: object): number {
-	return new TextEncoder().encode(JSON.stringify(message)).byteLength;
-}
 
 /**
  * Split a member's `carried` field off its answer. The service puts it on whatever it answers with — the
@@ -53,7 +48,9 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 	 */
 	async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[], options?: RpcDeadlineOptions): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
 		const message = { operation: 'update', record, carried };
-		if (carried.length === 0 || encodedBytes(message) > MAX_CONTROL_MESSAGE_BYTES) {
+		// The same cap `send` refuses a request over, so a request too large to carry falls back here
+		// rather than throwing there.
+		if (carried.length === 0 || jsonEncodedBytes(message) > MAX_BLOCK_MESSAGE_BYTES) {
 			if (carried.length > 0) log('carried:too-large peer=%s messageHash=%s carried=%d', this.peerId.toString(), record.messageHash, carried.length);
 			return { answer: await this.update(record, 0, options), carried: readCarriedOutcomes(carried, undefined) };
 		}
@@ -73,8 +70,13 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		const protocol = (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
 		// Apply the client-level dial/response deadline so a silent cluster peer
 		// can't hang the coordinator forever; an explicit caller override wins.
-		// Response is a ClusterRecord (peer set + signatures + small metadata) → control cap.
-		return await this.processMessage<unknown>(message, protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_CONTROL_MESSAGE_BYTES });
+		// A pend record carries the transaction's transforms, and the member answers with that record
+		// echoed back with its vote → block cap both ways, the cap `ClusterService` decodes under.
+		return await this.processMessage<unknown>(message, protocol, {
+			...withRpcDeadlineDefaults(options, this.rpcDeadlines),
+			maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
+			maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES,
+		});
 	}
 
 	/** The member's answer for `record`: its error rethrown, its redirect followed, or the record it returned. */

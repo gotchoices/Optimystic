@@ -528,7 +528,7 @@ export class BlockTransferClient extends ProtocolClient {
 		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
 		const request: BlockTransferRequest = { type: 'pull', blockIds, reason };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES });
 	}
 
 	/**
@@ -562,7 +562,7 @@ export class BlockTransferClient extends ProtocolClient {
 			...(certification?.blockMeta ? { blockMeta: certification.blockMeta } : {}),
 			...(certification?.blockProofs ? { blockProofs: certification.blockProofs } : {})
 		};
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
+		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES });
 	}
 }
 
