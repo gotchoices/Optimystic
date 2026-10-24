@@ -46,6 +46,16 @@
  * the same connection first, stays pending there, and condemns it after the dead-connection delay,
  * which aborts the request's stream from this side.
  *
+ * NOTE: libp2p (3.3.11) records a stream's protocol in the remote peer's peerStore record on every
+ * stream, both ends — `peerStore.merge(remotePeer, { protocols: [protocol] })` in
+ * `Connection.newStream` and in `onIncomingStream` — and each merge takes the peer's write lock. This
+ * pool moves the requester's open, and that merge, off the request's critical path, but it does not
+ * reduce the count: still one stream, so one merge, per request on each end. Fewer merges needs a
+ * stream that carries more than one request (a change to all four request/response protocols; backlog
+ * `feat-a-stream-carries-more-than-one-request`) or libp2p skipping a merge whose protocol is already
+ * recorded (upstream). An unchanged merge emits no `peer:update`, so it does not invalidate the key
+ * network's cached records (`peer-record-cache.ts`).
+ *
  * Imports here are type-only or pure, like `open-protocol-stream.ts`: this module is reachable from
  * the react-native entry (`src/rn.ts`) through `libp2p-key-network.ts`.
  */

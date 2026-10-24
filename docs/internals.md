@@ -2638,6 +2638,8 @@ A node chooses the peers that hold and coordinate a block from FRET's ring, then
 
 A stranger classified that way is a cohort member like any other. An embedding application measured it: after an outsider opened one refused stream on each members-only protocol of a member, that member's `findCluster` for a control block named the outsider first, and every later write to the block sent the outsider the block's contents (a pend carries the transforms) and counted it toward the cohort.
 
+The protocol list `membershipOf` reads is not fetched from the peerStore on every lookup. The key network keeps each peer's record — its protocols and addresses — per peer (`PeerRecordCache` in `packages/db-p2p/src/network/peer-record-cache.ts`) and drops it when libp2p dispatches `peer:update` for the peer (its stored record changed, which a protocol merged from a stream and a completed identify both do) or `peer:identify`, when a connection to it opens or closes, or after a minute, which covers the changes libp2p reports by no event (address ageing, a record's deletion). So a record is read once per change, not once per band member per lookup, which had made a read on a node with one connected peer several times slower than a solo node's (GitHub #45). Only the record is kept: the predicate below, FRET's band and the remembered serving verdicts are read on every lookup. The one read that bypasses it is the self-relay check before a cold dial (`assertNotSelfRelayOnly`), which must see an address a redirect merged an instant earlier.
+
 `NodeOptions.isNetworkMember` (typed `IsNetworkMember` in `packages/db-p2p/src/network-membership-gate.ts`) lets the embedder overrule the protocol list:
 
 ```ts
@@ -2655,7 +2657,7 @@ Contract:
 - **Fail closed.** Only a literal `true` admits. A throw, or any value other than a boolean (a promise included), refuses and is logged with the peer id under the `network-membership` namespace; nothing is thrown into a lookup.
 - **Self is always a member**, so the predicate may list remote members only — the same contract `authorizeInboundStream` has.
 - **Peer id encoding**: `PeerId.toString()`, the base58btc `12D3KooW…` form.
-- **Read live.** No verdict the predicate gave is kept: a peer the application admits counts on the next lookup, and one it removes drops out of the next lookup. There is no reclassify call to make.
+- **Read live.** No verdict the predicate gave is kept: a peer the application admits counts on the next lookup, and one it removes drops out of the next lookup. There is no reclassify call to make. The peer records above are cached, but the predicate is asked on every lookup ahead of the cached protocol list, so this holds with no event from libp2p.
 - **Requires network scoping.** `Libp2pKeyPeerNetwork` refuses a gate without a `protocolPrefix`, since the unscoped path classifies nobody; every node `createLibp2pNode` builds has one.
 
 What it gates. `membershipOf` is the one place every cohort and coordinator choice classifies remote peers — `findCluster`, every `findCoordinator` tier, `servingCohortAt` (where a reactivity topic's root group is placed) and `absentCohortMembers` — and a remote peer the gate refuses reads `foreign` there, ahead of both the protocol list and the remembered serving verdict. So a forged list is never added to that memory, and never persisted from it. Around that one place:

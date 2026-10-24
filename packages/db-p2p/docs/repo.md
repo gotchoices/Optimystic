@@ -328,7 +328,10 @@ option (the default) serve all four to anyone who can connect.
 
 Coordinator and cohort selection route work only to peers confirmed `serves`. A peer built to speak
 the repo protocol therefore becomes routable the moment its identify exchange completes; a peer whose
-ids are misspelled stays `foreign` forever and is silently skipped.
+ids are misspelled stays `foreign` forever and is silently skipped. The list is read from a per-peer
+copy of the peer's peerStore record (`PeerRecordCache` in
+`packages/db-p2p/src/network/peer-record-cache.ts`), which is refreshed when identify lands, since
+identify's write is reported as `peer:update`.
 
 ### Responsibility K and the redirect-skip check
 
