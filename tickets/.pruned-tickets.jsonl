@@ -243,3 +243,4 @@
 {"slug":"feat-an-app-can-supply-noise-crypto","file":"feat-an-app-can-supply-noise-crypto.md","completedAt":"2026-09-22","commit":"23929726e47a2b67132e8f66773e1a8fb97439a5","prunedAt":"2026-10-24T05:27:38.595Z"}
 {"slug":"received-replicas-report-their-source-as-a-holder","file":"received-replicas-report-their-source-as-a-holder.md","completedAt":"2026-09-23","commit":"9270de5edf3e59b98117231f46c572d3328a7f5d","prunedAt":"2026-10-24T05:27:38.595Z"}
 {"slug":"release-waits-until-every-package-is-visible-on-npm","file":"release-waits-until-every-package-is-visible-on-npm.md","completedAt":"2026-09-22","commit":"618f3ed864d8f48dcfcd0b8e4e12e6242a70ac9d","prunedAt":"2026-10-24T05:27:38.595Z"}
+{"slug":"bug-a-retried-write-can-store-two-versions-of-one-log-revision","file":"1-bug-a-retried-write-can-store-two-versions-of-one-log-revision.md","completedAt":"2026-09-24","commit":"6bdcc27c17b57f57e2791912642ef206f62d17ef","prunedAt":"2026-10-24T16:48:16.247Z"}
