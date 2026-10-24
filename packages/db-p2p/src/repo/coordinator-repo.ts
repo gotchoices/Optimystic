@@ -27,6 +27,7 @@ import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
 import { commitBatchOf, pendBatchOf, type CommitBatch, type PendBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
+import { HeldBlockConsults } from "./held-block-consults.js";
 import { withDeadline } from "../with-deadline.js";
 
 /**
@@ -45,20 +46,6 @@ export type AcquireBlockCallback = ReconcileBlockCallback;
 function isAdvanceOver(rev: number | undefined, baselineRev: number | undefined): boolean {
 	return typeof rev === 'number' && (baselineRev === undefined || rev > baselineRev);
 }
-
-/**
- * How many held-block consults may run behind reads at once
- * ({@link CoordinatorRepo.startHeldBlockConsult}). A table scan after a restart reads every block
- * once, and each consult opens one stream per cohort peer on the sync protocol, so unbounded, a cold
- * scan would open one stream per block per peer at once. The sync protocol is registered under
- * libp2p's defaults (`registerProtocolHandler`: 32 inbound streams per connection on the answering
- * peer, 64 outbound here), so 16 leaves the answering peer half its inbound allowance for its other
- * readers and for the archive fetches that acquisition runs over the same protocol.
- *
- * NOTE: a conservative bound, not a measured one. If `cluster-tx:read-repair-deferred` lines show
- * steadily under normal load, raise it or queue the deferred blocks instead of dropping them.
- */
-const MAX_HELD_BLOCK_CONSULTS = 16;
 
 /**
  * What one round of polling the cohort learned about a block: the revision the OTHER
@@ -711,16 +698,16 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	awaitWindowConsults = false;
 	/**
-	 * Per block, the consult running behind a read that was served from the local copy (see
-	 * {@link startHeldBlockConsult}): at most one per block, at most {@link MAX_HELD_BLOCK_CONSULTS} in
-	 * all. An entry removes itself when its pass ends, and the pass never rejects.
+	 * The consults running behind reads that were served from the local copy (see
+	 * {@link startHeldBlockConsult}): at most one per block, and as many as fit in the consult request
+	 * slots {@link HeldBlockConsults} counts. A pass leaves when it ends, and never rejects.
 	 *
 	 * NOTE: `CoordinatorRepo` has no stop. A pass in flight when the node stops runs until its
 	 * deadlines expire (per peer `cohortQueryTimeoutMs`; acquisition `reconcilePassTimeoutMs`), fails
 	 * against the closed node and is logged `cluster-fetch:error`. If that ever delays process exit or
 	 * test teardown measurably, give this class a stop that aborts the in-flight passes.
 	 */
-	private readonly heldBlockConsults = new Map<BlockId, Promise<void>>();
+	private readonly heldBlockConsults = new HeldBlockConsults();
 	/** Last sequence number handed out by {@link nextPassSeq}. */
 	private passSeq = 0;
 
@@ -1505,15 +1492,9 @@ export class CoordinatorRepo implements IRepo {
 		this.lastSeenCommitMs.set(blockId, { at: ts });
 	}
 
-	/**
-	 * Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). Loops,
-	 * because a pass that ends without arming the window (a transient decline) leaves the block open
-	 * to a read made meanwhile starting the next one.
-	 */
-	async settleHeldBlockConsults(): Promise<void> {
-		while (this.heldBlockConsults.size > 0) {
-			await Promise.all([...this.heldBlockConsults.values()]);
-		}
+	/** Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). */
+	settleHeldBlockConsults(): Promise<void> {
+		return this.heldBlockConsults.settled();
 	}
 
 	/**
@@ -1552,9 +1533,11 @@ export class CoordinatorRepo implements IRepo {
 	 * change event (`StorageRepo.saveReplicatedBlock`, `emitPromotions`), which wakes a watcher.
 	 *
 	 * At most one pass per block: the block stays unstamped until the pass ends, so every read of it
-	 * meanwhile lands here, is served, and starts nothing. At most {@link MAX_HELD_BLOCK_CONSULTS}
-	 * passes in all: past that the read is served, nothing starts, and the block stays unstamped so a
-	 * later read starts it. Returns whether a pass started, so the caller logs a trigger only for one.
+	 * meanwhile lands here, is served, and starts nothing. At most as many passes in all as fit in the
+	 * consult request slots ({@link HeldBlockConsults}), where the passes of one read share a slot per
+	 * request their round sends: past that the read is served, nothing starts, and the block stays
+	 * unstamped so a later read starts it. Returns whether a pass started, so the caller logs a trigger
+	 * only for one.
 	 *
 	 * `asker` and `floor` are captured from the triggering read — the floor only so the stamp records
 	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
@@ -1563,18 +1546,13 @@ export class CoordinatorRepo implements IRepo {
 	 * A pass that starts joins the read's `round`, so its questions ride in that read's requests.
 	 */
 	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, round: ConsultRound | undefined): boolean {
-		if (this.heldBlockConsults.has(blockId)) return false;
-		if (this.heldBlockConsults.size >= MAX_HELD_BLOCK_CONSULTS) {
-			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: this.heldBlockConsults.size });
-			return false;
+		// Joins only a pass that starts: a read that finds one running, or the slots full, asks nobody.
+		const outcome = this.heldBlockConsults.start(blockId, round, () =>
+			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), round?.join()));
+		if (outcome.kind === 'deferred') {
+			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: outcome.inFlight, slotsInUse: outcome.slotsInUse });
 		}
-		const passSeq = this.nextPassSeq();
-		// Joins only a pass that starts: a read that finds one running, or the cap reached, asks nobody.
-		const seat = round?.join();
-		const pass = this.runHeldBlockConsult(blockId, context, held, floor, asker, passSeq, seat)
-			.finally(() => this.heldBlockConsults.delete(blockId));
-		this.heldBlockConsults.set(blockId, pass);
-		return true;
+		return outcome.kind === 'started';
 	}
 
 	/**

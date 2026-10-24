@@ -4,8 +4,9 @@
  * A read of a block this node HOLDS, whose consult only the lazy read-repair window asked for, is
  * answered from the local copy at once; the consult runs behind it (`startHeldBlockConsult`). These
  * specs pin what that makes true of a read: it does not wait on a cohort peer that never answers,
- * what the consult learns reaches the NEXT read, and a pass that ends late cannot weaken a doubt
- * memo a pass that started after it recorded.
+ * what the consult learns reaches the NEXT read, a pass that ends late cannot weaken a doubt memo a
+ * pass that started after it recorded, and how many such passes may run at once (counted in consult
+ * requests, `HeldBlockConsults`).
  */
 
 import { expect } from 'chai';
@@ -19,6 +20,7 @@ import type {
 	MessageOptions, BlockId, ActionRev, FindCoordinatorOptions
 } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback, type CoordinatorRepoConfig } from '../src/repo/coordinator-repo.js';
+import type { ClusterLatestBatchCallback } from '../src/repo/consult-round.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag } from './support/capture-log.js';
@@ -42,6 +44,17 @@ const makeKeyNetwork = (cluster: ClusterPeers): IKeyNetwork => ({
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const makeClusterClient = ((_peerId: PeerId) => ({} as any)) as (peerId: PeerId) => ClusterClient;
 
+/** The write half of a storage double; these specs only read. */
+const noWrites: Pick<IRepo, 'pend' | 'cancel' | 'commit'> = {
+	async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
+		return { success: true, pending: [], blockIds: [], durability: localDurability() };
+	},
+	async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
+	async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
+		return { success: true, durability: localDurability() };
+	}
+};
+
 /**
  * Storage holding `blockId` at `rev`. With `adopts`, a read whose context names a newer committed
  * revision advances the held copy to it — the shape of a promotion landing, which is how the
@@ -56,26 +69,42 @@ const makeStorageRepo = (blockId: BlockId, rev: number, adopts: boolean): IRepo 
 			if (adopts && restoring && blockGets.blockIds.includes(blockId)) held = restoring;
 			return Object.fromEntries(blockGets.blockIds.map(id => [id, id === blockId ? { state: { latest: held } } : { state: {} }]));
 		},
-		async pend(_request: PendRequest, _options?: MessageOptions): Promise<PendResult> {
-			return { success: true, pending: [], blockIds: [], durability: localDurability() };
-		},
-		async cancel(_actionRef: ActionBlocks, _options?: MessageOptions): Promise<void> { },
-		async commit(_request: CommitRequest, _options?: MessageOptions): Promise<CommitResult> {
-			return { success: true, durability: localDurability() };
-		}
+		...noWrites
 	};
 };
+
+/** Storage holding every block of `blockIds` at revision 1, fixed. */
+const makeStorageHoldingAll = (blockIds: BlockId[]): IRepo => ({
+	async get(blockGets: BlockGets, _options?: MessageOptions): Promise<GetBlockResults> {
+		return Object.fromEntries(blockGets.blockIds.map(id => [id, blockIds.includes(id) ? { state: { latest: { actionId: 'local-action', rev: 1 } } } : { state: {} }]));
+	},
+	...noWrites
+});
 
 /** The production callback's self short-circuit: this node answers from its own storage. */
 const selfFrom = (storageRepo: IRepo, blockId: BlockId) => async (): Promise<ActionRev | undefined> =>
 	(await storageRepo.get({ blockIds: [blockId] }))[blockId]?.state?.latest;
 
+/**
+ * The single-block callback beside a batch callback: a round asks only this node itself through it.
+ * A remote peer asked through it rejects, so a question that bypassed the batch reads as silence.
+ */
+const selfOnly = (localPeer: PeerId, storageRepo: IRepo): ClusterLatestCallback => async (peerId, blockId) => {
+	if (!peerId.equals(localPeer)) throw new Error(`${blockId} asked of ${peerId.toString()} outside the batch`);
+	return selfFrom(storageRepo, blockId)();
+};
+
+/** A batch callback's reply answering every block asked at the revision the asker holds. */
+const answerHeld = (asks: Parameters<ClusterLatestBatchCallback>[1]) => ({ answers: new Map(asks.map(ask => [ask.blockId, ask.held])) });
+
 const buildRepo = (
-	localPeer: PeerId, cluster: ClusterPeers, storageRepo: IRepo, callback: ClusterLatestCallback, cfg: CoordinatorRepoConfig
+	localPeer: PeerId, cluster: ClusterPeers, storageRepo: IRepo, callback: ClusterLatestCallback, cfg: CoordinatorRepoConfig,
+	batch?: ClusterLatestBatchCallback
 ): CoordinatorRepo => new CoordinatorRepo(
 	makeKeyNetwork(cluster), makeClusterClient, storageRepo,
 	{ readRepairMode: 'lazy', ...cfg },
-	undefined, localPeer, undefined, callback
+	undefined, localPeer, undefined, callback,
+	undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, batch
 );
 
 describe('CoordinatorRepo held-block background consult', () => {
@@ -201,5 +230,58 @@ describe('CoordinatorRepo held-block background consult', () => {
 
 		const after = await repo.get({ blockIds: [blockId] });
 		expect(after[blockId]?.unconfirmedAheadRev, 'the memo B wrote stands').to.equal(3);
+	});
+
+	it('one read naming more held blocks than there are slots consults every one, in two requests per peer', async () => {
+		// A batched tail read across 18 collections names 36 blocks. The read's round asks each peer
+		// about up to 32 blocks per request, so its 36 passes need 2 of the 16 slots. Counted one per
+		// block, the first 16 started and the other 20 were deferred — the same 20 on every such read.
+		const localPeer = await makePeerId();
+		const peers = [await makePeerId(), await makePeerId()];
+		const blockIds = Array.from({ length: 36 }, (_, i) => `block-wide-${i}`);
+		const storageRepo = makeStorageHoldingAll(blockIds);
+		const batchCalls: { peer: string; blockIds: BlockId[] }[] = [];
+		const batch: ClusterLatestBatchCallback = async (peerId, asks) => {
+			batchCalls.push({ peer: peerId.toString(), blockIds: asks.map(ask => ask.blockId) });
+			return answerHeld(asks);
+		};
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, ...peers]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 3 }, batch);
+
+		await repo.get({ blockIds });
+		await repo.settleHeldBlockConsults();
+
+		for (const peer of peers) {
+			const calls = batchCalls.filter(call => call.peer === peer.toString());
+			expect(calls.map(call => call.blockIds.length), 'two requests: 32 blocks, then 4').to.have.members([32, 4]);
+			expect(calls.flatMap(call => call.blockIds), 'every block was consulted').to.have.members(blockIds);
+		}
+	});
+
+	it('a seventeenth single-block read is deferred while sixteen consults are held open', async () => {
+		// Unbatched reads keep the bound they always had: each read's round is a request of its own to the peer.
+		const localPeer = await makePeerId();
+		const peer = await makePeerId();
+		const blockIds = Array.from({ length: 17 }, (_, i) => `block-single-${i}`);
+		const storageRepo = makeStorageHoldingAll(blockIds);
+		const asked: BlockId[] = [];
+		let release!: () => void;
+		const released = new Promise<void>(resolve => { release = resolve; });
+		const batch: ClusterLatestBatchCallback = async (_peerId, asks) => {
+			asked.push(...asks.map(ask => ask.blockId));
+			await released;
+			return answerHeld(asks);
+		};
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 2, cohortQueryTimeoutMs: 5_000 }, batch);
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			for (const blockId of blockIds) await repo.get({ blockIds: [blockId] });
+		});
+		release();
+		await repo.settleHeldBlockConsults();
+
+		expect(asked, 'each of the first sixteen reads consulted').to.have.members(blockIds.slice(0, 16));
+		const deferred = captured.filter(args => typeof args[0] === 'string' && args[0].includes('cluster-tx:read-repair-deferred'));
+		expect(deferred.map(args => args[1]), 'the seventeenth was deferred with every slot in use')
+			.to.deep.equal([{ blockId: blockIds[16], inFlight: 16, slotsInUse: 16 }]);
 	});
 });
