@@ -394,7 +394,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// action's last group (or it never had one), so whatever was held fires first, then this
 			// call's own events, each to its collection's listeners and then to the catch-all.
 			if (hold !== undefined) {
-				this.releaseHeld(actionId);
+				this.releaseHeld(hold, actionId);
 			}
 			for (const event of events) {
 				this.firePerCollection(event);
@@ -405,9 +405,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		for (const event of events) {
 			this.fireCatchAll(event);
 		}
-		await this.closeAbandonedGroups(actionId);
+		await this.closeAbandonedGroups(hold, actionId);
 		if (!hold.hasOpenGroups(actionId)) {
-			this.releaseHeld(actionId);
+			this.releaseHeld(hold, actionId);
 			for (const event of events) {
 				this.firePerCollection(event);
 			}
@@ -415,7 +415,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 		for (const event of events) {
 			if (hold.hold(actionId, event)) {
-				this.armHoldTimer(actionId);
+				this.armHoldTimer(hold, actionId);
 			}
 			log('change-hold:held actionId=%s collection=%s openGroups=%d', actionId, event.collectionId, hold.openGroups(actionId).length);
 		}
@@ -429,9 +429,15 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * of the action ended with groups still open, never on the single-collection path. A record this
 	 * node cannot read keeps its group open — the hold's timer bounds the cost of being wrong that way,
 	 * where closing on a fault could wake a watcher early.
+	 *
+	 * NOTE: a commit this node REFUSED and dropped the records of (the behind divergence in
+	 * {@link commit}, healed by the reconcile that follows) reads as abandoned here too, so the action's
+	 * held events release at the refusal, before the reconcile lands that collection through
+	 * `saveReplicatedBlock` — which then fires only its own listeners. Needs cohort drift on a watched
+	 * member; if a wake after a refused commit is ever seen missing the reconciled collection, have
+	 * `commit` keep the refused group open for the reconcile (closed by its landing or the timer).
 	 */
-	private async closeAbandonedGroups(actionId: ActionId): Promise<void> {
-		const hold = this.changeHold!;
+	private async closeAbandonedGroups(hold: ActionChangeHold, actionId: ActionId): Promise<void> {
 		for (const group of hold.openGroups(actionId)) {
 			if (!(await this.anyStillPending(group, actionId))) {
 				hold.closeGroup(actionId, group);
@@ -492,7 +498,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 		hold.closeGroups(actionId, blockIds);
 		if (!hold.hasOpenGroups(actionId)) {
-			this.releaseHeld(actionId);
+			this.releaseHeld(hold, actionId);
 		}
 	}
 
@@ -507,11 +513,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * under `changeHoldMs`; if gaps beyond it are ever seen, have the vtab also subscribe to its
 	 * index collections (wake the table on any of them) rather than lengthening the hold.
 	 */
-	private armHoldTimer(actionId: ActionId): void {
+	private armHoldTimer(hold: ActionChangeHold, actionId: ActionId): void {
 		this.cancelHoldTimer(actionId);
 		this.holdTimers.set(actionId, armUnrefTimer(() => {
 			this.holdTimers.delete(actionId);
-			const held = this.changeHold!.release(actionId);
+			const held = hold.release(actionId);
 			log('change-hold:expired actionId=%s released=%d holdMs=%d', actionId, held.length, this.changeHoldMs);
 			this.fireReleased(held);
 		}, this.changeHoldMs));
@@ -523,9 +529,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	/** Release `actionId`'s held events to their collections' listeners, in the order held, and forget the action. */
-	private releaseHeld(actionId: ActionId): void {
+	private releaseHeld(hold: ActionChangeHold, actionId: ActionId): void {
 		this.cancelHoldTimer(actionId);
-		this.fireReleased(this.changeHold!.release(actionId));
+		this.fireReleased(hold.release(actionId));
 	}
 
 	private fireReleased(events: readonly CollectionChangeEvent[]): void {

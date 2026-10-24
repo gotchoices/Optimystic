@@ -78,7 +78,8 @@ export interface IBlockChangeNotifier {
 	 * same action is still pending there, releasing it when that collection lands, is cancelled, or
 	 * a bound elapses (`StorageRepo.emitCollectionChanges` in
 	 * `packages/db-p2p/src/storage/storage-repo.ts`). So an event may arrive from a later call of
-	 * the storage, or from a timer. Every change still produces exactly one event.
+	 * the storage, or from a timer, and a held event can fire after the event of a commit that landed
+	 * later. Every change still produces exactly one event.
 	 */
 	onCollectionChange(collectionId: CollectionId, listener: CollectionChangeListener): () => void;
 }
