@@ -66,16 +66,19 @@ describe('repo protocol: an operation that answers void', () => {
 	});
 
 	it('a remote cancel that failed still rejects', async () => {
-		const { repo } = makeRepo(async () => { throw new Error('cancel refused'); });
+		const { repo, cancels } = makeRepo(async () => { throw new Error('cancel refused'); });
 		const client = await connectedClient(repo);
 
-		let rejected = false;
+		let failure: Error | undefined;
 		try {
 			await client.cancel(actionRef, options());
-		} catch {
-			rejected = true;
+		} catch (err) {
+			failure = err as Error;
 		}
 
-		expect(rejected, 'the failure reaches the caller').to.equal(true);
+		expect(failure, 'the failure reaches the caller').to.be.instanceOf(Error);
+		// The client's own deadline also rejects; the failure must arrive as the service's abort, not by waiting it out.
+		expect(failure!.message).to.not.equal('RepoClient timeout');
+		expect(cancels).to.have.length(1);
 	});
 });

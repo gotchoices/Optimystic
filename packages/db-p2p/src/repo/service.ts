@@ -379,8 +379,9 @@ export class RepoService implements Startable {
 					response = await this.repo.commit(operation.commit, { expiration: message.expiration })
 				}
 
-				// Encode and yield the response
-				yield new TextEncoder().encode(JSON.stringify(response))
+				// `cancel` answers `void`, sent as a zero-length frame: `JSON.stringify(undefined)` is not a
+				// string, so the frame is built explicitly rather than left to how `TextEncoder` treats it.
+				yield response === undefined ? new Uint8Array(0) : new TextEncoder().encode(JSON.stringify(response))
 				// One request per stream: every real RepoClient sends exactly one request
 				// per dial (see ProtocolClient.processMessage), so complete the generator
 				// after the first response. A second frame a peer queued is then never read

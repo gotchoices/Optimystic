@@ -222,8 +222,8 @@ One request per stream: the service answers the first frame and completes the ge
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and
 closes. A second frame queued on the same stream is never read.
 
-`cancel` answers `void`, which the service encodes as `JSON.stringify(undefined)` — a zero-length
-frame. The client reads a zero-length frame as `undefined` rather than parsing it (the decode stage
+`cancel` answers `void`, which the service sends as a zero-length frame (there is no JSON text for
+`undefined`). The client reads a zero-length frame as `undefined` rather than parsing it (the decode stage
 in `ProtocolClient.exchange`, `packages/db-p2p/src/protocol-client.ts`, which every protocol client
 shares); no JSON value serializes to an empty string, so the empty frame is exactly a `void` reply. A
 cancel that fails is still a failure: the service aborts the stream and the client's read rejects.
