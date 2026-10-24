@@ -30,6 +30,11 @@ export const MAX_CONTROL_MESSAGE_BYTES = 1 * 1024 * 1024; // 1 MiB
  * cluster record's peer map (addresses capped at 8 per peer), its promise and commit signatures and
  * apply outcomes, and a commit record carried alongside a held-back pend record on the action's first
  * commit request (`ClusterClient.updateCarrying`).
+ *
+ * NOTE: sized by reasoning (a ten-peer record's peer map and signatures come to tens of kilobytes),
+ * not by measuring a near-limit record. If a `request:too-large` log ever names the cluster protocol,
+ * the envelope outgrew this reserve: measure it, raise the reserve, and lower `MAX_TRANSACTION_BYTES`
+ * by as much, so the frame cap other builds decode under stays at 8 MiB.
  */
 export const TRANSACTION_ENVELOPE_RESERVE_BYTES = 512 * 1024; // 512 KiB
 

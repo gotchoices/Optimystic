@@ -741,8 +741,8 @@ artifact carrying the commit `RepoMessage` verbatim (including the commit op's `
 the promise-round and commit-round vote signatures, and the membership-v2 digest with its full
 sorted peer-id list. No public keys ride along — every signer's Ed25519 key is recovered from its
 peer id, the same binding `peerIdBindsPublicKey` relies on. Measured size for a 10-peer cohort on
-a two-block commit: 4578 bytes (`test/commit-proof.spec.ts`), comfortably inside the 1 MiB
-control-message bound.
+a two-block commit: 4578 bytes (`test/commit-proof.spec.ts`), a rounding error inside the 8 MiB
+sync-response and block-transfer frames it rides in (`MAX_BLOCK_MESSAGE_BYTES`).
 
 Verification is pure, throw-free on hostile input, and split to match what the two repair stages
 know:

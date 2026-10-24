@@ -725,8 +725,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	async pend(blockAction: PendRequest): Promise<PendResult> {
-		// Refused before anything is sent, so no cancel is owed. The whole transaction is judged, not
-		// each coordinator's share: a share is a subset, so a whole that fits means every share does.
+		// Refused before anything is sent, so no cancel is owed. The whole pend is judged, not each
+		// coordinator's share: a share is a subset, so a whole that fits means every share does.
 		assertTransactionFits([blockAction]);
 		const t0 = Date.now();
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {

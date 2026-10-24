@@ -3,7 +3,9 @@ import type { PendRequest } from "./struct.js";
 
 /**
  * The most bytes one transaction's pend may encode to: 7.5 MiB, measured by {@link jsonEncodedBytes}
- * over every {@link PendRequest} the transaction sends — transforms, validation payload and all.
+ * over the {@link PendRequest}s that travel together in one consensus record — transforms, validation
+ * payload and all. That is one collection's pend for a writer that pends each collection on its own
+ * (`TransactionCoordinator` today), and the sum of the batch for `IRepo.pendMany`.
  *
  * A pend's payload travels whole in one frame on every hop it takes: writer → coordinator on the repo
  * protocol, then coordinator → each other cohort member on the cluster protocol, and back as the
@@ -46,9 +48,9 @@ export class TransactionTooLargeError extends Error {
 }
 
 /**
- * Throws {@link TransactionTooLargeError} when `requests` — one transaction's pends — together encode
- * to more than {@link MAX_TRANSACTION_BYTES}. The one rule both the writer (before sending) and the
- * coordinator (on receipt) apply.
+ * Throws {@link TransactionTooLargeError} when `requests` — one transaction's pends that ride in one
+ * consensus record — together encode to more than {@link MAX_TRANSACTION_BYTES}. The one rule both the
+ * writer (before sending) and the coordinator (on receipt) apply.
  *
  * NOTE: encodes every request once more than sending it does, on the writer and again on the
  * coordinator. Negligible for an ordinary write; if pend encoding ever shows in a profile of large
