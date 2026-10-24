@@ -9,8 +9,10 @@ tradeoffs: The planner works correctly on default estimates today, and real stat
 ## Context
 
 `OptimysticModule.getBestAccessPlan` estimates query cost from
-`request.estimatedRows || 1000000` and a handful of hardcoded selectivity constants
-(0.1 per equality, 0.25 per range, etc.). There is no real per-table statistics source:
+`request.estimatedRows ?? 1000` (the catalog's `analyze` figure, else Quereus's memory-module
+default) and, for equality seeks, from the `analyze` per-column distinct counts when the catalog
+holds them, falling back to a flat 0.1 per equality tuple; ranges still take a fixed 0.25. Those
+`analyze` statistics live only in the process's catalog. There is no persisted statistics source:
 an earlier `StatisticsCollector` was inert (it only counted rows seen in the current
 process, was never persisted, and was never read back by the planner) and was removed
 in `optimystic-statistics-remove`.

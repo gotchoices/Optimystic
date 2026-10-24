@@ -5347,8 +5347,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
           const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + matchedRows;
           const indexRows = Math.max(1, Math.floor(matchedRows));
 
-          // If this index is better than what we have, use it
-          if (indexCost < bestCost) {
+          // On a cost tie the longer match wins: without statistics every equality tuple
+          // estimates the same rows, but the longer seek reads fewer and leaves less residual.
+          const longerMatch = matchedFilterIndices.length > (bestSeekColumnIndexes?.length ?? 0);
+          if (indexCost < bestCost || (indexCost === bestCost && longerMatch)) {
             bestCost = indexCost;
             bestRows = indexRows;
             bestHandledFilters = request.filters.map((_, idx) => matchedFilterIndices.includes(idx));
