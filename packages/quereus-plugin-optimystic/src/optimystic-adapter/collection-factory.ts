@@ -1,5 +1,5 @@
 import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
-import { Tree, Collection, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -15,6 +15,8 @@ import {
 	resolveLinkDeadlines,
 	type OptimysticNodeAttachments,
 	type CollectionWatchHandle,
+	type CollectionTailReader,
+	committedTailReader,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
@@ -82,6 +84,12 @@ export class CollectionFactory {
    * cohort registration until the node stops.
    */
   private networkWatches = new Set<CollectionWatchHandle>();
+  /**
+   * One tail reader per transactor, handed to every network watch through it: the watch service reads
+   * the tails of every collection that shares a reader in one call per tick, so sharing is what makes an
+   * idle tick one request however many tables are watched.
+   */
+  private tailReaders = new WeakMap<ITransactor, CollectionTailReader>();
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -284,14 +292,7 @@ export class CollectionFactory {
     if (!watchService) {
       return undefined;
     }
-    const handle = watchService.watch({
-      collectionId,
-      readTail: async (knownTailId) => {
-        const tail = await Collection.readCommittedTail(transactor, collectionId, knownTailId);
-        return tail && { tailId: tail.tailId, revision: tail.rev };
-      },
-      onChange: listener,
-    });
+    const handle = watchService.watch({ collectionId, tails: this.tailReaderFor(transactor), onChange: listener });
     // NOTE: a dispose() landing during the await above has already emptied this set, so the handle
     // escapes it and lives until its table's DROP closes it; if hosts ever dispose while tables are
     // still initializing, refuse new watches after dispose (or close them on the spot).
@@ -300,6 +301,15 @@ export class CollectionFactory {
       this.networkWatches.delete(handle);
       await handle.close();
     };
+  }
+
+  private tailReaderFor(transactor: ITransactor): CollectionTailReader {
+    let reader = this.tailReaders.get(transactor);
+    if (!reader) {
+      reader = committedTailReader(transactor);
+      this.tailReaders.set(transactor, reader);
+    }
+    return reader;
   }
 
   /**

@@ -85,7 +85,11 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 			scheduleRotation: () => {},
 			setTimer: () => () => {},
 		});
-		watch.watch({ collectionId: COLLECTION, readTail: () => Promise.resolve({ tailId: TAIL, revision: 1 }), onChange: () => {} });
+		watch.watch({
+			collectionId: COLLECTION,
+			tails: { readTails: (queries) => Promise.resolve(new Map(queries.map((query) => [query.collectionId, { tail: { tailId: TAIL, revision: 1 } }]))) },
+			onChange: () => {},
+		});
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(registered, 'the watch service registered a subscriber').to.have.length(1);
 		const subscribedAs = decodeSubscribeAppPayload(registered[0]!.appPayload!).collectionId;

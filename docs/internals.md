@@ -1157,20 +1157,24 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   - **A host subscribes through `node.reactivityWatch`** (`network-collection-watch-service`).
     `ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts` is the typed,
     host-facing surface over all of the above — present exactly when `cohortTopic.enabled` built a host.
-    `watch({ collectionId, readTail, onChange })` returns at once; in the background the service keeps
+    `watch({ collectionId, tails, onChange })` returns at once; in the background the service keeps
     one subscription per collection (shared by every watch of it on the node), registers its one manager in
     the subscriber registry under the collection's topic and with the cohort under the tail block as the
     root key, renews it, and has it follow the tail when the log starts a new block (a registration at the
     root registers again under the new root key; one below the root only updates its root key). The first committed tail the service reads for a collection wakes its watchers once (it
-    cannot know what a caller read before then), so a caller opens the watch and then reads. Each
-    subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
-    collection's committed tail: a revision above the last one the watchers were woken for wakes them,
-    and a different tail block is followed. That check is what turns a lost notification, a
+    cannot know what a caller read before then), so a caller opens the watch and then reads. The
+    service also ticks, on one timer at the renewal cadence (30 s Core, 20 s Edge), and reads every
+    watched collection's committed tail: a revision above the last one the watchers were woken for wakes
+    them, and a different tail block is followed. That check is what turns a lost notification, a
     failed registration, an unannounced rotation or a commit nobody announced into one tick of delay
-    instead of a watcher that never wakes; it costs one tail read per watched collection per tick.
-    `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
-    host passes — it opens no collection handle, so it cannot replay a table's staged actions, and
-    given the tail id the service hands `readTail` it is one request. The stop
+    instead of a watcher that never wakes. It costs one read per tail reader per tick, naming every
+    collection that reads through it: `tails` is a `CollectionTailReader`, the service groups watches by
+    reader identity, and `committedTailReader` in the same file — `Collection.readCommittedTails` in
+    `packages/db-core/src/collection/collection.ts` over one transactor — answers a group whose logs
+    stayed on their tail blocks in one request. It opens no collection handle, so it cannot replay a
+    table's staged actions. A host builds one reader per transactor and passes it to every watch; the
+    Quereus plugin does (`CollectionFactory`'s `tailReaders`). The cost and the recovery bound are in
+    [reactivity.md § The node's watch service](reactivity.md#the-nodes-watch-service). The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin
     uses it for tables tagged `optimystic.network_watch` (see *Reactive Watch Bridge* above).
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). The bridge hands every commit

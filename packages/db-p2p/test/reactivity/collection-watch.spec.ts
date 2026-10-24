@@ -13,7 +13,7 @@ import {
 	type RegistrationHandle,
 	type VerifyResult,
 } from '@optimystic/db-core';
-import { ReactivityCollectionWatch, type CollectionTail } from '../../src/reactivity/collection-watch.js';
+import { ReactivityCollectionWatch, type CollectionTail, type CollectionTailReader } from '../../src/reactivity/collection-watch.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
 import { reactivityCollectionIdBytes, reactivityTailBytes } from '../../src/reactivity/topic-bytes.js';
 
@@ -93,6 +93,18 @@ function notification(tail: BlockId, revision: number): NotificationV1 {
 	};
 }
 
+/** A tail reader answering each collection from `tailOf`, recording the collection ids each call named. */
+function tailReader(tailOf: (collectionId: string) => CollectionTail | undefined): { reader: CollectionTailReader; calls: string[][] } {
+	const calls: string[][] = [];
+	const reader: CollectionTailReader = {
+		readTails: (queries) => {
+			calls.push(queries.map((query) => query.collectionId));
+			return Promise.resolve(new Map(queries.map((query) => [query.collectionId, { tail: tailOf(query.collectionId) }])));
+		},
+	};
+	return { reader, calls };
+}
+
 /** A watch whose first registration (under the old tail) is in flight, with the service, registry, tick and tail under the test's control. */
 async function attachedWatch() {
 	const service = new HeldRegistrationService();
@@ -107,7 +119,7 @@ async function attachedWatch() {
 		scheduleRotation: () => {},
 		setTimer: (fn) => { ticks.push(fn); return () => {}; },
 	});
-	const handle = watch.watch({ collectionId: COLLECTION, readTail: () => Promise.resolve(state.tail), onChange: () => { state.changes++; } });
+	const handle = watch.watch({ collectionId: COLLECTION, tails: tailReader(() => state.tail).reader, onChange: () => { state.changes++; } });
 	await settle();
 	return { service, registry, state, handle, watch, fireTick: (): void => ticks[ticks.length - 1]!() };
 }
@@ -218,5 +230,46 @@ describe('reactivity / collection watch', () => {
 		registry.deliver(TOPIC, notification(OLD_TAIL, 8));
 		await settle();
 		expect(state.changes - before, 'revision 8 is contiguous with what the tick read').to.equal(2);
+	});
+
+	it('collections sharing a reader are read in one call per tick, and a commit only the read sees wakes only its own watchers', async () => {
+		const service = new HeldRegistrationService();
+		const ticks: Array<() => void> = [];
+		const watch = new ReactivityCollectionWatch({
+			service,
+			profile: coreProfile(),
+			quorumRatio: 0.75,
+			subscribers: new ReactivitySubscriberRegistry(),
+			scheduleRotation: () => {},
+			setTimer: (fn) => { ticks.push(fn); return () => {}; },
+		});
+		const collections = ['app/a', 'app/b', 'app/c'];
+		const revisions = new Map(collections.map((id) => [id, 1]));
+		const { reader, calls } = tailReader((id) => ({ tailId: OLD_TAIL, revision: revisions.get(id)! }));
+		const changes = new Map(collections.map((id) => [id, 0]));
+		for (const id of collections) {
+			watch.watch({ collectionId: id, tails: reader, onChange: () => { changes.set(id, changes.get(id)! + 1); } });
+		}
+		await settle();
+		for (const registration of service.registrations) {
+			registration.resolve();
+		}
+		await settle();
+		expect(ticks, 'one timer for the service, not one per collection').to.have.length(1);
+
+		calls.length = 0;
+		for (let tick = 0; tick < 3; ++tick) {
+			ticks[ticks.length - 1]!();
+			await settle();
+		}
+		expect(calls, 'each idle tick read every collection in one call').to.deep.equal([collections, collections, collections]);
+
+		const before = new Map(changes);
+		revisions.set('app/b', 2);
+		ticks[ticks.length - 1]!();
+		await settle();
+		for (const id of collections) {
+			expect(changes.get(id)! - before.get(id)!, `wakes of ${id}`).to.equal(id === 'app/b' ? 1 : 0);
+		}
 	});
 });

@@ -12,7 +12,8 @@ import { expect } from 'chai'
 import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { LogDataBlockType } from '../src/log/struct.js'
-import type { BlockGets, GetBlockResults, IBlock } from '../src/index.js'
+import { Collection } from '../src/collection/collection.js'
+import type { BlockGets, CommittedTailAnswer, GetBlockResults, IBlock } from '../src/index.js'
 
 interface Row { key: number; value: string }
 
@@ -251,5 +252,73 @@ describe('refresh read cost', () => {
 		})
 		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(2)
 		expectNoBlockFetchedTwice(fetchesPerBlock)
+	})
+})
+
+/** Throws on any request naming `failing`, as `NetworkTransactor.get` does when one block of a
+ *  request gets no answer. */
+class OneBlockUnreachableTransactor extends CountingTransactor {
+	failing?: string
+
+	override async get(gets: BlockGets): Promise<GetBlockResults> {
+		if (this.failing !== undefined && gets.blockIds.includes(this.failing)) {
+			throw new Error(`no answer for ${this.failing}`)
+		}
+		return super.get(gets)
+	}
+}
+
+describe('batched committed-tail read cost', () => {
+	/** `ids` committed to `rows` rows each, and the query a poller that last read their tails holds. */
+	async function committed(net: CountingTransactor, ids: string[], rows: number) {
+		const writers = new Map<string, Tree<number, Row>>()
+		for (const id of ids) {
+			const writer = await Tree.createOrOpen<number, Row>(net, id, keyOf)
+			await writeRows(writer, 0, rows)
+			writers.set(id, writer)
+		}
+		const queries = await Promise.all(ids.map(async id => ({ id, knownTailId: await net.tailIdOf(id) })))
+		return { writers, queries }
+	}
+
+	it('collections whose logs stayed on their blocks cost one request, however many are named', async () => {
+		const net = new CountingTransactor()
+		const { writers, queries } = await committed(net, ['idle-a', 'idle-b', 'idle-c'], 3)
+
+		let answers: Map<string, CommittedTailAnswer> | undefined
+		const { requests } = await net.cost(async () => { answers = await Collection.readCommittedTails(net, queries) })
+		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(1)
+		for (const { id, knownTailId } of queries) {
+			expect(answers!.get(id), id).to.deep.equal({ tail: { tailId: knownTailId, rev: writers.get(id)!.committedRevision() } })
+		}
+	})
+
+	it('collections whose headers name new tails share one more request', async () => {
+		const net = new CountingTransactor()
+		const { writers, queries } = await committed(net, ['rolled-a', 'rolled-b', 'still'], 3)
+		for (const id of ['rolled-a', 'rolled-b']) {
+			await writeRows(writers.get(id)!, 3, 32)
+		}
+
+		let answers: Map<string, CommittedTailAnswer> | undefined
+		const { requests } = await net.cost(async () => { answers = await Collection.readCommittedTails(net, queries) })
+		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(2)
+		for (const { id, knownTailId } of queries) {
+			const tailId = await net.tailIdOf(id)
+			expect(tailId === knownTailId, `${id}'s tail moved`).to.equal(id === 'still')
+			expect(answers!.get(id), id).to.deep.equal({ tail: { tailId, rev: writers.get(id)!.committedRevision() } })
+		}
+	})
+
+	it('a header no request can retrieve fails its own collection only', async () => {
+		const net = new OneBlockUnreachableTransactor()
+		const { writers, queries } = await committed(net, ['lost', 'kept-a', 'kept-b'], 3)
+		net.failing = 'lost'
+
+		const answers = await Collection.readCommittedTails(net, queries)
+		expect(answers.get('lost'), 'the unreachable header is reported').to.have.property('error')
+		for (const id of ['kept-a', 'kept-b']) {
+			expect(answers.get(id), id).to.deep.equal({ tail: { tailId: await net.tailIdOf(id), rev: writers.get(id)!.committedRevision() } })
+		}
 	})
 })

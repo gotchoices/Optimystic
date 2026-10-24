@@ -15,7 +15,7 @@ import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability, withBlockRevs } from "../network/durability.js";
 import { highestStaleAt, isExpiryFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
-import type { CollectionHeaderBlock, CollectionId, ICollection, SyncOptions, TornActionReason } from "./index.js";
+import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, ICollection, SyncOptions, TornActionReason } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
@@ -101,6 +101,11 @@ type LogEnds = {
 	/** Every block read, with the revision it was served at — the seed for the refresh's block cache. */
 	served: Array<[BlockId, IBlock, number]>;
 };
+
+/** One block's answer in a {@link Collection.readCommittedTails} round: the repo's entry, or why
+ * reading the block failed. */
+type AttributedRead = { entry: GetBlockResult | undefined } | { error: unknown };
+type AttributedReads = Map<BlockId, AttributedRead>;
 
 /** Default base backoff (and historical fixed delay) between sync retries, in ms. */
 const PendingRetryDelayMs = 100;
@@ -376,11 +381,55 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Throws what a refresh's first read throws: `BlockUnavailableError` for a header or tail the
 	 * storage layer could not retrieve, `BlockPossiblyStaleError` for one it could not confirm
 	 * current. Neither is an absence. */
-	static async readCommittedTail(transactor: ITransactor, id: CollectionId, knownTailId?: BlockId): Promise<{ tailId: BlockId; rev: number } | undefined> {
+	static async readCommittedTail(transactor: ITransactor, id: CollectionId, knownTailId?: BlockId): Promise<CommittedTail | undefined> {
 		const ends = await Collection.readLogEnds(transactor, id, knownTailId);
 		const tailId = ends?.header.tailId;
-		const rev = ends?.tail?.state.latest?.rev;
-		return tailId === undefined || rev === undefined ? undefined : { tailId, rev };
+		return tailId === undefined ? undefined : Collection.committedTailOf(tailId, ends?.tail);
+	}
+
+	/** {@link readCommittedTail} for several collections at once, answered per collection: what
+	 * the single read would have resolved, as `tail`, or what it would have thrown, as `error`. A
+	 * collection named twice is read once.
+	 *
+	 * One request names every header and every known tail id. A collection whose header names a
+	 * different tail than its known one costs a second request, shared by every such collection. So
+	 * a poll of many collections whose logs stayed on their blocks is one request, however many it
+	 * names; the per-block judgement is {@link readLogEnds}'s, through the same helpers.
+	 *
+	 * A request that throws is not every collection's failure: `NetworkTransactor.get` fails as a
+	 * whole when any block in it gets no answer, so {@link readAttributed} then reads each block
+	 * alone and only the collections whose blocks failed report an error. That fallback costs what
+	 * reading each collection separately costs, and only when a request fails. */
+	static async readCommittedTails(transactor: ITransactor, queries: ReadonlyArray<CommittedTailQuery>): Promise<Map<CollectionId, CommittedTailAnswer>> {
+		const knownTails = new Map(queries.map(query => [query.id, query.knownTailId]));
+		const ends = await Collection.readAttributed(transactor,
+			[...knownTails].flatMap(([id, knownTailId]) => knownTailId === undefined ? [id] : [id, knownTailId]));
+		const answers = new Map<CollectionId, CommittedTailAnswer>();
+		/** Collections whose header names a tail other than the known one, with the tail it names. */
+		const moved = new Map<CollectionId, BlockId>();
+		for (const [id, knownTailId] of knownTails) {
+			try {
+				const tailId = Collection.answeredHeader(id, Collection.entryIn(ends, id))?.header.tailId;
+				if (tailId === undefined || tailId === knownTailId) {
+					answers.set(id, { tail: Collection.judgedTail(tailId, ends) });
+				} else {
+					moved.set(id, tailId);
+				}
+			} catch (error) {
+				answers.set(id, { error });
+			}
+		}
+		if (moved.size > 0) {
+			const tails = await Collection.readAttributed(transactor, [...new Set(moved.values())]);
+			for (const [id, tailId] of moved) {
+				try {
+					answers.set(id, { tail: Collection.judgedTail(tailId, tails) });
+				} catch (error) {
+					answers.set(id, { error });
+				}
+			}
+		}
+		return answers;
 	}
 
 	/** The per-instance read wiring every open path needs, plus the collection's log ends — the
@@ -2306,15 +2355,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 			blockIds: knownTailId === undefined ? [id] : [id, knownTailId],
 			...Collection.tailFloorField(knownTailId, tailFloor),
 		});
-		const headerEntry = results?.[id];
-		if (headerEntry === undefined) {
+		const answered = Collection.answeredHeader(id, results?.[id]);
+		if (answered === undefined) {
 			return undefined;
 		}
-		const header = answeredBlock(id, headerEntry, undefined) as CollectionHeaderBlock | undefined;
-		if (!header) {
-			return undefined;
-		}
-		const served: LogEnds['served'] = [[id, header, servedRevision(headerEntry)]];
+		const { header } = answered;
+		const served: LogEnds['served'] = [[id, header, answered.servedRev]];
 		const tailId = header.tailId;
 		if (tailId === undefined) {
 			return { header, served };
@@ -2326,6 +2372,69 @@ export class Collection<TAction> implements ICollection<TAction> {
 			served.push([tailId, tail.block, servedRevision(tail)]);
 		}
 		return { header, tail, served };
+	}
+
+	/** The header a repo answered for collection `id`, judged as an unpinned read, with the
+	 * revision it was served at. `undefined` when it is authoritatively absent — no entry, or one
+	 * with no block; a throw when the repo could not retrieve it or could not confirm it current
+	 * ({@link answeredBlock}). */
+	private static answeredHeader(id: CollectionId, entry: GetBlockResult | undefined): { header: CollectionHeaderBlock; servedRev: number } | undefined {
+		if (entry === undefined) {
+			return undefined;
+		}
+		const header = answeredBlock(id, entry, undefined) as CollectionHeaderBlock | undefined;
+		return header ? { header, servedRev: servedRevision(entry) } : undefined;
+	}
+
+	/** The committed tail a header naming `tailId` describes, given the repo's answer for that
+	 * block: `undefined` when the block has no committed revision (nothing committed yet). */
+	private static committedTailOf(tailId: BlockId, tail: GetBlockResult | undefined): CommittedTail | undefined {
+		const rev = tail?.state.latest?.rev;
+		return rev === undefined ? undefined : { tailId, rev };
+	}
+
+	/** The committed tail `tailId` names, read out of `reads` and checked as {@link checkedLogTail}
+	 * describes; `undefined` for no tail id. Throws the block's failed read, or a doubted answer. */
+	private static judgedTail(tailId: BlockId | undefined, reads: AttributedReads): CommittedTail | undefined {
+		return tailId === undefined
+			? undefined
+			: Collection.committedTailOf(tailId, Collection.checkedLogTail(tailId, Collection.entryIn(reads, tailId)));
+	}
+
+	/** The repo's entry for `id` in `reads`, or the error reading it failed with, thrown. */
+	private static entryIn(reads: AttributedReads, id: BlockId): GetBlockResult | undefined {
+		const read = reads.get(id);
+		if (read !== undefined && 'error' in read) {
+			throw read.error;
+		}
+		return read?.entry;
+	}
+
+	/** Unpinned reads of `blockIds` in ONE request, each block's answer kept apart. When that
+	 * request throws, each block is read in a request of its own — concurrently — so the failure
+	 * lands on the blocks it belongs to and every other block still answers. */
+	private static async readAttributed(transactor: ITransactor, blockIds: BlockId[]): Promise<AttributedReads> {
+		if (blockIds.length === 0) {
+			return new Map();
+		}
+		try {
+			const results = await transactor.get({ blockIds });
+			return new Map(blockIds.map(id => [id, { entry: results?.[id] }]));
+		} catch (error) {
+			if (blockIds.length === 1) {
+				return new Map([[blockIds[0]!, { error }]]);
+			}
+			log('collection:tails-read-split blocks=%d error=%o', blockIds.length, error);
+			return new Map(await Promise.all(blockIds.map(async id => [id, await Collection.readAlone(transactor, id)] as const)));
+		}
+	}
+
+	private static async readAlone(transactor: ITransactor, id: BlockId): Promise<AttributedRead> {
+		try {
+			return { entry: (await transactor.get({ blockIds: [id] }))?.[id] };
+		} catch (error) {
+			return { error };
+		}
 	}
 
 	/** An unpinned read of the log tail block, checked as {@link checkedLogTail} describes, carrying

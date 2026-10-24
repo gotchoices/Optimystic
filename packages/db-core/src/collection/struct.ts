@@ -6,6 +6,24 @@ export type CollectionId = BlockId;
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 
+/** A collection's committed tail: the log tail block its header names, and that block's latest
+ * committed revision, which is the collection's (every commit touches the log tail). */
+export type CommittedTail = { tailId: BlockId; rev: number };
+
+/** One collection a batched committed-tail read names (`Collection.readCommittedTails`). */
+export type CommittedTailQuery = {
+	readonly id: CollectionId;
+	/** The tail block the caller's previous read found. While the header still names it, the read
+	 * needs no second request for this collection. */
+	readonly knownTailId?: BlockId;
+};
+
+/** One collection's answer to a batched committed-tail read: its tail (`undefined` when it has
+ * never committed), or why reading it failed — what the single-collection read would have thrown. */
+export type CommittedTailAnswer =
+	| { readonly tail: CommittedTail | undefined }
+	| { readonly error: unknown };
+
 /** Bounds the retry loop inside {@link ICollection.sync} / {@link ICollection.updateAndSync}
  * so a transactor that keeps rejecting the sync can no longer spin the collection latch forever.
  * All fields are optional; unset fields fall back to conservative defaults. */

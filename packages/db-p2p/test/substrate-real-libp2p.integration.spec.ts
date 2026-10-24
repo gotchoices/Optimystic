@@ -46,7 +46,7 @@ import {
 	type ActionId,
 	type QueryV1,
 } from '@optimystic/db-core';
-import { Collection, Tree, routingKeyForBlock } from '@optimystic/db-core';
+import { Collection, Tree, routingKeyForBlock, type ITransactor } from '@optimystic/db-core';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { transactorFor } from './util/two-machine-lifecycle.js';
@@ -62,6 +62,7 @@ import { signedWillingness, type Member } from '../src/testing/cohort-topic-mesh
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import { DEFAULT_REACTIVITY_PROTOCOLS } from '../src/reactivity/protocols.js';
 import { reactivityCollectionIdBytes, reactivityTailBytes } from '../src/reactivity/topic-bytes.js';
+import { committedTailReader, type CollectionTailReader } from '../src/reactivity/collection-watch.js';
 import { reactivityDirectSubscribers } from '../src/reactivity/forwarder-host.js';
 import {
 	Libp2pReactivityRecoverTransport,
@@ -1167,6 +1168,24 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 });
 
 /**
+ * The host's reader over `transactor`, counting the reads it has started and finished: a wake the collection
+ * watch cases attribute to the notify socket must have happened with no tail read in flight.
+ */
+function countedTailReader(transactor: ITransactor, reads: { started: number; finished: number }): CollectionTailReader {
+	const committed = committedTailReader(transactor);
+	return {
+		readTails: async (queries) => {
+			reads.started++;
+			try {
+				return await committed.readTails(queries);
+			} finally {
+				reads.finished++;
+			}
+		},
+	};
+}
+
+/**
  * **The collection watch service over a real network.** The cases above each fake one end of reactivity — a
  * hand-built commit certificate fed to `onLocalCommit`, a membership certificate cached by hand, a registration
  * dialed straight to the root group's member rather than walked there. This one fakes none of them: a real `NetworkTransactor` commits a row
@@ -1246,15 +1265,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		let wakes = 0;
 		const handle = watcher.reactivityWatch!.watch({
 			collectionId: COLLECTION,
-			readTail: async (knownTailId) => {
-				reads.started++;
-				try {
-					const tail = await Collection.readCommittedTail(watcherTransactor, COLLECTION, knownTailId);
-					return tail === undefined ? undefined : { tailId: tail.tailId, revision: tail.rev };
-				} finally {
-					reads.finished++;
-				}
-			},
+			tails: countedTailReader(watcherTransactor, reads),
 			onChange: () => { wakes++; },
 		});
 		try {
@@ -1402,15 +1413,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 		const offCount = watcherRegistry.register(topicId, () => { delivered++; });
 		const handle = watcher.reactivityWatch!.watch({
 			collectionId: COLLECTION,
-			readTail: async (knownTailId) => {
-				reads.started++;
-				try {
-					const t = await Collection.readCommittedTail(watcherTransactor, COLLECTION, knownTailId);
-					return t === undefined ? undefined : { tailId: t.tailId, revision: t.rev };
-				} finally {
-					reads.finished++;
-				}
-			},
+			tails: countedTailReader(watcherTransactor, reads),
 			onChange: () => { wakes++; },
 		});
 		try {
