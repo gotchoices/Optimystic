@@ -4,9 +4,10 @@ import type { ActionId, BlockId, CollectionChangeEvent } from "@optimystic/db-co
  * The bookkeeping behind `StorageRepo`'s per-collection change hold: pure state, no I/O, no timers.
  *
  * A transaction that writes several collections — a SQL table and each of its indexes, or several
- * tables — pends and commits each collection as its own request under ONE action id, so a member
- * applies them as separate `StorageRepo.commit` calls, possibly hundreds of milliseconds apart. A
- * watcher woken by the first collection's event then reads the others before they have landed here.
+ * tables — commits them under ONE action id, and a member applies each as its own
+ * `StorageRepo.commit` call: back to back when they travel in one batch record, possibly hundreds of
+ * milliseconds apart when each goes as its own request. A watcher woken by the first collection's
+ * event then reads the others before they have landed here.
  * The writer pends every collection before committing any, so at the moment the first commit applies
  * this node already holds the other collections' pending records under the same action id: that is
  * the signal this module tracks.

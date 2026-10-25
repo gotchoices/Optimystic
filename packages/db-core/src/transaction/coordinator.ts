@@ -1,4 +1,4 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, CommitRequest, ActionId, WriteDurability } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
@@ -31,13 +31,13 @@ const DefaultMaxBackoffMs = 5000;
 /**
  * A pend that failed. `conflict` marks the retryable class — an optimistic-concurrency collision that
  * a re-read + re-pend can clear — as decided by `isConflictFailure` over the failure response. A hard
- * rejection (storage full, policy) is NOT a conflict and is not worth re-driving. Thrown by
- * {@link TransactionCoordinator.pendCollection} so the fan-out in pendPhase can settle it and read
- * the flag off the rejection.
+ * rejection (storage full, policy) is NOT a conflict and is not worth re-driving. Built by
+ * {@link pendRefusalError} for one collection's pend, or for every collection of a batched one, and
+ * classified by {@link pendFailure}, which reads the flag off it.
  */
 class PendRejectedError extends Error {
 	constructor(
-		collectionId: CollectionId,
+		collectionIds: readonly CollectionId[],
 		readonly conflict: boolean,
 		reason?: string,
 		/** Confirmed revision the responder holds, from `StaleFailure.staleAt`. Folded into the
@@ -45,10 +45,45 @@ class PendRejectedError extends Error {
 		 * form that reaches an embedder through the transaction result's `error` field. */
 		staleAt?: { blockId: BlockId; rev: number },
 	) {
-		super(`Pend failed for collection ${collectionId}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`
+		super(`Pend failed for ${collectionIds.length === 1 ? 'collection' : 'collections'} ${collectionIds.join(', ')}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`
 			+ (staleAt ? ` (block ${staleAt.blockId} at rev ${staleAt.rev})` : ''));
 		this.name = 'PendRejectedError';
 	}
+}
+
+/** The error a refused pend of `collectionIds` stands for: its expiry — never retried, since a re-drive's
+ * expiration comes from the same clock — or a rejection carrying whether a re-read can clear it.
+ * Retryability comes from the response itself: a producer that classified the failure sets `conflict`,
+ * and only where none did is it inferred from `missing`/`pending` (`isConflictFailure`). */
+function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): TransactionExpiredError | PendRejectedError {
+	return isExpiryFailure(refusal)
+		? new TransactionExpiredError(refusal.expired)
+		: new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
+}
+
+/** How the pend phase failed. */
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TransactionTooLargeError };
+
+/**
+ * The pend phase's failure for `reasons` — what every failed pend threw or stood for, at least one.
+ * The error text is the first reason's. The attempt is a retryable clean stale loss only if at least one
+ * reason was a conflicting pend ({@link PendRejectedError}`.conflict`) AND none was a hard failure: a
+ * single hard failure (storage/policy rejection, or a thrown/unavailable transactor) will not clear on a
+ * re-read, so re-driving it would just burn the retry budget. An expiry, and a pend too large to send,
+ * are hard failures carried whole: each is the error the commit surfaces.
+ */
+function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
+	const first = reasons[0];
+	const conflicts = reasons.filter(reason => reason instanceof PendRejectedError && reason.conflict);
+	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
+	const tooLarge = reasons.find((reason): reason is TransactionTooLargeError => reason instanceof TransactionTooLargeError);
+	return {
+		success: false,
+		error: first instanceof Error ? first.message : String(first),
+		staleLoss: conflicts.length > 0 && conflicts.length === reasons.length,
+		...(expired === undefined ? {} : { expired }),
+		...(tooLarge === undefined ? {} : { tooLarge }),
+	};
 }
 
 /**
@@ -81,10 +116,47 @@ type CommitCycle = {
 	saved: Map<CollectionId, WriteDurability | undefined>;
 };
 
-/** How one collection's commit ended ({@link TransactionCoordinator.commitCollection}). */
+/** How one collection's commit ended ({@link TransactionCoordinator.commitCollection}, or its share of
+ * a batched commit's one answer). */
 type CollectionCommitOutcome =
 	| { collectionId: CollectionId; committed: true; durability: WriteDurability }
 	| { collectionId: CollectionId; committed: false; error: string; stale?: boolean; expired?: TransactionExpiredError };
+
+/**
+ * How `collectionId`'s commit ended when `result` answered its `request` — the answer to its own
+ * commit, or, in a batched commit, the batch's one answer for every collection of it. A success is
+ * stamped with the collection's own blocks at its own revision (`withBlockRevs`).
+ */
+function collectionCommitOutcome(collectionId: CollectionId, request: CommitRequest, result: CommitResult): CollectionCommitOutcome {
+	if (result.success) {
+		return { collectionId, committed: true, durability: withBlockRevs(result.durability, request.blockIds, request.rev) };
+	}
+	if (isExpiryFailure(result)) {
+		// Not a stale loss: a re-drive's expiration comes from the same clock.
+		const expired = new TransactionExpiredError(result.expired);
+		return { collectionId, committed: false, error: expired.message, expired };
+	}
+	// Permanent stale failure: never retried verbatim. It IS a clean stale loss, though, so mark it
+	// retryable at the coordinator level (after a re-read advances the rev).
+	// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict` like the pend
+	// path does. Once the pend succeeded, a returned commit failure means the revision slot moved, or a
+	// member behind on the base refused — the durability gate's `commit-not-durable` (which does set
+	// `conflict`) or a solo StorageRepo's `missing-base-revision` (a bare `reason`, no `conflict`). All of
+	// these clear on a re-drive, so gating on `conflict` here would fail the last of them fast. One commit
+	// producer DOES set `conflict` now — db-p2p's CoordinatorRepo.commit returns lost commit-consensus
+	// races and classified stale-commit rejections as `{ success:false, conflict:true }` (returning, not
+	// throwing, is what keeps them out of commitCollection's verbatim retry) — but every returned failure
+	// still maps to `stale: true` here, and `isConflictFailure` covers that new shape, so no behavior
+	// change is needed. The one returned refusal that is NOT a stale loss, an expiry, is split off above.
+	// If a commit producer ever starts returning other hard commit rejections (validator policy, storage
+	// fault) as results too, gate `stale` on isConflictFailure here.
+	return {
+		collectionId,
+		committed: false,
+		stale: true,
+		error: result.reason ?? `Stale commit for collection ${collectionId}`
+	};
+}
 
 /** How one attempt's distributed phases ended ({@link TransactionCoordinator.coordinateTransaction}).
  * `committedCollections` carries who holds each collection that durably committed — every
@@ -1582,6 +1654,9 @@ export class TransactionCoordinator {
 	/**
 	 * PEND phase: Distribute transaction to all affected block clusters.
 	 *
+	 * Two or more collections go as ONE request when the transactor can send them so
+	 * ({@link pendTogether}); otherwise, and for one collection, each collection is pended on its own.
+	 *
 	 * @param transaction - The transaction being pended (its id names the action; its aged
 	 * priority rides on an unvalidated pend)
 	 * @param validation - What every pend carries for members to re-check, or undefined for an
@@ -1598,20 +1673,22 @@ export class TransactionCoordinator {
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		pendedRevs: ReadonlyMap<CollectionId, number>,
 		superclusterNominees: ReadonlySet<PeerId> | null
-	): Promise<
-		| { success: true; pendedBlockIds: Map<CollectionId, BlockId[]> }
-		| { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TransactionTooLargeError }
-	> {
+	): Promise<{ success: true; pendedBlockIds: Map<CollectionId, BlockId[]> } | PendPhaseFailure> {
 		if (collectionTransforms.size === 0) {
 			return { success: false, error: 'No transforms to pend' };
 		}
 
 		const actionId = transaction.id as ActionId;
 		const nominees = superclusterNominees ? Array.from(superclusterNominees) : undefined;
+		if (collectionTransforms.size > 1 && this.transactor.pendMany) {
+			const together = await this.pendTogether(transaction, validation, collectionTransforms, pendedRevs, actionId, nominees);
+			if (together !== undefined) return together;
+		}
+
 		// A one-collection transaction pends once and commits that one collection (commitPhase), as a
 		// `Collection.sync` write does, so its pend may say so (`PendRequest.soleReservation`). Two or
-		// more never may: each collection's commit lands on its own, and a late refusal of another
-		// collection's pend would surface after it.
+		// more pended one by one never may: each collection's commit can land on its own, and a late
+		// refusal of another collection's pend would surface after it.
 		const sole = collectionTransforms.size === 1;
 
 		// Fan out the independent per-collection pends concurrently. Each settles to a
@@ -1625,49 +1702,78 @@ export class TransactionCoordinator {
 			)
 		);
 
-		// Partition settled results: every collection that DID pend (keyed with its block
-		// ids), plus the first failure reason if any collection failed.
+		// Partition settled results: every collection that DID pend (keyed with its block ids), and
+		// every reason one did not, classified together (pendFailure) independent of iteration order.
 		const pendedBlockIds = new Map<CollectionId, BlockId[]>();
-		let failure: string | undefined;
-		// Classify across ALL failures (mirroring commitPhase, and independent of iteration order):
-		// the pend is a retryable clean stale loss only if at least one failure was a conflicting pend
-		// (PendRejectedError.conflict) AND none was a hard failure. A single hard failure (storage/
-		// policy rejection, or a thrown/unavailable transactor) will not clear on a re-read, so
-		// re-driving it would just burn the retry budget — fail fast instead.
-		let anyConflict = false;
-		let anyHard = false;
-		// An expiry is a hard failure too, and is carried whole: it is the error the commit surfaces.
-		// So is a pend too large to send.
-		let expired: TransactionExpiredError | undefined;
-		let tooLarge: TransactionTooLargeError | undefined;
+		const reasons: unknown[] = [];
 		for (const outcome of outcomes) {
 			if (outcome.status === 'fulfilled') {
 				pendedBlockIds.set(outcome.value.collectionId, outcome.value.blockIds);
 			} else {
-				if (failure === undefined) {
-					failure = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
-				}
-				if (outcome.reason instanceof PendRejectedError && outcome.reason.conflict) anyConflict = true;
-				else anyHard = true;
-				if (outcome.reason instanceof TransactionExpiredError) expired ??= outcome.reason;
-				if (outcome.reason instanceof TransactionTooLargeError) tooLarge ??= outcome.reason;
+				reasons.push(outcome.reason);
 			}
 		}
 
-		if (failure !== undefined) {
+		if (reasons.length > 0) {
 			// Any failure aborts the whole pend. With concurrency several collections may
 			// have pended in parallel, so cancel EVERY successfully-pended collection — not
 			// only those started before the failure. Cancels are best-effort (cancelPhase
 			// swallows their errors) so they cannot mask the original pend failure.
 			await this.cancelPhase(actionId, pendedBlockIds);
-			return {
-				success: false, error: failure, staleLoss: anyConflict && !anyHard,
-				...(expired === undefined ? {} : { expired }),
-				...(tooLarge === undefined ? {} : { tooLarge }),
-			};
+			return pendFailure(reasons);
 		}
 
 		return { success: true, pendedBlockIds };
+	}
+
+	/**
+	 * Pends every collection as ONE request ({@link ITransactor.pendMany}): one consensus record,
+	 * answered together. Every request is marked the action's only reservation
+	 * (`PendRequest.soleReservation`) — together they are, and their commit goes as one request to the
+	 * same coordinator ({@link commitTogether}) — so a coordinator may hold the pend's decision back for
+	 * the commit to carry, and a member that refuses any collection's pend late refuses the action's one
+	 * commit record before anything of it is durable.
+	 *
+	 * - **Success**: every collection is pended, with its own blocks.
+	 * - **Refusal**: classified as one collection's refusal is ({@link pendRefusalError}), once for the
+	 *   batch. `pendMany` cancelled every block, so nothing is left pended.
+	 * - **Throw** (a transactor other than `NetworkTransactor`, which answers a throw with `undefined`):
+	 *   a hard failure, as a thrown pend is. What was pended is unknown, so every collection's blocks are
+	 *   cancelled.
+	 * - **`undefined`**: they could not go as one, and nothing of them is pended. {@link pendPhase} then
+	 *   pends each collection on its own with requests rebuilt WITHOUT the mark. The marked requests are
+	 *   never re-sent one by one: each carries every block of its collection, so `NetworkTransactor.pend`
+	 *   would keep the mark, and one collection's late refusal could then surface after a sibling's commit
+	 *   landed — the tear the mark exists to prevent. Also `undefined` when a collection is missing from
+	 *   the registry, so that the per-collection path reports it as it always has.
+	 */
+	private async pendTogether(
+		transaction: Transaction,
+		validation: PendRequest['validation'],
+		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
+		pendedRevs: ReadonlyMap<CollectionId, number>,
+		actionId: ActionId,
+		nominees: PeerId[] | undefined
+	): Promise<{ success: true; pendedBlockIds: Map<CollectionId, BlockId[]> } | PendPhaseFailure | undefined> {
+		const requests: PendRequest[] = [];
+		for (const [collectionId, transforms] of collectionTransforms) {
+			const collection = this.collections.get(collectionId);
+			if (!collection) return undefined;
+			requests.push(this.pendRequestFor(transaction, validation, collection, transforms, pendedRevs.get(collectionId)!, actionId, nominees, true));
+		}
+		const blockIds = new Map(Array.from(collectionTransforms, ([collectionId, transforms]) => [collectionId, blockIdsForTransforms(transforms)]));
+
+		let result: PendResult | undefined;
+		try {
+			result = await this.transactor.pendMany!(requests);
+		} catch (e) {
+			await this.cancelPhase(actionId, blockIds);
+			return pendFailure([e]);
+		}
+		if (result === undefined) return undefined;
+		return result.success
+			? { success: true, pendedBlockIds: blockIds }
+			: pendFailure([pendRefusalError(Array.from(collectionTransforms.keys()), result)]);
 	}
 
 	/**
@@ -1694,21 +1800,48 @@ export class TransactionCoordinator {
 			throw new Error(`Collection not found: ${collectionId}`);
 		}
 
-		// Create the pend request. This is the only producer of PendRequest.validation, and it
-		// always sends the pair whole (transaction + operations hash) or not at all. The aged
-		// priority has one carrier per shape — inside the transaction when the pend carries it,
-		// on the pend itself when it does not — because a member's race resolution reads the
-		// transaction's priority first and falls back to the pend's (recordPriority in db-p2p's
-		// race-resolution.ts); an unvalidated pend that left both empty would never age. Omitted
-		// at 0, exactly as the single-collection path sends it (TransactorSource.transact), so
-		// the common first-attempt pend is indistinguishable from a Collection.sync pend.
+		const pendResult = await this.transactor.pend(
+			this.pendRequestFor(transaction, validation, collection, transforms, rev, actionId, nominees, sole)
+		);
+		if (!pendResult.success) {
+			throw pendRefusalError([collectionId], pendResult);
+		}
+
+		return { collectionId, blockIds: pendResult.blockIds };
+	}
+
+	/**
+	 * The pend request for one collection's transforms — the one place a pend request is built, whether it
+	 * goes on its own ({@link pendCollection}) or with its siblings ({@link pendTogether}).
+	 */
+	private pendRequestFor(
+		transaction: Transaction,
+		validation: PendRequest['validation'],
+		collection: Collection<any>,
+		transforms: Transforms,
+		/** The revision the log entry was stamped with (see {@link pendCollection}). */
+		rev: number,
+		actionId: ActionId,
+		nominees: PeerId[] | undefined,
+		/** Whether this request is the action's whole reservation, alone or with the siblings it is sent
+		 * with (`PendRequest.soleReservation`). */
+		sole: boolean
+	): PendRequest {
+		// This is the only producer of PendRequest.validation, and it always sends the pair whole
+		// (transaction + operations hash) or not at all. The aged priority has one carrier per shape —
+		// inside the transaction when the pend carries it, on the pend itself when it does not — because a
+		// member's race resolution reads the transaction's priority first and falls back to the pend's
+		// (recordPriority in db-p2p's race-resolution.ts); an unvalidated pend that left both empty would
+		// never age. Omitted at 0, exactly as the single-collection path sends it
+		// (TransactorSource.transact), so the common first-attempt pend is indistinguishable from a
+		// Collection.sync pend.
 		const priority = clampPriority(transaction.priority);
 		// The base each update-only block's operations were computed against, read from the same
-		// tracker the commit side digests (commitCollection); it still holds this transaction's staged
+		// tracker the commit side digests (commitRequestFor); it still holds this transaction's staged
 		// transforms and pins. Storage keeps it with the pending record so the record is never applied
 		// to a different version of the block (see PendRequest.baseRevs). Omitted when empty.
 		const baseRevs = collection.tracker.stagedBaseRevs(blockIdsForTransforms(transforms));
-		const pendRequest: PendRequest = {
+		return {
 			actionId,
 			rev,
 			transforms,
@@ -1720,28 +1853,16 @@ export class TransactionCoordinator {
 			superclusterNominees: nominees,
 			...(sole ? { soleReservation: true as const } : {})
 		};
-
-		const pendResult = await this.transactor.pend(pendRequest);
-		if (!pendResult.success) {
-			if (isExpiryFailure(pendResult)) {
-				throw new TransactionExpiredError(pendResult.expired);
-			}
-			// Retryability comes from the response itself: a producer that classified the failure sets
-			// `conflict`, and only where no producer set it do we fall back to inferring from
-			// `missing`/`pending`. Either way a conflict is an optimistic-concurrency loss, clearable
-			// by a re-read; anything else is a hard rejection (storage/policy) that re-driving won't fix.
-			throw new PendRejectedError(collectionId, isConflictFailure(pendResult), pendResult.reason, pendResult.staleAt);
-		}
-
-		return { collectionId, blockIds: pendResult.blockIds };
 	}
 
 	/**
 	 * COMMIT phase: Commit to all critical blocks with retry for transient failures.
 	 *
 	 * Once all collections are pended (Phase 1 passes), the coordinator has decided
-	 * to commit. Failed commits are retried (forward recovery) before giving up.
-	 * Returns which collections committed vs failed so the caller can do targeted cancel.
+	 * to commit. Two or more collections go as ONE request when the transactor can send them so
+	 * ({@link commitTogether}); otherwise each collection commits on its own, its transient failures
+	 * retried (forward recovery) before giving up. Returns which collections committed vs failed so
+	 * the caller can do targeted cancel.
 	 */
 	private async commitPhase(
 		actionId: ActionId,
@@ -1757,17 +1878,24 @@ export class TransactionCoordinator {
 		staleLoss?: boolean;
 		expired?: TransactionExpiredError;
 	}> {
-		// Fan out the independent per-collection commit-with-retry concurrently, then
-		// aggregate the committed/failed partition from the settled results.
-		const outcomes = await Promise.allSettled(
-			Array.from(pendedBlockIds.entries()).map(([collectionId, blockIds]) =>
-				this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!)
-			)
-		);
+		const together = pendedBlockIds.size > 1 && this.transactor.commitMany
+			? await this.commitTogether(actionId, criticalBlockIds, pendedBlockIds, pendedRevs)
+			: undefined;
+		// NOTE: a fallback after a batched pend leaves the multi-collection residual in place: the
+		// pend's decision may have been held back for a commit that now goes per collection, so a member
+		// that refuses one collection's pend late can do so after a sibling collection's commit landed —
+		// reported by forward recovery or `CoordinatorPartialCommitError`. Reached through a thrown
+		// batched commit (`NetworkTransactor.commitMany` answers `undefined` for that). Anything else that
+		// keeps a batch from going as one would have kept the batched pend from going too, except one
+		// case: the coordinator `pendMany` cached for every block evicted before the commit ran (the
+		// cache's TTL is at least a minute, its size cap 1000 transactions), so a live lookup can split
+		// the blocks. If that ever shows up, pin the commit to the coordinator the batched pend answered
+		// from. See docs/correctness.md §2 Definitions.
+		const outcomes = together ?? await this.commitEach(actionId, criticalBlockIds, pendedBlockIds, pendedRevs);
 
 		const committedCollections = new Map<CollectionId, WriteDurability>();
 		const failedCollections = new Set<CollectionId>();
-		const errors: string[] = [];
+		const errors = new Set<string>();
 		// Classify failures: a returned stale loss (someone committed a newer rev) is retryable after
 		// a re-read; a thrown/transient-exhausted or structural failure is not. staleLoss holds only
 		// if EVERY failure was a stale loss — a single hard failure makes the whole attempt not worth
@@ -1775,29 +1903,22 @@ export class TransactionCoordinator {
 		let anyStale = false;
 		let anyHard = false;
 		let expired: TransactionExpiredError | undefined;
-		for (const outcome of outcomes) {
-			if (outcome.status === 'fulfilled') {
-				const result = outcome.value;
-				if (result.committed) {
-					committedCollections.set(result.collectionId, result.durability);
-				} else {
-					failedCollections.add(result.collectionId);
-					errors.push(result.error);
-					if (result.stale) anyStale = true; else anyHard = true;
-					expired ??= result.expired;
-				}
+		for (const result of outcomes) {
+			if (result.committed) {
+				committedCollections.set(result.collectionId, result.durability);
 			} else {
-				// commitCollection resolves rather than rejects, but treat any unexpected
-				// rejection as a (hard) failure so the partitioned sets stay honest.
-				errors.push(outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason));
-				anyHard = true;
+				failedCollections.add(result.collectionId);
+				// A set: a batched refusal answers every collection with the one reason.
+				errors.add(result.error);
+				if (result.stale) anyStale = true; else anyHard = true;
+				expired ??= result.expired;
 			}
 		}
 
-		if (failedCollections.size > 0 || errors.length > 0) {
+		if (failedCollections.size > 0) {
 			return {
 				success: false,
-				error: errors.join('; ') || 'Commit failed',
+				error: Array.from(errors).join('; ') || 'Commit failed',
 				committedCollections,
 				failedCollections,
 				staleLoss: anyStale && !anyHard,
@@ -1809,47 +1930,81 @@ export class TransactionCoordinator {
 	}
 
 	/**
+	 * Commits every collection as ONE request ({@link ITransactor.commitMany}): one consensus record,
+	 * decided together — the commit half of {@link pendTogether}. Every collection gets the batch's one
+	 * answer ({@link collectionCommitOutcome}): committed, each stamped with its own blocks and revision;
+	 * or refused, every collection alike. A refused collection's attempt is then retained by
+	 * `commitOnceLatched`, and the refresh between attempts finishes any collection whose log entry did
+	 * land (`Collection.completeOwnEntry`) — the path a refused one-collection commit already takes.
+	 *
+	 * `undefined` when they could not go as one, when the request threw, or when a collection's request
+	 * could not be built (missing from the registry, or no log tail among its pended blocks):
+	 * {@link commitPhase} then commits each collection on its own, which re-sends everything and reports
+	 * a request it cannot build as it always has. The batch is never retried here: a returned refusal
+	 * cannot be won by the identical request, and a throw is the per-collection path's to retry.
+	 */
+	private async commitTogether(
+		actionId: ActionId,
+		criticalBlockIds: BlockId[],
+		pendedBlockIds: Map<CollectionId, BlockId[]>,
+		pendedRevs: ReadonlyMap<CollectionId, number>
+	): Promise<CollectionCommitOutcome[] | undefined> {
+		const built = await Promise.all(Array.from(pendedBlockIds, async ([collectionId, blockIds]) =>
+			({ collectionId, request: await this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!) })));
+		const requests: { collectionId: CollectionId; request: CommitRequest }[] = [];
+		for (const { collectionId, request } of built) {
+			if (typeof request === 'string') return undefined;
+			requests.push({ collectionId, request });
+		}
+
+		let result: CommitResult | undefined;
+		try {
+			result = await this.transactor.commitMany!(requests.map(({ request }) => request));
+		} catch (e) {
+			log('commitTogether: batched commit threw; committing each collection on its own actionId=%s: %o', actionId, e);
+			return undefined;
+		}
+		return result === undefined
+			? undefined
+			: requests.map(({ collectionId, request }) => collectionCommitOutcome(collectionId, request, result));
+	}
+
+	/** Commits each collection on its own, concurrently ({@link commitCollection}), one outcome per collection. */
+	private async commitEach(
+		actionId: ActionId,
+		criticalBlockIds: BlockId[],
+		pendedBlockIds: Map<CollectionId, BlockId[]>,
+		pendedRevs: ReadonlyMap<CollectionId, number>
+	): Promise<CollectionCommitOutcome[]> {
+		const entries = Array.from(pendedBlockIds.entries());
+		const settled = await Promise.allSettled(entries.map(([collectionId, blockIds]) =>
+			this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!)
+		));
+		// commitCollection resolves rather than rejects, but treat any unexpected rejection as a (hard)
+		// failure of its collection so the partitioned sets stay honest.
+		return settled.map((outcome, i) => outcome.status === 'fulfilled'
+			? outcome.value
+			: { collectionId: entries[i]![0], committed: false, error: outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason) });
+	}
+
+	/**
 	 * Commit a single collection's pended blocks, retrying transient failures up to three
 	 * times (forward recovery). Always resolves — success is carried in the returned
 	 * `committed` flag, with the commit's `durability` beside it — so the fan-out in
-	 * {@link commitPhase} can aggregate every result.
+	 * {@link commitEach} can aggregate every result.
 	 */
 	private async commitCollection(
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		collectionId: CollectionId,
 		blockIds: BlockId[],
-		/** The revision this collection PENDED at, threaded from the log append — the same bug
-		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
-		 * trips, could stamp the CommitRequest with a different number than the pend named. */
+		/** The revision this collection PENDED at (see {@link commitRequestFor}). */
 		rev: number
 	): Promise<CollectionCommitOutcome> {
-		const collection = this.collections.get(collectionId);
-		if (!collection) {
-			return { collectionId, committed: false, error: `Collection not found: ${collectionId}` };
+		const commitRequest = await this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, rev);
+		if (typeof commitRequest === 'string') {
+			return { collectionId, committed: false, error: commitRequest };
 		}
-
-		// Find the critical block (log tail) for this collection
-		const logTailBlockId = criticalBlockIds.find(blockId => blockIds.includes(blockId));
-		if (!logTailBlockId) {
-			return { collectionId, committed: false, error: `Log tail block not found for collection ${collectionId}` };
-		}
-
-		// Declare what each pended block will contain once committed. The collection's tracker still
-		// holds this transaction's staged transforms (it is reset only after commit succeeds) and
-		// layers over the collection's CacheSource, so this is a purely local computation; an id whose
-		// base is not cached is omitted and falls back to corroboration on the member side. Only the
-		// client can declare this — CoordinatorRepo.commit forwards without materializing.
-		const blockDigests = await computeBlockContentDigests(collection.tracker, blockIds);
-
-		// Create commit request
-		const commitRequest: CommitRequest = {
-			actionId,
-			blockIds,
-			tailId: logTailBlockId,
-			rev,
-			...blockDigestsField(blockDigests)
-		};
 
 		// Retry ONLY transient/thrown failures (unreachable peers, timeout) — forward recovery.
 		// A returned { success:false } is a refusal the IDENTICAL request can never win (a rival
@@ -1863,43 +2018,54 @@ export class TransactionCoordinator {
 		let lastTransientError: string | undefined;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			try {
-				const commitResult = await this.transactor.commit(commitRequest);
-				if (commitResult.success) {
-					return { collectionId, committed: true, durability: withBlockRevs(commitResult.durability, blockIds, rev) };
-				}
-				if (isExpiryFailure(commitResult)) {
-					// Not a stale loss: a re-drive's expiration comes from the same clock.
-					const expired = new TransactionExpiredError(commitResult.expired);
-					return { collectionId, committed: false, error: expired.message, expired };
-				}
-				// Permanent stale failure: do not retry here. It IS a clean stale loss, though, so
-				// mark it retryable at the coordinator level (after a re-read advances the rev).
-				// NOTE: deliberately does NOT consult `isConflictFailure` / `StaleFailure.conflict`
-				// like the pend path does. Once the pend succeeded, a returned commit failure means
-				// the revision slot moved, or a member behind on the base refused — the durability
-				// gate's `commit-not-durable` (which does set `conflict`) or a solo StorageRepo's
-				// `missing-base-revision` (a bare `reason`, no `conflict`). All of these clear on a
-				// re-drive, so gating on `conflict` here would fail the last of them fast. One commit
-				// producer DOES set `conflict` now —
-				// db-p2p's CoordinatorRepo.commit returns lost commit-consensus races and classified
-				// stale-commit rejections as `{ success:false, conflict:true }` (returning, not
-				// throwing, is what keeps them out of the verbatim retry above) — but every returned
-				// failure still maps to `stale: true` here, and `isConflictFailure` covers that new
-				// shape, so no behavior change is needed. The one returned refusal that is NOT a stale
-				// loss, an expiry, is split off above. If a commit producer ever starts returning other
-				// hard commit rejections (validator policy, storage fault) as results too, gate
-				// `stale` on isConflictFailure here.
-				return {
-					collectionId,
-					committed: false,
-					stale: true,
-					error: commitResult.reason ?? `Stale commit for collection ${collectionId}`
-				};
+				return collectionCommitOutcome(collectionId, commitRequest, await this.transactor.commit(commitRequest));
 			} catch (e) {
 				lastTransientError = e instanceof Error ? e.message : String(e);
 			}
 		}
 		return { collectionId, committed: false, error: `Commit failed for collection ${collectionId} after 3 attempts: ${lastTransientError}` };
+	}
+
+	/**
+	 * The commit request for one collection's pended blocks — the one place a commit request is built,
+	 * whether it goes on its own ({@link commitCollection}) or with its siblings ({@link commitTogether})
+	 * — or, as a string, why there is none.
+	 */
+	private async commitRequestFor(
+		actionId: ActionId,
+		criticalBlockIds: BlockId[],
+		collectionId: CollectionId,
+		blockIds: BlockId[],
+		/** The revision this collection PENDED at, threaded from the log append — the same bug
+		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
+		 * trips, could stamp the CommitRequest with a different number than the pend named. */
+		rev: number
+	): Promise<CommitRequest | string> {
+		const collection = this.collections.get(collectionId);
+		if (!collection) {
+			return `Collection not found: ${collectionId}`;
+		}
+
+		// Find the critical block (log tail) for this collection
+		const logTailBlockId = criticalBlockIds.find(blockId => blockIds.includes(blockId));
+		if (!logTailBlockId) {
+			return `Log tail block not found for collection ${collectionId}`;
+		}
+
+		// Declare what each pended block will contain once committed. The collection's tracker still
+		// holds this transaction's staged transforms (it is reset only after commit succeeds) and
+		// layers over the collection's CacheSource, so this is a purely local computation; an id whose
+		// base is not cached is omitted and falls back to corroboration on the member side. Only the
+		// client can declare this — CoordinatorRepo.commit forwards without materializing.
+		const blockDigests = await computeBlockContentDigests(collection.tracker, blockIds);
+
+		return {
+			actionId,
+			blockIds,
+			tailId: logTailBlockId,
+			rev,
+			...blockDigestsField(blockDigests)
+		};
 	}
 
 	/**

@@ -551,7 +551,7 @@ A commit reported below `full` can also be followed until its whole cohort holds
 One transaction's pend may encode to at most 7.5 MiB, measured as the UTF-8 length of its JSON (`MAX_TRANSACTION_BYTES` in `packages/db-core/src/network/transaction-size.ts`). The payload travels whole twice — writer to coordinator on the repo protocol, then coordinator to each other cohort member inside the cluster record, which the member echoes back with its vote — and both protocols frame it under one cap, `MAX_BLOCK_MESSAGE_BYTES` (8 MiB) in `packages/db-p2p/src/protocol-limits.ts`, derived as the limit plus a 512 KiB reserve for everything around the pend (`TRANSACTION_ENVELOPE_RESERVE_BYTES`). Before this, the cluster record was framed under the 1 MiB control cap, so a write between 1 and 8 MiB committed on one machine and failed with `Failed to get super-majority` as soon as a second joined (GitHub #35).
 
 - **The same at every group size.** A solo cohort takes no cluster hop, and is held to the limit anyway, so a write that commits alone does not start failing when the group grows.
-- **What counts.** Everything the pend carries: every block's transforms, the log entry, and the validation payload when there is one. A log entry repeats the data of the actions it records beside the blocks those actions change, so for a SQL write the row data is counted roughly twice — the batch reported in #35 encoded to 1.06 MB, of which 584 KB was log beside 480 KB of tree — and the usable row volume is about half the limit. `TransactionCoordinator` pends each collection of a multi-collection transaction separately today, each with its own copy of the validation payload, so the limit binds each collection's pend; a batch sent through `IRepo.pendMany` is judged as one sum, since one record carries all of it.
+- **What counts.** Everything the pend carries: every block's transforms, the log entry, and the validation payload when there is one. A log entry repeats the data of the actions it records beside the blocks those actions change, so for a SQL write the row data is counted roughly twice — the batch reported in #35 encoded to 1.06 MB, of which 584 KB was log beside 480 KB of tree — and the usable row volume is about half the limit. A multi-collection transaction whose collections travel together is judged as one sum (`IRepo.pendMany` carries them in one record), with every collection's own copy of the validation payload counted; when that sum is over the limit `NetworkTransactor.pendMany` declines the batch before sending, and each collection is pended — and judged — on its own.
 - **What the writer gets.** `NetworkTransactor.pend` checks first (`assertTransactionFits`), before anything is sent, so nothing is reserved and nothing needs cancelling, and throws `TransactionTooLargeError` (its `actionId`, `bytes` and `limit`, and a message naming `MAX_TRANSACTION_BYTES`). It is not a `StaleFailure` and nothing retries it: it comes out of `Collection.sync` unchanged (`Tree.replace` and `Diary.append` unstage what they staged, as for any failure), and out of `TransactionCoordinator.commit` by name. A writer with more to save splits it into several transactions.
 - **Backstops.** `CoordinatorRepo.pendMany` applies the same check on receipt, for a writer that did not go through `NetworkTransactor`; a remote writer then sees the repo stream reset and the coordinator's log names the cause. And every protocol client refuses, before dialing, a request larger than the cap its server decodes requests under (`ProcessMessageOptions.maxRequestBytes` in `packages/db-p2p/src/protocol-client.ts`), throwing `MessageTooLargeError` rather than sending a frame the far side would reset — which the sender could not tell from a peer that went silent.
 
@@ -570,7 +570,9 @@ operation for the pend and one for the commit, a single-collection write on a tw
 `packages/quereus-plugin-optimystic/test/two-node-write-request-count.spec.ts` for a SQL insert): each
 operation is a promise round and a decision, and the pend's decision rides on the commit's promise round
 (see *Both consensus rounds carry the coordinator's own member's vote*). A write spanning several
-collections costs 4 per collection, and a tail round plus a sweep costs more again.
+collections costs the same 3 when one coordinator covers all of their blocks, because it sends them as one
+pend record and one commit record (below); a write whose collections cannot travel together costs 4 per
+collection, and a tail round plus a sweep costs more again.
 
 A consensus record can carry several collections of one action — a **batch** (`RepoMessage` in
 `packages/db-core/src/network/repo-protocol.ts`): all pends or all commits, one action id, no block named by
@@ -588,12 +590,30 @@ collection's request was accepted. `CoordinatorRepo` runs a single `pend` or `co
 share one path. Consensus runs on the cohort of the batch's first block, as for a single request. A refusal of any
 collection refuses the batch: a stale loss is confirmed against each collection's own requested revision, and a
 commit the cohort decided can be answered refused while some of its collections already sit on a majority, when
-members held only part of it (the accepted-tradeoff `NOTE:` at `CoordinatorRepo.commitThroughCluster`). No writer
-sends a batch yet.
+members held only part of it (the accepted-tradeoff `NOTE:` at `CoordinatorRepo.commitThroughCluster`).
 One pend record and one commit record per action is what brings a multi-collection write to the three requests
 a one-collection write costs, and it keeps the held-back pend delivery safe: a member that refuses any
 collection's pend late refuses the action's one commit record before anything of it is durable
 (`mayDeferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
+
+The writer sends a batch through two optional transactor methods, `ITransactor.pendMany` and
+`ITransactor.commitMany` (`packages/db-core/src/transactor/transactor.ts`). `TransactionCoordinator.pendPhase`
+and `commitPhase` (`packages/db-core/src/transaction/coordinator.ts`) use them for any transaction of two or more
+collections — every SQL commit route that writes a table and its indexes, or several tables, in session mode and
+in legacy mode's batched commit (`commitBatchLegacy`). `NetworkTransactor.pendMany` sends the batch when the cover
+its pend computes (`coordinatorCover`) puts every collection's blocks on ONE coordinator whose repo takes batches,
+and the whole set fits the per-transaction size limit; every request is marked the action's only reservation, so
+the coordinator may hold the pend's decision back for the commit to carry. `NetworkTransactor.commitMany` sends
+the commit to that same coordinator, which `pendMany` cached for every block. Otherwise either answers
+`undefined` — "they could not go as one", never a verdict — and the coordinator falls back to one request per
+collection, the pends rebuilt without the mark. A batched pend that THREW is cancelled whole and then also falls
+back, since one request cannot be re-batched onto other coordinators the way per-collection pends are; a
+batched commit that threw falls back to per-collection commits, which re-send everything, and whatever the
+thrown request landed is the action's own revision, which storage treats as already done. Batching groups the
+collections WITHIN each phase; it does not merge the phases. The pend and the commit stay two consensus records,
+each with its own promise round, and a member still owed the pend's decision applies, or refuses, it before it
+votes on the commit record. A transactor without the methods (`TestTransactor`, the
+reference peer's) keeps one request per collection.
 
 What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
@@ -629,8 +649,10 @@ the decision. For a pend whose writer marked it the action's only reservation (`
 that decision is held back and carried on the first request of the action's commit, ahead of the commit's own
 record (`deferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, sent alone after
 `pendDeliveryDeferralMs`), so the member applies the pend, or refuses it, before it votes on the commit. That is
-how a single-collection write costs the other member three requests; why a write spanning several collections
-does not get it is in [correctness.md §2 Definitions](correctness.md#2-definitions). On the **promise**
+how a write costs the other member three requests — one collection's, or several collections' sent as one pend
+record and one commit record (*One commit round when one coordinator covers every block*, above); why a write
+whose collections go one request each does not get it is in
+[correctness.md §2 Definitions](correctness.md#2-definitions). On the **promise**
 round it is what makes the race arbiter run at all. `resolveRace`
 (`packages/db-p2p/src/cluster/race-resolution.ts`) compares the count of `approve` promise votes first, and
 that comparison gates the two below it — the aged priority and the message hash, which are the comparisons
@@ -933,10 +955,11 @@ StorageRepo.get()                          # read-driven promotion (context prov
   hence the asymmetry favors liveness.
 - **A collection's wake waits for the action's other collections pending here.** A SQL
   table and each of its indexes are separate collections, and a transaction writing a row
-  pends and commits each as its own consensus record under one action id
-  (`TransactionCoordinator.pendPhase` and `commitPhase` in
-  `packages/db-core/src/transaction/coordinator.ts`), so a member applies them as separate
-  `StorageRepo.commit` calls, a few hundred milliseconds apart on a relayed link. A watcher
+  commits them under one action id — in one consensus record when they travel together, one
+  record each when they cannot (`TransactionCoordinator.pendPhase` and `commitPhase` in
+  `packages/db-core/src/transaction/coordinator.ts`). Either way a member applies each
+  collection as its own `StorageRepo.commit` call: back to back within one record, or a few
+  hundred milliseconds apart on a relayed link when they travel separately. A watcher
   woken by the table's event read the index from this node's own replica before the index's
   commit had applied, and found nothing; the index's own event wakes nobody (GitHub #47). The
   writer pends every collection before committing any, so at the moment the table's commit

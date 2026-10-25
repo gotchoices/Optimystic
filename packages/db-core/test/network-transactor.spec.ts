@@ -2063,10 +2063,12 @@ describe('NetworkTransactor', () => {
         timeoutMs: 1000,
         abortOrCancelTimeoutMs: 500,
         keyNetwork: net,
-        getRepo: (peerId: PeerId) => {
+        getRepo: (peerId: PeerId): IRepo => {
           const t = transactors.get(peerId.toString());
           if (!t) throw new Error(`No transactor for ${peerId.toString()}`);
-          return t;
+          // A repo's view of the transactor: its batch methods answer differently (`undefined` means
+          // "send them one by one"), so they are not a repo's, and the repo offers none.
+          return { get: t.get.bind(t), pend: t.pend.bind(t), cancel: t.cancel.bind(t), commit: t.commit.bind(t) };
         },
       });
 

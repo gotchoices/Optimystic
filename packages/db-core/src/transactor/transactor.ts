@@ -58,4 +58,19 @@ export type ITransactor = {
 		  unable to establish the outcome, which it reports as such rather than guessing either way.
 	 */
 	getLineage?(ref: ActionBlocks & { rev: number }): Promise<ActionLineage>;
+
+	/** Pend every request (one action's, disjoint blocks) as ONE request to one coordinator, answered
+		together — one consensus record for the whole set (`IRepo.pendMany`).
+		- `undefined`: they could not go as one — nothing of them is left pended by this call, and the
+		  caller pends them its usual way. Never a verdict.
+		- Optional: without it, a writer pends each request on its own.
+	 */
+	pendMany?(requests: readonly PendRequest[]): Promise<PendResult | undefined>;
+
+	/** Commit every request as ONE request to one coordinator, answered together (`IRepo.commitMany`).
+		- `undefined`: they could not go as one, or the one request threw; the caller commits them its
+		  usual way. Never a verdict.
+		- Optional, like {@link pendMany}.
+	 */
+	commitMany?(requests: readonly CommitRequest[]): Promise<CommitResult | undefined>;
 }

@@ -89,8 +89,14 @@ This document describes the architecture for multi-collection transactions in Op
 
 > ### ⚠️ Session-mode (distributed) commit is not atomic across collections either
 >
-> The consensus path narrows the split window but does not (yet) close it. The
-> COMMIT phase commits each collection's pended blocks **independently**
+> The consensus path narrows the split window but does not (yet) close it. When one
+> coordinator covers every collection's blocks — always, in a group no larger than a
+> cohort — the collections commit as ONE consensus record (`ITransactor.commitMany`),
+> decided together; but a member still applies each collection on its own, and a record
+> the cohort decided can be answered refused while some of its collections already sit
+> on a majority of members (members that held only part of it), which the forward
+> recovery below finishes. When they cannot travel together, the COMMIT phase commits
+> each collection's pended blocks **independently**
 > (`TransactionCoordinator.commitPhase`, fanned out per collection). Once PEND
 > succeeds for every collection the coordinator has "decided to commit", but a
 > per-collection commit can still be refused between PEND and COMMIT — a **stale

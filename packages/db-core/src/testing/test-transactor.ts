@@ -508,6 +508,18 @@ export abstract class DelegatingTransactor implements ITransactor {
 	get queryClusterNominees(): ((blockId: BlockId) => Promise<ClusterNomineesResult>) | undefined {
 		return this.inner.queryClusterNominees?.bind(this.inner);
 	}
+
+	// Getters for the same reason: the coordinator treats their absence as "pend and commit each
+	// collection on its own". `TestTransactor` offers neither, so a wrapped one keeps that path.
+	get pendMany(): ITransactor['pendMany'] {
+		const inner: ITransactor = this.inner;
+		return inner.pendMany?.bind(inner);
+	}
+
+	get commitMany(): ITransactor['commitMany'] {
+		const inner: ITransactor = this.inner;
+		return inner.commitMany?.bind(inner);
+	}
 }
 
 /**

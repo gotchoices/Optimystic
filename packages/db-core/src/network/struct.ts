@@ -83,18 +83,20 @@ export type PendRequest = ActionTransforms & {
 	 */
 	baseRevs?: BlockBaseRevs;
 	/**
-	 * The writer's word that this pend is the action's only one — every block the action will commit
-	 * is in this one request — and that the action's commit goes to the coordinator this pend goes
-	 * to. Only then may a coordinator hold back the pend's final delivery to the other members and
-	 * send it inside the commit's first request (`ClusterCoordinator.mayDeferPendDelivery` in db-p2p):
-	 * a member that refuses the pend late refuses that one commit, before anything of the action is
-	 * durable. A send that pends several requests before committing any — several collections under
-	 * one action id, or one collection split across coordinators — must never carry it: one request's
-	 * late refusal would surface while another request's commit may already have landed, tearing the
-	 * action.
+	 * The writer's word that this pend, together with the other pends sent with it in one request
+	 * (`IRepo.pendMany`), is the action's whole reservation — every block the action will commit is in
+	 * that one request — and that the action's commit goes as one request to the coordinator this pend
+	 * goes to. Only then may a coordinator hold back the pend record's final delivery to the other
+	 * members and send it inside the commit's first request (`ClusterCoordinator.mayDeferPendDelivery`
+	 * in db-p2p): a member that refuses any of the record's pends late refuses that one commit record,
+	 * before anything of the action is durable. A send that pends in several requests before committing
+	 * any — several collections one request each under one action id, or one collection split across
+	 * coordinators — must never carry it: one request's late refusal would surface while another
+	 * request's commit may already have landed, tearing the action.
 	 *
-	 * Set by `TransactorSource.transact` and by `TransactionCoordinator` for a transaction of exactly
-	 * one collection; `NetworkTransactor.pend` keeps it only on a request carrying the whole pend.
+	 * Set by `TransactorSource.transact`, and by `TransactionCoordinator` for a transaction of exactly
+	 * one collection or for every request of a `pendMany` (whose commit goes through `commitMany`);
+	 * `NetworkTransactor.pend` keeps it only on a request carrying the whole pend.
 	 * `Collection.completeOwnEntry` re-sends one participant of a half-landed multi-collection action
 	 * through `transact`, and carries it too: that re-send pends and commits its one collection on its
 	 * own, so its late refusal stops only its own commit, as an on-time refusal would.

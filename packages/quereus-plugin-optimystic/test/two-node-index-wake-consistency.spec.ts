@@ -3,24 +3,26 @@
  * the table AND its index have landed there — GitHub #47, the Sereus report, reproduced on the
  * in-process mesh.
  *
- * A row's insert pends and commits the table and the index as separate consensus records under one
- * action id, so node 1 applies them as two `StorageRepo.commit` calls. Before the storage-side hold
+ * A row's insert commits the table and the index under one action id. Whether the two travel in one
+ * consensus record (the batched commit) or in two (when they cannot go as one), node 1 applies them as
+ * two `StorageRepo.commit` calls, the table's first. Before the storage-side hold
  * (`StorageRepo.emitCollectionChanges`), node 1's vtab was woken by the table's commit, looked the row
  * up through the index from node 1's own replica — which did not hold the index's commit yet — and
  * found nothing; the index's own event wakes nobody, so the app saw the row at its next poll or never.
  *
  * To make the gap deterministic rather than a race, node 1's apply of the index's commit is made to lag
- * its apply of the table's: every cluster delivery to node 1 carrying a commit of the index's log tail
- * waits on a gate that node 1's wake handler releases after it has run its lookups (or a fallback
- * delay, since with the hold in place the handler does not run until the index lands). The second
- * case runs the same scenario with the hold disabled and observes the gap, so the first case cannot
- * pass for want of the race it is meant to close.
+ * its apply of the table's: node 1's storage holds every commit of the index's log tail on a gate that
+ * node 1's wake handler releases after it has run its lookups (or a fallback delay, since with the hold
+ * in place the handler does not run until the index lands). The gate sits at storage rather than on the
+ * cluster delivery because a batched record delivers both commits at once. The second case runs the
+ * same scenario with the hold disabled and observes the gap, so the first case cannot pass for want of
+ * the race it is meant to close.
  */
 
 import { expect } from 'chai';
 import { defaultCollectionUri } from '../dist/index.js';
 import type { Database, SqlValue } from '@quereus/quereus';
-import { Collection, type BlockId, type ClusterRecord, type CollectionId } from '@optimystic/db-core';
+import { Collection, type CollectionId } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { collectionIdOf } from './trace-helpers.js';
 import { createMeshDbNode, startMockMesh, type MockMeshOptions } from './mesh-node-harness.js';
@@ -63,11 +65,6 @@ function gate(fallbackMs: number): { promise: Promise<void>; release(): void } {
 	return { promise, release: () => { clearTimeout(timer); open(); } };
 }
 
-/** Whether any of `records` commits the collection whose log tail is `tailId`. */
-function commitsTail(records: readonly ClusterRecord[], tailId: BlockId): boolean {
-	return records.some(record => record.message.operations.some(op => 'commit' in op && op.commit.tailId === tailId));
-}
-
 interface Scenario {
 	/** Every wake node 1's handler ran, in order. */
 	readonly wakes: readonly Wake[];
@@ -100,13 +97,15 @@ async function scenario(meshOptions: MockMeshOptions, indexLagFallbackMs: number
 	const indexTail = await Collection.readCommittedTail(transactorFor(0), INDEX_COLLECTION_ID);
 	expect(indexTail, 'the index collection has a committed tail after the seed insert').to.not.equal(undefined);
 
-	const watcherPeer = mesh.nodes[1]!.peerId.toString();
 	let latestId = 0;
 	let indexLag: ReturnType<typeof gate> | undefined;
-	mesh.failures.onClusterDelivery = async (target, record, carried) => {
-		if (target === watcherPeer && indexLag !== undefined && commitsTail([record, ...carried], indexTail!.tailId)) {
+	const watcherStorage = mesh.nodes[1]!.storageRepo;
+	const applyCommit = watcherStorage.commit.bind(watcherStorage);
+	watcherStorage.commit = async (request, options, apply) => {
+		if (indexLag !== undefined && request.tailId === indexTail!.tailId) {
 			await indexLag.promise;
 		}
+		return await applyCommit(request, options, apply);
 	};
 
 	const wakes: Wake[] = [];
@@ -130,7 +129,7 @@ async function scenario(meshOptions: MockMeshOptions, indexLagFallbackMs: number
 		},
 		async close(): Promise<void> {
 			subscription.unsubscribe();
-			mesh.failures.onClusterDelivery = undefined;
+			watcherStorage.commit = applyCommit;
 			await watcher.db.close();
 			await writer.db.close();
 		}

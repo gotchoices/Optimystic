@@ -110,6 +110,12 @@ const readingFrom = (node: MeshNode, inner: ITransactor): ITransactor => {
 	if (inner.queryClusterNominees) {
 		transactor.queryClusterNominees = blockId => inner.queryClusterNominees!(blockId);
 	}
+	if (inner.pendMany) {
+		transactor.pendMany = requests => inner.pendMany!(requests);
+	}
+	if (inner.commitMany) {
+		transactor.commitMany = requests => inner.commitMany!(requests);
+	}
 	return transactor;
 };
 

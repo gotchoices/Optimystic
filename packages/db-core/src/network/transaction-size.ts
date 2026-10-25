@@ -4,8 +4,8 @@ import type { PendRequest } from "./struct.js";
 /**
  * The most bytes one transaction's pend may encode to: 7.5 MiB, measured by {@link jsonEncodedBytes}
  * over the {@link PendRequest}s that travel together in one consensus record — transforms, validation
- * payload and all. That is one collection's pend for a writer that pends each collection on its own
- * (`TransactionCoordinator` today), and the sum of the batch for `IRepo.pendMany`.
+ * payload and all. That is the sum of the batch when a transaction's collections travel together
+ * (`IRepo.pendMany`), and one collection's pend when they cannot and each is pended on its own.
  *
  * A pend's payload travels whole in one frame on every hop it takes: writer → coordinator on the repo
  * protocol, then coordinator → each other cohort member on the cluster protocol, and back as the
@@ -48,17 +48,26 @@ export class TransactionTooLargeError extends Error {
 }
 
 /**
- * Throws {@link TransactionTooLargeError} when `requests` — one transaction's pends that ride in one
- * consensus record — together encode to more than {@link MAX_TRANSACTION_BYTES}. The one rule both the
- * writer (before sending) and the coordinator (on receipt) apply.
+ * What `requests` — one transaction's pends that ride in one consensus record — encode to together,
+ * the measure {@link MAX_TRANSACTION_BYTES} is judged by.
  *
  * NOTE: encodes every request once more than sending it does, on the writer and again on the
  * coordinator. Negligible for an ordinary write; if pend encoding ever shows in a profile of large
  * writes, measure once on the writer and hand the size along instead.
  */
-export function assertTransactionFits(requests: readonly PendRequest[]): void {
-	if (requests.length === 0) return;
+export function transactionBytes(requests: readonly PendRequest[]): number {
 	let bytes = 0;
 	for (const request of requests) bytes += jsonEncodedBytes(request);
+	return bytes;
+}
+
+/**
+ * Throws {@link TransactionTooLargeError} when `requests` together encode to more than
+ * {@link MAX_TRANSACTION_BYTES} ({@link transactionBytes}). The one rule both the writer (before
+ * sending) and the coordinator (on receipt) apply.
+ */
+export function assertTransactionFits(requests: readonly PendRequest[]): void {
+	if (requests.length === 0) return;
+	const bytes = transactionBytes(requests);
 	if (bytes > MAX_TRANSACTION_BYTES) throw new TransactionTooLargeError(requests[0]!.actionId, bytes);
 }

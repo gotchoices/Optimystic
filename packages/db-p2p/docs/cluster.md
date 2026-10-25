@@ -334,19 +334,21 @@ commit — sending that one the record again, now that the coordinator's member 
 a behind member another reconcile — and, in a cohort of two, the other member. In a healthy two- or
 three-member cohort a consensus operation therefore costs each remote member two calls instead of three.
 
-**A single-collection write's pend delivers its decision with the commit.** In a cohort of two, the
-decision of a pend whose writer marked it the action's only reservation (`PendRequest.soleReservation`:
-`TransactorSource.transact`, and `TransactionCoordinator` for a one-collection transaction) is not sent
-on its own. It is owed to the other member, and the action's commit carries it on its first request,
+**A write's pend delivers its decision with the commit.** In a cohort of two, the decision of a pend
+record whose writer marked every operation the action's only reservation (`PendRequest.soleReservation`:
+`TransactorSource.transact`; `TransactionCoordinator` for a one-collection transaction, and for every
+request of a set of collections it sends as one batch, `ITransactor.pendMany`, whose commit then goes as
+one batch too) is not sent on its own. It is owed to the other member, and the action's commit carries it on its first request,
 ahead of the commit's own record ([below](#owed-deliveries-ride-on-the-next-request)), so the member
-applies the pend, or refuses it, before it votes on the commit. Such a write costs the other member three
-requests instead of four. The decision is held back only when this node's own member applied the pend
+applies the pend, or refuses it, before it votes on the commit — every collection of a batch before the
+batch's one commit record. Such a write costs the other member three requests instead of four, however
+many collections it writes. The decision is held back only when this node's own member applied the pend
 and its storage accepted it, every remote member can be carried to — its answers stamp
 `acceptsCarried` and this node's client for it can carry — and the record's expiration is more than
 twice the deferral away (`mayDeferPendDelivery`). If no commit follows within `pendDeliveryDeferralMs`
 the decision goes alone, as a scheduled retry that does not count against
-`commitBroadcastRetryMaxAttempts`. A pend without the mark — every pend of a transaction spanning
-several collections — is delivered at once: its late refusal could surface after a sibling collection's
+`commitBroadcastRetryMaxAttempts`. A pend without the mark — a pend of a transaction whose collections
+go one request each — is delivered at once: its late refusal could surface after a sibling collection's
 commit landed, tearing the write (see [`docs/correctness.md` §2](../../../docs/correctness.md#2-definitions)).
 
 This simple majority is the *cluster-internal* commit-signature count — how many members have signed commit — not the writer-facing acknowledgement. The coordinator's answer to the writer is gated separately, by a post-reconcile storage-durability majority (the durability gate); it does not follow from commit-signature count alone. See [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for the full three-checkpoint pipeline.
