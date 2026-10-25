@@ -1,0 +1,50 @@
+description: A table's rows are stored in tree nodes of up to 64 rows each however large the rows are, so a table of large rows built nodes too big to copy between machines. Tree nodes now split by size as well as by count, and a separate ordering bug in branch splits was found and fixed on the way.
+architecture: packages/db-core/docs/btree.md#node-size
+files: packages/db-core/src/btree/btree.ts (`nodeTargetBytes`, `leafEdit`, `leafRuns`, `branchInsert`, `branchRuns`, `growRoot`, `cutTail`, `measure`, `leafUnderfull`, `leavesMerge`, `branchesMerge`), packages/db-core/src/btree/node-division.ts (`divideItems`, `fewestRuns`, `balancedSplit`, `leafItemBytes`, `branchItemBytes`), packages/db-core/src/collections/tree/tree.ts, packages/db-core/test/btree-node-size.spec.ts, packages/db-core/docs/btree.md, docs/internals.md, packages/db-core/README.md
+difficulty: hard
+----
+# A tree node splits by size
+
+## What landed (implement stage, `ticket(implement): a-tree-node-splits-by-size`)
+
+- `BTree` takes an optional `nodeTargetBytes` (constructor and `BTree.create`, after `nodeCapacity` and `newId`), measured like every block limit as the UTF-8 length of the node's JSON. `Tree` passes `BLOCK_TARGET_BYTES` (1 MiB) to every B-tree it writes through: the per-action tree, the create-path tree and the reopen tree. A bare `BTree` without a target behaves as before and never serializes a node to measure it.
+- **Fit rule.** A node fits when it holds at most `nodeCapacity` items and either no more than the target's bytes or the least a node holds: one entry for a leaf, two children (one key) for a branch. So a node over the target holds only that minimum.
+- **Division.** An insert or an in-place update (`upsert`, `updateAt`, `merge`) is judged on the leaf as it would stand with the edit applied. Over the count alone the node splits at the midpoint exactly as before, so trees of small entries write the same transforms. Over the bytes it divides into the fewest runs that each fit, balanced where two suffice, so an entry larger than the target lands alone in its own leaf and a leaf that outgrew the target before this change is brought within it by one write. A parent absorbs all of a child's new nodes at once and divides by the same rules; a root that cannot hold them grows a level and absorbs them through the same path.
+- **Rebalance on delete.** A node is under-full only when below half the count and below half the byte target. A borrow is refused when the receiver would pass the target; a merge when the merged node would, except a merge that removes an empty leaf.
+- **Determinism.** Every division is a pure function of the node's content and the edit.
+- **A pre-existing bug fixed on the way.** When a middle child of a full branch split and the new key landed in that child's right half, the old `branchInsert` inserted the new leaf into both halves of the dividing branch: a scan returned the moved entries twice and a point lookup for a key in the misplaced sibling returned nothing. Reproduced at fan-out 4 (keys 0, 10, …, 90, 35, 37, 38) and pinned by a spec. At the default fan-out it needed a branch of 64 leaves with out-of-order inserts, which is why the ascending-insert specs never saw it. Trees already written with the defect are not repaired.
+- Docs: "Node size" section in `packages/db-core/docs/btree.md`, a paragraph in `docs/internals.md` under "A transaction's size limit", one bullet in `packages/db-core/README.md`.
+
+## Review findings
+
+Read the implement-stage diff first, then the handoff; then read every function the division touches end to end and probed the arithmetic with a scratch spec (deleted) that recorded the operations a division writes and compared each merge formula against the JSON size of the merged node.
+
+**Checked and found correct.** The tail-cut index arithmetic in `leafEdit` and `branchInsert` for all four cases (insert or replace, landing in the kept run or a right run); key promotion for each right run; the path following its entry into a new leaf or branch; `growRoot` for both the whole-root and the absorb-through-`branchInsert` shape, including the loop for a second level; the claim that the count-only split is byte-identical to the old midpoint split, re-derived for leaf and branch at even and odd capacities; that no run `fewestRuns` or `balancedSplit` produces exceeds `nodeCapacity`, and that a count-only division of a branch that absorbed many children never does either (a node has at most 64 items and receives at most 64 new ones, so the midpoint of at most 128 is within capacity); the leaf borrow and merge byte formulas (exact); the empty-leaf merge exemption; the `Tracker` folding operations on a just-inserted node into the insert rather than recording updates; the `Keyset` subclass, which overrides nothing affected; and that the only `BTree` constructed without the target, `Tree.readView`, writes nothing.
+
+**Minor, fixed in this pass.**
+
+- `branchesMerge` under-counted the merged branch by one byte: joining two branches under the parent's key adds three commas (one before the key, one before each appended list), not two. Confirmed by measuring a merged branch against the formula (actual 125, formula 124). Now `+ 3`.
+- A division that left the old node with every item it had still recorded a zero-length splice against it, so the block was marked updated and re-committed and replicated for nothing. Confirmed with a probe: appending an entry larger than the leaf's ten existing entries together recorded `[entries, 10, 0, []]` on the untouched leaf. The branch path had the same shape for a leaf that overflowed from a branch's last child. Both cuts now go through `cutTail`, which records nothing when nothing is dropped. A spec pins it (*records no operation on a leaf that keeps every entry it had*).
+- The delete path serialized the rebalanced leaf up to five times (under-full check, two borrow checks, two merge checks) where the docs promised one. `rebalanceLeaf` and `rebalanceBranch` now measure the node once (`measure`, a `NodeFill`) and hand that to the fill rules; each sibling is still serialized once. The merge rules are written from the measured node's side, which is symmetric, so the left-merge no longer measures the sibling as the base.
+- `btree.ts` had grown to 1161 lines. The pure division arithmetic (`divideItems`, `fewestRuns`, `balancedSplit`, `countSplit`, `runOf`, and the leaf and branch byte rules `leafItemBytes` and `branchItemBytes`) moved to `packages/db-core/src/btree/node-division.ts` (155 lines); `btree.ts` is now 1050. Doc citations to `divideItems` updated in `packages/db-core/docs/btree.md` and `docs/internals.md`; `yarn lint:docs` resolves.
+- `packages/db-core/docs/btree.md` said `Tree` sets the target "write and read side alike"; `Tree.readView` is given none. Reworded to name the three trees that get it and the read view that does not, and the cost paragraph now says "one each" of the rebalanced node and its siblings, which is true after the fix above. A bullet records that a node the division leaves unchanged is not written.
+
+**Major.** None. The one class-level question, whether the `BTree` constructor's seven positional parameters should become an options object, is API shaping with no defect behind it and was left alone.
+
+**Tripwires recorded.**
+
+- `NOTE:` at `leafRuns` in `packages/db-core/src/btree/btree.ts` (kept from the implement stage): every entry of a leaf is serialized once per insert or in-place update; keep a running byte count per leaf if bulk inserts show it in a profile.
+- `NOTE:` at `rebalanceLeaf` in the same file (kept): a leaf under-full by both measures whose siblings refuse it by bytes reads both siblings on every delete and writes nothing.
+- `NOTE:` at `fewestRuns` in `packages/db-core/src/btree/node-division.ts` (new): three children whose two keys each pass half the target leave a one-child branch, which the tree routes through and a delete merges away. Only a key over half the target gets there, which no key the SQL layer frames does.
+
+**Considered and declined.**
+
+- Extending `packages/db-core/test/btree.property.spec.ts` with a byte-target arm or longer sequences, as the handoff suggested. The new spec's shuffled 200-insert and 170-delete sweeps under small byte targets, checked against a model after every delete, already cover the division and rebalance class at random; the property spec's entries are bare numbers, so a byte arm would need a different entry shape for little added coverage.
+- `growRoot` mints a header for a whole root it may then discard. Harmless, and ids are random, so it has no bearing on replay determinism.
+- A `Tree` built by `Tree.readView` without `nodeCapacity` (pre-existing); read-only, so neither limit matters.
+
+**Tests.** The six implement-stage specs check externally visible rules (every node within the limits, order preserved, model agreement, the path staying on its entry) rather than the division arithmetic, and were kept. One spec added for the defect found above. No spec cut.
+
+**Validation.** `npx tsc --noEmit -p packages/db-core/tsconfig.json` clean; `eslint` on the changed source and specs clean; `yarn workspace @optimystic/db-core test` 1917 passing; `yarn lint:docs` all citations resolve; `yarn build` clean; `yarn workspace @optimystic/upgrade-check test` 143 passing (trees older releases wrote still read); `yarn workspace @optimystic/quereus-plugin-optimystic test` 1064 passing, 14 pending, smoke ok. Not run: the db-p2p suite (no db-p2p source changed, and small-entry trees write the same transforms as before), `yarn test:integration`, `yarn check:rn`.
+
+**Remaining choices a reader should know.** A branch's minimum is two children, so a branch whose two keys together pass the target stays over it. Only the node's own content is measured, not the transaction envelope. There is no way to set a tree collection's target; `BLOCK_TARGET_BYTES` is a constant and needs no persisting. What is still open in this area is tracked by `a-writer-refuses-a-block-too-large-to-copy`.

@@ -7,6 +7,7 @@ import type { BranchNode, ITreeNode, LeafNode } from "./nodes.js";
 import type { TreeBlock } from "./tree-block.js";
 import { AtomicProxy, type AtomicScope } from "../transform/atomic-proxy.js";
 import { jsonEncodedBytes } from "../network/transaction-size.js";
+import { branchItemBytes, divideItems, emptyBranchBytes, emptyLeafBytes, leafItemBytes, runOf } from "./node-division.js";
 
 export const NodeCapacity = 64;
 
@@ -683,11 +684,10 @@ export class BTree<TKey, TEntry> {
 		});
 		const end = runs[1]!;	// this leaf keeps the entries before it
 		if (index < end) {	// the edit lands in this leaf: cut the tail off, then apply it
-			const kept = end - 1 + deleteCount;	// entries of the leaf as it stands that stay, before the edit
-			apply(this.store, leaf, [entries$, kept, leaf.entries.length - kept, []]);
+			this.cutTail(leaf, entries$, leaf.entries.length, end - 1 + deleteCount);	// what stays, counted in the leaf as it stands
 			apply(this.store, leaf, op);
 		} else {	// the edit landed in a new leaf, placed above
-			apply(this.store, leaf, [entries$, end, leaf.entries.length - end, []]);
+			this.cutTail(leaf, entries$, leaf.entries.length, end);
 		}
 		const pathRun = runOf(runs, index);
 		if (pathRun > 0) {
@@ -703,18 +703,12 @@ export class BTree<TKey, TEntry> {
 	 *  {@link divideItems} for the division, a pure function of the leaf's content and the edit, so a
 	 *  replayed or retried action produces the same transforms. */
 	private leafRuns(leaf: LeafNode<TEntry>, entries: readonly TEntry[], at: number): number[] | undefined {
-		let bytes: ItemBytes | undefined;
-		if (this.nodeTargetBytes !== undefined && entries.length > 1) {
-			// NOTE: serializes every entry of the leaf once per insert or in-place update, the same order
-			// of cost as the commit path's digest of each touched block. If bulk inserts ever show this in
-			// a profile, keep a running byte count per leaf instead of re-measuring it.
-			const before = prefixSums(itemBytes(entries));
-			const base = emptyLeafBytes(leaf);
-			bytes = {
-				target: this.nodeTargetBytes,
-				between: (from, to) => base + before[to]! - before[from]! + Math.max(0, to - from - 1),
-			};
-		}
+		// NOTE: serializes every entry of the leaf once per insert or in-place update, the same order
+		// of cost as the commit path's digest of each touched block. If bulk inserts ever show this in
+		// a profile, keep a running byte count per leaf instead of re-measuring it.
+		const bytes = this.nodeTargetBytes !== undefined && entries.length > 1
+			? leafItemBytes(leaf, entries, this.nodeTargetBytes)
+			: undefined;
 		return divideItems(entries.length, this.nodeCapacity, at, 1, bytes);
 	}
 
@@ -749,8 +743,8 @@ export class BTree<TKey, TEntry> {
 		// those that fall before `end` land here: cut the tail off the branch as it stands, then insert them.
 		const end = runs[1]!;
 		const landed = Math.min(Math.max(end - (childIndex + 1), 0), ids.length);
-		apply(this.store, node, [partitions$, end - 1 - landed, node.partitions.length - (end - 1 - landed), []]);
-		apply(this.store, node, [nodes$, end - landed, node.nodes.length - (end - landed), []]);
+		this.cutTail(node, partitions$, node.partitions.length, end - 1 - landed);
+		this.cutTail(node, nodes$, node.nodes.length, end - landed);
 		if (landed > 0) {
 			this.insertChildren(node, childIndex, keys.slice(0, landed), ids.slice(0, landed));
 		}
@@ -766,20 +760,11 @@ export class BTree<TKey, TEntry> {
 	 *  absorbed, the path following child `at` — divide into branches, or `undefined` when they fit one;
 	 *  the counterpart of {@link leafRuns}. A branch's bytes are its keys and child ids, so only large
 	 *  keys ever make bytes the reason, and a branch of two children (one key) always counts as fitting:
-	 *  nothing smaller routes. A run of children `[from, to)` carries the keys between them; the key
-	 *  before `from` is promoted and counts on neither side. */
+	 *  nothing smaller routes. */
 	private branchRuns(branch: BranchNode<TKey>, partitions: readonly TKey[], nodes: readonly BlockId[], at: number): number[] | undefined {
-		let bytes: ItemBytes | undefined;
-		if (this.nodeTargetBytes !== undefined && nodes.length > 2) {
-			const ids = prefixSums(itemBytes(nodes));
-			const keys = prefixSums(itemBytes(partitions));
-			const base = emptyBranchBytes(branch);
-			bytes = {
-				target: this.nodeTargetBytes,
-				between: (from, to) => base + ids[to]! - ids[from]! + keys[to - 1]! - keys[from]!
-					+ Math.max(0, to - from - 1) + Math.max(0, to - from - 2),
-			};
-		}
+		const bytes = this.nodeTargetBytes !== undefined && nodes.length > 2
+			? branchItemBytes(branch, partitions, nodes, this.nodeTargetBytes)
+			: undefined;
 		return divideItems(nodes.length, this.nodeCapacity, at, 2, bytes);
 	}
 
@@ -793,18 +778,21 @@ export class BTree<TKey, TEntry> {
 	 *  that, since an empty leaf always merges. If such reads ever show up, remember the refusal on
 	 *  the path for the rest of the action. */
 	protected async rebalanceLeaf(path: Path<TKey, TEntry>, depth: number): Promise<ITreeNode | undefined> {
-		if (depth === 0 || !this.leafUnderfull(path.leafNode)) {
+		if (depth === 0) {
 			return undefined;
 		}
-
 		const leaf = path.leafNode;
+		const fill = this.measure(leaf);
+		if (!this.leafUnderfull(leaf, fill)) {
+			return undefined;
+		}
 		const parent = path.branches.at(depth - 1)!;
 		const pIndex = parent.index;
 		const pNode = parent.node;
 
 		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as LeafNode<TEntry> : undefined;
-		if (rightSib && rightSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, rightSib.entries[0]!)) {   // Attempt to borrow from right sibling
+		if (rightSib && rightSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, fill, rightSib.entries[0]!)) {   // Attempt to borrow from right sibling
 			const entry = rightSib.entries[0]!;
 			apply(this.store, rightSib, [entries$, 0, 1, []]);
 			apply(this.store, leaf, [entries$, leaf.entries.length, 0, [entry]]);
@@ -814,7 +802,7 @@ export class BTree<TKey, TEntry> {
 
 		const leftSibId = pNode.nodes[pIndex - 1];
 		const leftSib = leftSibId ? (await get(this.store, leftSibId)) as LeafNode<TEntry> : undefined;
-		if (leftSib && leftSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, leftSib.entries[leftSib.entries.length - 1]!)) {   // Attempt to borrow from left sibling
+		if (leftSib && leftSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, fill, leftSib.entries[leftSib.entries.length - 1]!)) {   // Attempt to borrow from left sibling
 			const entry = leftSib.entries[leftSib.entries.length - 1]!;
 			apply(this.store, leftSib, [entries$, leftSib.entries.length - 1, 1, []]);
 			apply(this.store, leaf, [entries$, 0, 0, [entry]]);
@@ -823,7 +811,7 @@ export class BTree<TKey, TEntry> {
 			return undefined;
 		}
 
-		if (rightSib && this.leavesMerge(leaf, rightSib)) {  // Attempt to merge right sibling into leaf (right sib deleted)
+		if (rightSib && this.leavesMerge(leaf, fill, rightSib)) {  // Attempt to merge right sibling into leaf (right sib deleted)
 			apply(this.store, leaf, [entries$, leaf.entries.length, 0, rightSib.entries]);
 			this.deletePartition(pNode, pIndex);
 			if (pIndex === 0) { // 0th node of parent, update parent key
@@ -833,7 +821,7 @@ export class BTree<TKey, TEntry> {
 			return await this.rebalanceBranch(path, depth - 1);
 		}
 
-		if (leftSib && this.leavesMerge(leftSib, leaf)) {  // Attempt to merge into left sibling (leaf deleted)
+		if (leftSib && this.leavesMerge(leaf, fill, leftSib)) {  // Attempt to merge into left sibling (leaf deleted)
 			// NOTE: this fixes leafIndex, but the parent-branch index up the path is left pointing at
 			// the now-deleted leaf's old slot (same tolerated-staleness class as rebalanceBranch's
 			// left-merge, part c). Harmless today because deleteAt version-bumps and abandons the
@@ -859,7 +847,11 @@ export class BTree<TKey, TEntry> {
 			return path.branches[depth + 1]?.node ?? path.leafNode;
 		}
 
-		if (depth === 0 || !this.branchUnderfull(branch)) {
+		if (depth === 0) {
+			return undefined;
+		}
+		const fill = this.measure(branch);
+		if (!this.branchUnderfull(branch, fill)) {
 			return undefined;
 		}
 
@@ -869,7 +861,7 @@ export class BTree<TKey, TEntry> {
 
 		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as BranchNode<TKey> : undefined;
-		if (rightSib && rightSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(branch, pNode.partitions[pIndex]!, rightSib.nodes[0]!)) {   // Attempt to borrow from right sibling
+		if (rightSib && rightSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(fill, pNode.partitions[pIndex]!, rightSib.nodes[0]!)) {   // Attempt to borrow from right sibling
 			const node = rightSib.nodes[0]!;
 			const rightKey = rightSib.partitions[0]!;
 			this.insertPartition(branch, branch.partitions.length, pNode.partitions[pIndex]!, node);
@@ -880,7 +872,7 @@ export class BTree<TKey, TEntry> {
 
 		const leftSibId = pNode.nodes[pIndex - 1];
 		const leftSib = leftSibId ? (await get(this.store, leftSibId)) as BranchNode<TKey> : undefined;
-		if (leftSib && leftSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(branch, pNode.partitions[pIndex - 1]!, leftSib.nodes[leftSib.nodes.length - 1]!)) {   // Attempt to borrow from left sibling
+		if (leftSib && leftSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(fill, pNode.partitions[pIndex - 1]!, leftSib.nodes[leftSib.nodes.length - 1]!)) {   // Attempt to borrow from left sibling
 			const node = leftSib.nodes[leftSib.nodes.length - 1]!;
 			const pKey = leftSib.partitions[leftSib.partitions.length - 1]!;
 			this.insertPartition(branch, 0, pNode.partitions[pIndex - 1]!, node, 0);
@@ -890,7 +882,7 @@ export class BTree<TKey, TEntry> {
 			return undefined;
 		}
 
-		if (rightSib && this.branchesMerge(branch, rightSib, pNode.partitions[pIndex]!)) {   // Attempt to merge right sibling into self
+		if (rightSib && this.branchesMerge(branch, fill, rightSib, pNode.partitions[pIndex]!)) {   // Attempt to merge right sibling into self
 			const pKey = pNode.partitions[pIndex]!;
 			this.deletePartition(pNode, pIndex);
 			apply(this.store, branch, [partitions$, branch.partitions.length, 0, [pKey]]);
@@ -900,7 +892,7 @@ export class BTree<TKey, TEntry> {
 			return this.rebalanceBranch(path, depth - 1);
 		}
 
-		if (leftSib && this.branchesMerge(leftSib, branch, pNode.partitions[pIndex - 1]!)) {   // Attempt to merge self into left sibling
+		if (leftSib && this.branchesMerge(branch, fill, leftSib, pNode.partitions[pIndex - 1]!)) {   // Attempt to merge self into left sibling
 			const leftLen = leftSib.nodes.length;	// capture BEFORE the appends below shift it (see leaf path at rebalanceLeaf)
 			const pKey = pNode.partitions[pIndex - 1]!;
 			this.deletePartition(pNode, pIndex - 1);
@@ -933,6 +925,15 @@ export class BTree<TKey, TEntry> {
 	private insertChildren(branch: BranchNode<TKey>, index: number, keys: readonly TKey[], nodes: readonly BlockId[]) {
 		apply(this.store, branch, [partitions$, index, 0, keys.slice()]);
 		apply(this.store, branch, [nodes$, index + 1, 0, nodes.slice()]);
+	}
+
+	/** Drop the items of `node`'s `entity` array (now `length` long) from `keep` on. Nothing is
+	 *  recorded when there is nothing to drop: a zero-length splice would still mark the block updated
+	 *  and have it written again. */
+	private cutTail(node: ITreeNode, entity: string, length: number, keep: number) {
+		if (length > keep) {
+			apply(this.store, node, [entity, keep, length - keep, []]);
+		}
 	}
 
 	protected deletePartition(branch: BranchNode<TKey>, index: number, nodeOffset = 1) {
@@ -969,68 +970,73 @@ export class BTree<TKey, TEntry> {
 		await this.applyLeafEdit(path, { index: path.leafIndex, deleteCount: 1, entry });
 	}
 
-	// The fill rules a delete rebalances by. Each is one serialization of the nodes it weighs, and none
-	// runs without a byte target.
+	// The fill rules a delete rebalances by. The node being rebalanced is serialized once, into a
+	// `NodeFill`, and each sibling it weighs once; none of this runs without a byte target.
+
+	/** A node's bytes against the byte target, or `undefined` when the tree has none. */
+	private measure(node: ITreeNode): NodeFill | undefined {
+		return this.nodeTargetBytes === undefined ? undefined : { bytes: jsonEncodedBytes(node), target: this.nodeTargetBytes };
+	}
 
 	/** A leaf below half the count AND, with a byte target, below half the target — one that a borrow
 	 *  or merge could usefully fill. A leaf of a few large entries is under half the count for good but
 	 *  is a healthy block, so it is left alone and a delete from it reads no sibling. */
-	private leafUnderfull(leaf: LeafNode<TEntry>): boolean {
-		return leaf.entries.length < (this.nodeCapacity >>> 1)
-			&& (this.nodeTargetBytes === undefined || jsonEncodedBytes(leaf) < this.nodeTargetBytes / 2);
+	private leafUnderfull(leaf: LeafNode<TEntry>, fill: NodeFill | undefined): boolean {
+		return leaf.entries.length < (this.nodeCapacity >>> 1) && (fill === undefined || fill.bytes < fill.target / 2);
 	}
 
 	/** Whether `leaf` may take one more `entry` from a sibling without passing the byte target. */
-	private leafTakes(leaf: LeafNode<TEntry>, entry: TEntry): boolean {
-		return this.nodeTargetBytes === undefined
-			|| jsonEncodedBytes(leaf) + jsonEncodedBytes(entry) + (leaf.entries.length > 0 ? 1 : 0) <= this.nodeTargetBytes;
+	private leafTakes(leaf: LeafNode<TEntry>, fill: NodeFill | undefined, entry: TEntry): boolean {
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(entry) + (leaf.entries.length > 0 ? 1 : 0) <= fill.target;
 	}
 
-	/** Whether two sibling leaves may become one: within the count, and within the byte target unless
+	/** Whether `leaf` and a sibling may become one: within the count, and within the byte target unless
 	 *  one of them is empty — removing an empty leaf adds nothing to the other, so that is never refused
-	 *  and no empty leaf outlives the delete that emptied it. */
-	private leavesMerge(a: LeafNode<TEntry>, b: LeafNode<TEntry>): boolean {
-		if (a.entries.length + b.entries.length > this.nodeCapacity) {
+	 *  and no empty leaf outlives the delete that emptied it. Whichever of the two survives, the merged
+	 *  leaf is one fixed part plus both sets of entries and the comma that joins them. */
+	private leavesMerge(leaf: LeafNode<TEntry>, fill: NodeFill | undefined, sibling: LeafNode<TEntry>): boolean {
+		if (leaf.entries.length + sibling.entries.length > this.nodeCapacity) {
 			return false;
 		}
-		if (this.nodeTargetBytes === undefined || a.entries.length === 0 || b.entries.length === 0) {
+		if (fill === undefined || leaf.entries.length === 0 || sibling.entries.length === 0) {
 			return true;
 		}
-		return jsonEncodedBytes(a) + jsonEncodedBytes(b) - emptyLeafBytes(b) + 1 <= this.nodeTargetBytes;
+		return fill.bytes + jsonEncodedBytes(sibling) - emptyLeafBytes(sibling) + 1 <= fill.target;
 	}
 
 	/** {@link leafUnderfull} for a branch, by its children. */
-	private branchUnderfull(branch: BranchNode<TKey>): boolean {
-		return branch.nodes.length < (this.nodeCapacity >>> 1)
-			&& (this.nodeTargetBytes === undefined || jsonEncodedBytes(branch) < this.nodeTargetBytes / 2);
+	private branchUnderfull(branch: BranchNode<TKey>, fill: NodeFill | undefined): boolean {
+		return branch.nodes.length < (this.nodeCapacity >>> 1) && (fill === undefined || fill.bytes < fill.target / 2);
 	}
 
-	/** Whether `branch` may take one more child, `node`, under `key` — the parent's key that comes down
-	 *  with it — without passing the byte target. */
-	private branchTakes(branch: BranchNode<TKey>, key: TKey, node: BlockId): boolean {
-		return this.nodeTargetBytes === undefined
-			|| jsonEncodedBytes(branch) + jsonEncodedBytes(key) + jsonEncodedBytes(node) + 2 <= this.nodeTargetBytes;
+	/** Whether the measured branch may take one more child, `node`, under `key` — the parent's key
+	 *  that comes down with it — without passing the byte target: the key and the id, a comma before each. */
+	private branchTakes(fill: NodeFill | undefined, key: TKey, node: BlockId): boolean {
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(key) + jsonEncodedBytes(node) + 2 <= fill.target;
 	}
 
-	/** Whether two sibling branches may become one under `key`, the parent's key between them: within
-	 *  the count and, with a byte target, within it. A branch is never empty, so there is no exemption. */
-	private branchesMerge(a: BranchNode<TKey>, b: BranchNode<TKey>, key: TKey): boolean {
-		if (a.nodes.length + b.nodes.length > this.nodeCapacity) {
+	/** Whether `branch` and a sibling may become one under `key`, the parent's key between them: within
+	 *  the count and, with a byte target, within it — the sibling's keys and ids, the key that comes down,
+	 *  and the three commas that join them (one before the key, one before each of the two lists). A
+	 *  branch is never empty, so there is no exemption. */
+	private branchesMerge(branch: BranchNode<TKey>, fill: NodeFill | undefined, sibling: BranchNode<TKey>, key: TKey): boolean {
+		if (branch.nodes.length + sibling.nodes.length > this.nodeCapacity) {
 			return false;
 		}
-		return this.nodeTargetBytes === undefined
-			|| jsonEncodedBytes(a) + jsonEncodedBytes(b) - emptyBranchBytes(b) + jsonEncodedBytes(key) + 2 <= this.nodeTargetBytes;
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(sibling) - emptyBranchBytes(sibling) + jsonEncodedBytes(key) + 3 <= fill.target;
 	}
 }
+
+/** A node's bytes weighed against the tree's byte target, measured once per rebalance. */
+type NodeFill = { bytes: number; target: number };
 
 /** What a node that divided hands its parent: the nodes now to its right, each under the lowest key
  *  beneath it, and which of the resulting nodes the path's entry is in — 0 for the node that divided,
  *  1 for the first to its right, and so on. */
 type Overflow<TKey> = { rights: { key: TKey; node: ITreeNode }[]; pathRun: number };
-
-/** The byte rule a node's items are divided under: the target, and the bytes a node holding items
- *  `[from, to)` encodes to. */
-type ItemBytes = { target: number; between(from: number, to: number): number };
 
 function newLeafNode<TEntry>(store: BlockStore<ITreeNode>, entries: TEntry[]): LeafNode<TEntry> {
 	const header = store.createBlockHeader(TreeLeafBlockType);
@@ -1042,120 +1048,3 @@ function newBranchNode<TKey>(store: BlockStore<ITreeNode>, partitions: TKey[], n
 	return { header, partitions, nodes };
 }
 
-// The byte arithmetic behind a node's size limit. A node's JSON is its header and empty arrays (a
-// fixed part per node) plus each item's JSON and the commas between them, so one serialization per
-// item answers both whether a node fits and where to divide it.
-
-/** The JSON size of each item, by the measure block limits are judged with. */
-function itemBytes(items: readonly unknown[]): number[] {
-	return items.map(item => jsonEncodedBytes(item));
-}
-
-/** Running totals: `sums[i]` is the bytes of the first `i` items, so any run of items is one subtraction. */
-function prefixSums(sizes: readonly number[]): number[] {
-	const sums = [0];
-	for (const size of sizes) {
-		sums.push(sums[sums.length - 1]! + size);
-	}
-	return sums;
-}
-
-/** What a leaf encodes to with no entries: the part of its size the entries do not account for. */
-function emptyLeafBytes(leaf: LeafNode<unknown>): number {
-	return jsonEncodedBytes({ header: leaf.header, entries: [] });
-}
-
-/** What a branch encodes to with no children: the part of its size the keys and ids do not account for. */
-function emptyBranchBytes(branch: BranchNode<unknown>): number {
-	return jsonEncodedBytes({ header: branch.header, partitions: [], nodes: [] });
-}
-
-/**
- * How `count` items of one node divide into nodes when they no longer fit one, as run boundaries —
- * run `i` is the items `[runs[i], runs[i + 1])`, the first boundary 0 and the last `count` — or
- * `undefined` when they fit. A run fits when it holds at most `capacity` items and either no more
- * than `always` items (one entry, or two children: the least a node of its kind holds, so a node over
- * the byte target holds no more than that) or, under the byte rule, no more than the target's bytes.
- *
- * - Over the count alone: two runs at the midpoint ({@link countSplit}), the division the tree has
- *   always made, kept as it was so a tree of small entries writes the transforms it always did.
- * - Over the bytes: the fewest fitting runs ({@link fewestRuns}), so an entry larger than the target
- *   is left alone in a node of its own and a node that outgrew the target before this rule existed is
- *   brought within it in one write; where two runs suffice, the two whose larger is smallest
- *   ({@link balancedSplit}).
- *
- * A pure function of its arguments, so a replayed or retried action divides identically.
- */
-function divideItems(count: number, capacity: number, at: number, always: number, bytes?: ItemBytes): number[] | undefined {
-	const fits = (from: number, to: number) => to - from <= capacity
-		&& (bytes === undefined || to - from <= always || bytes.between(from, to) <= bytes.target);
-	if (fits(0, count)) {
-		return undefined;
-	}
-	if (bytes === undefined || count <= always || bytes.between(0, count) <= bytes.target) {
-		return [0, countSplit(count, at), count];	// the count is the only reason
-	}
-	const runs = fewestRuns(count, always, fits);
-	if (runs.length === 3) {
-		runs[1] = balancedSplit(count, always, fits, bytes.between, runs[1]!);
-	}
-	return runs;
-}
-
-/** Where the count rule divides `count` items: at the midpoint, the odd item going to the half the
- *  edit at `at` lands in. */
-function countSplit(count: number, at: number): number {
-	const mid = count >>> 1;
-	return mid + (at < mid ? 1 : 0);
-}
-
-/** The fewest runs that each fit, packing from the left: as many items into a run as fit, then the
- *  next run. A final run of a single item takes one more from the run before it when that run can
- *  spare one (it keeps more than `always`) and the pair fits — so a branch is not left routing to one
- *  child when its neighbour could have given it another. */
-function fewestRuns(count: number, always: number, fits: (from: number, to: number) => boolean): number[] {
-	const runs = [0];
-	for (let from = 0; from < count;) {
-		let to = from + 1;
-		while (to < count && fits(from, to + 1)) {
-			++to;
-		}
-		runs.push(to);
-		from = to;
-	}
-	const last = runs.length - 1;
-	if (last >= 2 && runs[last]! - runs[last - 1]! === 1 && runs[last - 1]! - runs[last - 2]! > always && fits(runs[last - 1]! - 1, count)) {
-		runs[last - 1] = runs[last - 1]! - 1;
-	}
-	return runs;
-}
-
-/** Where to divide `count` items into two runs that both fit so that the larger run's bytes are as
- *  small as possible. Each run keeps at least `always` items when the count allows, so a branch is
- *  not divided down to one child for the sake of balance. `fallback` is a division already known to
- *  fit, returned when no candidate does. */
-function balancedSplit(count: number, always: number, fits: (from: number, to: number) => boolean, between: (from: number, to: number) => number, fallback: number): number {
-	const least = count >= 2 * always ? always : 1;
-	let best = fallback;
-	let bestLarger = Infinity;
-	for (let m = least; m <= count - least; ++m) {
-		if (!fits(0, m) || !fits(m, count)) {
-			continue;
-		}
-		const larger = Math.max(between(0, m), between(m, count));
-		if (larger < bestLarger) {
-			bestLarger = larger;
-			best = m;
-		}
-	}
-	return best;
-}
-
-/** Which run of `runs` (see {@link divideItems}) item `index` falls in. */
-function runOf(runs: readonly number[], index: number): number {
-	let run = 0;
-	while (index >= runs[run + 1]!) {
-		++run;
-	}
-	return run;
-}

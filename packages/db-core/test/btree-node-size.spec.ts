@@ -247,3 +247,22 @@ describe('BTree node size', () => {
 		expect(keys).to.deep.equal(Array.from({ length: count }, (_, i) => i))
 	})
 })
+
+describe('BTree node size: what a division writes', () => {
+	it('records no operation on a leaf that keeps every entry it had when the new entry alone goes right', async () => {
+		// A division that leaves the old leaf exactly as it was must not write it: a zero-length splice
+		// still marks the block updated and has it re-committed and replicated for nothing.
+		const { store, btree } = makeTree<number, Sized>(64, 2_000, entry => entry.key)
+		const updated: string[] = []
+		const update = store.update.bind(store)
+		store.update = (id, op) => { updated.push(id); update(id, op) }
+		for (let key = 0; key < 10; key++) {
+			await btree.insert(sized(key, 40))
+		}
+		const leafBefore = (await btree.find(0)).leafNode.header.id
+		updated.length = 0
+		await btree.insert(sized(10, 1_500))	// larger than the ten together, so only it can go right
+		expect((await btree.find(10)).leafNode.header.id).to.not.equal(leafBefore)
+		expect(updated.filter(id => id === leafBefore)).to.deep.equal([])
+	})
+})
