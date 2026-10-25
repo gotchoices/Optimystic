@@ -9,7 +9,7 @@ import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, ClusterPeers,
 	BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks,
-	InvalidateRequest, DisputeResolutionProof, CommitCert, ActionId,
+	InvalidateRequest, DisputeResolutionProof, CommitCert, ActionId, BlockId,
 } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { clusterMember, type ClusterMember } from '../src/cluster/cluster-repo.js';
@@ -168,11 +168,12 @@ describe('ClusterMember invalidation apply path', () => {
 
 	it('captures the invalidation commit cert (for reactivity reuse) keyed by invalidationActionId', async () => {
 		const certs = new Map<ActionId, CommitCert>();
+		const tails = new Map<ActionId, readonly BlockId[] | undefined>();
 		member = clusterMember({
 			storageRepo: new MockRepo(), peerNetwork: new MockNetwork(),
 			peerId: self.peerId, privateKey: self.privateKey,
 			onInvalidate: async () => { /* applied */ },
-			onCommitCertificate: (actionId, cert) => { certs.set(actionId, cert); },
+			onCommitCertificate: (actionId, cert, tailIds) => { certs.set(actionId, cert); tails.set(actionId, tailIds); },
 		});
 
 		const proof = await challengerWinsProof('d1');
@@ -187,6 +188,9 @@ describe('ClusterMember invalidation apply path', () => {
 		expect(cert!.signers).to.include(self.peerId.toString());
 		expect(cert!.thresholdSig.length).to.be.greaterThan(0);
 		expect(cert!.signedPayload.length).to.be.greaterThan(0);
+		// Action-wide: an invalidation names no tail.
+		expect(tails.has(key), 'the sink saw the capture').to.equal(true);
+		expect(tails.get(key), 'no tails: an action-wide cert').to.equal(undefined);
 		// It is NOT captured under the original (reversed) action id — that id has its own commit cert.
 		expect(certs.get('a-inv' as ActionId)).to.be.undefined;
 	});

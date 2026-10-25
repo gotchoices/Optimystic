@@ -4,7 +4,7 @@ import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
-import { buildCommitCert, invalidationActionId } from "./commit-cert.js";
+import { buildCommitCert, committedTailIds, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
 import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -227,14 +227,20 @@ export type ReconcileBlockCallback = (blockId: BlockId, committed: ActionRev, co
 export type ConsultedArchives = ReadonlyMap<string, BlockArchive | undefined>;
 
 /**
- * Sink for the {@link CommitCert} this member assembled at consensus, fired once per committed action
- * **before** the commit is applied to local storage (so it is already retained when
- * {@link StorageRepo.commit} emits the matching `CollectionChangeEvent` the reactivity bridge reads).
- * The bytes are the cluster's own `approve` commit signatures, forwarded UNCHANGED — never re-signed.
- * Optional; absent on nodes that do not originate reactivity notifications. A throwing sink is
- * isolated + logged (it must never break consensus).
+ * Sink for the {@link CommitCert} this member assembled at consensus, fired once per consensus record
+ * that reaches its threshold, **before** the record is applied to local storage (so it is already
+ * retained when {@link StorageRepo.commit} emits the matching `CollectionChangeEvent` the reactivity
+ * bridge reads). The bytes are the cluster's own `approve` commit signatures, forwarded UNCHANGED —
+ * never re-signed. Optional; absent on nodes that do not originate reactivity notifications. A
+ * throwing sink is isolated + logged (it must never break consensus).
+ *
+ * `tailIds`: the collection tails this record committed, each of which this certificate signs for.
+ * Empty for a record that committed no tail (a sweep). `undefined` for an action-wide certificate (an
+ * invalidation, which names one collection by construction but no tail). One action can commit several
+ * collections as separate records, each with its own certificate, so a consumer resolving the
+ * certificate of a change event keys it by the event's tail, not by its action alone.
  */
-export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert) => void;
+export type CommitCertificateSink = (actionId: ActionId, cert: CommitCert, tailIds: readonly BlockId[] | undefined) => void;
 
 /**
  * Sink for peers evidenced to hold a block this node's own storage also holds — fed to the rebalance
@@ -3002,13 +3008,15 @@ export class ClusterMember implements ICluster {
 	 * member's off the response record — and the two readers must see the same answer, hence one
 	 * folded verdict, computed once, retained here for both.
 	 *
-	 * The commit cert and the commit proof belong to the record, not to an operation: a batch names
-	 * one action, so the one cert captured before the first operation's storage commit resolves for
-	 * every collection's change event, and the one proof is handed to every operation's commit.
+	 * The commit cert and the commit proof belong to the record, not to an operation: the one cert,
+	 * captured before the first operation's storage commit, is retained under every tail the record
+	 * commits, so it resolves for each of a batch's collections' change events — and only theirs: the
+	 * same action's other records (one per collection, when they cannot travel as one batch) retain
+	 * their own under their own tails. The one proof is handed to every operation's commit.
 	 */
 	private async applyConsensusCommits(record: ClusterRecord, commits: readonly CommitRequest[]): Promise<void> {
 		const actionId = commits[0]!.actionId;
-		await this.captureConsensusCommitCert(record, actionId);
+		await this.captureConsensusCommitCert(record, actionId, committedTailIds(commits));
 		const proof = this.consensusCommitProof(record, actionId);
 		const operations: CommitOperationVerdict[] = [];
 		for (const commit of commits) {
@@ -3034,12 +3042,12 @@ export class ClusterMember implements ICluster {
 	 * consumer, so a sink-less node pays neither the extra `sha256` nor the extra microtask — the true
 	 * zero-cost default.
 	 */
-	private async captureConsensusCommitCert(record: ClusterRecord, actionId: ActionId): Promise<void> {
+	private async captureConsensusCommitCert(record: ClusterRecord, actionId: ActionId, tailIds: readonly BlockId[]): Promise<void> {
 		if (!this.onCommitCertificate) {
 			return;
 		}
 		const commitSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
-		this.captureCommitCert(record, actionId, commitSignedPayload);
+		this.captureCommitCert(record, actionId, commitSignedPayload, tailIds);
 	}
 
 	/**
@@ -3330,10 +3338,15 @@ export class ClusterMember implements ICluster {
 		// of the commit-cert capture in {@link captureConsensusCommitCert}. Reactivity reuses it bit-for-bit
 		// as the invalidation notification's `sig` (never re-signed). Keyed on the deterministic
 		// {@link invalidationActionId} the invalidation's change event also carries, so the bridge's
-		// cert extractor resolves it. Gated on the sink — a node with no reactivity wired pays nothing.
+		// cert extractor resolves it. Action-wide (no tail): that id is unique to one reversal of one
+		// collection, and `InvalidateRequest` names no tail. Gated on the sink — a node with no
+		// reactivity wired pays nothing.
+		// NOTE: an invalidation change event will need a `tailId` among its `blockIds` to originate at
+		// all (the bridge's `selfAppliedTail` gate) once the dispute subsystem is wired; the action-wide
+		// cert then resolves for it through `CommitCertStore.get`'s fallback.
 		if (this.onCommitCertificate) {
 			const invSignedPayload = clusterVoteSigningPayload(await this.computeCommitHash(record), { type: 'approve' });
-			this.captureCommitCert(record, invalidationActionId(request.invalidatedActionId, request.resolution.disputeId), invSignedPayload);
+			this.captureCommitCert(record, invalidationActionId(request.invalidatedActionId, request.resolution.disputeId), invSignedPayload, undefined);
 		}
 
 		if (!this.onInvalidate) {
@@ -3358,9 +3371,10 @@ export class ClusterMember implements ICluster {
 	}
 
 	/**
-	 * Record the consensus commit cert for `actionId` into the injected {@link CommitCertificateSink},
-	 * if one is wired. The cert is built from the agreed `record.commits` (the per-member `approve`
-	 * commit signatures), forwarded UNCHANGED for reactivity to reuse. `signedPayload` is the exact
+	 * Record the consensus commit cert for `actionId`, signing for `tailIds` (see
+	 * {@link CommitCertificateSink}), into the injected sink, if one is wired. The cert is built from
+	 * the agreed `record.commits` (the per-member `approve` commit signatures), forwarded UNCHANGED
+	 * for reactivity to reuse. `signedPayload` is the exact
 	 * commit-vote preimage those signatures were produced over (`utf8(commitHash + ":approve")`),
 	 * computed by the caller from the same `record` *before* the synchronous commit — reactivity sets a
 	 * notification's `digest` from it so a real threshold-verify over `digest` succeeds. Stays
@@ -3378,7 +3392,7 @@ export class ClusterMember implements ICluster {
 	 * coordinating member, which applies with every commit merged, originates. If origination from the
 	 * other members is ever needed, have the coordinator deliver the merged record to them too.
 	 */
-	private captureCommitCert(record: ClusterRecord, actionId: ActionId, signedPayload: Uint8Array): void {
+	private captureCommitCert(record: ClusterRecord, actionId: ActionId, signedPayload: Uint8Array, tailIds: readonly BlockId[] | undefined): void {
 		if (!this.onCommitCertificate) {
 			return;
 		}
@@ -3389,7 +3403,7 @@ export class ClusterMember implements ICluster {
 				log('cluster-member:commit-cert-below-threshold', { actionId, signers: cert.signers.length, minSigs });
 				return;
 			}
-			this.onCommitCertificate(actionId, cert);
+			this.onCommitCertificate(actionId, cert, tailIds);
 		} catch (err) {
 			log('cluster-member:commit-cert-sink-error', { actionId, error: (err as Error).message });
 		}

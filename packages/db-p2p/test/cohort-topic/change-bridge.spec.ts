@@ -310,24 +310,56 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 	it('CommitCertStore: put/get round-trips, TTL-expires, and bounds entries', () => {
 		const store = createCommitCertStore({ ttlMs: 1_000, maxEntries: 2 });
 		const cert = (n: number): CommitCert => ({ thresholdSig: Uint8Array.from([n]), signers: [`p${n}`], minSigs: 1, signedPayload: Uint8Array.from([n]) });
+		const tail = 't' as BlockId;
 
-		store.put('a1' as ActionId, cert(1), 0);
-		expect(store.get('a1' as ActionId, 500)).to.deep.equal(cert(1));
+		store.put('a1' as ActionId, cert(1), [tail], 0);
+		expect(store.get('a1' as ActionId, tail, 500)).to.deep.equal(cert(1));
 		// Past the TTL the entry is gone.
-		expect(store.get('a1' as ActionId, 1_001), 'expired by TTL').to.equal(undefined);
+		expect(store.get('a1' as ActionId, tail, 1_001), 'expired by TTL').to.equal(undefined);
 
 		// Cap: inserting a third distinct key evicts the oldest.
-		store.put('b1' as ActionId, cert(2), 0);
-		store.put('b2' as ActionId, cert(3), 0);
-		store.put('b3' as ActionId, cert(4), 0);
-		expect(store.get('b1' as ActionId, 0), 'oldest evicted past the cap').to.equal(undefined);
-		expect(store.get('b3' as ActionId, 0)).to.deep.equal(cert(4));
+		store.put('b1' as ActionId, cert(2), [tail], 0);
+		store.put('b2' as ActionId, cert(3), [tail], 0);
+		store.put('b3' as ActionId, cert(4), [tail], 0);
+		expect(store.get('b1' as ActionId, tail, 0), 'oldest evicted past the cap').to.equal(undefined);
+		expect(store.get('b3' as ActionId, tail, 0)).to.deep.equal(cert(4));
+	});
+
+	it('CommitCertStore: each record of one action keeps its own cert under the tail it committed', () => {
+		// One action, two collections committed as separate records (the per-collection fallback), each
+		// signed by its own tail's cohort. On a member in both cohorts, the index record's capture can land
+		// between the table record's capture and the table's change event.
+		const store = createCommitCertStore();
+		const cert = (n: number): CommitCert => ({ thresholdSig: Uint8Array.from([n]), signers: [`p${n}`], minSigs: 1, signedPayload: Uint8Array.from([n]) });
+		const [certT, certI] = [cert(1), cert(2)];
+		const [tailT, tailI] = ['tail-table' as BlockId, 'tail-index' as BlockId];
+		store.put('A' as ActionId, certT, [tailT]);
+		store.put('A' as ActionId, certI, [tailI]);
+		// A sweep record (the table's non-tail blocks, landing after its tail) commits no tail: it retains
+		// nothing, so it cannot displace either record's cert.
+		store.put('A' as ActionId, cert(3), []);
+
+		const extract = makeClusterCommitCertExtractor(store);
+		const event = (collectionId: string, tailId: BlockId): CollectionChangeEvent => ({
+			collectionId: collectionId as CollectionId, blockIds: [tailId], actionId: 'A' as ActionId, rev: 1, tailId,
+		});
+		expect(extract(event('table', tailT)), 'the table event resolves the table record cert').to.equal(certT);
+		expect(extract(event('index', tailI)), 'the index event resolves the index record cert').to.equal(certI);
+		expect(store.get('A' as ActionId, 'tail-other' as BlockId), 'a commit writes no action-wide fallback').to.equal(undefined);
+
+		// An action-wide cert (an invalidation's, which names no tail) is found by any tail of its action,
+		// but does not shadow a per-tail entry of the same action.
+		store.put('inv' as ActionId, cert(4), undefined);
+		store.put('inv' as ActionId, cert(5), [tailT]);
+		expect(store.get('inv' as ActionId, tailI)).to.deep.equal(cert(4));
+		expect(store.get('inv' as ActionId, undefined)).to.deep.equal(cert(4));
+		expect(store.get('inv' as ActionId, tailT), 'the per-tail entry wins').to.deep.equal(cert(5));
 	});
 
 	it('makeClusterCommitCertExtractor: resolves the cert for a change event, undefined when absent', () => {
 		const store = createCommitCertStore();
 		const cert: CommitCert = { thresholdSig: Uint8Array.from([1, 2, 3]), signers: ['p'], minSigs: 1, signedPayload: Uint8Array.from([4, 5, 6]) };
-		store.put('a1' as ActionId, cert);
+		store.put('a1' as ActionId, cert, ['block-1' as BlockId]);
 		const extract = makeClusterCommitCertExtractor(store);
 
 		const event = (actionId: string): CollectionChangeEvent => ({
@@ -335,6 +367,7 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 			blockIds: ['block-1' as BlockId],
 			actionId: actionId as ActionId,
 			rev: 1,
+			tailId: 'block-1' as BlockId,
 		});
 
 		expect(extract(event('a1'))).to.equal(cert);
@@ -352,7 +385,7 @@ describe('cohort-topic: cluster commit-cert extraction', () => {
 			'peer-B': { type: 'approve', signature: sigB64([0x33, 0x44]) },
 		}, ['peer-A', 'peer-B']);
 		const expected = buildCommitCert(record, 2, new TextEncoder().encode('hash-1:approve'));
-		store.put('a1' as ActionId, expected);
+		store.put('a1' as ActionId, expected, ['block-1' as BlockId]);
 
 		const service = stubService();
 		let received: CommitCert | undefined;

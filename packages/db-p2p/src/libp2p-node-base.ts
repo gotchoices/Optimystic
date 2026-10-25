@@ -406,9 +406,10 @@ export type NodeOptions = ClusterPolicyOptions & {
 	transactionStateStore?: ITransactionStateStore;
 
 	/**
-	 * Optional sink for the consensus commit certificate, fired per committed action just before the
-	 * commit is applied to local storage (see {@link CommitCertificateSink}). This is the cluster-side
-	 * half of the reactivity origination path: a caller wiring reactivity supplies a
+	 * Optional sink for the consensus commit certificate, fired per committed consensus record just
+	 * before the record is applied to local storage, with the collection tails the record committed
+	 * (see {@link CommitCertificateSink}; a sink that ignores the third argument still works). This is
+	 * the cluster-side half of the reactivity origination path: a caller wiring reactivity supplies a
 	 * {@link CommitCertStore}'s `put` here, then resolves it via {@link makeClusterCommitCertExtractor}
 	 * when it installs the change-notifier bridge ({@link attachCohortChangeBridge}) on the running
 	 * node. Absent → zero cost (no cert is assembled).
@@ -987,7 +988,7 @@ export async function createLibp2pNodeBase(
 		// sink: the whole composed call is isolated in `ClusterMember.captureCommitCert`, so a caller sink
 		// that threw before the store was written would make that commit silently never originate. Ordering
 		// the store first keeps origination correct regardless of the caller sink (`put` never throws).
-		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
+		? (actionId, cert, tailIds): void => { certStore.put(actionId, cert, tailIds); options.onCommitCertificate?.(actionId, cert, tailIds); }
 		: options.onCommitCertificate;
 
 	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither

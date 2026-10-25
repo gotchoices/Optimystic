@@ -1013,12 +1013,12 @@ StorageRepo.get()                          # read-driven promotion (context prov
   index collections too if gaps beyond `changeHoldMs` are ever seen). Nothing is held for an
   action with no pend group here — one pended before a restart, an `inv:` invalidation, a
   collection in this node's cohort whose sibling collection is not (larger groups; such a node
-  behaves as before). The catch-all feed is never held: cohort-topic origination resolves a
-  commit certificate by action id alone, so a table event released after the index record's
-  certificate had been stored would hand it the wrong record's certificate (backlog
-  `bug-a-commit-cert-is-looked-up-by-action-alone`), and neither tail-rotation detection nor the
-  owned-block feed wants a delay. Pinned by the "a hold while another collection of the action is
-  still pending" cases in `packages/db-p2p/test/storage-repo.spec.ts` and end to end by
+  behaves as before). The catch-all feed is never held: neither tail-rotation detection nor the
+  owned-block feed wants a delay. (Cohort-topic origination, the feed's third consumer, resolves
+  its commit certificate by the event's collection tail, so a held table event would still find
+  the table record's certificate; holding it for origination is backlog
+  `feat-a-network-watch-wake-sees-the-whole-commit`.) Pinned by the "a hold while another
+  collection of the action is still pending" cases in `packages/db-p2p/test/storage-repo.spec.ts` and end to end by
   `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts`.
 - Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
   `OptimysticNodeAttachments` (`db-p2p/src/optimystic-node.ts`), which `createLibp2pNode`'s
@@ -1128,7 +1128,9 @@ across the network — not just to in-process subscribers.
 ```
 ClusterMember.handleConsensus            # consensus reached on a commit op
   → captureCommitCert(record)            # build CommitCert from record.commits (cluster-repo.ts)
-  → onCommitCertificate(actionId, cert)  # → CommitCertStore.put  (BEFORE storageRepo.commit)
+  → onCommitCertificate(actionId, cert, tailIds)
+                                         # → CommitCertStore.put, one entry per tail the record commits
+                                         #   (BEFORE storageRepo.commit)
   → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
 StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
   → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
@@ -1136,7 +1138,7 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
      → selfAppliedTail(event)?           # tail-less event, or a commit that landed only non-tail blocks
                                          #   here → no-op; the tail among event.blockIds means this node is
                                          #   in the tail's storage group (the announcing group), no ring read
-     → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get
+     → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get(actionId, tailId)
      → CohortTopicService.onLocalCommit(event, commitCert)   # reactivity originates from here
 ```
 
@@ -1154,6 +1156,19 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   the end of the call — so the cert must already be retained when the bridge resolves it.
   No retained cert (e.g. an idempotent re-commit) → the bridge skips origination rather
   than fabricating an unsigned one.
+- **One cert per collection tail, not per action.** A transaction writing a table and its
+  indexes commits them under one action id: as one consensus record (a batch) with one
+  certificate when they travel together, as one record per collection — each signed by its
+  own tail's cohort — when they cannot. A member in both cohorts can apply two such records
+  concurrently, so a store keyed by action alone handed the table's event the index record's
+  certificate, which a subscriber judging the table tail's root group refuses. The store keys
+  each certificate by `(actionId, tailId)` for every tail its record commits
+  (`committedTailIds` in `packages/db-p2p/src/cluster/commit-cert.ts`, the same test
+  `selfAppliedTail` applies to the event), and the extractor reads it by the event's tail. A
+  record that commits no tail — a sweep of a collection's non-tail blocks — retains nothing,
+  since its events never originate. An invalidation's certificate names no tail and is kept
+  action-wide; `get` falls back to it only when no per-tail entry exists, and commit records
+  never write one.
 - **Decorator, not a replacement.** `makeCohortTopicChangeNotifier` returns an
   `IBlockChangeNotifier` that the `NetworkTransactor` takes as its `localChangeNotifier`;
   its `onCollectionChange` delegates straight to the `StorageRepo`, so the Quereus

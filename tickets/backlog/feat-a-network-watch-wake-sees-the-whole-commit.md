@@ -16,5 +16,5 @@ Follow-up to GitHub [#47](https://github.com/gotchoices/Optimystic/issues/47). `
 A watcher that stores none of the table, woken over the network for another machine's commit, either sees that commit through every index at the wake, or is woken again once it can. Candidate directions, to be chosen in planning:
 
 - The vtab also opens network watches on its index collections (one per index) and wakes the table on any of them: simple, more registrations and renewals per table, and an early wake can still see the table and index disagree.
-- Origination waits for the action's other collections on the originating machine (needs `bug-a-commit-cert-is-looked-up-by-action-alone` first, since a delayed table event would otherwise resolve the index record's certificate), which helps only where the reader's coordinator is the originator.
+- Origination waits for the action's other collections on the originating machine (its prerequisite, `bug-a-commit-cert-is-looked-up-by-action-alone`, has landed: a commit certificate is now resolved per collection tail, so a delayed table event finds the table record's certificate), which helps only where the reader's coordinator is the originator.
 - The watch tick also compares index tails for a table's watch.

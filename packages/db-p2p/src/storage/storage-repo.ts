@@ -374,10 +374,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * with no pend group here (one pended before a restart, an `inv:` invalidation, a single
 	 * collection whose one group this very call closes) is dispatched at once with no storage read.
 	 *
-	 * The catch-all feed is never held: it feeds cohort-topic origination, whose commit certificate
-	 * is looked up by action id alone and would be the wrong record's once a later collection's
-	 * certificate had been stored (backlog `bug-a-commit-cert-is-looked-up-by-action-alone`), and
-	 * tail-rotation detection and the owned-block feed, none of which wants a delay.
+	 * The catch-all feed is never held: it feeds tail-rotation detection and the owned-block feed,
+	 * neither of which wants a delay, and cohort-topic origination, which resolves its commit
+	 * certificate by the event's collection tail and so would find the right record's certificate
+	 * after a hold too (holding it for origination is backlog
+	 * `feat-a-network-watch-wake-sees-the-whole-commit`).
 	 *
 	 * `tailId` is the `CommitRequest.tailId` on the commit path; `undefined` on read-driven
 	 * promotions and replica landings, which have no commit request. A single commit is for one

@@ -1,4 +1,4 @@
-import type { ActionId, ClusterRecord, CollectionChangeEvent, CommitCert } from "@optimystic/db-core";
+import type { ActionId, BlockId, ClusterRecord, CollectionChangeEvent, CommitCert, CommitRequest } from "@optimystic/db-core";
 import { fromString as uint8ArrayFromString } from 'uint8arrays';
 import { createLogger } from "../logger.js";
 
@@ -62,77 +62,120 @@ export const DEFAULT_COMMIT_CERT_TTL_MS = 60_000;
 export const DEFAULT_COMMIT_CERT_MAX_ENTRIES = 4096;
 
 /**
- * Bounded, TTL'd cache of recently-committed {@link CommitCert}s keyed by `actionId`. The cluster
- * member records a cert here just before consensus applies the commit to local storage; the
- * change-notifier bridge's extractor reads it when the StorageRepo emits the matching
- * {@link CollectionChangeEvent}. Both happen on the same node within one commit, so the window is
- * tiny — but a TTL + cap keep the map from leaking if a commit ever lands without emitting a change
- * event (e.g. an idempotent re-commit, or a path with no catch-all subscriber).
+ * Bounded, TTL'd cache of recently-committed {@link CommitCert}s, one per **collection tail** a
+ * consensus record committed. The cluster member records a cert here just before consensus applies the
+ * commit to local storage; the change-notifier bridge's extractor reads it when the StorageRepo emits
+ * the matching {@link CollectionChangeEvent}. Both happen on the same node within one commit, so the
+ * window is tiny — but a TTL + cap keep the map from leaking if a commit ever lands without emitting a
+ * change event (e.g. an idempotent re-commit, or a path with no catch-all subscriber).
+ *
+ * Keyed by `(actionId, tailId)`, not by action alone: one action can commit several collections as
+ * separate records (a table and its indexes, when they cannot travel as one batch), each signed by its
+ * own tail's cohort, and a member in both cohorts can apply them concurrently. Origination fires only
+ * for an event naming a tail this node applied, so the tail names the record whose signatures the
+ * notification needs.
+ *
+ * An entry with no tail is **action-wide**: an invalidation's cert, which reverses one collection by
+ * construction but names no tail. {@link get} falls back to it only when no per-tail entry exists, and
+ * commit records never write one, so the fallback cannot hand a commit event another collection's cert.
  */
 export interface CommitCertStore {
-	/** Record `cert` for `actionId` (overwrites any prior entry). `now` is unix ms (injectable for tests). */
-	put(actionId: ActionId, cert: CommitCert, now?: number): void;
-	/** The cert for `actionId` if still retained, else `undefined`. */
-	get(actionId: ActionId, now?: number): CommitCert | undefined;
+	/**
+	 * Record `cert` once per tail in `tailIds`, overwriting a prior entry for the same pair. An empty
+	 * array records nothing (a record that committed no tail, such as a sweep); `undefined` records the
+	 * action-wide entry. `now` is unix ms (injectable for tests).
+	 */
+	put(actionId: ActionId, cert: CommitCert, tailIds: readonly BlockId[] | undefined, now?: number): void;
+	/** The cert retained for `(actionId, tailId)`, else the action-wide cert for `actionId`, else `undefined`. */
+	get(actionId: ActionId, tailId: BlockId | undefined, now?: number): CommitCert | undefined;
 }
 
 export interface CommitCertStoreOptions {
 	/** Retention per entry (ms). Default {@link DEFAULT_COMMIT_CERT_TTL_MS}. */
 	readonly ttlMs?: number;
-	/** Maximum retained entries (oldest evicted first). Default {@link DEFAULT_COMMIT_CERT_MAX_ENTRIES}. */
+	/** Maximum retained entries, one per tail (oldest evicted first). Default {@link DEFAULT_COMMIT_CERT_MAX_ENTRIES}. */
 	readonly maxEntries?: number;
+}
+
+/** The map key for `(actionId, tailId)`. JSON escapes both strings, so no pair of ids collides with
+ * another, and the action-wide entry's `null` tail collides with no tail id. */
+function certKey(actionId: ActionId, tailId: BlockId | undefined): string {
+	return JSON.stringify([actionId, tailId ?? null]);
 }
 
 /** Build an in-memory {@link CommitCertStore} (insertion-ordered Map → recency for eviction). */
 export function createCommitCertStore(options: CommitCertStoreOptions = {}): CommitCertStore {
 	const ttlMs = options.ttlMs ?? DEFAULT_COMMIT_CERT_TTL_MS;
 	const maxEntries = options.maxEntries ?? DEFAULT_COMMIT_CERT_MAX_ENTRIES;
-	const entries = new Map<ActionId, { cert: CommitCert; expiresAt: number }>();
+	const entries = new Map<string, { cert: CommitCert; expiresAt: number }>();
 
 	const dropExpired = (now: number): void => {
-		for (const [actionId, entry] of entries) {
+		for (const [key, entry] of entries) {
 			if (entry.expiresAt <= now) {
-				entries.delete(actionId);
+				entries.delete(key);
 			}
 		}
 	};
 
+	const retain = (key: string, cert: CommitCert, now: number): void => {
+		// Re-insert so a refreshed key moves to the most-recent end (Map preserves insertion order).
+		entries.delete(key);
+		entries.set(key, { cert, expiresAt: now + ttlMs });
+	};
+
+	const retained = (key: string, now: number): CommitCert | undefined => {
+		const entry = entries.get(key);
+		if (!entry) {
+			return undefined;
+		}
+		if (entry.expiresAt <= now) {
+			entries.delete(key);
+			return undefined;
+		}
+		return entry.cert;
+	};
+
 	return {
-		put(actionId, cert, now = Date.now()): void {
+		put(actionId, cert, tailIds, now = Date.now()): void {
 			dropExpired(now);
-			// Re-insert so a refreshed key moves to the most-recent end (Map preserves insertion order).
-			entries.delete(actionId);
-			entries.set(actionId, { cert, expiresAt: now + ttlMs });
+			for (const tailId of tailIds ?? [undefined]) {
+				retain(certKey(actionId, tailId), cert, now);
+			}
 			while (entries.size > maxEntries) {
 				const oldest = entries.keys().next().value;
 				if (oldest === undefined) break;
 				entries.delete(oldest);
 			}
 		},
-		get(actionId, now = Date.now()): CommitCert | undefined {
-			const entry = entries.get(actionId);
-			if (!entry) {
-				return undefined;
-			}
-			if (entry.expiresAt <= now) {
-				entries.delete(actionId);
-				return undefined;
-			}
-			return entry.cert;
+		get(actionId, tailId, now = Date.now()): CommitCert | undefined {
+			const perTail = tailId === undefined ? undefined : retained(certKey(actionId, tailId), now);
+			return perTail ?? retained(certKey(actionId, undefined), now);
 		},
 	};
 }
 
 /**
- * The bridge's `extractCommitCert` over a {@link CommitCertStore}: resolve a change event's committed
- * action to the cluster commit cert captured for it. Returns `undefined` (logged) when no cert is
- * retained — the bridge then skips origination rather than fabricating an unsigned notification.
+ * The collection tails a consensus record's commit operations commit — the tails its cert signs for.
+ * An operation commits its tail when its `blockIds` name it, the same test `selfAppliedTail` applies
+ * to the change event that operation emits, so every event that can originate finds its record's cert.
+ * A batch yields one tail per collection; a sweep (a collection's non-tail blocks landing on another
+ * cohort after its tail) yields none, since its events never originate.
+ */
+export function committedTailIds(commits: readonly CommitRequest[]): BlockId[] {
+	return commits.filter(commit => commit.blockIds.includes(commit.tailId)).map(commit => commit.tailId);
+}
+
+/**
+ * The bridge's `extractCommitCert` over a {@link CommitCertStore}: resolve a change event's action and
+ * tail to the cluster commit cert of the record that committed that tail. Returns `undefined` (logged)
+ * when no cert is retained — the bridge then skips origination rather than fabricating an unsigned
+ * notification.
  */
 export function makeClusterCommitCertExtractor(store: CommitCertStore): (event: CollectionChangeEvent) => CommitCert | undefined {
 	return (event) => {
-		const cert = store.get(event.actionId);
+		const cert = store.get(event.actionId, event.tailId);
 		if (!cert) {
-			log('no commit cert retained for actionId=%s (collection=%s rev=%d); skipping origination', event.actionId, event.collectionId, event.rev);
+			log('no commit cert retained for actionId=%s tail=%s (collection=%s rev=%d); skipping origination', event.actionId, event.tailId, event.collectionId, event.rev);
 		}
 		return cert;
 	};

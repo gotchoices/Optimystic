@@ -626,7 +626,7 @@ Cohort memberships are anchored in the transaction log ([transactions.md](transa
 > the FRET membership cache (`FretMembershipSource.has`) genuinely answers existence for **T2/T3**, while
 > **T0/T1** existence needs a committed-state backing distinct from the FRET cache (committed-tier
 > integrity). No coord-keyed committed-membership index exists yet (the tx-log commit certificate is
-> keyed by action, not by `coord_0`), so T0/T1 parent-ref existence fails closed today; the dedicated
+> keyed by action and collection tail, not by `coord_0`), so T0/T1 parent-ref existence fails closed today; the dedicated
 > committed backing — and the stronger "the parent's committed record names *this* child" check — is the
 > follow-on `cohort-topic-parent-ref-tx-log-content`.
 
@@ -1303,8 +1303,8 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 >   — a cached `MembershipCertV1` means a cohort genuinely serves the parent); **T0/T1** consult the
 >   committed backing and the verifier **fails closed without one** (a FRET-cached cert must not vouch for
 >   committed-tier existence — committed-tier integrity). **Limitation (interim):** no coord-keyed
->   committed-membership index exists yet (the tx-log commit certificate is keyed by action, not by
->   `coord_0`), so a node wires no committed reader today and the T0/T1 existence check would fail closed for
+>   committed-membership index exists yet (the tx-log commit certificate is keyed by action and
+>   collection tail, not by `coord_0`), so a node wires no committed reader today and the T0/T1 existence check would fail closed for
 >   *every* parent. Because a brand-new root has no parent to reference, routing T0/T1 through that
 >   fail-closed verifier would make cold-root **origination** impossible
 >   (`cohort-topic-bootstrap-coldstart-origination-regression`). The host policy therefore keeps T0/T1

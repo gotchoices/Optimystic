@@ -732,13 +732,13 @@ describe('ClusterMember commit-certificate capture (reactivity origination feed)
 		// Stage the pend locally so the commit genuinely lands (and so emission semantics match production).
 		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
 
-		const captured: { actionId: string; cert: CommitCert }[] = [];
+		const captured: { actionId: string; cert: CommitCert; tailIds: readonly BlockId[] | undefined }[] = [];
 		member = clusterMember({
 			storageRepo: storage,
 			peerNetwork: mockNetwork,
 			peerId: self.peerId,
 			privateKey: self.privateKey,
-			onCommitCertificate: (actionId, cert): void => { captured.push({ actionId, cert }); },
+			onCommitCertificate: (actionId, cert, tailIds): void => { captured.push({ actionId, cert, tailIds }); },
 		});
 
 		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
@@ -746,6 +746,7 @@ describe('ClusterMember commit-certificate capture (reactivity origination feed)
 
 		expect(captured.length, 'cert captured once for the committed action').to.equal(1);
 		expect(captured[0]!.actionId).to.equal('a1');
+		expect(captured[0]!.tailIds, 'the cert signs for the tail the record committed').to.deep.equal(['block-1']);
 		// Default super-majority is unanimity over the 2-peer cohort → minSigs 2.
 		expect(captured[0]!.cert.minSigs).to.equal(2);
 		// Both approve-commit signers contribute (self adds its own commit during consensus, joining `other`).
