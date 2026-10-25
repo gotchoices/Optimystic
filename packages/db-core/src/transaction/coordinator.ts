@@ -1,17 +1,18 @@
-import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability } from "../index.js";
+import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability, BlockContentDigests } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
+import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { SyncOptions } from "../collection/index.js";
 import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
-import { computeBlockContentDigests, blockDigestsField, baseRevsField } from "../transform/digest.js";
+import { describeTouchedBlocks, blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { recordCollectionDurability, transactionDurability, type TransactionDurability } from "./durability.js";
@@ -61,22 +62,29 @@ function pendRefusalError(collectionIds: readonly CollectionId[], refusal: Write
 		: new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
 }
 
+/** A transaction refused before anything was sent: its pend, or a block it would leave, too large to send. */
+type TooLargeError = TransactionTooLargeError | BlockTooLargeError;
+
 /** How the pend phase failed. */
-type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TransactionTooLargeError };
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TooLargeError };
+
+/** Per collection, what its commit declares about its blocks (`CommitRequest.blockDigests`), described
+ * once before the pend ({@link TransactionCoordinator.declareTouchedBlocks}). */
+type DeclaredDigests = ReadonlyMap<CollectionId, BlockContentDigests>;
 
 /**
  * The pend phase's failure for `reasons` — what every failed pend threw or stood for, at least one.
  * The error text is the first reason's. The attempt is a retryable clean stale loss only if at least one
  * reason was a conflicting pend ({@link PendRejectedError}`.conflict`) AND none was a hard failure: a
  * single hard failure (storage/policy rejection, or a thrown/unavailable transactor) will not clear on a
- * re-read, so re-driving it would just burn the retry budget. An expiry, and a pend too large to send,
- * are hard failures carried whole: each is the error the commit surfaces.
+ * re-read, so re-driving it would just burn the retry budget. An expiry, and a pend or a block too large
+ * to send, are hard failures carried whole: each is the error the commit surfaces.
  */
 function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const first = reasons[0];
 	const conflicts = reasons.filter(reason => reason instanceof PendRejectedError && reason.conflict);
 	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
-	const tooLarge = reasons.find((reason): reason is TransactionTooLargeError => reason instanceof TransactionTooLargeError);
+	const tooLarge = reasons.find((reason): reason is TooLargeError => reason instanceof TransactionTooLargeError || reason instanceof BlockTooLargeError);
 	return {
 		success: false,
 		error: first instanceof Error ? first.message : String(first),
@@ -174,9 +182,9 @@ type CoordinationResult =
 		/** Present when a pend or a commit was refused because the transaction had expired by the
 		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
 		expired?: TransactionExpiredError;
-		/** Present when a pend was refused before it was sent because it was too large to send: the
-		 * error the commit surfaces, never a stale loss. */
-		tooLarge?: TransactionTooLargeError;
+		/** Present when the transaction was refused before anything was sent because its pend, or a block
+		 * it would leave, was too large to send: the error the commit surfaces, never a stale loss. */
+		tooLarge?: TooLargeError;
 	};
 
 /** What a successful commit wrote: `written` folded into one report, or `undefined` when it holds
@@ -890,9 +898,9 @@ export class TransactionCoordinator {
 			// the next refresh of that participant finds this transaction's own log entry, these are
 			// the transforms that finish it (Collection.completeOwnEntry) — without them the refresh
 			// can only refuse the write as torn, never save it. Copied, because until the restore
-			// this is the participant's LIVE tracker state. No block digests are retained: they are
-			// computed per commit from the live tracker (commitCollection), which is gone by the time
-			// a refresh re-sends, and an undeclared block falls back to member-side corroboration.
+			// this is the participant's LIVE tracker state. No block digests are retained: the
+			// declaration taken before the pend (declareTouchedBlocks) stays inside coordinateTransaction,
+			// so a re-send declares none, and an undeclared block falls back to member-side corroboration.
 			for (const { collectionId, collection } of collectionData) {
 				if (committed.has(collectionId)) continue;
 				collection.retainInFlightAttempt(transaction.id, {
@@ -1550,6 +1558,14 @@ export class TransactionCoordinator {
 		const trxId = transaction.id;
 		const t0 = Date.now();
 
+		// Before anything is sent: one materialization of every block the transaction touches, measured
+		// against MAX_BLOCK_BYTES here and declared on the commit below.
+		const described = await this.declareTouchedBlocks(collectionTransforms);
+		if (!described.success) {
+			log('trx:phases trxId=%s refused before sending: %s', trxId, described.error);
+			return described;
+		}
+
 		// 1. GATHER phase: collect critical cluster nominees (skip if single collection)
 		const criticalBlockIds = Array.from(criticalBlocks.values());
 		const tGather = Date.now();
@@ -1577,7 +1593,8 @@ export class TransactionCoordinator {
 			transaction.id as ActionId,
 			criticalBlockIds,
 			pendResult.pendedBlockIds,
-			pendedRevs
+			pendedRevs,
+			described.declared
 		);
 		const commitMs = Date.now() - tCommit;
 		if (!commitResult.success) {
@@ -1649,6 +1666,34 @@ export class TransactionCoordinator {
 		);
 
 		return new Set(byId.values());
+	}
+
+	/**
+	 * One local materialization of every block each collection's transforms touch
+	 * ({@link describeTouchedBlocks}), taken before anything is sent. A block the write would leave
+	 * over `MAX_BLOCK_BYTES` refuses the transaction here, as a pend-phase failure carrying the
+	 * {@link BlockTooLargeError} — the same shape as a pend too large to send, so `commit` throws it by
+	 * name and `execute` reports it as a failure. Otherwise each collection's digests are kept as its
+	 * commit's declaration ({@link commitRequestFor}), so the commit does not materialize again.
+	 *
+	 * Purely local: each collection's tracker holds this transaction's staged transforms until the commit
+	 * succeeds, under the instance latch the commit span holds, and the pend names its bases from the
+	 * same pins ({@link pendRequestFor}). A collection missing from the registry is skipped, for the pend
+	 * to report as it always has.
+	 */
+	private async declareTouchedBlocks(
+		collectionTransforms: ReadonlyMap<CollectionId, Transforms>
+	): Promise<{ success: true; declared: DeclaredDigests } | PendPhaseFailure> {
+		const declared = new Map<CollectionId, BlockContentDigests>();
+		for (const [collectionId, transforms] of collectionTransforms) {
+			const collection = this.collections.get(collectionId);
+			if (!collection) continue;
+			const touched = await describeTouchedBlocks(collection.tracker, blockIdsForTransforms(transforms));
+			const tooLarge = oversizedBlock(touched.bytes);
+			if (tooLarge) return pendFailure([tooLarge]);
+			declared.set(collectionId, touched.digests);
+		}
+		return { success: true, declared };
 	}
 
 	/**
@@ -1839,9 +1884,10 @@ export class TransactionCoordinator {
 		// Collection.sync pend.
 		const priority = clampPriority(transaction.priority);
 		// The base each update-only block's operations were computed against, read from the same
-		// tracker the commit side digests (commitRequestFor); it still holds this transaction's staged
-		// transforms and pins. Storage keeps it with the pending record so the record is never applied
-		// to a different version of the block (see PendRequest.baseRevs). Omitted when empty.
+		// tracker the commit's declaration was taken from (declareTouchedBlocks); it still holds this
+		// transaction's staged transforms and pins. Storage keeps it with the pending record so the
+		// record is never applied to a different version of the block (see PendRequest.baseRevs).
+		// Omitted when empty.
 		const baseRevs = collection.tracker.stagedBaseRevs(blockIdsForTransforms(transforms));
 		return {
 			actionId,
@@ -1870,7 +1916,8 @@ export class TransactionCoordinator {
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		pendedBlockIds: Map<CollectionId, BlockId[]>,
-		pendedRevs: ReadonlyMap<CollectionId, number>
+		pendedRevs: ReadonlyMap<CollectionId, number>,
+		declared: DeclaredDigests
 	): Promise<{
 		success: boolean;
 		error?: string;
@@ -1881,7 +1928,7 @@ export class TransactionCoordinator {
 		expired?: TransactionExpiredError;
 	}> {
 		const together = pendedBlockIds.size > 1 && this.transactor.commitMany
-			? await this.commitTogether(actionId, criticalBlockIds, pendedBlockIds, pendedRevs)
+			? await this.commitTogether(actionId, criticalBlockIds, pendedBlockIds, pendedRevs, declared)
 			: undefined;
 		// NOTE: a fallback after a batched pend leaves the multi-collection residual in place: the
 		// pend's decision may have been held back for a commit that now goes per collection, so a member
@@ -1893,7 +1940,7 @@ export class TransactionCoordinator {
 		// cache's TTL is at least a minute, its size cap 1000 transactions), so a live lookup can split
 		// the blocks. If that ever shows up, pin the commit to the coordinator the batched pend answered
 		// from. See docs/correctness.md §2 Definitions.
-		const outcomes = together ?? await this.commitEach(actionId, criticalBlockIds, pendedBlockIds, pendedRevs);
+		const outcomes = together ?? await this.commitEach(actionId, criticalBlockIds, pendedBlockIds, pendedRevs, declared);
 
 		const committedCollections = new Map<CollectionId, WriteDurability>();
 		const failedCollections = new Set<CollectionId>();
@@ -1949,12 +1996,12 @@ export class TransactionCoordinator {
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		pendedBlockIds: Map<CollectionId, BlockId[]>,
-		pendedRevs: ReadonlyMap<CollectionId, number>
+		pendedRevs: ReadonlyMap<CollectionId, number>,
+		declared: DeclaredDigests
 	): Promise<CollectionCommitOutcome[] | undefined> {
-		const built = await Promise.all(Array.from(pendedBlockIds, async ([collectionId, blockIds]) =>
-			({ collectionId, request: await this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!) })));
 		const requests: { collectionId: CollectionId; request: CommitRequest }[] = [];
-		for (const { collectionId, request } of built) {
+		for (const [collectionId, blockIds] of pendedBlockIds) {
+			const request = this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!, declared);
 			if (typeof request === 'string') return undefined;
 			requests.push({ collectionId, request });
 		}
@@ -1976,11 +2023,12 @@ export class TransactionCoordinator {
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		pendedBlockIds: Map<CollectionId, BlockId[]>,
-		pendedRevs: ReadonlyMap<CollectionId, number>
+		pendedRevs: ReadonlyMap<CollectionId, number>,
+		declared: DeclaredDigests
 	): Promise<CollectionCommitOutcome[]> {
 		const entries = Array.from(pendedBlockIds.entries());
 		const settled = await Promise.allSettled(entries.map(([collectionId, blockIds]) =>
-			this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!)
+			this.commitCollection(actionId, criticalBlockIds, collectionId, blockIds, pendedRevs.get(collectionId)!, declared)
 		));
 		// commitCollection resolves rather than rejects, but treat any unexpected rejection as a (hard)
 		// failure of its collection so the partitioned sets stay honest.
@@ -2001,9 +2049,10 @@ export class TransactionCoordinator {
 		collectionId: CollectionId,
 		blockIds: BlockId[],
 		/** The revision this collection PENDED at (see {@link commitRequestFor}). */
-		rev: number
+		rev: number,
+		declared: DeclaredDigests
 	): Promise<CollectionCommitOutcome> {
-		const commitRequest = await this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, rev);
+		const commitRequest = this.commitRequestFor(actionId, criticalBlockIds, collectionId, blockIds, rev, declared);
 		if (typeof commitRequest === 'string') {
 			return { collectionId, committed: false, error: commitRequest };
 		}
@@ -2033,7 +2082,7 @@ export class TransactionCoordinator {
 	 * whether it goes on its own ({@link commitCollection}) or with its siblings ({@link commitTogether})
 	 * — or, as a string, why there is none.
 	 */
-	private async commitRequestFor(
+	private commitRequestFor(
 		actionId: ActionId,
 		criticalBlockIds: BlockId[],
 		collectionId: CollectionId,
@@ -2041,8 +2090,9 @@ export class TransactionCoordinator {
 		/** The revision this collection PENDED at, threaded from the log append — the same bug
 		 * family as pendCollection's: recomputing `getNextRev()` here, after the pend round
 		 * trips, could stamp the CommitRequest with a different number than the pend named. */
-		rev: number
-	): Promise<CommitRequest | string> {
+		rev: number,
+		declared: DeclaredDigests
+	): CommitRequest | string {
 		const collection = this.collections.get(collectionId);
 		if (!collection) {
 			return `Collection not found: ${collectionId}`;
@@ -2054,19 +2104,16 @@ export class TransactionCoordinator {
 			return `Log tail block not found for collection ${collectionId}`;
 		}
 
-		// Declare what each pended block will contain once committed. The collection's tracker still
-		// holds this transaction's staged transforms (it is reset only after commit succeeds) and
-		// layers over the collection's CacheSource, so this is a purely local computation; an id whose
-		// base is not cached is omitted and falls back to corroboration on the member side. Only the
-		// client can declare this — CoordinatorRepo.commit forwards without materializing.
-		const blockDigests = await computeBlockContentDigests(collection.tracker, blockIds);
-
+		// Declare what each pended block will contain once committed: the description taken before the
+		// pend (declareTouchedBlocks), over the blocks the pend carried. An id whose base was not cached
+		// is omitted and falls back to corroboration on the member side. Only the client can declare
+		// this — CoordinatorRepo.commit forwards without materializing.
 		return {
 			actionId,
 			blockIds,
 			tailId: logTailBlockId,
 			rev,
-			...blockDigestsField(blockDigests)
+			...blockDigestsField(declared.get(collectionId))
 		};
 	}
 

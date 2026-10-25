@@ -6,7 +6,8 @@ import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
-import { computeBlockContentDigests, baseRevsField } from "../transform/digest.js";
+import { describeTouchedBlocks, baseRevsField } from "../transform/digest.js";
+import { oversizedBlock } from "../network/block-size.js";
 import type { BlockBaseRevs, BlockGets } from "../network/struct.js";
 import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
@@ -2040,7 +2041,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// iteration), so a sync that loses N races pays N full hashing passes over its touched
 			// blocks. Unmeasured and cheap relative to the round trips it is retrying; if a
 			// high-contention sync ever shows digest hashing in a profile, memoize per (id, staged ops).
-			const blockDigests = await computeBlockContentDigests(tracker, tracker.transformedBlockIds());
+			const touched = await describeTouchedBlocks(tracker, tracker.transformedBlockIds());
+			// No block may be left larger than one message can carry. Refused here, before anything is
+			// sent, as the transaction limit is at the pend, and judged apart from the declaration, which
+			// never throws: only the blocks it could materialize are measured (see describeTouchedBlocks).
+			// It escapes `sync` unretried — a later attempt would leave the same block — and nothing on
+			// this instance has been touched, since the attempt ran on the snapshot tracker.
+			const tooLarge = oversizedBlock(touched.bytes);
+			if (tooLarge) throw tooLarge;
+			const blockDigests = touched.digests;
 			// The base each update-only block's operations were computed against, for the pend (see
 			// `PendRequest.baseRevs`): the tracker's pinned revisions, which `restageIfBasesMoved` at the
 			// top of this iteration has just re-judged, so a moved base was re-staged before it is named.

@@ -1,6 +1,6 @@
 import type { BlockId, IBlock } from "../index.js";
 import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
-import { canonicalBlockHash } from "../blocks/helpers.js";
+import { canonicalBlockHashAndBytes } from "../blocks/helpers.js";
 import { createLogger } from "../logger.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
 import type { Tracker } from "./tracker.js";
@@ -32,16 +32,49 @@ export async function computeBlockContentDigests<T extends IBlock>(
 	tracker: Tracker<T>,
 	blockIds: BlockId[]
 ): Promise<BlockContentDigests> {
+	return (await describeTouchedBlocks(tracker, blockIds)).digests;
+}
+
+/** What a writer can say about the blocks a write touches, from one local materialization of each. */
+export type TouchedBlocks = {
+	/** The commit's declaration of what each block will contain ({@link computeBlockContentDigests}). */
+	digests: BlockContentDigests;
+	/** What each of the same blocks' post-write content encodes to, by `jsonEncodedBytes` — the measure
+	 * `oversizedBlock` judges against `MAX_BLOCK_BYTES`. */
+	bytes: Record<BlockId, number>;
+};
+
+/** {@link computeBlockContentDigests}, plus the size of every block it declares, taken from the
+ * serialization the digest already hashes — the one pass both write paths make over their touched
+ * blocks before anything is sent. Judging the sizes is the caller's separate step (`oversizedBlock`),
+ * so declaring content still never breaks committing it.
+ *
+ * A block this pass cannot materialize is in neither map: neither declared nor measured. Those are the
+ * omissions listed at {@link computeBlockContentDigests} — a deleted block, a blind update to a block
+ * this node never read, an update whose base was evicted before it was staged, a base that moved under
+ * its staged operations — and a base the staged operations would not apply to (`peekOrSkip`). So the
+ * per-block size bound has the same gaps as the declaration: a block that outgrows `MAX_BLOCK_BYTES`
+ * through an update this node cannot materialize is not refused by the writer. */
+// NOTE: if a block is ever seen past MAX_BLOCK_BYTES after growing through one of those gaps, measure an
+// unmeasured update-only block here by reading its base — the one exception that would make to a commit
+// never paying a network read to describe itself. Its digest can stay undeclared.
+export async function describeTouchedBlocks<T extends IBlock>(
+	tracker: Tracker<T>,
+	blockIds: BlockId[]
+): Promise<TouchedBlocks> {
 	const digests: BlockContentDigests = {};
+	const bytes: Record<BlockId, number> = {};
 	for (const id of blockIds) {
 		const peeked = peekOrSkip(tracker, id);
 		if (!peeked) continue;
+		const described = await canonicalBlockHashAndBytes(peeked.block);
 		digests[id] = {
-			digest: await canonicalBlockHash(peeked.block),
+			digest: described.hash,
 			...(peeked.baseRev !== undefined ? { baseRev: peeked.baseRev } : {}),
 		};
+		bytes[id] = described.bytes;
 	}
-	return digests;
+	return { digests, bytes };
 }
 
 /** Wraps `blockDigests` so it spreads onto a request only when there is something to declare. The
