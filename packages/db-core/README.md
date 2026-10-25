@@ -115,6 +115,7 @@ B+tree implementation providing efficient sorted access to data:
 - **Sorted access**: Keys maintained in order for efficient range queries
 - **Path-based navigation**: Cursor-like traversal through the tree
 - **Automatic rebalancing**: Splits, merges, and borrowing maintain optimal structure
+- **Bounded node size**: a tree collection's nodes split by size as well as by count, so a table of large rows never builds a block too large to copy between machines (see [Node size](docs/btree.md#node-size))
 - **Type-safe**: Generic implementation supporting custom key/entry types
 
 ```typescript

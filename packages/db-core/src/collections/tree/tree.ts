@@ -3,6 +3,7 @@ import type { ITransactor, BlockId, BlockStore, IBlock, ActionId, WriteDurabilit
 import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { structuralEquals } from "../../utility/structural-equals.js";
+import { BLOCK_TARGET_BYTES } from "../../network/block-size.js";
 import {
 	TreeHeaderBlockType, TreeDeleteGuardKindError, TreeEntryChangedError, TreeKeyTakenError,
 	TreeRangeTakenError, type TreeEntryGuard, type TreeReplaceAction,
@@ -184,6 +185,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						keyFromEntry,
 						compare,
 						nodeCapacity,	// keep the write btree's fan-out in lock-step with the read btree
+						BLOCK_TARGET_BYTES,	// and its node size rule: every node is a block that must stay copyable
 					);
 					for (const [key, entry, guard] of actions) {
 						// NOTE: an element is a DELETE when its entry slot is falsy, not when it is
@@ -237,7 +239,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 				held.btree = BTree.create<TKey, TEntry>(store, (_s, r) => {
 						rootId = r;
 						return new CollectionTrunk(store, hid);
-					}, keyFromEntry, compare, nodeCapacity);
+					}, keyFromEntry, compare, nodeCapacity, undefined, BLOCK_TARGET_BYTES);
 				return {
 					header: store.createBlockHeader(TreeHeaderBlockType, hid),
 					rootId: rootId!,
@@ -258,7 +260,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		nodeCapacity: number | undefined,
 	): Tree<TKey, TEntry> {
 		held.btree = held.btree
-			?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare, nodeCapacity);
+			?? new BTree<TKey, TEntry>(collection.tracker, new CollectionTrunk(collection.tracker, collection.id), keyFromEntry, compare, nodeCapacity, BLOCK_TARGET_BYTES);
 		return new Tree<TKey, TEntry>(collection, held.btree, keyFromEntry, compare);
 	}
 

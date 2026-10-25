@@ -169,9 +169,9 @@ apply(store, leafNode, [entries$, index, 1, []]);
 
 The tree automatically rebalances during insertions and deletions:
 
-- **Splits** - When nodes exceed capacity (64 entries)
-- **Merges** - When nodes fall below minimum capacity
-- **Borrowing** - Transfer entries between siblings
+- **Splits** - When a node would exceed its capacity (64 entries or children) or, under a byte target, its size (see [Node size](#node-size))
+- **Merges** - When nodes fall below minimum capacity, and the merged node stays within the byte target
+- **Borrowing** - Transfer entries between siblings, within the byte target
 - **Root changes** - Create new root during splits or collapse during merges
 
 ## Type Safety
@@ -235,16 +235,17 @@ The B-tree maintains these structural invariants at all times:
 | Property | Value | Notes |
 |----------|-------|-------|
 | Node capacity | 64 entries/children | `NodeCapacity` constant |
-| Minimum fill (non-root) | 32 entries/children | `NodeCapacity >>> 1` |
-| Split point | `(length + 1) >>> 1` | Midpoint of overfull node |
+| Node size target (optional) | `nodeTargetBytes` of JSON | `Tree` sets `BLOCK_TARGET_BYTES` (1 MiB); a node over it holds one entry (leaf) or two children (branch) |
+| Minimum fill (non-root) | 32 entries/children, or half the byte target | Under-full only when below both (`NodeCapacity >>> 1`, `nodeTargetBytes / 2`) |
+| Split point | `(length + 1) >>> 1` | Midpoint of overfull node when the count is the reason; by bytes otherwise (see [Node size](#node-size)) |
 | Data location | Leaf nodes only | B+-tree variant (no leaf linked list) |
 | Entry immutability | `Object.freeze()` on insert/upsert | Prevents mutation after storage |
 
 ### Rebalancing Rules
 
-- **Split**: triggered when a node reaches `NodeCapacity` during insert. Splits at `(entries.length + 1) >>> 1`, promoting the first key of the new right node into the parent branch.
-- **Borrow**: after a delete, if a sibling has more than `NodeCapacity >>> 1` entries, one entry is transferred.
-- **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity`, they are merged and the parent partition is removed. Merges cascade upward.
+- **Split**: triggered when an insert or an in-place update would take a node past `NodeCapacity`, or past the byte target. When the count is the reason it splits at `(entries.length + 1) >>> 1`, promoting the first key of the new right node into the parent branch; when bytes are, see [Node size](#node-size).
+- **Borrow**: after a delete, if a sibling has more than `NodeCapacity >>> 1` entries, one entry is transferred — unless it would take the receiving node past the byte target.
+- **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity` and the byte target, they are merged and the parent partition is removed. Merges cascade upward. A merge that removes an empty leaf is never refused.
 - **Root collapse**: when the root branch has zero partitions (one child), that child becomes the new root.
 
 ### Atomic Mutations
@@ -256,6 +257,24 @@ Trees constructed directly via `new BTree()` do not get atomicity; this path is 
 ### Path Invalidation
 
 A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version.
+
+## Node size
+
+Every node is a block, and a block that outgrows what one message carries can never be copied to another machine (see [docs/internals.md §A transaction's size limit](../../../docs/internals.md#a-transactions-size-limit)). A node holds up to 64 entries however large they are, and nothing else would stop a table of large rows from building a leaf past that limit: each row is its own small transaction, so the per-transaction limit never sees the leaf grow. So a tree can also be given a byte target, `nodeTargetBytes` on the `BTree` constructor and `BTree.create` in `packages/db-core/src/btree/btree.ts`, measured like every block limit as the UTF-8 length of the node's JSON (`jsonEncodedBytes` in `packages/db-core/src/network/transaction-size.ts`). The tree collection sets it to `BLOCK_TARGET_BYTES` (1 MiB, `packages/db-core/src/network/block-size.ts`) on every B-tree it builds, write and read side alike. A bare `BTree` without one splits by count alone and never serializes a node to measure it.
+
+**Fit.** A node fits when it holds at most `NodeCapacity` items and either no more than the target's bytes or the least a node of its kind holds: one entry for a leaf, two children (one key) for a branch, since nothing smaller routes. So a node may exceed the target only while holding that minimum, and a leaf of one entry is never larger than the transaction that wrote the entry.
+
+**Division** (`divideItems` in `packages/db-core/src/btree/btree.ts`). An insert, or an in-place update that grows an entry (`upsert`, `updateAt`, `merge`), is judged on the node as it would stand with the edit applied:
+
+- Over the count alone, the node splits in two at the midpoint, the odd item going to the half the edit lands in — the division the tree has always made, kept exactly so a tree of small entries writes the transforms it always did (64 entries of 16 KiB is 1 MiB, so for entries of that size and below the count still decides).
+- Over the bytes, the node divides into the fewest runs that each fit, and where two suffice into the two whose larger run is smallest. An entry larger than the target by itself is therefore left alone in a leaf of its own, with its neighbours within the target on either side, and a leaf that outgrew the target before this rule existed is brought within it by its next insert or update, in one write.
+- A parent absorbs all of a child's new nodes at once, each under the lowest key beneath it, and divides by the same rules if it cannot hold them. A branch's bytes are its keys and child ids, so only large keys ever make bytes the reason there.
+
+The division is a pure function of the node's content and the edit, so a conflict replay or a retried attempt re-stages identical transforms.
+
+**Rebalance on delete.** A node is under-full only when it is below half the count *and* below half the byte target, so a leaf of a few large entries — under half the count for good — is a healthy block that no delete tries to fill, and a delete from it reads no sibling. A borrow is refused when the receiving node would pass the target, and a merge when the merged node would, so a merge the count allows can still be refused; the one exception is a merge that removes an empty leaf, which adds nothing to the other and is never refused, so no empty leaf outlives the delete that emptied it. A leaf that is under-full by both measures and refused by both siblings costs a delete from it two sibling reads and no write.
+
+**Cost.** One serialization of the node's entries per insert or in-place update, and of the leaf and the siblings it weighs per rebalance — the same order of cost as the commit path's digest of each touched block. The `NOTE:` at `leafRuns` in `packages/db-core/src/btree/btree.ts` names the remedy (a running byte count per leaf) if bulk inserts ever show it in a profile.
 
 ## Performance Characteristics
 
@@ -279,7 +298,7 @@ A monotonic `_version` counter tracks tree mutations. Paths capture the version 
 - **Branching factor 64** → tree height ≈ log₆₄(n). A tree with 1M entries is ~3 levels deep.
 - **Blocks loaded on demand** via the `BlockStore` abstraction; no full-tree materialization.
 - **Structured cloning** (`structuredClone`) used for block isolation — reads never alias stored data.
-- **Block size** depends on entry size; `ring-selector.ts` estimates ~100 KB typical.
+- **Block size** depends on entry size, bounded for a tree collection by `BLOCK_TARGET_BYTES` (see [Node size](#node-size)); `ring-selector.ts` estimates ~100 KB typical.
 
 ### Network Efficiency
 
