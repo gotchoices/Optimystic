@@ -76,3 +76,16 @@ export const MAX_CONSULT_BATCH_BLOCKS = 32;
  * claims, proofs and framing.
  */
 export const CONSULT_RESPONSE_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES / 2;
+
+/**
+ * How many bytes one remote `get` reply may spend on its entries, measured as the JSON-encoded size of
+ * each: past it, `RepoService` answers a block with a left-out entry and the asker's `RepoClient` asks
+ * again for it (`fitGetReply` in `repo/get-reply.ts`). The first entry is always carried whole.
+ *
+ * The frame less the envelope reserve, i.e. the transaction limit, which is also the block limit
+ * (`MAX_BLOCK_BYTES`): a reply holding one block of that size fits the frame inside the same reserve a
+ * transaction gets, so a reply packed up to the same total leaves the reserve for the left-out entries
+ * and the JSON around the entries. Unlike a consult answer, a left-out entry carries no claim or proof,
+ * so nothing else needs the room {@link CONSULT_RESPONSE_CONTENT_BUDGET_BYTES} keeps back.
+ */
+export const GET_REPLY_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES - TRANSACTION_ENVELOPE_RESERVE_BYTES;

@@ -1,11 +1,12 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
-import type { CommitResult, IKeyNetwork, IRepo, PendResult, RepoMessage } from '@optimystic/db-core'
+import type { CommitResult, GetBlockResults, IKeyNetwork, IRepo, PendResult, RepoMessage } from '@optimystic/db-core'
 import { LruMap, blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { encodePeers, type RedirectPayload } from './redirect.js'
-import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
+import { fitGetReply, type RepoBlockGets, type RepoGetReply } from './get-reply.js'
+import { GET_REPLY_CONTENT_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger, type Logger } from '../logger.js'
 import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
@@ -326,6 +327,31 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * Answer a remote read, packed to fit one frame when the asker reads left-out entries
+	 * (`RepoBlockGets.acceptsLeftOut`, see `fitGetReply`); any other asker is answered whole, as before.
+	 * The flag is a wire detail and is not passed on to the repo.
+	 */
+	private async answerGet(request: RepoBlockGets, expiration: number | undefined, asker: PeerId | undefined): Promise<GetBlockResults | RepoGetReply> {
+		const { acceptsLeftOut, ...blockGets } = request
+		// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
+		// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for
+		// a block a cohort peer holds is an authoritative lie the transactor never
+		// retries. Only the sync protocol keeps the flag (`sync/service.ts`, where the
+		// consult itself lands), and that is what stops the recursion.
+		// NOTE: this also puts lazy read-repair on remote reads of locally-present blocks
+		// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
+		// block ids. If a working set wider than that LRU ever shows a consult on every
+		// read, widen the LRU rather than reinstating the skip.
+		// The connection's authenticated peer is the only identity a read's `askerHolds` may be
+		// bound to, so it is passed here rather than read from anything the request says.
+		const results = await this.repo.get(blockGets, {
+			expiration,
+			...(asker ? { asker: asker.toString() } : {})
+		})
+		return acceptsLeftOut === true ? fitGetReply(results, blockGets.blockIds, GET_REPLY_CONTENT_BUDGET_BYTES) : results
+	}
+
+	/**
 	 * Handle incoming streams on the repo protocol
 	 */
 	private handleIncomingStream(stream: Stream, connection?: Connection): void {
@@ -356,21 +382,7 @@ export class RepoService implements Startable {
 				} else if (message.operations.length > 1) {
 					response = await this.runBatch(message)
 				} else if ('get' in operation) {
-					// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
-					// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for
-					// a block a cohort peer holds is an authoritative lie the transactor never
-					// retries. Only the sync protocol keeps the flag (`sync/service.ts`, where the
-					// consult itself lands), and that is what stops the recursion.
-					// NOTE: this also puts lazy read-repair on remote reads of locally-present blocks
-					// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
-					// block ids. If a working set wider than that LRU ever shows a consult on every
-					// read, widen the LRU rather than reinstating the skip.
-					// The connection's authenticated peer is the only identity a read's `askerHolds` may be
-					// bound to, so it is passed here rather than read from anything the request says.
-					response = await this.repo.get(operation.get, {
-						expiration: message.expiration,
-						...(peerId ? { asker: peerId.toString() } : {})
-					})
+					response = await this.answerGet(operation.get, message.expiration, peerId)
 				} else if ('pend' in operation) {
 					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {
