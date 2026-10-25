@@ -68,6 +68,11 @@ export class BlockTooLargeError extends Error {
  * can materialize locally (`describeTouchedBlocks`), which leaves out a deleted block and an updated
  * block whose base it cannot materialize.
  */
+// NOTE: accepted tradeoff (no backwards compatibility yet, AGENTS.md) — a block a build without the split
+// rules already grew past the limit refuses every write that leaves it over, including ones that do not
+// grow it: a log tail's roll-over (which rewrites its `nextId`) wedges every later write to that
+// collection, and a delete from an oversized leaf is refused. If a deployment must keep writing over such
+// data, refuse only a block that grows past its base's size here, rather than every block over the limit.
 export function oversizedBlock(bytes: Readonly<Record<BlockId, number>>): BlockTooLargeError | undefined {
 	for (const [blockId, size] of Object.entries(bytes)) {
 		if (size > MAX_BLOCK_BYTES) return new BlockTooLargeError(blockId, size);

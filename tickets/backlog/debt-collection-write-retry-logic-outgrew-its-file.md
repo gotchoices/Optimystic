@@ -8,6 +8,8 @@ tradeoffs: The code is correct and heavily tested, the comments are what make it
 
 # Measured
 
+Re-measured 2026-10-25 (`wc -l`, after ticket `a-writer-refuses-a-block-too-large-to-copy`): `packages/db-core/src/collection/collection.ts` 2534 lines, `packages/db-core/src/transaction/coordinator.ts` 2149 lines. The figures below are the original measurement.
+
 `wc -l packages/db-core/src/collection/collection.ts` → 1559 lines (2026-09-16, after ticket `a-write-whose-log-entry-landed-alone-is-reported-saved`, which added about 280 of them). `syncAttempts` alone runs from roughly line 1199 to line 1450 — about 250 lines in one function, with a retry loop nested inside a retry loop, and more comment than code. `packages/db-core/src/transaction/coordinator.ts` is 1536 lines and its `commit` now carries a near-copy of the inner loop ("back off, refresh, and if finishing the half-saved write was refused for a cause that can clear, count it against the budget and refresh again").
 
 # What is wanted
