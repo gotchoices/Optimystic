@@ -37,6 +37,7 @@ The `RepoClient` provides a client-side implementation of the `IRepo` interface 
 - **Protocol Abstraction**: Handles libp2p protocol communication details
 - **Message Serialization**: Converts operations to/from network messages
 - **Error Handling**: Manages network errors and timeouts
+- **Multi-round reads**: a `get` whose blocks together outgrow one reply frame is answered with some blocks left out (`fitGetReply` in `packages/db-p2p/src/repo/get-reply.ts`, applied by `RepoService` only to a request marked `acceptsLeftOut`), and `get` asks the same peer again for those until every block is answered; see [docs/internals.md §A transaction's size limit](../../../docs/internals.md#a-transactions-size-limit)
 
 **Implementation Details:**
 ```typescript
