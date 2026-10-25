@@ -384,9 +384,9 @@ export class BlockTransferService implements Startable {
 		}
 
 		for (const blockId of request.blockIds) {
-			// The value is whatever JSON the sender wrote: absent, `null`, a primitive. Persisting a
-			// falsy or header-less "block" would seed metadata with no materialization, making every
-			// later `get` throw. Reject such payloads as missing rather than poison storage.
+			// The value is whatever JSON the sender wrote: absent, `null`, a primitive, a `null` header.
+			// Persisting a falsy or header-less "block" would seed metadata with no materialization, making
+			// every later `get` throw. Reject such payloads as missing rather than poison storage.
 			const block: unknown = request.blocks[blockId];
 			if (!isStructurallyBlock(block)) {
 				log('push:invalid block=%s (not a structurally valid block)', blockId);
@@ -476,9 +476,11 @@ export class BlockTransferService implements Startable {
 	}
 }
 
-/** A pushed value the receiver may go on to certify and persist: an object with a `header`. */
+/** A pushed value the receiver may go on to certify and persist: an object whose `header` is an object. */
 function isStructurallyBlock(value: unknown): value is IBlock {
-	return value !== null && typeof value === 'object' && (value as IBlock).header !== undefined;
+	if (value === null || typeof value !== 'object') return false;
+	const header: unknown = (value as IBlock).header;
+	return header !== null && typeof header === 'object';
 }
 
 /** Factory for creating BlockTransferService following the libp2p service pattern. */

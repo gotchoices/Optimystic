@@ -3,7 +3,7 @@ prereq: a-log-block-rolls-over-by-size
 architecture: docs/internals.md#spreadonchurnmonitor-middle-out
 files: packages/db-p2p/src/cluster/block-transfer-service.ts, packages/db-p2p/src/protocol-client.ts, packages/db-p2p/src/repo/service.ts, packages/db-p2p/src/cluster/service.ts, packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/protocol-limits.ts, packages/db-core/src/network/struct.ts, packages/db-p2p/test/block-transfer-roundtrip.spec.ts, packages/db-p2p/test/block-transfer-push-persist.spec.ts, packages/db-p2p/test/block-transfer.spec.ts, packages/db-p2p/test/inbound-stream-authorization.spec.ts, packages/db-p2p/test/inbound-message-caps.spec.ts, packages/db-p2p/test/rebalance-push-holders.spec.ts, packages/db-p2p/test/cohort-growth-heals-single-holder.spec.ts, packages/db-p2p/test/spread-on-churn.spec.ts, docs/internals.md, docs/debugging.md
 ----
-# A block copy travels unencoded — review handoff
+# A block copy travels unencoded
 
 ## What changed
 
@@ -12,7 +12,7 @@ files: packages/db-p2p/src/cluster/block-transfer-service.ts, packages/db-p2p/sr
 - `BlockTransferRequest` carries `blocks: Record<BlockId, IBlock>`, each block as its JSON value, in place of `blockData` (base64 strings). `type` is gone, since pull is gone (below). `blockIds`, `blockMeta` and `blockProofs` are unchanged.
 - `BlockTransferResponse` is `{ accepted: string[]; missing: string[] }`. It carries no block content (it used to echo every accepted block back).
 - `BlockTransferClient.pushBlocks(blocks, reason, certification, options)` takes a block map instead of parallel `blockIds` + `Uint8Array[]`. `pushBlockToPeers` passes `{ [blockId]: result.block }` and still reads answers the one true way: a peer holds the block when the answer does not list it missing.
-- `handlePush` keeps every receiver rule as it was: the structural check (now the helper `isStructurallyBlock`: an object with a `header`, which rejects `null`, primitives and absent entries), certification before persisting, per-block decisions, and holder-evidence reporting for the accepted set. A request with no `blocks` answers every id missing.
+- `handlePush` keeps every receiver rule as it was: the structural check (now the helper `isStructurallyBlock`: an object whose `header` is an object, which rejects `null`, primitives, absent entries and — tightened in review — a `null` header), certification before persisting, per-block decisions, and holder-evidence reporting for the accepted set. A request with no `blocks` answers every id missing.
 - The handler's catch arm used to answer `{ blocks: {}, missing: [] }` when `handlePush` threw. A sender reads "not listed missing" as "held", so that answer reported every block as confirmed. It now answers every block missing. In practice this path cannot be reached today: `handlePush` catches its own persist faults, and `certifyContent` does not throw.
 - `IBlockReplicaStore` no longer extends `IRepo`: with pull gone, the service only calls `saveReplicatedBlock`.
 
@@ -56,3 +56,30 @@ Ran `yarn build`, `yarn lint`, `yarn lint:docs` and db-p2p `yarn test` (3527 pas
 - A push answer lists accepted and missing ids and never block bytes.
 - A malformed value (`null`, primitive, header-less, absent) is answered missing and never persisted; a certified block beside it is still accepted.
 - Senders (`pushBlockToPeers`: rebalance push/confirm, spread-on-churn, the under-replication drain) still count a peer as holding a block exactly when its answer does not list it missing.
+
+## Review findings
+
+Read the implement diff (`ticket(implement): a-block-copy-travels-unencoded`) before the handoff, then the touched sources, tests and docs.
+
+**Checked, no change needed**
+
+- Wire shape and senders: `pushBlocks` is the only request builder, and every sender (`pushBlockToPeers`, used by rebalance push/confirm, spread-on-churn and the under-replication drain) still reads an answer by "not listed in `missing`". Nothing reads `accepted`; it is diagnostic only, which is what the ticket asked for. No other caller of `pullBlocks`, `blockData`, `handlePull` or the old response shape remains in `packages/*/src`, docs or tests.
+- Size: a block embedded as a JSON value encodes to the same bytes as the block alone (no string escaping), so the request is the block plus ids, metadata and proof, inside the 512 KiB envelope reserve. The new `MAX_BLOCK_BYTES` round-trip test exercises the request encode in `ProtocolClient` above 4 MiB, so it pins the encoder fix on that side too.
+- Encoder caps: read `it-length-prefixed`'s `encode` (default `MAX_DATA_LENGTH`, 4 MiB, checked as `chunk.byteLength > maxDataLength`). `maxDataLength: request.byteLength` in `ProtocolClient` is therefore exactly "no cap beyond `maxRequestBytes`", and every `processMessage` caller (repo, cluster, sync, dispute, block-transfer) passes `maxRequestBytes`. Each reply encode now matches its client's read cap. The remaining default encode, `DisputeProtocolService`'s reply, is control-sized and read under the 1 MiB cap, so the 4 MiB default never binds there. The cohort-topic streams frame through their own helper and are control-sized.
+- The catch arm answering every block missing is the right direction (a sender treats "not listed" as held). `request.blocks[blockId]` on a `__proto__`/`constructor`-shaped id yields a prototype or a function, which the structural check refuses.
+- Removal of pull and of `IBlockReplicaStore extends IRepo`: no production caller; the docs (`docs/internals.md`, `docs/debugging.md`, the `CommitRequest.blockDigests` comment) no longer mention it.
+- The accepted-tradeoff `NOTE:` on `BlockTransferRequest` (no protocol version gate) states what, why and the revisit condition; left as is.
+- Docs: `docs/internals.md` §A transaction's size limit and §SpreadOnChurnMonitor describe the new payload, the encoder rule and the mixed-build behaviour; `protocol-limits.ts`'s header carries the encoder rule.
+
+**Found and fixed**
+
+- The structural-validation test was vacuous. It ran on the strict receiver with no proof on the malformed values, so they were refused by `no-proof` whether or not `isStructurallyBlock` existed (the pre-change `null` test had the same flaw). Moved it under the migration posture (`requirePushCertificate: false`), where the structural check is the only gate. Doing so exposed a real gap:
+- `{ header: null }` passed `isStructurallyBlock` (it only tested `header !== undefined`) and was persisted under the migration flag — verified by the moved test failing before the fix. Tightened the helper to require an object header; added the case to the test; updated the wording in `docs/internals.md` and the handler comment.
+
+**Considered, parked**
+
+- An `lpEncode` added later without a cap would silently bring back the 4 MiB limit for that frame. Five sites, one rule; a shared helper with a required cap would not stop a direct `it-length-prefixed` import either, so no ticket. The rule lives in the `protocol-limits.ts` header and `docs/internals.md` §A transaction's size limit, which is where a future encode site's author meets it.
+- No test of its own over 4 MiB for the repo, cluster-echo and sync reply encodes (the implementer's first known gap). Each is the same one-line cap as the tested block-transfer and request sides; the repo reply gets its test from `a-remote-read-reply-fits-one-message`. Not worth the run time of a second 7 MiB mesh test.
+- `BlockTransferResponse` is still read under `MAX_BLOCK_MESSAGE_BYTES` although it carries only ids — agreed with the implementer's reasoning (a many-block push's id list is the sender's choice); no change.
+
+**Tests and checks run**: `yarn build`, `yarn lint`, `yarn lint:docs` (all clean) and db-p2p `yarn test` (3527 passing, 74 pending, 0 failing). The integration specs and the quereus-plugin suite were not run: the change only alters frames over 4 MiB and the block-transfer types, which nothing outside db-p2p uses.

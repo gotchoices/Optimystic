@@ -267,31 +267,34 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			expect(response.accepted).to.not.include(blockId);
 			expect(response.missing).to.deep.equal([blockId]);
 		});
+	});
 
+	describe('the migration flag (requirePushCertificate: false)', () => {
 		it('reports missing (and does not poison storage) for a value that is not a structurally valid block', async () => {
 			// The value is whatever JSON the sender wrote. Persisting `null`, a primitive or a
 			// header-less object would seed metadata with no materialization and make every later get
-			// throw. The certified block beside them shows the push itself is otherwise sound.
+			// throw. Run without the certificate gate, which would otherwise refuse these on `no-proof`
+			// and leave the structural check untested; the block beside them shows the push is sound.
 			const good = 'block-shape-good';
-			const goodBlock = makeBlock(good);
-			const goodMeta = { rev: 2, actionId: 'a2' };
-			const malformed = { 'block-null': null, 'block-primitive': 'not a block', 'block-headerless': { marker: 'x' } };
+			const malformed = {
+				'block-null': null,
+				'block-primitive': 'not a block',
+				'block-headerless': { marker: 'x' },
+				'block-null-header': { header: null }
+			};
 			const request = {
 				blockIds: [good, ...Object.keys(malformed)],
 				reason: 'replication',
-				blocks: { [good]: goodBlock, ...malformed },
-				blockMeta: { [good]: goodMeta },
-				blockProofs: { [good]: await certify(good, goodBlock, goodMeta) }
+				blocks: { [good]: makeBlock(good), ...malformed },
+				blockMeta: { [good]: { rev: 2, actionId: 'a2' } }
 			} as unknown as BlockTransferRequest;
 
-			const response = await push(service, request);
+			const response = await push(legacyService, request);
 			expect(response.accepted).to.deep.equal([good]);
 			expect(response.missing).to.deep.equal(Object.keys(malformed));
 			for (const blockId of Object.keys(malformed)) await expectNothingPersisted(blockId);
 		});
-	});
 
-	describe('the migration flag (requirePushCertificate: false)', () => {
 		it('accepts an uncertified push and persists it at the source revision (pre-proof behaviour)', async () => {
 			const blockId = 'block-legacy';
 			const block = makeBlock(blockId);
