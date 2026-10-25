@@ -179,7 +179,7 @@ function makeMockPeerNetwork(
 
 function createMockStream(missing: string[] = []) {
 	// Build a varint-LP-encoded response matching BlockTransferResponse
-	const response: { blocks: Record<string, string>; missing: string[] } = { blocks: {}, missing };
+	const response: { accepted: string[]; missing: string[] } = { accepted: [], missing };
 	const payload = new TextEncoder().encode(JSON.stringify(response));
 	// Varint encode the length (works for payloads < 128 bytes)
 	const frame = new Uint8Array(1 + payload.length);

@@ -3,8 +3,6 @@ import { localDurability } from '@optimystic/db-core';
 import type { IRepo, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult, ActionBlocks, IBlock, BlockId, BlockHeader, IPeerNetwork } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { fromString as u8FromString } from 'uint8arrays/from-string';
-import { toString as u8ToString } from 'uint8arrays/to-string';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { PartitionDetector } from '../src/cluster/partition-detector.js';
 import { BlockTransferCoordinator } from '../src/cluster/block-transfer.js';
@@ -71,7 +69,7 @@ class MockPeerNetwork implements IPeerNetwork {
 		}
 		// Return a mock stream
 		const peerIdStr = peerId.toString();
-		const response = this.responses.get(peerIdStr) ?? { blocks: {}, missing: [] };
+		const response = this.responses.get(peerIdStr) ?? { accepted: [], missing: [] };
 		return createMockStream(response, this.sentRequests);
 	}
 }
@@ -166,7 +164,7 @@ describe('BlockTransferCoordinator', () => {
 			const ownerIdStr = ownerId.toString();
 
 			peerNetwork.responses.set(ownerIdStr, {
-				blocks: { 'block-1': 'data' },
+				accepted: ['block-1'],
 				missing: []
 			});
 
@@ -185,7 +183,7 @@ describe('BlockTransferCoordinator', () => {
 			// corroborate the source in a read-repair quorum vote, so the vote would see one claimant.
 			repo.blocks.set('block-1', makeBlock('block-1'));
 			const ownerIdStr = (await makePeerId()).toString();
-			peerNetwork.responses.set(ownerIdStr, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(ownerIdStr, { accepted: ['block-1'], missing: [] });
 
 			await coordinator.pushBlocks(['block-1'], new Map([['block-1', [ownerIdStr]]]));
 
@@ -250,8 +248,8 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-1', makeBlock('block-1'));
 			const o1 = (await makePeerId()).toString();
 			const o2 = (await makePeerId()).toString();
-			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
-			peerNetwork.responses.set(o2, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(o1, { accepted: ['block-1'], missing: [] });
+			peerNetwork.responses.set(o2, { accepted: ['block-1'], missing: [] });
 
 			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
 
@@ -263,8 +261,8 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-1', makeBlock('block-1'));
 			const o1 = (await makePeerId()).toString();
 			const o2 = (await makePeerId()).toString();
-			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
-			peerNetwork.responses.set(o2, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(o1, { accepted: ['block-1'], missing: [] });
+			peerNetwork.responses.set(o2, { accepted: ['block-1'], missing: [] });
 
 			await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
 
@@ -278,8 +276,8 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-1', makeBlock('block-1'));
 			const o1 = (await makePeerId()).toString();
 			const o2 = (await makePeerId()).toString();
-			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });  // confirms
-			peerNetwork.responses.set(o2, { blocks: {}, missing: ['block-1'] });             // does NOT confirm
+			peerNetwork.responses.set(o1, { accepted: ['block-1'], missing: [] });  // confirms
+			peerNetwork.responses.set(o2, { accepted: [], missing: ['block-1'] });             // does NOT confirm
 
 			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1, o2]]]), 2);
 
@@ -295,7 +293,7 @@ describe('BlockTransferCoordinator', () => {
 			}
 			repo.blocks.set('block-1', makeBlock('block-1'));
 			const o1 = (await makePeerId()).toString();
-			peerNetwork.responses.set(o1, { blocks: { 'block-1': 'data' }, missing: [] });
+			peerNetwork.responses.set(o1, { accepted: ['block-1'], missing: [] });
 
 			const result = await coordinator.confirmReplicated(['block-1'], new Map([['block-1', [o1]]]), 1);
 
@@ -320,8 +318,8 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-b', makeBlock('block-b'));
 			const ownerA = (await makePeerId()).toString();
 			const ownerB = (await makePeerId()).toString();
-			peerNetwork.responses.set(ownerA, { blocks: { 'block-a': 'data' }, missing: [] });
-			peerNetwork.responses.set(ownerB, { blocks: { 'block-b': 'data' }, missing: [] });
+			peerNetwork.responses.set(ownerA, { accepted: ['block-a'], missing: [] });
+			peerNetwork.responses.set(ownerB, { accepted: ['block-b'], missing: [] });
 
 			let callCount = 0;
 			const realConnect = peerNetwork.connect.bind(peerNetwork);
@@ -355,7 +353,7 @@ describe('BlockTransferCoordinator', () => {
 			const newOwners = new Map(blockIds.map((id, i) => [id, [owners[i]!.toString()]]));
 			for (let i = 0; i < blockIds.length; i++) {
 				repo.blocks.set(blockIds[i]!, makeBlock(blockIds[i]!));
-				peerNetwork.responses.set(owners[i]!.toString(), { blocks: { [blockIds[i]!]: 'data' }, missing: [] });
+				peerNetwork.responses.set(owners[i]!.toString(), { accepted: [blockIds[i]!], missing: [] });
 			}
 
 			const realConnect = peerNetwork.connect.bind(peerNetwork);
@@ -381,7 +379,7 @@ describe('BlockTransferCoordinator', () => {
 
 			const ownerId = await makePeerId();
 			peerNetwork.responses.set(ownerId.toString(), {
-				blocks: { 'block-old': 'data' },
+				accepted: ['block-old'],
 				missing: []
 			});
 
@@ -420,7 +418,7 @@ describe('BlockTransferCoordinator', () => {
 		it('pushes a GROWN block to its newly co-responsible peer exactly once, even below the event floor', async () => {
 			repo.blocks.set('block-kept', makeBlock('block-kept'));
 			const newPeer = await makePeerId();
-			peerNetwork.responses.set(newPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
+			peerNetwork.responses.set(newPeer.toString(), { accepted: ['block-kept'], missing: [] });
 
 			// floor 3 but only ONE new peer: the per-block floor must clamp to the new-peer count, or
 			// executeConfirm could never reach 3 and would burn maxRetries re-pushing an accepted peer.
@@ -449,7 +447,7 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-kept', makeBlock('block-kept'));
 			const newPeer = await makePeerId();
 			// Receiver answers, but lists the block missing (parse/persist failure on its side).
-			peerNetwork.responses.set(newPeer.toString(), { blocks: {}, missing: ['block-kept'] });
+			peerNetwork.responses.set(newPeer.toString(), { accepted: [], missing: ['block-kept'] });
 
 			const event: RebalanceEvent = {
 				gained: [],
@@ -473,8 +471,8 @@ describe('BlockTransferCoordinator', () => {
 			repo.blocks.set('block-kept', makeBlock('block-kept'));
 			const goodPeer = await makePeerId();
 			const badPeer = await makePeerId();
-			peerNetwork.responses.set(goodPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
-			peerNetwork.responses.set(badPeer.toString(), { blocks: {}, missing: ['block-kept'] });
+			peerNetwork.responses.set(goodPeer.toString(), { accepted: ['block-kept'], missing: [] });
+			peerNetwork.responses.set(badPeer.toString(), { accepted: [], missing: ['block-kept'] });
 
 			const event: RebalanceEvent = {
 				gained: [],
@@ -532,7 +530,7 @@ describe('BlockTransferCoordinator', () => {
 			}
 			repo.blocks.set('block-kept', makeBlock('block-kept'));
 			const newPeer = await makePeerId();
-			peerNetwork.responses.set(newPeer.toString(), { blocks: { 'block-kept': 'data' }, missing: [] });
+			peerNetwork.responses.set(newPeer.toString(), { accepted: ['block-kept'], missing: [] });
 
 			const event: RebalanceEvent = {
 				gained: [],
@@ -574,7 +572,7 @@ describe('BlockTransferCoordinator', () => {
 			try {
 				repo.blocks.set('block-1', makeBlock('block-1'));
 				const ownerIdStr = (await makePeerId()).toString();
-				peerNetwork.responses.set(ownerIdStr, { blocks: { 'block-1': 'data' }, missing: [] });
+				peerNetwork.responses.set(ownerIdStr, { accepted: ['block-1'], missing: [] });
 
 				const result = await coordinator.pushBlocks(['block-1'], new Map([['block-1', [ownerIdStr]]]));
 
@@ -608,8 +606,8 @@ describe('pushBlockToPeers (the one push loop)', () => {
 	});
 
 	it('reports confirmed, rejected and unreachable peers apart, and pushes to every peer by default', async () => {
-		peerNetwork.responses.set(peerA, { blocks: { 'block-1': 'data' }, missing: [] });
-		peerNetwork.responses.set(peerB, { blocks: {}, missing: ['block-1'] });
+		peerNetwork.responses.set(peerA, { accepted: ['block-1'], missing: [] });
+		peerNetwork.responses.set(peerB, { accepted: [], missing: ['block-1'] });
 		peerNetwork.failPeers.add(peerC);
 
 		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { protocolPrefix: '/optimystic/x' });
@@ -627,12 +625,14 @@ describe('pushBlockToPeers (the one push loop)', () => {
 		expect(outcome.certified, 'this repo retains no proof').to.equal(false);
 		expect(peerNetwork.connectCalls.map(c => c.protocol), 'every dial is under the configured prefix')
 			.to.deep.equal(Array(3).fill(buildBlockTransferProtocol('/optimystic/x')));
-		expect(peerNetwork.sentRequests[0]).to.include({ type: 'push', reason: 'replication' });
+		expect(peerNetwork.sentRequests[0]!.reason).to.equal('replication');
+		expect(peerNetwork.sentRequests[0]!.blocks, 'the block travels as its own JSON value')
+			.to.deep.equal({ 'block-1': makeBlock('block-1') });
 		expect(peerNetwork.sentRequests[0]!.blockMeta).to.deep.equal({ 'block-1': { rev: 1, actionId: 'a1' } });
 	});
 
 	it('stops once stopAfterConfirmed distinct peers confirmed, reporting the rest skipped', async () => {
-		for (const peer of [peerA, peerB, peerC]) peerNetwork.responses.set(peer, { blocks: { 'block-1': 'data' }, missing: [] });
+		for (const peer of [peerA, peerB, peerC]) peerNetwork.responses.set(peer, { accepted: ['block-1'], missing: [] });
 
 		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { stopAfterConfirmed: 2, reason: 'rebalance' });
 
@@ -645,8 +645,8 @@ describe('pushBlockToPeers (the one push loop)', () => {
 	});
 
 	it('a refusal does not count toward the stop, so the loop keeps looking for a holder', async () => {
-		peerNetwork.responses.set(peerA, { blocks: {}, missing: ['block-1'] });
-		peerNetwork.responses.set(peerB, { blocks: { 'block-1': 'data' }, missing: [] });
+		peerNetwork.responses.set(peerA, { accepted: [], missing: ['block-1'] });
+		peerNetwork.responses.set(peerB, { accepted: ['block-1'], missing: [] });
 
 		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, [peerA, peerB, peerC], { stopAfterConfirmed: 1 });
 
@@ -673,7 +673,7 @@ describe('pushBlockToPeers (the one push loop)', () => {
 	});
 
 	it('treats a peer id that does not parse as unreachable rather than throwing', async () => {
-		peerNetwork.responses.set(peerA, { blocks: { 'block-1': 'data' }, missing: [] });
+		peerNetwork.responses.set(peerA, { accepted: ['block-1'], missing: [] });
 
 		const outcome = await pushBlockToPeers(repo, peerNetwork, 'block-1' as BlockId, ['not-a-peer-id', peerA]);
 
@@ -755,88 +755,5 @@ describe('sourceBlockMeta', () => {
 	it('is undefined when the source holds no latest', () => {
 		expect(sourceBlockMeta('block-1' as BlockId, { state: {} })).to.equal(undefined);
 		expect(sourceBlockMeta('block-1' as BlockId, undefined)).to.equal(undefined);
-	});
-});
-
-describe('BlockTransferRequest/Response types', () => {
-	it('pull request has correct shape', () => {
-		const req: BlockTransferRequest = {
-			type: 'pull',
-			blockIds: ['block-1', 'block-2'],
-			reason: 'rebalance'
-		};
-		expect(req.type).to.equal('pull');
-		expect(req.blockIds).to.have.length(2);
-	});
-
-	it('push request includes blockData', () => {
-		const req: BlockTransferRequest = {
-			type: 'push',
-			blockIds: ['block-1'],
-			reason: 'replication',
-			blockData: { 'block-1': 'base64data' }
-		};
-		expect(req.blockData).to.not.be.undefined;
-		expect(req.blockData!['block-1']).to.equal('base64data');
-	});
-
-	it('response distinguishes found and missing blocks', () => {
-		const resp: BlockTransferResponse = {
-			blocks: { 'block-1': 'data' },
-			missing: ['block-2']
-		};
-		expect(Object.keys(resp.blocks)).to.deep.equal(['block-1']);
-		expect(resp.missing).to.deep.equal(['block-2']);
-	});
-});
-
-describe('block-transfer wire encoding (uint8arrays base64pad, cross-platform)', () => {
-	// BlockTransferService encodes/decodes block payloads with uint8arrays' 'base64pad' codec
-	// instead of the Node-only `Buffer` global, which does not exist under Hermes/React Native.
-	// These tests pin the codec directly: on-wire byte-for-byte compatibility with Buffer's
-	// padded base64 output (old senders/receivers must keep interoperating with new ones), a
-	// non-ASCII payload, an empty payload, and the malformed-input failure mode `handlePush`
-	// relies on. The full push/pull service round trip — including with `globalThis.Buffer`
-	// removed entirely — is covered in block-transfer-roundtrip.spec.ts.
-
-	it('round-trips a block whose JSON contains multi-byte UTF-8 text', () => {
-		const block = { ...makeBlock('block-utf8'), marker: 'héllo 世界 🎉' };
-		const json = JSON.stringify(block);
-		const encoded = u8ToString(u8FromString(json, 'utf8'), 'base64pad');
-		const decoded = u8ToString(u8FromString(encoded, 'base64pad'), 'utf8');
-		expect(decoded).to.equal(json);
-	});
-
-	it("encodes to exactly the string Buffer's toString('base64') produces, at every padding length (new encoder, old decoder)", () => {
-		// Exact string equality, not a Buffer decode: Buffer's base64 decoder is lenient (it accepts
-		// unpadded or partly-invalid input), so decoding alone would not prove the wire bytes match.
-		// Suffix lengths 0..2 cover all three padding cases ('', '=', '==').
-		const json = JSON.stringify(makeBlock('block-interop-1'));
-		for (const suffix of ['', 'x', 'xy']) {
-			const payload = json + suffix;
-			expect(u8ToString(u8FromString(payload, 'utf8'), 'base64pad'), `payload length ${payload.length}`)
-				.to.equal(Buffer.from(payload, 'utf8').toString('base64'));
-		}
-	});
-
-	it('decodes what Buffer.from(json).toString(\'base64\') produces (old encoder, new decoder)', () => {
-		const json = JSON.stringify(makeBlock('block-interop-2'));
-		const encoded = Buffer.from(json, 'utf8').toString('base64');
-		const decoded = u8ToString(u8FromString(encoded, 'base64pad'), 'utf8');
-		expect(decoded, 'a legacy Buffer-based sender is still understood').to.equal(json);
-	});
-
-	it('round-trips a zero-length payload', () => {
-		const encoded = u8ToString(new Uint8Array(0), 'base64pad');
-		expect(encoded).to.equal('');
-		expect(u8FromString(encoded, 'base64pad')).to.deep.equal(new Uint8Array(0));
-	});
-
-	it('throws on a malformed base64 string rather than silently ignoring the bad characters', () => {
-		// Buffer.from(str, 'base64') silently ignores invalid characters; fromString throws
-		// instead. handlePush relies on that throw landing in its existing try/catch and being
-		// reported as a missing block, exactly like any other undecodable push — see
-		// block-transfer-push-persist.spec.ts.
-		expect(() => u8FromString('!!!not-base64!!!', 'base64pad')).to.throw();
 	});
 });

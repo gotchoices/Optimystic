@@ -18,7 +18,6 @@
  */
 
 import { expect } from 'chai';
-import { fromString as u8FromString } from 'uint8arrays/from-string';
 import type { PeerId } from '@libp2p/interface';
 import { canonicalBlockHash } from '@optimystic/db-core';
 import type {
@@ -65,8 +64,6 @@ const certificationFor = async (blockId: string, block: IBlock, meta: Meta): Pro
 	blockProofs: { [blockId]: await certify(blockId, block, meta) }
 });
 
-const wireBytes = (block: IBlock): Uint8Array => u8FromString(JSON.stringify(block), 'utf8');
-
 /** Just enough libp2p for the monitor: its peer id and the connection listeners it registers. */
 const monitorLibp2p = (peerId: PeerId) => ({
 	peerId,
@@ -83,7 +80,7 @@ interface Rig {
 	reports: BlockHolders[];
 	/** Push blocks to this node over the wire, as `sender`. */
 	pushAs: (
-		sender: PeerId, blockIds: string[], blocks: IBlock[], certification: PushCertification
+		sender: PeerId, blocks: Record<string, IBlock>, certification: PushCertification
 	) => Promise<BlockTransferResponse>;
 	stop: () => Promise<void>;
 }
@@ -146,9 +143,9 @@ const buildRig = async (self: PeerId, cohort: PeerId[]): Promise<Rig> => {
 	return {
 		monitor,
 		reports,
-		pushAs: (sender, blockIds, blocks, certification) =>
+		pushAs: (sender, blocks, certification) =>
 			new BlockTransferClient(self, peerNetworkFor(sender))
-				.pushBlocks(blockIds, blocks.map(wireBytes), 'replication', certification),
+				.pushBlocks(blocks, 'replication', certification),
 		stop: async () => { await service.stop(); await monitor.stop(); }
 	};
 };
@@ -170,7 +167,7 @@ describe('rebalance after a received replica (the push reports its sender as a h
 		const meta: Meta = { rev: 4, actionId: 'a4' as ActionId };
 
 		const response = await rig.pushAs(
-			sender.peerId, [blockId], [block], await certificationFor(blockId, block, meta));
+			sender.peerId, { [blockId]: block }, await certificationFor(blockId, block, meta));
 		expect(response.missing, 'precondition: the push was accepted').to.deep.equal([]);
 
 		expect(rig.reports, 'the sender is reported as a holder of the accepted block').to.deep.equal([
@@ -196,7 +193,7 @@ describe('rebalance after a received replica (the push reports its sender as a h
 		const refusedBlock = makeBlock(refused);
 		const acceptedMeta: Meta = { rev: 2, actionId: 'a2' as ActionId };
 
-		const response = await rig.pushAs(sender.peerId, [accepted, refused], [acceptedBlock, refusedBlock], {
+		const response = await rig.pushAs(sender.peerId, { [accepted]: acceptedBlock, [refused]: refusedBlock }, {
 			blockMeta: {
 				[accepted]: acceptedMeta,
 				[refused]: { rev: 2, actionId: 'b2' as ActionId }

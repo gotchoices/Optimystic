@@ -5,7 +5,7 @@ import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
-import { BlockTransferService, type BlockTransferRequest, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
+import { BlockTransferService, type BlockTransferRequest, type BlockTransferResponse, type IBlockReplicaStore } from '../src/cluster/block-transfer-service.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
 
 /**
@@ -65,10 +65,9 @@ const pushReq = (
 	meta?: Meta,
 	proof?: BlockCommitProof
 ): BlockTransferRequest => ({
-	type: 'push',
 	blockIds: [blockId],
 	reason: 'replication',
-	blockData: { [blockId]: Buffer.from(JSON.stringify(block)).toString('base64') },
+	blocks: { [blockId]: block },
 	...(meta ? { blockMeta: { [blockId]: meta } } : {}),
 	...(proof ? { blockProofs: { [blockId]: proof } } : {})
 });
@@ -97,7 +96,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 	});
 
 	const push = (svc: BlockTransferService, request: BlockTransferRequest) =>
-		(svc as any).handlePush(request) as Promise<{ blocks: Record<string, string>; missing: string[] }>;
+		(svc as any).handlePush(request) as Promise<BlockTransferResponse>;
 
 	/** Nothing landed: `get` reports no block for this id (and does not throw on poisoned metadata). */
 	const expectNothingPersisted = async (blockId: string) => {
@@ -112,7 +111,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const blockId = 'block-uncertified';
 			const response = await push(service, pushReq(blockId, makeBlock(blockId), { rev: 7, actionId: 'a7' }));
 
-			expect(response.blocks).to.not.have.property(blockId);
+			expect(response.accepted).to.not.include(blockId);
 			expect(response.missing).to.deep.equal([blockId]);
 			await expectNothingPersisted(blockId);
 		});
@@ -133,7 +132,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 			const response = await push(service, pushReq(blockId, block, meta, proof));
 
-			expect(response.blocks, 'a verifying push is accepted').to.have.property(blockId);
+			expect(response.accepted, 'a verifying push is accepted').to.include(blockId);
 			expect(response.missing).to.deep.equal([]);
 
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -193,13 +192,9 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const badMeta = { rev: 4, actionId: 'b4' };
 
 			const request: BlockTransferRequest = {
-				type: 'push',
 				blockIds: [good, bad],
 				reason: 'replication',
-				blockData: {
-					[good]: Buffer.from(JSON.stringify(goodBlock)).toString('base64'),
-					[bad]: Buffer.from(JSON.stringify(badBlock)).toString('base64')
-				},
+				blocks: { [good]: goodBlock, [bad]: badBlock },
 				blockMeta: { [good]: goodMeta, [bad]: badMeta },
 				// Only the first block is certified; the second is an uncertified rider.
 				blockProofs: { [good]: await certify(good, goodBlock, goodMeta) }
@@ -207,7 +202,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 			const response = await push(service, request);
 
-			expect(response.blocks, 'the verifying block is accepted').to.have.property(good);
+			expect(response.accepted, 'the verifying block is accepted').to.include(good);
 			expect(response.missing, 'the uncertified block is refused, alone').to.deep.equal([bad]);
 
 			const result = await repo.get({ blockIds: [good as BlockId, bad as BlockId] });
@@ -224,8 +219,8 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const r1 = await push(service, request);
 			const r2 = await push(service, request);
 
-			expect(r1.blocks).to.have.property(blockId);
-			expect(r2.blocks, 'the re-push is still accepted').to.have.property(blockId);
+			expect(r1.accepted).to.include(blockId);
+			expect(r2.accepted, 'the re-push is still accepted').to.include(blockId);
 			expect(r2.missing).to.deep.equal([]);
 
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -241,7 +236,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const stale = await push(service, await certifiedReq(blockId, block, { rev: 1, actionId: 'a1' }));
 
 			// The stale push is still "accepted" (the block is durably present), but latest holds at 5.
-			expect(stale.blocks).to.have.property(blockId);
+			expect(stale.accepted).to.include(blockId);
 			expect(stale.missing).to.deep.equal([]);
 
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -269,60 +264,30 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 			// A block that fails to persist must NOT be reported accepted, so the sender
 			// does not falsely treat it as replicated.
-			expect(response.blocks).to.not.have.property(blockId);
+			expect(response.accepted).to.not.include(blockId);
 			expect(response.missing).to.deep.equal([blockId]);
 		});
 
-		it('reports a block as missing when the wire payload is not parseable', async () => {
-			const blockId = 'block-baddata';
-			const request: BlockTransferRequest = {
-				type: 'push',
-				blockIds: [blockId],
+		it('reports missing (and does not poison storage) for a value that is not a structurally valid block', async () => {
+			// The value is whatever JSON the sender wrote. Persisting `null`, a primitive or a
+			// header-less object would seed metadata with no materialization and make every later get
+			// throw. The certified block beside them shows the push itself is otherwise sound.
+			const good = 'block-shape-good';
+			const goodBlock = makeBlock(good);
+			const goodMeta = { rev: 2, actionId: 'a2' };
+			const malformed = { 'block-null': null, 'block-primitive': 'not a block', 'block-headerless': { marker: 'x' } };
+			const request = {
+				blockIds: [good, ...Object.keys(malformed)],
 				reason: 'replication',
-				// Valid base64, but the decoded bytes are not JSON.
-				blockData: { [blockId]: Buffer.from('not json', 'utf8').toString('base64') }
-			};
+				blocks: { [good]: goodBlock, ...malformed },
+				blockMeta: { [good]: goodMeta },
+				blockProofs: { [good]: await certify(good, goodBlock, goodMeta) }
+			} as unknown as BlockTransferRequest;
 
 			const response = await push(service, request);
-			expect(response.blocks).to.not.have.property(blockId);
-			expect(response.missing).to.deep.equal([blockId]);
-		});
-
-		it('reports a block as missing when the wire payload is not valid base64 at all', async () => {
-			// uint8arrays' fromString throws SyntaxError on a character outside the base64
-			// alphabet (unlike Buffer.from(str, 'base64'), which silently ignores it). This pins
-			// that the throw lands in the same try/catch as an unparseable-but-valid-base64
-			// payload, above, and is reported the same way rather than as an unhandled rejection.
-			const blockId = 'block-notbase64';
-			const request: BlockTransferRequest = {
-				type: 'push',
-				blockIds: [blockId],
-				reason: 'replication',
-				blockData: { [blockId]: '!!!not-base64!!!' }
-			};
-
-			const response = await push(service, request);
-			expect(response.blocks).to.not.have.property(blockId);
-			expect(response.missing).to.deep.equal([blockId]);
-		});
-
-		it('reports missing (and does not poison storage) when the payload is valid JSON but not a block', async () => {
-			const blockId = 'block-null';
-			const request: BlockTransferRequest = {
-				type: 'push',
-				blockIds: [blockId],
-				reason: 'replication',
-				// `null` is valid JSON, so the parse guard alone would let it through; persisting
-				// it would seed metadata with no materialization and make every later get throw.
-				blockData: { [blockId]: Buffer.from('null', 'utf8').toString('base64') }
-			};
-
-			const response = await push(service, request);
-			expect(response.blocks).to.not.have.property(blockId);
-			expect(response.missing).to.deep.equal([blockId]);
-
-			// Storage was not poisoned: get returns empty rather than throwing.
-			await expectNothingPersisted(blockId);
+			expect(response.accepted).to.deep.equal([good]);
+			expect(response.missing).to.deep.equal(Object.keys(malformed));
+			for (const blockId of Object.keys(malformed)) await expectNothingPersisted(blockId);
 		});
 	});
 
@@ -334,7 +299,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 			const response = await push(legacyService, pushReq(blockId, block, meta));
 
-			expect(response.blocks).to.have.property(blockId);
+			expect(response.accepted).to.include(blockId);
 			expect(response.missing).to.deep.equal([]);
 
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -349,7 +314,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const blockId = 'block-legacy-nometa';
 			const response = await push(legacyService, pushReq(blockId, makeBlock(blockId)));
 
-			expect(response.blocks).to.have.property(blockId);
+			expect(response.accepted).to.include(blockId);
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
 			expect(result[blockId]?.block?.header.id).to.equal(blockId);
 			expect(result[blockId]?.state?.latest?.rev).to.equal(1);
@@ -387,7 +352,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 
 			const response = await push(legacyService, pushReq(blockId, block, meta, proof));
 
-			expect(response.blocks).to.have.property(blockId);
+			expect(response.accepted).to.include(blockId);
 			expect(await repo.getBlockProof(blockId as BlockId, meta.rev)).to.deep.equal(proof);
 		});
 	});
@@ -419,7 +384,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const proof = await certify(blockId, block, meta);
 			const response = await push(service, pushReq(blockId, block, meta, proof));
 
-			expect(response.blocks, 'the certified re-push is accepted').to.have.property(blockId);
+			expect(response.accepted, 'the certified re-push is accepted').to.include(blockId);
 			expect(response.missing).to.deep.equal([]);
 			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
 				'the verified proof is now retained for the held revision').to.deep.equal(proof);
@@ -444,7 +409,7 @@ describe('BlockTransferService.handlePush certification + persistence', () => {
 			const response = await push(service, pushReq(blockId, pushedBlock, meta, proof));
 
 			// The push itself verifies (the proof covers the bytes it carried) and is accepted...
-			expect(response.blocks).to.have.property(blockId);
+			expect(response.accepted).to.include(blockId);
 			// ...but nothing is retained for a revision this node materialized differently.
 			expect(await repo.getBlockProof(blockId as BlockId, meta.rev),
 				'a proof contradicting local content is never stored').to.equal(undefined);

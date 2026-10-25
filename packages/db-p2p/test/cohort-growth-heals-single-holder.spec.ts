@@ -191,7 +191,7 @@ class MockFret {
  * A duplex-shaped stream whose receive side is computed from what the client sent. `ProtocolClient`
  * writes every length-prefixed request frame via `stream.send(...)` BEFORE it starts reading the
  * stream's async iterator, so by first pull the request is complete: LP-decode it, drive the target
- * node's real `BlockTransferService` push/pull handler, and yield the LP-encoded response.
+ * node's real `BlockTransferService` push handler, and yield the LP-encoded response.
  */
 function createLoopbackStream(
 	handle: (request: BlockTransferRequest) => Promise<BlockTransferResponse>
@@ -220,7 +220,7 @@ function createLoopbackStream(
 	};
 }
 
-/** Routes a dial to the target peer's real BlockTransferService (push/pull handlers driven directly). */
+/** Routes a dial to the target peer's real BlockTransferService (its push handler driven directly). */
 class LoopbackPeerNetwork implements IPeerNetwork {
 	private readonly services = new Map<string, BlockTransferService>();
 	dialed: string[] = [];
@@ -238,10 +238,7 @@ class LoopbackPeerNetwork implements IPeerNetwork {
 		const target = this.services.get(peerId.toString());
 		if (!target) throw new Error(`loopback: no service registered for ${peerId.toString()}`);
 		this.dialed.push(peerId.toString());
-		return createLoopbackStream(async (request) =>
-			request.type === 'push'
-				? await (target as any).handlePush(request)
-				: await (target as any).handlePull(request));
+		return createLoopbackStream(async (request) => await (target as any).handlePush(request));
 	}
 }
 

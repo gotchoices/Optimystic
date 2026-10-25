@@ -33,3 +33,7 @@ If the implementer finds a cleaner seam (for example packing in `NetworkTransact
 - One regression test over the real stream handler (a linked-duplex pair as in `packages/db-p2p/test/block-transfer-roundtrip.spec.ts`): a two-block `get` whose blocks together exceed the frame returns both blocks.
 - Describe the packing in `docs/internals.md` next to §A transaction's size limit's block-size paragraph.
 - Run `yarn build` and `yarn test` for db-p2p.
+
+## Note from a-block-copy-travels-unencoded
+
+The length-prefix encoder (`it-length-prefixed`) defaults to a 4 MiB cap, and `RepoService` encoded its replies at that default, so any `get` reply over 4 MiB, a single 5 MiB block included, was refused by the server's own encoder before the reader's 8 MiB cap mattered. `a-block-copy-travels-unencoded` now has `RepoService` (and the cluster, sync and block-transfer services, and `ProtocolClient` for requests) encode under `MAX_BLOCK_MESSAGE_BYTES`. The regression test here — two 5 MiB blocks over the real stream handler — is the first to exercise that repo reply encode above 4 MiB.

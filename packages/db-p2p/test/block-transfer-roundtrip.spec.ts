@@ -2,12 +2,9 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { pushable } from 'it-pushable';
-import { fromString as u8FromString } from 'uint8arrays/from-string';
-import { toString as u8ToString } from 'uint8arrays/to-string';
 import type { PeerId } from '@libp2p/interface';
 import type { ActionId, CommitRequest, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
-import { canonicalBlockHash } from '@optimystic/db-core';
-import { BlockStorage } from '../src/storage/block-storage.js';
+import { canonicalBlockHash, jsonEncodedBytes, MAX_BLOCK_BYTES } from '@optimystic/db-core';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import {
@@ -16,6 +13,7 @@ import {
 	sourceBlockCertification,
 	type BlockTransferServiceInit,
 	type IBlockReplicaStore,
+	type PushCertification,
 } from '../src/cluster/block-transfer-service.js';
 import { ResponseTimeoutError, RESPONSE_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
@@ -23,9 +21,9 @@ import { makeLinkedPair } from './support/linked-duplex-pair.js';
 
 /**
  * Default-suite (no env gate) regression for the block-transfer request→response
- * round trip through the *registered stream handler* — not a direct handlePull/
- * handlePush call. The only other coverage of the real-stream path is the env-gated
- * churn integration test; a regression in the handler's stream framing or handler
+ * round trip through the *registered stream handler* — not a direct handlePush
+ * call. The only other coverage of the real-stream path is the env-gated churn
+ * integration test; a regression in the handler's stream framing or handler
  * signature would otherwise pass `yarn test` silently (that exact framing/signature
  * bug is what this ticket chain traces back to).
  *
@@ -44,6 +42,34 @@ const makePeerId = async (): Promise<PeerId> => {
 const makeBlock = (id: string): IBlock => ({
 	header: { id: id as BlockId, type: 'test', collectionId: 'col-1' as BlockId } as BlockHeader
 });
+
+/** A block whose JSON encodes to exactly `bytes`, padded with an ASCII payload (one byte a character). */
+const makeBlockOfEncodedSize = (id: string, bytes: number): IBlock => {
+	const unpadded = jsonEncodedBytes({ ...makeBlock(id), payload: '' });
+	return { ...makeBlock(id), payload: 'x'.repeat(bytes - unpadded) } as IBlock;
+};
+
+/**
+ * What a real source peer sends for `block` at `source`: a repo holding the block AND the cohort's
+ * proof for it, read back through `sourceBlockCertification` from ONE unpinned read, as the production
+ * push loop does.
+ */
+const certifiedSource = async (blockId: string, block: IBlock, source: { rev: number; actionId: ActionId }): Promise<PushCertification> => {
+	// One raw store shared across every BlockStorage, as a real node has: a fresh store per call would
+	// silently drop each write.
+	const sourceRepo = new StorageRepo(new MemoryRawStorage());
+	const commit: CommitRequest = {
+		actionId: source.actionId,
+		blockIds: [blockId as BlockId],
+		tailId: blockId as BlockId,
+		rev: source.rev,
+		blockDigests: { [blockId]: { digest: await canonicalBlockHash(block) } }
+	};
+	const { proof } = await makeSignedProof(4, commit);
+	await sourceRepo.saveReplicatedBlock(blockId as BlockId, block, source, proof);
+	const read = await sourceRepo.get({ blockIds: [blockId as BlockId] });
+	return await sourceBlockCertification(sourceRepo, blockId as BlockId, read[blockId]);
+};
 
 /** Mirrors `support/commit-proof-fixtures.ts`'s `PROOF_THRESHOLDS.superMajorityThreshold`. */
 const SUPER_MAJORITY = 0.75;
@@ -96,43 +122,19 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		peerId = await makePeerId();
 	});
 
-	it('pull returns a stored block through the handler+stream (not a direct call)', async function () {
-		this.timeout(2000);
-		const blockId = 'rt-pull-1';
-		const block = makeBlock(blockId);
-		// Seed the receiver's storage so the pull has something to serve.
-		await repo.saveReplicatedBlock(blockId as BlockId, block);
-
-		const { service, peerNetwork } = makeWiredNetwork(repo);
-		await service.start();
-		try {
-			const client = new BlockTransferClient(peerId, peerNetwork as any);
-			const response = await client.pullBlocks([blockId], 'replication');
-
-			expect(response.blocks, 'block returned through the stream path').to.have.property(blockId);
-			expect(response.missing).to.deep.equal([]);
-			// The wire bytes decode back to the seeded block.
-			const decoded = JSON.parse(Buffer.from(response.blocks[blockId]!, 'base64').toString('utf8'));
-			expect(decoded.header.id).to.equal(blockId);
-		} finally {
-			await service.stop();
-		}
-	});
-
 	it('push persists the block on the receiver through the handler+stream', async function () {
 		this.timeout(2000);
 		const blockId = 'rt-push-1';
 		const block = makeBlock(blockId);
-		const blockData = new TextEncoder().encode(JSON.stringify(block));
 
 		const { service, peerNetwork } = makeWiredNetwork(repo);
 		await service.start();
 		try {
 			const client = new BlockTransferClient(peerId, peerNetwork as any);
-			const response = await client.pushBlocks([blockId], [blockData], 'replication');
+			const response = await client.pushBlocks({ [blockId]: block }, 'replication');
 
-			// The handler accepted the block (returned in `blocks`, not `missing`)...
-			expect(response.blocks).to.have.property(blockId);
+			// The handler accepted the block (listed in `accepted`, not `missing`)...
+			expect(response.accepted).to.deep.equal([blockId]);
 			expect(response.missing).to.deep.equal([]);
 
 			// ...AND it is durably persisted on the receiver — proves saveReplicatedBlock
@@ -151,7 +153,6 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		this.timeout(2000);
 		const blockId = 'rt-silent-1';
 		const block = makeBlock(blockId);
-		const blockData = new TextEncoder().encode(JSON.stringify(block));
 
 		// A peer that accepts the connection and reads the request but never writes a
 		// reply and never closes the stream. `abort` ends the (never-fed) read queue so
@@ -172,7 +173,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		const t0 = Date.now();
 		let caught: unknown;
 		try {
-			await client.pushBlocks([blockId], [blockData], 'replication', undefined, { responseTimeoutMs: 80 });
+			await client.pushBlocks({ [blockId]: block }, 'replication', undefined, { responseTimeoutMs: 80 });
 		} catch (e) {
 			caught = e;
 		}
@@ -188,10 +189,9 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 	 *
 	 * Every other certification test drives `handlePush` with a proof object handed to it in
 	 * process. That cannot catch a proof a real sender builds correctly and the wire then mangles:
-	 * the push request is JSON-serialized and the block bytes are base64'd, so anything in a
-	 * `BlockCommitProof` that does not survive `JSON.parse(JSON.stringify(x))` -- or a digest
-	 * computed over bytes that differ after the round trip -- would verify in a unit test and be
-	 * rejected by every real peer.
+	 * the push request, block included, is JSON-serialized, so anything in a `BlockCommitProof` that
+	 * does not survive `JSON.parse(JSON.stringify(x))` -- or a digest computed over a block that
+	 * differs after the round trip -- would verify in a unit test and be rejected by every real peer.
 	 *
 	 * So: a real source repo retains a real proof, `sourceBlockCertification` reads it out exactly
 	 * as the two production push sites do, `BlockTransferClient.pushBlocks` puts it on the real
@@ -203,24 +203,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		const block = makeBlock(blockId);
 		const source = { rev: 4, actionId: 'rt-a4' as ActionId };
 
-		// --- The source peer: a real repo holding the block AND the cohort's proof for it. ---
-		// One raw store shared across every BlockStorage, as a real node has: a fresh store per
-		// call would silently drop each write.
-		const sourceRaw = new MemoryRawStorage();
-		const sourceRepo = new StorageRepo(sourceRaw);
-		const commit: CommitRequest = {
-			actionId: source.actionId,
-			blockIds: [blockId as BlockId],
-			tailId: blockId as BlockId,
-			rev: source.rev,
-			blockDigests: { [blockId]: { digest: await canonicalBlockHash(block) } }
-		};
-		const { proof } = await makeSignedProof(4, commit);
-		await sourceRepo.saveReplicatedBlock(blockId as BlockId, block, source, proof);
-
-		// --- What a producer sends: meta + proof from ONE unpinned read, as both push sites do. ---
-		const read = await sourceRepo.get({ blockIds: [blockId as BlockId] });
-		const certification = await sourceBlockCertification(sourceRepo, blockId as BlockId, read[blockId]);
+		const certification = await certifiedSource(blockId, block, source);
 		expect(certification.blockProofs?.[blockId], 'the source attaches its retained proof').to.not.be.undefined;
 
 		// --- The receiver runs the production default: no proof, no persist. ---
@@ -228,10 +211,9 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		await service.start();
 		try {
 			const client = new BlockTransferClient(peerId, peerNetwork as any);
-			const blockData = new TextEncoder().encode(JSON.stringify(block));
-			const response = await client.pushBlocks([blockId], [blockData], 'replication', certification);
+			const response = await client.pushBlocks({ [blockId]: block }, 'replication', certification);
 
-			expect(response.blocks, 'the certified push is accepted over the real stream').to.have.property(blockId);
+			expect(response.accepted, 'the certified push is accepted over the real stream').to.deep.equal([blockId]);
 			expect(response.missing).to.deep.equal([]);
 
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -252,10 +234,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		const block = makeBlock(blockId);
 		const source = { rev: 4, actionId: 'rt-a4' as ActionId };
 
-		// One raw store shared across every BlockStorage, as a real node has: a fresh store per
-		// call would silently drop each write.
-		const sourceRaw = new MemoryRawStorage();
-		const sourceRepo = new StorageRepo(sourceRaw);
+		const sourceRepo = new StorageRepo(new MemoryRawStorage());
 		await sourceRepo.saveReplicatedBlock(blockId as BlockId, block, source);
 
 		const read = await sourceRepo.get({ blockIds: [blockId as BlockId] });
@@ -267,8 +246,7 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 		await service.start();
 		try {
 			const client = new BlockTransferClient(peerId, peerNetwork as any);
-			const blockData = new TextEncoder().encode(JSON.stringify(block));
-			const response = await client.pushBlocks([blockId], [blockData], 'replication', certification);
+			const response = await client.pushBlocks({ [blockId]: block }, 'replication', certification);
 
 			expect(response.missing, 'refused end to end').to.deep.equal([blockId]);
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
@@ -279,18 +257,45 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 	});
 
 	/**
+	 * The largest block the size limit allows, pushed certified to a strict-default receiver. Base64
+	 * made a push a third larger than the block, so the client refused this request before dialing
+	 * (`MessageTooLargeError`: 7.5 MiB of block became 10 MiB of request against the 8 MiB frame). As
+	 * a JSON value, the block plus its revision metadata and commit proof fits one frame.
+	 */
+	it('a certified push of a block at MAX_BLOCK_BYTES fits one frame and is persisted', async function () {
+		this.timeout(30000);
+		const blockId = 'rt-largest-1';
+		const block = makeBlockOfEncodedSize(blockId, MAX_BLOCK_BYTES);
+		expect(jsonEncodedBytes(block), 'precondition: the block is exactly at the limit').to.equal(MAX_BLOCK_BYTES);
+		const source = { rev: 4, actionId: 'rt-a4' as ActionId };
+		const certification = await certifiedSource(blockId, block, source);
+
+		const { service, peerNetwork } = makeWiredNetwork(repo, {});
+		await service.start();
+		try {
+			const client = new BlockTransferClient(peerId, peerNetwork as any);
+			const response = await client.pushBlocks({ [blockId]: block }, 'replication', certification);
+
+			expect(response.accepted).to.deep.equal([blockId]);
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			expect(result[blockId]?.state?.latest, 'persisted at the source revision').to.deep.equal(source);
+			expect(jsonEncodedBytes(result[blockId]?.block), 'and whole').to.equal(MAX_BLOCK_BYTES);
+		} finally {
+			await service.stop();
+		}
+	});
+
+	/**
 	 * Reproduces the Hermes/React Native condition in Node: `globalThis.Buffer` does not exist
 	 * unless a host app happens to install a polyfill (see readme.md § React Native). Deletes the
-	 * global for the duration of one push AND one pull through the real handler+stream path, so a
-	 * regression that reaches for `Buffer` anywhere in that path (service, client, or the
-	 * `it-length-prefixed`/`it-pipe` framing in between) throws `ReferenceError: Buffer is not
-	 * defined` here instead of silently only failing on-device.
+	 * global for the duration of one push through the real handler+stream path, so a regression that
+	 * reaches for `Buffer` anywhere in that path (service, client, or the `it-length-prefixed`/
+	 * `it-pipe` framing in between) throws `ReferenceError: Buffer is not defined` here instead of
+	 * silently only failing on-device.
 	 */
-	it('completes a push and a pull with globalThis.Buffer deleted (Hermes/React Native condition)', async function () {
+	it('completes a push with globalThis.Buffer deleted (Hermes/React Native condition)', async function () {
 		this.timeout(2000);
-		const pullBlockId = 'rt-nobuffer-pull';
-		const pushBlockId = 'rt-nobuffer-push';
-		await repo.saveReplicatedBlock(pullBlockId as BlockId, makeBlock(pullBlockId));
+		const blockId = 'rt-nobuffer-push';
 
 		const { service, peerNetwork } = makeWiredNetwork(repo);
 		await service.start();
@@ -300,22 +305,13 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 			expect(typeof (globalThis as any).Buffer, 'precondition: the global is actually gone').to.equal('undefined');
 
 			const client = new BlockTransferClient(peerId, peerNetwork as any);
+			const response = await client.pushBlocks({ [blockId]: makeBlock(blockId) }, 'replication');
+			expect(response.accepted).to.deep.equal([blockId]);
+			expect(response.missing).to.deep.equal([]);
 
-			const pullResponse = await client.pullBlocks([pullBlockId], 'replication');
-			expect(pullResponse.blocks).to.have.property(pullBlockId);
-			expect(pullResponse.missing).to.deep.equal([]);
-			const decoded = JSON.parse(u8ToString(u8FromString(pullResponse.blocks[pullBlockId]!, 'base64pad'), 'utf8'));
-			expect(decoded.header.id).to.equal(pullBlockId);
-
-			const pushBlock = makeBlock(pushBlockId);
-			const pushData = new TextEncoder().encode(JSON.stringify(pushBlock));
-			const pushResponse = await client.pushBlocks([pushBlockId], [pushData], 'replication');
-			expect(pushResponse.blocks).to.have.property(pushBlockId);
-			expect(pushResponse.missing).to.deep.equal([]);
-
-			const result = await repo.get({ blockIds: [pushBlockId as BlockId] });
-			expect(result[pushBlockId]?.block?.header.id, 'pushed block durably persisted with no global Buffer')
-				.to.equal(pushBlockId);
+			const result = await repo.get({ blockIds: [blockId as BlockId] });
+			expect(result[blockId]?.block?.header.id, 'pushed block durably persisted with no global Buffer')
+				.to.equal(blockId);
 		} finally {
 			(globalThis as any).Buffer = savedBuffer;
 			await service.stop();

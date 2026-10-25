@@ -399,7 +399,8 @@ export class RepoService implements Startable {
 					stream,
 					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 					processStream.bind(this),
-					(source) => lpEncode(source)
+					// The cap `RepoClient` reads the reply under; the encoder's own default is 4 MiB.
+					(source) => lpEncode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES })
 				)
 				for await (const chunk of responses) {
 					stream.send(chunk)

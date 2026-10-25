@@ -1,5 +1,5 @@
 import type { Connection, Startable, Stream } from '@libp2p/interface';
-import type { IRepo, PeerId, IPeerNetwork, ActionId, ActionRev, GetBlockResult, IBlock, BlockId, BlockUnavailableReason, CollectionId } from '@optimystic/db-core';
+import type { PeerId, IPeerNetwork, ActionId, ActionRev, GetBlockResult, IBlock, BlockId, BlockUnavailableReason, CollectionId } from '@optimystic/db-core';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
@@ -24,24 +24,39 @@ const BLOCK_TRANSFER_VERSION = '1.0.0';
 export const buildBlockTransferProtocol = (protocolPrefix: string = ''): string =>
 	`${protocolPrefix}${BLOCK_TRANSFER_PREFIX}${BLOCK_TRANSFER_VERSION}`;
 
-/** Request to transfer blocks */
+/**
+ * A request to keep copies of blocks: the sender pushes each block, and the receiver persists it.
+ *
+ * NOTE: accepted tradeoff — no protocol version separates this shape from the one before it (blocks as
+ * base64 strings in `blockData`, answered with the bytes echoed back), so builds either side of the
+ * change cannot copy blocks to each other: each answers the other's push with every block `missing`,
+ * and nothing is persisted. Backwards compatibility is not a goal yet (AGENTS.md); revisit once
+ * mixed-version deployments must replicate to each other.
+ */
 export interface BlockTransferRequest {
-	type: 'pull' | 'push';
-	/** Block IDs being transferred */
+	/** Block IDs being pushed. An id with no entry in {@link blocks} is answered `missing`. */
 	blockIds: string[];
 	/** Reason for transfer */
 	reason: 'rebalance' | 'replication' | 'recovery';
-	/** For push: base64-encoded block data per block ID */
-	blockData?: Record<string, string>;
 	/**
-	 * For push: the source's revision metadata per block ID. Carries the sender's
+	 * Each block as its own JSON value, keyed by block ID. Not an encoded string: base64 made a block a
+	 * third larger, so a block over about 6 MiB of JSON could not be pushed at all. As itself, a block up
+	 * to `MAX_BLOCK_BYTES` plus its {@link blockMeta} and {@link blockProofs} fits one push frame
+	 * (`MAX_BLOCK_MESSAGE_BYTES`).
+	 *
+	 * Typed as blocks for the sender; the receiver gets whatever JSON the sender wrote and checks each
+	 * value is a structurally valid block before anything else.
+	 */
+	blocks?: Record<string, IBlock>;
+	/**
+	 * The source's revision metadata per block ID. Carries the sender's
 	 * `state.latest` so the replica's `latest` matches the source instead of being
 	 * fabricated. Optional: an older sender omits it and the receiver falls back to a
 	 * deterministic rev-1 replica (see {@link IBlockStorage.saveReplica}).
 	 */
 	blockMeta?: Record<string, { rev: number; actionId: ActionId }>;
 	/**
-	 * For push: the cohort's commit proof for each block's revision. Verified against the pushed
+	 * The cohort's commit proof for each block's revision. Verified against the pushed
 	 * bytes AND against the declared {@link blockMeta} before anything is persisted — one
 	 * `certifyContent` call covers the signatures and thresholds, the claim matching the declared
 	 * `(rev, actionId)`, and the declared digest matching the pushed bytes.
@@ -143,23 +158,25 @@ export async function sourceBlockCertification(
 	return { blockMeta, blockProofs: { [blockId]: proof } };
 }
 
-/** Response with block data */
+/**
+ * The answer to a push: which blocks the receiver now holds and which it does not. It carries no block
+ * content — the sender already has it, and echoing it back would double the bytes on the link.
+ */
 export interface BlockTransferResponse {
-	/** Blocks successfully transferred: blockId → base64-encoded data */
-	blocks: Record<string, string>;
-	/** Block IDs that couldn't be found/transferred */
+	/** Block IDs the receiver persisted, or already held at the pushed revision. */
+	accepted: string[];
+	/** Block IDs the receiver did not persist: absent, not a block, uncertified, or a persist fault. */
 	missing: string[];
 }
 
 // --- Service (server-side handler) ---
 
 /**
- * Repo capability the service needs: read access for `handlePull` plus a local
- * "save replica" path for `handlePush`. The replica path must land in the node's
- * *local* storage (not the cluster-coordinated repo), so it is a distinct method
- * from the `IRepo` commit funnel. `StorageRepo` implements this.
+ * Repo capability the service needs: a local "save replica" path for `handlePush`. The replica path
+ * must land in the node's *local* storage (not the cluster-coordinated repo), so it is a distinct
+ * method from the `IRepo` commit funnel. `StorageRepo` implements this.
  */
-export interface IBlockReplicaStore extends IRepo {
+export interface IBlockReplicaStore {
 	/**
 	 * Persist a replica of a block received out-of-band (churn re-replication).
 	 * Seeds metadata if absent, advances `latest` monotonically, and makes the block
@@ -228,10 +245,8 @@ export interface BlockTransferServiceComponents {
 }
 
 /**
- * Libp2p service that handles incoming block transfer requests.
- *
- * Responds to pull requests by reading blocks from local storage.
- * Handles push requests by accepting block data and storing it locally.
+ * Libp2p service that handles incoming block transfer requests: it accepts pushed blocks and stores
+ * them locally.
  */
 export class BlockTransferService implements Startable {
 	private running = false;
@@ -309,22 +324,22 @@ export class BlockTransferService implements Startable {
 				async function* (source) {
 					for await (const msg of source) {
 						const request = JSON.parse(u8ToString(msg.subarray(), 'utf8')) as BlockTransferRequest;
-						log('request type=%s blocks=%d reason=%s', request.type, request.blockIds.length, request.reason);
+						log('request blocks=%d reason=%s', request.blockIds.length, request.reason);
 						let response: BlockTransferResponse;
 						try {
-							response = request.type === 'pull'
-								? await self.handlePull(request)
-								: await self.handlePush(request, remotePeerId);
+							response = await self.handlePush(request, remotePeerId);
 						} catch (error) {
 							log('error: %s', (error as Error).message);
-							response = { blocks: {}, missing: [] };
+							// A sender counts a block held unless it is listed missing, so a fault answers
+							// every block missing rather than none.
+							response = { accepted: [], missing: request.blockIds };
 						}
-						log('response blocks=%d missing=%d', Object.keys(response.blocks).length, response.missing.length);
+						log('response accepted=%d missing=%d', response.accepted.length, response.missing.length);
 						yield u8FromString(JSON.stringify(response), 'utf8');
 						return; // one request → one response per stream
 					}
 				},
-				(source) => lp.encode(source)
+				(source) => lp.encode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES })
 			);
 			for await (const chunk of responses) {
 				stream.send(chunk);
@@ -336,29 +351,11 @@ export class BlockTransferService implements Startable {
 		}
 	}
 
-	private async handlePull(request: BlockTransferRequest): Promise<BlockTransferResponse> {
-		const blocks: Record<string, string> = {};
-		const missing: string[] = [];
-
-		const result = await this.repo.get({ blockIds: request.blockIds });
-
-		for (const blockId of request.blockIds) {
-			const blockResult = result[blockId];
-			if (blockResult?.block) {
-				blocks[blockId] = u8ToString(u8FromString(JSON.stringify(blockResult.block), 'utf8'), 'base64pad');
-			} else {
-				missing.push(blockId);
-			}
-		}
-
-		return { blocks, missing };
-	}
-
 	/**
 	 * Persist pushed blocks into local storage so the new owner holds a durable
 	 * replica after churn. A block is reported `accepted` only if it was both
-	 * received (parseable) AND successfully persisted; a parse, certification or persist failure
-	 * surfaces it as `missing` so the sender does not falsely treat it as replicated.
+	 * received (a structurally valid block) AND successfully persisted; an invalid, uncertified or
+	 * unpersisted block surfaces as `missing` so the sender does not falsely treat it as replicated.
 	 *
 	 * **Certification.** A pushed block is content this node will serve — and, because
 	 * `saveReplicatedBlock` advances `latest`, content it will later CORROBORATE in a read-repair
@@ -368,44 +365,30 @@ export class BlockTransferService implements Startable {
 	 * rationale.
 	 *
 	 * Decisions are strictly PER BLOCK: in a multi-block push a block that verifies is accepted
-	 * beside one that does not. `handlePull` is unaffected — it serves this node's own storage.
+	 * beside one that does not.
 	 *
 	 * **The sender is reported as a holder of every block this call ACCEPTS** (see
 	 * {@link BlockTransferServiceComponents.onBlockHolders}), which is exactly the set left out of
-	 * `missing`: a block that failed parsing, certification or persistence is not one this node now
+	 * `missing`: a block that failed validation, certification or persistence is not one this node now
 	 * holds, and suppressing its `gained` report would be a lie. A monotonic no-op acceptance —
 	 * `saveReplicatedBlock` finding the pushed revision already held, so no collection change fires —
 	 * is reported like any other: the sender is a holder either way, and the block may already be
 	 * tracked from an earlier route.
 	 */
 	private async handlePush(request: BlockTransferRequest, senderPeerId?: string): Promise<BlockTransferResponse> {
-		const blocks: Record<string, string> = {};
+		const accepted: string[] = [];
 		const missing: string[] = [];
 
-		if (!request.blockData) {
-			return { blocks: {}, missing: request.blockIds };
+		if (!request.blocks) {
+			return { accepted: [], missing: request.blockIds };
 		}
 
 		for (const blockId of request.blockIds) {
-			const data = request.blockData[blockId];
-			if (!data) {
-				missing.push(blockId);
-				continue;
-			}
-
-			// Decode + parse the wire payload into an IBlock.
-			let block: IBlock;
-			try {
-				block = JSON.parse(u8ToString(u8FromString(data, 'base64pad'), 'utf8')) as IBlock;
-			} catch {
-				missing.push(blockId);
-				continue;
-			}
-
-			// `JSON.parse` accepts `null`/primitives as valid JSON. Persisting a falsy or
-			// header-less "block" would seed metadata with no materialization, making every
+			// The value is whatever JSON the sender wrote: absent, `null`, a primitive. Persisting a
+			// falsy or header-less "block" would seed metadata with no materialization, making every
 			// later `get` throw. Reject such payloads as missing rather than poison storage.
-			if (block === null || typeof block !== 'object' || (block as IBlock).header === undefined) {
+			const block: unknown = request.blocks[blockId];
+			if (!isStructurallyBlock(block)) {
 				log('push:invalid block=%s (not a structurally valid block)', blockId);
 				missing.push(blockId);
 				continue;
@@ -465,15 +448,15 @@ export class BlockTransferService implements Startable {
 			// Persist locally. Only a received-AND-persisted block is reported accepted.
 			try {
 				await this.repo.saveReplicatedBlock(blockId, block, source, verifiedProof);
-				blocks[blockId] = data;
+				accepted.push(blockId);
 			} catch (error) {
 				log('persist:fail block=%s err=%s', blockId, (error as Error).message);
 				missing.push(blockId);
 			}
 		}
 
-		this.reportSenderHolds(Object.keys(blocks), senderPeerId);
-		return { blocks, missing };
+		this.reportSenderHolds(accepted, senderPeerId);
+		return { accepted, missing };
 	}
 
 	/**
@@ -491,6 +474,11 @@ export class BlockTransferService implements Startable {
 			log('push:block-holders-sink-error peer=%s err=%s', senderPeerId, (error as Error).message);
 		}
 	}
+}
+
+/** A pushed value the receiver may go on to certify and persist: an object with a `header`. */
+function isStructurallyBlock(value: unknown): value is IBlock {
+	return value !== null && typeof value === 'object' && (value as IBlock).header !== undefined;
 }
 
 /** Factory for creating BlockTransferService following the libp2p service pattern. */
@@ -515,25 +503,9 @@ export class BlockTransferClient extends ProtocolClient {
 	}
 
 	/**
-	 * Pull blocks from the remote peer.
-	 *
-	 * @param options Optional per-call deadlines/cancellation forwarded to the
-	 *   underlying request. `dialTimeoutMs` bounds connecting; `responseTimeoutMs`
-	 *   bounds waiting for the reply once connected; `signal` cancels the whole
-	 *   request. Omitting all of them preserves the previous uncapped behavior.
-	 */
-	async pullBlocks(
-		blockIds: string[],
-		reason: BlockTransferRequest['reason'] = 'rebalance',
-		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
-	): Promise<BlockTransferResponse> {
-		const request: BlockTransferRequest = { type: 'pull', blockIds, reason };
-		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES });
-	}
-
-	/**
 	 * Push blocks to the remote peer.
 	 *
+	 * @param blocks The blocks to push, keyed by block ID, each as read from this node's own store.
 	 * @param certification What this push claims about the blocks — the source's revision metadata
 	 *   and the cohort commit proof for that same revision, built as one unit by
 	 *   {@link sourceBlockCertification}. Without a proof the receiver rejects the block under its
@@ -547,18 +519,13 @@ export class BlockTransferClient extends ProtocolClient {
 	 *   uncapped behavior.
 	 */
 	async pushBlocks(
-		blockIds: string[],
-		blockDataBuffers: Uint8Array[],
+		blocks: Record<BlockId, IBlock>,
 		reason: BlockTransferRequest['reason'] = 'rebalance',
 		certification?: PushCertification,
 		options?: { signal?: AbortSignal; dialTimeoutMs?: number; responseTimeoutMs?: number }
 	): Promise<BlockTransferResponse> {
-		const blockData: Record<string, string> = {};
-		for (let i = 0; i < blockIds.length; i++) {
-			blockData[blockIds[i]!] = u8ToString(blockDataBuffers[i]!, 'base64pad');
-		}
 		const request: BlockTransferRequest = {
-			type: 'push', blockIds, reason, blockData,
+			blockIds: Object.keys(blocks), reason, blocks,
 			...(certification?.blockMeta ? { blockMeta: certification.blockMeta } : {}),
 			...(certification?.blockProofs ? { blockProofs: certification.blockProofs } : {})
 		};
@@ -620,8 +587,6 @@ export interface PushBlockOptions {
 	responseTimeoutMs?: number;
 }
 
-const textEncoder = new TextEncoder();
-
 /**
  * Push ONE locally held block to `peerIds`, in order: read it unpinned from `repo`, build its
  * {@link PushCertification} from that same read, push it to each peer, and read each answer the one
@@ -656,7 +621,6 @@ export async function pushBlockToPeers(
 	if (!result?.block) {
 		return { status: 'no-local-data' };
 	}
-	const blockData = textEncoder.encode(JSON.stringify(result.block));
 	const certification = await sourceBlockCertification(repo, blockId, result);
 	const reason = options.reason ?? 'replication';
 	const deadlines = { dialTimeoutMs: options.dialTimeoutMs, responseTimeoutMs: options.responseTimeoutMs };
@@ -672,7 +636,7 @@ export async function pushBlockToPeers(
 		}
 		try {
 			const client = new BlockTransferClient(peerIdFromString(peerIdStr), peerNetwork, options.protocolPrefix);
-			const response = await client.pushBlocks([blockId], [blockData], reason, certification, deadlines);
+			const response = await client.pushBlocks({ [blockId]: result.block }, reason, certification, deadlines);
 			if (response.missing.includes(blockId)) {
 				refusals.push({ peerId: peerIdStr, reason: 'rejected' });
 			} else {

@@ -312,8 +312,8 @@ export type CommitRequest = ActionBlocks & {
 	// cost: `StorageRepo.persistProofIfContentMatches` retains no `BlockCommitProof` for a block that
 	// declared no digest (`commit:proof-undeclared`), and a block with no proof is refused by any
 	// receiver running the default `requirePushCertificate: true` (`push:reject-uncertified
-	// reason=no-proof`). Such a block stays readable and pullable (`handlePull` is not certificate-gated)
-	// and still repairs by corroboration while two or more holders remain, but it can never GAIN a
+	// reason=no-proof`). Such a block stays readable and still repairs by corroboration while two or
+	// more holders remain, but it can never GAIN a
 	// holder by push — so spread-on-churn and cohort-growth healing silently stop maintaining its
 	// replication factor. Kept optional anyway because: (a) required-but-nullable is the strongest form
 	// available and still permits `undefined`, so it does not make the bad state unrepresentable, only

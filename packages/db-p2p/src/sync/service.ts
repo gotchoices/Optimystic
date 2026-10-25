@@ -4,7 +4,7 @@ import { buildSyncProtocol, type SyncBlockAnswer, type SyncRequest, type SyncRes
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
-import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { fitConsultContent, serveBlockArchive, serveConsultAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
@@ -122,7 +122,9 @@ export class SyncService implements Startable {
 					actualStream,
 					(source: any) => lp.decode(source, { maxDataLength: MAX_CONTROL_MESSAGE_BYTES }),
 					processStream,
-					(source: any) => lp.encode(source)
+					// An archive carries block bytes: the cap `SyncClient` reads it under, not the encoder's
+					// own 4 MiB default.
+					(source: any) => lp.encode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES })
 				);
 				for await (const chunk of responses) {
 					actualStream.send(chunk);

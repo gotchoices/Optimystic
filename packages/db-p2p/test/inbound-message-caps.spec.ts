@@ -290,8 +290,7 @@ describe('inbound message caps', () => {
 		it('aborts the stream on an oversized frame (declared > block cap)', async () => {
 			const repo: IBlockReplicaStore = {
 				calls: 0,
-				async get() { (repo as any).calls++; return {}; },
-				async saveReplicatedBlock() { },
+				async saveReplicatedBlock() { (repo as any).calls++; },
 			} as any;
 			const { registrar, getHandler } = capturingRegistrar();
 			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
@@ -302,14 +301,13 @@ describe('inbound message caps', () => {
 			await mock.finished;
 
 			expect(mock.isAborted(), 'oversized frame must abort the stream').to.equal(true);
-			expect((repo as any).calls, 'oversized frame must never reach repo.get').to.equal(0);
+			expect((repo as any).calls, 'oversized frame must never reach the repo').to.equal(0);
 		});
 
 		it('does NOT apply the control cap: a frame above control (within block) is not rejected', async () => {
 			const repo: IBlockReplicaStore = {
-				async get() { return {}; },
 				async saveReplicatedBlock() { },
-			} as any;
+			};
 			const { registrar, getHandler } = capturingRegistrar();
 			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
 			await service.start();
@@ -325,9 +323,8 @@ describe('inbound message caps', () => {
 			// Strong regression guard: a frame above the library's 4 MiB default but below the
 			// 8 MiB block cap. Reverting the `maxDataLength` edit would abort this at the default.
 			const repo: IBlockReplicaStore = {
-				async get() { return {}; },
 				async saveReplicatedBlock() { },
-			} as any;
+			};
 			const { registrar, getHandler } = capturingRegistrar();
 			const service = new BlockTransferService({ registrar, repo, superMajorityThreshold: 0.75 }, {});
 			await service.start();

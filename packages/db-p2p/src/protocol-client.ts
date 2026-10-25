@@ -284,10 +284,12 @@ export class ProtocolClient {
 				else options.signal.addEventListener('abort', onParentAbortResponse, { once: true });
 			}
 
-			// Send the request using length-prefixed encoding
+			// Send the request using length-prefixed encoding. Its size was judged once, by name, against
+			// `maxRequestBytes` (`encodeRequest`); the encoder's own default would add a 4 MiB cap below the
+			// 8 MiB frame block-carrying servers decode under, and refuse every request between the two.
 			const encoded = pipe(
 				[request],
-				lpEncode
+				(source) => lpEncode(source, { maxDataLength: request.byteLength })
 			);
 			for await (const chunk of encoded) {
 				stream.send(chunk);

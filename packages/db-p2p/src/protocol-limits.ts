@@ -13,6 +13,10 @@
  * Outbound, `ProtocolClient.processMessage` refuses to send a request larger than the cap its server
  * decodes under (`ProcessMessageOptions.maxRequestBytes`), so an oversized request fails locally, by
  * name, rather than as a remote stream reset.
+ *
+ * The encoder has the same 4 MiB default, so an encode left at it silently caps a block-carrying frame
+ * at half its size. Every block-carrying service therefore encodes its reply under the cap its client
+ * reads the reply under, and `ProtocolClient` encodes a request under no cap beyond `maxRequestBytes`.
  */
 
 import { MAX_TRANSACTION_BYTES } from '@optimystic/db-core';
@@ -45,7 +49,7 @@ export const TRANSACTION_ENVELOPE_RESERVE_BYTES = 512 * 1024; // 512 KiB
  * - cluster (`ClusterService`, `ClusterClient`) — a pend record carries the transaction's transforms,
  *   and the member echoes that record back with its vote;
  * - dispute challenge (`DisputeProtocolService`) — the challenge carries the disputed cluster record;
- * - block-transfer (`BlockTransferService`, `BlockTransferClient`) — base64-inflated block data;
+ * - block-transfer (`BlockTransferService`, `BlockTransferClient`) — a pushed block with its revision metadata and commit proof;
  * - sync responses (`SyncClient`) — block archives.
  *
  * Derived from the per-transaction limit, so a transaction a writer is allowed to send fits every frame
