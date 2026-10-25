@@ -3,19 +3,11 @@ prereq: a-coordinator-runs-an-actions-collections-as-one-record
 architecture: docs/internals.md#one-commit-round-when-one-coordinator-covers-every-block
 files: packages/db-core/src/transactor/transactor.ts (`ITransactor`), packages/db-core/src/transactor/network-transactor.ts (`pend`, `commitInOneRound`, `soleCommitCoordinator`, `sendCommit`, `consolidateCoordinators`, `owedCancels`, `txnCoordinatorsFor`), packages/db-core/src/transaction/coordinator.ts (`pendPhase`, `pendCollection`, `commitPhase`, `commitCollection`, the `sole = collectionTransforms.size === 1` rule), packages/db-core/src/network/struct.ts (`PendRequest.soleReservation` doc), packages/db-core/src/testing/test-transactor.ts (wrapper at the `getLineage` forward), packages/quereus-plugin-optimystic/test/two-node-write-request-count.spec.ts, docs/internals.md, docs/correctness.md, packages/db-p2p/docs/cluster.md
 ----
-**Blocked: specification is silent on mixed-version groups. Unblocked by the maintainer choosing one of the options below; the gardener then moves this ticket back to `implement/` with the choice written in.**
+## Decision (maintainer, 2026-10-24): no mixed-version handling
 
-## Decision needed: what a machine on an older build does with a combined request
+Backwards compatibility is out of scope (AGENTS.md), so a group running mixed builds is not a case this ticket handles: no protocol version, no capability check, no fallback for an older coordinator or member, and no `NOTE:` or release-note warning about it. Send `pendMany` / `commitMany` whenever one coordinator covers every collection's blocks, as specified below.
 
-Today's `RepoService` dispatches on `operations[0]` alone (`processStream` in `packages/db-p2p/src/repo/service.ts`), and the previous ticket sends a batch as several ordinary `pend` (or `commit`) operations in one message. So once THIS ticket sends batches, a coordinator on 1.16 or earlier pends and commits only the first collection (the table) and reports success; the index and UNIQUE trees never land, and nothing errors. An older cohort member applying a batched consensus record likewise handles it as one collection. A rolling upgrade across a user's phone and backup is the ordinary moment a group runs mixed builds, and `docs/internals.md` already treats mixed versions as real for base-less pends. AGENTS.md says not to worry about backwards compatibility yet, which settles refusals but not silent loss.
-
-Options:
-
-1. **Accept it.** Leave the `NOTE:` the previous ticket's plan called for, and the release notes say: upgrade every machine of a group together, or index writes may silently not land.
-2. **Fail loudly.** Carry a batch as its own operation kinds (`pendMany` / `commitMany` holding a request list) instead of repeated `pend` / `commit` operations. An older `RepoService` matches no branch for an unknown kind and answers nothing, so the writer gets an error rather than a partial save; writes fail on mixed groups until all are upgraded. About the same amount of code as today's plan.
-3. **Send a batch only where every party understands it (gardener's recommendation).** Advertise the capability as a new protocol version (a repo and a cluster protocol id beside the 1.0.0 ones), have the writer send `pendMany` / `commitMany` only to a coordinator that advertises it, and have the coordinator run one batched record only when every member of the cohort advertises the cluster version; otherwise fall back to today's one request per collection. Mixed groups keep working at today's cost; the saving arrives when the whole group is upgraded. More work, mostly here and in the coordinator's record construction.
-
-What happens if nothing is decided: this ticket stays here and #42's request count does not change; the first two tickets are inert without it.
+The maintainer also asked whether batching pends with commits short-circuits two-phase commit. It does not, and the docs this ticket touches should keep that plain: pends and commits stay separate consensus rounds; only the collections WITHIN each phase are grouped into one record. The deferred pend decision is delivered ahead of the commit record's promise round, and a member that refuses any collection's pend refuses the action's one commit record before anything of it is durable.
 
 # A transaction pends and commits its collections together
 
