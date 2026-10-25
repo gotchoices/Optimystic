@@ -3,6 +3,7 @@ import { Chain, EntriesPerBlock, entryAt } from '../src/chain/chain.js';
 import { TestBlockStore } from './test-block-store.js';
 import type { ChainDataNode } from '../src/chain/chain-nodes.js';
 import { ChainHeaderBlockType } from '../src/chain/chain-nodes.js';
+import { jsonEncodedBytes } from '../src/network/transaction-size.js';
 
 describe('Chain', () => {
     let store: TestBlockStore;
@@ -177,6 +178,26 @@ describe('Chain', () => {
 
             const priorBlock = await store.tryGet(tailBlock.priorId!) as ChainDataNode<string>;
             expect(priorBlock?.entries).to.have.length(EntriesPerBlock);
+        });
+
+        it('packs several entries added at once by size as well as by count', async () => {
+            // Entries encode to 1,002 bytes: three share a block under a 3,600-byte target, a fourth
+            // would pass it. The 5,000-character entry is over the target and so sits alone.
+            const targetBytes = 3_600;
+            const sizedChain = await Chain.create<string>(store, { blockTargetBytes: targetBytes });
+            const small = (i: number) => `${i}`.padEnd(1_000, '.');
+            const entries = [small(0), small(1), small(2), small(3), 'H'.repeat(5_000), small(4), small(5), small(6), small(7)];
+            await sizedChain.add(...entries);
+
+            const blocks: ChainDataNode<string>[] = [];
+            let block: ChainDataNode<string> | undefined = (await sizedChain.getHead())!.block;
+            while (block) {
+                blocks.push(block);
+                expect(jsonEncodedBytes(block) <= targetBytes || block.entries.length === 1).to.equal(true);
+                block = block.nextId ? await store.tryGet(block.nextId) as ChainDataNode<string> : undefined;
+            }
+            expect(blocks.map(b => b.entries.length)).to.deep.equal([3, 1, 1, 3, 1]);
+            expect(blocks.flatMap(b => b.entries)).to.deep.equal(entries);
         });
     });
 

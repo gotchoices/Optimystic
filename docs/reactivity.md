@@ -577,7 +577,7 @@ Subscribers MAY request a sub-range smaller than `[fromRevision, toRevision]`; c
   shows the tail check as the dominant wake latency for the root's direct subscribers on busy collections.
   The decision stands until that is measured.
 
-The tail block changes when a block fills (`block_fill_size`, the log's `EntriesPerBlock` of 32 entries). Rotation moves the tree's root — and only the root — to the new tail block's ring coordinate; the topic and the tiers below the root stay.
+The tail block changes when a block fills: after at most `block_fill_size` entries (the log's `EntriesPerBlock` of 32), or sooner once the block reaches `BLOCK_TARGET_BYTES` (1 MiB, `packages/db-core/src/network/block-size.ts`) — a log of large entries rolls over by size. Rotation moves the tree's root — and only the root — to the new tail block's ring coordinate; the topic and the tiers below the root stay.
 
 ### Rotation protocol
 
@@ -597,11 +597,13 @@ The tail block changes when a block fills (`block_fill_size`, the log's `Entries
 
 ### Anticipatory warm-up
 
-When a tail block reaches `block_fill_size − warm_threshold` (default 56 of 64) transactions, the outgoing tail cohort opportunistically pre-dials toward the likely-successor coord. The next `tailId` is not knowable until the filling commit, so this is best-effort: the cohort biases FRET pre-dialing toward peers whose ring position is consistent with high-probability successor coords. No state is migrated until the actual rotation.
+When a tail block reaches `block_fill_size − warm_threshold` (default 24 of 32) transactions, the outgoing tail cohort opportunistically pre-dials toward the likely-successor coord. The next `tailId` is not knowable until the filling commit, so this is best-effort: the cohort biases FRET pre-dialing toward peers whose ring position is consistent with high-probability successor coords. No state is migrated until the actual rotation.
+
+The count is an upper bound. A log of large entries rolls over by size before it reaches `block_fill_size`, so its warm-up comes late or not at all. Nothing depends on it: on a live node the warm-up and filling signals are logged only, and the rotation itself is detected from the commit that names a new tail (`ReactivityOriginationManager.observeTailCommit`).
 
 ### Rotation cost
 
-Rotation happens every `block_fill_size` = 32 log entries. Per rotation the re-registrations are the root's direct subscribers only — at most `cap_promote` = 64, since the root promotes past that — rather than every subscriber: at 10 commits/s that is at most about 20 re-registrations per second against the new root instead of about 3,000 for 10,000 subscribers, each one register walk fanned over `T_rejoin_jitter` (derived from the defaults, not measured). A subscriber below the root re-registers nothing; it keeps its registration and only its next re-walk names the new root. **The other half of the decision — a rotation re-links at most `F` tier-1 child cohorts to the new root — is deferred** to backlog `feat-reactivity-notifications-reach-child-cohorts`: no root fans out to child cohorts yet, so a subscriber below the root hears nothing from any root and is woken by the watch service's tail check, before and after this change.
+Rotation happens every `block_fill_size` = 32 log entries, or sooner for a log of large entries (§Tail rotation). Per rotation the re-registrations are the root's direct subscribers only — at most `cap_promote` = 64, since the root promotes past that — rather than every subscriber: at 10 commits/s that is at most about 20 re-registrations per second against the new root instead of about 3,000 for 10,000 subscribers, each one register walk fanned over `T_rejoin_jitter` (derived from the defaults, not measured). A subscriber below the root re-registers nothing; it keeps its registration and only its next re-walk names the new root. **The other half of the decision — a rotation re-links at most `F` tier-1 child cohorts to the new root — is deferred** to backlog `feat-reactivity-notifications-reach-child-cohorts`: no root fans out to child cohorts yet, so a subscriber below the root hears nothing from any root and is woken by the watch service's tail check, before and after this change.
 
 ---
 
@@ -841,7 +843,7 @@ Reactivity adds the following to the cohort-topic defaults:
 | `delta_max` (Core) | 4096 | Max delta payload size in bytes; Edge = 0 |
 | `T_drain` | 60 s | Old-tail drain time after rotation |
 | `warm_threshold` | 8 | Transactions remaining in tail before anticipatory warm-up |
-| `block_fill_size` | 32 | Entries per log block (`EntriesPerBlock`; drives tail rotation) |
+| `block_fill_size` | 32 | Most entries per log block (`EntriesPerBlock`; drives tail rotation). An upper bound: a log of large entries rolls over sooner, at `BLOCK_TARGET_BYTES` |
 
 > **Implemented** (`11.5-reactivity-rotation-backpressure-policy`). The consolidated defaults table is
 > `packages/db-core/src/reactivity/config.ts` (`DEFAULT_REACTIVITY_CONFIG` + the per-parameter constants);

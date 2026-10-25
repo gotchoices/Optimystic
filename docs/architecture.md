@@ -94,7 +94,7 @@ Block storage (see [repository.md](repository.md)) is versioned and reconstructi
 
 Built on the block layer (see `db-core` [documentation index](../packages/db-core/README.md#documentation)):
 
-* **Chains** — linked blocks used as stacks, queues, or logs (32 entries/block).
+* **Chains** — linked blocks used as stacks, queues, or logs (at most 32 entries per block; a log block also rolls over at 1 MiB of entries, so large entries never build a block too large to copy between machines).
 * **BTrees** — B+trees with path-based cursors, range queries, and automatic rebalancing.
 * **Logs** — SHA-256-hashed transaction logs built on chains; every entry carries the transaction ID, revision, affected blocks, and action payload.
 * **Collections** — high-level wrappers combining a data structure with a log:

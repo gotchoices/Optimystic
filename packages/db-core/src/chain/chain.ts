@@ -3,6 +3,7 @@ import type { BlockStore, BlockId, IBlock } from "../index.js";
 import { ChainDataBlockType, ChainHeaderBlockType, entries$, headId$, nextId$, priorId$, tailId$ } from "./chain-nodes.js";
 import type { ChainDataNode, ChainHeaderNode } from "./chain-nodes.js";
 import { apply } from "../blocks/index.js";
+import { jsonEncodedBytes } from "../network/transaction-size.js";
 
 export const EntriesPerBlock = 32;
 
@@ -20,6 +21,17 @@ export type ChainInitOptions<TEntry> = {
 	createDataBlock?: () => ChainNodeInit<ChainDataNode<TEntry>>;
 	createHeaderBlock?: (id?: BlockId) => ChainNodeInit<ChainHeaderNode>;
 	newBlock?: (newTail: ChainDataNode<TEntry>, oldTail: ChainDataNode<TEntry> | undefined) => Promise<void>;
+	/**
+	 * When set, a data block that already holds an entry also starts a new block once the next entry
+	 * would take its encoded size (`jsonEncodedBytes`) past this many bytes — besides the
+	 * {@link EntriesPerBlock} count, which always applies. A block holding no entry always takes the
+	 * next one, so an entry larger than this sits alone in its own block. Absent, blocks roll over by
+	 * count alone. The log sets it to `BLOCK_TARGET_BYTES`.
+	 *
+	 * The decision is a pure function of the tail block's content and the entries being added, so a
+	 * retried append at the same revision splits identically.
+	 */
+	blockTargetBytes?: number;
 }
 
 export type ChainCreateOptions<TEntry> = ChainInitOptions<TEntry> & {
@@ -109,19 +121,21 @@ export class Chain<TEntry> {
 		const trx = new Atomic(this.store);
 
 		// Attempt to fit in current block
-		const copied = entries.slice(0, EntriesPerBlock - tail.entries.length);
-		if (copied.length > 0) {
-			apply(trx, tail, [entries$, tail.entries.length, 0, copied]);
-			entries = entries.slice(copied.length);
+		let next = this.takenBy(tail, entries, 0);
+		if (next > 0) {
+			apply(trx, tail, [entries$, tail.entries.length, 0, entries.slice(0, next)]);
 		}
 
-		while (entries.length > 0) {
+		while (next < entries.length) {
 			const newTail = {
 				...(this.options?.createDataBlock?.() ?? { header: this.store.createBlockHeader(ChainDataBlockType) }),
-				entries: entries.splice(0, Math.min(EntriesPerBlock, entries.length)),
+				entries: [] as TEntry[],
 				priorId: tail.header.id,
 				nextId: undefined,
 			} as ChainDataNode<TEntry>;
+			const taken = this.takenBy(newTail, entries, next);
+			newTail.entries = entries.slice(next, next + taken);
+			next += taken;
 			// Predecessor is the running `tail` (immediately preceding block), NOT the original
 			// `oldTail`: across a multi-block append each new block links to the one before it.
 			await this.options?.newBlock?.(newTail, tail);
@@ -137,6 +151,41 @@ export class Chain<TEntry> {
 		trx.commit();
 
 		return { headerBlock, block: tail, index: tail.entries.length - 1 };
+	}
+
+	/**
+	 * How many of `entries`, from `start`, `block` takes before it is full: up to
+	 * {@link EntriesPerBlock} entries, and — when the chain has a byte target — no further entry once
+	 * it holds one and the next would take it past the target. A block holding no entry always takes
+	 * the first, so this is at least one for an empty block with entries left to place.
+	 *
+	 * The measure is the block's JSON as it stands, not counting what the `newBlock` hook adds to a
+	 * new block afterwards (the log's `priorHash`) nor what a caller writes into an entry after the add
+	 * (the log's `blockIds`) — both small against the gap between the target and the most a block may
+	 * hold.
+	 */
+	private takenBy(block: ChainDataNode<TEntry>, entries: readonly TEntry[], start: number): number {
+		const room = Math.max(0, Math.min(EntriesPerBlock - block.entries.length, entries.length - start));
+		const target = this.options?.blockTargetBytes;
+		if (target === undefined || room === 0) {
+			return room;
+		}
+		// NOTE: serializes the whole tail block once per append, the same order of cost as the commit
+		// path's digest of every touched block. If appends to large logs ever show this in a profile,
+		// keep a running byte count for the tail instead of re-measuring it.
+		let bytes = jsonEncodedBytes(block);
+		let held = block.entries.length;
+		let taken = 0;
+		for (; taken < room; ++taken) {
+			// Each entry after the first adds its own JSON plus the separating comma.
+			const grown = bytes + jsonEncodedBytes(entries[start + taken]) + (held > 0 ? 1 : 0);
+			if (held > 0 && grown > target) {
+				break;
+			}
+			bytes = grown;
+			++held;
+		}
+		return taken;
 	}
 
 	/** Updates the entry at the given path. */

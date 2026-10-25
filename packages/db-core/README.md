@@ -95,7 +95,7 @@ Linked block primitives that can function as stacks, queues, or logs:
 
 - **Flexible access patterns**: LIFO (stack), FIFO (queue), or sequential (log)
 - **Efficient traversal**: Forward and backward iteration with precise navigation
-- **Block efficiency**: 32 entries per block optimized for network transfer
+- **Block efficiency**: at most 32 entries per block, and a log block rolls over at `BLOCK_TARGET_BYTES` (1 MiB) as well, so every block stays small enough to copy between machines
 - **Distributed ready**: Lazy loading and efficient network operations
 
 ```typescript

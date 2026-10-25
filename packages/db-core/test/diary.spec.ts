@@ -1,6 +1,10 @@
 import { expect } from 'chai'
 import { Diary } from '../src/collections/diary/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
+import { BLOCK_TARGET_BYTES } from '../src/network/block-size.js'
+import { jsonEncodedBytes } from '../src/network/transaction-size.js'
+import type { IBlock } from '../src/index.js'
+import type { ChainDataNode, ChainHeaderNode } from '../src/chain/chain-nodes.js'
 
 interface TestEntry {
   id: number
@@ -196,6 +200,32 @@ describe('Diary', () => {
     }
     expect(entries2).to.have.lengthOf(1)
     expect(entries2[0]).to.deep.equal(entry2)
+  })
+
+  it('starts a new log block by size, so large entries never build a block too large to copy', async () => {
+    // 32 entries of 300 KB used to share one log block of 9.8 MB, past the 8 MiB message limit.
+    const content = 'x'.repeat(300_000)
+    const appended: TestEntry[] = Array.from({ length: 32 }, (_, i) => ({ id: i, content, timestamp: i }))
+    for (const entry of appended) {
+      await diary.append(entry)
+    }
+
+    const readBlock = async <T extends IBlock>(id: string) =>
+      (await network.get({ blockIds: [id] }))[id]!.block as T
+    const header = await readBlock<ChainHeaderNode>(collectionId)
+    for (let id: string | undefined = header.headId; id !== undefined;) {
+      const block: ChainDataNode<unknown> = await readBlock<ChainDataNode<unknown>>(id)
+      const bytes = jsonEncodedBytes(block)
+      expect(bytes <= BLOCK_TARGET_BYTES || block.entries.length === 1,
+        `log block ${id} holds ${block.entries.length} entries in ${bytes} bytes`).to.equal(true)
+      id = block.nextId
+    }
+
+    const read: TestEntry[] = []
+    for await (const entry of diary.select()) {
+      read.push(entry)
+    }
+    expect(read).to.deep.equal(appended)
   })
 
   describe('open vs createOrOpen', () => {

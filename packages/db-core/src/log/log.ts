@@ -7,6 +7,7 @@ import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, 
 import { LogDataBlockType, LogHeaderBlockType } from "./struct.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
+import { BLOCK_TARGET_BYTES } from '../network/block-size.js';
 
 export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
 	& {
@@ -284,10 +285,15 @@ export class Log<TAction> {
 		return pendings;
 	}
 
-	/** Chain options used by every log: block type factories plus the priorHash `newBlock` hook.
+	/** Chain options used by every log: block type factories, the priorHash `newBlock` hook, and the
+	 *  byte target a log block rolls over at. Every entry carries its action's data, so a count alone
+	 *  would let a log of large entries build a block too large to copy between machines; with
+	 *  {@link BLOCK_TARGET_BYTES} a log block either holds one entry (and is then no larger than the
+	 *  transaction that wrote it) or stays near the target.
 	 *  Exposed (not private) so tests can drive a raw {@link Chain} through the exact same hook. */
 	static getChainOptions<TAction>(store: BlockStore<IBlock>, newDataBlockId?: () => BlockId) {
 		return {
+			blockTargetBytes: BLOCK_TARGET_BYTES,
 			createDataBlock: () => ({ header: store.createBlockHeader(LogDataBlockType, newDataBlockId?.()) }),
 			createHeaderBlock: (id?: BlockId) => ({ header: store.createBlockHeader(LogHeaderBlockType, id) }),
 			newBlock: async (newTail: LogBlock<TAction>, oldTail: LogBlock<TAction> | undefined) => {

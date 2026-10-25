@@ -22,7 +22,7 @@ type ChainHeaderNode = IBlock & IChainHeader;
 
 // Data block - contains actual entries
 type ChainDataNode<TEntry> = IBlock & {
-  entries: TEntry[];              // Up to 32 entries per block
+  entries: TEntry[];              // Up to 32 entries per block (fewer with a byte target)
   priorId: BlockId | undefined;   // Link to previous block
   nextId: BlockId | undefined;    // Link to next block
 };
@@ -62,6 +62,16 @@ const chain = await Chain.create<string>(store, {
 // Open existing chain
 const chain = await Chain.open<string>(store, 'existing-chain-id');
 ```
+
+### Block roll-over: by count, and optionally by size
+
+`Chain.add` starts a new tail block when the current one holds `EntriesPerBlock` (32) entries. A chain given a byte target in its options (`ChainInitOptions.blockTargetBytes`) also starts one when the tail holds at least one entry and the next entry would take the tail's encoded size — the UTF-8 length of its JSON (`jsonEncodedBytes`) — past the target. A tail holding no entry always takes the next one, so an entry larger than the target sits alone in its own block. An `add` of several entries packs them by both rules, block after block.
+
+The size rule is opt-in so `Chain` stays generic: a chain without a target rolls over by count alone and never serializes a block to measure it. The log opts in (`Log.getChainOptions` sets `BLOCK_TARGET_BYTES`, 1 MiB, from `packages/db-core/src/network/block-size.ts`), because every log entry carries its action's data, and 32 large entries in one block made a block too large to copy between machines. So a log block either holds one entry — and is then no larger than the transaction that wrote it — or stays near the target; a log of entries of 32 KiB or less rolls over by count exactly as before.
+
+The split is a pure function of the tail block's content and the entries being added, so a retried append at the same revision splits identically. A tail written before the rule existed that is already past the target stops growing: the next append rolls over. Nothing shrinks it.
+
+Measuring costs one serialization of the tail block per append (see the `NOTE:` at `Chain.takenBy` in `packages/db-core/src/chain/chain.ts`).
 
 ### Merged Header Pattern
 
@@ -154,7 +164,7 @@ const recent = await feed.pop(10);
 
 ### Block Efficiency
 
-- **32 entries per block** optimize storage and network transfer
+- **At most 32 entries per block** — and, for the log, at most about `BLOCK_TARGET_BYTES` (1 MiB) per block holding more than one entry — keep each block small enough to copy between machines in one message
 - **Linked structure** enables efficient insertion and traversal
 - **Block reuse** minimizes storage overhead
 
