@@ -255,6 +255,9 @@ interface CollectionState {
 	rotatedFromTailB64?: string;
 	readonly subscribers: SubscriptionHandle[];
 	/** Certs cached for actionId so the synchronous bridge extractor can resolve a pre-signed real cert. */
+	// NOTE: keyed by action alone, unlike production's `CommitCertStore` (keyed by action and tail); sound only
+	// because every harness commit has its own action id and one collection. If the harness ever commits one
+	// action across several collections, switch to `createCommitCertStore` + `makeClusterCommitCertExtractor`.
 	readonly certByAction: Map<string, CommitCert>;
 }
 
