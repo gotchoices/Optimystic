@@ -56,16 +56,12 @@ export class RepoClient extends ProtocolClient implements IRepo {
 	 * copy of the validation payload. Together they are held to the per-transaction limit
 	 * (`MAX_TRANSACTION_BYTES`, checked by the coordinator's `pendMany`), which sits below the repo
 	 * protocol's frame limit (`MAX_BLOCK_MESSAGE_BYTES`) by the envelope reserve.
-	 * NOTE: a coordinator on a build that predates batches reads only the first operation, and answers
-	 * as if the others had not been sent — a commit that silently leaves collections behind. Mixed
-	 * builds are out of scope today; a rollout that must run them has to gate batches on the
-	 * coordinator's version.
 	 */
 	async pendMany(requests: readonly PendRequest[], options: MessageOptions): Promise<PendResult> {
 		return this.processRepoMessage<PendResult>(pendBatchOf(requests).operations, options);
 	}
 
-	/** {@link pendMany}'s commit twin (`IRepo.commitMany`); the same two NOTEs apply. */
+	/** {@link pendMany}'s commit twin (`IRepo.commitMany`); the same `NOTE:` applies. */
 	async commitMany(requests: readonly CommitRequest[], options: MessageOptions): Promise<CommitResult> {
 		return this.processRepoMessage<CommitResult>(commitBatchOf(requests).operations, options);
 	}

@@ -63,7 +63,8 @@ export type ITransactor = {
 		together — one consensus record for the whole set (`IRepo.pendMany`).
 		- `undefined`: they could not go as one — nothing of them is left pended by this call, and the
 		  caller pends them its usual way. Never a verdict.
-		- Optional: without it, a writer pends each request on its own.
+		- Optional: without it, or without {@link commitMany} beside it, a writer pends each request on its
+		  own — a batched pend promises its commit goes as one request too (`PendRequest.soleReservation`).
 	 */
 	pendMany?(requests: readonly PendRequest[]): Promise<PendResult | undefined>;
 

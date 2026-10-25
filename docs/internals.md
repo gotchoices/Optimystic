@@ -612,8 +612,9 @@ batched commit that threw falls back to per-collection commits, which re-send ev
 thrown request landed is the action's own revision, which storage treats as already done. Batching groups the
 collections WITHIN each phase; it does not merge the phases. The pend and the commit stay two consensus records,
 each with its own promise round, and a member still owed the pend's decision applies, or refuses, it before it
-votes on the commit record. A transactor without the methods (`TestTransactor`, the
-reference peer's) keeps one request per collection.
+votes on the commit record. A transactor without both methods (`TestTransactor`, the
+reference peer's) keeps one request per collection; the pend is batched only beside `commitMany`, since its mark
+promises the commit goes as one request too.
 
 What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail

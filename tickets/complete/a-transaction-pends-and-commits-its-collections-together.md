@@ -65,3 +65,30 @@ Third of three tickets for GitHub #42. The first two let a coordinator run one a
 - A transactor without the methods (`TestTransactor`, the reference peer): today's fan-out exactly.
 - A batched pend refused by a rival: one retryable conflict, nothing left pended, and the retry loop re-drives.
 - A batched commit refused: every collection is retained by `commitOnceLatched`, and the refresh between attempts finishes any whose log entry landed.
+
+## Review findings
+
+Reviewed the diff of `ticket(implement): a-transaction-pends-and-commits-its-collections-together` before the handoff, then the touched docs and the db-p2p `RepoClient` batch methods from the prereq.
+
+**Checked and found sound**
+- `NetworkTransactor.pendMany`: answers `undefined` before any side effect (size, cover, batch-capable repo); owed cancels discharged only once it will send; refusal and throw both cancel the union, awaited and never replacing the verdict; success seeds the per-transaction coordinator cache for every block, so `commitMany`'s `soleCommitCoordinator` reaches the same peer. The cover-first ordering (a deviation from the ticket) is the better choice and is documented.
+- `NetworkTransactor.commitMany`: tail-first per request, digests narrowed per request through the shared `repoCommitRequest`, throw → `undefined` with the same own-revision reasoning as `commitInOneRound`.
+- `TransactionCoordinator`: the fallback after an `undefined` batched pend rebuilds the requests without `soleReservation`; a thrown `pendMany` from a non-network transactor is a hard failure with a cancel of every collection; commit aggregation de-duplicates the batch's single reason and now counts a rejected `commitCollection` as a failed collection (previously it was in neither set).
+- Refactors (`pendRequestFor`, `commitRequestFor`, `pendRefusalError`, `pendFailure`, `collectionCommitOutcome`) are behaviour-preserving extractions; the moved `NOTE:` keeps its revisit condition.
+- Test wrappers: the ones that forward both methods only re-route reads; the interceptors deliberately forward neither. The `two-node-index-wake-consistency` hook change (gate at `StorageRepo.commit` on the index tail instead of on cluster delivery) keeps the control meaningful: the hold-disabled case still observes the gap.
+- Batched refusal paths are exercised end to end by the existing two-node race specs (`two-node-unique-value-race`, `two-node-index-mutation-sweep`), which now go through the batch.
+- Docs (`internals.md`, `correctness.md`, `transactions.md`, `cluster.md`, `action-change-hold.ts` header) state that batching groups collections within a phase and keeps pend and commit as two consensus records, as the maintainer asked. `ClusterMember.validateCommitAgainstRefusedPend`, cited in correctness.md, exists.
+
+**Found and fixed in this pass (minor)**
+- The coordinator batched the pend whenever the transactor offered `pendMany`, even without `commitMany`. The batched pend's `soleReservation` mark promises the commit goes as one request, so a transactor (or wrapper) offering only `pendMany` would have let a held-back pend decision meet per-collection commits — the tear the mark exists to prevent. `pendPhase` now requires both methods; the `ITransactor.pendMany` doc and `docs/internals.md` say so.
+- Removed the mixed-build `NOTE:` at `RepoClient.pendMany` (and the "two NOTEs" reference on `commitMany`): the maintainer decision on this ticket says mixed-version groups get no handling and no `NOTE:`.
+
+**Tripwires / existing tickets**
+- The residual where a commit after a batched pend goes per collection (thrown `commitMany`, or the coordinator cache evicting the action's entry) is already a `NOTE:` in `TransactionCoordinator.commitPhase` and in correctness.md; left as is.
+- `coordinator.ts` is 2102 lines (`wc -l`); appended a re-measure to the existing backlog `debt-collection-write-retry-logic-outgrew-its-file`, which already names this file, rather than filing a new ticket.
+- The two-coordinator batched path stays unverified by test; already backlog `debt-no-mesh-fixture-forces-two-coordinator-batches`.
+
+**Tests**
+- No tests added or cut. The new request-count case pins the #42 number (a measured contract); the re-pinned indexed case replaces the old four-per-collection expectation. The `pendMany`-without-`commitMany` fix has no test: no transactor in the tree offers one without the other, so it is a guard on a contract stated in the type's doc, not a reachable defect.
+
+**Validation**: db-core and db-p2p rebuilt after the edits. `yarn workspace @optimystic/db-core test` 1908 passing; `yarn workspace @optimystic/db-p2p test` 3537 passing, 74 pending; `yarn workspace @optimystic/quereus-plugin-optimystic test` 1064 passing, 14 pending, smoke ok; `yarn typecheck`, `yarn lint:docs` and eslint on the changed files clean. Not run: `yarn test:integration`, `yarn check:rn` (no change to the integration or React Native surfaces beyond what implement already shipped).

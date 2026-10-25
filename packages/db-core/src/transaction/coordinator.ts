@@ -1680,7 +1680,9 @@ export class TransactionCoordinator {
 
 		const actionId = transaction.id as ActionId;
 		const nominees = superclusterNominees ? Array.from(superclusterNominees) : undefined;
-		if (collectionTransforms.size > 1 && this.transactor.pendMany) {
+		// Both methods, never the pend alone: the batched pend's mark promises that the commit goes as one
+		// request too (`PendRequest.soleReservation`), which only `commitMany` can keep.
+		if (collectionTransforms.size > 1 && this.transactor.pendMany && this.transactor.commitMany) {
 			const together = await this.pendTogether(transaction, validation, collectionTransforms, pendedRevs, actionId, nominees);
 			if (together !== undefined) return together;
 		}
