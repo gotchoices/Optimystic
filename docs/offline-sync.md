@@ -1192,10 +1192,23 @@ backfill would read the entry's rows from the local view and commit index entrie
 not on the network yet. So a statement that changes a table's storage shape (creating or dropping an
 index, adding or dropping a column, dropping the table) is refused with a typed error naming the
 queued entries while any entry that wrote that table is queued, and succeeds once they settle.
-DDL that changes no stored shape (a tag change, a CHECK added or removed by name) is allowed. Table
-creation while offline keeps its current behaviour, including the catalog written alone at launch
-that backlog `6.5-partition-healing` records as fork-safe only while every machine writes identical
+DDL that changes no stored shape (a tag change, a CHECK added or removed by name, a column rename,
+which touches no row) is allowed. A `create table` is refused only when it declares, with other
+columns or another primary key, a collection a table with queued entries already backs; an identical
+declaration reads and writes the queued rows exactly as that table does. Table creation while
+offline otherwise keeps its current behaviour, including the catalog written alone at launch that
+backlog `6.5-partition-healing` records as fork-safe only while every machine writes identical
 catalog content.
+
+In the plugin the check is `OfflineMode.assertNoQueuedEntries`, which reads a table's collections
+from the bridge's collection-to-table record (`TransactionBridge.collectionsOf`) and throws
+`QueuedEntriesBlockSchemaChangeError` (`StatusCode.BUSY`, with the table, the operation and the
+queued transaction ids in queue order) when a queued entry wrote any of them; an entry being
+submitted or in doubt counts like any other. The DDL hooks of `OptimysticModule` call it after
+draining the pending catalog tag writes and before writing anything, so inside `apply schema` a
+refused step stages nothing into the catalog batch and the engine unwinds the apply as for any
+failed step. `create`'s arm compares the declaration's column names, column types and primary key
+against every live table over the same collection.
 
 ### Invented collections
 
@@ -1204,14 +1217,28 @@ one in the tracker. A queued entry that writes such a table carries no action th
 If another machine created the collection while this one was offline, committing the invented header
 would put two collections under one id — the joiner fork recorded in `6.5-partition-healing`.
 
-So the drain treats an entry that writes an invented collection specially: before submitting, it
-opens the collection from the network (`Collection.open`), which returns `undefined` only when the
-header is authoritatively absent. If the header exists, the invented header and its transforms are
-discarded, the collection adopts the network's, and every sealed segment is replayed onto it, with
-refusals handled as on any rebase. If it is authoritatively absent, the entry commits the header as
-today's first write does. If the probe cannot be answered, the entry waits: an invented collection is
-never committed on an unanswered probe. Restore after a restart re-invents the header from the
-declaration before re-staging, since a header's id is the collection's name.
+The probe that prevents it is the refresh every drain cycle opens with (`Collection.commitHead`, and
+`TransactionCoordinator.commitEntry` for an entry over several collections): `Collection.updateInternal`
+re-reads the header with no remembered tail, so it asks the network the question an open would. Its
+three outcomes are the three cases:
+
+- **The header exists.** The collection adopts the network's log and revision, and replays every
+  sealed segment onto the committed state; once a revision is adopted the replay starts from an
+  empty baseline rather than from the invented one (`Collection.replayActions`), so the invented
+  header, log block and root are dropped. A segment the replay refuses is recorded and reported as on
+  any rebase ([Removing an entry](#removing-an-entry)).
+- **The header is authoritatively absent.** Nothing is adopted, the head commit stages its segment
+  over the invented baseline, and the entry commits the header as today's first write does.
+- **The header cannot be read.** The refresh throws `BlockUnavailableError`, which
+  `classifyCommitFailure` sorts as `cohort-unreachable` for the two unreachability reasons and
+  `unknown` otherwise; the entry waits either way. An invented collection is never committed on an
+  unanswered probe.
+
+Restore after a restart re-invents the header from the declaration before re-staging, since a
+header's id is the collection's name. `packages/db-core/test/invented-collection-adoption.spec.ts`
+pins the three outcomes at the collection tier, and
+`packages/quereus-plugin-optimystic/test/offline-mode-invented-collection.spec.ts` the joiner at the
+SQL level.
 
 ### Session mode
 
@@ -1304,11 +1331,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
    cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
    Usable by a `Tree`/`Diary` application without SQL.
-4. **Offline mode in the plugin** (five tickets; the first three landed). `offline.enter`/`exit`,
+4. **Offline mode in the plugin** (five tickets; the first four landed). `offline.enter`/`exit`,
    acknowledgement fixed at BEGIN, status and queue-state listeners, durability reports for drained
    entries, refusal while session mode is configured, `notifyExternalChange` on removal, the
-   `optimystic.offline` tag and network acknowledgement behind a non-empty queue (implemented); the
-   DDL gate, the invented-collection probe and live-read degrade (the remaining two).
+   `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL gate and the
+   invented-collection probe (implemented); live-read degrade (the remaining one).
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on

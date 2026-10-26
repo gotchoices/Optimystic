@@ -165,7 +165,7 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first three plugin stages, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first four plugin stages, and says at the end what is still missing.
 
 **A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
 
@@ -221,6 +221,23 @@ A commit acknowledged by the network — offline mode not entered, a `'network'`
 
 The shape that cannot be queued commits ahead of the queue instead, logged as `offline:queue-bypassed`, and when it writes a table with queued transactions it fails with `SealedSegmentsError`, rolled back cleanly; retry it after `whenDrained()`.
 
+#### Schema changes wait for the queued transactions
+
+A statement that changes how a table's rows are stored is refused while a queued transaction wrote the table: an index built now would index rows the network does not hold yet, and a queued transaction carries no write for an index added after it. The statement throws `QueuedEntriesBlockSchemaChangeError` (`StatusCode.BUSY`, exported from both entries), carrying `table` (`schema.table`), `operation` and `transactionIds`, the queued transactions in queue order; one being submitted, or in doubt, counts like any other. Nothing was written, and the same statement succeeds once they settle — `await plugin.offline.whenDrained()` and run it again. Quereus rewraps the error out of `create index`, `create table` and `apply schema`, so look for it along the `cause` chain.
+
+| Refused while the table has queued transactions | Not refused |
+|---|---|
+| `create index`, `drop index` | `alter table … set tags` |
+| `alter table … add column`, `drop column` | a CHECK added or dropped by name |
+| `drop table` | `alter table … rename column` |
+| `create table` over a collection a table with queued transactions backs, unless it declares the same columns (names and types, in order) and primary key | `create table` of an unrelated table |
+
+Inside `apply schema` a refused step fails the apply like any other failed step: the engine unwinds the steps that landed, and the error reaches the caller. A dropped table's collections are forgotten only once the drop succeeds.
+
+#### A table first written offline joins the copy another machine created
+
+A table declared but never written has no committed storage yet, so the first transaction that writes it creates it. When that transaction is queued, another machine may create the same table (same collection URI) before it drains. The drain finds that machine's copy and adds the queued rows to it — the table ends with one copy holding both machines' rows — rather than creating a second one under the same name. A queued row the other copy refuses — its primary key already taken there, say — fails with reason `'constraint'`, decided on this machine before anything of it is sent, and the other machine's row is what this machine reads from then on. While the other machines cannot be asked whether the table exists, the transaction waits; it never creates the table on an unanswered question.
+
 #### Following a queued transaction — `plugin.offline.onStatus(listener)`
 
 ```typescript
@@ -262,7 +279,6 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 
 #### Not yet in this stage
 
-- **Schema changes are not refused** while a table's transactions are queued; await `whenDrained()` before DDL on such a table.
 - **Live reads while the cohort is unreachable fail as they do today**, for `'queue'` tables as for `'network'` ones.
 - **Nothing survives a restart.**
 

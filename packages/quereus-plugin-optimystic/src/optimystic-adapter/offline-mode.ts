@@ -66,6 +66,30 @@ export class OfflineCommitTimeoutError extends QuereusError {
 	}
 }
 
+/** The statements that change how a table's rows are stored (docs/offline-sync.md §Schema changes).
+ * `'create table'` is one only when it re-declares, with other columns or another primary key, a
+ * collection a live table already backs. */
+export type StorageShapeChange = 'create table' | 'create index' | 'drop index' | 'add column' | 'drop column' | 'drop table';
+
+/**
+ * Thrown by a statement that would change how {@link table}'s rows are stored while transactions that
+ * wrote it are still queued (docs/offline-sync.md §Schema changes): an index built now would index
+ * rows the network does not hold yet, and a queued transaction carries no write for an index added
+ * after it. Nothing was written; the same statement succeeds once the transactions settle
+ * (`plugin.offline.whenDrained()`). {@link transactionIds} lists them in queue order — one being
+ * submitted, or in doubt, counts like any other.
+ *
+ * Carries `StatusCode.BUSY`: the statement was not judged wrong, it has to wait.
+ */
+export class QueuedEntriesBlockSchemaChangeError extends QuereusError {
+	constructor(readonly table: string, readonly operation: StorageShapeChange, readonly transactionIds: readonly string[]) {
+		super(`cannot ${operation} while ${transactionIds.length === 1 ? 'a queued offline transaction' : `${transactionIds.length} queued offline transactions`} that wrote ${table} ${transactionIds.length === 1 ? 'is' : 'are'} unsettled (${transactionIds.join(', ')}): it changes how ${table}'s rows are stored, and those rows have not reached the network yet. It succeeds once they settle (plugin.offline.whenDrained())`,
+		StatusCode.BUSY);
+		this.name = 'QueuedEntriesBlockSchemaChangeError';
+		Object.setPrototypeOf(this, QueuedEntriesBlockSchemaChangeError.prototype);
+	}
+}
+
 /**
  * Which acknowledgement a transaction writing a table may get in offline mode, from the table's
  * `optimystic.offline` tag (docs/offline-sync.md §Per-table policy): `'queue'`, the mode's (the
@@ -216,6 +240,29 @@ export class OfflineMode {
 	 * no vtab published one for. */
 	tablePolicy(name: string): OfflineTablePolicy {
 		return this.tablePolicies.get(name) ?? 'queue';
+	}
+
+	/**
+	 * Refuse `operation`, a change to how `table`'s rows are stored, while any queued transaction wrote
+	 * one of the table's collections — its main tree or an index tree, as the bridge recorded them
+	 * (`TransactionBridge.collectionsOf`). Called by each such DDL hook before it writes anything.
+	 * @throws QueuedEntriesBlockSchemaChangeError naming those transactions in queue order.
+	 */
+	assertNoQueuedEntries(table: QualifiedTableName, operation: StorageShapeChange): void {
+		const collections = new Set(this.bridge.collectionsOf(table));
+		if (collections.size === 0) return;
+		const listed = this.queue.entries()
+			.filter(entry => entry.collections.some(id => collections.has(id)))
+			.map(entry => entry.id);
+		// A failed entry leaves the queue at once, while its removal is still dropping its segments; until
+		// the drops finish its rows are still in this machine's view, so a segment still sealed counts too.
+		const registry = this.bridge.getCollectionRegistry();
+		const stillSealed = [...collections].flatMap(id => registry.get(id)?.sealedEntries() ?? []);
+		const blocking = [...new Set([...listed, ...stillSealed])];
+		if (blocking.length === 0) return;
+		const name = qualifiedTableName(table);
+		log('offline:schema-change-refused table=%s operation=%s transactions=%o', name, operation, blocking);
+		throw new QueuedEntriesBlockSchemaChangeError(name, operation, blocking);
 	}
 
 	/**

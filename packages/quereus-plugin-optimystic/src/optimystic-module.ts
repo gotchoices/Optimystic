@@ -9,7 +9,7 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
-import type { OfflineTablePolicy } from './optimystic-adapter/offline-mode.js';
+import type { OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -510,6 +510,17 @@ function describePrimaryKey(schema: Pick<StoredTableSchema, 'columns' | 'primary
     return pk.desc ? `${name} desc` : name;
   });
   return `(${parts.join(', ')})`;
+}
+
+/**
+ * What the stored rows of a table declared by `schema` are encoded and keyed by: its column names and
+ * types in order, and its primary key ({@link describePrimaryKey}). Two declarations with the same
+ * shape read and write the same rows; tags, constraints and indexes are not part of it.
+ */
+function storedRowShape(schema: TableSchema): string {
+  const columns = schema.columns.map(columnSchemaToStored);
+  const columnList = columns.map(col => `${col.name.toLowerCase()} ${col.affinity}`).join(', ');
+  return `(${columnList}) keyed ${describePrimaryKey({ columns, primaryKeyDefinition: [...schema.primaryKeyDefinition] }).toLowerCase()}`;
 }
 
 /** The table tag that opts a table into network change notification (README § Reactive Watching). */
@@ -4274,6 +4285,38 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
+   * Refuse `operation` on `schemaName.tableName` while offline transactions that wrote the table are
+   * queued (`OfflineMode.assertNoQueuedEntries`, docs/offline-sync.md §Schema changes). Each hook that
+   * changes how a table's rows are stored calls it after its {@link whenCatalogPersisted} drain and
+   * before it writes anything, so inside `apply schema` the refused step stages nothing into the
+   * batch and the engine unwinds the apply as for any failed step. A bridge built bare has no queue.
+   */
+  private assertNoQueuedEntries(schemaName: string, tableName: string, operation: StorageShapeChange): void {
+    this.txnBridge.getOfflineMode()?.assertNoQueuedEntries({ schemaName, tableName }, operation);
+  }
+
+  /**
+   * {@link create}'s arm of the gate: a declaration over a collection that a live table already backs
+   * is refused while that table has queued transactions, unless it declares the same columns and
+   * primary key ({@link storedRowShape}) — such a re-declare reads and writes the queued rows exactly
+   * as the live table does. Every live table over the collection is judged, since two tables declared
+   * over one URI share its collections.
+   */
+  private assertRedeclarationKeepsShape(tableSchema: TableSchema): void {
+    const collectionId = this.collectionFactory.getCollectionId(this.parseTableSchema(tableSchema));
+    const shape = storedRowShape(tableSchema);
+    for (const live of this.txnBridge.tablesOf(collectionId)?.values() ?? []) {
+      const declared = this.tables.get(`${live.schemaName}.${live.tableName}`.toLowerCase())?.tableSchema;
+      // NOTE: a table the bridge records with no instance here cannot be compared, and is treated as
+      // differing. Unreachable while every queued transaction was staged through a live instance in
+      // this process; revisit when queued transactions outlive a restart (offline-sync-journal).
+      if (declared === undefined || storedRowShape(declared) !== shape) {
+        this.assertNoQueuedEntries(live.schemaName, live.tableName, 'create table');
+      }
+    }
+  }
+
+  /**
    * Create a schema manager for a specific table's transactor configuration
    */
   private createSchemaManager(tableOptions: ParsedOptimysticOptions): SchemaManager {
@@ -4580,6 +4623,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (this.tables.has(tableKey)) {
       throw new Error(`Optimystic table '${tableSchema.name}' already exists in schema '${tableSchema.schemaName}'.`);
     }
+    this.assertRedeclarationKeepsShape(tableSchema);
 
     const table = await this.instantiateTable(db, tableSchema);
 
@@ -4849,6 +4893,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (!resolved) {
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot create index.`);
     }
+    this.assertNoQueuedEntries(schemaName, tableName, 'create index');
     const { table, fresh } = resolved;
 
     // Inside an `APPLY SCHEMA` batch the index trees this statement populates land at
@@ -4910,6 +4955,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (!resolved) {
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot drop index.`);
     }
+    this.assertNoQueuedEntries(schemaName, tableName, 'drop index');
     const { table, fresh } = resolved;
 
     await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
@@ -5103,6 +5149,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       );
     }
     const after = columnSchemaToStored(column);
+    this.assertNoQueuedEntries(tableSchema.schemaName, tableSchema.name, 'add column');
     return this.alterCatalogOnly(tableSchema, {
       operation: 'add column',
       kind: 'column',
@@ -5152,6 +5199,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       throw new QuereusError(dropColumnRefusal(tableSchema.name, column.name, [...blockers], 'engine'), StatusCode.UNSUPPORTED);
     }
     const before = columnSchemaToStored(column);
+    this.assertNoQueuedEntries(tableSchema.schemaName, tableSchema.name, 'drop column');
     return this.alterCatalogOnly(tableSchema, {
       operation: 'drop column',
       kind: 'column',
@@ -5608,6 +5656,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string
   ): Promise<void> {
     await this.whenCatalogPersisted();
+    this.assertNoQueuedEntries(schemaName, tableName, 'drop table');
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const table = this.tables.get(tableKey)
       ?? await this.instantiateForTeardown(db, schemaName, tableName);
