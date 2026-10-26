@@ -533,7 +533,11 @@ The queue records the attempt's identity — action id, revision, and the retain
 is known. A later drain of an in-doubt entry marks that action in flight on the collection
 (`beginInFlightAction`) and refreshes first, so a refresh that finds the entry's log entry completes
 it instead of committing a second copy. A new action id is minted only after an attempt is proven
-not to have landed (a refused pend, or `TornActionError` with `final: true`).
+not to have landed (a refused pend, or `TornActionError` with `final: true`). A refused pend proves
+this for the attempt that sent it only: one sync sends several attempts under one action id, and an
+earlier one may have left its log entry standing (see `SyncRetryExhaustedError` in
+`packages/db-core/src/collection/struct.ts`), so the proof has to cover every attempt sent under
+the id.
 
 This is also why `discard` refuses an entry that has been sent: the plugin cannot withdraw a change
 it cannot rule out having already saved.

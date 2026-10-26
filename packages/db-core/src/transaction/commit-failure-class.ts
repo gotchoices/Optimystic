@@ -14,8 +14,10 @@ import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./erro
  * §Classifying an attempt's outcome). Each arm carries the error it was sorted from, narrowed to the
  * classes that produce it.
  *
- * - `cohort-unreachable` — too few of the cohort answered; nothing was saved. Wait for the cohort.
- * - `contention` — the write lost races until its retry budget ran out; nothing was saved. Back off.
+ * - `cohort-unreachable` — too few of the cohort answered, so the attempt that met it stored nothing.
+ *   Wait for the cohort.
+ * - `contention` — the write lost races until its retry budget ran out and was not saved, though an
+ *   earlier attempt's log entry may still stand (see {@link SyncRetryExhaustedError}). Back off.
  * - `guard-refused` — a rival's commit made the write wrong: `constraint` for a uniqueness refusal,
  *   `concurrent-modification` for a lost update. Final.
  * - `rejected` — the members that sank the write judged it invalid. Final.
@@ -61,7 +63,8 @@ const cohortUnreachableReasons: ReadonlySet<BlockUnavailableReason> = new Set(['
  * recognised: classify the db-core error before mapping it.
  *
  * Classes are matched with `instanceof`, so an error constructed by a second copy of this package
- * sorts as `unknown`; `yarn lint:deps` keeps one copy in the tree.
+ * sorts as `unknown` — the conservative answer, but a host that installs two copies loses every
+ * other class. No guard in this repository checks for that.
  */
 export function classifyCommitFailure(error: unknown): CommitFailureClass {
 	if (error instanceof PromiseShortfallError) {
