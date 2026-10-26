@@ -9,21 +9,21 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
-import type { OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
-import { KeyRange } from '@optimystic/db-core';
+import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
-import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
+import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
 import { withTagsOf } from './schema/tag-overlay.js';
 import { PhysicalType } from '@quereus/quereus';
 import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
@@ -630,6 +630,12 @@ export class OptimysticVirtualTable extends VirtualTable {
   private offlinePolicy: OfflineTablePolicy;
   /** A tag value that names no policy was logged; it is logged once per table. */
   private unknownOfflinePolicyLogged = false;
+  /**
+   * Live reads of this table are being served from this machine's own view because the cohort cannot
+   * be reached ({@link refreshLive}): set by the first such read, which logs it, and cleared by the
+   * next refresh that reaches the cohort, so each episode is logged once.
+   */
+  private readsServedLocally = false;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -1293,9 +1299,12 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /** Tell the offline-mode controller this table's policy, which decides the acknowledgement of a
-   * transaction that writes it; a bridge built bare has no controller to tell. */
+   * transaction that writes it and whether a live read may be served locally, and the reachability
+   * gate of its transactor, which the queue and those reads ask; a bridge built bare has no
+   * controller to tell. */
   private publishOfflinePolicy(): void {
-    this.txnBridge.getOfflineMode()?.setTablePolicy(this.qualifiedTable, this.offlinePolicy);
+    this.txnBridge.getOfflineMode()?.setTablePolicy(
+      this.qualifiedTable, this.offlinePolicy, this.collectionFactory.getCohortReachability(this.options));
   }
 
   /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */
@@ -1525,10 +1534,10 @@ export class OptimysticVirtualTable extends VirtualTable {
           : undefined;
       } else {
         // Live reads refresh each tree from the network first.
-        await mainTree.update();
+        await this.refreshLive(mainTree);
         mainRead = mainTree;
         if (indexTarget !== undefined) {
-          await indexTarget.tree.update();
+          await this.refreshLive(indexTarget.tree);
           indexScan = { ...indexTarget, read: indexTarget.tree };
         }
       }
@@ -1584,6 +1593,57 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(wrapped.message);
       throw wrapped;
     }
+  }
+
+  /**
+   * Refresh `tree` from the network before a live read, or a write's uniqueness probe, reads it. Every
+   * such refresh in this class goes through here; a committed read never refreshes.
+   *
+   * Outside offline mode, and for a table tagged `'network'`, it is `tree.update()`, failing as it
+   * always has. In offline mode, for a `'queue'` table, a cohort that cannot be reached leaves the read
+   * to this machine's own view — the committed blocks it holds plus every queued transaction
+   * (docs/offline-sync.md §Reads in offline mode): the refresh is skipped while the gate the queue asks
+   * says the cohort is unreachable, so a read does not pay the dial timeouts, and a refresh that fails
+   * for unreachability (`isCohortUnreachableRead`, the rule the drain sorts its failures by) is
+   * absorbed. Every other failure propagates, and a block this machine does not hold still fails the
+   * read that reaches it. Each outcome is reported to the controller, which keeps `readsServedLocally`.
+   */
+  private async refreshLive<TEntry>(tree: Tree<string, TEntry>): Promise<void> {
+    const offline = this.txnBridge.getOfflineMode();
+    const table = qualifiedTableName(this.qualifiedTable);
+    if (offline === undefined || !offline.degradesLiveReads(table)) {
+      await tree.update();
+      this.reachedCohort(offline);
+      return;
+    }
+    if (!await offline.cohortReachable(table, gateBlockIds(tree.getCollection()))) {
+      this.servedLocally(offline, 'gate-closed');
+      return;
+    }
+    try {
+      await tree.update();
+    } catch (error) {
+      if (!isCohortUnreachableRead(error)) throw error;
+      this.servedLocally(offline, error.reason);
+      return;
+    }
+    this.reachedCohort(offline);
+  }
+
+  /** A live refresh of this table reached the cohort: its episode of locally served reads, if any, is over. */
+  private reachedCohort(offline: OfflineMode | undefined): void {
+    this.readsServedLocally = false;
+    offline?.noteLiveRefresh(false);
+  }
+
+  /** A live read of this table is served from this machine's own view; the first of an episode is logged. */
+  private servedLocally(offline: OfflineMode, because: string): void {
+    if (!this.readsServedLocally) {
+      this.readsServedLocally = true;
+      log('offline:read-served-locally table=%s because=%s: live reads serve this machine\'s own view until a refresh reaches the cohort',
+        qualifiedTableName(this.qualifiedTable), because);
+    }
+    offline.noteLiveRefresh(true);
   }
 
   /**
@@ -2368,7 +2428,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // ever shows up in a profile, memoize the emptiness answer until the first stage.
     if (await this.hasNoRowsToBackfill()) return;
 
-    await tree.update();
+    await this.refreshLive(tree);
     // Emptiness is "the first path is not ON an entry" — isValid() only reports whether
     // a path survived a concurrent mutation (its version), NOT whether it points at a
     // row, so at()===undefined is the on-entry signal (an empty tree's first() is
@@ -2388,7 +2448,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async populateUniqueTree(descriptor: StoredIndexSchema, tree: Tree<string, IndexEntry>): Promise<void> {
     if (!this.collection || !this.rowCodec || !this.indexManager) return;
-    await this.collection.update();
+    // NOTE: the refresh degrades in offline mode but the `tree.sync()` below still needs the cohort, so
+    // the first write probing a synthesized tree an older build left empty fails while the cohort is
+    // unreachable (and succeeds once it is reachable). Only tables an older build wrote reach this; if
+    // offline writes to such tables matter, stage the populate into the caller's transaction instead.
+    await this.refreshLive(this.collection);
     for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
       if (hasNullIndexValue(descriptor, row)) {
         continue;
@@ -2466,7 +2530,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (synthesized) {
       await this.ensureUniquePopulated(descriptor, tree);
     }
-    await tree.update();
+    await this.refreshLive(tree);
     const probeKey = this.indexManager.createIndexKey(descriptor, values);
     const collisions: UniqueCollision[] = [];
     for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {

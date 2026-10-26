@@ -1,6 +1,6 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: stages 1 to 3 of [Implementation stages](#implementation-stages) are implemented; the
+**Status: stages 1 to 4 of [Implementation stages](#implementation-stages) are implemented; the
 rest is a proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
@@ -153,6 +153,9 @@ const plugin = register(db, {
     // How long a network-acknowledged commit made while entries are queued waits behind them (see
     // "Network acknowledgement behind a non-empty queue"). Default: five minutes.
     networkCommitTimeoutMs: 5 * 60_000,
+    // Advanced: the drain's re-check timer while the cohort is unreachable or after a transient
+    // failure, exponential from baseMs to maxMs (OfflineQueueOptions.recheck).
+    recheck: { baseMs: 1_000, maxMs: 60_000 },
   },
 });
 ```
@@ -260,7 +263,7 @@ Queue-wide state, for a status bar:
 plugin.offline.onQueueState(state => …);   // and plugin.offline.queueState() for the current value
 type OfflineModeState = OfflineQueueState & {   // db-core's queue state: depth, oldestQueuedAt, draining,
   mode: 'offline' | 'online';                   //   waitingFor ('cohort' | 'backoff' | undefined), unclassifiedFailures
-  readsServedLocally: boolean;   // the last live read could not reach the cohort (see "Reads")
+  readsServedLocally: boolean;   // the last live read was served from this machine's own view (see "Reads")
 };
 ```
 
@@ -277,9 +280,10 @@ plugin.offline.acknowledge(transactionId);// forget a retained outcome
 `discard` refuses an entry that has been sent at least once, because the plugin can no longer say
 whether it landed; see [Identity across attempts](#identity-across-attempts).
 
-A read-only virtual table, `optimystic_queue`, lists the same entries (`transaction_id`, `seq`,
+A read-only virtual table, `optimystic_queue`, would list the same entries (`transaction_id`, `seq`,
 `status`, `tables`, `queued_at`, `attempts`, `last_error`) for applications that live in SQL. It is
-convenience, not a separate source of truth.
+convenience, not a separate source of truth, and stage 4 did not include it: it is backlog
+`feat-offline-sync-queue-virtual-table`.
 
 ### Per-table policy
 
@@ -293,7 +297,7 @@ create table Revocation (…) using optimystic('tree://app/revocation')
   with tags ("optimystic.offline" = 'network');
 ```
 
-| `optimystic.offline` | Writes | Live reads while the cohort is unreachable |
+| `optimystic.offline` | Writes | Live reads in offline mode while the cohort is unreachable |
 |---|---|---|
 | `'queue'` (default) | A transaction gets the mode's acknowledgement. | Served from this machine's view (see [Reads](#reads-in-offline-mode)). |
 | `'network'` | A transaction that writes this table gets network acknowledgement, whatever the mode. | Fail as today, with `BlockUnavailableError`. |
@@ -302,12 +306,13 @@ A transaction that writes any `'network'` table gets network acknowledgement for
 transaction, since it commits atomically.
 
 The vtab reads the tag from the declaration and from every `table_modified` (so `alter table … set
-tags` applies to the next transaction that commits) and publishes it to the controller
-(`OfflineMode.setTablePolicy`, withdrawn on drop); `TransactionBridge.offlineRoute` asks it at commit,
-for every table behind the transaction's staged collections. The policy only ever demotes a local
-acknowledgement to a network one. A tag value other than the two reads as `'queue'` and is logged once
-per table (`offline:unknown-policy-tag`): Quereus applies a tag change to its own catalog before the
-module hears of it, so it cannot be refused.
+tags` applies to the next transaction that commits, and to the next live read) and publishes it to
+the controller, beside its transactor's reachability gate (`OfflineMode.setTablePolicy`, withdrawn
+on drop); `TransactionBridge.offlineRoute` asks it at commit, for every table behind the
+transaction's staged collections, and a live read asks it before refreshing. The policy only ever
+demotes a local acknowledgement to a network one. A tag value other than the two reads as `'queue'`
+and is logged once per table (`offline:unknown-policy-tag`): Quereus applies a tag change to its own
+catalog before the module hears of it, so it cannot be refused.
 
 ## Where the queue lives: segments in the collections
 
@@ -476,6 +481,15 @@ collection's header and log tail resolve to contains a member other than this no
 is missing from the cohort (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) and
 no configured bootstrap peer is still awaited (`awaitingBootstrapContact`, same file). The `local`,
 `test` and `mesh-test` transactors are always reachable.
+
+In the plugin a gate belongs to a transactor: `CollectionFactory.getCohortReachability` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts` answers with the gate
+registered for the transactor's key (`registerCohortReachability`, keyed as `registerTransactor`
+is), and with the always-open gate until one is; stage 6 registers the `network` transactor's. Each
+table's vtab publishes its transactor's gate to the controller with its policy, and the gate the
+controller hands the queue (`OfflineQueueOptions.reachability`) asks the gate of every table behind
+the collections it is asked about — one in practice, since an entry is one transactor's. A live read
+in offline mode asks the same gate ([Reads in offline mode](#reads-in-offline-mode)).
 
 The gate is what keeps offline mode from creating forks. Without it, a drain that runs while this
 node's routing view has dropped its partners takes the solo commit path (`soloCohortDurability` in
@@ -1019,8 +1033,9 @@ tables whose policy is `'queue'`:
 - A live read whose refresh fails for unreachability (the same classification as the drain's
   "cohort unreachable" row) serves this machine's view — committed blocks it holds plus every queued
   entry — and sets `readsServedLocally` on the queue state.
-- While the reachability port reports the cohort unreachable, a live read skips the refresh instead
-  of paying the dial timeouts on every read, and refreshes again on the next connection event.
+- While the reachability gate reports the cohort unreachable, a live read skips the refresh instead
+  of paying the dial timeouts on every read. The gate is asked on every read, so the first read after
+  it answers reachable refreshes again.
 - A block this machine does not hold at all still fails the read with `BlockUnavailableError`. The
   mode does not make data appear; an application that wants to read a table offline must have read
   it while online on a machine that keeps what it reads, which in a small group is every member
@@ -1029,6 +1044,26 @@ tables whose policy is `'queue'`:
 This is candidate answer 2 of that ticket ("the refresh should degrade, and report that it did"),
 taken only where the application opted in, per table. A `'network'` table keeps today's fail-loud
 read, which is the answer that ticket's revocation case needs.
+
+In the plugin every live refresh goes through one method of the vtab, `refreshLive` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`: the main tree and the index tree of a
+live scan, and the refreshes a write makes in its uniqueness probe (`probeUniqueConstraint`,
+`ensureUniquePopulated`, `populateUniqueTree`), so an offline insert into a table with a UNIQUE
+column is queued while the cohort cannot be reached rather than failing on its probe. It asks the
+controller whether the table's reads degrade (`OfflineMode.degradesLiveReads`: the mode is entered
+and the table's policy is `'queue'`), then the table's gate (`OfflineMode.cohortReachable`, asked
+with the header and known log tail ids that `gateBlockIds` in
+`packages/db-core/src/offline/reachability.ts` gives the queue too), then refreshes. A refresh
+failure is absorbed only when `isCohortUnreachableRead` in
+`packages/db-core/src/transaction/commit-failure-class.ts` accepts it, the predicate
+`classifyCommitFailure` sorts the same errors by; every other failure propagates, a
+`BlockUnavailableError` with another reason and a `BlockPossiblyStaleError` included. Each outcome is
+reported (`OfflineMode.noteLiveRefresh`): `readsServedLocally` is the last report's value, published
+when it changes, so a refresh that reaches the cohort, in or out of the mode, clears it. The first
+locally served read of a table is logged as `offline:read-served-locally`, and again the first one
+after a refresh has reached the cohort. The degrade has no transaction branch, so a live read inside
+an open transaction degrades the same way. A committed read (`committed.<Table>`) never refreshes
+and is unchanged.
 
 ## Persistence
 
@@ -1331,11 +1366,12 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
    cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
    Usable by a `Tree`/`Diary` application without SQL.
-4. **Offline mode in the plugin** (five tickets; the first four landed). `offline.enter`/`exit`,
+4. **Offline mode in the plugin** (implemented, in five tickets). `offline.enter`/`exit`,
    acknowledgement fixed at BEGIN, status and queue-state listeners, durability reports for drained
    entries, refusal while session mode is configured, `notifyExternalChange` on removal, the
-   `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL gate and the
-   invented-collection probe (implemented); live-read degrade (the remaining one).
+   `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL gate, the
+   invented-collection probe, and the live-read degrade with the per-transactor reachability gate it
+   and the queue share.
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on
@@ -1359,7 +1395,7 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
     `committed`.
 11. **Later, each separately:** the constraint re-check before submission; session-mode re-execution;
     submission as a long-lived pend; column-level actions for blind partial updates; the
-    `optimystic_queue` virtual table if stage 4 did not include it.
+    `optimystic_queue` virtual table (backlog `feat-offline-sync-queue-virtual-table`).
 
 ## Test plan
 
@@ -1380,8 +1416,29 @@ the head is on the network; a partly committed entry finished, and one whose rem
 refused, failing with its committed half named. `packages/db-p2p/test/offline-queue-mesh.spec.ts`,
 on a two-member mesh: an entry over a table and its index pended and committed as one record per
 phase and read back on the other node, and a rival's commit between that entry's refresh and its pend
-failing it with `constraint`, leaving nothing of it on either collection. Everything below that names
-SQL, a watcher, a restart, isolation or the outlook waits for its stage.
+failing it with `constraint`, leaving nothing of it on either collection.
+
+Stage 4 pins the SQL scenarios on a two-node mesh:
+`packages/quereus-plugin-optimystic/test/offline-mode.spec.ts` (an offline commit followed through
+`queued`, `submitting` and `committed` to the other node; several entries over a table and its index
+drained in order, an index-driven read and a full scan agreeing; the acknowledgement fixed at BEGIN;
+`discard` before and after send; the two refusals between session mode and offline mode),
+`packages/quereus-plugin-optimystic/test/offline-mode-removal.spec.ts` (a rival's primary key failing
+an entry with `constraint`, its row leaving the view, a watcher waking, and the update queued over it
+failing with `causedBy`; `concurrent-modification`; a rollback and a savepoint rollback during the
+drain), `packages/quereus-plugin-optimystic/test/offline-mode-network-ack.spec.ts` (the `'network'`
+tag, and a network-acknowledged commit waiting behind the queue, both timeout arms included),
+`packages/quereus-plugin-optimystic/test/offline-mode-ddl-gate.spec.ts` (DDL refused while a
+transaction that wrote the table is queued, allowed once it settles),
+`packages/quereus-plugin-optimystic/test/offline-mode-invented-collection.spec.ts` (the joiner) and
+`packages/quereus-plugin-optimystic/test/offline-mode-reads.spec.ts` (live reads served locally
+through an index and a scan alike, the fail-loud read outside the mode and for a `'network'` table,
+a read and the queue waiting on one gate, a table never read failing, and a write's uniqueness probe
+degrading); `packages/db-core/test/invented-collection-adoption.spec.ts` pins the invented-collection
+probe at the collection tier. Of the list below, what is left waits for its stage: the crash cases
+(stage 5); the two-machine group with one member away, and `expireAfterMs` reached while
+unreachable, which needs stage 6's gate to keep an entry unsent and so expirable; and the outlook
+(stages 7 to 10).
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.

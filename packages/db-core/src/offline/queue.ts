@@ -1,6 +1,5 @@
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
-import type { BlockId } from '../blocks/structs.js';
 import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import { ActionRefusedError, SealedSegmentsError } from '../collection/struct.js';
@@ -13,7 +12,7 @@ import type { TransactionDurability } from '../transaction/durability.js';
 import type { CoordinatorPartialCommitError } from '../transaction/errors.js';
 import type { RandFn } from '../utility/backoff.js';
 import { createLogger } from '../logger.js';
-import { alwaysReachable } from './reachability.js';
+import { alwaysReachable, gateBlockIds } from './reachability.js';
 import type { ICohortReachability } from './reachability.js';
 import {
 	EntryDiscardedError,
@@ -462,12 +461,7 @@ export class OfflineQueue {
 	/** The gate, asked with each of the head's remaining collections' header id and known log tail id.
 	 * A gate that throws is logged and read as closed: the next re-check asks again. */
 	private async gateOpen(entry: Entry): Promise<boolean> {
-		const blockIds: BlockId[] = [];
-		for (const collection of this.remainingCollections(entry)) {
-			blockIds.push(collection.id);
-			const tailId = collection.knownLogTailId();
-			if (tailId !== undefined) blockIds.push(tailId);
-		}
+		const blockIds = this.remainingCollections(entry).flatMap(gateBlockIds);
 		try {
 			return await this.reachability.reachable(blockIds);
 		} catch (err) {

@@ -1,4 +1,5 @@
 import type { BlockId } from '../blocks/structs.js';
+import type { Collection } from '../collection/collection.js';
 
 /**
  * Whether the cohorts responsible for these blocks can be reached now — the gate of
@@ -16,3 +17,12 @@ export interface ICohortReachability {
 export const alwaysReachable: ICohortReachability = {
 	reachable: () => Promise.resolve(true),
 };
+
+/** What a gate is asked with for one collection: its header id and its last known log tail id
+ * (`Collection.knownLogTailId`), when it knows one. The offline queue asks with these for every
+ * collection the head entry still has to commit, and the Quereus plugin's live-read degrade for the
+ * tree it is about to refresh, so the two ask one gate the same question. */
+export function gateBlockIds(collection: Collection<any>): BlockId[] {
+	const tailId = collection.knownLogTailId();
+	return tailId === undefined ? [collection.id] : [collection.id, tailId];
+}

@@ -75,8 +75,8 @@ export type QueuedTransaction = {
 };
 
 /** Queue-wide state, for a status bar: the db-core queue's, plus which mode the database is in and
- * whether the last live read was served from this machine's own copy (always `false` until the read
- * degrade of docs/offline-sync.md §Reads in offline mode lands). */
+ * whether the last live read was served from this machine's own copy because the cohort could not be
+ * reached (docs/offline-sync.md §Reads in offline mode). */
 export type OfflineModeState = OfflineQueueState & {
 	readonly mode: 'offline' | 'online';
 	readonly readsServedLocally: boolean;

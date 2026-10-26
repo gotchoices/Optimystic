@@ -48,6 +48,18 @@ export type CommitFailureClass =
 const cohortUnreachableReasons: ReadonlySet<BlockUnavailableReason> = new Set(['cohort-unreachable', 'peers-unreachable']);
 
 /**
+ * Whether `error` is a read that failed because the cohort could not be reached: a
+ * {@link BlockUnavailableError} with one of the two unreachability reasons — exactly the errors
+ * {@link classifyCommitFailure} sorts as `cohort-unreachable` from that class. Every other
+ * unavailability reason is a doubt about one block that reaching the cohort would not settle. Shared
+ * with the Quereus plugin's live-read degrade (docs/offline-sync.md §Reads in offline mode), so a read
+ * served from this machine's own copy and a write left waiting for the cohort are sorted by one rule.
+ */
+export function isCohortUnreachableRead(error: unknown): error is BlockUnavailableError {
+	return error instanceof BlockUnavailableError && cohortUnreachableReasons.has(error.reason);
+}
+
+/**
  * Sorts a commit failure into a {@link CommitFailureClass} — the one place every commit failure is
  * sorted, so no caller has to read an error's message to decide what to do with a write.
  *
@@ -72,7 +84,7 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 		return { kind: 'cohort-unreachable', error };
 	}
 	if (error instanceof BlockUnavailableError) {
-		return cohortUnreachableReasons.has(error.reason)
+		return isCohortUnreachableRead(error)
 			? { kind: 'cohort-unreachable', error }
 			: { kind: 'unknown', error };
 	}

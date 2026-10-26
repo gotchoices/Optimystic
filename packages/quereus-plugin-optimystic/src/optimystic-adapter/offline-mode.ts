@@ -1,9 +1,9 @@
 import type { Database } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
-import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError } from '@optimystic/db-core';
+import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError, alwaysReachable } from '@optimystic/db-core';
 import type {
-	ActionRefusedError, Collection, CollectionId, EntryId, EntryStatus, OfflineQueueOptions, OfflineQueueState, QueuedEntry,
-	TransactionDurability,
+	ActionRefusedError, BlockId, Collection, CollectionId, EntryId, EntryStatus, ICohortReachability, OfflineQueueOptions,
+	OfflineQueueState, QueuedEntry, TransactionDurability,
 } from '@optimystic/db-core';
 import type { TransactionBridge } from './txn-bridge.js';
 import type { OfflineConfig } from './offline-config.js';
@@ -98,6 +98,13 @@ export class QueuedEntriesBlockSchemaChangeError extends QuereusError {
  */
 export type OfflineTablePolicy = 'queue' | 'network';
 
+/** What a table's vtab tells the controller about how the table behaves offline. */
+interface PublishedTable {
+	readonly policy: OfflineTablePolicy;
+	/** The reachability gate of the table's transactor (`CollectionFactory.getCohortReachability`). */
+	readonly reachability: ICohortReachability;
+}
+
 type StatusListener = (status: QueuedTransactionStatus) => void;
 type StateListener = (state: OfflineModeState) => void;
 /** Called with a transaction's terminal outcome, or `undefined` when the controller was disposed first. */
@@ -133,8 +140,9 @@ export class OfflineMode {
 	private readonly outcomeRetentionMs: number;
 	private readonly now = Date.now;
 	private entered = false;
-	/** Set by the read degrade of docs/offline-sync.md §Reads in offline mode once it lands. */
-	private readonly readsServedLocally = false;
+	/** Whether the last live read reported through {@link noteLiveRefresh} was served from this
+	 * machine's own view because the cohort could not be reached. */
+	private readsServedLocally = false;
 	/** The queue's last published state, re-published with the mode on every change of either. */
 	private lastQueueState: OfflineQueueState;
 	private readonly statusListeners = new Set<StatusListener>();
@@ -142,15 +150,15 @@ export class OfflineMode {
 	/** Terminal statuses since they were emitted, oldest first, pruned lazily (no timer). */
 	private readonly retainedOutcomes = new Map<string, RetainedOutcome>();
 	private readonly networkCommitTimeoutMs: number;
-	/** Each table's policy, keyed by its `schema.table` rendering, as its vtab published it; a table
-	 * absent here takes `'queue'`. */
-	private readonly tablePolicies = new Map<string, OfflineTablePolicy>();
+	/** Each table's policy and reachability gate, keyed by its `schema.table` rendering, as its vtab
+	 * published them; a table absent here takes `'queue'` and is always reachable. */
+	private readonly tables = new Map<string, PublishedTable>();
 	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
 	private disposed = false;
 
 	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: OfflineConfig = {}) {
-		const options: OfflineQueueOptions = {};
+		const options: OfflineQueueOptions = { reachability: this.reachability };
 		if (config.expireAfterMs !== undefined) options.expireAfterMs = config.expireAfterMs;
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
 		this.queue = new OfflineQueue(options);
@@ -225,23 +233,88 @@ export class OfflineMode {
 
 	/**
 	 * Record `table`'s policy, read from its `optimystic.offline` tag by its vtab at initialization and
-	 * again on every tag change. The bridge reads it when a transaction writing the table commits
-	 * ({@link tablePolicy}); a transaction already queued keeps the acknowledgement it got.
+	 * again on every tag change, and the reachability gate of its transactor. The bridge reads the
+	 * policy when a transaction writing the table commits ({@link tablePolicy}); a transaction already
+	 * queued keeps the acknowledgement it got. The gate is what the queue asks before submitting an
+	 * entry that wrote the table, and what a live read of it asks before refreshing in offline mode
+	 * ({@link cohortReachable}).
 	 */
-	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy): void {
-		this.tablePolicies.set(qualifiedTableName(table), policy);
+	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy, reachability: ICohortReachability): void {
+		this.tables.set(qualifiedTableName(table), { policy, reachability });
 	}
 
-	/** Forget `table`'s policy: it was dropped, or its CREATE was refused. */
+	/** Forget `table`'s policy and gate: it was dropped, or its CREATE was refused. */
 	withdrawTablePolicy(table: QualifiedTableName): void {
-		this.tablePolicies.delete(qualifiedTableName(table));
+		this.tables.delete(qualifiedTableName(table));
 	}
 
 	/** The policy of the table named `schema.table` ({@link qualifiedTableName}); `'queue'` for a table
 	 * no vtab published one for. */
 	tablePolicy(name: string): OfflineTablePolicy {
-		return this.tablePolicies.get(name) ?? 'queue';
+		return this.tables.get(name)?.policy ?? 'queue';
 	}
+
+	// ── reads in offline mode ──────────────────────────────────────────────────────────────────
+
+	/**
+	 * Whether a live read of the table named `name` may be served from this machine's own view when
+	 * its refresh cannot reach the cohort (docs/offline-sync.md §Reads in offline mode): only while the
+	 * mode is entered, and only for a `'queue'` table. Outside the mode, and for a `'network'` table, a
+	 * read keeps failing loudly.
+	 */
+	degradesLiveReads(name: string): boolean {
+		return this.entered && this.tablePolicy(name) === 'queue';
+	}
+
+	/**
+	 * Whether the gate of the table named `name` says its cohort can be reached now, asked with
+	 * `blockIds` (`gateBlockIds` of the tree a live read is about to refresh) — the gate the queue asks
+	 * for the same table. A gate that throws is logged and read as reachable: the refresh then runs,
+	 * and its own failure decides whether the read is served locally.
+	 */
+	async cohortReachable(name: string, blockIds: readonly BlockId[]): Promise<boolean> {
+		const gate = this.tables.get(name)?.reachability ?? alwaysReachable;
+		try {
+			return await gate.reachable(blockIds);
+		} catch (error) {
+			log('offline:reachability-threw table=%s: %o; refreshing anyway', name, error);
+			return true;
+		}
+	}
+
+	/**
+	 * Record how a live read's refresh went: `true` when the read was served from this machine's own
+	 * view because the cohort could not be reached, `false` when the refresh reached it.
+	 * `readsServedLocally` on the queue state is the last report's value, published when it changes.
+	 */
+	noteLiveRefresh(servedLocally: boolean): void {
+		if (this.readsServedLocally === servedLocally) return;
+		this.readsServedLocally = servedLocally;
+		this.publishState();
+	}
+
+	/**
+	 * The gate the queue asks before it submits its head entry, with the header and known log tail ids
+	 * of each collection the entry still has to commit (docs/offline-sync.md §When to submit): the gate
+	 * of every table behind those collections must answer reachable. An entry is one transactor's, so
+	 * in practice that is one gate, the one a live read of the same tables asks. A collection no table
+	 * published a gate for adds none, and with none at all the cohort is reachable.
+	 */
+	private readonly reachability: ICohortReachability = {
+		reachable: async blockIds => {
+			const gates = new Set<ICohortReachability>();
+			for (const id of blockIds) {
+				for (const name of this.bridge.tablesOf(id)?.keys() ?? []) {
+					const published = this.tables.get(name);
+					if (published !== undefined) gates.add(published.reachability);
+				}
+			}
+			for (const gate of gates) {
+				if (!await gate.reachable(blockIds)) return false;
+			}
+			return true;
+		},
+	};
 
 	/**
 	 * Refuse `operation`, a change to how `table`'s rows are stored, while any queued transaction wrote

@@ -165,7 +165,7 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first four plugin stages, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after stage 4 of that design, and says at the end what is still missing.
 
 **A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
 
@@ -191,6 +191,15 @@ The acknowledgement a transaction gets is fixed when it **begins**: `enter()` or
 
 A commit in offline mode seals every table it wrote into one queue entry, including a table's index trees. One shape cannot be queued and is acknowledged by the network instead, logged as `offline:local-ack-unavailable`: two tables declared over one collection URI written in one transaction. Everything else that holds for an online commit holds for the queued one: a commit that wrote nothing queues nothing, and the constraint and concurrent-modification refusals arrive as the same errors, on the `failed` status instead of out of `commit`.
 
+#### Reading while the other machines cannot be reached
+
+Every live read first pulls what the other machines have committed, so outside offline mode a read whose pull cannot reach them fails, even for rows this machine holds, with `BlockUnavailableError` along the error's `cause` chain. In offline mode such a read is served from this machine's own view instead: the committed rows it holds plus every queued transaction, through an index or a full scan alike, inside an open transaction or not. The reads a write makes to check a UNIQUE column do the same, so an offline insert into such a table is queued rather than refused.
+
+- A table tagged `"optimystic.offline" = 'network'` (below) keeps failing, in the mode and out of it.
+- The mode does not make data appear. Rows this machine does not hold still fail the read with `BlockUnavailableError` — a table it has never read, say. To read a table offline, read it while online first.
+- `readsServedLocally` on the queue state (see [Following a queued transaction](#following-a-queued-transaction--pluginofflineonstatuslistener)) is `true` while the last live read was served this way, and the next read that reaches the other machines sets it back. The first such read of each table, and the first after each reconnect, is logged as `offline:read-served-locally`.
+- A committed read (`committed.<Table>`) never pulls, and is unchanged.
+
 #### Tables that are always acknowledged by the network — `optimystic.offline`
 
 Not every table should accept a local answer: a table of revoked peers, say, where a machine that has not heard of a revocation must not be told its write is safe. A table tag chooses:
@@ -201,12 +210,12 @@ create table Revocation (id integer primary key, peer text)
   with tags ("optimystic.offline" = 'network');
 ```
 
-| `optimystic.offline` | A transaction that writes the table |
-|---|---|
-| `'queue'` (the default) | gets the mode's acknowledgement |
-| `'network'` | gets network acknowledgement, whatever the mode |
+| `optimystic.offline` | A transaction that writes the table | A live read in offline mode while the other machines cannot be reached |
+|---|---|---|
+| `'queue'` (the default) | gets the mode's acknowledgement | is served from this machine's own view |
+| `'network'` | gets network acknowledgement, whatever the mode | fails, as outside the mode |
 
-A transaction that writes any `'network'` table is acknowledged by the network as a whole, since it commits atomically; the tag never turns a network acknowledgement into a local one, and the transaction is logged as `offline:network-policy`. Any other value reads as `'queue'`, logged once per table as `offline:unknown-policy-tag`: Quereus applies a tag to its own catalog before the plugin hears of it, so a bad value cannot be refused. The tag is read from the declaration and again after every `alter table … set tags`, so a change applies to the next transaction that commits (one already queued keeps the acknowledgement it got), and it is saved in the table's catalog record, so `hydrate` restores it.
+A transaction that writes any `'network'` table is acknowledged by the network as a whole, since it commits atomically; the tag never turns a network acknowledgement into a local one, and the transaction is logged as `offline:network-policy`. Any other value reads as `'queue'`, logged once per table as `offline:unknown-policy-tag`: Quereus applies a tag to its own catalog before the plugin hears of it, so a bad value cannot be refused. The tag is read from the declaration and again after every `alter table … set tags`, so a change applies to the next transaction that commits (one already queued keeps the acknowledgement it got) and to the next live read, and it is saved in the table's catalog record, so `hydrate` restores it.
 
 #### A network-acknowledged commit waits behind the queue
 
@@ -263,7 +272,7 @@ const unsubscribe = plugin.offline.onStatus(status => {
 
 **What a watcher sees when a transaction fails.** The queued transaction's rows were in this machine's view since its local commit, which fired `Database.watch` subscribers as any commit does. When it fails, its rows leave that view, and every table in its `changedTables` is announced to the `Database`'s watchers as a whole-table change (`Database.notifyExternalChange`, the call [Reactive Watching](#reactive-watching) describes), after the `failed` status has reached every `onStatus` listener. A `committed` status announces nothing, since the drain committed exactly what this machine already showed. A transaction that fails because an earlier one failed is announced again, so a table can wake a watcher once per failed transaction; each wake is a re-query, never a missed change. The rows can leave the view earlier than the `failed` status: a read that pulls the other machine's commit sees the refusal and stops showing them at once, and the status and the announcement follow when the drain acts on it.
 
-Queue-wide state, for a status bar: `plugin.offline.onQueueState(listener)`, published whenever the queue or the mode changes, and `plugin.offline.queueState()` for the current value. It carries `mode` (`'offline'` or `'online'`), `depth`, `oldestQueuedAt`, `draining` (a submission is on the network), `waitingFor` (`'cohort'` or `'backoff'` for the head), `unclassifiedFailures` (attempts the drain could not classify; a rising count with a stuck depth is the signal), and `readsServedLocally`, always `false` until live reads degrade in offline mode.
+Queue-wide state, for a status bar: `plugin.offline.onQueueState(listener)`, published whenever the queue or the mode changes, and `plugin.offline.queueState()` for the current value. It carries `mode` (`'offline'` or `'online'`), `depth`, `oldestQueuedAt`, `draining` (a submission is on the network), `waitingFor` (`'cohort'` or `'backoff'` for the head), `unclassifiedFailures` (attempts the drain could not classify; a rising count with a stuck depth is the signal), and `readsServedLocally` (the last live read was served from this machine's own view because the other machines could not be reached; see [Reading while the other machines cannot be reached](#reading-while-the-other-machines-cannot-be-reached)).
 
 #### Queries and actions
 
@@ -279,8 +288,9 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 
 #### Not yet in this stage
 
-- **Live reads while the cohort is unreachable fail as they do today**, for `'queue'` tables as for `'network'` ones.
-- **Nothing survives a restart.**
+- **Nothing survives a restart.** Queued transactions and retained outcomes live in memory.
+- **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally; the consequence for `discard` is above. A later stage adds the check both consult.
+- **No SQL view of the queue.** `plugin.offline.entries()` is the only listing; an `optimystic_queue` virtual table is in the backlog.
 
 ## Reactive Watching
 

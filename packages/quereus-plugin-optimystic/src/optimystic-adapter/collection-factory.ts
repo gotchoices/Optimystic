@@ -1,5 +1,5 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions } from '@optimystic/db-core';
-import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url, alwaysReachable } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -99,6 +99,13 @@ export class CollectionFactory {
    * per tree.
    */
   private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
+  /**
+   * The reachability gate registered for each transactor key ({@link registerCohortReachability}), and
+   * the one stable gate per key {@link getCohortReachability} hands out over it. A key with nothing
+   * registered answers {@link alwaysReachable}.
+   */
+  private cohortReachabilities = new Map<string, ICohortReachability>();
+  private cohortGates = new Map<string, ICohortReachability>();
 
   /**
    * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
@@ -778,6 +785,35 @@ export class CollectionFactory {
    */
   registerTransactor(key: string, transactor: ITransactor): void {
     this.transactors.set(key, transactor);
+  }
+
+  /**
+   * The gate saying whether the cohort behind `options`' transactor can be reached now
+   * (`ICohortReachability`, docs/offline-sync.md §When to submit: the reachability gate). The offline
+   * queue asks it before submitting an entry, and a live read in offline mode before it refreshes
+   * (docs/offline-sync.md §Reads in offline mode), so both ask one gate. The same object for every
+   * call with one transactor key, and it looks the registration up each time it is asked, so a gate
+   * registered after a table took this one still applies. A transactor with no gate registered is
+   * always reachable — `local`, `test` and `mesh-test` have no cohort to lose; the `network` one is
+   * registered by the node attachment of stage 6 (ticket `offline-sync-cohort-reachability`).
+   */
+  getCohortReachability(options: ParsedOptimysticOptions): ICohortReachability {
+    const key = this.getTransactorKey(options);
+    let gate = this.cohortGates.get(key);
+    if (gate === undefined) {
+      gate = { reachable: blockIds => (this.cohortReachabilities.get(key) ?? alwaysReachable).reachable(blockIds) };
+      this.cohortGates.set(key, gate);
+    }
+    return gate;
+  }
+
+  /**
+   * Register the reachability gate for the transactor under `key` — `${transactor}:${keyNetwork}`, the
+   * key {@link registerTransactor} takes. For tests, and for the node attachment that answers for the
+   * `network` transactor. Replaces any gate registered under `key` before.
+   */
+  registerCohortReachability(key: string, reachability: ICohortReachability): void {
+    this.cohortReachabilities.set(key, reachability);
   }
 
   /**
