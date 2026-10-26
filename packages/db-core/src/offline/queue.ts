@@ -1,7 +1,6 @@
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type { BlockId } from '../blocks/structs.js';
-import type { ActionId } from '../collection/action.js';
 import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import { ActionRefusedError, SealedSegmentsError } from '../collection/struct.js';
@@ -11,9 +10,7 @@ import { TransactionCoordinator } from '../transaction/coordinator.js';
 import { classifyCommitFailure, refusalReason } from '../transaction/commit-failure-class.js';
 import { transactionDurability } from '../transaction/durability.js';
 import type { TransactionDurability } from '../transaction/durability.js';
-import { jitteredBackoffMs } from '../utility/backoff.js';
-import type { JitteredBackoffConfig, RandFn } from '../utility/backoff.js';
-import { armUnrefTimer } from '../utility/unref-timer.js';
+import type { RandFn } from '../utility/backoff.js';
 import { createLogger } from '../logger.js';
 import { alwaysReachable } from './reachability.js';
 import type { ICohortReachability } from './reachability.js';
@@ -25,6 +22,9 @@ import {
 	UnknownEntryError,
 } from './status.js';
 import type { EntryStatus, EntryWaitingFor, OfflineQueueState, QueuedEntry, QueuedFailureReason } from './status.js';
+import { currentStatus, queuedStatus, queuedStatusChanged, snapshot } from './entry.js';
+import type { Entry } from './entry.js';
+import { DrainWaker } from './wake.js';
 
 const log = createLogger('offline');
 
@@ -53,53 +53,10 @@ export type OfflineQueueOptions = {
 	now?: () => number;
 };
 
-/** One queued entry, as the queue holds it. */
-type Entry = {
-	readonly id: EntryId;
-	readonly seq: number;
-	readonly queuedAt: number;
-	readonly expiresAt: number | undefined;
-	/** The collections the entry sealed a segment in — the ones `sealPending` answered `true` for. */
-	readonly collections: readonly Collection<any>[];
-	/** One action id for the entry's whole life, with one exception (see {@link OfflineQueue.applyFailure}). */
-	actionId: ActionId;
-	attempts: number;
-	/** See the NOTE at {@link OfflineQueue.recordAttempts}. */
-	inDoubt: boolean;
-	/** The attempts recorded under `actionId` and not yet resolved, per collection, handed back as
-	 * `resume` when the entry is re-driven. Cleared with the action id. */
-	readonly retained: Map<CollectionId, InFlightAttempt>;
-	phase: 'queued' | 'submitting';
-	waitingFor: EntryWaitingFor | undefined;
-	lastError: unknown;
-	/** The last `queued` status emitted, so a re-check that changes nothing emits nothing. */
-	lastQueued: QueuedStatus | undefined;
-	/** The `offline:expiry-deferred` line is logged once per entry, not once per re-check. */
-	expiryDeferredLogged: boolean;
-};
-
 /** A refusal `onSealedRefused` reported and the drain has not yet acted on. */
 type PendingRefusal = { readonly error: ActionRefusedError; readonly causedBy: EntryId | undefined };
 
 type Deferred<T> = { resolve: (value: T) => void; reject: (error: unknown) => void };
-
-type QueuedStatus = Extract<EntryStatus, { kind: 'queued' }>;
-
-/** The step counter behind the one re-check timer the gate and the backoff share: exponential,
- * jittered, reset by a wake or a successful submission. */
-class RecheckBackoff {
-	private step = 0;
-
-	constructor(private readonly config: JitteredBackoffConfig, private readonly rand: RandFn | undefined) {}
-
-	nextDelayMs(): number {
-		return jitteredBackoffMs(this.step++, this.config, this.rand);
-	}
-
-	reset(): void {
-		this.step = 0;
-	}
-}
 
 /** The write-ahead hook threw: nothing was sent, so the entry is kept queued and re-driven after the
  * backoff. Private to the queue — the hook's own error travels as `cause`. */
@@ -148,7 +105,7 @@ export class OfflineQueue {
 	private readonly byId = new Map<EntryId, Entry>();
 	private nextSeq = 1;
 	private readonly reachability: ICohortReachability;
-	private readonly recheck: RecheckBackoff;
+	private readonly waker: DrainWaker;
 	private readonly submitOptions: OfflineQueueOptions['submit'];
 	private readonly expireAfterMs: number | undefined;
 	private readonly recordAttemptHook: OfflineQueueOptions['recordAttempt'];
@@ -168,14 +125,14 @@ export class OfflineQueue {
 	 * never interleave their drops and {@link causeOf} always names one removal. Never rejects: a
 	 * removal's throw reaches whoever awaited that removal, or {@link noteDefect} for a discard. */
 	private removals: Promise<void> = Promise.resolve();
+	/** Removals chained and not yet finished — a `discard`'s runs off the loop's path, and
+	 * `whenDrained` answers at once only when none is. */
+	private pendingRemovals = 0;
 
 	private inFlight: { readonly entry: Entry; readonly controller: AbortController } | undefined;
 	private loop: Promise<void> | undefined;
 	/** The loop is parked on an empty queue (so `whenDrained` can answer at once). */
 	private waitingForWork = false;
-	private wakeWaiter: (() => void) | undefined;
-	/** A wake that arrived while the loop was busy; consumed by its next wait. */
-	private wakePending = false;
 	private readonly drainedWaiters: Deferred<void>[] = [];
 	private disposed = false;
 	private disposal: Promise<void> | undefined;
@@ -185,7 +142,7 @@ export class OfflineQueue {
 
 	constructor(private readonly transactor: ITransactor, options: OfflineQueueOptions = {}) {
 		this.reachability = options.reachability ?? alwaysReachable;
-		this.recheck = new RecheckBackoff(
+		this.waker = new DrainWaker(
 			{ baseMs: options.recheck?.baseMs ?? DefaultRecheckBaseMs, capMs: options.recheck?.maxMs ?? DefaultRecheckMaxMs },
 			options.recheck?.rand);
 		this.submitOptions = options.submit;
@@ -240,7 +197,7 @@ export class OfflineQueue {
 		} else {
 			this.wake();
 		}
-		return this.snapshot(entry);
+		return snapshot(entry);
 	}
 
 	/**
@@ -266,14 +223,14 @@ export class OfflineQueue {
 
 	/** The queued entries, in queue order. */
 	entries(): readonly QueuedEntry[] {
-		return this.list.map(entry => this.snapshot(entry));
+		return this.list.map(entry => snapshot(entry));
 	}
 
 	/** The current status of a queued entry, or `undefined` for an id not queued — never queued, or
 	 * already committed or failed (a settled entry leaves the queue with its terminal status event). */
 	status(entryId: EntryId): EntryStatus | undefined {
 		const entry = this.byId.get(entryId);
-		return entry === undefined ? undefined : this.currentStatus(entry);
+		return entry === undefined ? undefined : currentStatus(entry);
 	}
 
 	/**
@@ -321,13 +278,7 @@ export class OfflineQueue {
 	/** Kick the drain: a new local commit ({@link enqueue} calls it), a connection event, a test. A
 	 * wake that finds the loop busy is kept for its next wait, and a wake resets the re-check backoff. */
 	wake(): void {
-		const waiter = this.wakeWaiter;
-		if (waiter !== undefined) {
-			this.wakeWaiter = undefined;
-			waiter();
-		} else {
-			this.wakePending = true;
-		}
+		this.waker.wake();
 	}
 
 	/** Resolves when the queue is empty and every removal has finished; rejects with
@@ -336,7 +287,8 @@ export class OfflineQueue {
 	whenDrained(): Promise<void> {
 		if (this.disposed) return Promise.reject(new QueueDisposedError());
 		if (this.defect !== undefined) return Promise.reject(this.defect);
-		if (this.list.length === 0 && (this.loop === undefined || this.waitingForWork)) return Promise.resolve();
+		const idle = this.loop === undefined || (this.waitingForWork && this.pendingRemovals === 0);
+		if (this.list.length === 0 && idle) return Promise.resolve();
 		return new Promise<void>((resolve, reject) => { this.drainedWaiters.push({ resolve, reject }); });
 	}
 
@@ -372,6 +324,7 @@ export class OfflineQueue {
 			while (!this.disposed) {
 				if (this.defect !== undefined) throw this.defect;
 				await this.processPendingRefusals();
+				if (this.disposed) break;
 				await this.expireDue();
 				if (this.disposed) break;
 				const head = this.list[0];
@@ -380,7 +333,7 @@ export class OfflineQueue {
 					this.publishState();
 					this.waitingForWork = true;
 					try {
-						await this.awaitWake();
+						await this.waker.untilWoken();
 					} finally {
 						this.waitingForWork = false;
 					}
@@ -394,14 +347,15 @@ export class OfflineQueue {
 				}
 				if (!await this.gateOpen(head)) {
 					this.setQueued(head, 'cohort');
-					await this.awaitWakeOrTimer();
+					await this.waker.untilWokenOrTimer();
 					continue;
 				}
-				// `discard` may have taken the head while the gate was asked; a new iteration re-reads it.
-				if (this.list[0] !== head) continue;
+				// `discard` may have taken the head, or `dispose` may have run, while the gate was asked;
+				// a new iteration re-reads the one and ends on the other.
+				if (this.disposed || this.list[0] !== head) continue;
 				const retryLater = await this.submit(head);
 				if (retryLater) {
-					await this.awaitWakeOrTimer();
+					await this.waker.untilWokenOrTimer();
 				}
 			}
 		} catch (err) {
@@ -422,13 +376,13 @@ export class OfflineQueue {
 	}
 
 	/** The pending refusal whose entry is earliest in queue order, dropping any for an entry no
-	 * longer queued and leaving the submitting entry's to its submission. */
+	 * longer queued. The submitting entry's is never met here: the loop runs this step only between
+	 * submissions, and its submission throws the refusal itself. */
 	private nextPendingRefusal(): { entry: Entry; refusal: PendingRefusal } | undefined {
 		for (const entryId of [...this.pendingRefusals.keys()]) {
 			if (!this.byId.has(entryId)) this.pendingRefusals.delete(entryId);
 		}
 		for (const entry of this.list) {
-			if (entry === this.inFlight?.entry) continue;
 			const refusal = this.pendingRefusals.get(entry.id);
 			if (refusal !== undefined) return { entry, refusal };
 		}
@@ -437,13 +391,15 @@ export class OfflineQueue {
 
 	/** Step two: expire what has outlived its `expiresAt`, in queue order, head or not. An entry in
 	 * doubt is kept and logged (`offline:expiry-deferred`): a possibly-landed write is never dropped
-	 * on a clock; it expires once its doubt resolves without committing.
+	 * on a clock; it expires once its doubt resolves without committing. Stops when the queue is
+	 * disposed mid-step, since disposal leaves every entry as it is.
 	 * NOTE: checked once per iteration, and a non-empty queue always has a timer or a submission
 	 * pending, so an expiry is applied at most one re-check delay (`recheck.maxMs`, 60 s by default)
 	 * late; if an application ever needs it on the minute, arm a timer at the earliest `expiresAt`. */
 	private async expireDue(): Promise<void> {
 		const now = this.now();
 		for (const entry of [...this.list]) {
+			if (this.disposed) return;
 			if (entry.expiresAt === undefined || entry.expiresAt > now || !this.byId.has(entry.id)) continue;
 			if (entry.inDoubt) {
 				if (!entry.expiryDeferredLogged) {
@@ -548,10 +504,19 @@ export class OfflineQueue {
 		}, submit);
 	}
 
-	/** The queue's write-ahead wrapper: the one moment before a send the queue is told about. */
+	/** The queue's write-ahead wrapper: the one moment before a send the queue is told about. The
+	 * hook runs first; a throw out of it aborts the cycle with nothing sent (both drivers promise
+	 * that), so an attempt it refused is neither retained nor a reason for doubt — the entry stays
+	 * discardable, and `resume` on the next drive names only attempts that may have landed. */
 	private async recordAttempts(entry: Entry, attempts: ReadonlyMap<CollectionId, InFlightAttempt>): Promise<void> {
-		// NOTE: in doubt is STICKY — set here, the first time an attempt of the entry is about to be
-		// sent, and cleared only by a terminal outcome or by `torn-not-saved`. A cycle's own refreshes
+		try {
+			await this.recordAttemptHook?.(entry.id, attempts);
+		} catch (err) {
+			log('offline:record-attempt-failed entry=%s action=%s error=%s', entry.id, entry.actionId, describe(err));
+			throw new RecordAttemptFailed(err);
+		}
+		// NOTE: in doubt is STICKY — set here, once the first attempt of the entry is about to be sent,
+		// and cleared only by a terminal outcome or by `torn-not-saved`. A cycle's own refreshes
 		// resolve its earlier attempts (each refresh finds a landed own entry, and an attempt at an
 		// unchanged revision finishes an earlier one as the same action), so the last cycle's
 		// classification speaks for the cycle; but a coordinator lagging its cohort can still hide a
@@ -562,12 +527,6 @@ export class OfflineQueue {
 		for (const [collectionId, attempt] of attempts) {
 			entry.retained.set(collectionId, attempt);
 		}
-		try {
-			await this.recordAttemptHook?.(entry.id, attempts);
-		} catch (err) {
-			log('offline:record-attempt-failed entry=%s action=%s error=%s', entry.id, entry.actionId, describe(err));
-			throw new RecordAttemptFailed(err);
-		}
 	}
 
 	private committed(entry: Entry, durability: TransactionDurability): void {
@@ -576,7 +535,7 @@ export class OfflineQueue {
 		entry.retained.clear();
 		entry.inDoubt = false;
 		this.emit({ kind: 'committed', entryId: entry.id, durability });
-		this.recheck.reset();
+		this.waker.resetBackoff();
 		this.publishState();
 	}
 
@@ -613,8 +572,9 @@ export class OfflineQueue {
 			return true;
 		}
 		if (error instanceof QueueDisposedError && this.disposed) {
-			// The queue's own abort of the submission in flight: not a failure of the write.
-			this.setQueued(entry, undefined, error);
+			// The queue's own abort of the submission in flight: not a failure of the write, so not
+			// its `lastError` either.
+			this.setQueued(entry, undefined);
 			return true;
 		}
 		if (error instanceof ActionRefusedError) {
@@ -697,8 +657,10 @@ export class OfflineQueue {
 	/** Queue `entry`'s drops behind every removal already chained; the returned promise is that
 	 * removal's own, so its throw reaches the caller while the chain itself never rejects. */
 	private chainRemoval(entry: Entry, reason: QueuedFailureReason, error: Error, causedBy: EntryId | undefined): Promise<void> {
+		this.pendingRemovals++;
 		const removal = this.removals.then(() => this.remove(entry, reason, error, causedBy));
-		this.removals = removal.then(() => undefined, () => undefined);
+		const settled = (): void => { this.pendingRemovals--; };
+		this.removals = removal.then(settled, settled);
 		return removal;
 	}
 
@@ -758,50 +720,19 @@ export class OfflineQueue {
 		} while (chain !== this.removals);
 	}
 
-	// ── waiting ────────────────────────────────────────────────────────────────────────────────
-
-	/** Park until {@link wake} (or dispose); a wake that arrived meanwhile returns at once. */
-	private awaitWake(): Promise<void> {
-		if (this.disposed || this.wakePending) {
-			this.wakePending = false;
-			return Promise.resolve();
-		}
-		return new Promise<void>(resolve => { this.wakeWaiter = resolve; });
-	}
-
-	/** Park until the re-check timer at the current backoff step fires or {@link wake} is called,
-	 * whichever is first; a wake resets the step. The timer is unref'd, so an idle queue holds no
-	 * process open, and it is cancelled by the wake that pre-empts it. */
-	private awaitWakeOrTimer(): Promise<void> {
-		if (this.disposed) return Promise.resolve();
-		if (this.wakePending) {
-			this.wakePending = false;
-			this.recheck.reset();
-			return Promise.resolve();
-		}
-		const delayMs = this.recheck.nextDelayMs();
-		return new Promise<void>(resolve => {
-			let cancelTimer: (() => void) | undefined;
-			const woken = (): void => {
-				cancelTimer?.();
-				this.recheck.reset();
-				resolve();
-			};
-			const fired = (): void => {
-				this.wakeWaiter = undefined;
-				resolve();
-			};
-			this.wakeWaiter = woken;
-			cancelTimer = armUnrefTimer(fired, delayMs);
-		});
-	}
+	// ── stopping ───────────────────────────────────────────────────────────────────────────────
 
 	private settleDrained(): void {
 		for (const waiter of this.drainedWaiters.splice(0)) waiter.resolve();
 	}
 
 	/** The drain has met a defect: stop it, reject every `whenDrained`, and leave every entry as it
-	 * is. Segments stay sealed in their collections, so nothing the application committed is lost. */
+	 * is. Segments stay sealed in their collections, so nothing the application committed is lost.
+	 * NOTE: a removal that threw is read as a defect too, though `dropSealed`'s replay reads blocks
+	 * through the collection's source and so can throw for a read that could not be served (a cache
+	 * miss while the cohort is unreachable). Fine while every replay runs over blocks the staging
+	 * read into the cache; if `offline:drain-stopped` is ever seen with such an error, a removal
+	 * needs to be retried on the re-check timer rather than stop the drain. */
 	private stopOnDefect(error: unknown): void {
 		this.defect = error;
 		log('offline:drain-stopped error=%s', describe(error));
@@ -823,53 +754,15 @@ export class OfflineQueue {
 		entry.phase = 'queued';
 		entry.waitingFor = waitingFor;
 		if (lastError !== undefined) entry.lastError = lastError;
-		const status = this.queuedStatus(entry);
-		const previous = entry.lastQueued;
-		if (previous !== undefined
-			&& previous.waitingFor === status.waitingFor
-			&& previous.attempts === status.attempts
-			&& previous.inDoubt === status.inDoubt
-			&& previous.lastError === status.lastError) {
-			return;
-		}
+		if (!queuedStatusChanged(entry.lastQueued, queuedStatus(entry))) return;
 		this.emitQueued(entry);
 		this.publishState();
 	}
 
 	private emitQueued(entry: Entry): void {
-		const status = this.queuedStatus(entry);
+		const status = queuedStatus(entry);
 		entry.lastQueued = status;
 		this.emit(status);
-	}
-
-	private currentStatus(entry: Entry): EntryStatus {
-		return entry.phase === 'submitting'
-			? { kind: 'submitting', entryId: entry.id, attempt: entry.attempts }
-			: this.queuedStatus(entry);
-	}
-
-	private queuedStatus(entry: Entry): QueuedStatus {
-		return {
-			kind: 'queued',
-			entryId: entry.id,
-			seq: entry.seq,
-			collections: entry.collections.map(collection => collection.id),
-			queuedAt: entry.queuedAt,
-			attempts: entry.attempts,
-			inDoubt: entry.inDoubt,
-			waitingFor: entry.waitingFor,
-			...(entry.lastError === undefined ? {} : { lastError: entry.lastError }),
-		};
-	}
-
-	private snapshot(entry: Entry): QueuedEntry {
-		return {
-			id: entry.id,
-			seq: entry.seq,
-			queuedAt: entry.queuedAt,
-			collections: entry.collections.map(collection => collection.id),
-			status: this.currentStatus(entry),
-		};
 	}
 
 	private emit(status: EntryStatus): void {

@@ -419,6 +419,33 @@ describe('OfflineQueue', function () {
 		await second.queue.dispose();
 	});
 
+	it('a write-ahead hook that throws keeps the entry queued with nothing sent and NOT in doubt, so it can still be discarded; whenDrained waits for that discard\'s removal', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS);
+		const transactor = new RecordsPends(inner);
+		const journalFull = new Error('journal write failed');
+		const { queue, statuses } = openQueue(transactor, {
+			recordAttempt: async () => { throw journalFull; },
+			recheck: { baseMs: 60_000, maxMs: 60_000 },
+		});
+		const users = await openTree(transactor, queue, USERS);
+		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		await waitFor(() => statuses.some(s => s.kind === 'queued' && s.entryId === 'E1' && s.waitingFor === 'backoff'),
+			{ description: 'E1 reported queued again after the hook refused its attempt' });
+
+		const after = asQueued(queue.status('E1'), 'E1 is queued');
+		expect(after.inDoubt, 'nothing was sent, so nothing may have landed').to.equal(false);
+		expect(after.lastError, 'the hook\'s own error is reported').to.equal(journalFull);
+		expect(transactor.pends).to.have.length(0);
+
+		queue.discard('E1');
+		await queue.whenDrained();
+		expect(failedOf(statuses, 'E1').reason, 'whenDrained resolved only once the discard\'s removal had reported').to.equal('discarded');
+		expect(users.getCollection().sealedEntries()).to.deep.equal([]);
+		expect(await users.get(1)).to.equal(undefined);
+		await queue.dispose();
+	});
+
 	it('resolves an in-doubt entry without a crash: a torn first drive leaves it queued and in doubt, discard refuses it, a passed expiry is deferred, and the next drive resumes the recorded attempt and commits it once', async () => {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);

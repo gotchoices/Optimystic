@@ -622,8 +622,11 @@ cascades:
 
 1. Drop the entry's segments from every collection it wrote.
 2. Each of those collections replays its remaining sealed segments and its open segment.
-3. A later entry whose guard now refuses fails in turn, with `causedBy` set to the entry whose
-   removal triggered the replay, and is removed by the same steps.
+3. A later entry whose guard now refuses fails in turn, with `causedBy` set to the nearest earlier
+   entry that is failing — the entry whose removal triggered the replay, or, when that one replay
+   refuses several dependent entries at once, the refused entry just ahead of it — so a chain of
+   dependents reads E3 ← E2 ← E1 rather than every one pointing at E1 (`OfflineQueue.causeOf` in
+   `packages/db-core/src/offline/queue.ts`). It is removed by the same steps.
 4. Every table whose visible rows changed is announced through `Database.notifyExternalChange`, so
    `Database.watch` subscribers re-query; the same call the reactive watch bridge already makes for
    a remote commit.
