@@ -43,7 +43,7 @@ export type {
  * Plugin registration function
  * This is called by Quereus when the plugin is loaded
  */
-export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
 	if (config.debug) {
 		log('Optimystic plugin loading with config: %o', config);
 	}
@@ -53,7 +53,8 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 	const txnBridge = new TransactionBridge(collectionFactory);
 	// One offline queue per Database, idle until the first locally acknowledged commit. Wired before
 	// any table opens: every tree the factory opens from here on reports sealed-segment refusals to it.
-	const offline = new OfflineMode(txnBridge, parseOfflineConfig(config.offline));
+	// It announces a failed transaction's tables to this Database's watchers.
+	const offline = new OfflineMode(txnBridge, db, parseOfflineConfig(config.offline));
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);

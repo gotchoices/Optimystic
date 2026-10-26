@@ -16,6 +16,7 @@ import { addListener, notifyListeners } from './listeners.js';
 import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
+import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger, revisionToken } from '../logger.js';
 
 const log = createLogger('txn-bridge');
@@ -377,13 +378,14 @@ export class TransactionBridge {
    */
   private collectionRegistry = new Map<CollectionId, Collection<any>>();
   /**
-   * The tables (`schema.table`) each registered collection backs — its main tree or one of its
-   * index trees — recorded by {@link registerCollection}. A set because two tables declared over
+   * The tables each registered collection backs — its main tree or one of its index trees —
+   * recorded by {@link registerCollection}, keyed by their `schema.table` rendering
+   * ({@link qualifiedTableName}) with the pair beside it. Several because two tables declared over
    * one collection URI share its collections. Read to build a commit report's per-table view
    * ({@link reportCommitDurability}) and, through {@link tablesOf}, the table-level statuses of the
-   * offline queue.
+   * offline queue and the tables it announces to `Database.watch` subscribers.
    */
-  private collectionTables = new Map<CollectionId, Set<string>>();
+  private collectionTables = new Map<CollectionId, Map<string, QualifiedTableName>>();
   /**
    * Listeners registered with {@link onCommitDurability}, called in registration order once per
    * commit that wrote something.
@@ -592,10 +594,10 @@ export class TransactionBridge {
    * mid-transaction) still gets its own clean capture while the old instance's
    * capture is left alone.
    *
-   * `table` is the qualified `schema.table` the collection backs, which a commit's durability
+   * `table` is the table the collection backs, whose `schema.table` rendering a commit's durability
    * report groups its collections under (see {@link onCommitDurability}).
    */
-  registerCollection(collection: Collection<any>, table?: string): void {
+  registerCollection(collection: Collection<any>, table?: QualifiedTableName): void {
     if (table !== undefined) {
       this.recordCollectionTable(collection.id, table);
     }
@@ -617,33 +619,36 @@ export class TransactionBridge {
     }
   }
 
-  private recordCollectionTable(id: CollectionId, table: string): void {
+  private recordCollectionTable(id: CollectionId, table: QualifiedTableName): void {
     const tables = this.collectionTables.get(id);
+    const name = qualifiedTableName(table);
     if (tables === undefined) {
-      this.collectionTables.set(id, new Set([table]));
-    } else {
-      tables.add(table);
+      this.collectionTables.set(id, new Map([[name, { ...table }]]));
+    } else if (!tables.has(name)) {
+      tables.set(name, { ...table });
     }
   }
 
   /**
-   * Stop naming `table` (`schema.table`) in commit reports — for a table that was dropped, or
-   * whose CREATE was refused. Its collections stay registered (a DROP has never unregistered
-   * them), so without this a later table declared over the same URI would report its writes
-   * under the dropped table's name as well as its own.
+   * Stop naming `table` in commit reports — for a table that was dropped, or whose CREATE was
+   * refused. Its collections stay registered (a DROP has never unregistered them), so without this
+   * a later table declared over the same URI would report its writes under the dropped table's name
+   * as well as its own.
    */
-  forgetTable(table: string): void {
+  forgetTable(table: QualifiedTableName): void {
+    const name = qualifiedTableName(table);
     for (const [id, tables] of this.collectionTables) {
-      if (tables.delete(table) && tables.size === 0) {
+      if (tables.delete(name) && tables.size === 0) {
         this.collectionTables.delete(id);
       }
     }
   }
 
-  /** The tables (`schema.table`) collection `id` backs, as {@link registerCollection} recorded them;
-   * `undefined` for a collection no table was registered for (a test double). Read by the
-   * offline-mode controller to name tables on its statuses. */
-  tablesOf(id: CollectionId): ReadonlySet<string> | undefined {
+  /** The tables collection `id` backs, as {@link registerCollection} recorded them, keyed by their
+   * `schema.table` rendering; `undefined` for a collection no table was registered for (a test
+   * double). Read by the offline-mode controller, which names the keys on its statuses and
+   * announces the pairs when a queued transaction's rows leave this machine's view. */
+  tablesOf(id: CollectionId): ReadonlyMap<string, Readonly<QualifiedTableName>> | undefined {
     return this.collectionTables.get(id);
   }
 
@@ -1100,7 +1105,7 @@ export class TransactionBridge {
     if (demanded || this.durabilityListeners.size > 0 || this.fullyHeldListeners.size > 0) {
       const verdict = this.durabilityFollower.follow(
         transactionId, durability, { selfPeerId: this.peerId, notifier: this.durabilityNotifier });
-      report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id), verdict !== 'unfollowed');
+      report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id)?.keys(), verdict !== 'unfollowed');
       notifyListeners(this.durabilityListeners, report,
         error => log('commit:durability-listener-threw transaction=%s: %o', transactionId, error));
       // Every block's event came before the commit's answer did: fully held already, but reported

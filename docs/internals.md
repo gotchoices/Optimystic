@@ -1316,6 +1316,12 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   machine's commit wakes watchers twice: once from the storage listener, once from
   the network notification. Both are whole-table invalidations, so the cost is one
   extra re-query; neither path suppresses the other.
+- **A failed offline transaction is announced the same way.** Its rows leave this
+  machine's view with no commit to announce them, so the offline-mode controller
+  makes the same call for each table its removal changed, through the same
+  error-isolating helper (`announceExternalChange` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`;
+  [offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)).
 - **Lifetime.** The subscription is established once after table init and released
   in `OptimysticModule.destroy` (DROP TABLE). It is deliberately NOT released in
   the per-statement `disconnect()` (a no-op that keeps the table initialized across

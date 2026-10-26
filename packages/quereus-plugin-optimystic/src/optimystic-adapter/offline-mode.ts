@@ -1,3 +1,4 @@
+import type { Database } from '@quereus/quereus';
 import { OfflineQueue } from '@optimystic/db-core';
 import type {
 	ActionRefusedError, Collection, CollectionId, EntryId, EntryStatus, OfflineQueueOptions, OfflineQueueState, QueuedEntry,
@@ -7,6 +8,8 @@ import type { TransactionBridge } from './txn-bridge.js';
 import type { OfflineConfig } from './offline-config.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { addListener, notifyListeners } from './listeners.js';
+import { announceExternalChange } from './external-change.js';
+import type { QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('offline-mode');
@@ -55,6 +58,11 @@ interface RetainedOutcome {
  * entry at commit (`TransactionBridge.commitTransaction`) and reads the mode here when a transaction
  * begins. The drain loop starts on the first entry, so an idle queue costs nothing.
  *
+ * A `failed` transaction's rows leave this machine's view, which no Quereus commit announces, so the
+ * controller announces every table behind the status's `changedCollections` to the `Database`'s
+ * watchers once the status has been delivered (docs/offline-sync.md §Removing an entry). A
+ * `committed` one changes no row this machine sees and announces nothing.
+ *
  * None of the bridge's single-writer state is read or written here: the drain owns the sealed
  * segments and the queue, the open SQL transaction owns the open segment, and the collection latch
  * serialises their in-memory steps (docs/offline-sync.md §The single-writer bridge).
@@ -73,7 +81,7 @@ export class OfflineMode {
 	/** Terminal statuses since they were emitted, oldest first, pruned lazily (no timer). */
 	private readonly retainedOutcomes = new Map<string, RetainedOutcome>();
 
-	constructor(private readonly bridge: TransactionBridge, config: OfflineConfig = {}) {
+	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: OfflineConfig = {}) {
 		const options: OfflineQueueOptions = {};
 		if (config.expireAfterMs !== undefined) options.expireAfterMs = config.expireAfterMs;
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
@@ -205,6 +213,20 @@ export class OfflineMode {
 		if (translated.kind === 'committed' || translated.kind === 'failed') this.retain(translated);
 		notifyListeners(this.statusListeners, translated,
 			error => log('offline:status-listener-threw transaction=%s kind=%s: %o', translated.transactionId, translated.kind, error));
+		if (status.kind === 'failed') this.announceRemoval(status.entryId, status.changedCollections);
+	}
+
+	/**
+	 * Tell the `Database`'s watchers about each table whose rows the removal of `transactionId` took
+	 * out of this machine's view: the tables behind the collections it still held a segment in, each
+	 * once per removal. A cascade announces again for every entry it fails, which costs a watcher one
+	 * re-query each. Fire-and-forget, never thrown into the drain.
+	 */
+	private announceRemoval(transactionId: string, changedCollections: readonly CollectionId[]): void {
+		for (const [name, table] of this.tablesBehind(changedCollections)) {
+			announceExternalChange(this.db, table,
+				error => log('offline:announce-failed transaction=%s table=%s: %o', transactionId, name, error));
+		}
 	}
 
 	/** Every status the queue emits, in SQL terms. Reached only from the queue's own emission: the
@@ -283,14 +305,21 @@ export class OfflineMode {
 		};
 	}
 
-	/** The qualified names of the tables `ids` back, each once, in order of first appearance; a
-	 * collection the bridge knows no table for is dropped, as a durability report drops it. */
+	/** The qualified names of the tables `ids` back, each once, in order of first appearance. */
 	private tablesOf(ids: readonly CollectionId[]): string[] {
-		const tables = new Set<string>();
+		return [...this.tablesBehind(ids).keys()];
+	}
+
+	/** The tables `ids` back, each once, keyed by `schema.table` in order of first appearance; a
+	 * collection the bridge knows no table for is dropped, as a durability report drops it. */
+	private tablesBehind(ids: readonly CollectionId[]): Map<string, Readonly<QualifiedTableName>> {
+		const tables = new Map<string, Readonly<QualifiedTableName>>();
 		for (const id of ids) {
-			for (const table of this.bridge.tablesOf(id) ?? []) tables.add(table);
+			for (const [name, table] of this.bridge.tablesOf(id) ?? []) {
+				if (!tables.has(name)) tables.set(name, table);
+			}
 		}
-		return [...tables];
+		return tables;
 	}
 
 	/** The error an online commit would have thrown for the same refusal; anything the bridge does

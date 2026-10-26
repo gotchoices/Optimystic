@@ -689,9 +689,16 @@ cascades:
    `packages/db-core/src/offline/queue.ts`). It is removed by the same steps.
 4. Every table whose visible rows changed is announced through `Database.notifyExternalChange`, so
    `Database.watch` subscribers re-query; the same call the reactive watch bridge already makes for
-   a remote commit. The tables are the ones behind the `failed` status's `changedCollections`: the
-   collections the entry still had a segment in when it was removed, which for a partly committed
-   entry excludes the half that committed.
+   a remote commit (`announceExternalChange` in
+   `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`, shared by both).
+   The tables are the ones behind the `failed` status's `changedCollections`: the collections the
+   entry still had a segment in when it was removed, which for a partly committed entry excludes the
+   half that committed. The plugin's controller announces each such table once, after the `failed`
+   status has reached the application's listeners, so a watcher's re-query runs after the
+   application has heard why (`OfflineMode` in
+   `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts`). A cascade announces
+   once per failed entry, so a table two cascading entries wrote is announced twice, which costs a
+   watcher one extra re-query. A failure in the announcement is logged, never thrown into the drain.
 
 A cascade removes only entries whose own checks fail without the removed one. An entry that merely
 read the removed entry's rows (an `insert … select` that copied them, a value computed from them)
@@ -1275,11 +1282,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
    cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
    Usable by a `Tree`/`Diary` application without SQL.
-4. **Offline mode in the plugin** (five tickets; the first landed). `offline.enter`/`exit`,
+4. **Offline mode in the plugin** (five tickets; the first two landed). `offline.enter`/`exit`,
    acknowledgement fixed at BEGIN, status and queue-state listeners, durability reports for drained
-   entries and refusal while session mode is configured (implemented); `notifyExternalChange` on
-   removal, the `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL
-   gate, the invented-collection probe and live-read degrade (the remaining four).
+   entries, refusal while session mode is configured, and `notifyExternalChange` on removal
+   (implemented); the `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the
+   DDL gate, the invented-collection probe and live-read degrade (the remaining three).
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on

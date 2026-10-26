@@ -27,10 +27,11 @@ export type MeshDbNode = { db: Database; plugin: Plugin };
 /**
  * The opt-in wiring a spec may ask of its mesh, each off by default so no other spec changes: the
  * two transactor options that make a node hear its own storage's commits and read its own replica
- * (`BuildTransactorOptions.notifyLocalChanges` / `selfFirstReads`), and the storage change hold's
- * bound (`MeshOptions.changeHoldMs`; `0` disables it).
+ * (`BuildTransactorOptions.notifyLocalChanges` / `selfFirstReads`), the wrapper a spec puts around
+ * each node's repo to hold or fail one RPC (`BuildTransactorOptions.wrapRepo`), and the storage
+ * change hold's bound (`MeshOptions.changeHoldMs`; `0` disables it).
  */
-export type MockMeshOptions = Pick<BuildTransactorOptions, 'notifyLocalChanges' | 'selfFirstReads'> & Pick<MeshOptions, 'changeHoldMs'>;
+export type MockMeshOptions = Pick<BuildTransactorOptions, 'notifyLocalChanges' | 'selfFirstReads' | 'wrapRepo'> & Pick<MeshOptions, 'changeHoldMs'>;
 
 /** A running mock mesh, plus the lookup from node index to that node's transactor. */
 export interface MockMesh {
@@ -127,14 +128,7 @@ export interface TreeShape {
  * transaction-scoped, so a cache-less call always opens a new Tree.
  */
 export async function readTree(plugin: Plugin, collectionUri: string): Promise<TreeShape> {
-	const tree = await plugin.collectionFactory.createOrGetCollection({
-		collectionUri,
-		transactor: 'shared',
-		keyNetwork: 'test',
-		libp2pOptions: {},
-		cache: false,
-		encoding: 'json' as const,
-	});
+	const tree = await openFreshTree(plugin, collectionUri);
 	await tree.update();
 	let entries = 0;
 	let split = false;
@@ -144,6 +138,19 @@ export async function readTree(plugin: Plugin, collectionUri: string): Promise<T
 		if (treePath.branches.length > 0) split = true;
 	}
 	return { entries, split };
+}
+
+/** A new handle on `collectionUri` over this node's transactor, sharing no state with the vtabs'
+ * (see {@link readTree} for why passing no transaction state makes it fresh). */
+export function openFreshTree(plugin: Plugin, collectionUri: string): ReturnType<Plugin['collectionFactory']['createOrGetCollection']> {
+	return plugin.collectionFactory.createOrGetCollection({
+		collectionUri,
+		transactor: 'shared',
+		keyNetwork: 'test',
+		libp2pOptions: {},
+		cache: false,
+		encoding: 'json' as const,
+	});
 }
 
 /** Committed entry count at `collectionUri`, seen from this node. */

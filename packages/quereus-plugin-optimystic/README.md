@@ -165,7 +165,7 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first plugin stage, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first two plugin stages, and says at the end what is still missing.
 
 **A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
 
@@ -213,6 +213,8 @@ const unsubscribe = plugin.offline.onStatus(status => {
 - `failed` carries `reason` (`'constraint'`, `'concurrent-modification'`, `'rejected'`, `'too-large'`, `'expired'`, `'discarded'`), `error` as an online commit would have thrown it (a `ConstraintError` reading `UNIQUE constraint failed: …`, a `ConcurrentModificationError`, with the db-core refusal reachable through `cause`), `changedTables` (whose rows the removal changed), `causedBy` naming the earlier transaction whose removal made this one fail, and `committedTables` when part of it had committed first — the network then holds half of the transaction.
 - A listener that throws is logged and the rest still run. The returned function unsubscribes and is safe to call twice.
 
+**What a watcher sees when a transaction fails.** The queued transaction's rows were in this machine's view since its local commit, which fired `Database.watch` subscribers as any commit does. When it fails, its rows leave that view, and every table in its `changedTables` is announced to the `Database`'s watchers as a whole-table change (`Database.notifyExternalChange`, the call [Reactive Watching](#reactive-watching) describes), after the `failed` status has reached every `onStatus` listener. A `committed` status announces nothing, since the drain committed exactly what this machine already showed. A transaction that fails because an earlier one failed is announced again, so a table can wake a watcher once per failed transaction; each wake is a re-query, never a missed change. The rows can leave the view earlier than the `failed` status: a read that pulls the other machine's commit sees the refusal and stops showing them at once, and the status and the announcement follow when the drain acts on it.
+
 Queue-wide state, for a status bar: `plugin.offline.onQueueState(listener)`, published whenever the queue or the mode changes, and `plugin.offline.queueState()` for the current value. It carries `mode` (`'offline'` or `'online'`), `depth`, `oldestQueuedAt`, `draining` (a submission is on the network), `waitingFor` (`'cohort'` or `'backoff'` for the head), `unclassifiedFailures` (attempts the drain could not classify; a rising count with a stuck depth is the signal), and `readsServedLocally`, always `false` until live reads degrade in offline mode.
 
 #### Queries and actions
@@ -232,7 +234,7 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 - **A network-acknowledged commit does not wait behind the queue.** After `exit()`, or in a transaction begun before `enter()`, a commit that writes a table with queued transactions fails with `SealedSegmentsError` (rolled back cleanly; retry it after `whenDrained()`), and one that writes other tables commits ahead of the queue.
 - **Every table takes the mode's acknowledgement**; the per-table `optimystic.offline` tag is later.
 - **Schema changes are not refused** while a table's transactions are queued; await `whenDrained()` before DDL on such a table.
-- **Live reads while the cohort is unreachable fail as they do today**, and a `Database.watch` on a table is not told when a failed transaction's rows are removed.
+- **Live reads while the cohort is unreachable fail as they do today.**
 - **Nothing survives a restart.**
 
 ## Reactive Watching

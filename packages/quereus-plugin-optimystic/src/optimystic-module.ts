@@ -7,6 +7,7 @@
 
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
@@ -1183,22 +1184,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * notifyExternalChange).
    */
   private handleCollectionChange(): void {
-    try {
-      const result = this.db.notifyExternalChange(this.tableName, this.schemaName);
-      if (result && typeof (result as Promise<void>).catch === 'function') {
-        (result as Promise<void>).catch((error: unknown) => {
-          log(
-            `WARN: notifyExternalChange failed for '${this.tableName}': ` +
-            `${error instanceof Error ? error.message : String(error)}`
-          );
-        });
-      }
-    } catch (error) {
+    announceExternalChange(this.db, this.qualifiedTable, (error: unknown) => {
       log(
-        `WARN: notifyExternalChange threw for '${this.tableName}': ` +
+        `WARN: notifyExternalChange failed for '${this.tableName}': ` +
         `${error instanceof Error ? error.message : String(error)}`
       );
-    }
+    });
   }
 
   /**
@@ -2026,17 +2017,18 @@ export class OptimysticVirtualTable extends VirtualTable {
    * commit's durability report groups the tree's collection under.
    */
   private registerTree(tree: Tree<any, any>): void {
-    this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedName);
+    this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedTable);
   }
 
   /** Stop the bridge naming this table in commit reports; on DROP and on a refused CREATE. */
   forgetInCommitReports(): void {
-    this.txnBridge.forgetTable(this.qualifiedName);
+    this.txnBridge.forgetTable(this.qualifiedTable);
   }
 
-  /** The `schema.table` key a commit's durability report groups this table's collections under. */
-  private get qualifiedName(): string {
-    return `${this.schemaName}.${this.tableName}`;
+  /** This table as the bridge records it: a commit's durability report groups the table's
+   * collections under its `schema.table` rendering. */
+  private get qualifiedTable(): QualifiedTableName {
+    return { schemaName: this.schemaName, tableName: this.tableName };
   }
 
   /**
