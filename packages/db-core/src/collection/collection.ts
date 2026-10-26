@@ -1859,8 +1859,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * open segment is non-empty (a transaction is open, and its actions were staged over state without
 	 * this segment; the only caller refuses to restore mid-transaction), when a head commit is in
 	 * flight ({@link SealedSegmentsError}, `in-flight`), when `entryId` is already sealed here, or when
-	 * `before` names no segment here. A replay error that is not a refusal propagates with the segment
-	 * left in place, the shape a refresh's replay has.
+	 * `before` names no segment here. A replay error that is not a refusal (a block the replay could
+	 * not read, say) propagates with the segment REMOVED again: the caller's restore rolls back and
+	 * may try this entry again later, which would otherwise meet its own segment as "already sealed".
+	 * The tracker is then half re-staged, the state a refresh's replay that throws leaves too (backlog
+	 * `debt-a-failed-refresh-can-leave-a-collection-half-restaged`); the next replay rebuilds it.
 	 *
 	 * @returns this segment's own refusal, when the replay refused it; `undefined` when it staged. */
 	async restoreSealed(entryId: EntryId, actions: readonly Action<TAction>[], position: { before: EntryId } | 'last'): Promise<ActionRefusedError | undefined> {
@@ -1874,7 +1877,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 				throw new SealedSegmentsError(this.id, this.segments.entryIds(), 'in-flight', this.headInFlight.entryId);
 			}
 			this.segments.insert(entryId, actions, position === 'last' ? undefined : position.before);
-			await this.replayActions(entryId);
+			try {
+				await this.replayActions(entryId);
+			} catch (err) {
+				this.segments.drop(entryId);
+				throw err;
+			}
 			return this.segments.find(entryId)?.refused;
 		} finally {
 			release();

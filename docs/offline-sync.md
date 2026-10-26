@@ -1202,7 +1202,10 @@ what that callback does:
   returned to the restore rather than reported, and the restore fails the entry through the ordinary
   cascade with no `causedBy`. A later segment the replay newly refuses is reported through
   `onSealedRefused` as any replay's would be, and is attributed to no earlier entry either, since a
-  restore removes nothing. An insertion costs one replay, the cost every drop already pays.
+  restore removes nothing. A replay error that is not a refusal — a block it could not read —
+  propagates with the segment removed again, so the restore that rolls back can be tried again
+  later without meeting its own segment. An insertion costs one replay, the cost every drop already
+  pays.
 
 ### Outcomes after a restart
 

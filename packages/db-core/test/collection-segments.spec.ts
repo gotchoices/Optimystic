@@ -28,6 +28,8 @@ import {
 	createTransactionStamp,
 	createTransactionId,
 	ACTIONS_ENGINE_ID,
+	type BlockGets,
+	type GetBlockResults,
 	type CommitRequest,
 	type CommitResult,
 	type HeadCommitOptions,
@@ -1097,6 +1099,34 @@ describe('Collection sealed segments', function () {
 
 			const invented = (await Tree.createOrOpen<number, Entry>(transactor, 'fresh', byKey)).getCollection();
 			expect(invented.holdsCommitted({ actionId, rev }), 'no context, nothing held').to.be.false;
+		});
+
+		it('a replay error that is not a refusal propagates with the segment removed again, so the same entry can be restored once the read is answered', async () => {
+			class ThrowsOnGet extends DelegatingTransactor {
+				armed: Error | undefined;
+				constructor(inner: TestTransactor) { super(inner); }
+				override get(b: BlockGets): Promise<GetBlockResults> {
+					if (this.armed !== undefined) return Promise.reject(this.armed);
+					return super.get(b);
+				}
+			}
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new ThrowsOnGet(inner);
+			const refusals: Refusal[] = [];
+			const collection = (await openReporting(transactor, refusals)).getCollection();
+			const actions = [replaceAction([[3, entry(3, 'restored')]])];
+			transactor.armed = new Error('the root block could not be read');
+
+			const err = await capture(() => collection.restoreSealed('R', actions, 'last'));
+
+			expect(err, 'the read error, not a refusal').to.equal(transactor.armed);
+			expect(collection.sealedEntries(), 'the segment was removed again').to.deep.equal([]);
+			expect(refusals).to.be.empty;
+
+			transactor.armed = undefined;
+			expect(await collection.restoreSealed('R', actions, 'last'), 'restored once the read is answered').to.be.undefined;
+			expect(collection.sealedEntries()).to.deep.equal(['R']);
 		});
 	});
 

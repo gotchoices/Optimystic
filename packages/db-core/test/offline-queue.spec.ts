@@ -44,6 +44,7 @@ import {
 	type RestoredSegment,
 	type TreeReplaceAction,
 	type Action,
+	type ActionRefusedError,
 } from '../src/index.js';
 import {
 	DelegatingTransactor,
@@ -262,8 +263,8 @@ async function partiallyCommitted(statuses: EntryStatus[], entryId: string): Pro
 const replaceAction = (data: TreeReplaceAction<number, Entry>): Action<TreeReplaceAction<number, Entry>> => ({ type: 'replace', data });
 
 /** A `stage` answer for a segment `Collection.restoreSealed` put in place, with its refusal if any. */
-const stagedSegment = (refused: Error | undefined): RestoredSegment =>
-	refused === undefined ? { kind: 'staged' } : { kind: 'staged', refused: refused as never };
+const stagedSegment = (refused: ActionRefusedError | undefined): RestoredSegment =>
+	refused === undefined ? { kind: 'staged' } : { kind: 'staged', refused };
 
 /** What `promise` rejected with; fails the test if it resolved. */
 async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {

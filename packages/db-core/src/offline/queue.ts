@@ -306,10 +306,16 @@ export class OfflineQueue {
 			lastQueued: undefined,
 			expiryDeferredLogged: false,
 		};
-		await this.journalQueued(entry);
-		// The sequence number is taken only once the record is written, so a refused enqueue leaves
-		// no gap in the order the journal lists.
+		// The sequence number is reserved for the write, so a restore that runs meanwhile takes a later
+		// one, and handed back when the write is refused and nothing took a later one since, so a
+		// refused enqueue leaves no gap in the order the journal lists.
 		this.nextSeq = entry.seq + 1;
+		try {
+			await this.journalQueued(entry);
+		} catch (err) {
+			if (this.nextSeq === entry.seq + 1) this.nextSeq = entry.seq;
+			throw err;
+		}
 		this.list.push(entry);
 		this.byId.set(id, entry);
 		this.emitQueued(entry);
@@ -385,6 +391,11 @@ export class OfflineQueue {
 	readonly onSealedRefused = (entryId: EntryId, error: ActionRefusedError): void => {
 		const entry = this.byId.get(entryId);
 		if (entry === undefined) {
+			// NOTE: this also covers an entry `enqueue` has sealed but not yet registered (its journal
+			// write is outstanding) whose segment a head commit's replay refused meanwhile. The refusal
+			// stays recorded on the segment, and the loop's head check (`recordedRefusal`) fails the entry
+			// once it reaches the head — later than a pending refusal would, never lost. If that delay
+			// ever matters, re-check `sealedRefusal` for each collection when `enqueue` registers.
 			log('offline:refusal-for-unknown-entry entry=%s error=%s', entryId, error.message);
 			return;
 		}
@@ -458,7 +469,10 @@ export class OfflineQueue {
 
 	/** Resolves when the queue is empty and every removal has finished; rejects with
 	 * {@link QueueDisposedError} on {@link dispose}, and with the drain's defect once it has stopped
-	 * on one. */
+	 * on one.
+	 * NOTE: a {@link restore} in progress is not waited for: on an empty queue it answers at once
+	 * while the restore is about to register an entry. Fine while restores run at start-up, before
+	 * anything awaits a drain; if a host ever awaits both, make this wait out the restore chain. */
 	whenDrained(): Promise<void> {
 		if (this.disposed) return Promise.reject(new QueueDisposedError());
 		if (this.defect !== undefined) return Promise.reject(this.defect);
@@ -939,6 +953,10 @@ export class OfflineQueue {
 	}
 
 	// ── restoring ──────────────────────────────────────────────────────────────────────────────
+	// NOTE: this file is near 1300 lines (`wc -l`). The restore machinery below (the hold, the
+	// registration by seq, the staging and its rollback) reads and writes the queue's private state
+	// directly, which is why it stays here; if the file grows again, it is the section to extract
+	// behind a small interface over `list`, `byId` and the hold.
 
 	/** One {@link restore}, run on the restore chain: take the hold, wait for the loop to park and the
 	 * removal chain to drain, register, stage, admit, release. */
@@ -1083,7 +1101,9 @@ export class OfflineQueue {
 		}
 		if (staged === 0) {
 			log('offline:restored-already-committed entry=%s action=%s collections=%o', entry.id, entry.actionId, [...outcomes.keys()]);
-			await this.committed(entry, transactionDurability(new Map([...outcomes.keys()].map(id => [id, undefined]))));
+			// Every collection is in `entry.committed` by now, each with the class the drive record knew
+			// or none; nothing new was written, so nothing is merged over them.
+			await this.committed(entry);
 			return undefined;
 		}
 		this.emitQueued(entry);
