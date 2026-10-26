@@ -150,6 +150,9 @@ const plugin = register(db, {
     // Let a drain commit alone while this node knows of absent cohort members. Default: false — a
     // queued entry is committed only by a commit its cohort reached consensus on.
     allowSoloCommit: false,
+    // How long a network-acknowledged commit made while entries are queued waits behind them (see
+    // "Network acknowledgement behind a non-empty queue"). Default: five minutes.
+    networkCommitTimeoutMs: 5 * 60_000,
   },
 });
 ```
@@ -177,9 +180,7 @@ The acknowledgement a transaction gets is fixed when it **begins** (at `Transact
 not when it commits, so a mode change during an open transaction changes nothing about it.
 Leaving the mode does not stop the drain: entries already queued keep draining, and a
 network-acknowledged transaction committed while entries are queued waits behind them (see
-[Network acknowledgement behind a non-empty queue](#network-acknowledgement-behind-a-non-empty-queue);
-the wait is the network-acknowledgement ticket of stage 4, and until it lands such a commit over a
-queued table is refused, as the plugin README says).
+[Network acknowledgement behind a non-empty queue](#network-acknowledgement-behind-a-non-empty-queue)).
 
 ### Following transactions
 
@@ -299,6 +300,14 @@ create table Revocation (…) using optimystic('tree://app/revocation')
 
 A transaction that writes any `'network'` table gets network acknowledgement for the whole
 transaction, since it commits atomically.
+
+The vtab reads the tag from the declaration and from every `table_modified` (so `alter table … set
+tags` applies to the next transaction that commits) and publishes it to the controller
+(`OfflineMode.setTablePolicy`, withdrawn on drop); `TransactionBridge.offlineRoute` asks it at commit,
+for every table behind the transaction's staged collections. The policy only ever demotes a local
+acknowledgement to a network one. A tag value other than the two reads as `'queue'` and is logged once
+per table (`offline:unknown-policy-tag`): Quereus applies a tag change to its own catalog before the
+module hears of it, so it cannot be refused.
 
 ## Where the queue lives: segments in the collections
 
@@ -1154,6 +1163,19 @@ entry was sent, the entry may have landed and cannot be withdrawn: it stays queu
 acknowledged entry, and `commit` throws an error carrying the `transactionId` and saying so, so the
 caller can follow it.
 
+In the plugin the route is chosen by `TransactionBridge.offlineRoute`, and the wait is
+`OfflineMode.awaitNetworkAcknowledgement`, which resolves from the same translation of the queue's
+statuses that `onStatus` listeners receive. The bound is `offline.networkCommitTimeoutMs`, five
+minutes by default (`NetworkCommitBoundMs`, the expiry a legacy multi-tree commit's stamp has too).
+The timeout error is `OfflineCommitTimeoutError`, whose `sent` says which of the two cases it was; a
+withdrawn entry fails with reason `discarded`. A `failed` entry's `commit` throws the status's mapped
+error without restoring the transaction's snapshots, since the queue has already dropped its segments
+and replayed what remains. The route is also taken while a collection the transaction writes still
+holds a sealed segment with nothing queued (a failed entry's removal still dropping it). A dirty set
+that cannot be one entry (two tables declared over one collection URI) cannot wait behind the queue:
+it commits ahead of it, logged `offline:queue-bypassed`, and is refused with `SealedSegmentsError`
+when it writes a collection that holds queued entries.
+
 ### The single-writer bridge
 
 The bridge's single-writer state (see
@@ -1282,11 +1304,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
    cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
    Usable by a `Tree`/`Diary` application without SQL.
-4. **Offline mode in the plugin** (five tickets; the first two landed). `offline.enter`/`exit`,
+4. **Offline mode in the plugin** (five tickets; the first three landed). `offline.enter`/`exit`,
    acknowledgement fixed at BEGIN, status and queue-state listeners, durability reports for drained
-   entries, refusal while session mode is configured, and `notifyExternalChange` on removal
-   (implemented); the `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the
-   DDL gate, the invented-collection probe and live-read degrade (the remaining three).
+   entries, refusal while session mode is configured, `notifyExternalChange` on removal, the
+   `optimystic.offline` tag and network acknowledgement behind a non-empty queue (implemented); the
+   DDL gate, the invented-collection probe and live-read degrade (the remaining two).
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on

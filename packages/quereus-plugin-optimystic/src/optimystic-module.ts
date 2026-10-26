@@ -9,6 +9,7 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
+import type { OfflineTablePolicy } from './optimystic-adapter/offline-mode.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -523,6 +524,22 @@ function wantsNetworkWatch(tags: Readonly<Record<string, SqlValue>> | undefined)
   return tags?.[NETWORK_WATCH_TAG] === true;
 }
 
+/** The table tag that chooses which acknowledgement a transaction writing the table may get in
+ * offline mode (docs/offline-sync.md §Per-table policy): `'queue'`, the default, or `'network'`. */
+const OFFLINE_POLICY_TAG = 'optimystic.offline';
+
+/**
+ * The offline policy a table's tags choose, and whether the tag's value named one. An absent tag is
+ * `'queue'`; so is any value other than `'queue'` and `'network'`, which cannot be refused because
+ * Quereus applies a tag to its own catalog before the module hears of it, and which the vtab logs
+ * instead ({@link OptimysticVirtualTable.followSchemaTags}).
+ */
+function offlinePolicyTag(tags: Readonly<Record<string, SqlValue>> | undefined): { policy: OfflineTablePolicy; recognised: boolean } {
+  const value = tags?.[OFFLINE_POLICY_TAG];
+  if (value === 'network') return { policy: 'network', recognised: true };
+  return { policy: 'queue', recognised: value === undefined || value === 'queue' };
+}
+
 /**
  * Production-grade virtual table for Optimystic tree collections
  */
@@ -594,6 +611,14 @@ export class OptimysticVirtualTable extends VirtualTable {
   private networkWatchSteps: Promise<void> = Promise.resolve();
   /** The "tagged, but no watch service" warning was logged; it is logged once per table. */
   private networkWatchUnavailableLogged = false;
+  /**
+   * The table's `optimystic.offline` policy, taken from the declaration and kept current on every
+   * `table_modified` ({@link followSchemaTags}), and published to the offline-mode controller
+   * ({@link publishOfflinePolicy}), which the bridge asks at commit.
+   */
+  private offlinePolicy: OfflineTablePolicy;
+  /** A tag value that names no policy was logged; it is logged once per table. */
+  private unknownOfflinePolicyLogged = false;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -611,6 +636,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.tableSchema = tableSchema;
     this.declaredColumns = tableSchema.columns.length > 0;
     this.networkWatchTagged = wantsNetworkWatch(tableSchema.tags);
+    this.offlinePolicy = this.readOfflinePolicy(tableSchema.tags);
     this.options = options;
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
@@ -961,6 +987,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // registerCollections). Must happen before any DML so the coordinator
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
+      this.publishOfflinePolicy();
 
       // This is one of two paths on which doInitialize runs TWICE for a table — the
       // upgrade after a provisional pass, and a retry after a failed attempt (see
@@ -1229,7 +1256,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    * constraints folded in from the record, indexes withheld after a failed batch
    * commit) — so a re-initialize that rewrites the record from `tableSchema` writes the
    * new tags rather than the old ones. Then the network watch is started or stopped to
-   * match. Idempotent. A table not yet initialized only records the tags; its
+   * match, and the offline policy is published again — a transaction already queued keeps the
+   * acknowledgement it got. Idempotent. A table not yet initialized only records the tags; its
    * initialization opens the watch. Saving the tags to the catalog record is the
    * module's job, not this instance's: a hydrated table may have no instance at all.
    */
@@ -1237,6 +1265,31 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.tableSchema = withTagsOf(this.tableSchema, schema);
     this.networkWatchTagged = wantsNetworkWatch(this.tableSchema.tags);
     this.reconcileNetworkWatch();
+    this.offlinePolicy = this.readOfflinePolicy(this.tableSchema.tags);
+    this.publishOfflinePolicy();
+  }
+
+  /** The policy `tags` choose ({@link offlinePolicyTag}), logging once per table a value that names
+   * none. */
+  private readOfflinePolicy(tags: Readonly<Record<string, SqlValue>> | undefined): OfflineTablePolicy {
+    const { policy, recognised } = offlinePolicyTag(tags);
+    if (!recognised && !this.unknownOfflinePolicyLogged) {
+      this.unknownOfflinePolicyLogged = true;
+      log('offline:unknown-policy-tag table=%s value=%o: %s takes \'queue\' or \'network\'; read as \'queue\'',
+        this.tableName, tags?.[OFFLINE_POLICY_TAG], OFFLINE_POLICY_TAG);
+    }
+    return policy;
+  }
+
+  /** Tell the offline-mode controller this table's policy, which decides the acknowledgement of a
+   * transaction that writes it; a bridge built bare has no controller to tell. */
+  private publishOfflinePolicy(): void {
+    this.txnBridge.getOfflineMode()?.setTablePolicy(this.qualifiedTable, this.offlinePolicy);
+  }
+
+  /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */
+  withdrawOfflinePolicy(): void {
+    this.txnBridge.getOfflineMode()?.withdrawTablePolicy(this.qualifiedTable);
   }
 
   /** Queue one step bringing the network watch in line with the tags and the table's lifetime. */
@@ -4546,6 +4599,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       this.tables.delete(tableKey);
       table.teardownChangeSubscription();
       table.forgetInCommitReports();
+      table.withdrawOfflinePolicy();
       throw error;
     }
 
@@ -5562,6 +5616,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
       table.forgetInCommitReports();
+      table.withdrawOfflinePolicy();
       try {
         await this.underBatchCheckpoint(table.catalogManager, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {

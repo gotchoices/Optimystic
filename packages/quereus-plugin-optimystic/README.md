@@ -165,7 +165,7 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first two plugin stages, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first three plugin stages, and says at the end what is still missing.
 
 **A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
 
@@ -176,6 +176,7 @@ const plugin = register(db, {
     expireAfterMs: 7 * 24 * 3600_000,          // fail a transaction unsettled this long with reason 'expired'; default: no limit
     outcomeRetentionMs: 7 * 24 * 3600_000,     // how long a terminal outcome stays in outcomes() / status(); default: 7 days
     recheck: { baseMs: 1_000, maxMs: 60_000 }, // advanced: the drain's re-check timer while the cohort is unreachable
+    networkCommitTimeoutMs: 5 * 60_000,         // how long a network-acknowledged commit waits behind queued transactions; default: 5 minutes
   },
 });
 
@@ -189,6 +190,36 @@ await plugin.offline.whenDrained();  // resolves once the queue is empty; reject
 The acknowledgement a transaction gets is fixed when it **begins**: `enter()` or `exit()` during an open transaction changes nothing about it. Leaving the mode does not stop the drain. Session mode and offline mode refuse each other in either order: `enter()` throws `OfflineModeRefusedError` while `configureTransactionMode` has been called, and `configureTransactionMode` throws `SessionModeRefusedError` while the mode is entered or transactions are still queued.
 
 A commit in offline mode seals every table it wrote into one queue entry, including a table's index trees. One shape cannot be queued and is acknowledged by the network instead, logged as `offline:local-ack-unavailable`: two tables declared over one collection URI written in one transaction. Everything else that holds for an online commit holds for the queued one: a commit that wrote nothing queues nothing, and the constraint and concurrent-modification refusals arrive as the same errors, on the `failed` status instead of out of `commit`.
+
+#### Tables that are always acknowledged by the network — `optimystic.offline`
+
+Not every table should accept a local answer: a table of revoked peers, say, where a machine that has not heard of a revocation must not be told its write is safe. A table tag chooses:
+
+```sql
+create table Revocation (id integer primary key, peer text)
+  using optimystic('tree://app/revocation')
+  with tags ("optimystic.offline" = 'network');
+```
+
+| `optimystic.offline` | A transaction that writes the table |
+|---|---|
+| `'queue'` (the default) | gets the mode's acknowledgement |
+| `'network'` | gets network acknowledgement, whatever the mode |
+
+A transaction that writes any `'network'` table is acknowledged by the network as a whole, since it commits atomically; the tag never turns a network acknowledgement into a local one, and the transaction is logged as `offline:network-policy`. Any other value reads as `'queue'`, logged once per table as `offline:unknown-policy-tag`: Quereus applies a tag to its own catalog before the plugin hears of it, so a bad value cannot be refused. The tag is read from the declaration and again after every `alter table … set tags`, so a change applies to the next transaction that commits (one already queued keeps the acknowledgement it got), and it is saved in the table's catalog record, so `hydrate` restores it.
+
+#### A network-acknowledged commit waits behind the queue
+
+A commit acknowledged by the network — offline mode not entered, a `'network'` table, or the one shape that cannot be queued — takes the ordinary path while nothing is queued. While transactions are queued it was decided on a view that includes them, so it cannot commit ahead of them: it is queued behind them like any transaction, reported through `onStatus` and retained in `outcomes()` like any, and `commit` waits for it to settle.
+
+- `committed`: `commit` resolves. Its durability report reached `onCommitDurability` listeners once, through the drain.
+- `failed`: `commit` throws the status's `error`, as an online commit would have thrown it (a `ConstraintError`, a `ConcurrentModificationError`, …), and the transaction's changes are gone from this machine's view.
+- not settled within `offline.networkCommitTimeoutMs` (five minutes by default): `commit` throws `OfflineCommitTimeoutError` (`StatusCode.BUSY`, exported from both entries), carrying `transactionId`, `timeoutMs` and `sent`:
+  - `sent: false` — it was never sent, so it has been withdrawn: it fails with reason `'discarded'`, the outcome `status(transactionId)` then answers, and its rows are gone.
+  - `sent: true` — it may already be saved, so it cannot be withdrawn. It stays queued as a locally acknowledged transaction and its rows stay in this machine's view; follow it under `transactionId` with `onStatus` or `status(transactionId)`. Quereus fires no watcher for a commit that throws, so the tables it wrote are announced to the `Database`'s watchers instead.
+- `plugin.dispose()` during the wait: `commit` throws `QueueDisposedError`, and the transaction stays sealed, like every queued one.
+
+The shape that cannot be queued commits ahead of the queue instead, logged as `offline:queue-bypassed`, and when it writes a table with queued transactions it fails with `SealedSegmentsError`, rolled back cleanly; retry it after `whenDrained()`.
 
 #### Following a queued transaction — `plugin.offline.onStatus(listener)`
 
@@ -231,10 +262,8 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 
 #### Not yet in this stage
 
-- **A network-acknowledged commit does not wait behind the queue.** After `exit()`, or in a transaction begun before `enter()`, a commit that writes a table with queued transactions fails with `SealedSegmentsError` (rolled back cleanly; retry it after `whenDrained()`), and one that writes other tables commits ahead of the queue.
-- **Every table takes the mode's acknowledgement**; the per-table `optimystic.offline` tag is later.
 - **Schema changes are not refused** while a table's transactions are queued; await `whenDrained()` before DDL on such a table.
-- **Live reads while the cohort is unreachable fail as they do today.**
+- **Live reads while the cohort is unreachable fail as they do today**, for `'queue'` tables as for `'network'` ones.
 - **Nothing survives a restart.**
 
 ## Reactive Watching

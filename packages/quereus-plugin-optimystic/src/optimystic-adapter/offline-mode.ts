@@ -1,5 +1,6 @@
 import type { Database } from '@quereus/quereus';
-import { OfflineQueue } from '@optimystic/db-core';
+import { QuereusError, StatusCode } from '@quereus/quereus';
+import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError } from '@optimystic/db-core';
 import type {
 	ActionRefusedError, Collection, CollectionId, EntryId, EntryStatus, OfflineQueueOptions, OfflineQueueState, QueuedEntry,
 	TransactionDurability,
@@ -9,7 +10,8 @@ import type { OfflineConfig } from './offline-config.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { addListener, notifyListeners } from './listeners.js';
 import { announceExternalChange } from './external-change.js';
-import type { QualifiedTableName } from '../schema/table-identity.js';
+import { NetworkCommitBoundMs } from './network-commit-bound.js';
+import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('offline-mode');
@@ -39,8 +41,42 @@ export class SessionModeRefusedError extends Error {
 	}
 }
 
+/**
+ * Thrown out of a network-acknowledged commit that waited behind queued offline transactions longer
+ * than `offline.networkCommitTimeoutMs` (docs/offline-sync.md §Network acknowledgement behind a
+ * non-empty queue). {@link sent} says what became of the transaction:
+ *
+ * - `false`: it was never sent, so it has been withdrawn. It failed with reason `discarded`, its rows
+ *   are gone from this machine's view, and nothing of it is saved.
+ * - `true`: it has been sent and may already be saved, so it could not be withdrawn. It stays queued
+ *   as a locally acknowledged transaction; follow it under {@link transactionId} through
+ *   `plugin.offline.onStatus` or `plugin.offline.status(transactionId)`.
+ *
+ * Carries `StatusCode.BUSY`, as `ConcurrentModificationError` does: the commit was not refused, the
+ * network did not answer in time.
+ */
+export class OfflineCommitTimeoutError extends QuereusError {
+	constructor(readonly transactionId: string, readonly sent: boolean, readonly timeoutMs: number, cause?: Error) {
+		super(sent
+			? `transaction ${transactionId} was not acknowledged by the network within ${timeoutMs} ms; it has been sent and may already be saved, so it stays queued (follow it through plugin.offline.status)`
+			: `transaction ${transactionId} was not acknowledged by the network within ${timeoutMs} ms; it was never sent and has been withdrawn`,
+		StatusCode.BUSY, cause);
+		this.name = 'OfflineCommitTimeoutError';
+		Object.setPrototypeOf(this, OfflineCommitTimeoutError.prototype);
+	}
+}
+
+/**
+ * Which acknowledgement a transaction writing a table may get in offline mode, from the table's
+ * `optimystic.offline` tag (docs/offline-sync.md §Per-table policy): `'queue'`, the mode's (the
+ * default), or `'network'`, network acknowledgement whatever the mode.
+ */
+export type OfflineTablePolicy = 'queue' | 'network';
+
 type StatusListener = (status: QueuedTransactionStatus) => void;
 type StateListener = (state: OfflineModeState) => void;
+/** Called with a transaction's terminal outcome, or `undefined` when the controller was disposed first. */
+type SettleWaiter = (outcome: TransactionOutcome | undefined) => void;
 
 /** A retained terminal status and when it was emitted, for the retention window. */
 interface RetainedOutcome {
@@ -80,6 +116,13 @@ export class OfflineMode {
 	private readonly stateListeners = new Set<StateListener>();
 	/** Terminal statuses since they were emitted, oldest first, pruned lazily (no timer). */
 	private readonly retainedOutcomes = new Map<string, RetainedOutcome>();
+	private readonly networkCommitTimeoutMs: number;
+	/** Each table's policy, keyed by its `schema.table` rendering, as its vtab published it; a table
+	 * absent here takes `'queue'`. */
+	private readonly tablePolicies = new Map<string, OfflineTablePolicy>();
+	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
+	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
+	private disposed = false;
 
 	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: OfflineConfig = {}) {
 		const options: OfflineQueueOptions = {};
@@ -87,6 +130,7 @@ export class OfflineMode {
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
 		this.queue = new OfflineQueue(options);
 		this.outcomeRetentionMs = config.outcomeRetentionMs ?? DEFAULT_OUTCOME_RETENTION_MS;
+		this.networkCommitTimeoutMs = config.networkCommitTimeoutMs ?? NetworkCommitBoundMs;
 		this.lastQueueState = this.queue.queueState();
 		this.queue.onStatus(status => this.onQueueStatus(status));
 		this.queue.onQueueState(state => {
@@ -139,9 +183,39 @@ export class OfflineMode {
 		return this.queue.whenDrained();
 	}
 
-	/** Stop draining (`OfflineQueue.dispose`): entries left queued stay sealed in their collections. */
-	dispose(): Promise<void> {
-		return this.queue.dispose();
+	/**
+	 * Stop draining (`OfflineQueue.dispose`): entries left queued stay sealed in their collections. A
+	 * network-acknowledged commit still waiting behind the queue then throws `QueueDisposedError`
+	 * ({@link awaitNetworkAcknowledgement}); one whose submission was in flight and committed during
+	 * the disposal is answered with that outcome instead. Idempotent.
+	 */
+	async dispose(): Promise<void> {
+		await this.queue.dispose();
+		this.disposed = true;
+		for (const waiters of this.settleWaiters.values()) {
+			for (const waiter of waiters) waiter(undefined);
+		}
+		this.settleWaiters.clear();
+	}
+
+	/**
+	 * Record `table`'s policy, read from its `optimystic.offline` tag by its vtab at initialization and
+	 * again on every tag change. The bridge reads it when a transaction writing the table commits
+	 * ({@link tablePolicy}); a transaction already queued keeps the acknowledgement it got.
+	 */
+	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy): void {
+		this.tablePolicies.set(qualifiedTableName(table), policy);
+	}
+
+	/** Forget `table`'s policy: it was dropped, or its CREATE was refused. */
+	withdrawTablePolicy(table: QualifiedTableName): void {
+		this.tablePolicies.delete(qualifiedTableName(table));
+	}
+
+	/** The policy of the table named `schema.table` ({@link qualifiedTableName}); `'queue'` for a table
+	 * no vtab published one for. */
+	tablePolicy(name: string): OfflineTablePolicy {
+		return this.tablePolicies.get(name) ?? 'queue';
 	}
 
 	/**
@@ -195,6 +269,93 @@ export class OfflineMode {
 		this.queue.discard(transactionId);
 	}
 
+	/**
+	 * Wait for a network-acknowledged transaction the bridge has just queued behind earlier ones to
+	 * settle (docs/offline-sync.md §Network acknowledgement behind a non-empty queue), at most
+	 * `networkCommitTimeoutMs`. Its statuses are reported like any queued transaction's, and a
+	 * `committed` one reaches `onCommitDurability` listeners through the drain's report.
+	 *
+	 * @returns the transaction's terminal outcome.
+	 * @throws OfflineCommitTimeoutError once the bound has passed: `sent: false` after the transaction
+	 * has been withdrawn (it failed with reason `discarded`, and its rows are gone), `sent: true` when it
+	 * may already be saved and stays queued.
+	 * @throws QueueDisposedError when {@link dispose} ran before it settled; it stays sealed, as every
+	 * queued transaction does.
+	 */
+	async awaitNetworkAcknowledgement(transactionId: string): Promise<TransactionOutcome> {
+		const settled = this.whenSettled(transactionId);
+		const answer = await this.settledWithin(settled, this.networkCommitTimeoutMs);
+		const outcome = answer === 'timed-out' ? await this.networkCommitTimedOut(transactionId, settled) : answer;
+		if (outcome === undefined) throw new QueueDisposedError();
+		return outcome;
+	}
+
+	/**
+	 * The bound passed with `transactionId` unsettled: withdraw it when it was never sent, and throw
+	 * saying which it was. Answers instead only when the transaction left the queue as the clock ran
+	 * out (its removal still dropping its segments): its outcome, or `undefined` for a disposal.
+	 */
+	private async networkCommitTimedOut(transactionId: string, settled: Promise<TransactionOutcome | undefined>): Promise<TransactionOutcome | undefined> {
+		const collections = this.queue.entries().find(entry => entry.id === transactionId)?.collections ?? [];
+		try {
+			this.queue.discard(transactionId);
+		} catch (error) {
+			if (error instanceof UnknownEntryError) return settled;
+			if (!(error instanceof EntryNotDiscardableError)) throw error;
+			log('offline:network-commit-timeout transaction=%s sent=true because=%s timeoutMs=%d: it stays queued',
+				transactionId, error.because, this.networkCommitTimeoutMs);
+			// The commit throws, so Quereus fires no watcher for the rows this machine now shows.
+			this.announceChanged(transactionId, collections);
+			throw new OfflineCommitTimeoutError(transactionId, true, this.networkCommitTimeoutMs, error);
+		}
+		log('offline:network-commit-timeout transaction=%s sent=false timeoutMs=%d: withdrawn', transactionId, this.networkCommitTimeoutMs);
+		// Its `failed` status arrives once the drops that take its rows out of this machine's view are done.
+		if (await settled === undefined) return undefined;
+		throw new OfflineCommitTimeoutError(transactionId, false, this.networkCommitTimeoutMs);
+	}
+
+	/** What `settled` answers, or `'timed-out'` once `ms` have passed first. */
+	private async settledWithin(settled: Promise<TransactionOutcome | undefined>, ms: number): Promise<TransactionOutcome | undefined | 'timed-out'> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const expired = new Promise<'timed-out'>(resolve => { timer = setTimeout(() => resolve('timed-out'), ms); });
+		try {
+			return await Promise.race([settled, expired]);
+		} finally {
+			clearTimeout(timer);
+		}
+	}
+
+	/**
+	 * Resolves with `transactionId`'s terminal outcome once the queue settles it — from the translation
+	 * that reports it to {@link onStatus} listeners, after them — or with `undefined` when
+	 * {@link dispose} runs first. A transaction already settled answers its retained outcome. Never
+	 * rejects, so a waiter that stops listening leaves nothing unhandled.
+	 * @throws UnknownEntryError for an id neither queued nor retained.
+	 */
+	private whenSettled(transactionId: string): Promise<TransactionOutcome | undefined> {
+		if (this.queue.status(transactionId) === undefined) {
+			const retained = this.status(transactionId);
+			if (retained?.kind === 'committed' || retained?.kind === 'failed') return Promise.resolve(retained);
+			throw new UnknownEntryError(transactionId);
+		}
+		if (this.disposed) return Promise.resolve(undefined);
+		return new Promise(resolve => {
+			const waiters = this.settleWaiters.get(transactionId);
+			if (waiters === undefined) {
+				this.settleWaiters.set(transactionId, [resolve]);
+			} else {
+				waiters.push(resolve);
+			}
+		});
+	}
+
+	private settle(outcome: TransactionOutcome): void {
+		const waiters = this.settleWaiters.get(outcome.transactionId);
+		if (waiters === undefined) return;
+		this.settleWaiters.delete(outcome.transactionId);
+		for (const waiter of waiters) waiter(outcome);
+	}
+
 	/** The terminal outcomes retained since they were emitted and not yet acknowledged, oldest first. */
 	outcomes(): TransactionOutcome[] {
 		this.pruneOutcomes();
@@ -213,16 +374,19 @@ export class OfflineMode {
 		if (translated.kind === 'committed' || translated.kind === 'failed') this.retain(translated);
 		notifyListeners(this.statusListeners, translated,
 			error => log('offline:status-listener-threw transaction=%s kind=%s: %o', translated.transactionId, translated.kind, error));
-		if (status.kind === 'failed') this.announceRemoval(status.entryId, status.changedCollections);
+		if (status.kind === 'failed') this.announceChanged(status.entryId, status.changedCollections);
+		if (translated.kind === 'committed' || translated.kind === 'failed') this.settle(translated);
 	}
 
 	/**
-	 * Tell the `Database`'s watchers about each table whose rows the removal of `transactionId` took
-	 * out of this machine's view: the tables behind the collections it still held a segment in, each
-	 * once per removal. A cascade announces again for every entry it fails, which costs a watcher one
-	 * re-query each. Fire-and-forget, never thrown into the drain.
+	 * Tell the `Database`'s watchers about each table behind `changedCollections`, whose rows changed
+	 * in this machine's view with no Quereus commit saying so: the removal of `transactionId` took them
+	 * out (the collections it still held a segment in), or a network-acknowledged commit that timed
+	 * out after it was sent left them in while throwing. Each table once per call; a cascade announces
+	 * again for every entry it fails, which costs a watcher one re-query each. Fire-and-forget, never
+	 * thrown into the drain or the commit.
 	 */
-	private announceRemoval(transactionId: string, changedCollections: readonly CollectionId[]): void {
+	private announceChanged(transactionId: string, changedCollections: readonly CollectionId[]): void {
 		for (const [name, table] of this.tablesBehind(changedCollections)) {
 			announceExternalChange(this.db, table,
 				error => log('offline:announce-failed transaction=%s table=%s: %o', transactionId, name, error));

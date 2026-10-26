@@ -14,10 +14,10 @@
 
 import { expect } from 'chai';
 import type { Database, SqlValue, WatchEvent } from '@quereus/quereus';
-import { Log, type IRepo, type LogEntry } from '@optimystic/db-core';
+import { Log, type LogEntry } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import type { QueuedTransactionStatus } from '../dist/index.js';
-import { CommitGate } from './commit-gate.js';
+import { CommitGate, parkingPends } from './commit-gate.js';
 import { countTreeEntries, createMeshDbNode, openFreshTree, startMockMesh, type MeshDbNode, type Plugin } from './mesh-node-harness.js';
 import { expectConcurrentModificationRefusal, expectConstraintRefusal, queryAll } from './query-helpers.js';
 
@@ -36,23 +36,6 @@ interface TwoNodes {
 	parkPends(): CommitGate;
 	/** Every status node A's plugin reported, in order. */
 	statuses: QueuedTransactionStatus[];
-}
-
-/** `repo` with its pends held at the gate `gateFor()` names, if any. */
-function parkingPends(repo: IRepo, gateFor: () => CommitGate | undefined): IRepo {
-	const held = async (): Promise<void> => {
-		await gateFor()?.pass();
-	};
-	const pendMany = repo.pendMany?.bind(repo);
-	const commitMany = repo.commitMany?.bind(repo);
-	return {
-		get: (blockGets, options) => repo.get(blockGets, options),
-		pend: async (request, options) => { await held(); return repo.pend(request, options); },
-		cancel: (actionRef, options) => repo.cancel(actionRef, options),
-		commit: (request, options) => repo.commit(request, options),
-		...(pendMany ? { pendMany: async (...args: Parameters<typeof pendMany>) => { await held(); return pendMany(...args); } } : {}),
-		...(commitMany ? { commitMany } : {}),
-	};
 }
 
 /** Both nodes with `Notes` declared and node A's statuses recorded; no gate is armed yet. */

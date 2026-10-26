@@ -15,6 +15,8 @@ import { DurabilityFollower } from './durability-follower.js';
 import { addListener, notifyListeners } from './listeners.js';
 import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
+import type { TransactionOutcome } from './offline-status.js';
+import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger, revisionToken } from '../logger.js';
@@ -109,6 +111,10 @@ export interface DirtyTree {
  * lists so both name the same tree the same way.
  */
 const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() ?? `tree#${index}`;
+
+/** Whether a dirty tree has anything to push. A tree without `hasUnsyncedChanges` counts as staged:
+ * a flush of a clean tree is a safe no-op, whereas wrongly leaving a staged one out would drop DML. */
+const isStaged = (tree: DirtyTree): boolean => tree.hasUnsyncedChanges?.() !== false;
 
 /** What a commit wrote, from the per-collection answers gathered so far: `undefined` when none
  * was gathered — nothing was written, or no tree that wrote could say (a test double). */
@@ -268,22 +274,19 @@ interface MappedRefusal {
  */
 const LegacyCommitEngineId = 'legacy';
 
-/**
- * Time-to-live of a legacy multi-tree commit's transaction stamp. Members never see the
- * stamp (an unvalidated pend carries no transaction), so this expiry is only the
- * coordinator's own ceiling, checked before each attempt. Set well above the default retry
- * budget (about 21 s of backoff across 10 attempts, plus round trips) so that the budget,
- * not the clock, ends a contended commit — the single-tree `Collection.sync` path has no
- * clock at all.
- */
-const LegacyCommitTtlMs = 5 * 60_000;
-
 /** The collections a multi-tree legacy commit pends as one batch, on the one transactor
  * they all share. See {@link TransactionBridge.legacyBatch}. */
 interface LegacyBatch {
   collections: readonly Collection<any>[];
   transactor: ITransactor;
 }
+
+/** How the offline queue takes one non-session commit; see {@link TransactionBridge.offlineRoute}. */
+type OfflineRoute =
+  /** Locally acknowledged: sealed into one queue entry, and the commit resolves once it is queued. */
+  | { readonly kind: 'local'; readonly collections: readonly Collection<any>[] }
+  /** Network-acknowledged behind queued transactions: queued, and the commit waits for it to settle. */
+  | { readonly kind: 'behind-queue'; readonly collections: readonly Collection<any>[] };
 
 /**
  * Transaction bridge between Quereus and Optimystic.
@@ -485,9 +488,10 @@ export class TransactionBridge {
   private schemaHashProvider: (() => Promise<string>) | null = null;
   /**
    * The offline-mode controller of the `Database` this bridge serves ({@link attachOfflineMode}):
-   * read when a transaction begins, to fix its acknowledgement, and handed the dirty trees of a
-   * locally acknowledged commit to seal ({@link sealForLocalAcknowledgement}). Absent for a bridge
-   * built bare (tests); every transaction is then network-acknowledged.
+   * read when a transaction begins, to fix its acknowledgement, and at commit for the tables' offline
+   * policies and whether transactions are queued ({@link offlineRoute}); handed the collections of a
+   * commit the queue takes ({@link sealIntoQueue}). Absent for a bridge built bare (tests); every
+   * transaction is then network-acknowledged and takes legacy direct sync.
    */
   private offline: OfflineMode | undefined;
 
@@ -503,6 +507,12 @@ export class TransactionBridge {
   attachOfflineMode(offline: OfflineMode): void {
     if (this.offline !== undefined) throw new Error('an offline-mode controller is already attached to this bridge');
     this.offline = offline;
+  }
+
+  /** The attached offline-mode controller, which a table publishes its `optimystic.offline` policy
+   * to; `undefined` for a bridge built bare. */
+  getOfflineMode(): OfflineMode | undefined {
+    return this.offline;
   }
 
   /**
@@ -553,10 +563,11 @@ export class TransactionBridge {
     if (this.offline?.isEntered()) throw new SessionModeRefusedError('offline-mode');
     if (this.offline?.hasQueuedEntries()) throw new SessionModeRefusedError('queued-entries');
     // NOTE: a transaction begun 'local' and still open passes both checks (enter, begin, exit,
-    // configure): its commit then queues an entry, behind which the session transactions that
-    // follow meet SealedSegmentsError, the refusal README § Offline mode documents for a network
-    // commit over queued tables. Only a host that configures session mode mid-transaction meets
-    // it; if one does, refuse here while the open transaction's acknowledgement is 'local'.
+    // configure): its commit then queues an entry, and the session transactions that follow,
+    // which never wait behind the queue (offlineRoute is not consulted in session mode), meet
+    // SealedSegmentsError over its tables until it drains. Only a host that configures session mode
+    // mid-transaction meets it; if one does, refuse here while the open transaction's
+    // acknowledgement is 'local'.
     this.coordinator = coordinator;
     this.engine = engine;
     this.schemaHashProvider = schemaHashProvider;
@@ -876,25 +887,26 @@ export class TransactionBridge {
    * Commit the current transaction.
    *
    * If transaction mode is enabled, commits through TransactionSession for distributed consensus.
-   * A transaction that began with local acknowledgement (offline mode, `TransactionState.acknowledgement`)
-   * is sealed into the offline queue instead of reaching storage ({@link sealForLocalAcknowledgement}).
-   * Otherwise, uses legacy direct sync.
+   * Otherwise the offline queue may take it ({@link offlineRoute}): a transaction that began with
+   * local acknowledgement (offline mode, `TransactionState.acknowledgement`) is sealed into the queue
+   * instead of reaching storage, and a network-acknowledged one made while transactions are queued is
+   * queued behind them and waited for ({@link awaitQueuedCommit}). Everything else uses legacy direct
+   * sync.
    */
   async commitTransaction(): Promise<void> {
     if (!this.currentTransaction?.isActive) {
       throw new Error('No active transaction to commit');
     }
     const transactionId = this.currentTransaction.stampId;
+    const route = this.session ? undefined : this.offlineRoute();
 
     let durability: TransactionDurability | undefined;
-    // A local acknowledgement reaches no storage, so it reconciles nothing: the degraded latch is
-    // left as it was rather than released (see degradedReason).
-    let reconciled = true;
+    let queued = false;
     try {
       if (this.session) {
         durability = await this.commitSession(this.session);
-      } else if (this.currentTransaction.acknowledgement === 'local' && this.sealForLocalAcknowledgement(transactionId)) {
-        reconciled = false;
+      } else if (route !== undefined) {
+        queued = this.sealIntoQueue(route.collections, transactionId);
       } else {
         // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
@@ -914,131 +926,229 @@ export class TransactionBridge {
         // docs/transactions.md (§ "Legacy (single-node) commit").
         durability = await this.commitDirtyTreesLegacy();
       }
-
-      this.currentTransaction.isActive = false;
-      this.accumulatedStatements = [];
-      this.session = null;
-      this.dirtyTrees.clear();
-      this.savepoints.clear();
-      // A clean commit reconciles the local view — release the degraded latch so
-      // committed reads answer again (see degradedReason).
-      if (reconciled) this.degradedReason = null;
-
     } catch (error) {
-      if (error instanceof PartialCommitError) {
-        // The legacy fallback sweep already cleaned up: it restored the trees that
-        // never touched storage and left the durably-committed trees alone (their
-        // in-memory state correctly mirrors storage). Running rollbackTransaction
-        // here would restore the committed trees too, re-introducing exactly the
-        // memory/storage divergence this error exists to prevent. Latch the
-        // degraded state (committed reads must refuse until the next clean
-        // commit/rollback) and propagate.
-        this.degradedReason = error.message;
-        throw error;
-      }
-      if (error instanceof CoordinatorPartialCommitError) {
-        // A pended batch's commit half-landed — in session mode, or a legacy
-        // multi-tree commit (commitBatchLegacy): some collections durably committed
-        // via consensus and CANNOT be rolled back. The coordinator ALREADY did the
-        // split local handling (folded the committed collections' trackers to cache
-        // + reset, restored the failed ones to their pre-append state; the legacy
-        // path then restored those failed trees to their pre-transaction snapshots,
-        // as the fallback sweep does). Running rollbackTransaction here would
-        // clean-restore the committed collections' trackers too, cementing the
-        // memory/storage divergence and falsely reporting a rollback that did not
-        // happen. So latch the degraded state (committed reads must refuse until the
-        // next clean commit/rollback), tear down transaction state WITHOUT
-        // restoring, and propagate the structured signal for reconciliation.
-        this.degradedReason = error.message;
-        this.currentTransaction!.collections.clear();
-        this.currentTransaction!.isActive = false;
-        this.accumulatedStatements = [];
-        this.session = null;
-        this.dirtyTrees.clear();
-        this.savepoints.clear();
-        throw error;
-      }
-      // Nothing durably committed (a clean session-mode commit failure, or a legacy
-      // failure on the FIRST tree): a clean snapshot-restore rollback is correct.
-      // A concurrency-refused duplicate key (TreeKeyTakenError anywhere in the cause
-      // chain — session mode surfaces it raw out of the coordinator's inter-attempt
-      // refresh; the legacy sweep has already mapped it, which mapCommitRefusal
-      // detects and passes through) is rewrapped as the ordinary UNIQUE-constraint
-      // error so the loser sees the same refusal a sequential duplicate produces.
-      // The commit's failure is the answer; a restore that fails inside this rollback has
-      // already been logged and latched by rollbackTransaction (which tears the transaction
-      // down either way), and must not replace it.
-      try {
-        await this.rollbackTransaction();
-      } catch (rollbackError) {
-        log('commit:rollback-failed error=%s', rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
-      }
-      throw this.mapCommitRefusal(error);
+      throw await this.afterFailedCommit(error);
     }
+
+    if (route?.kind === 'behind-queue' && queued) {
+      await this.awaitQueuedCommit(this.offline!, transactionId);
+      return;
+    }
+    this.endTransaction();
+    // A clean commit reconciles the local view — release the degraded latch so committed reads
+    // answer again (see degradedReason). A local acknowledgement reaches no storage, so it reconciles
+    // nothing: the latch is left as it was.
+    if (route?.kind !== 'local') this.degradedReason = null;
     if (durability !== undefined) this.reportCommitDurability(transactionId, durability);
   }
 
   /**
-   * The offline route of a commit whose transaction began with local acknowledgement: seal every
-   * staged dirty tree's open segment into one queue entry under the transaction's id, so the commit
-   * resolves once the entry is queued and the drain commits it later under that same id
-   * (docs/offline-sync.md §Entry lifecycle). The `queued` status is delivered synchronously inside
-   * the enqueue, before this commit returns. Answers `false`, sealing nothing, when the dirty set
-   * cannot be one entry ({@link localAcknowledgementSet}): the caller then takes the network route
-   * for this transaction. `true` otherwise, including when nothing was staged — nothing is queued
-   * and nothing is reported then, as a commit that wrote nothing reports nothing.
+   * After a commit route threw: clean up by what the failure left durable, and answer the error the
+   * commit throws.
    */
-  private sealForLocalAcknowledgement(transactionId: string): boolean {
+  private async afterFailedCommit(error: unknown): Promise<unknown> {
+    if (error instanceof PartialCommitError) {
+      // The legacy fallback sweep already cleaned up: it restored the trees that
+      // never touched storage and left the durably-committed trees alone (their
+      // in-memory state correctly mirrors storage). Running rollbackTransaction
+      // here would restore the committed trees too, re-introducing exactly the
+      // memory/storage divergence this error exists to prevent. Latch the
+      // degraded state (committed reads must refuse until the next clean
+      // commit/rollback) and propagate.
+      this.degradedReason = error.message;
+      return error;
+    }
+    if (error instanceof CoordinatorPartialCommitError) {
+      // A pended batch's commit half-landed — in session mode, or a legacy
+      // multi-tree commit (commitBatchLegacy): some collections durably committed
+      // via consensus and CANNOT be rolled back. The coordinator ALREADY did the
+      // split local handling (folded the committed collections' trackers to cache
+      // + reset, restored the failed ones to their pre-append state; the legacy
+      // path then restored those failed trees to their pre-transaction snapshots,
+      // as the fallback sweep does). Running rollbackTransaction here would
+      // clean-restore the committed collections' trackers too, cementing the
+      // memory/storage divergence and falsely reporting a rollback that did not
+      // happen. So latch the degraded state (committed reads must refuse until the
+      // next clean commit/rollback), tear down transaction state WITHOUT
+      // restoring, and propagate the structured signal for reconciliation.
+      this.degradedReason = error.message;
+      this.endTransaction();
+      return error;
+    }
+    // Nothing durably committed (a clean session-mode commit failure, a legacy
+    // failure on the FIRST tree, or a queue that refused the entry): a clean
+    // snapshot-restore rollback is correct.
+    // A concurrency-refused duplicate key (TreeKeyTakenError anywhere in the cause
+    // chain — session mode surfaces it raw out of the coordinator's inter-attempt
+    // refresh; the legacy sweep has already mapped it, which mapCommitRefusal
+    // detects and passes through) is rewrapped as the ordinary UNIQUE-constraint
+    // error so the loser sees the same refusal a sequential duplicate produces.
+    // The commit's failure is the answer; a restore that fails inside this rollback has
+    // already been logged and latched by rollbackTransaction (which tears the transaction
+    // down either way), and must not replace it.
+    try {
+      await this.rollbackTransaction();
+    } catch (rollbackError) {
+      log('commit:rollback-failed error=%s', rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
+    }
+    return this.mapCommitRefusal(error);
+  }
+
+  /**
+   * End the current transaction without restoring anything: forget its dirty trees and their
+   * snapshots, its savepoints, statements and session. Every commit route ends here, the failed ones
+   * that must not restore included; {@link rollbackTransaction} restores first and then does the same.
+   */
+  private endTransaction(): void {
+    this.currentTransaction!.collections.clear();
+    this.currentTransaction!.isActive = false;
+    this.accumulatedStatements = [];
+    this.session = null;
+    this.dirtyTrees.clear();
+    this.savepoints.clear();
+  }
+
+  /**
+   * Whether the offline queue takes this commit, and how; `undefined` sends it down legacy direct
+   * sync ({@link commitDirtyTreesLegacy}), which is every commit while offline mode is not entered and
+   * nothing is queued.
+   *
+   * - **`local`**: the transaction began in offline mode and writes no table whose
+   *   `optimystic.offline` tag is `'network'` ({@link networkPolicyTable}). One such table makes the
+   *   whole transaction network-acknowledged, since it commits atomically; the policy only ever
+   *   demotes local acknowledgement to network.
+   * - **`behind-queue`**: a network-acknowledged transaction made while transactions are queued, or
+   *   while a collection it writes still holds a sealed segment (a failed transaction's removal still
+   *   dropping it). It was decided on a view that includes them, so it cannot commit ahead of them
+   *   (docs/offline-sync.md §Network acknowledgement behind a non-empty queue).
+   *
+   * Both need a dirty set that can be one queue entry ({@link queueableSet}). One that cannot takes
+   * legacy direct sync: a locally acknowledged transaction is then acknowledged by the network
+   * (`offline:local-ack-unavailable`), and a network-acknowledged one commits ahead of the queue
+   * (`offline:queue-bypassed`), refused with `SealedSegmentsError` when it writes a collection that
+   * holds queued transactions.
+   */
+  private offlineRoute(): OfflineRoute | undefined {
     const offline = this.offline;
-    if (offline === undefined) return false;
-    const trees = [...this.dirtyTrees.keys()];
-    const collections = this.localAcknowledgementSet(trees);
-    if (collections === undefined) return false;
+    if (offline === undefined) {
+      return undefined;
+    }
+    const trees = [...this.dirtyTrees.keys()].filter(isStaged);
+    const local = this.currentTransaction!.acknowledgement === 'local';
+    const behindQueue = offline.hasQueuedEntries()
+      || trees.some(tree => (tree.getCollection?.()?.sealedEntries().length ?? 0) > 0);
+    if (!local && !behindQueue) {
+      return undefined;
+    }
+    const set = this.queueableSet(trees);
+    if ('unqueueable' in set) {
+      if (local) {
+        log('offline:local-ack-unavailable reason=%s: this transaction is acknowledged by the network', set.unqueueable);
+      }
+      if (behindQueue) {
+        log('offline:queue-bypassed reason=%s: this network-acknowledged transaction commits ahead of the queued ones', set.unqueueable);
+      }
+      return undefined;
+    }
+    if (local) {
+      const networkTable = this.networkPolicyTable(offline, set.collections);
+      if (networkTable === undefined) {
+        return { kind: 'local', collections: set.collections };
+      }
+      log('offline:network-policy table=%s: this transaction is acknowledged by the network', networkTable);
+    }
+    return behindQueue ? { kind: 'behind-queue', collections: set.collections } : undefined;
+  }
+
+  /**
+   * The collections of `trees` (the staged dirty trees) as one queue entry, or why they cannot be:
+   * a tree with no collection to seal, collections on different transactor instances (an entry is one
+   * network transaction on one transactor), or two trees that are separate instances over one
+   * collection id, whose two segments under one entry id the per-entry coordinator's id-keyed map
+   * would collapse — the reason {@link legacyBatch} refuses to batch them too. The shape is
+   * {@link legacyBatch}'s with the single-tree case allowed: the queue commits one collection through
+   * `Collection.commitHead`.
+   */
+  private queueableSet(trees: readonly DirtyTree[]): { collections: Collection<any>[] } | { unqueueable: string } {
+    const collections: Collection<any>[] = [];
+    for (const [index, tree] of trees.entries()) {
+      const collection = tree.getCollection?.();
+      if (collection === undefined) {
+        return { unqueueable: `${treeLabel(tree, index)} has no collection to seal` };
+      }
+      collections.push(collection);
+    }
+    const transactor = collections[0]?.transactor;
+    if (collections.some(collection => collection.transactor !== transactor)) {
+      return { unqueueable: 'the collections sit on different transactors' };
+    }
+    if (new Set(collections.map(collection => collection.id)).size !== collections.length) {
+      return { unqueueable: 'two trees are separate instances over one collection id' };
+    }
+    return { collections };
+  }
+
+  /** The first table behind `collections` whose offline policy is `'network'`, by its `schema.table`
+   * rendering, or `undefined` when there is none. A collection backs every table declared over it,
+   * so writing it writes each of them. */
+  private networkPolicyTable(offline: OfflineMode, collections: readonly Collection<any>[]): string | undefined {
+    for (const collection of collections) {
+      for (const name of this.collectionTables.get(collection.id)?.keys() ?? []) {
+        if (offline.tablePolicy(name) === 'network') {
+          return name;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Seal every collection's open segment into one queue entry under the transaction's id
+   * (docs/offline-sync.md §Entry lifecycle), which the drain commits later under that same id. The
+   * `queued` status is delivered synchronously inside the enqueue, before this commit returns.
+   * Answers whether an entry was queued: `false` when nothing was staged, which queues nothing and
+   * reports nothing, as a commit that wrote nothing reports nothing.
+   */
+  private sealIntoQueue(collections: readonly Collection<any>[], transactionId: string): boolean {
     if (log.enabled) {
-      this.logCommitCollections('offline', trees.map((tree, i) => ({
+      this.logCommitCollections('offline', [...this.dirtyTrees.keys()].map((tree, i) => ({
         id: treeLabel(tree, i),
         staged: tree.hasUnsyncedChanges?.(),
         rev: treeRevision(tree),
         action: treeActionId(tree),
       })));
     }
-    offline.enqueue(collections, transactionId);
-    return true;
+    return this.offline!.enqueue(collections, transactionId) !== undefined;
   }
 
   /**
-   * The collections one locally acknowledged commit seals: every staged dirty tree's, or `undefined`
-   * when the set cannot be one entry. The shape is {@link legacyBatch}'s, with the single-tree case
-   * allowed (the queue commits one collection through `Collection.commitHead`): a tree with no
-   * collection to seal, collections on different transactor instances (an entry is one network
-   * transaction on one transactor), or two trees that are separate instances over one collection id,
-   * whose two segments under one entry id the per-entry coordinator's id-keyed map would collapse —
-   * the reason the sweep refuses to batch them too. A refused set is logged
-   * `offline:local-ack-unavailable` with its reason.
+   * The rest of a network-acknowledged commit queued behind earlier transactions: wait for it to
+   * settle ({@link OfflineMode.awaitNetworkAcknowledgement}), then end the transaction without
+   * restoring anything, whatever the answer — the transaction's staged state is the entry's now.
+   *
+   * - **committed**: the commit resolves. The drain already reported its durability to every
+   *   `onCommitDurability` listener and delivered its statuses, so nothing is reported here.
+   * - **failed**: throws the status's error, mapped as an online commit's would be. The queue has
+   *   already dropped the entry's segments and replayed what remains, so a snapshot restore would put
+   *   back a view the drop already reconciled. The degraded latch is set when part of the
+   *   transaction committed first, and released otherwise, as a clean rollback releases it.
+   * - **no answer** (`OfflineCommitTimeoutError`, `QueueDisposedError`): throws it, the latch as it
+   *   was. A transaction withdrawn on the timeout has already been dropped; one that stays queued is
+   *   a local acknowledgement.
    */
-  private localAcknowledgementSet(trees: readonly DirtyTree[]): Collection<any>[] | undefined {
-    const staged = trees.filter(tree => tree.hasUnsyncedChanges?.() !== false);
-    const collections: Collection<any>[] = [];
-    for (const [index, tree] of staged.entries()) {
-      const collection = tree.getCollection?.();
-      if (collection === undefined) {
-        return this.localAcknowledgementUnavailable(`${treeLabel(tree, index)} has no collection to seal`);
-      }
-      collections.push(collection);
+  private async awaitQueuedCommit(offline: OfflineMode, transactionId: string): Promise<void> {
+    let outcome: TransactionOutcome;
+    try {
+      outcome = await offline.awaitNetworkAcknowledgement(transactionId);
+    } finally {
+      this.endTransaction();
     }
-    const transactor = collections[0]?.transactor;
-    if (collections.some(collection => collection.transactor !== transactor)) {
-      return this.localAcknowledgementUnavailable('the collections sit on different transactors');
+    if (outcome.kind === 'committed') {
+      this.degradedReason = null;
+      return;
     }
-    if (new Set(collections.map(collection => collection.id)).size !== collections.length) {
-      return this.localAcknowledgementUnavailable('two trees are separate instances over one collection id');
-    }
-    return collections;
-  }
-
-  private localAcknowledgementUnavailable(reason: string): undefined {
-    log('offline:local-ack-unavailable reason=%s: this transaction is acknowledged by the network', reason);
-    return undefined;
+    this.degradedReason = outcome.committedTables === undefined ? null : outcome.error.message;
+    throw outcome.error;
   }
 
   /**
@@ -1257,8 +1367,7 @@ export class TransactionBridge {
    * - two trees are separate instances over one collection id (two tables declared over
    *   the same URI in one Database), which one id-keyed batch cannot hold.
    *
-   * A tree without `hasUnsyncedChanges` counts as staged: the sweep's `sync()` is a
-   * safe no-op for a clean tree, whereas wrongly leaving a staged one out would drop DML.
+   * A tree without `hasUnsyncedChanges` counts as staged ({@link isStaged}).
    *
    * NOTE: tables declared on different transactors in one SQL transaction cannot share a
    * pend batch — each transactor is its own storage, with no consensus spanning them — so
@@ -1266,7 +1375,7 @@ export class TransactionBridge {
    * today; if one ever does, it needs one batch per transactor, committed in turn.
    */
   private legacyBatch(trees: readonly DirtyTree[]): LegacyBatch | undefined {
-    const staged = trees.filter(tree => tree.hasUnsyncedChanges?.() !== false);
+    const staged = trees.filter(isStaged);
     if (staged.length < 2) {
       return undefined;
     }
@@ -1351,10 +1460,11 @@ export class TransactionBridge {
    * reads (the single-tree sync never did either), so the coordinator uses it for three
    * things only: the action id every participant's log entry carries (`id`), the expiry it
    * checks before each attempt (`stamp.expiration`), and its one-open-stamp check
-   * (`stamp.id`). No member ever sees it — the pend carries no validation payload.
+   * (`stamp.id`). No member ever sees it — the pend carries no validation payload — so its
+   * expiry ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
    */
   private async legacyTransaction(): Promise<Transaction> {
-    const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, LegacyCommitTtlMs);
+    const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, NetworkCommitBoundMs);
     return { stamp, statements: [], reads: [], id: await createTransactionId(stamp.id, [], []) };
   }
 
@@ -1483,14 +1593,9 @@ export class TransactionBridge {
         const persisted = synced.map(label);
         const unpersisted = unsynced.map(label);
 
-        // Tear down transaction state to mirror rollbackTransaction's non-restore
-        // cleanup — WITHOUT restoring the persisted trees (that is the whole point).
-        this.dirtyTrees.clear();
-        this.savepoints.clear();
-        this.currentTransaction!.collections.clear();
-        this.currentTransaction!.isActive = false;
-        this.accumulatedStatements = [];
-        this.session = null;
+        // Tear down transaction state WITHOUT restoring the persisted trees (that is the
+        // whole point).
+        this.endTransaction();
 
         throw new PartialCommitError(persisted, unpersisted, error, writtenDurability(written));
       }

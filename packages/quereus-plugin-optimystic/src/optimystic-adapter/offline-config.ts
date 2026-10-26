@@ -11,9 +11,13 @@ export interface OfflineConfig {
 	/** The drain's re-check timer while the cohort is unreachable or after a transient failure
 	 * (`OfflineQueueOptions.recheck`): exponential from `baseMs` to `maxMs`. Advanced; tests shorten it. */
 	recheck?: { baseMs?: number; maxMs?: number };
+	/** How long a network-acknowledged commit made while transactions are queued waits behind them
+	 * before throwing `OfflineCommitTimeoutError` (docs/offline-sync.md §Network acknowledgement behind
+	 * a non-empty queue). Default `NetworkCommitBoundMs`, five minutes. */
+	networkCommitTimeoutMs?: number;
 }
 
-const offlineKeys: ReadonlySet<string> = new Set(['expireAfterMs', 'outcomeRetentionMs', 'recheck']);
+const offlineKeys: ReadonlySet<string> = new Set(['expireAfterMs', 'outcomeRetentionMs', 'recheck', 'networkCommitTimeoutMs']);
 const recheckKeys: ReadonlySet<string> = new Set(['baseMs', 'maxMs']);
 
 /**
@@ -30,6 +34,8 @@ export function parseOfflineConfig(declared: unknown): OfflineConfig {
 	if (expireAfterMs !== undefined) config.expireAfterMs = expireAfterMs;
 	const outcomeRetentionMs = positiveMs(offline.outcomeRetentionMs, 'offline.outcomeRetentionMs');
 	if (outcomeRetentionMs !== undefined) config.outcomeRetentionMs = outcomeRetentionMs;
+	const networkCommitTimeoutMs = positiveMs(offline.networkCommitTimeoutMs, 'offline.networkCommitTimeoutMs');
+	if (networkCommitTimeoutMs !== undefined) config.networkCommitTimeoutMs = networkCommitTimeoutMs;
 	if (offline.recheck !== undefined) {
 		const recheck = plainObject(offline.recheck, 'offline.recheck');
 		refuseUnknownKeys(recheck, 'offline.recheck', recheckKeys);
