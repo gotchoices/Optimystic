@@ -1046,6 +1046,10 @@ export class TransactionBridge {
         log('offline:local-ack-unavailable reason=%s: this transaction is acknowledged by the network', set.unqueueable);
       }
       if (behindQueue) {
+        // NOTE: committing ahead breaks the design's "cannot commit ahead of them" rule when the set
+        // writes only collections with nothing queued (one that writes a queued collection is refused
+        // with SealedSegmentsError). Reachable today only with two tables declared over one URI; if
+        // an unqueueable shape ever becomes ordinary, refuse it here while anything is queued.
         log('offline:queue-bypassed reason=%s: this network-acknowledged transaction commits ahead of the queued ones', set.unqueueable);
       }
       return undefined;
