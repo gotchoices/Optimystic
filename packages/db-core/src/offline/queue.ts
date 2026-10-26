@@ -571,7 +571,7 @@ export class OfflineQueue {
 	 * | `contention`, `expired`, `in-doubt`, `unknown` | `queued`, `backoff`; `unknown` is also logged and counted |
 	 * | `guard-refused`, `rejected`, `too-large` | `failed`, with the class's reason |
 	 * | `torn-not-saved` | `queued`, `backoff`; doubt cleared (unless part of the entry is committed), a fresh action id, retained attempts cleared |
-	 * | `partial` | `partially-committed`, then `queued`, `backoff`, in doubt, under the same id ({@link partiallyCommitted}) |
+	 * | `partial` | `partially-committed`, then `queued`, `backoff`, in doubt, under the same id unless its cause is `torn-not-saved` ({@link partiallyCommitted}) |
 	 *
 	 * `SealedSegmentsError` out of a submission means the head alignment invariant broke — a queue
 	 * defect — and is thrown out of the loop, which stops the drain.
@@ -618,8 +618,7 @@ export class OfflineQueue {
 				// The torn attempt is provably not saved, but a partial commit's half is: an entry with a
 				// committed part stays in doubt, so it is never discarded or expired.
 				entry.inDoubt = entry.committed.size > 0;
-				entry.actionId = mintId();
-				entry.retained.clear();
+				this.renewIdentity(entry);
 				this.setQueued(entry, 'backoff', error);
 				return true;
 			}
@@ -651,9 +650,10 @@ export class OfflineQueue {
 	 * A submission committed part of the entry (docs/offline-sync.md §Partial commits). The committed
 	 * collections' segments are already consumed and their attempts resolved, so they are recorded on
 	 * the entry and leave `retained`; the rest are still sealed and first, their attempts retained, and
-	 * the next submission drives exactly them, under the same action id. The entry is in doubt from
-	 * here to its terminal outcome, so it is neither discarded nor expired. `partially-committed` is
-	 * emitted in place of the `queued` status this transition would otherwise report.
+	 * the next submission drives exactly them, under the same action id (a fresh one when the rest
+	 * failed `torn-not-saved`). The entry is in doubt from here to its terminal outcome, so it is
+	 * neither discarded nor expired. `partially-committed` is emitted in place of the `queued` status
+	 * this transition would otherwise report.
 	 *
 	 * @returns whether the entry stays queued: `false` only when no collection still holds its segment
 	 * (the failure came after every collection was saved), which settles it committed. */
@@ -668,6 +668,10 @@ export class OfflineQueue {
 			this.committed(entry);
 			return false;
 		}
+		// The coordinator reports any failure after a saved participant as a partial commit, so the
+		// rest may have failed `torn-not-saved`; re-driving it under the same id would only meet that
+		// stranded entry again.
+		if (classifyCommitFailure(error.reason).kind === 'torn-not-saved') this.renewIdentity(entry);
 		const committedCollections = [...entry.committed.keys()];
 		log('offline:partially-committed entry=%s action=%s committed=%o pending=%o reason=%s',
 			entry.id, entry.actionId, committedCollections, pending, describe(error.reason));
@@ -684,6 +688,14 @@ export class OfflineQueue {
 		});
 		this.publishState();
 		return true;
+	}
+
+	/** After a `torn-not-saved` outcome: nothing sent under the entry's action id is saved or will
+	 * land, so the next submission goes under a fresh one with nothing to resume. A partly committed
+	 * entry's committed half keeps the old id; only the remainder commits under the new one. */
+	private renewIdentity(entry: Entry): void {
+		entry.actionId = mintId();
+		entry.retained.clear();
 	}
 
 	// ── removing ───────────────────────────────────────────────────────────────────────────────

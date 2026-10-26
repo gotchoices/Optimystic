@@ -647,7 +647,11 @@ partial commit's `reason` as `cause` (the partial commit error itself when that 
 `Error`, as the commit-phase reason of a hard failure is not). The entry stays at the head, in doubt, so it is neither discarded nor expired;
 `entries()` lists it `queued` with its `committedCollections`. Its next submission drives only the
 collections still holding its segment — through `commitHead` when one is left, through
-`commitEntry` when several are — under the same action id, with their retained attempts as `resume`.
+`commitEntry` when several are — under the same action id, with their retained attempts as `resume`,
+unless the rest failed with `TornActionError` and `final: true` (the coordinator reports any failure
+after one collection was saved as a partial commit): then the remainder goes under a fresh id, as
+under [Identity across attempts](#identity-across-attempts), and the entry's two halves are logged
+under different action ids.
 When the remainder commits, `committed` carries one durability over every collection the entry wrote:
 the partial commit's committed half beside the remainder's answer. A second partial commit of the
 remainder adds to `committedCollections` and reports `partially-committed` again.
