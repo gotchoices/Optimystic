@@ -842,6 +842,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// needs the clocks to start disagreeing between a write's attempts, since an expiry on the
 		// attempt itself ends the write before any refresh. If it is ever seen burning a budget,
 		// settle it at once beside the confirmed rival.
+		// NOTE: a promise shortfall of the re-send (`isShortfallFailure`) lands in the same arm, and
+		// there it can genuinely clear (the silent members come back), so the write is re-sent each
+		// round until the budget's last round settles it — unlike a fresh attempt's shortfall, which
+		// ends the write at once. If a silent cohort is ever seen holding torn writes for the whole
+		// budget, settle it at once here too.
 		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is
 		// pointless, but the lineage question is asked only this once, so a member that is silent
 		// just now makes the answer `final: false`. If unsettled outcomes ever show up often under

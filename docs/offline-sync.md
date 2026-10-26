@@ -494,11 +494,13 @@ message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-
 | Torn, outcome unknown | `TornActionError` with `final: false` | `submitting`, in doubt; see below |
 | Part of the entry committed | `CoordinatorPartialCommitError` (in `packages/db-core/src/transaction/errors.ts`) | `partially-committed`; see below |
 
-Two of these rows need typed errors that do not all exist today: the super-majority shortfall a
-cohort with absent members produces ("Failed to get super-majority: 1/2 approvals …") reaches the
-writer as plain text, and the validator rejection has no stable class at the writer. Typing both is
-a prerequisite of the drain, listed in [Implementation stages](#implementation-stages). Anything the
-drain cannot classify is treated as transient, logged with the entry id, and counted, so an
+Two of these rows need typed errors. The super-majority shortfall a cohort with absent members
+produces on a pend now reaches the writer as `PromiseShortfallError` (in
+`packages/db-core/src/network/promise-shortfall-error.ts`), carrying the counts and the silent
+members; a commit-phase shortfall is still thrown inside the transactor's plain aggregate, and is in
+doubt rather than "nothing sent". The validator rejection has no stable class at the writer yet;
+typing it is a prerequisite of the drain, listed in
+[Implementation stages](#implementation-stages). Anything the drain cannot classify is treated as transient, logged with the entry id, and counted, so an
 unclassified failure is retried rather than silently dropping a change the application was told was
 committed; `expireAfterMs` bounds how long that can go on.
 
