@@ -10,7 +10,7 @@
  * through node A's transactor instead (`Isolation` in `isolation.ts`): wrapped, and registered under
  * the key the factory resolves (`shared:test`), its `get` answers every block `unavailable:
  * 'cohort-unreachable'` while armed — what a refresh meets on a node that cannot reach its cohort. A
- * reachability gate registered on A's factory stands in for stage 6's.
+ * reachability gate registered on A's factory stands in for the node's (`node.cohortReachability`).
  */
 
 import { expect } from 'chai';

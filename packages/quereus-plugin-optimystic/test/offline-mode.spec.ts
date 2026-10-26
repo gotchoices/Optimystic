@@ -10,11 +10,12 @@
  * `mesh.failures.failingPeers`: a commit A drives then meets a promise shortfall, which the drain
  * sorts as `cohort-unreachable` and re-checks on its timer (shortened through `offline.recheck`).
  *
- * Not pinned here, and why: `expireAfterMs` reached while unreachable. Stage 4 wires no reachability
- * gate, so the drain sends the head at once; the first attempt puts the entry in doubt (it is sent,
- * and a shortfall does not clear doubt — `OfflineQueue.recordAttempts`), and an entry in doubt is
- * neither expired nor discardable. The reachability port of stage 6 is what keeps an entry unsent,
- * and so expirable, while the cohort is unreachable; the expiry itself is pinned in db-core.
+ * Not pinned here, and why: `expireAfterMs` reached while unreachable. These cases register no
+ * reachability gate, so the drain sends the head at once; the first attempt puts the entry in doubt
+ * (it is sent, and a shortfall does not clear doubt — `OfflineQueue.recordAttempts`), and an entry in
+ * doubt is neither expired nor discardable. The gate is what keeps an entry unsent, and so expirable,
+ * while the cohort is unreachable: `offline-mode-two-machine.spec.ts` pins the expiry over the node's
+ * real gate.
  */
 
 import { expect } from 'chai';
@@ -444,7 +445,8 @@ describe('Offline mode: entering, sealing a commit, following it to the other no
 	it('register refuses an offline block it does not understand', () => {
 		const db = new Database();
 		try {
-			expect(() => register(db, { offline: { allowSoloCommit: true } as unknown as SqlValue })).to.throw(/offline\.allowSoloCommit is not a registration option/);
+			expect(() => register(db, { offline: { soloCommit: true } as unknown as SqlValue })).to.throw(/offline\.soloCommit is not a registration option/);
+			expect(() => register(db, { offline: { allowSoloCommit: 'yes' } as unknown as SqlValue })).to.throw(/offline\.allowSoloCommit must be true or false/);
 			expect(() => register(db, { offline: { expireAfterMs: -1 } as unknown as SqlValue })).to.throw(/offline\.expireAfterMs must be a positive number/);
 			expect(() => register(db, { offline: { recheck: { base: 1 } } as unknown as SqlValue })).to.throw(/offline\.recheck\.base is not a registration option/);
 		} finally {

@@ -163,7 +163,7 @@ const plugin = register(db, {
 });
 ```
 
-`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `allowSoloCommit` is refused until its stage lands rather than silently ignored. It also refuses a `journal` that is not shaped like an `IKVStore` (naming the methods it lacks), and a `journalLabel` given without a `journal` or with anything but lowercase letters, digits, `_` and `-` — the label is one key segment, which every store can hold, and a filesystem that ignores case would file two labels differing only in case together.
+`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so a misspelt key is an error rather than a silently different configuration, and a value of the wrong type (`allowSoloCommit` anything but a boolean, a duration anything but a positive number). `allowSoloCommit` reaches the queue as `OfflineQueueOptions.allowSoloCommit` ([When to submit](#when-to-submit-the-reachability-gate)). It also refuses a `journal` that is not shaped like an `IKVStore` (naming the methods it lacks), and a `journalLabel` given without a `journal` or with anything but lowercase letters, digits, `_` and `-` — the label is one key segment, which every store can hold, and a filesystem that ignores case would file two labels differing only in case together.
 
 Persistence is a registration-time choice, not a per-entry one, for two reasons: entries have to be
 restored before the application's first statement after a restart, which happens before any
@@ -479,27 +479,67 @@ others are not) holds back every entry behind it. That is accepted for the first
 The drain submits the head entry when the cohort can be reached, and otherwise waits, woken by the
 connection events the `UnderReplicationDrain` in `packages/db-p2p/src/repo/under-replication-drain.ts`
 already listens to (`connection:open`, `peer:identify`), by a re-check timer with backoff, and by
-each new local commit. The queue takes the connection events through one subscription,
-`OfflineQueueOptions.wakeOn` in `packages/db-core/src/offline/queue.ts`, which stage 6 binds; a wake
-also resets the timer's backoff.
+each new local commit. A wake also resets the timer's backoff.
 
-"Can be reached" is asked of a new port, `ICohortReachability.reachable(blockIds)` in
+"Can be reached" is asked of a port, `ICohortReachability.reachable(blockIds)` in
 `packages/db-core/src/offline/reachability.ts`, with the header id and the last known log tail id of
 each collection the head entry still has to commit, so an implementation resolves cohorts from routing
-keys alone. `db-core` defines the port and `db-p2p` implements it over the key network: the cohort the
-collection's header and log tail resolve to contains a member other than this node, or this node is genuinely alone — no member the key network knows of
-is missing from the cohort (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) and
-no configured bootstrap peer is still awaited (`awaitingBootstrapContact`, same file). The `local`,
-`test` and `mesh-test` transactors are always reachable.
+keys alone and never needs the network to answer whether the network can be reached. The `local`,
+`test` and `mesh-test` transactors have no cohort to lose and are always reachable.
+
+A networked node's gate is `KeyNetworkCohortReachability` in
+`packages/db-p2p/src/network/cohort-reachability.ts`, which `createLibp2pNode` builds and attaches as
+`node.cohortReachability`. It judges each distinct block it is asked about by the cohort `findCluster`
+assembles for it now, and answers reachable only when every block's cohort passes:
+
+- a cohort naming a member other than this node is reachable;
+- an empty cohort (`no-cohort`) or a lookup that throws (`lookup-failed`) is not;
+- a cohort of this node alone is reachable only when the node is genuinely alone: no serving member
+  the key network remembers is missing from it (`absent-members`, from `absentCohortMembers` in
+  `packages/db-p2p/src/libp2p-key-network.ts`), no configured bootstrap peer is still awaited
+  (`awaiting-bootstrap`, from `awaitingBootstrapContact`, same file), and no identify exchange is in
+  flight on the node (`identifying`, from `IdentifyProgress` in
+  `packages/db-p2p/src/network/identify-progress.ts`). The last arm covers the moment the other two
+  cannot see: a peer mid-identify is out of every cohort, and a returning partner may for that moment
+  show a partial protocol list that reads as another network's.
+
+It logs `reachability:closed`, with the reason and the block, or `reachability:open` each time its
+answer changes. Two cases read reachable while the partner is in fact gone, and both end in a wait
+rather than a lone commit: after a restart with persisted network state, a partner restored into FRET's
+table reads as serving and sits in the cohort until FRET's liveness drops it; and FRET keeps a
+long-lived peer live for up to its dead-peer grace (`maxDeadGraceMs`, five minutes by default) after it
+departs. Either way the submission runs on a cohort of two, meets a promise shortfall, and the entry
+waits with backoff; the cohort is not this node alone, so no lone commit is possible.
+
+The gate's optional `onChange` is the wake. The node's gate calls its listeners after a connection
+opens or a peer is identified, debounced so the identify that follows a connection is coalesced with
+it (`NodeOptions.cohortReachability`, 500 ms by default, `DEFAULT_WAKE_DEBOUNCE_MS`). Only
+reconnection-shaped events wake; a departure can only close the gate, which the next re-check reads.
 
 In the plugin a gate belongs to a transactor: `CollectionFactory.getCohortReachability` in
-`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts` answers with the gate
-registered for the transactor's key (`registerCohortReachability`, keyed as `registerTransactor`
-is), and with the always-open gate until one is; stage 6 registers the `network` transactor's. Each
-table's vtab publishes its transactor's gate to the controller with its policy, and the gate the
-controller hands the queue (`OfflineQueueOptions.reachability`) asks the gate of every table behind
-the collections it is asked about — one in practice, since an entry is one transactor's. A live read
-in offline mode asks the same gate ([Reads in offline mode](#reads-in-offline-mode)).
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts` hands out one gate
+per transactor key, a `LateBoundCohortReachability`
+(`packages/quereus-plugin-optimystic/src/optimystic-adapter/late-bound-reachability.ts`) standing in
+for the gate registered for that key (`registerCohortReachability`, keyed as `registerTransactor` is)
+and for the always-open gate until one is. The `network` transactor registers its node's gate when it
+is built (`CollectionFactory.createNetworkTransactor`), unless a test or host registered one first; a
+node a host injected without `cohortReachability` leaves the transactor always reachable. Both halves
+of the stand-in are late-bound — `reachable` asks the registered gate on every call, and `onChange`
+listeners are moved to each gate registered after them — so a table that took the gate before the
+registration still asks and hears the registered one. Each table's vtab publishes its transactor's gate
+to the controller with its policy at the start of every full initialization, before any network read,
+so a table whose initialization fails because its cohort cannot be reached has published it too. The
+gate the controller hands the queue (`OfflineQueueOptions.reachability`) asks the gate of every table
+behind the collections it is asked about — one in practice, since an entry is one transactor's. A live
+read in offline mode asks the same gate ([Reads in offline mode](#reads-in-offline-mode)).
+
+The wake reaches the queue through the controller, not through `OfflineQueueOptions.wakeOn`:
+`OfflineMode` subscribes once to each distinct gate a table publishes, and on a wake first starts a
+restore pass when a journaled transaction is deferred
+([Restore after a restart](#restore-after-a-restart)), then wakes the queue. The restore pass is the
+reason: while the queue is empty no drain iteration asks the gate, so nothing else would retry a
+deferred record when the cohort returns. `OfflineMode.dispose` releases the subscriptions first, so a
+wake arriving after it is ignored. `wakeOn` remains for a queue used without the plugin.
 
 The gate is what keeps offline mode from creating forks. Without it, a drain that runs while this
 node's routing view has dropped its partners takes the solo commit path (`soloCohortDurability` in
@@ -1271,7 +1311,9 @@ initialization propagates out of `restore()` and `hydrate`: a corrupt catalog or
 is not a reason to wait. The deferred records are retried by another pass, which runs on every
 `restore()` call; when a deferred table's vtab finishes a full initialization or a live refresh of it
 reaches the cohort (`OfflineMode.tableReadable`, scheduled off the statement's path once no
-transaction is open, never awaited by the read); and from the controller's reachability gate, asked
+transaction is open, never awaited by the read); on every wake of a published gate, likewise once no
+transaction is open — a machine connected or was identified — which is what retries a deferred record
+while the queue is empty; and from the controller's reachability gate, asked
 by the queue before each submission — while anything is deferred the gate starts a pass and answers
 `false`, so nothing queued after the restart is submitted ahead of an older transaction still on
 disk, and the queue's re-check timer is also the restore's retry timer. Such an entry reports
@@ -1576,9 +1618,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    write ordering and restore operations; the journal over `IKVStore`, retained outcomes in it, and
    the `NODE_KV_NAMESPACES` entry; restore in `hydrate` and `offline.restore`, with deferral of a
    record whose table cannot be reached.
-6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on
-   connection events, and the solo-refusing write option, set by every drain unless the application
-   opts out with `allowSoloCommit`.
+6. **Reachability in `db-p2p`** (implemented, in four tickets). The key-network implementation of
+   `ICohortReachability` and its wake on connection events; the solo-refusing write option, set by
+   every drain unless the application opts out with `allowSoloCommit`; the typed answer for a block
+   no machine answered; and the plugin wiring: the node's gate registered on the `network`
+   transactor, its wake routed through the controller, and `offline.allowSoloCommit`.
 7. **The outlook from guards alone.** Compute `CommitOutlook` from the actions' guards and the queue,
    with no Quereus change: every `absent` and `absentRange` guard is exposed unless its column is
    tagged fresh, every `unchanged` guard is exposed unless its row was inserted by an unsettled entry
@@ -1651,9 +1695,17 @@ over one store; a table dropped while down, deferred and discarded; a table unre
 deferred and put back by the first read that reaches the cohort; a new offline commit waiting behind
 a deferred record and draining after it; `discard` refused for the record a pass is putting back at
 that moment; a restored entry refused by a guard; an entry record left beside its outcome; and
-`restore()` refused inside a transaction. Of the list below, what is left
-waits for its stage: the two-machine group with one member away, and `expireAfterMs` reached while
-unreachable, which needs stage 6's gate to keep an entry unsent and so expirable; and the outlook
+`restore()` refused inside a transaction; and a deferred record with nothing else queued, put back by a
+gate's wake.
+
+Stage 6 pins the gate itself in `packages/db-p2p/test/cohort-reachability.spec.ts`, the solo refusal in
+`packages/db-p2p/test/offline-queue-mesh.spec.ts` (a lone coordinator refusing an entry while it knows
+its partner is missing, and committing it at `local` under `allowSoloCommit`), and the SQL scenarios in
+`packages/quereus-plugin-optimystic/test/offline-mode-two-machine.spec.ts`, over node A's real gate on
+the two-node mesh with B away: an offline write queued and sent nowhere, a live read serving it, and
+the drain on B's return reported `queued`, `submitting` and `committed` once each, woken by the gate
+with the re-check timer too long to explain it; and `expireAfterMs` reached while B is away, the entry
+failing `expired`, never sent. Of the list below, what is left waits for its stage: the outlook
 (stages 7 to 10).
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →

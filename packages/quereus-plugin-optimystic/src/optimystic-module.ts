@@ -801,6 +801,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       // OptimysticModule), but it should not outlive the open it describes.
       this.setErrorMessage(undefined);
       const txnState = readOnly ? null : this.txnBridge.getCurrentTransaction();
+      // Published before the first network read, since neither the policy nor the gate depends on
+      // one: a table whose initialization fails because its cohort cannot be reached — one a
+      // journaled offline transaction is deferred on — still has its gate's wakes reach the
+      // controller, which retries the restore from them.
+      if (!readOnly) this.publishOfflinePolicy();
       // NOTE: create-on-missing is intentional here, and stays. A table registered in the
       // schema catalog but never written to has NO committed header block — the header is
       // only committed on the first write — so "absent header" and "empty table" are
@@ -1004,7 +1009,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       // registerCollections). Must happen before any DML so the coordinator
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
-      this.publishOfflinePolicy();
       // A journaled offline transaction deferred because this table could not be reached is put back
       // now that it can (docs/offline-sync.md §Restore after a restart); scheduled, never awaited here.
       this.txnBridge.getOfflineMode()?.tableReadable(this.qualifiedTable);

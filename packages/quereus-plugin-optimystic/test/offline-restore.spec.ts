@@ -9,7 +9,7 @@
  * its `powerLoss()` is the crash, its `reopen()` what the restarted process reads. "Restarting A" is a
  * fresh `Database` over the reopened journal and A's transactor; where A's node store is lost too, the
  * mesh node is restarted over a fresh driver (`Mesh.restart`). A reachability gate registered on A's
- * factory (stage 6's seam) keeps a transaction unsent, and `Isolation` (`isolation.ts`) makes one
+ * factory (the seam the node's own gate is registered through) keeps a transaction unsent, and `Isolation` (`isolation.ts`) makes one
  * table's blocks unreadable, as on a node that never held them while its cohort is unreachable.
  */
 
@@ -43,10 +43,19 @@ const DRIVE_1 = 'optimystic-offline/default/drives/000000000001';
 const journaled = (journal: IKVStore, extra: Record<string, unknown> = {}): Record<string, SqlValue> =>
 	({ offline: { recheck: { baseMs: 20, maxMs: 100 }, journal, ...extra } }) as unknown as Record<string, SqlValue>;
 
-/** Stage 6's reachability gate, as a test sets it: closed keeps every submission unsent. */
+/** A reachability gate as a test sets it: closed keeps every submission unsent; {@link wake}
+ * is the node's connection event, called by hand. */
 class Gate implements ICohortReachability {
+	private readonly listeners = new Set<() => void>();
 	constructor(public open: boolean) {}
 	readonly reachable = (): Promise<boolean> => Promise.resolve(this.open);
+	readonly onChange = (listener: () => void): (() => void) => {
+		this.listeners.add(listener);
+		return () => { this.listeners.delete(listener); };
+	};
+	wake(): void {
+		for (const listener of [...this.listeners]) listener();
+	}
 }
 
 /** One life of node A's `Database`: its plugin over `journal`, its gate when given, and every status it reports. */
@@ -453,6 +462,34 @@ describe('Offline mode: restoring the queue from its journal after a restart', f
 		await a2.plugin.offline.whenDrained();
 		expect(await notesOf(a2.db)).to.deep.equal([{ id: 1, body: 'unreadable' }]);
 		expect(await notesOf(b.db)).to.deep.equal([{ id: 1, body: 'unreadable' }]);
+	});
+
+	it("a deferred record with nothing else queued is put back by the gate's wake when the cohort returns, and drains, with no read of its table", async () => {
+		const { transactorFor } = await startMockMesh(2);
+		const isolation = new Isolation(blockId => blockId.startsWith(NOTES_COLLECTION));
+		const transactorA = isolation.wrap(transactorFor(0));
+		const store = new PowerLossKVStore();
+		const gate = new Gate(false);
+		const a = openA(transactorA, store, { gate });
+		const b = createMeshDbNode(transactorFor(1));
+		await a.db.exec(createNotes);
+		await b.db.exec(createNotes);
+		a.plugin.offline.enter();
+		const transactionId = await insertNote(a.db, 1, 'woken');
+		const reopened = await crashA(store, a);
+
+		isolation.armed = true;
+		const a2 = openA(transactorA, reopened, { gate });
+		await a2.plugin.hydrate(a2.db);
+		expect(a2.plugin.offline.entries().map(entry => entry.transactionId), 'only the deferred record').to.deep.equal([transactionId]);
+		expect(a2.plugin.offline.status(transactionId)).to.include({ kind: 'queued', waitingFor: 'restore' });
+
+		// The queue is empty, so no drain iteration asks the gate; only the wake can start the retry.
+		isolation.armed = false;
+		gate.open = true;
+		gate.wake();
+		await waitFor(() => statusesOf(a2.statuses, 'committed', transactionId).length === 1, { description: 'the wake to put the record back and drain it' });
+		expect(await notesOf(b.db)).to.deep.equal([{ id: 1, body: 'woken' }]);
 	});
 
 	it('a new offline commit made while a record is deferred waits behind it: nothing is submitted until the record is back, and the two drain in sequence order', async () => {

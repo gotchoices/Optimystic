@@ -18,6 +18,11 @@ export interface OfflineConfig {
 	expireAfterMs?: number;
 	/** How long a terminal outcome stays in `outcomes()` / `status()`. Default seven days. */
 	outcomeRetentionMs?: number;
+	/** Let the drain commit a queued transaction on this machine alone while it knows its cohort has
+	 * members it cannot reach (`OfflineQueueOptions.allowSoloCommit`, docs/offline-sync.md §When to
+	 * submit: the reachability gate). Default `false`: a queued transaction is committed only by a
+	 * commit its cohort reached consensus on, and otherwise waits for the cohort. */
+	allowSoloCommit?: boolean;
 	/** The drain's re-check timer while the cohort is unreachable or after a transient failure
 	 * (`OfflineQueueOptions.recheck`): exponential from `baseMs` to `maxMs`. Advanced; tests shorten it. */
 	recheck?: { baseMs?: number; maxMs?: number };
@@ -41,15 +46,15 @@ export const DEFAULT_JOURNAL_LABEL = 'default';
 // ever meets it, refuse those names here.
 const JOURNAL_LABEL = /^[a-z0-9_-]+$/;
 
-const offlineKeys: ReadonlySet<string> = new Set(['journal', 'journalLabel', 'expireAfterMs', 'outcomeRetentionMs', 'recheck', 'networkCommitTimeoutMs']);
+const offlineKeys: ReadonlySet<string> = new Set(['journal', 'journalLabel', 'expireAfterMs', 'outcomeRetentionMs', 'allowSoloCommit', 'recheck', 'networkCommitTimeoutMs']);
 const recheckKeys: ReadonlySet<string> = new Set(['baseMs', 'maxMs']);
 const kvStoreMethods = ['get', 'set', 'delete', 'list'] as const;
 
 /**
  * Read `config.offline` as `register` received it, refusing anything it does not understand: a
- * misspelt key is an error here rather than a silently different configuration later
- * (`allowSoloCommit` arrives with a later stage and is refused until then). A `journal` given as a
- * factory is called here, once; whatever it throws is thrown out of `register`.
+ * misspelt key is an error here rather than a silently different configuration later, and so is a
+ * value of the wrong type. A `journal` given as a factory is called here, once; whatever it throws is
+ * thrown out of `register`.
  */
 export function parseOfflineConfig(declared: unknown): ParsedOfflineConfig {
 	if (declared === undefined) return {};
@@ -63,6 +68,8 @@ export function parseOfflineConfig(declared: unknown): ParsedOfflineConfig {
 	if (expireAfterMs !== undefined) config.expireAfterMs = expireAfterMs;
 	const outcomeRetentionMs = positiveMs(offline.outcomeRetentionMs, 'offline.outcomeRetentionMs');
 	if (outcomeRetentionMs !== undefined) config.outcomeRetentionMs = outcomeRetentionMs;
+	const allowSoloCommit = optionalBoolean(offline.allowSoloCommit, 'offline.allowSoloCommit');
+	if (allowSoloCommit !== undefined) config.allowSoloCommit = allowSoloCommit;
 	const networkCommitTimeoutMs = positiveMs(offline.networkCommitTimeoutMs, 'offline.networkCommitTimeoutMs');
 	if (networkCommitTimeoutMs !== undefined) config.networkCommitTimeoutMs = networkCommitTimeoutMs;
 	if (offline.recheck !== undefined) {
@@ -114,10 +121,15 @@ function plainObject(value: unknown, name: string): Record<string, unknown> {
 function refuseUnknownKeys(object: Record<string, unknown>, name: string, known: ReadonlySet<string>): void {
 	for (const key of Object.keys(object)) {
 		if (!known.has(key)) {
-			throw new Error(`${name}.${key} is not a registration option; ${name} takes ${[...known].join(', ')}`
-				+ (name === 'offline' ? " ('allowSoloCommit' arrives with a later stage)" : ''));
+			throw new Error(`${name}.${key} is not a registration option; ${name} takes ${[...known].join(', ')}`);
 		}
 	}
+}
+
+function optionalBoolean(value: unknown, name: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== 'boolean') throw new Error(`${name} must be true or false; got ${typeof value} ${String(value)}`);
+	return value;
 }
 
 function positiveMs(value: unknown, name: string): number | undefined {

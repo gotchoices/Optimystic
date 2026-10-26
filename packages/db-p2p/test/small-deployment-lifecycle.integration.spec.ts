@@ -169,7 +169,10 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 		// Observed, not asserted: whether a lone survivor of a two-machine group should accept writes is
 		// under design (tickets/backlog/more-design/6.5-partition-healing.md). This phase pins durability of
 		// what was acknowledged; the admission outcome — and, when refused, whether the refused row surfaces
-		// anyway — is reported so a change in either shows up in the run output.
+		// anyway — is reported so a change in either shows up in the run output. For a write made in offline
+		// mode the outcome is settled, and pinned deterministically on the in-process mesh in
+		// `packages/quereus-plugin-optimystic/test/offline-mode-two-machine.spec.ts`: queued, not committed
+		// alone, and sent when the partner returns.
 		console.log(`      phase 5 observed: A's write with B away was ${await describeWriteAttempt(attempt, whileAway, TREE_ID, [a, b])}`);
 	});
 

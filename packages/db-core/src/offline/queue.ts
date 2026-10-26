@@ -36,8 +36,10 @@ const DefaultRecheckMaxMs = 60_000;
 export type OfflineQueueOptions = {
 	/** The gate of docs/offline-sync.md §When to submit. Default: always reachable. */
 	reachability?: ICohortReachability;
-	/** An external wake signal (db-p2p's connection events in stage 6): subscribe the queue's
-	 * {@link OfflineQueue.wake} and return the unsubscribe, which {@link OfflineQueue.dispose} calls. */
+	/** An external wake signal — a gate's `ICohortReachability.onChange`, say: subscribe the queue's
+	 * {@link OfflineQueue.wake} and return the unsubscribe, which {@link OfflineQueue.dispose} calls.
+	 * The Quereus plugin does not use it: its controller calls `wake` itself, after retrying a deferred
+	 * restore. */
 	wakeOn?: (wake: () => void) => () => void;
 	/** Fail an entry that stays unsettled this long, with reason `expired`. Default: no limit. An
 	 * entry in doubt is never expired; it expires once its doubt resolves without committing. */

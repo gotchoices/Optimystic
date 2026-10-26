@@ -173,6 +173,11 @@ export class OfflineMode {
 	private readonly tables = new Map<string, PublishedTable>();
 	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
+	/** The unsubscribe of each distinct gate a table published that has `onChange` ({@link subscribeToGate});
+	 * one per transactor, since the factory hands out one gate per transactor key. */
+	private readonly gateWakes = new Map<ICohortReachability, () => void>();
+	/** Set by {@link dispose} before anything else, so a wake already on its way is ignored. */
+	private wakesReleased = false;
 	private disposed = false;
 
 	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: ParsedOfflineConfig = {}) {
@@ -180,7 +185,10 @@ export class OfflineMode {
 			tablesOf: id => this.bridge.tablesOf(id),
 			outcomeOf: status => this.journalOutcome(status),
 		});
+		// The gates' wakes reach the queue through `onGateChange`, never as `wakeOn`: a wake must also
+		// start a restore pass, which nothing else asks for while the queue is empty.
 		const options: OfflineQueueOptions = { reachability: this.reachability };
+		if (config.allowSoloCommit !== undefined) options.allowSoloCommit = config.allowSoloCommit;
 		if (this.journal !== undefined) options.journal = this.journal;
 		if (config.expireAfterMs !== undefined) options.expireAfterMs = config.expireAfterMs;
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
@@ -269,6 +277,7 @@ export class OfflineMode {
 	 * record it is on and stops. Idempotent.
 	 */
 	async dispose(): Promise<void> {
+		this.releaseGateWakes();
 		// The restore is told first, so it goes no further than its current record; the queue's disposal
 		// then ends a `queue.restore` it is waiting on, and the pass is awaited last.
 		const restoreStopped = this.restorer?.dispose();
@@ -287,13 +296,15 @@ export class OfflineMode {
 	 * policy when a transaction writing the table commits ({@link tablePolicy}); a transaction already
 	 * queued keeps the acknowledgement it got. The gate is what the queue asks before submitting an
 	 * entry that wrote the table, and what a live read of it asks before refreshing in offline mode
-	 * ({@link cohortReachable}).
+	 * ({@link cohortReachable}); its wakes wake the drain ({@link subscribeToGate}).
 	 */
 	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy, reachability: ICohortReachability): void {
 		this.tables.set(qualifiedTableName(table), { policy, reachability });
+		this.subscribeToGate(reachability);
 	}
 
-	/** Forget `table`'s policy and gate: it was dropped, or its CREATE was refused. */
+	/** Forget `table`'s policy and gate: it was dropped, or its CREATE was refused. The gate's wake
+	 * subscription stays: a wake for a gate no table uses costs one gate check. */
 	withdrawTablePolicy(table: QualifiedTableName): void {
 		this.tables.delete(qualifiedTableName(table));
 	}
@@ -427,6 +438,40 @@ export class OfflineMode {
 			return true;
 		},
 	};
+
+	/** Hear `gate`'s wakes ({@link onGateChange}), once per distinct gate; a gate without `onChange`
+	 * wakes nothing, and after {@link dispose} nothing is subscribed. */
+	private subscribeToGate(gate: ICohortReachability): void {
+		if (this.wakesReleased || this.gateWakes.has(gate) || gate.onChange === undefined) return;
+		this.gateWakes.set(gate, gate.onChange(this.onGateChange));
+	}
+
+	/**
+	 * A gate says the cohort may have become reachable: a machine connected or was identified. When a
+	 * journaled transaction is deferred, a restore pass is started once no transaction is open — this is
+	 * what retries a deferred record while the queue is empty, since no drain iteration then asks the
+	 * gate. Then the queue is woken, which also resets its re-check backoff, so an entry waiting on the
+	 * cohort is submitted now rather than at its next re-check.
+	 */
+	private readonly onGateChange = (): void => {
+		if (this.wakesReleased) return;
+		const restorer = this.restorer;
+		if (restorer?.hasDeferred()) {
+			// NOTE: one pass per wake while anything is deferred (wakes requested while a pass runs join
+			// the one pending), and the node's gate debounces its wakes until its events go quiet. If a
+			// node whose connections churn ever shows passes in profiles, rate-limit them here.
+			this.bridge.whenTransactionIdle()
+				.then(() => restorer.run())
+				.catch(error => log('offline:restore-pass-failed from=wake: %o', error));
+		}
+		this.queue.wake();
+	};
+
+	private releaseGateWakes(): void {
+		this.wakesReleased = true;
+		for (const unsubscribe of this.gateWakes.values()) unsubscribe();
+		this.gateWakes.clear();
+	}
 
 	/**
 	 * Refuse `operation`, a change to how `table`'s rows are stored, while any queued transaction wrote

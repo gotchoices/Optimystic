@@ -1,5 +1,5 @@
 import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
-import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url, alwaysReachable } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -22,6 +22,7 @@ import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
+import { LateBoundCohortReachability } from './late-bound-reachability.js';
 
 const log = createLogger('collection-factory');
 
@@ -100,12 +101,11 @@ export class CollectionFactory {
    */
   private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
   /**
-   * The reachability gate registered for each transactor key ({@link registerCohortReachability}), and
-   * the one stable gate per key {@link getCohortReachability} hands out over it. A key with nothing
-   * registered answers {@link alwaysReachable}.
+   * The one stable gate per transactor key that {@link getCohortReachability} hands out, standing in
+   * for the gate registered for the key ({@link registerCohortReachability}) and for the always-open
+   * gate until one is.
    */
-  private cohortReachabilities = new Map<string, ICohortReachability>();
-  private cohortGates = new Map<string, ICohortReachability>();
+  private cohortGates = new Map<string, LateBoundCohortReachability>();
 
   /**
    * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
@@ -387,6 +387,7 @@ export class CollectionFactory {
     }
 
     const { node, coordinatedRepo, blockChangeNotifier } = nodeInfo;
+    this.registerNodeCohortReachability(this.getTransactorKey(options), node);
 
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
@@ -439,6 +440,17 @@ export class CollectionFactory {
       // peers go to this node and its own writes skip the network hop.
       localPeerId: node.peerId,
     });
+  }
+
+  /**
+   * Register `node`'s reachability gate (`node.cohortReachability`) for the transactor under `key`,
+   * unless a gate is registered there already: one a test or host registered explicitly wins. A node a
+   * host injected without building it through `createLibp2pNode` may carry none; its transactor then
+   * stays always reachable, and nothing wakes the drain but its own re-check timer.
+   */
+  private registerNodeCohortReachability(key: string, node: FactoryNode): void {
+    const gate = this.cohortGateFor(key);
+    if (node.cohortReachability !== undefined && !gate.bound) gate.bind(node.cohortReachability);
   }
 
   /**
@@ -791,29 +803,34 @@ export class CollectionFactory {
    * The gate saying whether the cohort behind `options`' transactor can be reached now
    * (`ICohortReachability`, docs/offline-sync.md §When to submit: the reachability gate). The offline
    * queue asks it before submitting an entry, and a live read in offline mode before it refreshes
-   * (docs/offline-sync.md §Reads in offline mode), so both ask one gate. The same object for every
-   * call with one transactor key, and it looks the registration up each time it is asked, so a gate
-   * registered after a table took this one still applies. A transactor with no gate registered is
-   * always reachable — `local`, `test` and `mesh-test` have no cohort to lose; the `network` one is
-   * registered by the node attachment of stage 6 (ticket `offline-sync-cohort-reachability`).
+   * (docs/offline-sync.md §Reads in offline mode), so both ask one gate; the offline-mode controller
+   * also subscribes to its `onChange`, which wakes the drain. The same object for every call with one
+   * transactor key, late-bound to the registration ({@link LateBoundCohortReachability}): a gate
+   * registered after a table took this one is the one it asks and hears. A transactor with no gate
+   * registered is always reachable and never wakes anyone — `local`, `test` and `mesh-test` have no
+   * cohort to lose; the `network` transactor registers its node's ({@link createNetworkTransactor}).
    */
   getCohortReachability(options: ParsedOptimysticOptions): ICohortReachability {
-    const key = this.getTransactorKey(options);
-    let gate = this.cohortGates.get(key);
-    if (gate === undefined) {
-      gate = { reachable: blockIds => (this.cohortReachabilities.get(key) ?? alwaysReachable).reachable(blockIds) };
-      this.cohortGates.set(key, gate);
-    }
-    return gate;
+    return this.cohortGateFor(this.getTransactorKey(options));
   }
 
   /**
    * Register the reachability gate for the transactor under `key` — `${transactor}:${keyNetwork}`, the
-   * key {@link registerTransactor} takes. For tests, and for the node attachment that answers for the
-   * `network` transactor. Replaces any gate registered under `key` before.
+   * key {@link registerTransactor} takes. For tests and hosts; the `network` transactor registers its
+   * node's gate itself unless one is registered here first. Replaces any gate registered under `key`
+   * before, moving every wake subscription to it.
    */
   registerCohortReachability(key: string, reachability: ICohortReachability): void {
-    this.cohortReachabilities.set(key, reachability);
+    this.cohortGateFor(key).bind(reachability);
+  }
+
+  private cohortGateFor(key: string): LateBoundCohortReachability {
+    let gate = this.cohortGates.get(key);
+    if (gate === undefined) {
+      gate = new LateBoundCohortReachability();
+      this.cohortGates.set(key, gate);
+    }
+    return gate;
   }
 
   /**
