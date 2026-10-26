@@ -346,8 +346,9 @@ list. Five rules follow from the split:
   reverse. The cycle opens with a refresh round through the handles, as `commitHead` opens with one,
   so a re-drive under the id of an attempt that may have landed finishes and consumes that attempt's
   entry in each participant that holds it (such a participant is recorded as saved and leaves the
-  set) instead of committing a second copy; the whole answer is `undefined` when that refresh found
-  every participant saved and sent nothing. Each attempt then builds every remaining participant's
+  set) instead of committing a second copy. The answer is always a `TransactionDurability`, never
+  `undefined`, since a slice writes at least one collection: a participant the refresh saved without
+  learning who holds it is listed with an `undefined` class, as `commit` lists one. Each attempt then builds every remaining participant's
   attempt on its head tracker (`stage`), hands them all to the write-ahead hook
   (`EntryCommit.recordAttempt`, awaited under every latch; a throw aborts with nothing sent),
   releases every latch, runs the coordinator's own phases over them — every participant pended, then

@@ -110,13 +110,6 @@ function collectionAttemptOf(staged: StagedAttempt): CollectionAttempt {
 	};
 }
 
-/** Whether a successful commit's answer names no holder for any collection: every participant was
- * found already saved without re-sending anything (the status-read fallback of
- * `Collection.completeOwnEntry`), so nothing was sent. */
-function holdersUnknown(written: TransactionDurability): boolean {
-	return [...written.collections.values()].every(durability => durability === undefined);
-}
-
 /**
  * The pend phase's failure for `reasons` — what every failed pend threw or stood for, at least one.
  * The error text is the first reason's. The attempt is a retryable clean stale loss only if at least one
@@ -714,6 +707,7 @@ export class TransactionCoordinator {
 	private async commitAttempts(driver: AttemptDriver, cycle: CommitCycle, options?: SyncOptions): Promise<TransactionDurability | undefined> {
 		const budget = new RetryBudget(options);
 		if (driver.opensWithRefresh) {
+			budget.assertOpen();
 			await this.refreshRounds(driver, budget);
 			if (cycle.saved.size > 0 && driver.nothingLeft()) {
 				return transactionDurability(cycle.saved);
@@ -1252,10 +1246,12 @@ export class TransactionCoordinator {
 	 * while a {@link commit} of the same coordinator is open is not a supported combination, and
 	 * nothing but the collection latches guards it.
 	 *
-	 * @returns what {@link commit} returns: who holds each collection the entry wrote, across every
-	 * attempt — a participant the refresh saved included — or `undefined` when the opening refresh
-	 * found every participant already saved under `entry.actionId` and sent nothing (the status-read
-	 * fallback of `Collection.completeOwnEntry`, the answer `Collection.commitHead` gives then).
+	 * @returns who holds each collection the entry wrote, across every attempt, as {@link commit}
+	 * answers it — a participant the refresh saved included, listed with an `undefined` class (and
+	 * `overall` then absent) when the refresh established it was saved under `entry.actionId` without
+	 * re-sending (the status-read fallback of `Collection.completeOwnEntry`, where
+	 * `Collection.commitHead` answers `undefined`). Never `undefined`: a slice always writes at least
+	 * one collection, so the "nothing was written" answer `commit` has is unrepresentable here.
 	 * @throws what {@link commit} throws — a {@link CoordinatorStaleLossError} once the retry budget
 	 * is spent, a {@link CoordinatorPartialCommitError} for a partial landing (every participant it
 	 * names as committed has had its head consumed; every failed one's head is still sealed and
@@ -1264,7 +1260,7 @@ export class TransactionCoordinator {
 	 * participant's segment intact since nothing was sent or the send was refused, and
 	 * `SealedSegmentsError` from `Collection.openHeadCommit`'s preconditions, before anything is done.
 	 */
-	async commitEntry(entry: EntryCommit, options?: SyncOptions): Promise<TransactionDurability | undefined> {
+	async commitEntry(entry: EntryCommit, options?: SyncOptions): Promise<TransactionDurability> {
 		if (this.pendValidation !== 'none') {
 			throw new Error(`commitEntry ${entry.entryId}: a queued entry commits through a coordinator built with `
 				+ `pendValidation: 'none' — it has no statements for a member to re-execute`);
@@ -1284,7 +1280,10 @@ export class TransactionCoordinator {
 		};
 		try {
 			const written = await this.commitAttempts(driver, cycle, options);
-			return written !== undefined && holdersUnknown(written) ? undefined : written;
+			if (written === undefined) {
+				throw new Error(`commitEntry ${entry.entryId}: the cycle ended with nothing committed and nothing saved`);
+			}
+			return written;
 		} catch (err) {
 			throw this.reportSaved(entry.actionId, cycle, err);
 		} finally {
@@ -1630,10 +1629,11 @@ export class TransactionCoordinator {
 		// Released in the finally: execute has early failure returns.
 		const latchReleases: (() => void)[] = [];
 		try {
-			// NOTE: deadlock-freedom against a concurrent commitOnce needs BOTH paths to acquire in
-			// the SAME order, not merely each in a sorted one. `CollectionId` is a string, so this
-			// default `.sort()` and commitOnce's explicit `<`/`>` comparator agree today. If either
-			// spelling changes — a custom comparator, a non-string id — change both together.
+			// NOTE: deadlock-freedom against a concurrent commitOnce or commitEntry needs ALL three
+			// paths to acquire in the SAME order, not merely each in a sorted one. `CollectionId` is a
+			// string, so this default `.sort()`, commitOnce's explicit `<`/`>` comparator and
+			// `compareCollectionIds` in entry-commit.ts agree today. If any spelling changes — a
+			// custom comparator, a non-string id — change all three together.
 			for (const collectionId of [...allCollectionIds].sort()) {
 				const collection = this.collections.get(collectionId);
 				if (collection) {
