@@ -386,10 +386,10 @@ Validation never degenerates to a whole-network vote: a dispute still split at t
 
 **Proof sketch.**
 
-Equivocation detection occurs during record merging in `ClusterMember.mergeRecords()`. When a peer's signature type changes between observations (approve → reject or vice versa):
+Equivocation detection occurs during record merging in `ClusterMember.mergeRecords()`. When a peer's signature type changes between observations (approve → reject or vice versa), or a reject's signed validity marker does (added, removed, or naming a different computed hash — a member signs one promise vote per record, so an honest member never sends both):
 
 1. The first-seen signature is preserved (prevents the Byzantine node from "correcting" its vote).
-2. The equivocation is recorded as evidence: `phase:messageHash:existingType→incomingType`.
+2. The equivocation is recorded as evidence: `phase:messageHash:existingVote→incomingVote`, each vote named by its type, and a marked reject by `reject-invalid:<computed hash>`.
 3. A `PenaltyReason.Equivocation` penalty (weight 100) is applied, which exceeds the ban threshold (80).
 4. The peer is immediately banned for the affected ring segment.
 

@@ -56,6 +56,10 @@ export type PendValidationEvent =
  *   escaping error. At the cluster tier an escaping throw costs the member its vote entirely —
  *   indistinguishable from an unreachable peer, and with no signed reason for the dispute path.
  *
+ * Neither of those refusals carries `validity`: both say this node could not judge the transaction,
+ * not that it is wrong. A checker's own verdict is returned untouched, its `validity` included, so the
+ * class it gave a refusal is the class the cluster member signs (`ValidityRejection` in db-core).
+ *
  * NOTE: a TRANSIENT checker fault (database busy, momentary connection loss) therefore produces a
  * terminal reject where a redelivery might have produced an approve. `CoordinatorRepo`'s two
  * rejection classifiers confirm retryability against LOCAL storage state and never read this prose,

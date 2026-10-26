@@ -1,5 +1,6 @@
 import type { RepoMessage } from "../network/repo-protocol.js";
 import type { CommitResult, PendResult } from "../network/struct.js";
+import type { ValidityRejection } from "../transaction/transaction.js";
 
 /**
  * One member's vote on a cluster transaction, in either the promise or the commit map.
@@ -11,6 +12,10 @@ import type { CommitResult, PendResult } from "../network/struct.js";
  */
 export type Signature =
 	| { type: 'approve'; signature: string }
+	/**
+	 * A plain reject, or an **expiry vote**. Never a validity vote: `validity` belongs to the other
+	 * reject arm, so one vote cannot claim both a clock disagreement and a validity judgement.
+	 */
 	| {
 		type: 'reject';
 		signature: string;
@@ -23,6 +28,25 @@ export type Signature =
 		 * Still a `reject` in every count — the record really is dead for this member.
 		 */
 		expiredAt?: number;
+		validity?: never;
+	}
+	/**
+	 * A **validity vote**: the member re-checked the transaction and judged it wrong in a way that holds
+	 * on every retry and at every honest validator (see {@link ValidityRejection} for which refusals
+	 * qualify). `validity.computedHash` is the operations hash the member computed, when re-execution got
+	 * that far. Signed like `expiredAt`, so a coordinator can tell "refused for good" from "try again"
+	 * without reading `rejectReason`.
+	 *
+	 * Absent means "not known to be a validity judgement" — a stale revision, a reservation, a refusal the
+	 * member could not judge, or a member on a build that predates the field — so a reader must never
+	 * treat an unmarked reject as final. Still a `reject` in every count.
+	 */
+	| {
+		type: 'reject';
+		signature: string;
+		rejectReason?: string;
+		validity: ValidityRejection;
+		expiredAt?: never;
 	}
 	/**
 	 * This member refuses the transaction *for now*: it holds a conflicting transaction that won
@@ -68,13 +92,21 @@ export type ClusterVote = Unsigned<Signature>;
  * held's `heldBy`, nothing for an approve. Folding the extra in is what makes it integrity-protected in
  * transit rather than free-floating prose.
  *
- * One variant carries two fields: an expiry vote, a `reject` with {@link Signature} `expiredAt`. It is
- * encoded `<hash>:reject-expired:<json>`, where `<json>` is `JSON.stringify([expiredAt, rejectReason ??
- * null])`. Two properties make that unambiguous: the tag differs from every other vote's at the
- * character after `reject` (a hash is base64url, so the first `:` always ends it), and a JSON array
- * cannot be read as a different pair of values. A reason that itself contains `:` — `"x:5"` — can
- * therefore never verify as reason `"x"` with `expiredAt: 5`, and a string smuggled into `expiredAt`
- * changes the bytes. Every vote without `expiredAt` encodes exactly as before the field existed.
+ * Two reject variants carry two fields each, and each has its own tag:
+ *  - an expiry vote, a `reject` with {@link Signature} `expiredAt`, is encoded
+ *    `<hash>:reject-expired:<json>`, where `<json>` is `JSON.stringify([expiredAt, rejectReason ?? null])`;
+ *  - a validity vote, a `reject` with {@link Signature} `validity`, is encoded
+ *    `<hash>:reject-invalid:<json>`, where `<json>` is `JSON.stringify([computedHash ?? null,
+ *    rejectReason ?? null])`.
+ *
+ * Two properties make that unambiguous. The tag is decided character by character after the hash (a
+ * hash is base64url, so the first `:` always ends it): a plain reject continues `reject` with `:` or
+ * nothing, the two marked ones with `-`, and those two differ at the next character (`e` and `i`); every
+ * other vote's tag differs from all three at its first character. And a JSON array cannot be read as a
+ * different pair of values. A reason that itself contains `:` — `"x:5"` — can therefore never verify as
+ * reason `"x"` with `expiredAt: 5`, a string smuggled into `expiredAt` changes the bytes, and adding,
+ * removing or altering a vote's `validity` changes them too. The type keeps the two marked forms apart
+ * (no vote carries both). Every vote with neither field encodes exactly as before either existed.
  *
  * Producers and verifiers must both build the preimage here. It lives beside {@link Signature}
  * rather than in either consumer because a second copy that forgets a variant does not fail loudly:
@@ -98,6 +130,9 @@ export function clusterVoteVerificationPayload(hash: string, signature: Signatur
 function voteTagAndExtra(vote: ClusterVote): string {
 	switch (vote.type) {
 		case 'reject':
+			if (vote.validity !== undefined) {
+				return 'reject-invalid:' + JSON.stringify([vote.validity.computedHash ?? null, vote.rejectReason ?? null]);
+			}
 			return vote.expiredAt === undefined
 				? withExtra('reject', vote.rejectReason)
 				: 'reject-expired:' + JSON.stringify([vote.expiredAt, vote.rejectReason ?? null]);

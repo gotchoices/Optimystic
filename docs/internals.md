@@ -1414,6 +1414,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
   approval either); what they buy is classification, signed evidence, and an operator-visible count
   of how much traffic went unchecked. A node with no checker configured is unaffected by the policy.
   No composition root supplies a checker today (backlog `feat-no-deployment-validates-transactions-at-pend`).
+  Neither shape is marked as a validity judgement (next bullet): both say this node could not judge
+  the transaction, not that it is wrong.
+- **A reject that judges the transaction itself wrong says so in its signature.** Every member
+  refusal other than a `conflict`, a `held` or an expiry is a `reject` with prose, so a stale
+  revision, a membership refusal, a content-digest disagreement and a checker fault look identical
+  to a writer — and the prose must never become control flow. The five `TransactionValidator`
+  refusals that judge the transaction itself wrong — a tampered stamp, a missing or invalid client
+  signature, a failed re-execution and an operations-hash mismatch — return a `validity` class
+  (`ValidityRejection` in `packages/db-core/src/transaction/transaction.ts`), carrying the operations
+  hash the member computed when it got that far; every other refusal returns none.
+  `checkPendValidation` passes a checker's class through untouched, and the pend-validation branch of
+  `ClusterMember.validatePendOperations` is the one site whose verdict can carry it, which `voteFor`
+  in `packages/db-p2p/src/cluster/cluster-repo.ts` signs as `Signature.validity`: encoded
+  `reject-invalid:<json>` the way `expiredAt` is encoded `reject-expired:`, so it cannot be added,
+  stripped or altered in transit, and the type keeps one vote from carrying both. The marker is
+  positive on purpose, so **absent means "not known to be a validity judgement"**: a member on an older
+  build sends none, and its stale-revision reject must never be read as final. Counting is unchanged
+  everywhere — a marked reject is a reject — and `detectEquivocation` treats a differing marker on a
+  re-delivered reject as a re-signed vote. The mixed-version cost is the one the expiry encoding
+  already accepted: an older member verifying a marked vote builds the old preimage and reports
+  `InvalidSignature` against an honest member, tolerable because no deployment re-validates
+  transactions yet, so marked votes are rare, while the common stale-revision reject keeps its
+  encoding byte for byte. Nothing acts on the marker yet: the writer's typed failure (ticket
+  `offline-sync-typed-validity-rejection`) and limiting dispute evidence to marked rejects (backlog
+  `dispute-validity-reject-marker`) are its consumers. The classification is the design of record
+  in [right-is-right.md §Which rejections are disputes](right-is-right.md#which-rejections-are-disputes).
 - **An expired record is answered with a vote, not a throw.** Expiry is a promise *verdict*, decided
   first in `ClusterMember.evaluatePromise` (and ahead of the conflict race in `getTransactionPhase`,
   so an expired record cannot clear a live rival's reservation), never a check in `validateRecord`,

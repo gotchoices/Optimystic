@@ -8,6 +8,7 @@ export type {
 	ExecutionResult,
 	CollectionActions,
 	ValidationResult,
+	ValidityRejection,
 	ITransactionValidator,
 	ActionsStatement,
 	TransactionSigner,

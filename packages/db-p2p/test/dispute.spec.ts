@@ -81,12 +81,10 @@ async function makeClusterRecord(
 		const type = isRejector ? 'reject' : 'approve';
 		const rejectReason = isRejector ? 'validation-mismatch' : undefined;
 		const payload = promiseHash + ':' + type + (rejectReason ? ':' + rejectReason : '');
-		const sigBytes = await privateKey.sign(new TextEncoder().encode(payload));
-		promises[peerId.toString()] = {
-			type,
-			signature: uint8ArrayToString(sigBytes, 'base64url'),
-			...(rejectReason ? { rejectReason } : {}),
-		};
+		const signature = uint8ArrayToString(await privateKey.sign(new TextEncoder().encode(payload)), 'base64url');
+		promises[peerId.toString()] = rejectReason
+			? { type: 'reject', signature, rejectReason }
+			: { type: 'approve', signature };
 	}
 
 	// Build commits (from approving peers only)

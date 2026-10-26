@@ -1,6 +1,6 @@
 import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
 import type { ActionContext, ActionRev } from "../collection/action.js";
-import type { Transaction } from "../transaction/transaction.js";
+import type { Transaction, ValidityRejection } from "../transaction/transaction.js";
 import type { DisputeResolutionProof } from "../log/struct.js";
 import type { PeerId } from "./types.js";
 
@@ -618,6 +618,8 @@ export type PendValidationResult = {
 	valid: boolean;
 	/** Reason for validation failure (if valid=false) */
 	reason?: string;
+	/** Set only on a failure that judges the transaction itself wrong; see {@link ValidityRejection}. */
+	validity?: ValidityRejection;
 };
 
 /**
