@@ -1,5 +1,5 @@
 description: Teach a networked node to answer "can this collection's group of machines be reached right now?" and to wake the offline queue when a machine reconnects, so queued changes are sent as soon as they can be and never committed by this machine alone.
-prereq: offline-sync-db-core-queue
+prereq: offline-sync-queue-partial-commits
 architecture: docs/offline-sync.md#when-to-submit-the-reachability-gate
 files: packages/db-p2p/src/libp2p-key-network.ts, packages/db-p2p/src/repo/under-replication-drain.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/optimystic-node.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, docs/offline-sync.md
 ----

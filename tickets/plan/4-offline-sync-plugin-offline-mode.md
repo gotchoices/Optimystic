@@ -1,5 +1,5 @@
 description: Let a SQL application switch a database into offline mode, where a commit returns as soon as the transaction is queued on this machine and the application is told later whether it reached the network, while reads keep working from this machine's own copy.
-prereq: offline-sync-db-core-queue
+prereq: offline-sync-queue-partial-commits
 architecture: docs/offline-sync.md#application-interface
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-durability.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/durability-follower.ts, packages/quereus-plugin-optimystic/src/plugin.ts, packages/quereus-plugin-optimystic/README.md, docs/offline-sync.md
 difficulty: hard
