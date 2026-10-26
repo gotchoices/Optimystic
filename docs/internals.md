@@ -216,9 +216,9 @@ list. Five rules follow from the split:
   in that method's existing catch, which restores every participant. `clearPendingActions` clears
   the open segment only; `filterAgainstEntry` (the `filterConflict` hook) and `consumeOwnEntry`
   apply to the open segment only, a sealed segment's action list being the entry's own and never
-  rewritten. A sealed segment is committed on its own by the head commit (ticket
-  `offline-sync-collection-segments`); the version counter on `SegmentList` is what the snapshot
-  restore (next rule) branches on.
+  rewritten — `consumeOwnEntry` has a second arm for the head commit (sixth rule). A sealed segment
+  is committed on its own by the head commit; the version counter on `SegmentList`, bumped by every
+  seal, drop, refusal and head commit, is what the snapshot restore (next rule) branches on.
 - **A snapshot covers the open segment, and its restore is version-aware.** `CollectionSnapshot`
   (`Collection.snapshotPending`) captures the WHOLE tracker's transforms — the sealed segments'
   effects included, which is what `Tree.readView` builds a committed read view from, so a
@@ -263,6 +263,67 @@ list. Five rules follow from the split:
   rewind the committed trees. The throwing collection itself stays half re-staged, the state backlog
   `debt-a-failed-refresh-can-leave-a-collection-half-restaged` describes. `Collection.unstage` keeps
   its own verbatim-or-replay split.
+- **The head segment is committed on its own, without holding the latch across the network.**
+  `Collection.commitHead(entryId, options)` commits exactly the oldest sealed segment as one log
+  entry under the action id and timestamp `options` supplies (`HeadCommitOptions` in
+  `packages/db-core/src/collection/struct.ts`; the queue mints both, and re-supplies the same action
+  id when it re-drives an entry whose earlier attempt may have landed). Its preconditions each throw
+  `SealedSegmentsError` with a `reason`: `not-head`, `refused` (the queue drops a refused segment, it
+  never commits it), `in-flight`. The cycle is the sync's — the per-attempt tracker and log append,
+  the retry accounting with its stall check, the refresh-until-settled loop — extracted into
+  `AttemptCycle` and `stageAttempt` in `packages/db-core/src/collection/write-attempts.ts` so the two
+  paths share one implementation; `syncAttempts` and `commitHead` each decide only what an attempt
+  is built from and what to do with a commit. Four things differ:
+  - **The attempt runs on a head tracker, built once per revision.** The live tracker holds every
+    sealed segment and the open one cumulatively, so an attempt cannot run on a copy of it the way a
+    sync's does. `Collection.headTrackerFor` stages the head segment's actions alone, atomically
+    (`Collection.stageInto`, the path `act` uses), over the committed state — from the invented
+    baseline while the collection has no committed revision, so an invented collection's header,
+    log block and root ride in the head's commit — into a `Tracker` over the handle's read cache
+    with pins of its own. It is built once per revision the attempt requests and reused across
+    attempts, because a rebuild re-runs the handlers and mints fresh ids for the blocks they insert,
+    which would send different content under one `(action id, revision)` (the rule
+    `logAppendBlockIds` closes); a refresh that adopts a newer revision rebuilds it, the write being
+    genuinely different then. Before each attempt its pins are re-judged exactly as
+    `restageIfBasesMoved` re-judges the live queue (`Collection.rereadUnretainedBases`, then
+    `Tracker.movedBases`), and a moved base rebuilds at the same revision — the same narrow
+    exception the `NOTE:` at `syncAttempts`' call records. Staging runs the actions' guards against
+    the committed state; a refusal there is the segment's refusal, recorded and reported once
+    (`Collection.recordSealedRefusal`) and thrown out of `commitHead`, equivalent to the live replay
+    refusing the same segment on a refresh — which usually finds it first, since the cycle opens
+    with a refresh (like `updateAndSync`) that, with the action already marked in flight, also
+    recognises an earlier attempt's own entry and finishes or consumes it rather than committing a
+    second copy.
+  - **The latch is released around the one network `await`.** `Collection.sendUnlatched` releases
+    the collection latch for `source.transact` alone and retakes it before anything on the instance
+    is touched, so `act`, `sealPending`, `update`, a snapshot or restore, and `dropSealed` of
+    another segment all run meanwhile; a second `commitHead` waits on the latch and then meets the
+    `in-flight` precondition. The window is marked by `Collection.headInFlight` — set just before
+    the release, cleared right after the retake, and distinct from `inFlightActionId`, which the
+    head commit's own refreshes run under and must take the own-entry path. Two things read it. A
+    refresh (`updateInternal`) that walks into the in-flight entry returns before `forgetAndAdopt`,
+    changing nothing (`collection:refresh-deferred-to-head-commit`): the entry is not failed, so it
+    is not finished and consumed as the write's own, and it is not a stranger's, so it is not
+    filtered and replayed over state that already contains it; the head commit applies the outcome
+    when it retakes the latch, and the next refresh finds nothing new. And `dropSealed` of the
+    in-flight head throws (`in-flight`). A refresh that finds a rival's entry instead proceeds as
+    any refresh does, and may refuse the head in its replay, so `commitHead` re-checks the head's
+    recorded refusal before every attempt and after every retake, and throws it in place of a retry.
+  - **On success the fold precedes the replay.** Under the retaken latch: the head segment is
+    removed (asserted still first — nothing may remove it while in flight — and the version bumped),
+    the ATTEMPT's transforms — the head's over committed state, plus the log append — are folded
+    into the cache and the revision adopted (`Collection.foldOwnCommit`, shared with the sync), and
+    only then are the remaining sealed segments and the open segment replayed over the committed
+    state that now holds the head. The replay after every head commit is what makes a drain
+    quadratic in the queue length; the tripwire `NOTE:` at that call names the remedy.
+  - **A torn head attempt is finished and consumed as the head.** The refresh between attempts
+    finishes a half-landed attempt from the retained one exactly as a sync's does, and
+    `consumeOwnEntry` then takes its head arm (`Collection.consumeHead`, keyed on
+    `Collection.headCommitEntry`, set for the cycle): the entry records the head segment's actions,
+    so consuming it removes that segment — after asserting the counts agree — and leaves the open
+    segment, which may have grown while the attempt was in flight, untouched. `commitHead` then
+    answers the refresh's durability, or `undefined` when the refresh established the write was
+    saved without re-sending (the status-read fallback of `completeOwnEntry`).
 
 `packages/db-core/test/collection-segments.spec.ts` pins each of these.
 
@@ -1445,7 +1506,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   and the log append): one read per pinned block the cache does not retain (a below-floor answer, so
   storage may have caught up with no log movement), one cache probe per pinned block, and a replay of
   the pending queue if any base moved (logged as `collection:restage-moved-base`). `mustReplay` has
-  the same test as its third reason, beside conflicts and a revision advance.
+  the same test as its third reason, beside conflicts and a revision advance. A head commit's
+  tracker is re-judged the same way before each of its attempts (`Collection.headTrackerFor`), and
+  rebuilt rather than replayed, since it holds the head segment alone.
 
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
@@ -1665,14 +1728,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   therefore produce byte-identical transforms, which needs both of the values the append would
   otherwise mint fresh to be per-WRITE:
   - the entry's **timestamp**, minted once beside the action id (`Collection.syncInternal`) and
-    passed down to `Log.addActions`; on the coordinator path it is `transaction.stamp.timestamp`,
-    fixed at BEGIN and already stable across attempts. Nothing in the tree reads
-    `LogEntry.timestamp` for logic — it is informational — so the write's time is a safe value, and
-    arguably the more honest one.
+    passed down to `Log.addActions` as part of the write's identity (`WriteIdentity` in
+    `packages/db-core/src/collection/write-attempts.ts`); on the coordinator path it is
+    `transaction.stamp.timestamp`, fixed at BEGIN and already stable across attempts, and on a head
+    commit (`Collection.commitHead`) it is the entry's local commit time, supplied by the queue as
+    `HeadCommitOptions.timestamp`. Nothing in the tree reads `LogEntry.timestamp` for logic — it is
+    informational — so the write's time is a safe value, and arguably the more honest one.
   - the **id of the data block** the append mints when the current log block is full (32 entries, or
     `BLOCK_TARGET_BYTES` of JSON — see [A transaction's size limit](#a-transactions-size-limit)).
     `Collection.logAppendBlockIds` hands `Log.open` the ids an earlier attempt of this action minted
-    at this revision, in order, and mints fresh past them. This one is worse than a stray orphan
+    at this revision, in order, and mints fresh past them; every write path reaches it through
+    `stageAttempt` (`packages/db-core/src/collection/write-attempts.ts`) or the coordinator's own
+    append, `commitHead` included. This one is worse than a stray orphan
     block: a second id also rewrites `nextId` on the block that was the tail and `tailId` on the
     collection header, so two attempts send different update operations for two blocks that already
     exist — a machine that landed the first reads the log as ending in one block and a machine that
@@ -1789,8 +1856,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
   `updateInternal` reads the field rather than taking the id as a parameter, so no refresh path can
   be correct-only-by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
-  the field unset, and the consume branch cannot fire. Both write paths set it: `Collection.sync`
-  brackets its whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
+  the field unset, and the consume branch cannot fire. Every write path sets it: `Collection.sync`
+  and `Collection.commitHead` each bracket their whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
   right after taking its latch, pushing the disposers into the commit's `CommitCycle`, which
   `commit` clears in a `finally` around the WHOLE retry loop. The coordinator's clear cannot be
   latch-scoped: its inter-attempt refresh (`collection.refreshInFlight`) — the only reader of the

@@ -1,7 +1,7 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: stage 1 of [Implementation stages](#implementation-stages) is implemented; the rest is a
-proposal.** It describes an opt-in operating
+**Status: stages 1 and 2 of [Implementation stages](#implementation-stages) are implemented; the
+rest is a proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
 transaction's progress to the application until it is committed or has failed.
@@ -338,8 +338,12 @@ The `Collection` additions (the list itself is `SegmentList` in
   what remains.
 - `onSealedRefused`, a callback in `CollectionInitOptions` — how the collection reports a refused
   segment to the queue.
-- `commitHead(entryId, options)` — commits exactly the head segment as one log entry (for an entry
-  that wrote one collection; multi-collection entries go through the coordinator, below).
+- `commitHead(entryId, options)` — commits exactly the head segment as one log entry, under the
+  action id and timestamp `options` supplies (`HeadCommitOptions` in
+  `packages/db-core/src/collection/struct.ts`, which also takes the retry bounds of `SyncOptions`).
+  It answers what `sync` answers — who holds the commit — or `undefined` when its refresh found the
+  write already saved under that action id and consumed the segment without re-sending. For an entry
+  that wrote one collection; multi-collection entries go through the coordinator, below.
 
 The whole-collection commits — `sync`, `updateAndSync`, `actAndSync`, and the coordinator's append
 through `getPendingActions` — refuse with `SealedSegmentsError` (in
@@ -492,14 +496,32 @@ latch, so nothing can be staged into a collection while it syncs. Held across a 
 can take seconds, that would block every SQL write in offline mode behind the drain, which defeats
 the point of the mode.
 
-So the head commit runs the way a sync attempt already does — on a snapshot tracker built from the
-committed state plus the head segment only — without holding the live latch while it waits on the
-network. The latch is taken for the two in-memory steps: building the attempt, and applying the
-outcome (remove the head segment, fold the committed transforms into the cache, adopt the revision,
-replay what remains). This makes live the case the `NOTE` after a successful attempt in
-`Collection.syncAttempts` describes as dormant — staging that happens while a transact is in flight —
-and that note's precondition holds here: the fold and the revision adoption run **before** the
-replay of the remaining segments, which is the order `updateInternal` already requires.
+So the head commit (`Collection.commitHead`) runs its attempts on a **head tracker** — the head
+segment's actions alone, staged over the committed state, built once per revision the attempt
+requests and reused across retries — and releases the live latch for exactly the one `await` on the
+network, the pend-and-commit round trip. Everything else runs under the latch: the refresh that
+opens the cycle, building the head tracker and the attempt, the refresh and backoff between
+attempts, and applying the outcome (remove the head segment, fold the attempt's transforms into the
+cache, adopt the revision, replay what remains). This makes live the case the `NOTE` after a
+successful attempt in `Collection.syncAttempts` describes as dormant — staging that happens while a
+transact is in flight — and that note's precondition holds here: the fold and the revision adoption
+run **before** the replay of the remaining segments, which is the order `updateInternal` already
+requires.
+
+While the latch is released, a refresh of the same handle can walk into the head commit's own log
+entry, already stored while the answer is still on its way back. Such a refresh changes nothing and
+returns (logged `collection:refresh-deferred-to-head-commit`): the entry is not failed, so it is not
+finished and consumed as the write's own, and it is not a stranger's, so it is not filtered and
+replayed over state that already contains it. The head commit applies the outcome itself when it
+retakes the latch, and the next refresh finds nothing new. A refresh that finds a rival's entry
+instead proceeds as any refresh does — the attempt in flight is refused as stale, and the head
+commit's own refresh adopts the rival and rebuilds the head tracker at the new revision, unless the
+replay refused the head, in which case the recorded refusal is thrown in place of a retry.
+`dropSealed` of the segment on the network refuses too (`SealedSegmentsError` with reason
+`in-flight`); any other segment can be dropped meanwhile. The attempt machinery itself —
+the per-attempt tracker and log append, the retry accounting, the refresh-until-settled loop — is
+shared with `sync` (`AttemptCycle` and `stageAttempt` in
+`packages/db-core/src/collection/write-attempts.ts`), so the two paths cannot drift.
 
 ### Classifying an attempt's outcome
 
@@ -1167,10 +1189,10 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
 1. **Typed classification** (implemented). Give the super-majority shortfall and the validator rejection stable
    error classes at the writer, and add one db-core predicate that sorts a commit failure into the
    classification table above. Useful without offline mode; prerequisite of the drain.
-2. **Segments in `Collection`.** `sealPending`, `sealedEntries`, `dropSealed`; segment-aware replay
-   with the refusal callback; open-segment-only snapshot and restore; the head commit that does not
-   hold the latch across the network, with the fold-before-replay order. No plugin change. Unit tests
-   in `db-core` over `TestTransactor`.
+2. **Segments in `Collection`** (implemented). `sealPending`, `sealedEntries`, `dropSealed`;
+   segment-aware replay with the refusal callback; open-segment-only snapshot and restore; the head
+   commit that does not hold the latch across the network, with the fold-before-replay order. No
+   plugin change. Unit tests in `db-core` over `TestTransactor`.
 3. **The queue in `db-core`.** An in-memory, transport-agnostic queue over a set of collections:
    FIFO drain, the coordinator's per-entry slice commit, classification, in-doubt identity, partial
    commits, cascading removal, status events, the `ICohortReachability` port (always reachable in

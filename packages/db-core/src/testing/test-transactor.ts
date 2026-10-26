@@ -668,6 +668,32 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 	}
 }
 
+/**
+ * Answers every pend with a promise shortfall — the cohort's silence, in the shape
+ * `CoordinatorRepo.pend` returns it — and delegates nothing, so nothing is reserved and nothing
+ * lands. For the write paths' "stopped by name" cases: a shortfall is not a conflict a retry can
+ * win, so one attempt is made and `PromiseShortfallError` escapes with every staged action still
+ * staged.
+ */
+export class RefusesPendsAsShortfall extends DelegatingTransactor {
+	/** Pends refused so far. */
+	pends = 0;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+	}
+
+	override async pend(_request: PendRequest): Promise<PendResult> {
+		this.pends++;
+		return {
+			success: false,
+			conflict: false,
+			reason: 'Failed to get super-majority: injected shortfall',
+			shortfall: { approvals: 1, rejections: 0, peerCount: 3, needed: 3, silentPeers: ['peer-b', 'peer-c'] },
+		};
+	}
+}
+
 /** What one attempt of a write put on the wire: the pend's transforms, with the action id and
  *  revision it was pended under. Recorded by {@link RecordsAttemptsRefusesFirstCommit}. */
 export type RecordedAttempt = {

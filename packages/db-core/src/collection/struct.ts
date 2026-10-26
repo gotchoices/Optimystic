@@ -1,4 +1,4 @@
-import type { IBlock, BlockId, Action, WriteDurability } from "../index.js";
+import type { IBlock, BlockId, Action, ActionId, WriteDurability } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
@@ -29,6 +29,14 @@ export class ActionRefusedError extends Error {
 	}
 }
 
+/** Why a sealed segment stood in the way of a commit (see {@link SealedSegmentsError}):
+ * - `whole-collection` — a whole-collection commit was asked for while a segment is sealed.
+ * - `not-head` — `commitHead` named a segment that is not the oldest sealed one.
+ * - `refused` — `commitHead` named a segment a replay has refused; the queue drops it instead.
+ * - `in-flight` — a head commit is on the network for the named segment, so neither a second
+ *   `commitHead` nor a `dropSealed` of it can proceed. */
+export type SealedSegmentsReason = 'whole-collection' | 'not-head' | 'refused' | 'in-flight';
+
 /**
  * Thrown by the whole-collection commit paths — {@link ICollection.sync},
  * {@link ICollection.updateAndSync}, `Collection.actAndSync` and `Collection.getPendingActions`
@@ -36,7 +44,8 @@ export class ActionRefusedError extends Error {
  * everything staged as ONE log entry under one action id; over sealed segments that would merge
  * several queue entries into one, which the queue's identity rules forbid
  * (docs/offline-sync.md §Identity across attempts). A sealed segment is committed on its own,
- * through the head commit (ticket `offline-sync-collection-segments`).
+ * through `Collection.commitHead`, whose own preconditions throw this class too, with a
+ * {@link reason} other than `whole-collection` (see {@link SealedSegmentsReason}).
  *
  * Nothing is unstaged or changed when this is thrown: every segment, sealed and open, is exactly
  * as it was.
@@ -46,12 +55,47 @@ export class SealedSegmentsError extends Error {
 		readonly collectionId: CollectionId,
 		/** The sealed segments' entry ids, in order. */
 		readonly sealedEntries: EntryId[],
+		readonly reason: SealedSegmentsReason = 'whole-collection',
+		/** The entry a `commitHead` or `dropSealed` named, for every reason but `whole-collection`. */
+		readonly entryId?: EntryId,
 	) {
-		super(`collection ${collectionId} holds sealed segment(s) ${sealedEntries.join(', ')}; `
-			+ `a whole-collection commit would merge them into one log entry — commit the head segment instead`);
+		super(sealedSegmentsMessage(collectionId, sealedEntries, reason, entryId));
 		this.name = 'SealedSegmentsError';
 	}
 }
+
+function sealedSegmentsMessage(collectionId: CollectionId, sealedEntries: EntryId[], reason: SealedSegmentsReason, entryId: EntryId | undefined): string {
+	const listed = sealedEntries.length === 0 ? 'nothing' : sealedEntries.join(', ');
+	switch (reason) {
+		case 'whole-collection':
+			return `collection ${collectionId} holds sealed segment(s) ${listed}; `
+				+ `a whole-collection commit would merge them into one log entry — commit the head segment instead`;
+		case 'not-head':
+			return `collection ${collectionId}: entry ${entryId} is not the head sealed segment (sealed: ${listed}); `
+				+ `only the oldest sealed segment can be committed`;
+		case 'refused':
+			return `collection ${collectionId}: entry ${entryId} carries a recorded refusal; `
+				+ `a refused segment is dropped, never committed`;
+		case 'in-flight':
+			return `collection ${collectionId}: a head commit of entry ${entryId} is in flight on this instance`;
+	}
+}
+
+/** What `Collection.commitHead` commits the head segment under, beside the retry bounds of
+ * {@link SyncOptions}. Both fields are the queue's (docs/offline-sync.md §Identity across
+ * attempts): the collection mints neither. */
+export type HeadCommitOptions = SyncOptions & {
+	/** The action id the attempt cycle runs under. The queue mints it, and re-supplies the SAME id
+	 * when it re-drives an entry whose earlier attempt may have landed, so the refresh that opens the
+	 * cycle recognises that attempt's log entry as the write's own and finishes or consumes it
+	 * instead of committing a second copy. */
+	actionId: ActionId;
+	/** The entry's local commit time, stamped on the log entry in place of the time
+	 * `Collection.syncInternal` mints for a sync. Fixed per write, so every attempt appends the same
+	 * entry (see "A write's log append is a fixed function of the write and the revision it is
+	 * requesting" in docs/internals.md). */
+	timestamp: number;
+};
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 

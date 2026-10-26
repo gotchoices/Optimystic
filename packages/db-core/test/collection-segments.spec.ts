@@ -1,12 +1,16 @@
 /**
- * Sealed segments in a `Collection` (ticket `offline-sync-segment-bookkeeping`, stage 2 of
- * docs/offline-sync.md): the staged actions are an ordered list of sealed segments, one per
- * queued entry, ahead of the open segment the current transaction stages into. A segment can be
- * removed on its own, a replay stages each sealed segment atomically and records a refusal of one
- * instead of throwing it, and a whole-collection commit refuses while anything is sealed.
+ * Sealed segments in a `Collection` (stage 2 of docs/offline-sync.md): the staged actions are an
+ * ordered list of sealed segments, one per queued entry, ahead of the open segment the current
+ * transaction stages into. A segment can be removed on its own, a replay stages each sealed segment
+ * atomically and records a refusal of one instead of throwing it, a whole-collection commit refuses
+ * while anything is sealed (ticket `offline-sync-segment-bookkeeping`), a snapshot covers the open
+ * segment only (`offline-sync-open-segment-snapshot`), and the head segment is committed on its own
+ * without holding the collection latch across the network (`offline-sync-collection-segments`).
  *
  * Every case runs over `Tree` and `TestTransactor`, with a real rival handle committing through
- * `commitRivalTreeWrite` where a refusal has to be provoked — nothing is faked.
+ * `commitRivalTreeWrite` where a refusal has to be provoked — nothing is faked. The doubles that
+ * park or tear a commit (`GatedCommitTransactor`, `GatedPendTransactor`, `TailLandsButReportsStale`)
+ * delegate the real round trip and only decide WHEN the answer comes back, or how much of it lands.
  */
 
 import { expect } from 'chai';
@@ -15,16 +19,27 @@ import {
 	TreeEntryChangedError,
 	TreeKeyTakenError,
 	ActionRefusedError,
+	PromiseShortfallError,
 	SealedSegmentsError,
 	SegmentList,
 	TransactionCoordinator,
 	createTransactionStamp,
 	createTransactionId,
 	ACTIONS_ENGINE_ID,
+	type HeadCommitOptions,
+	type ITransactor,
 	type Transaction,
 	type TreeReplaceAction,
 } from '../src/index.js';
-import { TestTransactor, commitRivalTreeWrite } from '../src/testing/test-transactor.js';
+import {
+	TestTransactor,
+	GatedCommitTransactor,
+	GatedPendTransactor,
+	RecordsAttemptsRefusesFirstCommit,
+	RefusesPendsAsShortfall,
+	TailLandsButReportsStale,
+	commitRivalTreeWrite,
+} from '../src/testing/test-transactor.js';
 import { captureCollectionLog } from './capture-log.js';
 
 interface Entry {
@@ -55,7 +70,7 @@ async function seedUsers(transactor: TestTransactor): Promise<void> {
 }
 
 /** A tree whose collection reports sealed-segment refusals into `refusals`. */
-async function openReporting(transactor: TestTransactor, refusals: Refusal[], id = USERS): Promise<Tree<number, Entry>> {
+async function openReporting(transactor: ITransactor, refusals: Refusal[], id = USERS): Promise<Tree<number, Entry>> {
 	return Tree.createOrOpen<number, Entry>(transactor, id, byKey, undefined, undefined, {
 		onSealedRefused: (entryId, error) => { refusals.push({ entryId, error }); },
 	});
@@ -69,6 +84,35 @@ async function sealAs(tree: Tree<number, Entry>, entryId: string, actions: TreeR
 
 async function rivalWrites(transactor: TestTransactor, key: number, name: string): Promise<void> {
 	await commitRivalTreeWrite<number, Entry>(transactor, USERS, byKey, [[key, entry(key, name)]]);
+}
+
+/** The head commit's identity, as the queue would supply it, with a short retry budget. */
+const headOptions = (actionId: string): HeadCommitOptions =>
+	({ actionId, timestamp: Date.now(), maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+
+/** The keys each committed log entry of `id` replaced, in log order, read through a fresh handle
+ * over the UNWRAPPED transactor — durable storage, not the handle under test's view. */
+async function committedKeys(inner: TestTransactor, id = USERS): Promise<number[][]> {
+	const fresh = await Tree.createOrOpen<number, Entry>(inner, id, byKey);
+	const keys: number[][] = [];
+	for await (const action of fresh.getCollection().selectLog()) {
+		keys.push(action.data.map(([key]) => key));
+	}
+	return keys;
+}
+
+/** `promise`, or a failure naming `what` if it has not settled within `ms` — for a call that must
+ * not wait on the network. */
+async function withinMs<T>(ms: number, promise: Promise<T>, what: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`${what} blocked for ${ms}ms`)), ms);
+	});
+	try {
+		return await Promise.race([promise, timeout]);
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 describe('Collection sealed segments', function () {
@@ -395,6 +439,275 @@ describe('Collection sealed segments', function () {
 			expect(await tree.get(10), 'the sealed segments were re-staged before the refusal').to.deep.equal(entry(10, 'ten'));
 			expect(await tree.get(20)).to.deep.equal(entry(20, 'twenty'));
 			expect(await tree.get(1)).to.deep.equal(entry(1, 'rival'));
+		});
+	});
+
+
+	describe('commitHead (ticket offline-sync-collection-segments)', () => {
+		it('releases the latch while the commit is on the network: staging goes on, a second commitHead and a dropSealed of the head are refused as in flight, and the outcome folds before the replay', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new GatedCommitTransactor(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			await transactor.commitParked;	// durable on the inner transactor; the answer not yet returned
+
+			// The latch is released: staging does not wait for the network.
+			await withinMs(2000, tree.stage([[2, entry(2, 'open')]]), 'staging during the head commit');
+			const second = await capture(() => collection.commitHead('E1', headOptions('A2')));
+			expect(second).to.be.instanceOf(SealedSegmentsError);
+			expect((second as SealedSegmentsError).reason).to.equal('in-flight');
+			const drop = await capture(() => collection.dropSealed('E1'));
+			expect(drop).to.be.instanceOf(SealedSegmentsError);
+			expect((drop as SealedSegmentsError).reason).to.equal('in-flight');
+			expect(collection.sealedEntries(), 'the head stays sealed while in flight').to.deep.equal(['E1']);
+
+			transactor.openGate();
+			const durability = await committing;
+
+			expect(durability, 'who holds the commit').to.not.equal(undefined);
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(await committedKeys(inner), 'the committed log holds the head alone').to.deep.equal([[5], [1]]);
+			expect(collection.committedRevision()).to.equal(2);
+			expect(collection.hasUnsyncedChanges(), 'the open action is still staged').to.be.true;
+			expect(await tree.get(1), 'a read sees the committed head').to.deep.equal(entry(1, 'queued'));
+			expect(await tree.get(2), 'and the open action, replayed over it').to.deep.equal(entry(2, 'open'));
+		});
+
+		it('refuses a segment that is not the head, and commits each head in turn, re-staging the segment behind it over the committed state', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'one')]]);
+			await sealAs(tree, 'E2', [[2, entry(2, 'two')]]);
+
+			const notHead = await capture(() => collection.commitHead('E2', headOptions('A2')));
+			expect(notHead).to.be.instanceOf(SealedSegmentsError);
+			expect((notHead as SealedSegmentsError).reason).to.equal('not-head');
+			expect(collection.sealedEntries(), 'nothing changed').to.deep.equal(['E1', 'E2']);
+
+			await collection.commitHead('E1', headOptions('A1'));
+
+			expect(collection.sealedEntries(), 'E2 is the head now, its actions never consumed').to.deep.equal(['E2']);
+			expect(await committedKeys(inner)).to.deep.equal([[5], [1]]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'one'));
+			expect(await tree.get(2), 'E2 is re-staged over the committed head').to.deep.equal(entry(2, 'two'));
+
+			await collection.commitHead('E2', headOptions('A2'));
+
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(await committedKeys(inner)).to.deep.equal([[5], [1], [2]]);
+			expect(collection.hasUnsyncedChanges()).to.be.false;
+		});
+
+		it('a reader\'s refresh that walks into the in-flight entry defers to the commit: nothing adopted, nothing refused, and the refresh after the commit finds nothing new', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new GatedCommitTransactor(inner);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			await transactor.commitParked;
+			const lines = await captureCollectionLog(() => tree.update());
+
+			expect(lines.some(line => line.includes('collection:refresh-deferred-to-head-commit') && line.includes('entry=E1') && line.includes('action=A1')),
+				`the deferral is logged: ${lines.join('\n')}`).to.be.true;
+			expect(collection.committedRevision(), 'the held revision is unchanged').to.equal(1);
+			expect(collection.sealedEntries(), 'the head is still sealed').to.deep.equal(['E1']);
+			expect(collection.sealedRefusal('E1')).to.be.undefined;
+			expect(refusals).to.be.empty;
+
+			transactor.openGate();
+			await committing;
+
+			expect(collection.committedRevision(), 'the commit applied its own outcome').to.equal(2);
+			const after = await captureCollectionLog(() => tree.update());
+			expect(after.filter(line => line.includes('refresh-deferred')), 'nothing to defer to any more').to.be.empty;
+			expect(collection.committedRevision(), 'and nothing new to adopt').to.equal(2);
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(await committedKeys(inner), 'the head is logged once').to.deep.equal([[5], [1]]);
+		});
+
+		it('a rival that lands while the attempt is in flight: a reader\'s refresh proceeds and adopts it, the attempt is refused, and the retry commits the head rebuilt at the adopted revision', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new GatedPendTransactor<TreeReplaceAction<number, Entry>>(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			transactor.collection = collection;
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			await transactor.pendParked;	// the attempt is built, nothing has reached storage
+			await rivalWrites(inner, 2, 'rival');	// lands first
+			await tree.update();	// the reader's refresh finds the rival, not our entry: it proceeds
+
+			expect(collection.committedRevision(), 'the rival was adopted while the attempt was in flight').to.equal(2);
+			expect(collection.sealedRefusal('E1'), 'the head holds over the rival').to.be.undefined;
+
+			transactor.openGate();	// the stale attempt reaches storage and is refused
+			const durability = await committing;
+
+			expect(durability).to.not.equal(undefined);
+			expect(transactor.snapshots, 'the refused attempt, then the retry').to.have.length(2);
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(collection.committedRevision()).to.equal(3);
+			expect(await committedKeys(inner), 'the rival first, then the head').to.deep.equal([[5], [2], [1]]);
+			const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			expect(await fresh.get(1)).to.deep.equal(entry(1, 'queued'));
+			expect(await fresh.get(2)).to.deep.equal(entry(2, 'rival'));
+		});
+
+		it('a head attempt whose tail landed but was refused: the refresh finishes it from the retained attempt and consumes the HEAD, not the action staged during the window, and the segment behind it is untouched', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new TailLandsButReportsStale(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			await sealAs(tree, 'E2', [[3, entry(3, 'behind')]]);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			// Queued on the latch, which the head commit releases for its network round trip: this
+			// stages while the attempt is in flight, and holds the latch until the commit retakes it.
+			const staging = tree.stage([[2, entry(2, 'open')]]);
+			const durability = await committing;
+			await staging;
+
+			expect(transactor.tears, 'the attempt landed its tail only').to.equal(1);
+			expect(durability, 'the refresh that finished the write reports who holds it').to.not.equal(undefined);
+			expect(collection.sealedEntries(), 'the head was consumed; the segment behind it was not').to.deep.equal(['E2']);
+			expect(await committedKeys(inner), 'the head is logged once').to.deep.equal([[5], [1]]);
+			expect(collection.committedRevision()).to.equal(2);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
+			expect(await tree.get(2), 'the open action is still staged').to.deep.equal(entry(2, 'open'));
+			expect(await tree.get(3), 'E2 is re-staged, its actions never consumed').to.deep.equal(entry(3, 'behind'));
+			const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			expect(await fresh.get(2), 'nothing of the open segment landed').to.be.undefined;
+			expect(await fresh.get(3), 'nor of E2').to.be.undefined;
+		});
+
+		it('a head refused on rebase before anything is sent: the recorded refusal is thrown, reported once, and no attempt is made', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new RecordsAttemptsRefusesFirstCommit(inner, 0);	// records pends, refuses nothing
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued'), { kind: 'absent' }]]);
+			await rivalWrites(inner, 1, 'rival');
+
+			const err = await capture(() => collection.commitHead('E1', headOptions('A1')));
+
+			expect(err, 'the handler\'s own refusal').to.be.instanceOf(TreeKeyTakenError);
+			expect(refusals.map(r => r.entryId), 'reported once').to.deep.equal(['E1']);
+			expect(collection.sealedRefusal('E1')).to.equal(err);
+			expect(transactor.attempts, 'nothing was sent').to.be.empty;
+			expect(collection.sealedEntries(), 'the refused segment stays listed for the queue to drop').to.deep.equal(['E1']);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'rival'));
+
+			const again = await capture(() => collection.commitHead('E1', headOptions('A2')));
+			expect(again, 'a refused head meets the precondition').to.be.instanceOf(SealedSegmentsError);
+			expect((again as SealedSegmentsError).reason).to.equal('refused');
+			expect(refusals, 'and is not reported again').to.have.length(1);
+		});
+
+		it('a head refused by a rival that landed while the attempt was in flight: the refresh adopts the rival, the replay refuses the head, and the recorded refusal is thrown instead of a retry', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new GatedPendTransactor<TreeReplaceAction<number, Entry>>(inner);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			transactor.collection = collection;
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued'), { kind: 'absent' }]]);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			await transactor.pendParked;
+			await rivalWrites(inner, 1, 'rival');	// takes the head's key
+			transactor.openGate();
+			const err = await capture(() => committing);
+
+			expect(err).to.be.instanceOf(TreeKeyTakenError);
+			expect(refusals.map(r => r.entryId)).to.deep.equal(['E1']);
+			expect(transactor.snapshots, 'one attempt, no retry').to.have.length(1);
+			expect(collection.sealedEntries()).to.deep.equal(['E1']);
+			expect(collection.committedRevision(), 'the rival was adopted').to.equal(2);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'rival'));
+			expect(await committedKeys(inner), 'the seed and the rival only').to.deep.equal([[5], [1]]);
+		});
+
+		it('a snapshot restored across a head commit takes the replay arm: the committed segment is not put back, the open action is gone, and the log holds it once', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E', [[1, entry(1, 'one')]]);
+			const snapshot = collection.snapshotPending();
+			await tree.stage([[2, entry(2, 'open')]]);
+
+			await collection.commitHead('E', headOptions('A1'));
+			await collection.restorePending(snapshot);
+
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(collection.hasUnsyncedChanges(), 'nothing is staged: E was not re-staged, the open action is gone').to.be.false;
+			expect(await tree.get(1), 'E reads through, committed').to.deep.equal(entry(1, 'one'));
+			expect(await tree.get(2)).to.be.undefined;
+			expect(await committedKeys(inner), 'E is committed once').to.deep.equal([[5], [1]]);
+			await tree.sync();	// nothing to commit: the restore did not reinstate E
+			expect(await committedKeys(inner)).to.deep.equal([[5], [1]]);
+		});
+
+		it('an invented collection commits its header, log and root with the head, re-stages the segment behind it over the committed state, and stops consulting the baseline', async () => {
+			const transactor = new TestTransactor();
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'fresh', byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'one')]]);
+			await sealAs(tree, 'E2', [[2, entry(2, 'two')]]);
+			expect(collection.committedRevision(), 'invented').to.be.undefined;
+
+			const durability = await collection.commitHead('E1', headOptions('A1'));
+
+			expect(durability).to.not.equal(undefined);
+			expect(collection.committedRevision(), 'a committed revision is adopted, so the baseline is no longer consulted').to.equal(1);
+			expect(collection.sealedEntries()).to.deep.equal(['E2']);
+			const opened = await Tree.open<number, Entry>(transactor, 'fresh', byKey);
+			expect(opened, 'the header is committed').to.not.be.undefined;
+			expect(await opened!.get(1), 'with the root and E1').to.deep.equal(entry(1, 'one'));
+			expect(await opened!.get(2), 'E2 is not committed').to.be.undefined;
+			expect(await committedKeys(transactor, 'fresh')).to.deep.equal([[1]]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'one'));
+			expect(await tree.get(2), 'E2 is re-staged over the committed state and readable').to.deep.equal(entry(2, 'two'));
+		});
+
+		it('a promise shortfall out of a head attempt is thrown by name and leaves every segment staged', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new RefusesPendsAsShortfall(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'one')]]);
+			await sealAs(tree, 'E2', [[2, entry(2, 'two')]]);
+			await tree.stage([[3, entry(3, 'open')]]);
+
+			const err = await capture(() => collection.commitHead('E1', headOptions('A1')));
+
+			expect(err).to.be.instanceOf(PromiseShortfallError);
+			expect(transactor.pends, 'one attempt, stopped by name').to.equal(1);
+			expect(collection.sealedEntries()).to.deep.equal(['E1', 'E2']);
+			expect(collection.sealedRefusal('E1'), 'a shortfall is not a refusal of the segment').to.be.undefined;
+			expect(collection.committedRevision()).to.equal(1);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'one'));
+			expect(await tree.get(2)).to.deep.equal(entry(2, 'two'));
+			expect(await tree.get(3)).to.deep.equal(entry(3, 'open'));
+			expect(await committedKeys(inner)).to.deep.equal([[5]]);
 		});
 	});
 

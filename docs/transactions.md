@@ -173,7 +173,7 @@ This document describes the architecture for multi-collection transactions in Op
 >   difference: `Collection.sync` stops sleeping once a write has lost
 >   `SlotHoldAfterLosses` attempts to confirmed committed revisions, the latest included,
 >   because cohort members then hold the next slot for it (`retryBackoffMs` in
->   `packages/db-core/src/collection/collection.ts`); the coordinator loop cannot
+>   `packages/db-core/src/collection/write-attempts.ts`); the coordinator loop cannot
 >   see the confirmed revision yet and keeps backing off). Only once
 >   the retry budget (`maxAttempts` / optional `deadlineMs`, tunable via the
 >   `SyncOptions` passed to `commit`/`session.commit`) is exhausted does it throw a
