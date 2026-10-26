@@ -2,6 +2,7 @@ import type { IBlock, BlockId, Action, ActionId, WriteDurability } from "../inde
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
+import type { InFlightAttempt } from "./collection.js";
 
 export type CollectionId = BlockId;
 
@@ -95,6 +96,22 @@ export type HeadCommitOptions = SyncOptions & {
 	 * entry (see "A write's log append is a fixed function of the write and the revision it is
 	 * requesting" in docs/internals.md). */
 	timestamp: number;
+	/** The write-ahead hook: called with each attempt exactly as it is about to be sent — after it is
+	 * built and BEFORE the collection latch is released for the network — and awaited under that
+	 * latch. It is where the queue records the attempt's identity before sending it
+	 * (docs/offline-sync.md §Identity across attempts) and, later, where the journal writes it. A
+	 * throw aborts the cycle before anything is sent: it escapes `commitHead` unchanged, the handle
+	 * closes, and every segment is exactly as it was. */
+	recordAttempt?: (attempt: InFlightAttempt) => Promise<void>;
+	/** The attempt an earlier cycle under the SAME `actionId` handed to `recordAttempt` and did not
+	 * resolve — it must carry this `actionId`, and `openHeadCommit` throws before touching anything
+	 * when it does not. Seeded as the retained attempt right after the action is marked in flight,
+	 * so the cycle's opening refresh, finding that attempt's log entry with blocks missing, finishes
+	 * it from these transforms (`Collection.completeOwnEntry`) instead of refusing it as torn with
+	 * `transforms-not-held`. Without it a re-drive can recognise only an attempt that landed whole.
+	 * The revision check still applies: an attempt recorded at a revision other than the entry's is
+	 * refused as before. */
+	resume?: InFlightAttempt;
 };
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;

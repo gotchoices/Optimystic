@@ -165,12 +165,15 @@ export async function stageAttempt<TAction>(
 	};
 }
 
-/** Exactly what a refused attempt sent, for `Collection.retainInFlightAttempt`: a refused commit is
- * not proof nothing landed, and if the refresh that follows finds the attempt's own log entry these
- * are the transforms that finish the action. The attempt's tracker is abandoned once this is taken,
- * so its transforms are handed over as they are, uncopied. */
-export function retainedAttempt(staged: StagedAttempt): InFlightAttempt {
+/** Exactly what an attempt sends under `actionId`, for `Collection.retainInFlightAttempt` and for
+ * the write-ahead hook (`HeadCommitOptions.recordAttempt`): a refused commit is not proof nothing
+ * landed, and if the refresh that follows finds the attempt's own log entry these are the
+ * transforms that finish the action. The attempt's tracker is abandoned once this is taken, so its
+ * transforms are handed over as they are, uncopied; nothing downstream mutates them (a fold clones
+ * the inserts and applies the updates to the cache's own blocks). */
+export function retainedAttempt(staged: StagedAttempt, actionId: ActionId): InFlightAttempt {
 	return {
+		actionId,
 		rev: staged.rev,
 		transforms: staged.tracker.transforms,
 		tailId: staged.tailId,

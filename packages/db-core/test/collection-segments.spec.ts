@@ -22,6 +22,8 @@ import {
 	PromiseShortfallError,
 	SealedSegmentsError,
 	SegmentList,
+	SyncRetryExhaustedError,
+	TornActionError,
 	TransactionCoordinator,
 	createTransactionStamp,
 	createTransactionId,
@@ -29,6 +31,7 @@ import {
 	type CommitRequest,
 	type CommitResult,
 	type HeadCommitOptions,
+	type InFlightAttempt,
 	type ITransactor,
 	type PendRequest,
 	type PendResult,
@@ -141,6 +144,17 @@ class CommitLandsThenThrows extends DelegatingTransactor {
 			throw new Error('connection reset after the commit landed');
 		}
 		return result;
+	}
+}
+
+/** `TailLandsButReportsStale` that also counts the pends it delegates, so a test can say how many
+ * attempts and re-sends went to the network: with no injections it tears nothing and only counts. */
+class CountsPends extends TailLandsButReportsStale {
+	pends = 0;
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		this.pends++;
+		return super.pend(request);
 	}
 }
 
@@ -766,6 +780,117 @@ describe('Collection sealed segments', function () {
 			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
 			expect(await tree.get(2), 'the open action is still staged').to.deep.equal(entry(2, 'open'));
 			expect(await tree.get(3), 'E2 is re-staged over the committed head').to.deep.equal(entry(3, 'behind'));
+		});
+	});
+
+	describe('the write-ahead hook and resuming a recorded attempt (ticket offline-sync-head-commit-handle)', () => {
+		it('a recordAttempt hook that throws aborts the cycle before anything is sent: its error escapes commitHead unchanged, every segment is intact, and the next commitHead lands the head once', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new CountsPends(inner, 0);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			await sealAs(tree, 'E2', [[3, entry(3, 'behind')]]);
+			const recorded: InFlightAttempt[] = [];
+			const journalDown = new Error('journal write failed');
+			const recordAttempt = async (attempt: InFlightAttempt) => {
+				recorded.push(attempt);
+				if (recorded.length === 1) throw journalDown;
+			};
+
+			const err = await capture(() => collection.commitHead('E1', { ...headOptions('A1'), recordAttempt }));
+
+			expect(err, 'the hook\'s own error, unchanged').to.equal(journalDown);
+			expect(transactor.pends, 'nothing was sent').to.equal(0);
+			expect(recorded[0], 'the hook saw the attempt as it would have been sent').to.include({ actionId: 'A1', rev: 2 });
+			expect(recorded[0]?.tailId).to.be.a('string');
+			expect(collection.sealedEntries()).to.deep.equal(['E1', 'E2']);
+			expect(collection.committedRevision()).to.equal(1);
+			expect(await committedKeys(inner)).to.deep.equal([[5]]);
+
+			// The latch was released with the handle: this would wait forever otherwise.
+			const durability = await collection.commitHead('E1', { ...headOptions('A1'), recordAttempt });
+
+			expect(durability).to.not.equal(undefined);
+			expect(recorded, 'the retry recorded its attempt too, before sending it').to.have.length(2);
+			expect(transactor.pends).to.equal(1);
+			expect(transactor.landedCommits).to.equal(1);
+			expect(collection.sealedEntries()).to.deep.equal(['E2']);
+			expect(await committedKeys(inner), 'the head is logged once').to.deep.equal([[5], [1]]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
+			expect(await tree.get(3), 'E2 is re-staged over the committed head').to.deep.equal(entry(3, 'behind'));
+		});
+
+		it('a recorded attempt finishes a torn head on a later cycle: without resume the re-drive is refused as torn (transforms-not-held); with it the opening refresh finishes the write, consumes the head, and no new attempt is built', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new CountsPends(inner, 1);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			await sealAs(tree, 'E2', [[3, entry(3, 'behind')]]);
+			const recorded: InFlightAttempt[] = [];
+			// One attempt and no refresh after it, so the cycle ends with its tail landed and the
+			// attempt retained nowhere a later cycle can see — except through the hook.
+			const options = (resume?: InFlightAttempt): HeadCommitOptions => ({
+				...headOptions('A1'),
+				maxAttempts: 1,
+				recordAttempt: async attempt => { recorded.push(attempt); },
+				...(resume === undefined ? {} : { resume }),
+			});
+
+			const first = await capture(() => collection.commitHead('E1', options()));
+			expect(first).to.be.instanceOf(SyncRetryExhaustedError);
+			expect(transactor.tears, 'the tail landed, the rest was abandoned').to.equal(1);
+			expect(recorded).to.have.length(1);
+			expect(recorded[0]).to.include({ actionId: 'A1', rev: 2 });
+			expect(collection.sealedEntries(), 'in doubt: nothing was applied').to.deep.equal(['E1', 'E2']);
+			expect(collection.committedRevision()).to.equal(1);
+
+			// The control: a re-drive under the same id with nothing handed back finds the entry and
+			// can only refuse it — the blocks are missing and nothing holds the transforms.
+			const control = await capture(() => collection.commitHead('E1', options()));
+			expect(control).to.be.instanceOf(TornActionError);
+			expect((control as TornActionError).reason).to.equal('transforms-not-held');
+			expect(recorded, 'the opening refresh threw before any attempt was built').to.have.length(1);
+			expect(transactor.pends, 'nothing was re-sent').to.equal(1);
+			expect(collection.sealedEntries()).to.deep.equal(['E1', 'E2']);
+			expect(collection.committedRevision()).to.equal(1);
+
+			const durability = await collection.commitHead('E1', options(recorded[0]));
+
+			expect(durability, 'finished by re-sending the recorded attempt, so who holds it is known').to.not.equal(undefined);
+			expect(recorded, 'no new attempt was built').to.have.length(1);
+			expect(transactor.pends, 'the re-send of the recorded attempt only').to.equal(2);
+			expect(transactor.landedCommits, 'landed whole once').to.equal(1);
+			expect(collection.sealedEntries(), 'the head was consumed; E2 was not').to.deep.equal(['E2']);
+			expect(collection.committedRevision()).to.equal(2);
+			expect(await committedKeys(inner), 'the head is logged once').to.deep.equal([[5], [1]]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
+			expect(await tree.get(3), 'E2 is re-staged over the committed head').to.deep.equal(entry(3, 'behind'));
+			const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			expect(await fresh.get(1), 'the data block landed, not only the tail').to.deep.equal(entry(1, 'queued'));
+		});
+
+		it('a recorded attempt under another action id is refused before the latch is taken', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			const recorded: InFlightAttempt[] = [];
+			await capture(() => collection.commitHead('E1', {
+				...headOptions('A1'), maxAttempts: 1,
+				recordAttempt: async attempt => { recorded.push(attempt); throw new Error('stop here'); },
+			}));
+
+			const err = await capture(() => collection.commitHead('E1', { ...headOptions('A2'), resume: recorded[0] }));
+
+			expect(err).to.be.instanceOf(Error);
+			expect((err as Error).message).to.include('A1').and.include('A2');
+			expect(collection.sealedEntries()).to.deep.equal(['E1']);
+			await withinMs(500, tree.stage([[2, entry(2, 'open')]]), 'staging after the refused open');
 		});
 	});
 

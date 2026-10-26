@@ -20,6 +20,8 @@ import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
 import { AttemptCycle, retainedAttempt, stageAttempt } from "./write-attempts.js";
 import type { AttemptTarget, Refresh, StagedAttempt, WriteIdentity } from "./write-attempts.js";
+import { driveHeadCommit } from "./head-commit.js";
+import type { HeadCommitHandle } from "./head-commit.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { randomBytes } from '@noble/hashes/utils.js';
@@ -53,8 +55,16 @@ type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
 /** Exactly what one failed write attempt sent to the transactor — enough to send the same thing
  * again. Retained by {@link Collection.retainInFlightAttempt} so that a refresh which then finds
  * this attempt's own log entry can land the blocks the attempt left behind, at the same action id
- * and revision (see {@link Collection.completeOwnEntry}). */
+ * and revision (see {@link Collection.completeOwnEntry}).
+ *
+ * Also the shape a caller RECORDS before an attempt is sent and hands back on a later cycle
+ * (`HeadCommitOptions.recordAttempt` and `resume`; docs/offline-sync.md §Identity across attempts),
+ * so it must stay plain data — ids, numbers and the transforms as the wire carries them, nothing
+ * with object identity and no functions: the offline-sync journal serialises it as JSON. */
 export type InFlightAttempt = {
+	/** The action id the attempt was sent under — the one every attempt of the write reuses, and
+	 * the one a cycle that resumes from this record must run under. */
+	actionId: ActionId;
 	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
 	rev: number;
 	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
@@ -104,14 +114,6 @@ type LogEnds = {
  * reading the block failed. */
 type AttributedRead = { entry: GetBlockResult | undefined } | { error: unknown };
 type AttributedReads = Map<BlockId, AttributedRead>;
-
-/** The handle a head commit holds on the collection latch while it runs: the attempt's one network
- * round trip is made with the latch released, and the latch is retaken before anything on the
- * instance is touched again (see {@link Collection.commitHead}). */
-type LatchHandle = {
-	release(): void;
-	retake(): Promise<void>;
-};
 
 /** The tracker a head commit's attempts are built from: the head segment's actions staged over the
  * committed state, and the revision the attempt built from it requests (see
@@ -261,7 +263,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Only the latest attempt is kept. An own entry can only be visible at the revision of an
 	 * attempt whose tail landed, and a later attempt at a DIFFERENT revision is only made after a
 	 * refresh adopted somebody else's entry at the earlier one — which is proof the earlier tail did
-	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch. */
+	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch.
+	 *
+	 * A head commit may be opened with one already in hand ({@link openHeadCommit}'s `resume`): the
+	 * attempt an earlier cycle under the same action id recorded through `HeadCommitOptions.recordAttempt`
+	 * before sending it, which the cycle's opening refresh can then finish from. */
 	private inFlightAttempt?: InFlightAttempt;
 
 	/** The log data-block ids the append of the action marked in {@link inFlightActionId} has
@@ -270,15 +276,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * {@link beginInFlightAction} and its disposer. */
 	private mintedLogBlockIds?: { rev: number; ids: BlockId[] };
 
-	/** The sealed segment a {@link commitHead} cycle on this instance is committing, for the whole
-	 * cycle — set and cleared under the latch, beside {@link inFlightActionId}. Read by
+	/** The sealed segment a head commit on this instance is committing ({@link openHeadCommit}), for
+	 * the whole cycle — set and cleared beside {@link inFlightActionId}. Read by
 	 * {@link consumeOwnEntry}: the entry a head commit's own refresh finds under the in-flight action
 	 * id records the HEAD segment's actions, not the open segment's, so consuming it removes that
 	 * segment. */
 	private headCommitEntry?: EntryId;
 
 	/** Set only while a head commit has RELEASED the collection latch for its one network round trip
-	 * (see {@link commitHead}), and cleared the moment it is retaken, so anything that runs under the
+	 * ({@link HeadCommitHandle.release}), and cleared the moment it is retaken, so anything that runs under the
 	 * latch in that window can tell. Two things must: a refresh ({@link updateInternal}) that walks
 	 * into the in-flight entry returns without adopting it, since it can neither finish it as the
 	 * write's own (nothing failed, nothing is retained) nor replay it as a stranger's (that would
@@ -830,8 +836,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// A write's own cycle retains an attempt before any refresh can run, so from inside a cycle
 			// this branch is reached only when the entry sits at a revision the retained attempt was
 			// not made at — a forked lineage. The ordinary way here is a NEW cycle under an old id:
-			// the queue re-driving an entry whose earlier head commit ended in doubt
-			// ({@link commitHead}, whose opening refresh runs with nothing retained).
+			// the queue re-driving an entry whose earlier head commit ended in doubt without handing
+			// back the attempt it recorded ({@link openHeadCommit}, whose opening refresh runs with
+			// nothing retained unless `resume` seeds it).
 			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
 			if (entry.blockIds.every((_, i) => status?.statuses[i] === 'committed')) {
 				// Whole, and saved: the refresh reports it as finished (see RefreshReport), so the
@@ -2024,12 +2031,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * a path that does not still never reports a half-landed write as saved (the refresh then
 	 * refuses with a `transforms-not-held` {@link TornActionError}), but it cannot recover from one.
 	 *
-	 * A no-op unless `actionId` is the action currently marked, so a late call from an attempt whose
-	 * cycle has already ended cannot plant transforms under somebody else's mark. Latch-free and
+	 * A no-op unless the attempt's action is the one currently marked, so a late call from an attempt
+	 * whose cycle has already ended cannot plant transforms under somebody else's mark. Latch-free and
 	 * synchronous, like the mark itself: `TransactionCoordinator` calls it from inside its commit
 	 * span, where it already holds this instance's latch. */
-	retainInFlightAttempt(actionId: ActionId, attempt: InFlightAttempt): void {
-		if (this.inFlightActionId === actionId) {
+	retainInFlightAttempt(attempt: InFlightAttempt): void {
+		if (this.inFlightActionId === attempt.actionId) {
 			this.inFlightAttempt = attempt;
 		}
 	}
@@ -2161,10 +2168,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// (no segment is sealed here — syncInternal refused if one was).
 			const pending = [...this.segments.open];
 			const staged = await this.buildAttempt({ actions: pending, transforms: this.tracker.transforms, pins: this.tracker.pins }, identity);
-			const attempt = await this.send(staged, identity, cycle);
+			const attempt = await this.send(staged, identity, cycle.priority());
 			if (!attempt.success) {
 				cycle.recordRefusal(attempt);
-				this.retainInFlightAttempt(identity.actionId, retainedAttempt(staged));
+				this.retainInFlightAttempt(retainedAttempt(staged, identity.actionId));
 				await cycle.refreshUntilSettled(this.refreshBetweenAttempts);
 			} else {
 				cycle.recordCommit(attempt.durability);
@@ -2196,10 +2203,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			store => this.logAppendBlockIds(store, identity.actionId, rev));
 	}
 
-	/** Send one attempt — pend, then commit — under the cycle's aged retry priority. */
-	private send(staged: StagedAttempt, identity: WriteIdentity, cycle: AttemptCycle): Promise<CommitResult> {
+	/** Send one attempt — pend, then commit — under the cycle's aged retry `priority`. */
+	private send(staged: StagedAttempt, identity: WriteIdentity, priority: number): Promise<CommitResult> {
 		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId,
-			cycle.priority(), staged.blockDigests, staged.baseRevs);
+			priority, staged.blockDigests, staged.baseRevs);
 	}
 
 	/** Fold a committed attempt's transforms — the log append included — into this instance's read
@@ -2225,9 +2232,40 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Commit exactly the head sealed segment — the oldest, `entryId` — as one log entry under the
 	 * action id and timestamp `options` supplies, for the offline-sync queue's drain
-	 * (docs/offline-sync.md §One entry, one network transaction). The attempt machinery is
-	 * {@link syncAttempts}' ({@link AttemptCycle}, {@link stageAttempt}); what differs is the target
-	 * and the latch.
+	 * (docs/offline-sync.md §One entry, one network transaction): {@link openHeadCommit} followed by
+	 * the one-collection driver, `driveHeadCommit` in head-commit.ts, with the handle closed on every
+	 * exit. The attempt machinery is {@link syncAttempts}' ({@link AttemptCycle}, {@link stageAttempt});
+	 * what differs is the target — a head tracker ({@link headTrackerFor}) — and the latch, released
+	 * around the one network `await` ({@link HeadCommitHandle.release}). `options.recordAttempt` is
+	 * called with each attempt before it is sent, and `options.resume` hands back an attempt an
+	 * earlier cycle under the same action id recorded (see {@link HeadCommitOptions}).
+	 *
+	 * @returns what {@link sync} returns: who holds the commit, or `undefined` when the refresh
+	 * established that the write was already saved under `options.actionId` without re-sending.
+	 * @throws SealedSegmentsError before anything is done, when `entryId` is not the head segment
+	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
+	 * this instance (`in-flight`); the head segment's recorded refusal, an {@link ActionRefusedError},
+	 * when a refresh or the head tracker's staging refused it during the cycle; whatever
+	 * `options.recordAttempt` throws, before anything is sent; otherwise what {@link sync} throws. */
+	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
+		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, options.resume);
+		try {
+			return await driveHeadCommit(handle, options);
+		} finally {
+			handle.close();
+		}
+	}
+
+	/** Open a head commit of `entryId` under `identity` and hand back the handle a driver runs it
+	 * through, step by step ({@link HeadCommitHandle}): this is {@link commitHead} with the loop left
+	 * to the caller, for the coordinator's per-entry commit over several collections, which runs each
+	 * step on every collection it wrote in lock-step. Takes the collection latch, which the handle
+	 * holds until its `close()` except around the network round trip; checks the three
+	 * preconditions; marks the action in flight for the whole cycle ({@link beginInFlightAction}), as
+	 * a sync's is, so the refresh between attempts recognises the write's own entry; sets
+	 * {@link headCommitEntry}, which tells {@link consumeOwnEntry} that such an entry records the head
+	 * segment; and seeds the retained attempt with `resume` when one is given, so that the opening
+	 * refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}).
 	 *
 	 * **The target.** The live tracker holds every sealed segment and the open one, cumulatively, so
 	 * an attempt cannot run on a copy of it the way a sync's does. It runs on a HEAD TRACKER instead
@@ -2236,59 +2274,134 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * attempts, since a rebuild mints fresh ids for the blocks the actions insert and would send
 	 * different content under one `(action id, revision)` (the rule {@link logAppendBlockIds}
 	 * closes). Staging runs the actions' guards against the committed state; a refusal there is the
-	 * segment's refusal, recorded and reported exactly as a replay's would be, and thrown out of here.
+	 * segment's refusal, recorded and reported exactly as a replay's would be, and thrown out of
+	 * `stage()`.
 	 *
-	 * **The latch.** The collection latch is held throughout EXCEPT around the one `await` on the
-	 * network, `source.transact`, which is made with the latch released ({@link sendUnlatched}) so
-	 * `act`, `sealPending`, `update` and the rest are not blocked behind a commit that can take
-	 * seconds (docs/offline-sync.md §The drain does not hold the collection latch across the network).
-	 * While it is released {@link headInFlight} is set: a refresh that walks into this commit's entry
-	 * defers to it, and `dropSealed` of the head refuses. The action is marked in flight for the whole
-	 * cycle ({@link beginInFlightAction}), as a sync's is, so the refresh between attempts recognises
-	 * the write's own entry; and {@link headCommitEntry} tells {@link consumeOwnEntry} that such an
-	 * entry records the head segment.
+	 * **The latch.** Held for every step EXCEPT the one `await` on the network, so `act`,
+	 * `sealPending`, `update` and the rest are not blocked behind a commit that can take seconds
+	 * (docs/offline-sync.md §The drain does not hold the collection latch across the network). While
+	 * it is released {@link headInFlight} is set: a refresh that walks into this commit's entry defers
+	 * to it, and `dropSealed` of the head refuses. A second head commit on this instance waits on the
+	 * latch and then meets the `in-flight` precondition.
 	 *
-	 * **The cycle.** A refresh first, like {@link updateAndSync}'s — with the action already marked,
-	 * so an entry an earlier attempt under the same id left in the log (the queue re-drives an
-	 * in-doubt entry under its original id; docs/offline-sync.md §Identity across attempts) is
-	 * finished, or recognised as saved, and consumed rather than committed a second time. Then
-	 * attempts until the head is committed. Before every attempt and after every retake of the
-	 * latch the head's recorded refusal is checked, because a refresh that adopted a rival — a
-	 * reader's, while the latch was released, or this cycle's own — may have replayed and refused
-	 * it; the recorded refusal is thrown in place of another attempt. On success, under the latch:
-	 * the head segment is removed and the segment version bumped, the attempt's transforms are
-	 * folded into the cache and its revision adopted, and only THEN are the remaining segments and
-	 * the open segment replayed over the committed state that now holds the head — the
-	 * fold-before-replay order {@link syncAttempts} takes, which anything staged while the commit was
-	 * on the network relies on.
+	 * **The head's recorded refusal** is re-checked by `stage()` before every attempt and by
+	 * `refused()` after every refused send, because a refresh that adopted a rival — a reader's,
+	 * while the latch was released, or this cycle's own — may have replayed and refused it; each
+	 * throws the recorded refusal in place of another attempt. On success the driver calls `fold()`
+	 * (remove the head segment, bump the segment version, fold the attempt's transforms into the
+	 * cache and adopt its revision) and only THEN `replay()` (the remaining segments and the open
+	 * segment over the committed state that now holds the head) — the fold-before-replay order
+	 * {@link syncAttempts} takes, which anything staged while the commit was on the network relies on.
 	 *
-	 * @returns what {@link sync} returns: who holds the commit, or `undefined` when the refresh
-	 * established that the write was already saved under `options.actionId` without re-sending.
-	 * @throws SealedSegmentsError before anything is done, when `entryId` is not the head segment
+	 * A driver that opens handles on more than one collection opens them in sorted collection-id
+	 * order, the order `TransactionCoordinator.commitOnce` takes the same latches in; see the
+	 * interface.
+	 *
+	 * @throws Error before the latch is taken when `resume` was recorded under an action other than
+	 * `identity.actionId` — a caller defect, since the attempt would be re-sent under the wrong id;
+	 * SealedSegmentsError, with the latch released again, when `entryId` is not the head segment
 	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
-	 * this instance (`in-flight`); the head segment's recorded refusal, an {@link ActionRefusedError},
-	 * when a refresh or the head tracker's staging refused it during the cycle; otherwise what
-	 * {@link sync} throws. */
-	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
-		let release = await Latches.acquire(this.latchId);
-		const latch: LatchHandle = {
-			release: () => release(),
-			retake: async () => { release = await Latches.acquire(this.latchId); },
-		};
+	 * this instance (`in-flight`). */
+	async openHeadCommit(entryId: EntryId, identity: WriteIdentity, resume?: InFlightAttempt): Promise<HeadCommitHandle> {
+		if (resume !== undefined && resume.actionId !== identity.actionId) {
+			throw new Error(`Collection ${this.id}: an attempt recorded under action ${resume.actionId} cannot resume `
+				+ `a head commit of ${entryId} under action ${identity.actionId}`);
+		}
+		const release = await Latches.acquire(this.latchId);
 		try {
 			this.assertHeadCommittable(entryId);
-			const identity: WriteIdentity = { actionId: options.actionId, timestamp: options.timestamp };
-			const endInFlight = this.beginInFlightAction(identity.actionId);
-			this.headCommitEntry = entryId;
-			try {
-				return await this.headCommitAttempts(entryId, identity, options, latch);
-			} finally {
-				this.headCommitEntry = undefined;
-				endInFlight();
-			}
-		} finally {
+		} catch (err) {
 			release();
+			throw err;
 		}
+		const endInFlight = this.beginInFlightAction(identity.actionId);
+		this.headCommitEntry = entryId;
+		if (resume !== undefined) {
+			this.retainInFlightAttempt(resume);
+		}
+		return this.headCommitHandle(entryId, identity, release, endInFlight);
+	}
+
+	/** The handle {@link openHeadCommit} returns: closures over this instance's private state, so
+	 * nothing private becomes public. `release` is the latch release of the latch the caller took;
+	 * `endInFlight` the disposer of the in-flight mark. The head tracker lives here, per handle, so it
+	 * is reused across the attempts of one cycle exactly as the in-line loop reused it. */
+	private headCommitHandle(entryId: EntryId, identity: WriteIdentity, release: () => void, endInFlight: () => void): HeadCommitHandle {
+		let held = true;
+		let closed = false;
+		let head: HeadTracker | undefined;
+		const assertUsable = (step: string, needsLatch: boolean) => {
+			if (closed) {
+				throw new Error(`Collection ${this.id}: head commit of ${entryId} is closed; ${step}() is a defect`);
+			}
+			if (held !== needsLatch) {
+				throw new Error(`Collection ${this.id}: head commit of ${entryId} ${held ? 'holds' : 'has released'} the latch; `
+					+ `${step}() is a defect here`);
+			}
+		};
+		return {
+			collectionId: this.id,
+			instanceTag: this.instanceTag,
+			entryId,
+			refresh: (report, lastChance, tailFloor) => {
+				assertUsable('refresh', true);
+				return this.updateInternal(report, lastChance, tailFloor);
+			},
+			nextRev: () => this.getNextRev(),
+			heldRev: () => this.source.actionContext?.rev,
+			stage: async () => {
+				assertUsable('stage', true);
+				const segment = this.committableHead(entryId);
+				head = await this.headTrackerFor(segment, head);
+				return this.buildAttempt({ actions: segment.actions, transforms: head.tracker.transforms, pins: head.tracker.pins }, identity);
+			},
+			send: (staged, priority) => {
+				assertUsable('send', false);
+				return this.send(staged, identity, priority);
+			},
+			release: () => {
+				assertUsable('release', true);
+				this.headInFlight = { entryId, actionId: identity.actionId };
+				held = false;
+				release();
+			},
+			retake: async () => {
+				assertUsable('retake', false);
+				release = await Latches.acquire(this.latchId);
+				held = true;
+				this.headInFlight = undefined;
+			},
+			fold: (staged) => {
+				assertUsable('fold', true);
+				this.segments.drop(this.headSegment(entryId).entryId);
+				this.foldOwnCommit(staged, identity.actionId);
+			},
+			replay: () => {
+				assertUsable('replay', true);
+				// NOTE: the remaining sealed segments and the open segment are replayed after EVERY head
+				// commit, so draining a queue of n entries is quadratic in n (docs/offline-sync.md
+				// §Failure modes and accepted tradeoffs). Negligible for tens of entries; if it shows up
+				// for a device that queued thousands, keep per-segment trackers chained over the cache,
+				// so a committed head is popped and folded instead of replayed.
+				return this.replayActions();
+			},
+			refused: (staged) => {
+				assertUsable('refused', true);
+				this.committableHead(entryId);
+				this.retainInFlightAttempt(retainedAttempt(staged, identity.actionId));
+			},
+			close: () => {
+				if (closed) return;
+				closed = true;
+				this.headCommitEntry = undefined;
+				this.headInFlight = undefined;
+				endInFlight();
+				if (held) {
+					held = false;
+					release();
+				}
+			},
+		};
 	}
 
 	/** {@link commitHead}'s preconditions, each a {@link SealedSegmentsError} naming its reason. */
@@ -2304,41 +2417,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.headInFlight !== undefined) {
 			throw new SealedSegmentsError(this.id, sealed, 'in-flight', this.headInFlight.entryId);
 		}
-	}
-
-	/** The attempt cycle behind {@link commitHead}, run with the action marked in flight and the
-	 * latch held (released only inside {@link sendUnlatched}). */
-	private async headCommitAttempts(entryId: EntryId, identity: WriteIdentity, options: HeadCommitOptions, latch: LatchHandle): Promise<WriteDurability | undefined> {
-		const cycle = new AttemptCycle(this.id, this.instanceTag, options);
-		let saved = await cycle.refreshUntilSettled(this.refreshBetweenAttempts);
-		let head: HeadTracker | undefined;
-		while (!saved) {
-			const segment = this.committableHead(entryId);
-			cycle.beforeAttempt(this.getNextRev(), this.source.actionContext?.rev);
-			head = await this.headTrackerFor(segment, head);
-			const staged = await this.buildAttempt({ actions: segment.actions, transforms: head.tracker.transforms, pins: head.tracker.pins }, identity);
-			const attempt = await this.sendUnlatched({ entryId, actionId: identity.actionId }, latch, () => this.send(staged, identity, cycle));
-			if (attempt.success) {
-				cycle.recordCommit(attempt.durability);
-				this.segments.drop(this.headSegment(entryId).entryId);
-				this.foldOwnCommit(staged, identity.actionId);
-				// NOTE: the remaining sealed segments and the open segment are replayed after EVERY head
-				// commit, so draining a queue of n entries is quadratic in n (docs/offline-sync.md
-				// §Failure modes and accepted tradeoffs). Negligible for tens of entries; if it shows up
-				// for a device that queued thousands, keep per-segment trackers chained over the cache,
-				// so a committed head is popped and folded instead of replayed.
-				await this.replayActions();
-				saved = true;
-			} else {
-				// A reader's refresh while the latch was released may have adopted the rival this
-				// attempt lost to, and refused the head in its replay.
-				this.committableHead(entryId);
-				cycle.recordRefusal(attempt);
-				this.retainInFlightAttempt(identity.actionId, retainedAttempt(staged));
-				saved = await cycle.refreshUntilSettled(this.refreshBetweenAttempts);
-			}
-		}
-		return cycle.durability;
 	}
 
 	/** The head segment, which a running head commit may still commit: it is `entryId` — anything
@@ -2406,20 +2484,6 @@ export class Collection<TAction> implements ICollection<TAction> {
 			throw err;
 		}
 		return tracker;
-	}
-
-	/** Make a head attempt's one network round trip with the collection latch released, so staging
-	 * and reading through this instance go on meanwhile, and retake it before returning or throwing.
-	 * {@link headInFlight} is set for exactly that window (see the field). */
-	private async sendUnlatched<T>(inFlight: { entryId: EntryId; actionId: ActionId }, latch: LatchHandle, send: () => Promise<T>): Promise<T> {
-		this.headInFlight = inFlight;
-		latch.release();
-		try {
-			return await send();
-		} finally {
-			await latch.retake();
-			this.headInFlight = undefined;
-		}
 	}
 
 	/** Stage `actions` and flush them as one call that either takes effect or leaves NOTHING behind:

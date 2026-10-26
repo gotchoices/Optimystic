@@ -922,7 +922,8 @@ export class TransactionCoordinator {
 			// so a re-send declares none, and an undeclared block falls back to member-side corroboration.
 			for (const { collectionId, collection } of collectionData) {
 				if (committed.has(collectionId)) continue;
-				collection.retainInFlightAttempt(transaction.id, {
+				collection.retainInFlightAttempt({
+					actionId: transaction.id,
 					rev: pendedRevs.get(collectionId)!,
 					transforms: copyTransforms(collectionTransforms.get(collectionId)!),
 					tailId: criticalBlocks.get(collectionId)!,

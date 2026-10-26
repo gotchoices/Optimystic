@@ -573,11 +573,17 @@ rule across drain attempts and restarts:
 > **An entry that has been sent is in doubt until its outcome is established, and it is re-sent
 > only under the action id and revision of the attempt that may have landed.**
 
-The queue records the attempt's identity — action id, revision, and the retained attempt itself —
-**before** sending it (in the journal, when persistence is on), and clears it only once the outcome
-is known. A later drain of an in-doubt entry marks that action in flight on the collection
+The queue records the attempt's identity — action id, revision, and the retained attempt itself,
+one `InFlightAttempt` in `packages/db-core/src/collection/collection.ts` — **before** sending it (in
+the journal, when persistence is on), and clears it only once the outcome is known. The head commit
+hands it the attempt at exactly that point: `HeadCommitOptions.recordAttempt` in
+`packages/db-core/src/collection/struct.ts` is called with each attempt after it is built and before
+the collection latch is released for the network, and a throw out of it aborts the cycle with nothing
+sent. A later drain of an in-doubt entry marks that action in flight on the collection
 (`beginInFlightAction`) and refreshes first, so a refresh that finds the entry's log entry completes
-it instead of committing a second copy. A new action id is minted only after an attempt is proven
+it instead of committing a second copy — from the recorded attempt, which the drain hands back as
+`HeadCommitOptions.resume`; without it the refresh can only recognise an attempt that landed whole,
+and refuses a torn one as `transforms-not-held`. A new action id is minted only after an attempt is proven
 not to have landed (a refused pend, or `TornActionError` with `final: true`). A refused pend proves
 this for the attempt that sent it only: one sync sends several attempts under one action id, and an
 earlier one may have left its log entry standing (see `SyncRetryExhaustedError` in

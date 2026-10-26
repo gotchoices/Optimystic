@@ -273,7 +273,18 @@ list. Five rules follow from the split:
   the retry accounting with its stall check, the refresh-until-settled loop — extracted into
   `AttemptCycle` and `stageAttempt` in `packages/db-core/src/collection/write-attempts.ts` so the two
   paths share one implementation; `syncAttempts` and `commitHead` each decide only what an attempt
-  is built from and what to do with a commit. Four things differ:
+  is built from and what to do with a commit. The head commit's steps are exposed one at a time
+  through `HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`: `Collection.openHeadCommit`
+  takes the latch, checks the preconditions, marks the action in flight and returns the handle (a
+  closure over the collection's private state), and `driveHeadCommit` in the same file is the
+  one-collection loop `commitHead` runs over it — refresh, then per attempt stage, record, release,
+  send, retake, then fold and replay or refused — so the coordinator's per-entry commit can drive
+  several collections through the same steps in lock-step. Two hooks on `HeadCommitOptions` serve
+  the queue and the journal: `recordAttempt` is called with each attempt (an `InFlightAttempt`, plain
+  data, carrying its action id) after it is built and before the latch is released, and a throw out
+  of it aborts the cycle with nothing sent; `resume` hands back an attempt an earlier cycle under the
+  same action id recorded, seeded as the retained attempt so the opening refresh finishes a torn
+  attempt from it instead of refusing it as `transforms-not-held`. Four things differ:
   - **The attempt runs on a head tracker, built once per revision.** The live tracker holds every
     sealed segment and the open one cumulatively, so an attempt cannot run on a copy of it the way a
     sync's does. `Collection.headTrackerFor` stages the head segment's actions alone, atomically
@@ -294,11 +305,12 @@ list. Five rules follow from the split:
     with a refresh (like `updateAndSync`) that, with the action already marked in flight, also
     recognises an earlier attempt's own entry and finishes or consumes it rather than committing a
     second copy.
-  - **The latch is released around the one network `await`.** `Collection.sendUnlatched` releases
-    the collection latch for `source.transact` alone and retakes it before anything on the instance
-    is touched, so `act`, `sealPending`, `update`, a snapshot or restore, and `dropSealed` of
-    another segment all run meanwhile; a second `commitHead` waits on the latch and then meets the
-    `in-flight` precondition. The window is marked by `Collection.headInFlight` — set just before
+  - **The latch is released around the one network `await`.** The handle's `release` and `retake`
+    (`HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`) bracket `source.transact`
+    alone, the retake in a `finally`, so nothing on the instance is touched without the latch and
+    `act`, `sealPending`, `update`, a snapshot or restore, and `dropSealed` of another segment all run
+    meanwhile; a second `commitHead` waits on the latch and then meets the `in-flight` precondition.
+    The window is marked by `Collection.headInFlight` — set just before
     the release, cleared right after the retake, and distinct from `inFlightActionId`, which the
     head commit's own refreshes run under and must take the own-entry path. Two things read it. A
     refresh (`updateInternal`) that walks into the in-flight entry returns before `forgetAndAdopt`,
