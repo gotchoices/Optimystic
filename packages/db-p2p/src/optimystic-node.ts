@@ -2,6 +2,7 @@ import type { Libp2p, PrivateKey } from '@libp2p/interface';
 import type { BlockId, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
+import type { NodeCohortReachability } from './network/cohort-reachability.js';
 import type { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
 import type { PeerReputationService } from './reputation/peer-reputation.js';
 import type { ArrivalPushReceiver } from './matchmaking/arrival-push-receiver.js';
@@ -57,6 +58,13 @@ export interface OptimysticNodeAttachments {
 	 * was built with `cohortTopic.enabled`; without it a seeker session takes the poll path.
 	 */
 	matchmakingArrivalPush?: ArrivalPushReceiver;
+	/**
+	 * Whether the cohorts responsible for some blocks can be reached now, or this node is genuinely
+	 * alone in them — the offline queue's reachability gate (docs/offline-sync.md §When to submit: the
+	 * reachability gate), built over this node's own key network. Its `onChange` wakes a listener,
+	 * debounced (`NodeOptions.cohortReachability`), when a connection opens or a peer is identified.
+	 */
+	cohortReachability: NodeCohortReachability;
 	/**
 	 * Record that `peerId` holds `blockId` at revision `rev` or later, as learned by the embedder — for
 	 * example from a block push the embedder made itself and the peer accepted. Two effects:

@@ -11,6 +11,10 @@ import type { Collection } from '../collection/collection.js';
  */
 export interface ICohortReachability {
 	reachable(blockIds: readonly BlockId[]): Promise<boolean>;
+	/** Optionally call `listener` when reachability may have improved — a machine connected or was
+	 *  identified. A hint, not an answer: the listener asks `reachable` again. Returns an idempotent
+	 *  unsubscribe. Absent → nothing wakes the asker but its own timer. */
+	onChange?(listener: () => void): () => void;
 }
 
 /** The gate that is always open: what a queue over a transactor with no cohort to lose uses. */

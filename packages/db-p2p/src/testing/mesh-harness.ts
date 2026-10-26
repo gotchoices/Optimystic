@@ -506,17 +506,27 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	 */
 	const makeNodeKeyNetwork = (selfPeerId: PeerId): IKeyNetwork => {
 		const selfStr = selfPeerId.toString();
+		const sideOfSelf = () => failures.partitionSides?.find(s => s.has(selfStr));
 		return {
 			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),
 			async findCluster(key) {
 				const peers = await keyNetwork.findCluster(key);
-				const side = failures.partitionSides?.find(s => s.has(selfStr));
+				const side = sideOfSelf();
 				if (side) {
 					for (const id of Object.keys(peers)) {
 						if (!side.has(id)) delete peers[id];
 					}
 				}
 				return peers;
+			},
+			// The mesh's analogue of "remembered serving, missing from the view": the members of the
+			// unpartitioned cohort that this node's side filter removes, nearest first. `[]` with no
+			// partition, as on a real node that has never seen another serving peer go missing.
+			async absentCohortMembers(key) {
+				const side = sideOfSelf();
+				if (!side) return [];
+				const peers = await keyNetwork.findCluster(key);
+				return Object.keys(peers).filter(id => id !== selfStr && !side.has(id));
 			}
 		};
 	};

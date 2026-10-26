@@ -1466,8 +1466,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * connection opening and identify landing a peer of this network can show a partial list and
 	 * read `foreign` here. The next reading corrects it, and the cost is one cohort assembly that
 	 * leaves the peer out. Anything that must not act on that moment reads identify's outcome
-	 * instead, as {@link heardFromBootstrapPeer} does; if a second such decision appears, have
-	 * `identifyOnConnectionOpen` report for every peer rather than for bootstrap peers alone.
+	 * instead: {@link heardFromBootstrapPeer} for bootstrap peers, and the cohort reachability gate
+	 * (`KeyNetworkCohortReachability` in `network/cohort-reachability.ts`), which reads a self-only
+	 * view as unreachable while any identify exchange is in flight (`IdentifyProgress`). The demotion
+	 * below is left as it is: identify's full list corrects it.
+	 *
+	 * NOTE: what neither covers is an identify that FAILS (a timeout, a reset) on a peer of this
+	 * network whose list stayed partial: it then reads `foreign`, sits in FRET's band where
+	 * {@link absentCohortMembers} does not look, and the gate reads this node alone. If a fork is ever
+	 * traced to an `identify:failed` line, treat a band member whose latest identify failed as
+	 * not-alone.
 	 */
 	private membershipOf(idStr: string, protocols: readonly string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'

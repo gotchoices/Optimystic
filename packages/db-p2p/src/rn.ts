@@ -76,6 +76,7 @@ export * from './routing/responsibility.js';
 export * from './routing/libp2p-known-peers.js';
 export * from './network/network-manager-service.js';
 export * from './network/get-network-manager.js';
+export * from './network/cohort-reachability.js';
 export * from './reputation/index.js';
 export * from './dispute/index.js';
 export * from './cohort-topic/index.js';
