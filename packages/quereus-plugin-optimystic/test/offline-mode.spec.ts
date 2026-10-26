@@ -209,6 +209,9 @@ describe('Offline mode: entering, sealing a commit, following it to the other no
 		expect(new Set(queuedOrder).size, 'three transactions queued').to.equal(3);
 		expect(statuses.filter((s): s is QueuedStatus => s.kind === 'queued').map(s => s.tables))
 			.to.deep.equal([['main.Items'], ['main.Items'], ['main.Items']]);
+		// Every later read on this machine sees the queued rows, through the index as through a scan.
+		await expectIndexAgreesWithScan(a.db, 'Items', 'Token');
+		expect((await collect(a.db, 'select Id from Items order by Id')).map(r => r.Id), 'A reads its three queued rows').to.deep.equal([1, 2, 3]);
 
 		// After each commit settles, B's two read shapes of the table must agree with each other.
 		const checks: Promise<void>[] = [];

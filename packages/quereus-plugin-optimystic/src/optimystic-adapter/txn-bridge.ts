@@ -550,6 +550,11 @@ export class TransactionBridge {
   ): void {
     if (this.offline?.isEntered()) throw new SessionModeRefusedError('offline-mode');
     if (this.offline?.hasQueuedEntries()) throw new SessionModeRefusedError('queued-entries');
+    // NOTE: a transaction begun 'local' and still open passes both checks (enter, begin, exit,
+    // configure): its commit then queues an entry, behind which the session transactions that
+    // follow meet SealedSegmentsError, the refusal README § Offline mode documents for a network
+    // commit over queued tables. Only a host that configures session mode mid-transaction meets
+    // it; if one does, refuse here while the open transaction's acknowledgement is 'local'.
     this.coordinator = coordinator;
     this.engine = engine;
     this.schemaHashProvider = schemaHashProvider;

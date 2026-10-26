@@ -274,7 +274,8 @@ per-node attribution from another subsystem, pass its peer id as `createLogger`'
 | `plugin`              | Plugin registration (config dump when `debug` option set)           |
 | `module`              | Virtual table change-subscription lifecycle: subscribe/notify/teardown; `index:tree-open` and `index:seek` (below) |
 | `collection-factory`  | Collection watch no-op notices and libp2p node shutdown             |
-| `txn-bridge`          | `commit:collections` (below) — which collections each commit carries |
+| `txn-bridge`          | `commit:collections` (below) — which collections each commit carries, `mode=offline` for one sealed into the offline queue; `offline:local-ack-unavailable` (a dirty set that cannot be one queue entry took the network route; README § Offline mode) |
+| `offline-mode`        | The mode under `plugin.offline` (`OfflineMode` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts`): `offline:entered` / `offline:exited`, and `offline:status-listener-threw` / `offline:state-listener-threw` (a host listener threw; isolated, the rest still run). The queue's own lines are under db-core's `offline` namespace above |
 
 #### Which collections did a write carry?
 

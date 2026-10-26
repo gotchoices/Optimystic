@@ -154,7 +154,7 @@ const plugin = register(db, {
 });
 ```
 
-`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts`), so `journal` and `allowSoloCommit` are refused until their stages land rather than silently ignored.
+`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `journal` and `allowSoloCommit` are refused until their stages land rather than silently ignored.
 
 Persistence is a registration-time choice, not a per-entry one, for two reasons: entries have to be
 restored before the application's first statement after a restart, which happens before any
@@ -177,7 +177,9 @@ The acknowledgement a transaction gets is fixed when it **begins** (at `Transact
 not when it commits, so a mode change during an open transaction changes nothing about it.
 Leaving the mode does not stop the drain: entries already queued keep draining, and a
 network-acknowledged transaction committed while entries are queued waits behind them (see
-[Network acknowledgement behind a non-empty queue](#network-acknowledgement-behind-a-non-empty-queue)).
+[Network acknowledgement behind a non-empty queue](#network-acknowledgement-behind-a-non-empty-queue);
+the wait is the network-acknowledgement ticket of stage 4, and until it lands such a commit over a
+queued table is refused, as the plugin README says).
 
 ### Following transactions
 
@@ -267,7 +269,7 @@ type OfflineModeState = OfflineQueueState & {   // db-core's queue state: depth,
 plugin.offline.entries();                 // the queued entries, in order, with their current status
 plugin.offline.status(transactionId);     // one entry's status, or a retained outcome, or undefined
 plugin.offline.discard(transactionId);    // withdraw a queued (never sent) entry; fails it with 'discarded'
-plugin.offline.outcomes();                // terminal outcomes retained since the last acknowledge
+plugin.offline.outcomes();                // terminal outcomes retained (outcomeRetentionMs) and not yet acknowledged
 plugin.offline.acknowledge(transactionId);// forget a retained outcome
 ```
 
@@ -1273,10 +1275,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
    cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
    Usable by a `Tree`/`Diary` application without SQL.
-4. **Offline mode in the plugin.** `offline.enter`/`exit`, acknowledgement fixed at BEGIN, status
-   and queue-state listeners, durability reports for drained entries, `notifyExternalChange` on
+4. **Offline mode in the plugin** (five tickets; the first landed). `offline.enter`/`exit`,
+   acknowledgement fixed at BEGIN, status and queue-state listeners, durability reports for drained
+   entries and refusal while session mode is configured (implemented); `notifyExternalChange` on
    removal, the `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL
-   gate, the invented-collection probe, live-read degrade, refusal while session mode is configured.
+   gate, the invented-collection probe and live-read degrade (the remaining four).
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on

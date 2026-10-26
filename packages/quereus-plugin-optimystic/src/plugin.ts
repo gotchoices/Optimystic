@@ -9,7 +9,8 @@ import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
 import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
-import { OfflineMode, parseOfflineConfig } from './optimystic-adapter/offline-mode.js';
+import { OfflineMode } from './optimystic-adapter/offline-mode.js';
+import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
@@ -32,7 +33,7 @@ export type {
 // Offline mode (README § Offline mode): the controller under `plugin.offline`, its two refusals, the
 // db-core errors its queries throw, and the statuses it reports.
 export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError } from './optimystic-adapter/offline-mode.js';
-export type { OfflineConfig } from './optimystic-adapter/offline-mode.js';
+export type { OfflineConfig } from './optimystic-adapter/offline-config.js';
 export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
 export type {
 	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
@@ -179,10 +180,13 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 */
 		dispose: async () => {
 			await optimysticModule.whenCatalogPersisted();
-			txnBridge.dispose();
-			// After the bridge: a pending `whenDrained` rejects with QueueDisposedError, and entries
-			// still queued stay sealed in their collections (nothing of the application's is dropped).
+			// Before the bridge: a submission in flight finishes its current network step, and a commit
+			// it lands is reported through the bridge's follower while that is still live (a report
+			// after the bridge's dispose would subscribe the follower to the node's events again, with
+			// nothing left to release it). A pending `whenDrained` rejects with QueueDisposedError, and
+			// entries still queued stay sealed in their collections (nothing of the application's is dropped).
 			await offline.dispose();
+			txnBridge.dispose();
 			await collectionFactory.dispose();
 		},
 	};
