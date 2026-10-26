@@ -155,6 +155,73 @@ rolls back. That is correct, not a leak: only the separate `committed.<Table>` p
 concurrent peer's commit is expected live-read behavior; snapshot isolation is
 opt-in via `queryCommitted()`, not the default for ordinary reads.
 
+#### Staged actions are segments
+
+A collection's staged actions are two parts, not one list, kept in `SegmentList` in
+`packages/db-core/src/collection/segments.ts`: an ordered list of **sealed segments**, one per
+queued entry of the offline-sync queue
+([offline-sync.md §The segment model](offline-sync.md#the-segment-model)), oldest first, ahead of
+the **open segment** the current transaction stages into. `Collection.act` appends to the open
+segment; `Collection.sealPending` closes it into a sealed segment owned by an entry id, answering
+`false` and changing nothing when the open segment is empty (an invented collection's header,
+log block and root are not an action and are never sealed); `Collection.sealedEntries`,
+`Collection.sealedRefusal` and `Collection.dropSealed` list, inspect and remove them. While nothing
+is sealed every path behaves exactly as it did with one list, because the open segment IS that
+list. Four rules follow from the split:
+
+- **A replay starts from the invented baseline, not from empty, while the collection holds no
+  committed revision.** `Collection.inventedBaseline` is the tracker's transforms right after
+  `createOrOpen`'s create branch has staged the header, the empty log block and (for a tree) the
+  empty root, copied after the `Log.open` that writes the tail id into the header. A replay
+  (`Collection.replayActions`) resets the tracker to a copy of it while `source.actionContext` is
+  undefined, and to empty otherwise, since once a context is adopted those blocks are in storage.
+  Before the baseline a replay on an invented collection dropped its header and left the collection
+  unreadable; `mustReplay` kept the paths that reached it behind "a staged action exists", and
+  `dropSealed` on an invented collection with sealed segments is the first path that gets there
+  with one. The baseline also makes the order of `Collection.syncAttempts`' success branch
+  load-bearing: it folds the committed transforms into the cache and adopts the revision BEFORE
+  replaying, the order `updateInternal` and `TransactionCoordinator.commitOnceLatched` already
+  required. A replay first would reinstate the baseline's header insert over the just-committed
+  header on an invented collection's first commit, and `hasUnsyncedChanges` would never turn
+  false.
+- **A sealed segment replays atomically, and its refusal is recorded rather than thrown.**
+  `Collection.replayActions` stages each sealed segment, in order, through one `internalTransact`
+  call over all of its actions, so a throw discards the whole segment's writes (the Atomic inside
+  gives that). A throw of `ActionRefusedError` in `packages/db-core/src/collection/struct.ts`, a
+  handler's statement that the action cannot be applied over the committed state it is being
+  replayed against (`TreeGuardRefusedError` is the tree's subclass, so every guard refusal is one),
+  is recorded on the segment, logged as `collection:sealed-segment-refused`, reported once through
+  the `onSealedRefused` callback `CollectionInitOptions` carries, and the replay goes on to the
+  next segment. A refused segment is skipped by every later replay and stays listed until it is
+  dropped; dropping it and cascading through the entry's other collections is the queue's job
+  ([offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)). The open segment keeps
+  the earlier behaviour, one `internalTransact` per action with a refusal propagating out of the
+  refresh, because that refusal is the live transaction's own. Any error that is not a refusal
+  propagates from either. The callback runs synchronously under the collection latch, so it must
+  not call a latched method of the collection; a throw out of it is logged
+  (`collection:refusal-callback-threw`) and never aborts the replay. `classifyCommitFailure` and
+  the Quereus bridge keep matching `TreeGuardRefusedError`, which the subclass relation leaves
+  unchanged.
+- **Every replayable action counts.** `mustReplay` and `restageIfBasesMoved` count the non-refused
+  sealed segments' actions plus the open segment's, since a refresh that adopts a newer revision
+  must re-stage every sealed segment too. `hasUnsyncedChanges` keeps its formula (open segment
+  non-empty, or tracker transforms non-empty, which now includes the sealed segments' effects) and
+  therefore says `true` over a sealed collection that `sync` will refuse (next rule).
+- **A whole-collection commit refuses over sealed segments.** `sync`, `updateAndSync` and
+  `actAndSync` commit everything staged as one log entry under one action id; over sealed segments
+  that would merge several queue entries into one, which the queue's identity rules forbid. Each
+  throws `SealedSegmentsError` in `packages/db-core/src/collection/struct.ts`, naming the sealed
+  entry ids, before anything is minted or staged, and so does `getPendingActions`, whose only
+  caller is the coordinator's whole-collection append inside `commitOnceLatched`; the throw lands
+  in that method's existing catch, which restores every participant. `clearPendingActions` clears
+  the open segment only; `filterAgainstEntry` (the `filterConflict` hook) and `consumeOwnEntry`
+  apply to the open segment only, a sealed segment's action list being the entry's own and never
+  rewritten. A sealed segment is committed on its own by the head commit (ticket
+  `offline-sync-collection-segments`), and the version counter on `SegmentList` is what the
+  version-aware snapshot restore (ticket `offline-sync-open-segment-snapshot`) branches on.
+
+`packages/db-core/test/collection-segments.spec.ts` pins each of these.
+
 #### A block re-read after a refresh can be answered too old, and is never remembered
 
 The trap the replay-ordering rule above closes — the read cache refilled with old content that no

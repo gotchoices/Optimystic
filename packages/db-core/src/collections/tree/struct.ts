@@ -2,6 +2,7 @@ import type { BlockId, CollectionHeaderBlock, CollectionId } from "../../index.j
 import type { KeyRange } from "../../btree/index.js";
 import { registerBlockType } from "../../blocks/block-types.js";
 import { registerCollectionType } from "../../collection/collection-type-registry.js";
+import { ActionRefusedError } from "../../collection/struct.js";
 import { nameof } from "../../utility/nameof.js";
 
 export const TreeHeaderBlockType = registerBlockType("TRE", "TreeHeaderBlock");
@@ -129,16 +130,21 @@ export type TreeReplaceAction<TKey, TEntry> = (
  * {@link TreeEntryChangedError} is a lost update (the bridge raises its
  * `ConcurrentModificationError`, status code BUSY, which is not a constraint error). Catch
  * this base to treat any guard refusal uniformly; catch a subclass to say which happened.
+ *
+ * It is the tree's {@link ActionRefusedError}, which is what the collection's segment-aware
+ * replay recognises (a refusal from a sealed segment is recorded against that segment rather
+ * than thrown — see `Collection.replayActions`); the classifier and the bridge keep matching
+ * this class, which the subclass relation leaves unchanged.
  */
-export class TreeGuardRefusedError<TKey = unknown> extends Error {
+export class TreeGuardRefusedError<TKey = unknown> extends ActionRefusedError {
 	constructor(
 		/** The collection whose tree refused the entry. */
-		public readonly collectionId: CollectionId,
+		collectionId: CollectionId,
 		/** The key whose staged entry was refused. */
 		public readonly key: TKey,
 		message: string,
 	) {
-		super(message);
+		super(collectionId, message);
 		this.name = 'TreeGuardRefusedError';
 	}
 }

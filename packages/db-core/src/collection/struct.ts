@@ -1,8 +1,57 @@
 import type { IBlock, BlockId, Action, WriteDurability } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
+import type { EntryId } from "./segments.js";
 
 export type CollectionId = BlockId;
+
+/**
+ * A handler's statement that an action cannot be applied over the committed state it is being
+ * replayed against — a uniqueness or lost-update check failed. Not a transport failure and never
+ * retryable: the action's staged writes are discarded (the handler runs inside an Atomic), and
+ * nothing downgrades it to a stale failure. `TreeGuardRefusedError` in
+ * `packages/db-core/src/collections/tree/struct.ts` is the tree's subclass, and carries the
+ * contract every refusal obeys.
+ *
+ * Lives here rather than beside the tree so the collection can recognise a refusal without
+ * importing the tree module (which imports the collection). Segment-aware replay
+ * (`Collection.replayActions`) treats a throw of this class from a SEALED segment as that
+ * segment's refusal and keeps going; from the open segment it propagates as it always has.
+ */
+export class ActionRefusedError extends Error {
+	constructor(
+		/** The collection whose handler refused the action. */
+		readonly collectionId: CollectionId,
+		message: string,
+	) {
+		super(message);
+		this.name = 'ActionRefusedError';
+	}
+}
+
+/**
+ * Thrown by the whole-collection commit paths — {@link ICollection.sync},
+ * {@link ICollection.updateAndSync}, `Collection.actAndSync` and `Collection.getPendingActions`
+ * (the coordinator's append) — while the collection holds sealed segments. Those paths commit
+ * everything staged as ONE log entry under one action id; over sealed segments that would merge
+ * several queue entries into one, which the queue's identity rules forbid
+ * (docs/offline-sync.md §Identity across attempts). A sealed segment is committed on its own,
+ * through the head commit (ticket `offline-sync-collection-segments`).
+ *
+ * Nothing is unstaged or changed when this is thrown: every segment, sealed and open, is exactly
+ * as it was.
+ */
+export class SealedSegmentsError extends Error {
+	constructor(
+		readonly collectionId: CollectionId,
+		/** The sealed segments' entry ids, in order. */
+		readonly sealedEntries: EntryId[],
+	) {
+		super(`collection ${collectionId} holds sealed segment(s) ${sealedEntries.join(', ')}; `
+			+ `a whole-collection commit would merge them into one log entry — commit the head segment instead`);
+		this.name = 'SealedSegmentsError';
+	}
+}
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 

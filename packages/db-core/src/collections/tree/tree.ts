@@ -108,6 +108,11 @@ interface BTreeHolder<TKey, TEntry> {
 	btree?: BTree<TKey, TEntry>;
 }
 
+/** The collection options a tree's opener may set — the ones that are not the tree's own to
+ * decide. Today that is the sealed-segment refusal callback the offline-sync queue installs
+ * (see {@link CollectionInitOptions.onSealedRefused}). */
+export type TreeCollectionOptions<TKey, TEntry> = Pick<CollectionInitOptions<TreeReplaceAction<TKey, TEntry>>, 'onSealedRefused'>;
+
 export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	private constructor(
@@ -130,9 +135,11 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0,
 		/** See {@link Tree.createOrOpen}'s `nodeCapacity`. */
 		nodeCapacity?: number,
+		/** See {@link Tree.createOrOpen}'s `options`. */
+		options?: TreeCollectionOptions<TKey, TEntry>,
 	): Promise<Tree<TKey, TEntry> | undefined> {
 		const held: BTreeHolder<TKey, TEntry> = {};
-		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held);
+		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
 		const collection = await Collection.open<TreeReplaceAction<TKey, TEntry>>(network, id, init);
 		return collection ? Tree.attach(collection, held, keyFromEntry, compare, nodeCapacity) : undefined;
 	}
@@ -154,9 +161,12 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		 *  they pass it consistently); if a persisted tree ever needs a custom fan-out, persist it in
 		 *  the header and read it back on reopen rather than trusting the caller to re-supply it. */
 		nodeCapacity?: number,
+		/** Collection options the opener sets rather than the tree: the sealed-segment refusal
+		 *  callback (see {@link TreeCollectionOptions}). Omit for a tree nothing seals. */
+		options?: TreeCollectionOptions<TKey, TEntry>,
 	): Promise<Tree<TKey, TEntry>> {
 		const held: BTreeHolder<TKey, TEntry> = {};
-		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held);
+		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
 		const collection = await Collection.createOrOpen<TreeReplaceAction<TKey, TEntry>>(network, id, init);
 		return Tree.attach(collection, held, keyFromEntry, compare, nodeCapacity);
 	}
@@ -169,8 +179,10 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		compare: (a: TKey, b: TKey) => number,
 		nodeCapacity: number | undefined,
 		held: BTreeHolder<TKey, TEntry>,
+		options: TreeCollectionOptions<TKey, TEntry> | undefined,
 	): CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> {
 		return {
+			...options,
 			modules: {
 				"replace": async ({ data: actions }, trx) => {
 					// Write through the Atomic store the handler is handed (`trx`), NOT the captured

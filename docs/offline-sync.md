@@ -325,14 +325,28 @@ collection C2 (index tree):  [ seg E2 ][ seg E3 ][ open ]
 queue:                        E1, E2, E3, E4
 ```
 
-Proposed `Collection` additions (names illustrative):
+The `Collection` additions (the list itself is `SegmentList` in
+`packages/db-core/src/collection/segments.ts`):
 
-- `sealPending(entryId)` — closes the open segment into a sealed segment owned by `entryId`. A no-op
-  for a collection the transaction staged nothing into.
-- `sealedEntries()` — the entry ids of the sealed segments, in order.
-- `dropSealed(entryId)` — removes a segment and rebuilds the tracker by replaying what remains.
+- `sealPending(entryId)` — closes the open segment into a sealed segment owned by `entryId`. Answers
+  `false` and changes nothing for a collection the transaction staged nothing into.
+- `sealedEntries()` — the entry ids of the sealed segments, in order, refused ones included until
+  they are dropped.
+- `sealedRefusal(entryId)` — the refusal a replay recorded for a segment it excluded, if any (see
+  [Replay with a per-segment refusal](#replay-with-a-per-segment-refusal)).
+- `dropSealed(entryId)` — removes a segment, wherever it sits, and rebuilds the tracker by replaying
+  what remains.
+- `onSealedRefused`, a callback in `CollectionInitOptions` — how the collection reports a refused
+  segment to the queue.
 - `commitHead(entryId, options)` — commits exactly the head segment as one log entry (for an entry
   that wrote one collection; multi-collection entries go through the coordinator, below).
+
+The whole-collection commits — `sync`, `updateAndSync`, `actAndSync`, and the coordinator's append
+through `getPendingActions` — refuse with `SealedSegmentsError` (in
+`packages/db-core/src/collection/struct.ts`) while any segment is sealed: each commits everything
+staged as one log entry under one action id, which over sealed segments would merge several queue
+entries into one (see [Identity across attempts](#identity-across-attempts)). A sealed segment is
+committed only through `commitHead` or the coordinator's per-entry slice.
 
 Three invariants, each checked by the queue:
 
@@ -373,10 +387,13 @@ transaction back. With segments, a refusal in a sealed segment is a statement ab
 and must not take down the read or the open transaction that triggered the refresh. Replay becomes
 segment-aware:
 
-- A `TreeGuardRefusedError` (in `packages/db-core/src/collections/tree/struct.ts`) raised while
-  replaying sealed segment `E` excludes `E`'s actions from the replay, records the refusal, and
-  continues with the next segment. The collection reports `(E, error)` to the queue through a
-  callback it is constructed with.
+- An `ActionRefusedError` (in `packages/db-core/src/collection/struct.ts`; `TreeGuardRefusedError`
+  in `packages/db-core/src/collections/tree/struct.ts` is the tree's subclass) raised while
+  replaying sealed segment `E` excludes `E`'s actions from the replay, records the refusal on the
+  segment (`sealedRefusal(E)`), and continues with the next segment. Each sealed segment is staged
+  as one atomic unit, so a refusal of any of its actions leaves none of them staged. The collection
+  reports `(E, error)` to the queue, once, through the `onSealedRefused` callback it is constructed
+  with; a refused segment is skipped by every later replay until the queue drops it.
 - A refusal in the open segment keeps today's behaviour: it is the live transaction's own refusal,
   and it surfaces through the refresh as it does now (the "a live read inside a doomed transaction"
   note in `runQuery` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`).
