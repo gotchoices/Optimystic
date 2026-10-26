@@ -36,8 +36,11 @@ import {
 	type PendRequest,
 	type PendResult,
 	type Transaction,
+	type Transforms,
 	type TreeReplaceAction,
 } from '../src/index.js';
+import { NodeCapacity } from '../src/btree/btree.js';
+import { EntriesPerBlock } from '../src/chain/chain.js';
 import {
 	TestTransactor,
 	DelegatingTransactor,
@@ -144,6 +147,32 @@ class CommitLandsThenThrows extends DelegatingTransactor {
 			throw new Error('connection reset after the commit landed');
 		}
 		return result;
+	}
+}
+
+/** Answers every commit `commit-not-durable` while `refusing` and lands NOTHING: the pend is
+ * delegated (reserved, then cancelled by the writer's own discharge) and the commit is not. The
+ * attempt is then in doubt with nothing visible to any refresh — the shape a coordinator lagging its
+ * cohort leaves behind. Keeps a copy of every pend's transforms, so a test can compare what two
+ * cycles sent. Set `refusing` false to delegate commits again. */
+class LandsNothingReportsNotDurable extends DelegatingTransactor {
+	refusing = true;
+	readonly pended: Transforms[] = [];
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		this.pended.push(structuredClone(request.transforms));
+		return this.inner.pend(request);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.refusing) {
+			return { success: false, conflict: true, reason: 'commit-not-durable: injected, nothing landed' };
+		}
+		return this.inner.commit(request);
 	}
 }
 
@@ -871,6 +900,55 @@ describe('Collection sealed segments', function () {
 			expect(await tree.get(3), 'E2 is re-staged over the committed head').to.deep.equal(entry(3, 'behind'));
 			const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
 			expect(await fresh.get(1), 'the data block landed, not only the tail').to.deep.equal(entry(1, 'queued'));
+		});
+
+		it('a re-drive with resume at the revision the recorded attempt requested, after a refresh that found nothing new, re-sends the recorded attempt itself — the same log block id and tree node ids — rather than a rebuilt one', async () => {
+			const inner = new TestTransactor();
+			// Fill the log tail and the one leaf: with `EntriesPerBlock` entries in the tail the head's
+			// append mints a log data block, and with `NodeCapacity` entries in the leaf its insert
+			// divides the leaf into fresh nodes — the two kinds of id a rebuild would mint anew.
+			expect(NodeCapacity % EntriesPerBlock, 'one round of seeding leaves the tail exactly full').to.equal(0);
+			for (let i = 0; i < NodeCapacity; i++) {
+				await rivalWrites(inner, 100 + i, `seed-${i}`);
+			}
+			const transactor = new LandsNothingReportsNotDurable(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			const recorded: InFlightAttempt[] = [];
+			// Recorded as a journal would keep it: a copy, so nothing the cycle does afterwards can
+			// touch what is compared below.
+			const options = (resume?: InFlightAttempt): HeadCommitOptions => ({
+				...headOptions('A1'),
+				maxAttempts: 1,
+				recordAttempt: async attempt => { recorded.push(structuredClone(attempt)); },
+				...(resume === undefined ? {} : { resume }),
+			});
+
+			const first = await capture(() => collection.commitHead('E1', options()));
+			expect(first).to.be.instanceOf(SyncRetryExhaustedError);
+			expect(transactor.pended, 'one attempt was sent').to.have.length(1);
+			const attempt = recorded[0]!;
+			expect(attempt).to.include({ actionId: 'A1', rev: NodeCapacity + 1 });
+			expect(Object.keys(attempt.transforms.inserts ?? {}), 'the attempt minted a log block and new tree nodes')
+				.to.have.length.greaterThan(1);
+			expect(collection.sealedEntries(), 'in doubt: nothing was applied').to.deep.equal(['E1']);
+			expect(collection.committedRevision(), 'and nothing landed').to.equal(NodeCapacity);
+
+			// The earlier attempt may still sit on a minority of its cohort, hidden from the refresh.
+			// Under the same action id and revision, what goes out now must be byte-identical to it.
+			transactor.refusing = false;
+			const durability = await collection.commitHead('E1', options(attempt));
+
+			expect(durability).to.not.equal(undefined);
+			expect(transactor.pended, 'the second cycle sent one attempt').to.have.length(2);
+			expect(transactor.pended[1], 'the recorded attempt, not a rebuilt one').to.deep.equal(attempt.transforms);
+			expect(recorded, 'the hook saw the same attempt again').to.have.length(2);
+			expect(recorded[1]).to.deep.equal(attempt);
+			expect(collection.sealedEntries(), 'the head was committed').to.deep.equal([]);
+			expect(collection.committedRevision()).to.equal(NodeCapacity + 1);
+			expect((await committedKeys(inner)).at(-1), 'logged once, as the last entry').to.deep.equal([1]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
 		});
 
 		it('a recorded attempt under another action id is refused before the latch is taken', async () => {

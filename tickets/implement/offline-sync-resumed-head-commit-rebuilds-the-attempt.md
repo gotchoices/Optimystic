@@ -1,0 +1,44 @@
+description: When a queued change is sent again after an earlier attempt may have reached only part of the network, the collection rebuilds the attempt from scratch instead of re-sending the recorded one, so two different versions of the same change can exist on different machines under one identity.
+architecture: docs/offline-sync.md#identity-across-attempts
+files: packages/db-core/src/collection/collection.ts, packages/db-core/src/collection/head-commit.ts, packages/db-core/src/collection/write-attempts.ts, packages/db-core/src/collection/struct.ts, packages/db-core/test/collection-segments.spec.ts, docs/offline-sync.md, docs/internals.md
+difficulty: medium
+repro: verified
+----
+
+## The defect, reproduced
+
+The reproduction is already in the tree and failing: the case "a re-drive with resume at the revision the recorded attempt requested, after a refresh that found nothing new, re-sends the recorded attempt itself" in `packages/db-core/test/collection-segments.spec.ts`, under the describe block for the write-ahead hook and resuming a recorded attempt. It runs a head commit over a collection whose log tail holds exactly `EntriesPerBlock` entries and whose one leaf holds `NodeCapacity` entries (seeded by `NodeCapacity` rival writes, asserted to be a multiple of `EntriesPerBlock`), through a transactor double (`LandsNothingReportsNotDurable` in the same spec) that delegates the pend, answers the commit `commit-not-durable` and lands nothing. The first cycle (`maxAttempts: 1`) ends in doubt with one recorded attempt. The second cycle under the same action id, with that attempt as `resume` and the double delegating again, finds nothing new on its opening refresh and today sends a REBUILT attempt: the pend it makes differs from the recorded one in the id of the log data block the append mints (`nextId` on the old tail, `tailId` on the header), in the ids of the tree nodes the leaf division inserts (`rootId` on the header, the new leaves), and in the inserts' partitions. The assertion that fails is "the recorded attempt, not a rebuilt one".
+
+Run it with:
+
+```
+cd packages/db-core && yarn test --grep "re-drive with resume at the revision"
+```
+
+Why it matters is the rule in [docs/offline-sync.md §Identity across attempts](../../docs/offline-sync.md#identity-across-attempts): an entry in doubt is re-sent only under the action id and revision of the attempt that may have landed, and storage accepts a retry of one `(action id, revision)` as the same write. The earlier attempt may sit on a minority of its cohort, hidden from the refresh by a coordinator lagging its cohort. Sent with different content, the machines holding the first attempt keep it as "already done" and the rest store the second: the log forks permanently, the divergence `Collection.logAppendBlockIds` exists to close within one cycle. Nothing closes it across cycles, because the memories a cycle keeps (`mintedLogBlockIds`, and the head tracker inside the closure `Collection.headCommitHandle` returns) die with the cycle's `beginInFlightAction` disposer and its handle.
+
+## The fix, confirmed by prototype
+
+Keyed on `resume`, in the `stage` step of the handle `Collection.headCommitHandle` returns (pass `resume` through from `Collection.openHeadCommit`): while `resume` is given and the revision the next attempt would request (`Collection.getNextRev`) equals `resume.rev`, `stage()` answers the recorded attempt itself instead of building one. The `StagedAttempt` is a `Tracker` over the handle's read cache (`sourceCache`) seeded with `copyTransforms(resume.transforms)` and pins of its own, with `resume.rev`, `resume.tailId`, `resume.blockDigests` and `resume.baseRevs` (an absent `baseRevs` is the empty record). A prototype of exactly that, about ten lines, made the reproduction pass and left the whole segments spec (29 cases), `packages/db-core/test/coordinator-entry-commit.spec.ts` and `packages/db-core/test/offline-queue.spec.ts` green; it was reverted so this ticket starts from HEAD.
+
+Everything downstream of `stage()` works on such an attempt unchanged, which is why one site suffices: `fold` takes the tracker's transforms through `Collection.foldOwnCommit` (`tracker.reset()` hands them over), `refused` retains it again through `retainedAttempt` (the same content, so a second refusal at the same revision answers the same attempt again on the next `stage()`), the write-ahead hook records it again (`OfflineQueue.recordAttempts` sets it per collection id, so re-recording the same attempt changes nothing), and `send` reads the tracker's transforms. The coordinator's lock-step driver (`EntryParticipants` in `packages/db-core/src/transaction/entry-commit.ts`) opens its handles with `EntryCommit.resume` through the same `openHeadCommit` and calls the same `stage()`, so it gets the rule with no change of its own. Keep the rule in `collection.ts` beside `headTrackerFor`, as a small private method building the resumed `StagedAttempt`, or in `write-attempts.ts` beside `retainedAttempt` as its inverse; the latter keeps the attempt shape's two conversions in one file, which is where "how an attempt is built" is documented to live.
+
+Three decisions to state at the site, in a comment, since each is a deliberate departure from what the rebuild path does:
+
+- **Keyed on `resume`, not on the retained attempt.** Within one cycle a retry at an unchanged revision already reuses the head tracker and the minted log block ids, so it is byte-identical already, and it keeps the base-pin re-judging before each attempt (`Collection.headTrackerFor`). The recorded attempt is different in kind: it IS the attempt that may have landed, so it is re-sent as it was, and a base that moved under it is judged by storage's own base guard, which refuses it on any machine whose base moved, the same exception `Collection.completeOwnEntry`'s re-send already takes. Say so, and that it is deliberate.
+- **The invented-baseline question does not arise.** A head tracker over a collection with no committed revision starts from the invented baseline so the header, log block and root ride in the head's commit; the recorded transforms already carry those inserts.
+- **Only equality switches it on.** Once a refresh moves the revision past `resume.rev`, the recorded attempt is proven lost at that revision (a rival's entry was adopted there) and the ordinary rebuild applies. A next revision BELOW `resume.rev` is not reachable inside one process (the held revision never lowers), and a new handle after a restart reaching one has read a view behind the attempt, which the ordinary rebuild path handles as it does today; the rule does not try to adopt the recorded revision.
+
+## Documentation
+
+- `docs/internals.md`, the bullet "The attempt runs on a head tracker, built once per revision" under *Staged actions are segments*: add that a cycle opened with `resume` sends the recorded attempt verbatim while the requested revision equals the recorded one, name the two things it deliberately skips (the base-pin re-judging; the baseline), and that the rule is in the handle's `stage` step so the coordinator's per-entry commit shares it.
+- `docs/offline-sync.md` §Identity across attempts, the paragraph that introduces `HeadCommitOptions.resume`: today it says the resumed attempt is what the opening refresh finishes a torn attempt FROM; add the third case, a refresh that finds nothing new, where the recorded attempt is what the cycle re-SENDS, and that the three cases (own entry found and finished, a rival adopted and the write rebuilt at a higher revision, nothing new and the recorded attempt re-sent) together are what makes "re-sent only under the action id and revision of the attempt that may have landed" true across cycles.
+- The doc comment on `HeadCommitOptions.resume` in `packages/db-core/src/collection/struct.ts` and on `HeadCommitHandle.stage` in `packages/db-core/src/collection/head-commit.ts` say the same thing in one sentence each.
+
+The reproduction spec is the regression test; it needs no change beyond, if the implementer prefers, tightening its title. Nothing else in the segments spec covers this shape (the torn-head resume case has the refresh FIND the entry, and the never-answered case has it land whole).
+
+## TODO
+
+- Pass `resume` from `Collection.openHeadCommit` into `Collection.headCommitHandle`, and make its `stage` step answer the recorded attempt while `resume.rev` equals `Collection.getNextRev()`; build that `StagedAttempt` in one small function beside `retainedAttempt` or `headTrackerFor`, with the three decisions above stated in its comment.
+- Run `yarn test --grep "Collection sealed segments"`, `--grep "commitEntry"` and `--grep "OfflineQueue"` in `packages/db-core`, then the package's whole `yarn test`.
+- Update the two docs and the two doc comments as listed under *Documentation*; run `yarn lint:docs` from the root.
