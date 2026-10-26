@@ -14,6 +14,7 @@ import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
+import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
@@ -41,6 +42,7 @@ export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from 
 export type {
 	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
 } from './optimystic-adapter/offline-status.js';
+export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
 
 /**
  * Plugin registration function
@@ -64,8 +66,9 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	// The restore after a restart initializes each journaled transaction's tables through the module.
 	offline.attachTableResolver(optimysticModule);
 
-	// Create the StampId function
+	// Create the StampId and CommitOutlook functions
 	const stampIdFunc = createStampIdFunction(txnBridge);
+	const commitOutlookFunc = createCommitOutlookFunction(txnBridge, offline);
 
 	// Note: Transaction hooks are handled by the virtual table's begin, commit, rollback methods
 
@@ -90,6 +93,20 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 						isReadOnly: true,
 					},
 					implementation: stampIdFunc,
+				},
+			},
+			{
+				schema: {
+					name: 'CommitOutlook',
+					numArgs: 0,
+					flags: 1 as FunctionFlags, // UTF8
+					returnType: {
+						typeClass: 'scalar' as const,
+						logicalType: TEXT_TYPE,
+						nullable: true,
+						isReadOnly: true,
+					},
+					implementation: commitOutlookFunc,
 				},
 			},
 		],

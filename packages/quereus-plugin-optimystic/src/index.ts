@@ -43,6 +43,9 @@ export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from 
 export type {
 	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
 } from './optimystic-adapter/offline-status.js';
+// Whether a queued transaction can be made to fail by another writer (README § Offline mode, "Will it
+// go in?"): on the `queued` status, and as the JSON `CommitOutlook()` answers. Exported from `./plugin` too.
+export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';

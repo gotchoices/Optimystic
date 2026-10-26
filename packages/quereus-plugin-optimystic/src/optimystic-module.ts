@@ -10,6 +10,7 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+import type { MainTreeDescription, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -17,7 +18,7 @@ import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchem
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
-import type { Collection, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Collection, CollectionId, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
@@ -26,7 +27,8 @@ import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
 import { withTagsOf } from './schema/tag-overlay.js';
 import { PhysicalType } from '@quereus/quereus';
-import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger, revisionToken } from './logger.js';
@@ -551,6 +553,19 @@ function offlinePolicyTag(tags: Readonly<Record<string, SqlValue>> | undefined):
   return { policy: 'queue', recognised: value === undefined || value === 'queue' };
 }
 
+/** The column tag that declares the column's values generated unique per write by the application,
+ * so an offline transaction's check on them cannot be refused by another writer (docs/offline-sync.md
+ * §Declared hints). */
+const FRESH_TAG = 'optimystic.fresh';
+
+/** The table tag that declares only one machine writes the table's rows (docs/offline-sync.md §Declared hints). */
+const SINGLE_WRITER_TAG = 'optimystic.single_writer';
+
+/** Whether `column` is tagged fresh — read with `=== true`, as {@link wantsNetworkWatch} reads its tag. */
+function freshTagged(column: { readonly tags?: Readonly<Record<string, SqlValue>> } | undefined): boolean {
+  return column?.tags?.[FRESH_TAG] === true;
+}
+
 /**
  * Production-grade virtual table for Optimystic tree collections
  */
@@ -630,6 +645,11 @@ export class OptimysticVirtualTable extends VirtualTable {
   private offlinePolicy: OfflineTablePolicy;
   /** A tag value that names no policy was logged; it is logged once per table. */
   private unknownOfflinePolicyLogged = false;
+  /** What the offline-mode controller asks to judge a transaction's checks on this table's trees,
+   * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
+  private readonly outlookSource: TableOutlookSource = {
+    describe: collectionId => this.describeCollection(collectionId),
+  };
   /**
    * Live reads of this table are being served from this machine's own view because the cohort cannot
    * be reached ({@link refreshLive}): set by the first such read, which logs it, and cleared by the
@@ -1311,7 +1331,62 @@ export class OptimysticVirtualTable extends VirtualTable {
    * controller to tell. */
   private publishOfflinePolicy(): void {
     this.txnBridge.getOfflineMode()?.setTablePolicy(
-      this.qualifiedTable, this.offlinePolicy, this.collectionFactory.getCohortReachability(this.options));
+      this.qualifiedTable, this.offlinePolicy, this.collectionFactory.getCohortReachability(this.options), this.outlookSource);
+  }
+
+  /**
+   * Which of this table's trees `collectionId` is (docs/offline-sync.md §Judging each guard): the main
+   * tree, an index tree that enforces a UNIQUE constraint, or another index tree; `undefined` for none
+   * of them, or before the table is initialized. Read from the live schema, codec and indexes, so a
+   * tag changed, or an index created or dropped, since the table published this needs no
+   * re-publication.
+   */
+  private describeCollection(collectionId: CollectionId): TableCollectionDescription | undefined {
+    const rowCodec = this.rowCodec;
+    if (!this.collection || !rowCodec) return undefined;
+    const table = qualifiedTableName(this.qualifiedTable);
+    if (this.collection.getCollection().id === collectionId) return this.describeMainTree(table, rowCodec);
+    const unique = this.describeUniqueIndex(collectionId, table, rowCodec);
+    if (unique) return unique;
+    const indexed = this.indexManager?.getIndexTrees().some(tree => tree.getCollection().id === collectionId) ?? false;
+    return indexed ? { kind: 'index', table } : undefined;
+  }
+
+  private describeMainTree(table: string, rowCodec: RowCodec): MainTreeDescription {
+    const columns = this.tableSchema.columns;
+    return {
+      kind: 'main',
+      table,
+      freshKey: this.tableSchema.primaryKeyDefinition.some(pk => freshTagged(columns[pk.index])),
+      singleWriter: this.tableSchema.tags?.[SINGLE_WRITER_TAG] === true,
+      decodeKey: key => {
+        // decodePrimaryKey answers one value per key column whatever it is given; a key with another
+        // number of framed elements is not one of this table's.
+        const values = rowCodec.decodePrimaryKey(key);
+        return splitKeyTuple(key).length === values.length ? values : undefined;
+      },
+    };
+  }
+
+  /** The UNIQUE constraint whose enforcing index tree ({@link resolveEnforcingIndex}) is
+   * `collectionId` — the trees {@link guardedUniqueIndexes} guards — described for the outlook. */
+  private describeUniqueIndex(collectionId: CollectionId, table: string, rowCodec: RowCodec): UniqueIndexDescription | undefined {
+    for (const uc of this.tableSchema.uniqueConstraints ?? []) {
+      if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+      if (this.resolveEnforcingIndex(uc)?.tree.getCollection().id !== collectionId) continue;
+      const affinities = uc.columns.map(ci => rowCodec.getSchema().columns[ci]?.affinity);
+      return {
+        kind: 'unique-index',
+        table,
+        columns: uc.columns.map(ci => this.tableSchema.columns[ci]?.name ?? `col${ci}`),
+        freshValue: uc.columns.some(ci => freshTagged(this.tableSchema.columns[ci])),
+        decodeValue: indexKey => {
+          const values = decodeIndexKey(indexKey, affinities);
+          return values.length === uc.columns.length ? values : undefined;
+        },
+      };
+    }
+    return undefined;
   }
 
   /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */

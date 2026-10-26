@@ -10,6 +10,8 @@ import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-confi
 import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
 import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
+import { judgeTransaction } from './commit-outlook.js';
+import type { CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, QueueAhead, StagedWrites, TableOutlookSource } from './commit-outlook.js';
 import { addListener, notifyListeners } from './listeners.js';
 import { announceExternalChange } from './external-change.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
@@ -105,6 +107,8 @@ interface PublishedTable {
 	readonly policy: OfflineTablePolicy;
 	/** The reachability gate of the table's transactor (`CollectionFactory.getCohortReachability`). */
 	readonly reachability: ICohortReachability;
+	/** Which of the table's trees a collection is, for judging a transaction's checks ({@link OfflineMode.openTransactionOutlook}). */
+	readonly outlook: TableOutlookSource;
 }
 
 /** The one thing the restore after a restart needs from the module: a declared table's collections,
@@ -173,6 +177,10 @@ export class OfflineMode {
 	private readonly tables = new Map<string, PublishedTable>();
 	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
+	/** Each queued transaction's outlook, judged when the queue first reported it `queued`
+	 * ({@link judgeQueued}) and held until it settles. Nothing of it is journaled: a restart judges a
+	 * restored transaction again when the restore puts it back. */
+	private readonly outlooks = new Map<string, CommitOutlook>();
 	/** The unsubscribe of each distinct gate a table published that has `onChange` ({@link subscribeToGate});
 	 * one per transactor, since the factory hands out one gate per transactor key. */
 	private readonly gateWakes = new Map<ICohortReachability, () => void>();
@@ -296,15 +304,17 @@ export class OfflineMode {
 	 * policy when a transaction writing the table commits ({@link tablePolicy}); a transaction already
 	 * queued keeps the acknowledgement it got. The gate is what the queue asks before submitting an
 	 * entry that wrote the table, and what a live read of it asks before refreshing in offline mode
-	 * ({@link cohortReachable}); its wakes wake the drain ({@link subscribeToGate}).
+	 * ({@link cohortReachable}); its wakes wake the drain ({@link subscribeToGate}). `outlook` says
+	 * which of the table's trees a collection is, asked whenever a transaction that wrote it is judged;
+	 * it reads the table's live schema, so a tag change needs no new publication.
 	 */
-	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy, reachability: ICohortReachability): void {
-		this.tables.set(qualifiedTableName(table), { policy, reachability });
+	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy, reachability: ICohortReachability, outlook: TableOutlookSource): void {
+		this.tables.set(qualifiedTableName(table), { policy, reachability, outlook });
 		this.subscribeToGate(reachability);
 	}
 
-	/** Forget `table`'s policy and gate: it was dropped, or its CREATE was refused. The gate's wake
-	 * subscription stays: a wake for a gate no table uses costs one gate check. */
+	/** Forget `table`'s policy, gate and outlook source: it was dropped, or its CREATE was refused. The
+	 * gate's wake subscription stays: a wake for a gate no table uses costs one gate check. */
 	withdrawTablePolicy(table: QualifiedTableName): void {
 		this.tables.delete(qualifiedTableName(table));
 	}
@@ -671,12 +681,99 @@ export class OfflineMode {
 		this.deleteOutcomeRecord(transactionId);
 	}
 
+	// ── the outlook ────────────────────────────────────────────────────────────────────────────
+
+	/**
+	 * The outlook the open transaction would get were it committed now (docs/offline-sync.md §Using
+	 * the outlook before committing): its open segments, in every collection it staged into, judged as
+	 * one entry sealed behind everything queued now — every queued transaction and every deferred one
+	 * counts as earlier. Judged exactly as a queued transaction is ({@link judgeQueued}), from memory
+	 * alone, so it is synchronous. With nothing queued — outside offline mode, typically — it answers
+	 * whether the commit can lose a race at all. `CommitOutlook()` asks it once a transaction is open.
+	 */
+	openTransactionOutlook(): CommitOutlook {
+		const collections = this.bridge.stagedCollections().filter(collection => collection.openActions().length > 0);
+		const writes: StagedWrites = new Map(collections.map(collection => [collection.id, collection.openActions()]));
+		return this.judge(writes, collections.map(collection => collection.id), this.queueAhead(this.queue.entries(), Infinity));
+	}
+
+	/**
+	 * Judge the queued transaction `entryId` when the queue first reports it `queued` — inside the
+	 * enqueue, before its commit resolves, or inside the restore that put it back — and hold the
+	 * outlook until it settles: its segments, against the entries ahead of it in queue order and the
+	 * journaled transactions numbered below it that are still deferred. It is not judged again, so a
+	 * tag changed later, or an earlier entry settling, changes nothing here.
+	 */
+	private judgeQueued(entryId: string): void {
+		const entries = this.queue.entries();
+		const position = entries.findIndex(entry => entry.id === entryId);
+		const entry = entries[position];
+		if (entry === undefined) {
+			log('offline:outlook-unjudged transaction=%s: the queue reported it queued without listing it', entryId);
+			return;
+		}
+		const collections = this.heldCollections(entry);
+		const ahead = this.queueAhead(entries.slice(0, position), entry.seq);
+		this.outlooks.set(entryId, this.judge(this.sealedWrites(entryId, collections), collections, ahead));
+	}
+
+	private judge(writes: StagedWrites, collections: readonly CollectionId[], ahead: QueueAhead): CommitOutlook {
+		return judgeTransaction({ writes, tables: this.tablesOf(collections) }, this.describeCollection, ahead);
+	}
+
+	/** `entries`, each with the segments it still holds and its outlook's kind, beside the deferred
+	 * journaled transactions numbered below `seq` (a record a pass has put back is in the queue, and
+	 * among `entries` when it is ahead). */
+	private queueAhead(entries: readonly QueuedEntry[], seq: number): QueueAhead {
+		const earlier = entries.map((entry): EarlierEntry => ({
+			transactionId: entry.id,
+			seq: entry.seq,
+			writes: this.sealedWrites(entry.id, this.heldCollections(entry)),
+			assured: this.outlooks.get(entry.id)?.kind === 'assured',
+		}));
+		const deferred = this.restorer?.records()
+			.filter(record => record.seq < seq && this.queue.status(record.transactionId) === undefined)
+			.map((record): DeferredTransaction => ({ transactionId: record.transactionId, seq: record.seq, tables: record.tables })) ?? [];
+		return { earlier, deferred };
+	}
+
+	/** The collections `entry` still holds a segment in: every one it sealed, less those a partial
+	 * commit has committed (their segments are consumed). */
+	private heldCollections(entry: QueuedEntry): CollectionId[] {
+		const committed = new Set(entry.committedCollections ?? []);
+		return entry.collections.filter(id => !committed.has(id));
+	}
+
+	/** Each collection's segment of `entryId`, read from the instance the bridge registered for it;
+	 * `undefined` where that instance holds none, which the judgement reads as unreadable.
+	 * NOTE: the registry holds one instance per collection id, so with two tables declared over one URI
+	 * this can read the other table's instance — the caveat {@link assertNoQueuedEntries} records. */
+	private sealedWrites(entryId: string, collections: readonly CollectionId[]): StagedWrites {
+		const registry = this.bridge.getCollectionRegistry();
+		return new Map(collections.map(id => [id, registry.get(id)?.sealedActions(entryId)]));
+	}
+
+	/** The first description a table behind `collectionId` publishes for it; else the name of the first
+	 * table the bridge recorded for it, when there is one. */
+	private readonly describeCollection = (collectionId: CollectionId): CollectionDescription => {
+		const tables = this.bridge.tablesOf(collectionId);
+		for (const name of tables?.keys() ?? []) {
+			const description = this.tables.get(name)?.outlook.describe(collectionId);
+			if (description !== undefined) return description;
+		}
+		return { kind: 'unknown', table: tables === undefined ? undefined : [...tables.keys()][0] };
+	};
+
 	// ── translation ────────────────────────────────────────────────────────────────────────────
 
 	private onQueueStatus(status: EntryStatus): void {
+		if (status.kind === 'queued' && !this.outlooks.has(status.entryId)) this.judgeQueued(status.entryId);
 		const outcome = status.kind === 'committed' || status.kind === 'failed' ? this.outcomeOf(status) : undefined;
 		const translated = outcome?.status ?? this.translate(status);
-		if (outcome !== undefined) this.retain(outcome);
+		if (outcome !== undefined) {
+			this.outlooks.delete(status.entryId);
+			this.retain(outcome);
+		}
 		notifyListeners(this.statusListeners, translated,
 			error => log('offline:status-listener-threw transaction=%s kind=%s: %o', translated.transactionId, translated.kind, error));
 		if (status.kind === 'failed') this.announceChanged(status.entryId, status.changedCollections);
@@ -762,7 +859,10 @@ export class OfflineMode {
 	 * use it; a terminal status here is a defect, since the queue lists no settled entry. */
 	private translateListed(status: EntryStatus): QueuedTransactionStatus {
 		switch (status.kind) {
-			case 'queued':
+			case 'queued': {
+				// Absent only for an entry a restore has registered and is still putting back: it is judged
+				// when the restore admits it and the queue reports it `queued`.
+				const outlook = this.outlooks.get(status.entryId);
 				return {
 					kind: 'queued',
 					transactionId: status.entryId,
@@ -775,7 +875,9 @@ export class OfflineMode {
 					...(status.lastError === undefined ? {} : { lastError: status.lastError }),
 					...(status.committedCollections === undefined ? {} : { committedTables: this.tablesOf(status.committedCollections) }),
 					persisted: this.journal !== undefined,
+					...(outlook === undefined ? {} : { outlook }),
 				};
+			}
 			case 'submitting':
 				return { kind: 'submitting', transactionId: status.entryId, attempt: status.attempt };
 			default:

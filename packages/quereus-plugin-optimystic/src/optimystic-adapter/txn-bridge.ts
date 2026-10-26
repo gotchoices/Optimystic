@@ -1803,6 +1803,18 @@ export class TransactionBridge {
     return this.dirtyTrees.get(tree);
   }
 
+  /** The collections of the trees the current transaction has staged into ({@link markDirty}), each
+   * once — what a commit would seal into one queue entry. Read by `OfflineMode.openTransactionOutlook`
+   * for `CommitOutlook()`; a tree without a collection (a test double) is left out. */
+  stagedCollections(): Collection<any>[] {
+    const collections = new Set<Collection<any>>();
+    for (const tree of this.dirtyTrees.keys()) {
+      const collection = tree.getCollection?.();
+      if (collection !== undefined) collections.add(collection);
+    }
+    return [...collections];
+  }
+
   /**
    * Add a SQL statement to the accumulated statements for the current transaction.
    * Statements are only accumulated when a transaction is active.

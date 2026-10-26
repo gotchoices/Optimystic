@@ -4,8 +4,9 @@ import type { TransactionDurability } from '../transaction/durability.js';
 
 /**
  * The status an offline-sync queue reports for each entry (docs/offline-sync.md §Following
- * transactions), in its db-core form: collections stand in for tables, and the fields later stages
- * add there (`outlook`, `effect`, `followed`, `persisted`) are absent until they land.
+ * transactions), in its db-core form: collections stand in for tables. The plugin's `followed`,
+ * `persisted` and `outlook` are its own and never appear here — the outlook needs the catalog's tags
+ * and key decoding, which only the plugin has — and `effect` is absent until its stage lands.
  */
 
 /** Why an entry failed. `constraint` and `concurrent-modification` are the two guard refusals

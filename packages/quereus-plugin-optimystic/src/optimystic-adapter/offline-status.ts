@@ -1,12 +1,13 @@
 import type { EntryWaitingFor, OfflineQueueState, QueuedFailureReason } from '@optimystic/db-core';
 import type { SqlCommitDurability } from './commit-durability.js';
+import type { CommitOutlook } from './commit-outlook.js';
 
 /**
  * What `plugin.offline` reports about each locally acknowledged transaction (docs/offline-sync.md
  * §Following transactions): the db-core queue's `EntryStatus` with tables (`schema.table`) in place
- * of collection ids and the transaction's `StampId()` in place of the entry id, `persisted`, and one
- * waiting state of the plugin's own, `'restore'` (docs/offline-sync.md §Restore after a restart). The
- * fields later stages add there (`outlook`, `effect`) are absent until they land.
+ * of collection ids and the transaction's `StampId()` in place of the entry id, `persisted`, the
+ * `outlook`, and one waiting state of the plugin's own, `'restore'` (docs/offline-sync.md §Restore
+ * after a restart). The `effect` a later stage adds is absent until it lands.
  */
 
 export type { QueuedFailureReason } from '@optimystic/db-core';
@@ -38,6 +39,12 @@ export type QueuedTransactionStatus =
 		/** Whether the transaction is in the journal (`offline.journal` is configured): its entry record
 		 * was flushed before its commit resolved, so it survives a crash of this process. */
 		persisted: boolean;
+		/** Whether anything another writer does could make the transaction fail (docs/offline-sync.md
+		 * §Predicting whether an entry will commit), judged when it was queued. Present on every
+		 * transaction the queue holds; absent exactly while `waitingFor` is `'restore'`, since a
+		 * transaction not back in the queue cannot be judged — its first `queued` status after it is put
+		 * back carries one. */
+		outlook?: CommitOutlook;
 	}
 	| { kind: 'submitting'; transactionId: string; attempt: number }
 	/** The same report `onCommitDurability` listeners received for this commit, which they did, before
@@ -73,7 +80,8 @@ export type QueuedTransactionStatus =
  * plain `Error` with the original's name and message and no `cause`. */
 export type TransactionOutcome = Extract<QueuedTransactionStatus, { kind: 'committed' | 'failed' }>;
 
-/** One queued transaction as `plugin.offline.entries()` lists it: its identity and its current status. */
+/** One queued transaction as `plugin.offline.entries()` lists it: its identity and its current status,
+ * which carries its `outlook` while it is `queued`. */
 export type QueuedTransaction = {
 	readonly transactionId: string;
 	readonly seq: number;

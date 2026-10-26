@@ -165,7 +165,7 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands, through stage 6 of that design, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands, through stage 6 of that design and the outlook of stage 7, and says at the end what is still missing.
 
 **A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. With `journal` configured each queued transaction is saved on this machine before its commit resolves and put back after a restart (see [Saving the queue on this machine](#saving-the-queue-on-this-machine--offlinejournal) and [Restarting](#restarting)).
 
@@ -291,7 +291,7 @@ const unsubscribe = plugin.offline.onStatus(status => {
 ```
 
 - `transactionId` is what `StampId()` returned inside the transaction. `tables` names the tables it changed, as `schema.table`.
-- `queued` is delivered synchronously inside the commit, before `db.exec` resolves, by the rule `onCommitDurability` uses, which is how an autocommit statement's caller learns the id it never selected. It carries `seq` (the drain order), `waitingFor` (`'earlier-entry'`, `'cohort'`, `'backoff'`, or undefined for the head about to be sent), `attempts`, `inDoubt` (an attempt may have landed), `lastError`, `committedTables` once part of the transaction has committed, and `persisted` (it is saved in the journal). It is delivered again whenever one of those changes.
+- `queued` is delivered synchronously inside the commit, before `db.exec` resolves, by the rule `onCommitDurability` uses, which is how an autocommit statement's caller learns the id it never selected. It carries `seq` (the drain order), `waitingFor` (`'earlier-entry'`, `'cohort'`, `'backoff'`, or undefined for the head about to be sent), `attempts`, `inDoubt` (an attempt may have landed), `lastError`, `committedTables` once part of the transaction has committed, `persisted` (it is saved in the journal), and `outlook`, whether another machine can make it fail (see [Whether another machine can make a queued transaction fail](#whether-another-machine-can-make-a-queued-transaction-fail--outlook)). It is delivered again whenever one of those changes.
 - `committed` is the `SqlCommitDurability` an online commit reports (`durability`, `tables`, `followed`) with `kind` added. `onCommitDurability` listeners received that same report a moment earlier, and `onCommitFullyHeld` follows the commit exactly as it follows an online one. Unlike an online report it arrives during no `db.exec`; the transaction id is the attribution.
 - `partially-committed` names the `committedTables` the network already holds and the `pendingTables` the next submission drives; the transaction stays queued, in doubt.
 - `failed` carries `reason` (`'constraint'`, `'concurrent-modification'`, `'rejected'`, `'too-large'`, `'expired'`, `'discarded'`), `error` as an online commit would have thrown it (a `ConstraintError` reading `UNIQUE constraint failed: …`, a `ConcurrentModificationError`, with the db-core refusal reachable through `cause`), `changedTables` (whose rows the removal changed), `causedBy` naming the earlier transaction whose removal made this one fail, and `committedTables` when part of it had committed first — the network then holds half of the transaction.
@@ -300,6 +300,40 @@ const unsubscribe = plugin.offline.onStatus(status => {
 **What a watcher sees when a transaction fails.** The queued transaction's rows were in this machine's view since its local commit, which fired `Database.watch` subscribers as any commit does. When it fails, its rows leave that view, and every table in its `changedTables` is announced to the `Database`'s watchers as a whole-table change (`Database.notifyExternalChange`, the call [Reactive Watching](#reactive-watching) describes), after the `failed` status has reached every `onStatus` listener. A `committed` status announces nothing, since the drain committed exactly what this machine already showed. A transaction that fails because an earlier one failed is announced again, so a table can wake a watcher once per failed transaction; each wake is a re-query, never a missed change. The rows can leave the view earlier than the `failed` status: a read that pulls the other machine's commit sees the refusal and stops showing them at once, and the status and the announcement follow when the drain acts on it.
 
 Queue-wide state, for a status bar: `plugin.offline.onQueueState(listener)`, published whenever the queue or the mode changes, and `plugin.offline.queueState()` for the current value. It carries `mode` (`'offline'` or `'online'`), `depth`, `oldestQueuedAt`, `draining` (a submission is on the network), `waitingFor` (`'cohort'` or `'backoff'` for the head), `unclassifiedFailures` (attempts the drain could not classify; a rising count with a stuck depth is the signal), and `readsServedLocally` (the last live read was served from this machine's own view because the other machines could not be reached; see [Reading while the other machines cannot be reached](#reading-while-the-other-machines-cannot-be-reached)).
+
+#### Whether another machine can make a queued transaction fail — `outlook`
+
+Most queued transactions cannot fail: a new note under an id the application generated, an edit of a row only this machine has seen. A few can: claiming a username another machine may claim first, editing a row other people also edit. Each `queued` status carries an `outlook` that says which, judged when the transaction is queued, from the checks the transaction is judged by again when it is sent:
+
+- `kind` — `'assured'` when no other writer can make it fail, `'exposed'` when one can.
+- `exposures` — one per check another writer can refuse, in the order the transaction staged them, each `{ table, rule, key, columns? }`. `rule` is `'primary-key'` (an insert's key must still be free; `key` is the primary key), `'unique'` (a UNIQUE value must still be free; `columns` names the constraint's columns and `key` the value), or `'row'` (an update, delete or replace read a row another writer may change or delete; `key` is its primary key). A check the plugin cannot judge is reported as `'row'` with no `key`, never left out.
+- `dependsOn` — the earlier queued transactions this one relies on, `{ transactionId, via: 'guard' }`, in queue order: if one of them fails, a check of this one can refuse. A transaction is assured only if every one it depends on is.
+- `unchecked` — always `'not-computed'`: what a statement decided by reading other rows (a foreign key, a subquery) is not analysed yet.
+
+How to present it is the application's choice; one way is to show an assured transaction as plain progress and an exposed one as "may not go through", with its exposures as the reason.
+
+No value counts as fresh unless a tag says so: the plugin does not yet see that a value came from `StampId()` or a random source. Two tags declare what it cannot see; they are read `=== true` and saved in the catalog record like every tag:
+
+| Tag | On | Effect on the outlook |
+|---|---|---|
+| `"optimystic.fresh" = true` | a column | The application generates the column's values unique per write (a UUID made in the app). An insert under a primary key that has such a column, and a UNIQUE value that has one, is not exposed; nor is an update or delete of a row an earlier queued transaction inserted under such a key, since no other machine has seen the row. |
+| `"optimystic.single_writer" = true` | a table | Only this machine writes the table's rows (a device's own settings): its updates and deletes are not exposed. Inserts under a natural key still are. |
+
+```sql
+create table Note (id text primary key with tags ("optimystic.fresh" = true), body text)
+  using optimystic('tree://app/notes');
+```
+
+A tag changes only the prediction: every check is still made when the transaction is sent, so a false tag gives an assured transaction that fails anyway. The outlook is judged once, when the transaction is queued — a tag changed later does not judge it again — and it is not yet updated as earlier transactions settle. A transaction put back after a restart is judged again then; one still waiting to be put back (`waitingFor: 'restore'`) carries no outlook, and counts as an exposed dependency of every later transaction that wrote one of its tables.
+
+**Asking before committing — `CommitOutlook()`.** Inside an open transaction, `select CommitOutlook()` answers, as JSON, the outlook the transaction would get if it were committed now, behind everything queued; outside one it answers `NULL`, like `StampId()`. A bigint renders as a number when it is a safe integer and as a decimal string otherwise, bytes as `0x` followed by hex, and an unknown key as `null`. It judges what is staged at the moment it is evaluated, so inside a statement that also writes it sees what that statement has staged before it. It works outside offline mode too, where it says whether the commit can lose a race with another writer at all.
+
+```sql
+begin;
+update Note set body = :body where id = :id;
+select CommitOutlook();   -- {"kind":"exposed","exposures":[{"table":"main.Note","rule":"row","key":["n1"]}],"dependsOn":[],"unchecked":"not-computed"}
+commit;
+```
 
 #### Queries and actions
 
@@ -316,6 +350,8 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 #### Not yet in this stage
 
 - **No SQL view of the queue.** `plugin.offline.entries()` is the only listing; an `optimystic_queue` virtual table is in the backlog.
+- **The outlook does not follow the queue.** A transaction exposed only through `dependsOn` is not told when the transactions it depends on commit, and an assured transaction that fails is not singled out in the log.
+- **No fresh-value detection.** Only the `optimystic.fresh` tag makes a value fresh; a key from `StampId()` or a random source counts as natural until the plugin can see where a statement's values came from.
 
 ## Reactive Watching
 

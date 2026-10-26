@@ -1156,11 +1156,10 @@ describe('Plugin Registration & Lifecycle (TEST-7.3.1)', () => {
 		expect(plugin.vtables[0]!.name).to.equal('optimystic');
 	});
 
-	it('should register the StampId function', () => {
+	it('should register the StampId and CommitOutlook functions', () => {
 		const { plugin } = createTestEnv();
 
-		expect(plugin.functions).to.have.lengthOf(1);
-		expect(plugin.functions[0]!.schema.name).to.equal('StampId');
+		expect(plugin.functions.map(func => func.schema.name)).to.deep.equal(['StampId', 'CommitOutlook']);
 	});
 
 	it('should support full CRUD lifecycle through adapter', async () => {

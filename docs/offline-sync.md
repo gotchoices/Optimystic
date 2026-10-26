@@ -211,7 +211,7 @@ type QueuedTransactionStatus =
   | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[]; queuedAt: number;
       attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
       persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | 'restore' | undefined;
-      outlook: CommitOutlook }
+      outlook?: CommitOutlook }        // absent exactly while waitingFor is 'restore'
   | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
   | { kind: 'submitting'; transactionId: string; attempt: number }
   | { kind: 'committed'; transactionId: string; durability: TransactionDurability;
@@ -248,6 +248,9 @@ type QueuedFailureReason =
 - `outlook` says whether anything another writer does can make the entry fail, and if so what; an
   application uses it to decide whether a pending change needs the user's attention or only a
   progress indicator. See [Predicting whether an entry will commit](#predicting-whether-an-entry-will-commit).
+  It is present on every entry the queue holds and absent exactly while `waitingFor` is `'restore'`:
+  a transaction not back in the queue cannot be judged, and its first `queued` status after the
+  restore puts it back carries one. `QueuedTransaction.status` carries it the same way.
 - `committedTables` on `failed` is set only when part of the transaction committed and the rest was
   then refused permanently; see [Partial commits](#partial-commits).
 - `waitingFor: 'restore'` is the plugin's own state, absent from the db-core queue: the transaction is
@@ -260,9 +263,11 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 `committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
 `failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
 what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
-plugin passes through. `outlook` and `outlook-changed` arrive with stage 7 and `effect` with stage
-10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4, and `persisted`
-(on `queued`, and on each item `entries()` lists) and the `'restore'` waiting state with stage 5.
+plugin passes through. It carries no `outlook`: judging a guard needs the catalog's tags and the
+tables' key decoding, which only the plugin has, so the outlook is the plugin's own and `effect`
+arrives with stage 10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4,
+`persisted` (on `queued`, and on each item `entries()` lists) and the `'restore'` waiting state with
+stage 5, and `outlook` on `queued` with stage 7.
 
 Queue-wide state, for a status bar:
 
@@ -875,8 +880,12 @@ type CommitOutlook = {
   /** Earlier unsettled entries whose failure would fail this one, or change what it means. */
   dependsOn: readonly { transactionId: string; via: 'guard' | 'unchecked' }[];
   /** Decisions made against rows nothing re-checks at rebase. Independent of `kind`: they do not
-   *  make the entry fail, they can make it commit with a decision a fresh evaluation would refuse. */
-  unchecked: readonly UncheckedDecision[];
+   *  make the entry fail, they can make it commit with a decision a fresh evaluation would refuse.
+   *  'not-computed' when the analysis had no description of what the statements read: always from
+   *  the guards alone (stage 7), and from the write description unless every statement of the entry
+   *  was described (stage 9). A string rather than an absent field, because `CommitOutlook()` renders
+   *  this as JSON, where an absent key would be ambiguous. */
+  unchecked: readonly UncheckedDecision[] | 'not-computed';
 };
 
 type Exposure = {
@@ -894,7 +903,13 @@ type UncheckedDecision = {
 ```
 
 The outlook is computed at local commit and delivered on the `queued` status, so it is in hand
-before `commit` resolves. It changes in one direction only while the entry is queued: an entry that
+before `commit` resolves. More exactly, it is computed when the queue emits the entry's first
+`queued` status — inside the enqueue, after sealing, or inside the restore after a restart that
+puts the entry back — from the sealed segments, and the controller holds it per transaction id until
+the entry settles. The entry's own judgement (its exposures, below) is fixed then and never
+recomputed: a tag changed later, or an earlier entry committing, does not re-judge it, which is what
+makes the outlook move in one direction only. Nothing of it is journaled; a restart judges a restored
+entry again, against the entries restored before it. It changes in one direction only while the entry is queued: an entry that
 was exposed only through `dependsOn` becomes assured when those entries commit, and the queue
 delivers an `outlook-changed` status. Nothing makes an assured entry exposed later, because its own
 guards and its position in the queue do not change; a rival commit that refuses an exposed entry's
@@ -946,6 +961,35 @@ Two refinements matter in practice:
   estimate probabilities; a username, an email address or a date-keyed row is exposed, with the key
   in `exposures`, and the application decides how to present that.
 
+The judgement is one pass over the entry's elements, in staging order (`judgeTransaction` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`), one exposure per
+guard that can be refused:
+
+- **A guard covered by an earlier write of the same entry is not judged.** When an earlier element of
+  the entry, in the same collection, wrote exactly the same key under an `absent` or `unchanged`
+  guard, any rival change that would refuse the later guard refuses that earlier one first. So
+  "insert under a fresh key, then update it, in one transaction" is assured, and "insert under a
+  natural key, then update it" carries one exposure, the insert's. Only an exact-key `absent` or
+  `unchanged` covers: an unguarded earlier write (an index-tree delete) covers nothing, and an
+  `absentRange` is never covered, since a rival taking the value under another key refuses it
+  without touching the earlier element's key.
+- **The table knowledge comes from each table.** Each vtab publishes, beside its offline policy, a
+  description of its collections (`TableOutlookSource`): which is the main tree (with its key
+  decoder, and whether a primary-key column is tagged fresh), which index trees enforce a UNIQUE
+  constraint (with the constraint's columns, whether one of them is tagged fresh, and a value
+  decoder), and which are other index trees. It reads the live schema at call time, so a tag change
+  needs no re-publication. Tags are read `=== true`, the rule `optimystic.network_watch` is read by.
+- **Exposures name what a user can recognise.** `absent` reports `rule: 'primary-key'` with the
+  decoded primary key; `absentRange` reports `rule: 'unique'` with the constraint's columns and the
+  unique value decoded from the range's lower bound (`decodeIndexKey` in
+  `packages/quereus-plugin-optimystic/src/schema/index-manager.ts`); `unchanged` reports `rule:
+  'row'` with the decoded primary key.
+- **Anything the analysis cannot read is exposed** (see [Conservative by
+  construction](#conservative-by-construction)): an unknown guard kind, an action that is not a tree
+  `replace`, a guard in a collection no table describes, a guard of a kind its collection does not
+  carry, a segment that cannot be read, a key that does not decode. Each is reported as `rule: 'row'`
+  with no key, under the collection's table name when one is known and its collection id otherwise.
+
 ### Unchecked decisions
 
 The rows a statement read to make its decision, other than the target row its guard protects, are
@@ -968,9 +1012,14 @@ which tells an application, and the dependency rule below, how wide the dependen
 
 An entry depends on an earlier unsettled entry in two ways:
 
-- **Through a guard**: its `unchanged` guard protects a row the earlier entry wrote. If the earlier
-  entry fails, the row reverts and the guard refuses. Recorded with `via: 'guard'`. The entry is
-  assured only if the earlier entry is.
+- **Through a guard**: one of its guards covers something the earlier entry wrote — the exact key
+  for `absent` and `unchanged`, the range for `absentRange`. If the earlier entry fails, its write
+  reverts and the guard can refuse: an `unchanged` guard over a row the earlier entry wrote, an
+  `absent` re-insert of a key the earlier entry deleted, an `absentRange` over a value the earlier
+  entry freed. Recorded with `via: 'guard'`. The entry is assured only if the earlier entry is (an
+  assured earlier entry can still fail for reasons the prediction does not cover — expiry, discard,
+  rejection — which is why it stays listed). A guard covered by an earlier write of the same entry
+  contributes no dependency of its own.
 - **Through an unchecked read**: one of its unchecked decisions read rows the earlier entry wrote —
   a message whose conversation was created by the earlier entry. If the earlier entry fails, this
   one is kept (its guards still pass) but its decision rested on rows that are gone. Recorded with
@@ -980,6 +1029,13 @@ Matching a read against an earlier entry's writes uses the read's scope: a `row`
 when the earlier entry wrote that key, a `group` or `global` read matches when it wrote the table.
 The queue knows each entry's written keys from its actions. This is the change-scope lattice's
 intersection (`intersectScopes`), applied to a read scope and a write set.
+
+"Earlier" means before the entry in the queue's order. A journaled transaction the restore after a
+restart still defers (see [Restore after a restart](#restore-after-a-restart)) with a lower sequence
+number counts too, whenever it wrote one of the entry's tables: its writes are not staged, so they
+cannot be matched by key, and it is never assured. Each transaction is listed once, in queue order.
+`CommitOutlook()` judges the open transaction as an entry sealed behind everything queued now, so
+every queued entry and every deferred record counts as earlier.
 
 ### What the analysis needs from Quereus
 
@@ -1094,7 +1150,13 @@ commit;
 
 `CommitOutlook()` mirrors `StampId()`: a function the plugin registers, answering for the current
 transaction, `NULL` outside one. It is useful online too, where it predicts whether a commit can
-lose a race at all.
+lose a race at all. It judges what the transaction has staged at the moment it is evaluated
+(`Collection.openActions`, in every collection the transaction staged into), as an entry sealed
+behind everything queued now, by the same judgement a queued entry gets
+(`OfflineMode.openTransactionOutlook`); everything it reads is in memory, so it is synchronous. The
+JSON renders a value the way Quereus's own JSON output does: a bigint as a number when it is a safe
+integer and as a decimal string otherwise, bytes as `0x` followed by hex, and an unknown key as
+`null`.
 
 ## Reads in offline mode
 
@@ -1705,8 +1767,16 @@ its partner is missing, and committing it at `local` under `allowSoloCommit`), a
 the two-node mesh with B away: an offline write queued and sent nowhere, a live read serving it, and
 the drain on B's return reported `queued`, `submitting` and `committed` once each, woken by the gate
 with the re-check timer too long to explain it; and `expireAfterMs` reached while B is away, the entry
-failing `expired`, never sent. Of the list below, what is left waits for its stage: the outlook
-(stages 7 to 10).
+failing `expired`, never sent.
+
+The first half of stage 7 pins the outlook from guards in
+`packages/quereus-plugin-optimystic/test/offline-outlook.spec.ts`, on one node whose gate never opens:
+an insert then an update in one transaction, assured under a fresh key and exposed once on the key
+under a natural one; an update of a row an earlier queued entry inserted under a fresh key, assured
+with that entry in `dependsOn`; an update of a row committed before going offline, exposed with its
+key; an insert under a fresh key into a table with natural UNIQUE columns, exposed on each decoded
+value; and `CommitOutlook()` inside an open transaction and outside one. Of the list below, what is
+left waits for its stage: the rest of the outlook (stages 7 to 10).
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.

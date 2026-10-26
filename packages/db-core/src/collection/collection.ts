@@ -1848,6 +1848,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.segments.find(entryId)?.actions;
 	}
 
+	/** The OPEN segment's actions — what the current transaction has staged since the last seal — as
+	 * the array the segment holds (never mutated by a caller). Unlike {@link getPendingActions} it
+	 * answers while segments are sealed, for a reader that judges the open transaction beside the
+	 * queued ones (the Quereus plugin's `CommitOutlook()`). Synchronous and latch-free, like
+	 * {@link sealedActions}. */
+	openActions(): readonly Action<TAction>[] {
+		return this.segments.open;
+	}
+
 	/** The exact inverse of {@link sealPending}, list-only and latch-free by the same contract: move
 	 * the segment's actions back into the open segment, for an enqueue whose journal write failed
 	 * after sealing (`OfflineQueue.enqueue`, which unseals every collection it sealed, in reverse
