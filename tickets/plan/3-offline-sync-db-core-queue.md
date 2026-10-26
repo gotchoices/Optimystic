@@ -1,5 +1,5 @@
 description: Build the offline queue itself in the core library: an in-memory, network-agnostic list of locally committed transactions that it sends to the network one at a time, in order, and reports on until each is committed or has failed.
-prereq: offline-sync-typed-commit-failure-classes, offline-sync-collection-segments
+prereq: offline-sync-commit-failure-classifier, offline-sync-collection-segments
 architecture: docs/offline-sync.md#draining
 files: packages/db-core/src/transaction/coordinator.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/network/, packages/db-core/src/index.ts, docs/offline-sync.md
 difficulty: hard
@@ -13,7 +13,7 @@ A queue over a set of collections whose entries are the sealed segments stage 2 
 
 - **FIFO drain** ([§Order: strictly first in, first out](../../docs/offline-sync.md#order-strictly-first-in-first-out)): one entry at a time, in local commit order; head-of-line blocking accepted.
 - **One entry, one network transaction** ([§One entry, one network transaction](../../docs/offline-sync.md#one-entry-one-network-transaction)): a one-collection entry commits via `commitHead`; a multi-collection entry commits through a per-entry `TransactionCoordinator` that pends every collection's head segment, then commits. `TransactionCoordinator` gains a way to commit a named slice (per collection, one segment's actions) instead of everything staged.
-- **Classification** of each attempt by the stage-1 predicate, into the transitions of the entry lifecycle diagram ([§Entry lifecycle](../../docs/offline-sync.md#entry-lifecycle)).
+- **Classification** of each attempt by the stage-1 predicate (`classifyCommitFailure`, which answers `unknown` for anything thrown from a commit phase — handle that as in doubt), into the transitions of the entry lifecycle diagram ([§Entry lifecycle](../../docs/offline-sync.md#entry-lifecycle)).
 - **Identity across attempts** ([§Identity across attempts](../../docs/offline-sync.md#identity-across-attempts)): an entry that has been sent is in doubt until its outcome is established, and is re-sent only under the action id and revision of the attempt that may have landed; a new action id only after a proven non-landing (refused pend, or `TornActionError` with `final: true`). The attempt identity is recorded before sending through a hook the journal (stage 5) will implement.
 - **Partial commits** ([§Partial commits](../../docs/offline-sync.md#partial-commits)): `CoordinatorPartialCommitError` → `partially-committed`, keep driving the uncommitted segments; permanent refusal of the remainder → `failed` with `committedTables`.
 - **Cascading removal** ([§Removing an entry](../../docs/offline-sync.md#removing-an-entry)): on failure, drop the entry's segments from every collection it wrote, let them replay, fail later entries whose guards now refuse with `causedBy`, and report which collections' visible content changed (the plugin turns that into `notifyExternalChange`).

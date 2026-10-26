@@ -111,3 +111,9 @@ The evidence is already collected and then dropped at two named boundaries, both
 So the field work here has a third member: alongside the operation **phase** on the transactor aggregate and the shortfall's **counts**, `SyncRetryExhaustedError` wants the rival action ids (and whether any responder named one at all) as data. Same shape, same argument, same file for the first hop.
 
 One caveat for whoever sizes this. The lost write sereus measured was not caused by the missing field — it was caused by a pending record that never cleared, which is `implement/a-member-that-missed-a-commit-refuses-every-later-write`. With that fixed, re-presenting on this distinction becomes useful rather than a way to loop forever, and the two should probably be weighed in that order.
+
+## Update, 2026-10-25 — the shortfall arm moved to `offline-sync-typed-promise-shortfall`
+
+The 2026-09-16 arm above (the promise shortfall's counts as fields, and switching `expectPromiseShortfall` off the regex) is now the implement ticket `offline-sync-typed-promise-shortfall`, stage 1 of `docs/offline-sync.md`. It adds `PromiseShortfallError` / `ShortfallFailure` (approvals, rejections, peer count, needed count, silent peers), returned from a refused pend so it reaches a remote writer too. One consequence for sereus: the `Failed to get super-majority: …` sentence stays byte-identical, but on a refused pend a local writer now receives it as the **top-level** `PromiseShortfallError` thrown out of `Collection.sync`, no longer as the `cause` of a `Some peers did not complete:` aggregate. A matcher that looks only inside that aggregate stops firing; the replacement is `instanceof PromiseShortfallError`. A commit-phase shortfall still arrives as before.
+
+What stays open here: the operation **phase** as a field on the transactor aggregate (and the two site comments), and the rival action ids on `SyncRetryExhaustedError`.
