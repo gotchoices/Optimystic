@@ -25,3 +25,4 @@ export * from "./utility/pending.js";
 export * from "./utility/lru-map.js";
 export * from "./utility/backoff.js";
 export * from "./utility/unref-timer.js";
+export * from "./utility/visit-every.js";

@@ -360,6 +360,36 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			expect(txn.collections.size).to.equal(0);
 		});
 
+		it('a restore that throws during rollback stops no other restore, ends the transaction, and latches the degraded state', async () => {
+			const { plugin } = createTestEnv();
+			const bridge = plugin.txnBridge;
+			const restored: string[] = [];
+			const failure = new Error('replay refused the restored open segment');
+			const double = (name: string, restore: () => Promise<void>) =>
+				({ sync: async () => undefined, snapshot: () => ({}), restore, describe: () => name });
+
+			await bridge.beginTransaction(defaultOptions);
+			bridge.markDirty(double('double/throws', async () => { restored.push('throws'); throw failure; }));
+			bridge.markDirty(double('double/after', async () => { restored.push('after'); }));
+
+			let caught: unknown;
+			try {
+				await bridge.rollbackTransaction();
+			} catch (err) {
+				caught = err;
+			}
+
+			expect(caught, 'the restore\'s own failure propagates').to.equal(failure);
+			expect(restored, 'the tree after the throwing one is still restored').to.deep.equal(['throws', 'after']);
+			expect(bridge.isTransactionActive(), 'the transaction is over, as Quereus already considers it').to.be.false;
+			expect(bridge.getDegradedReason(), 'committed reads refuse until a clean commit or rollback').to.equal(failure.message);
+
+			// The next transaction begins fresh, and its clean rollback releases the latch.
+			await bridge.beginTransaction(defaultOptions);
+			await bridge.rollbackTransaction();
+			expect(bridge.isDegraded()).to.be.false;
+		});
+
 		it('should throw when committing without active transaction', async () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;

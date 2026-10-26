@@ -19,6 +19,7 @@ import { collectOperations, hashOperations } from "./operations-hash.js";
 import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 import { recordCollectionDurability, transactionDurability, type TransactionDurability } from "./durability.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
+import { visitEveryThenThrow } from "../utility/visit-every.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('trx:coordinator');
@@ -1100,10 +1101,12 @@ export class TransactionCoordinator {
 		// phantom that a conflicting sync's replayActions would resurrect as live data.
 		// Awaited: a restore across a change to the collection's sealed segments replays them
 		// (Collection.restorePending), and the single-call-path assumption above is what keeps a
-		// stage from landing on the collection while that replay runs.
-		for (const [collection, snapshot] of data.preSnapshot) {
-			await collection.restorePending(snapshot);
-		}
+		// stage from landing on the collection while that replay runs. Every participant is
+		// restored even after one throws (a refusal of the restored open segment, or a failed
+		// re-read inside the replay): each restore is independent, and stopping at the first throw
+		// would leave the later participants holding the rolled-back stamp's actions, which the
+		// next transaction would then log as its own.
+		await visitEveryThenThrow(data.preSnapshot, ([collection, snapshot]) => collection.restorePending(snapshot));
 	}
 
 	/**

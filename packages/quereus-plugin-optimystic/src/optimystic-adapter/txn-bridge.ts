@@ -5,6 +5,7 @@ import type {
 import {
   TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
   TreeKeyTakenError, createTransactionId, createTransactionStamp, recordCollectionDurability, transactionDurability,
+  visitEveryThenThrow,
 } from '@optimystic/db-core';
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
@@ -932,7 +933,14 @@ export class TransactionBridge {
       // refresh; the legacy sweep has already mapped it, which mapCommitRefusal
       // detects and passes through) is rewrapped as the ordinary UNIQUE-constraint
       // error so the loser sees the same refusal a sequential duplicate produces.
-      await this.rollbackTransaction();
+      // The commit's failure is the answer; a restore that fails inside this rollback has
+      // already been logged and latched by rollbackTransaction (which tears the transaction
+      // down either way), and must not replace it.
+      try {
+        await this.rollbackTransaction();
+      } catch (rollbackError) {
+        log('commit:rollback-failed error=%s', rollbackError instanceof Error ? rollbackError.message : String(rollbackError));
+      }
       throw this.mapCommitRefusal(error);
     }
     this.reportCommitDurability(transactionId, durability);
@@ -1250,13 +1258,33 @@ export class TransactionBridge {
    * matches storage (nothing of this transaction reached that collection). The committed
    * trees are left alone — the coordinator already folded them, and their memory matches
    * storage too. Restoring a clean tree is a no-op, as in the fallback sweep.
+   *
+   * Never throws: the partial-commit error the caller is about to raise is the structured signal
+   * the host reconciles from, and a restore's own failure must not replace it — a bare error in
+   * its place would send `commitTransaction` down its clean-rollback path, which rewinds the
+   * committed trees too. So every uncommitted tree is restored, and a failed restore is logged
+   * (`commit:restore-failed`) and reflected in the degraded latch the caller is about to set.
    */
   private async restoreUncommittedTrees(committed: ReadonlySet<CollectionId>): Promise<void> {
-    for (const [tree, snapshot] of this.dirtyTrees) {
+    const uncommitted = [...this.dirtyTrees].filter(([tree]) => {
       const id = tree.getCollection?.()?.id;
-      if (id === undefined || !committed.has(id)) {
-        await tree.restore(snapshot);
-      }
+      return id === undefined || !committed.has(id);
+    });
+    await this.restoreOrLog(uncommitted);
+  }
+
+  /**
+   * Restore every tree in `entries`, letting no throw stop the rest, and log rather than raise a
+   * failed restore — for the paths that already hold the error they will raise (a partial
+   * commit, a failed commit's rollback), where the restore's own failure is a consequence to
+   * record, not the answer. The paths whose answer IS the restore ({@link rollbackTransaction},
+   * {@link rollbackToSavepoint}) let it propagate instead.
+   */
+  private async restoreOrLog(entries: Iterable<[DirtyTree, unknown]>): Promise<void> {
+    try {
+      await visitEveryThenThrow(entries, ([tree, snapshot]) => tree.restore(snapshot));
+    } catch (error) {
+      log('commit:restore-failed error=%s', error instanceof Error ? error.message : String(error));
     }
   }
 
@@ -1343,9 +1371,7 @@ export class TransactionBridge {
         // large single-collection commits ever fail mid-block-loop in practice,
         // classify a partially-committed failing tree as persisted here.
         const unsynced = trees.filter(t => !synced.includes(t));
-        for (const t of unsynced) {
-          await t.restore(this.dirtyTrees.get(t));
-        }
+        await this.restoreOrLog(unsynced.map(t => [t, this.dirtyTrees.get(t)]));
 
         const label = (t: DirtyTree) => treeLabel(t, trees.indexOf(t));
         const persisted = synced.map(label);
@@ -1376,13 +1402,48 @@ export class TransactionBridge {
       throw new Error('No active transaction to rollback');
     }
 
-    // Rollback session if in transaction mode
+    // Quereus ends its transaction whether or not this hook throws (its transaction manager
+    // resets in a `finally` and logs a connection's throw), so the bridge's transaction ends
+    // here too, whatever the restores below do: a transaction left active would make the next
+    // BEGIN a no-op over this one's state. A restore that threw leaves its collection
+    // un-reconciled (half re-staged, see Collection.updateInternal's note on a throw out of
+    // replayActions), so the degraded latch is set from it rather than released, and the throw
+    // propagates once every tree has been restored.
+    const transaction = this.currentTransaction;
+    let restoreFailure: unknown;
+    try {
+      await this.restoreForRollback();
+    } catch (error) {
+      restoreFailure = error;
+      this.degradedReason = error instanceof Error ? error.message : String(error);
+      throw error;
+    } finally {
+      this.dirtyTrees.clear();
+      this.savepoints.clear();
+      transaction.collections.clear();
+      transaction.isActive = false;
+      this.accumulatedStatements = [];
+      this.session = null;
+      // A clean rollback restores a reconciled local view (memory matches what each
+      // tree's storage holds) — release the degraded latch (see degradedReason).
+      if (restoreFailure === undefined) this.degradedReason = null;
+    }
+
+    // Note: We intentionally do NOT clear the collection factory cache here.
+    // The transactor cache contains pre-registered transactors that should persist
+    // across transactions. Clearing them would cause the factory to create new
+    // disconnected transactors instead of using the registered ones.
+  }
+
+  /** The restoring half of {@link rollbackTransaction}: the session's own rollback in session
+   * mode (the coordinator restores every participant, then throws the first failure), each dirty
+   * tree's restore otherwise — every tree, even after one throws, since each restore is
+   * independent and a tree left un-restored would carry the rolled-back statements into the next
+   * transaction. Throws the first restore failure after every collection has been visited; the
+   * caller tears the transaction down and latches the degraded state either way. */
+  private async restoreForRollback(): Promise<void> {
     if (this.session && !this.session.isRolledBack()) {
-      try {
-        await this.session.rollback();
-      } catch {
-        // Ignore rollback errors - we're already cleaning up
-      }
+      await this.session.rollback();
     }
 
     // Roll back staged-but-unsynced DML. Quereus runs deferred row constraints
@@ -1405,27 +1466,8 @@ export class TransactionBridge {
     //     Restoring the snapshot (rather than clearing the tracker) keeps a
     //     never-synced collection's header/root intact so it stays readable.
     if (!this.session) {
-      for (const [tree, snapshot] of this.dirtyTrees) {
-        await tree.restore(snapshot);
-      }
+      await visitEveryThenThrow(this.dirtyTrees, ([tree, snapshot]) => tree.restore(snapshot));
     }
-    this.dirtyTrees.clear();
-    this.savepoints.clear();
-
-    // Clean up local state
-    this.currentTransaction.collections.clear();
-    this.currentTransaction.isActive = false;
-
-    this.accumulatedStatements = [];
-    this.session = null;
-    // A clean rollback restores a reconciled local view (memory matches what each
-    // tree's storage holds) — release the degraded latch (see degradedReason).
-    this.degradedReason = null;
-
-    // Note: We intentionally do NOT clear the collection factory cache here.
-    // The transactor cache contains pre-registered transactors that should persist
-    // across transactions. Clearing them would cause the factory to create new
-    // disconnected transactors instead of using the registered ones.
   }
 
   /**
@@ -1636,12 +1678,20 @@ export class TransactionBridge {
     if (!snapshots) {
       return;
     }
-    for (const [collection, snapshot] of snapshots) {
-      await collection.restorePending(snapshot as Parameters<Collection<any>['restorePending']>[0]);
-    }
-    for (const openDepth of this.savepoints.keys()) {
-      if (openDepth > depth) {
-        this.savepoints.delete(openDepth);
+    // Every collection is restored even after one throws, and the deeper savepoints are
+    // discarded either way: Quereus has already unwound its own savepoint stack to `depth`
+    // before broadcasting, and a collection left un-restored would keep the statements the
+    // savepoint was meant to discard — committed with the transaction, were the engine to
+    // swallow this throw (its statement-level savepoint path does). The first failure
+    // propagates once every collection has been visited.
+    try {
+      await visitEveryThenThrow(snapshots, ([collection, snapshot]) =>
+        collection.restorePending(snapshot as Parameters<Collection<any>['restorePending']>[0]));
+    } finally {
+      for (const openDepth of this.savepoints.keys()) {
+        if (openDepth > depth) {
+          this.savepoints.delete(openDepth);
+        }
       }
     }
   }

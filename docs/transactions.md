@@ -281,7 +281,11 @@ persisted vs. unpersisted trees — rather than serve an incoherent "snapshot";
 this is what upstream's committed-snapshot contract requires of a module in a
 known-degraded state. Live reads still answer: they honestly mirror whatever the
 trees hold. The latch clears on the next successful commit or rollback, the
-point at which a reconciled local state is back in view.
+point at which a reconciled local state is back in view. A rollback whose restore
+of a tree throws (the replay arm of `Collection.restorePending`, see
+[internals.md §Staged actions are segments](internals.md#staged-actions-are-segments))
+sets the latch too, from the restore's error: the transaction is over, but that
+tree's memory is not known to match its storage.
 
 ### Committed reads run concurrently with a stalled commit (`readCommittedSnapshot`)
 

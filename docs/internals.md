@@ -250,8 +250,19 @@ list. Five rules follow from the split:
   turn (`_rollbackToSavepointBroadcast` in `@quereus/quereus/src/core/database.ts`), so a statement
   does not continue until every restore has finished. The coordinator's two partial-commit arms
   fold the committed participants first, in one await-free pass, and restore the failed ones after
-  it, so the committed subset keeps the event-loop atomicity the success fold promises.
-  `Collection.unstage` keeps its own verbatim-or-replay split.
+  it, so the committed subset keeps the event-loop atomicity the success fold promises. A rollback
+  restores EVERY collection before it propagates a restore's throw — `TransactionCoordinator.rollback`
+  and the bridge's `rollbackTransaction` and `rollbackToSavepoint` loop through `visitEveryThenThrow`
+  in `packages/db-core/src/utility/visit-every.ts` — since each restore is independent and a
+  collection left un-restored would carry the rolled-back statements into the next transaction, or
+  into a `COMMIT` where Quereus swallows the throw (its statement-level savepoint path does). The
+  bridge ends its transaction either way, as Quereus already has, and sets its degraded latch from
+  the failure instead of releasing it; the two partial-commit restores and the failed commit's own
+  rollback log a restore failure (`commit:restore-failed`, `commit:rollback-failed`) rather than let
+  it replace the error they are raising, which would send the bridge down its clean-rollback path and
+  rewind the committed trees. The throwing collection itself stays half re-staged, the state backlog
+  `debt-a-failed-refresh-can-leave-a-collection-half-restaged` describes. `Collection.unstage` keeps
+  its own verbatim-or-replay split.
 
 `packages/db-core/test/collection-segments.spec.ts` pins each of these.
 
