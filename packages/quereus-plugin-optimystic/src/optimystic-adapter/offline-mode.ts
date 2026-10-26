@@ -460,8 +460,10 @@ export class OfflineMode {
 			// NOTE: one pass per wake while anything is deferred (wakes requested while a pass runs join
 			// the one pending), and the node's gate debounces its wakes until its events go quiet. If a
 			// node whose connections churn ever shows passes in profiles, rate-limit them here.
+			// Re-checked once idle: a dispose begun meanwhile has disposed the restorer, whose `run` would
+			// only reject with QueueDisposedError.
 			this.bridge.whenTransactionIdle()
-				.then(() => restorer.run())
+				.then(() => this.wakesReleased ? undefined : restorer.run())
 				.catch(error => log('offline:restore-pass-failed from=wake: %o', error));
 		}
 		this.queue.wake();
