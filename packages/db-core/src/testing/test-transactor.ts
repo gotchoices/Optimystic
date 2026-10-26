@@ -900,6 +900,29 @@ export class GatedCommitTransactor extends DelegatingTransactor {
 }
 
 /**
+ * Throws, nothing delegated, on every commit of the collection whose log tail is `tailId` while
+ * `armed` — the hard failure of one participant's commit after its siblings' landed, which a
+ * multi-collection commit reports as `CoordinatorPartialCommitError`. Disarmed, everything delegates.
+ */
+export class ThrowsOnCommitOf extends DelegatingTransactor {
+	/** Commits thrown so far. */
+	thrown = 0;
+	armed = true;
+
+	constructor(inner: TestTransactor, private readonly tailId: BlockId) {
+		super(inner);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.armed && request.tailId === this.tailId) {
+			this.thrown++;
+			throw new Error('connection dropped before the commit was sent');
+		}
+		return this.inner.commit(request);
+	}
+}
+
+/**
  * Parks the FIRST pend BEFORE it reaches the inner transactor, so a rival can durably take the
  * revision while the coordinator is already committed to a set of transforms it captured at the
  * log append.

@@ -1,6 +1,6 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: stages 1 and 2 of [Implementation stages](#implementation-stages) are implemented; the
+**Status: stages 1 to 3 of [Implementation stages](#implementation-stages) are implemented; the
 rest is a proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
@@ -238,6 +238,15 @@ type QueuedFailureReason =
 - `committedTables` on `failed` is set only when part of the transaction committed and the rest was
   then refused permanently; see [Partial commits](#partial-commits).
 
+The db-core queue (stage 3; `EntryStatus` in `packages/db-core/src/offline/status.ts`) reports the
+same shapes with collection ids in place of tables and `entryId` in place of `transactionId`:
+`collections` on `queued`, `committedCollections` and `pendingCollections` on `partially-committed`,
+`committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
+`failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
+what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`). `outlook`
+and `outlook-changed` arrive with stage 7, `effect` with stage 10, `persisted` with stage 5, and
+`followed` and the per-table `tables` map with stage 4.
+
 Queue-wide state, for a status bar:
 
 ```typescript
@@ -444,11 +453,15 @@ others are not) holds back every entry behind it. That is accepted for the first
 The drain submits the head entry when the cohort can be reached, and otherwise waits, woken by the
 connection events the `UnderReplicationDrain` in `packages/db-p2p/src/repo/under-replication-drain.ts`
 already listens to (`connection:open`, `peer:identify`), by a re-check timer with backoff, and by
-each new local commit.
+each new local commit. The queue takes the connection events through one subscription,
+`OfflineQueueOptions.wakeOn` in `packages/db-core/src/offline/queue.ts`, which stage 6 binds; a wake
+also resets the timer's backoff.
 
-"Can be reached" is asked of a new port, `ICohortReachability`, which `db-core` defines and `db-p2p`
-implements over the key network: the cohort the collection's header and log tail resolve to contains
-a member other than this node, or this node is genuinely alone — no member the key network knows of
+"Can be reached" is asked of a new port, `ICohortReachability.reachable(blockIds)` in
+`packages/db-core/src/offline/reachability.ts`, with the header id and the last known log tail id of
+each collection the head entry still has to commit, so an implementation resolves cohorts from routing
+keys alone. `db-core` defines the port and `db-p2p` implements it over the key network: the cohort the
+collection's header and log tail resolve to contains a member other than this node, or this node is genuinely alone — no member the key network knows of
 is missing from the cohort (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) and
 no configured bootstrap peer is still awaited (`awaitingBootstrapContact`, same file). The `local`,
 `test` and `mesh-test` transactors are always reachable.
@@ -485,7 +498,9 @@ has staged; `TransactionCoordinator.commitEntry` commits a named slice — for e
 actions of one sealed segment, the entry's head — by driving the head commit's steps
 (`HeadCommitHandle`) in lock-step across the entry's collections, with the whole-collection commit's
 own phases and retry loop between them (see
-[internals.md §Staged actions are segments](internals.md#staged-actions-are-segments)). The existing
+[internals.md §Staged actions are segments](internals.md#staged-actions-are-segments)). Like
+`commitHead`, it releases every participant's collection latch around the one network round trip and
+retakes them, in sorted collection-id order, before applying the outcome. The existing
 pend-all-then-commit ordering is what keeps a refusal at pend (the common case: a rival took the
 key) from leaving any part of the entry durable.
 
@@ -505,6 +520,8 @@ segment's actions alone, staged over the committed state, built once per revisio
 requests and reused across retries — and releases the live latch for exactly the one `await` on the
 network, the pend-and-commit round trip (the `release` and `retake` steps of `HeadCommitHandle` in
 `packages/db-core/src/collection/head-commit.ts`, which every driver brackets the round trip with).
+Both drivers do: `Collection.commitHead` for an entry over one collection, and
+`TransactionCoordinator.commitEntry`, holding one handle per participant, for an entry over several.
 Everything else runs under the latch: the refresh that
 opens the cycle, building the head tracker and the attempt, the refresh and backoff between
 attempts, and applying the outcome (remove the head segment, fold the attempt's transforms into the
@@ -585,19 +602,33 @@ the journal, when persistence is on), and clears it only once the outcome is kno
 hands it the attempt at exactly that point: `HeadCommitOptions.recordAttempt` in
 `packages/db-core/src/collection/struct.ts` is called with each attempt after it is built and before
 the collection latch is released for the network, and a throw out of it aborts the cycle with nothing
-sent. A later drain of an in-doubt entry marks that action in flight on the collection
+sent; the coordinator's per-entry commit calls its own hook the same way, with every participant's
+attempt at once. The queue wraps both, and hands what it records on to its own hook,
+`OfflineQueueOptions.recordAttempt` in `packages/db-core/src/offline/queue.ts`, the seam the journal
+of stage 5 fills. A later drain of an in-doubt entry marks that action in flight on the collection
 (`beginInFlightAction`) and refreshes first, so a refresh that finds the entry's log entry completes
 it instead of committing a second copy — from the recorded attempt, which the drain hands back as
-`HeadCommitOptions.resume`; without it the refresh can only recognise an attempt that landed whole,
-and refuses a torn one as `transforms-not-held`. A new action id is minted only after an attempt is proven
-not to have landed (a refused pend, or `TornActionError` with `final: true`). A refused pend proves
-this for the attempt that sent it only: one sync sends several attempts under one action id, and an
-earlier one may have left its log entry standing (see `SyncRetryExhaustedError` in
-`packages/db-core/src/collection/struct.ts`), so the proof has to cover every attempt sent under
-the id.
+`HeadCommitOptions.resume` (one collection) or `EntryCommit.resume` in
+`packages/db-core/src/transaction/entry-commit.ts` (several); without it the refresh can only
+recognise an attempt that landed whole, and refuses a torn one as `transforms-not-held`.
 
-This is also why `discard` refuses an entry that has been sent: the plugin cannot withdraw a change
-it cannot rule out having already saved.
+An entry keeps **one action id for its whole life**, minted when it is queued. Re-driving under it is
+always safe — storage treats a re-send at the same revision as finishing the write and one at a new
+revision as a new write — and it keeps the slot hold the write earned on the members by losing. A
+fresh id is minted only after `TornActionError` with `final: true`, which proves that nothing sent
+under the old id is saved or will land, and which a re-drive under that id could never get past: it
+would find its own stranded log entry on every refresh and be told again that a rival built past it.
+A refused pend mints none. It proves only that the attempt that sent it did not land, while one cycle
+sends several attempts under one action id and an earlier one may have left its log entry standing
+(see `SyncRetryExhaustedError` in `packages/db-core/src/collection/struct.ts`).
+
+**An entry in doubt neither expires nor can be discarded until its doubt resolves.** It is in doubt
+from the first time the queue has recorded an attempt of it (a hook that throws aborts the cycle with
+nothing sent, so it sets nothing) until a terminal outcome or a `TornActionError` with `final: true`,
+and an entry part of which a partial commit landed stays in doubt until it settles. A passed
+`expireAfterMs` is deferred while it is (logged `offline:expiry-deferred`), and `discard` throws
+`EntryNotDiscardableError` in `packages/db-core/src/offline/status.ts`: the plugin cannot withdraw a
+change it cannot rule out having already saved.
 
 ### Partial commits
 
@@ -610,10 +641,23 @@ collections' segments stay at the head of their collections, and the drain keeps
 any other submission. The local view stays coherent throughout (the committed part is committed,
 the rest is still staged), so no degraded latch is set while the entry is being finished.
 
-If the remainder is refused permanently, the entry fails with `committedTables` set, its remaining
-segments are dropped, and the bridge sets the degraded latch exactly as it would for an online
-partial commit, because the network now holds half of a transaction. The application has to
-reconcile that, as it does today ([correctness.md](correctness.md) "Partial landing").
+In the db-core queue (`OfflineQueue.partiallyCommitted` in `packages/db-core/src/offline/queue.ts`)
+the `partially-committed` status names the committed and the pending collections and carries the
+partial commit's `reason` as `cause` (the partial commit error itself when that reason is not an
+`Error`, as the commit-phase reason of a hard failure is not). The entry stays at the head, in doubt, so it is neither discarded nor expired;
+`entries()` lists it `queued` with its `committedCollections`. Its next submission drives only the
+collections still holding its segment — through `commitHead` when one is left, through
+`commitEntry` when several are — under the same action id, with their retained attempts as `resume`.
+When the remainder commits, `committed` carries one durability over every collection the entry wrote:
+the partial commit's committed half beside the remainder's answer. A second partial commit of the
+remainder adds to `committedCollections` and reports `partially-committed` again.
+
+If the remainder is refused permanently, the entry fails with `committedTables` set
+(`committedCollections` in db-core, whatever triggered the failure — a refusal met by the drain or
+one a reader's refresh reported between submissions), its remaining segments are dropped, the
+removal cascades as any other does, and the bridge sets the degraded latch exactly as it would for
+an online partial commit, because the network now holds half of a transaction. The application has
+to reconcile that, as it does today ([correctness.md](correctness.md) "Partial landing").
 
 ### Removing an entry
 
@@ -629,7 +673,9 @@ cascades:
    `packages/db-core/src/offline/queue.ts`). It is removed by the same steps.
 4. Every table whose visible rows changed is announced through `Database.notifyExternalChange`, so
    `Database.watch` subscribers re-query; the same call the reactive watch bridge already makes for
-   a remote commit.
+   a remote commit. The tables are the ones behind the `failed` status's `changedCollections`: the
+   collections the entry still had a segment in when it was removed, which for a partly committed
+   entry excludes the half that committed.
 
 A cascade removes only entries whose own checks fail without the removed one. An entry that merely
 read the removed entry's rows (an `insert … select` that copied them, a value computed from them)
@@ -1208,10 +1254,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    segment-aware replay with the refusal callback; open-segment-only snapshot and restore; the head
    commit that does not hold the latch across the network, with the fold-before-replay order. No
    plugin change. Unit tests in `db-core` over `TestTransactor`.
-3. **The queue in `db-core`.** An in-memory, transport-agnostic queue over a set of collections:
-   FIFO drain, the coordinator's per-entry slice commit, classification, in-doubt identity, partial
-   commits, cascading removal, status events, the `ICohortReachability` port (always reachable in
-   tests). Usable by a `Tree`/`Diary` application without SQL.
+3. **The queue in `db-core`** (implemented). An in-memory, transport-agnostic queue over a set of
+   collections (`OfflineQueue` in `packages/db-core/src/offline/queue.ts`): FIFO drain, the
+   coordinator's per-entry slice commit, classification, in-doubt identity, partial commits,
+   cascading removal, status events, the `ICohortReachability` port (always reachable in tests).
+   Usable by a `Tree`/`Diary` application without SQL.
 4. **Offline mode in the plugin.** `offline.enter`/`exit`, acknowledgement fixed at BEGIN, status
    and queue-state listeners, durability reports for drained entries, `notifyExternalChange` on
    removal, the `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL
@@ -1244,7 +1291,24 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
 ## Test plan
 
 Scenarios each stage should pin, on the in-process mesh (`packages/db-p2p/src/testing/mesh-harness.ts`,
-which can isolate and restart a node) unless stated:
+which can isolate and restart a node) unless stated.
+
+Stage 3 pins the scenarios that need no SQL. `packages/db-core/test/offline-queue.spec.ts`, over
+`TestTransactor`: several entries drained in order, each reported `queued`, `submitting` and
+`committed` once, with its log entry under its own action id at its local commit time; an entry over
+two trees committed under one action id; nothing sent while the reachability gate is closed; a rival
+taking a key a queued insert used, failing that entry with `constraint`, a later entry that updated
+the row with `concurrent-modification` and `causedBy` naming it, and one after that in turn, the rows
+gone from the local read; a refusal a reader's refresh found before the drain did; a promise
+shortfall waiting for the cohort; an unclassified failure re-driven under the same action id; a
+write-ahead hook that throws; an in-doubt entry that `discard` refuses and whose passed expiry is
+deferred, then finished from its recorded attempt with its log holding it once; `discard` of a never-sent entry while
+the head is on the network; a partly committed entry finished, and one whose remainder is then
+refused, failing with its committed half named. `packages/db-p2p/test/offline-queue-mesh.spec.ts`,
+on a two-member mesh: an entry over a table and its index pended and committed as one record per
+phase and read back on the other node, and a rival's commit between that entry's refresh and its pend
+failing it with `constraint`, leaving nothing of it on either collection. Everything below that names
+SQL, a watcher, a restart, isolation or the outlook waits for its stage.
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.

@@ -1,8 +1,9 @@
 /**
- * The offline-sync queue in db-core (`OfflineQueue`, ticket offline-sync-queue-core): the in-memory
- * list of locally committed entries that drains one at a time once the cohort can be reached, applies
- * each failure by its class, removes a failed entry and everything that depended on it, and reports
- * every step (docs/offline-sync.md §Draining, §Removing an entry).
+ * The offline-sync queue in db-core (`OfflineQueue`, tickets offline-sync-queue-core and
+ * offline-sync-queue-partial-commits): the in-memory list of locally committed entries that drains one
+ * at a time once the cohort can be reached, applies each failure by its class, finishes an entry that
+ * partly committed, removes a failed entry and everything that depended on it, and reports every step
+ * (docs/offline-sync.md §Draining, §Partial commits, §Removing an entry).
  *
  * Every case runs over `Tree` on one `TestTransactor`, with a real rival handle committing through
  * `commitRivalTreeWrite` where a refusal has to be provoked. The doubles decide only WHEN an answer
@@ -12,6 +13,7 @@
 
 import { expect } from 'chai';
 import {
+	CoordinatorPartialCommitError,
 	EntryNotDiscardableError,
 	Log,
 	OfflineQueue,
@@ -42,6 +44,7 @@ import {
 	RefusesPendsAsShortfall,
 	TailLandsButReportsStale,
 	TestTransactor,
+	ThrowsOnCommitOf,
 	commitRivalTreeWrite,
 	delay,
 	waitFor,
@@ -62,6 +65,7 @@ const T0 = 1_700_000_000_000;
 type QueuedStatus = Extract<EntryStatus, { kind: 'queued' }>;
 type FailedStatus = Extract<EntryStatus, { kind: 'failed' }>;
 type CommittedStatus = Extract<EntryStatus, { kind: 'committed' }>;
+type PartialStatus = Extract<EntryStatus, { kind: 'partially-committed' }>;
 
 /** Short timers: these cases are about WHAT the drain does, not how long it waits. */
 const fast: OfflineQueueOptions = {
@@ -196,6 +200,21 @@ async function entriesUnder(inner: TestTransactor, id: CollectionId, actionId: s
 		if (logEntry.action?.actionId === actionId) found.push(logEntry);
 	}
 	return found;
+}
+
+/** The log tail block `id`'s header names — the block every commit of that collection carries as its
+ * tail, which is how {@link ThrowsOnCommitOf} tells one collection's commit from its sibling's. */
+async function logTailOf(inner: TestTransactor, id: CollectionId): Promise<BlockId> {
+	const tail = (await Tree.createOrOpen<number, Entry>(inner, id, byKey)).getCollection().knownLogTailId();
+	expect(tail, `${id} names a log tail`).to.be.a('string');
+	return tail!;
+}
+
+/** Waits for `entryId`'s `partially-committed` status and answers it. */
+async function partiallyCommitted(statuses: EntryStatus[], entryId: string): Promise<PartialStatus> {
+	await waitFor(() => statuses.some(s => s.kind === 'partially-committed' && s.entryId === entryId),
+		{ description: `${entryId} reported partially committed` });
+	return statuses.find((s): s is PartialStatus => s.kind === 'partially-committed' && s.entryId === entryId)!;
 }
 
 /** The action id the write-ahead hook saw for `entryId` in `collectionId`. */
@@ -498,6 +517,85 @@ describe('OfflineQueue', function () {
 		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
 		const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
 		expect(await fresh.get(1), 'the data block landed, not only the tail').to.deep.equal(entry(1, 'one'));
+		await queue.dispose();
+	});
+
+	it('finishes an entry over two trees that partly committed: partially-committed with ITEMS committed and USERS pending — listed queued with its committed half, in doubt, not discardable — then committed with a durability naming both, the remainder sent alone under the same action id, each log holding the entry once', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS, ITEMS);
+		// `users` sorts after `items`, so its commit is the one that fails after its sibling's landed.
+		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
+		const { queue, statuses, recorded } = openQueue(throwing, { recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		const users = await openTree(throwing, queue, USERS);
+		const items = await openTree(throwing, queue, ITEMS);
+		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]], [items, [[7, entry(7, 'seven')]]]);
+
+		const partial = await partiallyCommitted(statuses, 'E1');
+		expect(partial.committedCollections).to.deep.equal([ITEMS]);
+		expect(partial.pendingCollections).to.deep.equal([USERS]);
+		expect(partial.cause, 'a commit-phase reason is a string, so the cause is the partial commit itself').to.be.instanceOf(CoordinatorPartialCommitError);
+		expect(throwing.thrown).to.be.at.least(1);
+		const [listed] = queue.entries();
+		expect(listed?.committedCollections, 'entries() shows the committed half').to.deep.equal([ITEMS]);
+		const between = asQueued(listed?.status, 'E1 is queued between submissions');
+		expect(between.committedCollections).to.deep.equal([ITEMS]);
+		expect(between.inDoubt).to.equal(true);
+		expect(between.waitingFor).to.equal('backoff');
+		expect(() => queue.discard('E1')).to.throw(EntryNotDiscardableError);
+		expect(items.getCollection().sealedEntries(), 'the committed half is consumed').to.deep.equal([]);
+		expect(users.getCollection().sealedEntries(), 'the rest is still sealed').to.deep.equal(['E1']);
+		const firstDriveRecords = recorded.length;
+
+		throwing.armed = false;
+		queue.wake();
+		await queue.whenDrained();
+
+		expect(kindsOf(statuses, 'E1')).to.deep.equal(['queued', 'submitting', 'partially-committed', 'submitting', 'committed']);
+		expect([...committedOf(statuses, 'E1').durability.collections.keys()].sort(), 'every collection the entry wrote').to.deep.equal([ITEMS, USERS]);
+		const actionId = actionIdOf(recorded, 'E1', ITEMS);
+		const remainder = recorded.slice(firstDriveRecords);
+		expect(remainder.length, 'the remainder was sent').to.be.at.least(1);
+		for (const { attempts } of remainder) {
+			expect([...attempts.keys()], 'only the pending collection').to.deep.equal([USERS]);
+			expect(attempts.get(USERS)!.actionId, 'under the entry\'s one action id').to.equal(actionId);
+		}
+		expect(await entriesUnder(inner, ITEMS, actionId)).to.have.length(1);
+		expect(await entriesUnder(inner, USERS, actionId)).to.have.length(1);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		expect(await committedKeys(inner, ITEMS)).to.deep.equal([[5], [7]]);
+		await queue.dispose();
+	});
+
+	it('fails a partly committed entry whose remainder a rival then refuses: constraint, naming the committed half and changing only the pending collection; the committed row stays, the refused one is gone locally, and a later entry that updated it fails caused by it', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS, ITEMS);
+		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
+		const { queue, statuses } = openQueue(throwing, { recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		const users = await openTree(throwing, queue, USERS);
+		const items = await openTree(throwing, queue, ITEMS);
+		const one = entry(1, 'one');
+		await queueEntry(queue, 'E1', [users, [[1, one, { kind: 'absent' }]]], [items, [[7, entry(7, 'seven')]]]);
+		await queueEntry(queue, 'E2', [users, [[1, entry(1, 'one-updated'), { kind: 'unchanged', expected: one }]]]);
+		await partiallyCommitted(statuses, 'E1');
+
+		await commitRivalTreeWrite<number, Entry>(inner, USERS, byKey, [[1, entry(1, 'rival')]]);
+		queue.wake();
+		await queue.whenDrained();
+
+		const f1 = failedOf(statuses, 'E1');
+		expect(f1.reason).to.equal('constraint');
+		expect(f1.error).to.be.instanceOf(TreeKeyTakenError);
+		expect(f1.committedCollections, 'the half the network holds').to.deep.equal([ITEMS]);
+		expect(f1.changedCollections, 'only the dropped segment changed what is visible').to.deep.equal([USERS]);
+		const f2 = failedOf(statuses, 'E2');
+		expect(f2.reason).to.equal('concurrent-modification');
+		expect(f2.causedBy).to.equal('E1');
+		expect(f2.committedCollections, 'nothing of E2 committed').to.equal(undefined);
+		expect(await items.get(7), 'the committed row stays').to.deep.equal(entry(7, 'seven'));
+		expect(await users.get(1), 'E1\'s row is gone; the rival\'s shows').to.deep.equal(entry(1, 'rival'));
+		expect(await committedKeys(inner, ITEMS)).to.deep.equal([[5], [7]]);
+		expect(users.getCollection().sealedEntries()).to.deep.equal([]);
+		expect(queue.entries()).to.deep.equal([]);
 		await queue.dispose();
 	});
 

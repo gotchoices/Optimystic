@@ -8,8 +8,9 @@ import type { CollectionId, InFlightAttempt, SyncOptions } from '../collection/s
 import type { ITransactor } from '../transactor/transactor.js';
 import { TransactionCoordinator } from '../transaction/coordinator.js';
 import { classifyCommitFailure, refusalReason } from '../transaction/commit-failure-class.js';
-import { transactionDurability } from '../transaction/durability.js';
+import { recordCollectionDurability, transactionDurability } from '../transaction/durability.js';
 import type { TransactionDurability } from '../transaction/durability.js';
+import type { CoordinatorPartialCommitError } from '../transaction/errors.js';
 import type { RandFn } from '../utility/backoff.js';
 import { createLogger } from '../logger.js';
 import { alwaysReachable } from './reachability.js';
@@ -22,7 +23,7 @@ import {
 	UnknownEntryError,
 } from './status.js';
 import type { EntryStatus, EntryWaitingFor, OfflineQueueState, QueuedEntry, QueuedFailureReason } from './status.js';
-import { currentStatus, queuedStatus, queuedStatusChanged, snapshot } from './entry.js';
+import { committedField, currentStatus, queuedStatus, queuedStatusChanged, snapshot } from './entry.js';
 import type { Entry } from './entry.js';
 import { DrainWaker } from './wake.js';
 
@@ -76,6 +77,16 @@ function describe(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+/** What `entry` wrote across every submission: the collections earlier partial commits committed,
+ * beside what the last submission answered (`undefined` when it answered nothing new). */
+function entryDurability(entry: Entry, written: TransactionDurability | undefined): TransactionDurability {
+	const collections = new Map(entry.committed);
+	for (const [collectionId, durability] of written?.collections ?? []) {
+		recordCollectionDurability(collections, collectionId, durability);
+	}
+	return transactionDurability(collections);
+}
+
 /**
  * The offline-sync queue (docs/offline-sync.md §Draining): an in-memory list of locally committed
  * entries, each the sealed segments one local commit left in the collections it wrote, drained one
@@ -90,6 +101,10 @@ function describe(error: unknown): string {
  * `TransactionCoordinator.commitEntry` over several — and apply the outcome by its class
  * (`classifyCommitFailure`). The gate and the transient failures share one re-check timer, whose
  * step a wake or a committed entry resets.
+ *
+ * **A partly committed entry is finished, not rolled back** (docs/offline-sync.md §Partial commits):
+ * the committed collections' segments are consumed, the entry stays at the head in doubt, and each
+ * later submission drives only the collections still holding its segment, under the same action id.
  *
  * **Removing an entry cascades** (docs/offline-sync.md §Removing an entry): a failed entry's
  * segments are dropped from its collections, each drop replays what remains, a later entry the
@@ -182,6 +197,7 @@ export class OfflineQueue {
 			attempts: 0,
 			inDoubt: false,
 			retained: new Map(),
+			committed: new Map(),
 			phase: 'queued',
 			waitingFor: this.list.length > 0 ? 'earlier-entry' : undefined,
 			lastError: undefined,
@@ -422,11 +438,17 @@ export class OfflineQueue {
 		return undefined;
 	}
 
-	/** The gate, asked with each of the head's collections' header id and known log tail id. A gate
-	 * that throws is logged and read as closed: the next re-check asks again. */
+	/** The collections in which `entry` is still a sealed segment: every collection it wrote, until a
+	 * partial commit consumes some. */
+	private remainingCollections(entry: Entry): Collection<any>[] {
+		return entry.collections.filter(collection => collection.sealedEntries().includes(entry.id));
+	}
+
+	/** The gate, asked with each of the head's remaining collections' header id and known log tail id.
+	 * A gate that throws is logged and read as closed: the next re-check asks again. */
 	private async gateOpen(entry: Entry): Promise<boolean> {
 		const blockIds: BlockId[] = [];
-		for (const collection of entry.collections) {
+		for (const collection of this.remainingCollections(entry)) {
 			blockIds.push(collection.id);
 			const tailId = collection.knownLogTailId();
 			if (tailId !== undefined) blockIds.push(tailId);
@@ -445,10 +467,7 @@ export class OfflineQueue {
 	 * re-check timer before its next iteration (a transient failure) rather than go straight on (the
 	 * entry committed or failed). */
 	private async submit(entry: Entry): Promise<boolean> {
-		// A partial commit (next ticket) leaves the entry's head consumed in the collections it
-		// committed; the re-drive commits what is left, so only the collections still holding the
-		// segment take part.
-		const remaining = entry.collections.filter(collection => collection.sealedEntries().includes(entry.id));
+		const remaining = this.remainingCollections(entry);
 		if (remaining.length === 0) {
 			throw new Error(`offline queue: entry ${entry.id} holds no sealed segment in any collection it wrote`);
 		}
@@ -529,12 +548,14 @@ export class OfflineQueue {
 		}
 	}
 
-	private committed(entry: Entry, durability: TransactionDurability): void {
+	/** Settle `entry` committed, reporting every collection it wrote: `written`, the last submission's
+	 * answer, beside what earlier partial commits committed. */
+	private committed(entry: Entry, written?: TransactionDurability): void {
 		this.claimRemoval(entry);
 		this.pendingRefusals.delete(entry.id);
 		entry.retained.clear();
 		entry.inDoubt = false;
-		this.emit({ kind: 'committed', entryId: entry.id, durability });
+		this.emit({ kind: 'committed', entryId: entry.id, durability: entryDurability(entry, written) });
 		this.waker.resetBackoff();
 		this.publishState();
 	}
@@ -549,8 +570,8 @@ export class OfflineQueue {
 	 * | `cohort-unreachable` | `queued`, `cohort`; the timer re-checks the gate |
 	 * | `contention`, `expired`, `in-doubt`, `unknown` | `queued`, `backoff`; `unknown` is also logged and counted |
 	 * | `guard-refused`, `rejected`, `too-large` | `failed`, with the class's reason |
-	 * | `torn-not-saved` | `queued`, `backoff`; doubt cleared, a fresh action id, retained attempts cleared |
-	 * | `partial` | next ticket; until then `queued`, `backoff`, under the same id — the committed participants' heads are consumed, so the re-drive commits what is left |
+	 * | `torn-not-saved` | `queued`, `backoff`; doubt cleared (unless part of the entry is committed), a fresh action id, retained attempts cleared |
+	 * | `partial` | `partially-committed`, then `queued`, `backoff`, in doubt, under the same id ({@link partiallyCommitted}) |
 	 *
 	 * `SealedSegmentsError` out of a submission means the head alignment invariant broke — a queue
 	 * defect — and is thrown out of the loop, which stops the drain.
@@ -594,17 +615,16 @@ export class OfflineQueue {
 				return true;
 			}
 			case 'torn-not-saved': {
-				entry.inDoubt = false;
+				// The torn attempt is provably not saved, but a partial commit's half is: an entry with a
+				// committed part stays in doubt, so it is never discarded or expired.
+				entry.inDoubt = entry.committed.size > 0;
 				entry.actionId = mintId();
 				entry.retained.clear();
 				this.setQueued(entry, 'backoff', error);
 				return true;
 			}
 			case 'partial': {
-				log('offline:partial-commit-deferred entry=%s action=%s committed=%o: re-driven under the same id for what is left',
-					entry.id, entry.actionId, [...outcome.error.durability.collections.keys()]);
-				this.setQueued(entry, 'backoff', error);
-				return true;
+				return this.partiallyCommitted(entry, outcome.error);
 			}
 			case 'unknown': {
 				this.unclassifiedFailures++;
@@ -625,6 +645,45 @@ export class OfflineQueue {
 				return false;
 			}
 		}
+	}
+
+	/**
+	 * A submission committed part of the entry (docs/offline-sync.md §Partial commits). The committed
+	 * collections' segments are already consumed and their attempts resolved, so they are recorded on
+	 * the entry and leave `retained`; the rest are still sealed and first, their attempts retained, and
+	 * the next submission drives exactly them, under the same action id. The entry is in doubt from
+	 * here to its terminal outcome, so it is neither discarded nor expired. `partially-committed` is
+	 * emitted in place of the `queued` status this transition would otherwise report.
+	 *
+	 * @returns whether the entry stays queued: `false` only when no collection still holds its segment
+	 * (the failure came after every collection was saved), which settles it committed. */
+	private partiallyCommitted(entry: Entry, error: CoordinatorPartialCommitError): boolean {
+		for (const [collectionId, durability] of error.durability.collections) {
+			recordCollectionDurability(entry.committed, collectionId, durability);
+			entry.retained.delete(collectionId);
+		}
+		entry.inDoubt = true;
+		const pending = this.remainingCollections(entry).map(collection => collection.id);
+		if (pending.length === 0) {
+			this.committed(entry);
+			return false;
+		}
+		const committedCollections = [...entry.committed.keys()];
+		log('offline:partially-committed entry=%s action=%s committed=%o pending=%o reason=%s',
+			entry.id, entry.actionId, committedCollections, pending, describe(error.reason));
+		entry.phase = 'queued';
+		entry.waitingFor = 'backoff';
+		entry.lastError = error;
+		entry.lastQueued = queuedStatus(entry);
+		this.emit({
+			kind: 'partially-committed',
+			entryId: entry.id,
+			committedCollections,
+			pendingCollections: pending,
+			cause: error.reason instanceof Error ? error.reason : error,
+		});
+		this.publishState();
+		return true;
 	}
 
 	// ── removing ───────────────────────────────────────────────────────────────────────────────
@@ -666,9 +725,10 @@ export class OfflineQueue {
 
 	/** The asynchronous half of a failure: drop the entry's segment from every collection that still
 	 * holds one (a collection the entry had no segment in, or whose segment a partial commit consumed,
-	 * is skipped), then emit `failed` naming those collections. Each drop replays and may report
-	 * refusals of later entries through {@link onSealedRefused}, which {@link causeOf} attributes while
-	 * `removing` names this entry. */
+	 * is skipped), then emit `failed` naming those collections, and the ones a partial commit
+	 * committed whatever triggered the failure. Each drop replays and may report refusals of later
+	 * entries through {@link onSealedRefused}, which {@link causeOf} attributes while `removing` names
+	 * this entry. */
 	private async remove(entry: Entry, reason: QueuedFailureReason, error: Error, causedBy: EntryId | undefined): Promise<void> {
 		this.pendingRefusals.delete(entry.id);
 		const changedCollections: CollectionId[] = [];
@@ -682,7 +742,19 @@ export class OfflineQueue {
 		} finally {
 			this.removing = undefined;
 		}
-		this.emit({ kind: 'failed', entryId: entry.id, reason, error, changedCollections, ...(causedBy === undefined ? {} : { causedBy }) });
+		if (entry.committed.size > 0) {
+			log('offline:partially-committed-entry-failed entry=%s action=%s committed=%o dropped=%o reason=%s: the network holds part of the transaction',
+				entry.id, entry.actionId, [...entry.committed.keys()], changedCollections, reason);
+		}
+		this.emit({
+			kind: 'failed',
+			entryId: entry.id,
+			reason,
+			error,
+			changedCollections,
+			...(causedBy === undefined ? {} : { causedBy }),
+			...committedField(entry),
+		});
 		this.publishState();
 	}
 

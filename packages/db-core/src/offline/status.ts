@@ -36,9 +36,34 @@ export type EntryStatus =
 		waitingFor: EntryWaitingFor | undefined;
 		/** What the last attempt failed with, when one has. */
 		lastError?: unknown;
+		/** The collections of the entry already durably committed, once a submission has committed
+		 * part of it (docs/offline-sync.md §Partial commits); absent while none is. */
+		committedCollections?: readonly CollectionId[];
 	}
 	| { kind: 'submitting'; entryId: EntryId; attempt: number }
-	| { kind: 'committed'; entryId: EntryId; durability: TransactionDurability }
+	| {
+		kind: 'committed';
+		entryId: EntryId;
+		/** Every collection the entry wrote, each with its class — across submissions, so a partly
+		 * committed entry's earlier half is listed beside the remainder's. */
+		durability: TransactionDurability;
+	}
+	| {
+		/** A submission committed part of the entry and not the rest (`CoordinatorPartialCommitError`).
+		 * Emitted in place of the `queued` status that transition would otherwise report: the entry
+		 * stays at the head, in doubt, and the drain drives the pending collections on the next
+		 * submission. Between submissions `status` and `entries` report it `queued`, with
+		 * `committedCollections` set. */
+		kind: 'partially-committed';
+		entryId: EntryId;
+		/** Every collection of the entry durably committed so far, across submissions. */
+		committedCollections: readonly CollectionId[];
+		/** The collections in which the entry is still a sealed segment: what the next submission drives. */
+		pendingCollections: readonly CollectionId[];
+		/** Why the rest did not commit: the partial commit's `reason` when that is an `Error`, otherwise
+		 * the partial commit error itself (whose message names the reason). */
+		cause: Error;
+	}
 	| {
 		kind: 'failed';
 		entryId: EntryId;
@@ -49,6 +74,10 @@ export type EntryStatus =
 		/** The collections whose visible content this removal changed — the ones the entry still had a
 		 * segment in when it was removed. */
 		changedCollections: readonly CollectionId[];
+		/** Set only when part of the entry had committed before the rest failed: the network now holds
+		 * half of the transaction, which the application has to reconcile (docs/offline-sync.md
+		 * §Partial commits). */
+		committedCollections?: readonly CollectionId[];
 	};
 
 /** Queue-wide state, for a status bar. */
@@ -70,6 +99,8 @@ export type QueuedEntry = {
 	readonly seq: number;
 	readonly queuedAt: number;
 	readonly collections: readonly CollectionId[];
+	/** As on the `queued` status: the collections already committed, once part of the entry is. */
+	readonly committedCollections?: readonly CollectionId[];
 	readonly status: EntryStatus;
 };
 

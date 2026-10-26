@@ -41,6 +41,7 @@ import {
 	DelegatingTransactor,
 	GatedCommitTransactor,
 	TestTransactor,
+	ThrowsOnCommitOf,
 	commitRivalTreeWrite,
 } from '../src/testing/test-transactor.js';
 
@@ -150,25 +151,6 @@ async function logTailOf<T>(collection: Collection<T>): Promise<BlockId> {
 	const header = await collection.tracker.tryGet(collection.id) as CollectionHeaderBlock | undefined;
 	expect(header?.tailId, `${collection.id} names a log tail`).to.be.a('string');
 	return header!.tailId!;
-}
-
-/** Throws, nothing delegated, on every commit of the collection whose log tail is `tailId` while
- * armed — the hard failure of one participant's commit after its siblings' landed. */
-class ThrowsOnCommitOf extends DelegatingTransactor {
-	thrown = 0;
-	armed = true;
-
-	constructor(inner: TestTransactor, private readonly tailId: BlockId) {
-		super(inner);
-	}
-
-	override async commit(request: CommitRequest): Promise<CommitResult> {
-		if (this.armed && request.tailId === this.tailId) {
-			this.thrown++;
-			throw new Error('connection dropped before the commit was sent');
-		}
-		return this.inner.commit(request);
-	}
 }
 
 /** In one attempt, tears the collection whose log tail is `tornTailId` (lands its tail only, then

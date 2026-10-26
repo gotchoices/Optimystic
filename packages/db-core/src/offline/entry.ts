@@ -2,6 +2,7 @@ import type { ActionId } from '../collection/action.js';
 import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
+import type { WriteDurability } from '../network/struct.js';
 import type { EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
 
 /** One queued entry, as `OfflineQueue` holds it, and the projections of it the queue reports. */
@@ -21,6 +22,11 @@ export type Entry = {
 	/** The attempts recorded under `actionId` and not yet resolved, per collection, handed back as
 	 * `resume` when the entry is re-driven. Cleared with the action id. */
 	readonly retained: Map<CollectionId, InFlightAttempt>;
+	/** The collections a partial commit has already committed, with who holds each, accumulated
+	 * across submissions (`recordCollectionDurability`); empty until one does. The committed half's
+	 * segments are consumed, so the next submission drives only the rest, and the terminal status
+	 * reports these beside it. */
+	readonly committed: Map<CollectionId, WriteDurability | undefined>;
 	phase: 'queued' | 'submitting';
 	waitingFor: EntryWaitingFor | undefined;
 	lastError: unknown;
@@ -43,7 +49,14 @@ export function queuedStatus(entry: Entry): QueuedStatus {
 		inDoubt: entry.inDoubt,
 		waitingFor: entry.waitingFor,
 		...(entry.lastError === undefined ? {} : { lastError: entry.lastError }),
+		...committedField(entry),
 	};
+}
+
+/** `{ committedCollections }` once part of the entry has committed, `{}` before — the field the
+ * `queued` and `failed` statuses and {@link snapshot} carry only when it says something. */
+export function committedField(entry: Entry): { committedCollections?: readonly CollectionId[] } {
+	return entry.committed.size === 0 ? {} : { committedCollections: [...entry.committed.keys()] };
 }
 
 export function currentStatus(entry: Entry): EntryStatus {
@@ -59,6 +72,7 @@ export function snapshot(entry: Entry): QueuedEntry {
 		seq: entry.seq,
 		queuedAt: entry.queuedAt,
 		collections: entry.collections.map(collection => collection.id),
+		...committedField(entry),
 		status: currentStatus(entry),
 	};
 }
@@ -69,5 +83,7 @@ export function queuedStatusChanged(previous: QueuedStatus | undefined, status: 
 		|| previous.waitingFor !== status.waitingFor
 		|| previous.attempts !== status.attempts
 		|| previous.inDoubt !== status.inDoubt
-		|| previous.lastError !== status.lastError;
+		|| previous.lastError !== status.lastError
+		// The committed set only grows, so its size says whether it changed.
+		|| previous.committedCollections?.length !== status.committedCollections?.length;
 }
