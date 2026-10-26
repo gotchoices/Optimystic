@@ -14,8 +14,8 @@
 
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import type { ITransactor } from '@optimystic/db-core';
-import { KeyRange } from '@optimystic/db-core';
+import type { ITransactor, LogEntry } from '@optimystic/db-core';
+import { KeyRange, Log } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type BuildTransactorOptions, type Mesh, type MeshOptions } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
 
@@ -28,10 +28,13 @@ export type MeshDbNode = { db: Database; plugin: Plugin };
  * The opt-in wiring a spec may ask of its mesh, each off by default so no other spec changes: the
  * two transactor options that make a node hear its own storage's commits and read its own replica
  * (`BuildTransactorOptions.notifyLocalChanges` / `selfFirstReads`), the wrapper a spec puts around
- * each node's repo to hold or fail one RPC (`BuildTransactorOptions.wrapRepo`), and the storage
- * change hold's bound (`MeshOptions.changeHoldMs`; `0` disables it).
+ * each node's repo to hold or fail one RPC (`BuildTransactorOptions.wrapRepo`), the storage change
+ * hold's bound (`MeshOptions.changeHoldMs`; `0` disables it), and, for a power-loss spec, each node's
+ * raw storage (`MeshOptions.rawStorageFactory`) and the sync window its applies may defer by
+ * (`MeshOptions.durabilityWindowFor`).
  */
-export type MockMeshOptions = Pick<BuildTransactorOptions, 'notifyLocalChanges' | 'selfFirstReads' | 'wrapRepo'> & Pick<MeshOptions, 'changeHoldMs'>;
+export type MockMeshOptions = Pick<BuildTransactorOptions, 'notifyLocalChanges' | 'selfFirstReads' | 'wrapRepo'>
+	& Pick<MeshOptions, 'changeHoldMs' | 'rawStorageFactory' | 'durabilityWindowFor'>;
 
 /** A running mock mesh, plus the lookup from node index to that node's transactor. */
 export interface MockMesh {
@@ -61,12 +64,14 @@ export interface MockMesh {
  * `CoordinatorRepo`). Specs here don't need to re-derive this arithmetic.
  */
 export async function startMockMesh(size: number, options: MockMeshOptions = {}): Promise<MockMesh> {
-	const { changeHoldMs, ...transactorOptions } = options;
+	const { changeHoldMs, rawStorageFactory, durabilityWindowFor, ...transactorOptions } = options;
 	const mesh = await createMesh(size, {
 		responsibilityK: size,
 		clusterSize: size,
 		superMajorityThreshold: 0.67,
 		...(changeHoldMs === undefined ? {} : { changeHoldMs }),
+		...(rawStorageFactory === undefined ? {} : { rawStorageFactory }),
+		...(durabilityWindowFor === undefined ? {} : { durabilityWindowFor }),
 	});
 	const transactors = buildNetworkTransactors(mesh, transactorOptions);
 	return {
@@ -156,4 +161,19 @@ export function openFreshTree(plugin: Plugin, collectionUri: string): ReturnType
 /** Committed entry count at `collectionUri`, seen from this node. */
 export async function countTreeEntries(plugin: Plugin, collectionUri: string): Promise<number> {
 	return (await readTree(plugin, collectionUri)).entries;
+}
+
+/** The action entries of `collectionUri`'s committed log under `actionId`, read on this node through a
+ * fresh handle — how many times the network recorded one write, which a re-send under the same id
+ * must leave at one. */
+export async function loggedUnder(plugin: Plugin, collectionUri: string, actionId: string): Promise<LogEntry<unknown>[]> {
+	const tree = await openFreshTree(plugin, collectionUri);
+	await tree.update();
+	const collection = tree.getCollection();
+	const log = await Log.open<unknown>(collection.tracker, collection.id);
+	const entries: LogEntry<unknown>[] = [];
+	for await (const entry of log?.select() ?? []) {
+		if (entry.action?.actionId === actionId) entries.push(entry);
+	}
+	return entries;
 }

@@ -406,6 +406,16 @@ export class OfflineQueue {
 		this.wake();
 	};
 
+	/**
+	 * Reserve every sequence number up to and including `seq`: the next {@link enqueue} takes a higher
+	 * one. For a journal that has read records it cannot put back yet (a table it cannot reach), so a
+	 * transaction queued meanwhile never takes a journaled record's number — {@link restore} refuses a
+	 * `seq` another queued entry holds. Never lowers the counter.
+	 */
+	reserveSeqThrough(seq: number): void {
+		this.nextSeq = Math.max(this.nextSeq, seq + 1);
+	}
+
 	/** The queued entries, in queue order. */
 	entries(): readonly QueuedEntry[] {
 		return this.list.map(entry => snapshot(entry));

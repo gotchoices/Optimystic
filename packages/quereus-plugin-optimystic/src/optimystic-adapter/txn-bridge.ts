@@ -309,6 +309,8 @@ export class TransactionBridge {
   // needs its OWN bridge. See docs/transactions.md § "One writer at a time on the
   // shared TransactionBridge" for the shared-vs-single-writer state table.
   private currentTransaction: TransactionState | null = null;
+  /** Who waits for the current transaction to end ({@link whenTransactionIdle}). */
+  private readonly idleWaiters: (() => void)[] = [];
   /**
    * The libp2p peer id of the node this bridge writes from, resolved at {@link beginTransaction}
    * (undefined for a node with no exposed key: local, test and injected transactors). Session
@@ -1014,6 +1016,7 @@ export class TransactionBridge {
     this.session = null;
     this.dirtyTrees.clear();
     this.savepoints.clear();
+    this.settleIdleWaiters();
   }
 
   /**
@@ -1652,6 +1655,7 @@ export class TransactionBridge {
       // A clean rollback restores a reconciled local view (memory matches what each
       // tree's storage holds) — release the degraded latch (see degradedReason).
       if (restoreFailure === undefined) this.degradedReason = null;
+      this.settleIdleWaiters();
     }
 
     // Note: We intentionally do NOT clear the collection factory cache here.
@@ -1732,6 +1736,23 @@ export class TransactionBridge {
    */
   isTransactionActive(): boolean {
     return this.currentTransaction?.isActive ?? false;
+  }
+
+  /**
+   * Resolves once no transaction is active on this bridge: at once when none is, else when the
+   * current one ends, by commit or rollback. For work that must run between transactions and is
+   * scheduled from inside one — the offline-mode controller's restore pass, triggered by a table's
+   * initialization inside a statement (`OfflineMode.tableReadable`). Says nothing about the next
+   * transaction, which may begin right after; the caller re-checks {@link isTransactionActive}.
+   */
+  whenTransactionIdle(): Promise<void> {
+    if (!this.isTransactionActive()) return Promise.resolve();
+    return new Promise(resolve => { this.idleWaiters.push(resolve); });
+  }
+
+  /** Resolve every {@link whenTransactionIdle} waiter: the transaction has ended. */
+  private settleIdleWaiters(): void {
+    for (const waiter of this.idleWaiters.splice(0)) waiter();
   }
 
   /**

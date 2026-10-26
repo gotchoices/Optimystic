@@ -179,7 +179,7 @@ should be spelled that way.
 ```typescript
 plugin.offline.enter();          // transactions begun from now on get local acknowledgement
 plugin.offline.exit();           // transactions begun from now on get network acknowledgement
-await plugin.offline.whenDrained(); // resolves when the queue is empty (or rejects on dispose)
+await plugin.offline.whenDrained(); // resolves when the queue is empty and nothing journaled is left to put back (or rejects on dispose)
 ```
 
 The acknowledgement a transaction gets is fixed when it **begins** (at `TransactionBridge.beginTransaction`),
@@ -210,7 +210,7 @@ Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/s
 type QueuedTransactionStatus =
   | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[]; queuedAt: number;
       attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
-      persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | undefined;
+      persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | 'restore' | undefined;
       outlook: CommitOutlook }
   | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
   | { kind: 'submitting'; transactionId: string; attempt: number }
@@ -250,6 +250,9 @@ type QueuedFailureReason =
   progress indicator. See [Predicting whether an entry will commit](#predicting-whether-an-entry-will-commit).
 - `committedTables` on `failed` is set only when part of the transaction committed and the rest was
   then refused permanently; see [Partial commits](#partial-commits).
+- `waitingFor: 'restore'` is the plugin's own state, absent from the db-core queue: the transaction is
+  in the journal but not yet back in the queue after a restart, because a table it wrote cannot be
+  reached or is not declared; see [Restore after a restart](#restore-after-a-restart).
 
 The db-core queue (stage 3; `EntryStatus` in `packages/db-core/src/offline/status.ts`) reports the
 same shapes with collection ids in place of tables and `entryId` in place of `transactionId`:
@@ -259,7 +262,7 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
 plugin passes through. `outlook` and `outlook-changed` arrive with stage 7 and `effect` with stage
 10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4, and `persisted`
-(on `queued`, and on each item `entries()` lists) with stage 5.
+(on `queued`, and on each item `entries()` lists) and the `'restore'` waiting state with stage 5.
 
 Queue-wide state, for a status bar:
 
@@ -274,15 +277,18 @@ type OfflineModeState = OfflineQueueState & {   // db-core's queue state: depth,
 ### Queries and actions
 
 ```typescript
-plugin.offline.entries();                 // the queued entries, in order, with their current status
+plugin.offline.entries();                 // the queued entries, in order, with their current status, then any journaled ones not yet put back
 plugin.offline.status(transactionId);     // one entry's status, or a retained outcome, or undefined
 plugin.offline.discard(transactionId);    // withdraw a queued (never sent) entry; fails it with 'discarded'
 plugin.offline.outcomes();                // terminal outcomes retained (outcomeRetentionMs) and not yet acknowledged
 plugin.offline.acknowledge(transactionId);// forget a retained outcome
+plugin.offline.restore();                 // put the journaled entries back; what hydrate runs (see "Restore after a restart")
 ```
 
 `discard` refuses an entry that has been sent at least once, because the plugin can no longer say
-whether it landed; see [Identity across attempts](#identity-across-attempts).
+whether it landed; see [Identity across attempts](#identity-across-attempts). A journaled entry not
+yet put back after a restart is discarded the same way, with the same refusal when a drive record
+was written for it (see [Restore after a restart](#restore-after-a-restart)).
 
 A read-only virtual table, `optimystic_queue`, would list the same entries (`transaction_id`, `seq`,
 `status`, `tables`, `queued_at`, `attempts`, `last_error`) for applications that live in SQL. It is
@@ -1070,7 +1076,10 @@ leaving the mode. The first
 locally served read of a table is logged as `offline:read-served-locally`, and again the first one
 after a refresh has reached the cohort. The degrade has no transaction branch, so a live read inside
 an open transaction degrades the same way. A committed read (`committed.<Table>`) never refreshes
-and is unchanged.
+and is unchanged. One table is excepted: while a journaled transaction that wrote it is waiting to be
+put back after a restart ([Restore after a restart](#restore-after-a-restart)), its reads do not
+degrade — this machine's view lacks rows the application was told are committed — so a read of it
+fails while the cohort cannot be reached, and the first read that reaches the cohort puts them back.
 
 ## Persistence
 
@@ -1196,23 +1205,65 @@ and inherits that section's rules.
 ### Restore after a restart
 
 `plugin.hydrate(db)` restores the queue after rebuilding the catalog and before returning, so the
-application's first statement after `hydrate` already sees its queued transactions. For each record
-in sequence order it initializes the tables the record names, re-stages each segment's actions into
-its collection (which re-runs the action handlers against the local committed state, rebuilding the
-transforms), and seals the segment. A guard that refuses during restore — the local state changed
-underneath while the app was down, for example a replica that arrived after the entry was queued —
-fails the entry exactly as a refusal during replay would.
+application's first statement after `hydrate` already sees its queued transactions. A host that does
+not call `hydrate` calls `plugin.offline.restore()` itself, which is what `hydrate` runs; it can be
+called again at any time — a record already put back is skipped, one deferred (below) is tried
+again — and refuses to run while a transaction is open on the `Database`, since each collection's
+open segment belongs to that transaction. The pass is `OfflineRestore` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-restore.ts`, owned by the
+controller; it runs one at a time, and a pass requested while one runs starts after it.
 
-A collection whose base blocks this machine cannot read (it never held them, and the cohort is
-unreachable) cannot be re-staged. Its entries stay journaled and are restored on that table's first
-successful read; until then, reads of the table fail as they would without the mode. No journaled
-entry is dropped for this.
+A pass lists the label's entry, drive and outcome records once. It loads the outcome records into
+the retained outcomes (one past `outcomeRetentionMs` is deleted instead), reserves every listed
+sequence number on the queue so a transaction queued meanwhile never takes a journaled one, and then
+walks the entry records in queue order:
 
-**An entry record whose transaction has an outcome record is settled.** The deletes that follow an
-outcome are not flushed, so a crash can leave the entry and drive records beside the outcome; the
-restore deletes them and restores nothing, and the outcome is listed by `outcomes()` as any other.
+- **An entry record whose transaction has an outcome record is settled.** The deletes that follow an
+  outcome are not flushed, so a crash can leave the entry and drive records beside the outcome; the
+  restore deletes them and puts nothing back, emits no status, and the outcome is listed by
+  `outcomes()` as any other.
+- **A record of an unknown version stops the pass**, thrown out of `hydrate` or `restore()` as
+  `OfflineJournalError` (reason `'unknown-version'`, the key and the version), with every record from
+  it on left as it is and the records before it put back. Skipping it would drain later transactions
+  ahead of one the order says must go first, and dropping it would lose a change the application was
+  told is committed; the host sees a loud failure saying the journal was written by a newer build.
+- **Otherwise each table the record names is initialized** to reach its collections, the instances
+  every statement reads and stages through (`OptimysticModule.collectionsOfTable`), and the entry is
+  put back through `OfflineQueue.restore` (below). A guard that refuses as the segment is re-staged —
+  the local state changed underneath while the app was down, a rival's row at the key, say — fails
+  the entry exactly as a refusal during replay would, and its outcome is retained.
 
-A host that does not call `hydrate` calls `plugin.offline.restore()` itself, with the same rule.
+**Deferral.** A record cannot be put back when a table it names is not in the engine's catalog
+(dropped by another machine while this one was down, or not yet declared by a host that restores
+before `apply schema`), when initializing or opening the table throws `BlockUnavailableError` (its
+base blocks cannot be read: this machine never held them and the cohort cannot be reached — out of
+the open, or out of the segment's replay, which the queue then rolls back), or when the record names
+a collection the table no longer backs (re-declared over another URI while down). The pass stops
+there: this record and every record after it stay journaled, unrestored, so the queue keeps its
+order, each logged `offline:restore-deferred` once per pass. Any other error out of a table's
+initialization propagates out of `restore()` and `hydrate`: a corrupt catalog or a programming error
+is not a reason to wait. The deferred records are retried by another pass, which runs on every
+`restore()` call; when a deferred table's vtab finishes a full initialization or a live refresh of it
+reaches the cohort (`OfflineMode.tableReadable`, scheduled off the statement's path once no
+transaction is open, never awaited by the read); and from the controller's reachability gate, asked
+by the queue before each submission — while anything is deferred the gate starts a pass and answers
+`false`, so nothing queued after the restart is submitted ahead of an older transaction still on
+disk, and the queue's re-check timer is also the restore's retry timer. Such an entry reports
+`waitingFor: 'cohort'`, the closest existing value; the reason is in the log line.
+
+What the application sees of a deferred record: `entries()` lists it after the queue's entries as
+`queued` with `waitingFor: 'restore'`, `persisted: true`, `attempts` 1 and `inDoubt` true when a
+drive record was written for it (a send may have landed), else 0 and false; `status(transactionId)`
+answers the same; `whenDrained()` stays pending until a later pass puts it back and it drains, or
+it is discarded; it counts as queued for a network-acknowledged commit (which waits behind it), for
+session mode's refusal, and for the DDL gate on its tables. `discard` of one that is not in doubt
+deletes its records and fails it with reason `discarded` and empty `changedTables` (nothing was
+staged, so nothing is announced); one in doubt is refused with `EntryNotDiscardableError`, as a
+queued one is. A dropped table with an in-doubt record is therefore stuck until the table exists
+again or the record is removed from the store by hand, logged once as `offline:restore-stuck` and
+recorded as an accepted tradeoff at the discard site. A restored entry's `queued` status is emitted
+during the pass, before `hydrate` returns, so a listener registered before `hydrate` hears it; one
+registered after reads `entries()`.
 
 Both go through `OfflineQueue.restore` in `packages/db-core/src/offline/queue.ts`, the only way to
 register an entry whose segments `enqueue` did not seal. It holds the drain for the whole call — it
@@ -1492,9 +1543,10 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL gate, the
    invented-collection probe, and the live-read degrade with the per-transactor reachability gate it
    and the queue share.
-5. **Persistence** (in three tickets; the first two implemented). The journal port in db-core with
-   the queue's write ordering and restore operations; the journal over `IKVStore`, retained outcomes
-   in it, and the `NODE_KV_NAMESPACES` entry; restore in `hydrate` and `offline.restore`.
+5. **Persistence** (implemented, in three tickets). The journal port in db-core with the queue's
+   write ordering and restore operations; the journal over `IKVStore`, retained outcomes in it, and
+   the `NODE_KV_NAMESPACES` entry; restore in `hydrate` and `offline.restore`, with deferral of a
+   record whose table cannot be reached.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on
    connection events, and the solo-refusing write option, set by every drain unless the application
    opts out with `allowSoloCommit`.
@@ -1560,8 +1612,17 @@ probe at the collection tier. `packages/quereus-plugin-optimystic/test/offline-j
 the write side of stage 5: the records an offline commit over a table and its index leaves, in queue
 order, and what its drain leaves; a journal that refuses the entry record failing the commit; what
 survives a crash after the drain committed and before the deletes were flushed, and after one
-refused send; two labels over one store. Of the list below, what is left waits for its stage: the
-restore side of the crash cases (stage 5); the two-machine group with one member away, and `expireAfterMs` reached while
+refused send; two labels over one store.
+`packages/quereus-plugin-optimystic/test/offline-restore.spec.ts` pins the restore side: a crash
+after the network commit and before the journal delete, with the node store synced and with it lost,
+each reported committed once with one log entry; a crash after the local acknowledgement, put back by
+`hydrate` and readable before the cohort is reached; a crash with the send held at the cohort, the
+entry in doubt and drained once under the recorded action id; an unknown-version record; two labels
+over one store; a table dropped while down, deferred and discarded; a table unreadable at restore,
+deferred and put back by the first read that reaches the cohort; a new offline commit waiting behind
+a deferred record and draining after it; a restored entry refused by a guard; an entry record left
+beside its outcome; and `restore()` refused inside a transaction. Of the list below, what is left
+waits for its stage: the two-machine group with one member away, and `expireAfterMs` reached while
 unreachable, which needs stage 6's gate to keep an entry unsent and so expirable; and the outlook
 (stages 7 to 10).
 
@@ -1579,9 +1640,10 @@ unreachable, which needs stage 6's gate to keep an entry unsent and so expirable
 - Crash after the network commit and before the journal delete
   (`PowerLossKVStore` for the journal and `MemoryBatchBackend({ deferSync: true })` for the node
   store, each with `powerLoss()`):
-  after restart the entry is reported committed and the log holds one entry for it.
+  after restart the entry is reported committed and the log holds one entry for it (pinned in
+  `offline-restore.spec.ts`).
 - Crash after the local acknowledgement: the entry is restored by `hydrate`, visible before the first
-  network contact, and drains on reconnect.
+  network contact, and drains on reconnect (pinned in `offline-restore.spec.ts`).
 - Two-machine group, one away: an offline-mode write on the other is queued, not committed alone,
   and drains when the partner returns (the deterministic replacement for the race recorded in phase 5
   of `packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts`, for writes made in the

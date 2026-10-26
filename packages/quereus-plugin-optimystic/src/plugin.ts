@@ -35,6 +35,7 @@ export type {
 // the table, the db-core errors its queries throw, and the statuses it reports.
 export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError, OfflineCommitTimeoutError, QueuedEntriesBlockSchemaChangeError } from './optimystic-adapter/offline-mode.js';
 export type { StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+export { OfflineJournalError } from './optimystic-adapter/offline-journal.js';
 export type { OfflineConfig } from './optimystic-adapter/offline-config.js';
 export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
 export type {
@@ -60,6 +61,8 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
+	// The restore after a restart initializes each journaled transaction's tables through the module.
+	offline.attachTableResolver(optimysticModule);
 
 	// Create the StampId function
 	const stampIdFunc = createStampIdFunction(txnBridge);
@@ -96,13 +99,21 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		txnBridge,
 		/**
 		 * Hydrate Quereus's in-memory catalog from persisted Optimystic vtab
-		 * schemas. Hosts that re-open a `Database` against existing storage
-		 * should call this once after registering the plugin (and before
-		 * running `apply schema` / DDL) so Quereus sees the existing tables in
-		 * its catalog and skips re-emitting CREATE TABLE / CREATE INDEX for
-		 * each one. Idempotent.
+		 * schemas, then put the offline queue's journaled transactions back
+		 * (`plugin.offline.restore()`; README § Offline mode, "Restarting").
+		 * Hosts that re-open a `Database` against existing storage should call
+		 * this once after registering the plugin (and before running `apply
+		 * schema` / DDL) so Quereus sees the existing tables in its catalog and
+		 * skips re-emitting CREATE TABLE / CREATE INDEX for each one, and so the
+		 * first statement sees the queued transactions. Idempotent. Resolves to
+		 * the catalog counts; rejects with `OfflineJournalError` for a journal
+		 * record written by a newer build (every record before it is restored).
 		 */
-		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
+		hydrate: async (db: Database) => {
+			const counts = await optimysticModule.hydrateCatalog(db, config, config);
+			await offline.restore();
+			return counts;
+		},
 		/**
 		 * Compare every secondary index of one table against the table's rows, in both
 		 * directions, and report each disagreement: a row the index holds no entry for

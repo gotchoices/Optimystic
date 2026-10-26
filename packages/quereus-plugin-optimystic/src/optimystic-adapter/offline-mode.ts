@@ -8,6 +8,7 @@ import type {
 import type { TransactionBridge } from './txn-bridge.js';
 import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-config.js';
 import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
+import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { addListener, notifyListeners } from './listeners.js';
 import { announceExternalChange } from './external-change.js';
@@ -106,6 +107,12 @@ interface PublishedTable {
 	readonly reachability: ICohortReachability;
 }
 
+/** The one thing the restore after a restart needs from the module: a declared table's collections,
+ * initialized (`OptimysticModule.collectionsOfTable`). Attached by `register` once the module exists. */
+export interface TableCollectionsResolver {
+	collectionsOfTable(db: Database, table: QualifiedTableName): Promise<readonly Collection<any>[] | undefined>;
+}
+
 type StatusListener = (status: QueuedTransactionStatus) => void;
 type StateListener = (state: OfflineModeState) => void;
 /** Called with a transaction's terminal outcome, or `undefined` when the controller was disposed first. */
@@ -133,11 +140,18 @@ type SettleWaiter = (outcome: TransactionOutcome | undefined) => void;
  * With `offline.journal` configured the queue writes through an {@link OfflineJournal} over that
  * store (docs/offline-sync.md §Persistence): a commit resolves only once its entry record is flushed,
  * each send is preceded by its drive record, and each terminal outcome is written before it is
- * reported — and deleted again when it is acknowledged or ages out of the retention window.
+ * reported — and deleted again when it is acknowledged or ages out of the retention window. After a
+ * restart {@link restore} (run by `plugin.hydrate`) puts the journaled transactions back through
+ * {@link OfflineRestore}; the ones it cannot put back yet are listed here as `queued` with
+ * `waitingFor: 'restore'` and count as queued everywhere the queue's entries do
+ * (docs/offline-sync.md §Restore after a restart).
  */
 export class OfflineMode {
 	private readonly queue: OfflineQueue;
 	private readonly journal: OfflineJournal | undefined;
+	/** The restore over the journal; absent without one. */
+	private readonly restorer: OfflineRestore | undefined;
+	private tableResolver: TableCollectionsResolver | undefined;
 	private readonly outcomeRetentionMs: number;
 	private readonly now = Date.now;
 	private entered = false;
@@ -172,6 +186,16 @@ export class OfflineMode {
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
 		this.queue = new OfflineQueue(options);
 		this.outcomeRetentionMs = config.outcomeRetentionMs ?? DEFAULT_OUTCOME_RETENTION_MS;
+		this.restorer = this.journal === undefined ? undefined : new OfflineRestore({
+			queue: this.queue,
+			journal: this.journal,
+			outcomeRetentionMs: this.outcomeRetentionMs,
+			now: () => this.now(),
+			transactionOpen: () => this.bridge.isTransactionActive(),
+			collectionsOfTable: table => this.requireTableResolver().collectionsOfTable(this.db, table),
+			retainOutcome: outcome => this.retainRead(outcome),
+			emitSettled: status => this.onQueueStatus(status),
+		});
 		this.networkCommitTimeoutMs = config.networkCommitTimeoutMs ?? NetworkCommitBoundMs;
 		this.lastQueueState = this.queue.queueState();
 		this.queue.onStatus(status => this.onQueueStatus(status));
@@ -219,23 +243,37 @@ export class OfflineMode {
 		return this.entered;
 	}
 
+	/** Whether anything is queued: a queue entry, or a journaled transaction the restore has read and
+	 * not yet put back (counted so a network-acknowledged commit waits behind it, and session mode is
+	 * refused, as behind a queued entry). */
 	hasQueuedEntries(): boolean {
-		return this.queue.queueState().depth > 0;
+		return this.queue.queueState().depth > 0 || (this.restorer?.holdsRecords() ?? false);
 	}
 
-	/** Resolves when the queue is empty; rejects with `QueueDisposedError` on `dispose`. */
-	whenDrained(): Promise<void> {
-		return this.queue.whenDrained();
+	/** Resolves when the queue is empty and no journaled transaction is left to put back; rejects with
+	 * `QueueDisposedError` on `dispose`. A deferred transaction keeps it pending until a later pass puts
+	 * it back and it drains, or it is discarded. */
+	async whenDrained(): Promise<void> {
+		for (;;) {
+			await this.queue.whenDrained();
+			if (this.restorer === undefined || this.restorer.settled()) return;
+			await this.restorer.whenChanged();
+		}
 	}
 
 	/**
 	 * Stop draining (`OfflineQueue.dispose`): entries left queued stay sealed in their collections. A
 	 * network-acknowledged commit still waiting behind the queue then throws `QueueDisposedError`
 	 * ({@link awaitNetworkAcknowledgement}); one whose submission was in flight and committed during
-	 * the disposal is answered with that outcome instead. Idempotent.
+	 * the disposal is answered with that outcome instead. A restore pass in progress finishes the
+	 * record it is on and stops. Idempotent.
 	 */
 	async dispose(): Promise<void> {
+		// The restore is told first, so it goes no further than its current record; the queue's disposal
+		// then ends a `queue.restore` it is waiting on, and the pass is awaited last.
+		const restoreStopped = this.restorer?.dispose();
 		await this.queue.dispose();
+		await restoreStopped;
 		this.disposed = true;
 		for (const waiters of this.settleWaiters.values()) {
 			for (const waiter of waiters) waiter(undefined);
@@ -266,16 +304,62 @@ export class OfflineMode {
 		return this.tables.get(name)?.policy ?? 'queue';
 	}
 
+	// ── restore after a restart ────────────────────────────────────────────────────────────────
+
+	/** Attach the module that resolves a table's collections for the restore. Once, by `register`. */
+	attachTableResolver(resolver: TableCollectionsResolver): void {
+		if (this.tableResolver !== undefined) throw new Error('a table resolver is already attached to this offline-mode controller');
+		this.tableResolver = resolver;
+	}
+
+	private requireTableResolver(): TableCollectionsResolver {
+		if (this.tableResolver === undefined) throw new Error('offline restore: no table resolver is attached; register() attaches the module before any statement runs');
+		return this.tableResolver;
+	}
+
+	/**
+	 * Put the journaled transactions back in the queue (docs/offline-sync.md §Restore after a
+	 * restart). `plugin.hydrate` runs it after rebuilding the catalog, so the application's first
+	 * statement after `hydrate` sees its queued transactions; a host that does not call `hydrate` calls
+	 * it. Idempotent, and callable at any time: a record already put back is skipped, one deferred is
+	 * tried again. A `queued` status is emitted for each transaction put back, before this resolves.
+	 * Without a journal there is nothing to put back, and this is a no-op.
+	 *
+	 * @throws Error while a transaction is open on this `Database` (the open segment belongs to it;
+	 * run it between transactions); `OfflineJournalError` for a record written by a newer build, after
+	 * putting back every record before it; whatever a table's initialization threw, other than the
+	 * `BlockUnavailableError` that defers the record.
+	 */
+	async restore(): Promise<void> {
+		if (this.restorer === undefined) return;
+		await this.restorer.run();
+	}
+
+	/**
+	 * `table` became readable — its vtab finished a full initialization, or a live refresh of it
+	 * reached the cohort. When a deferred transaction wrote it, a restore pass is scheduled off the
+	 * statement's path: once no transaction is open on the bridge, never awaited by the read. A pass
+	 * that cannot run (a transaction began meanwhile) is logged and left to the next trigger.
+	 */
+	tableReadable(table: QualifiedTableName): void {
+		const restorer = this.restorer;
+		if (restorer === undefined || !restorer.wantsRetryFor(qualifiedTableName(table))) return;
+		this.bridge.whenTransactionIdle()
+			.then(() => restorer.run())
+			.catch(error => log('offline:restore-pass-failed table=%s: %o', qualifiedTableName(table), error));
+	}
+
 	// ── reads in offline mode ──────────────────────────────────────────────────────────────────
 
 	/**
 	 * Whether a live read of the table named `name` may be served from this machine's own view when
 	 * its refresh cannot reach the cohort (docs/offline-sync.md §Reads in offline mode): only while the
-	 * mode is entered, and only for a `'queue'` table. Outside the mode, and for a `'network'` table, a
-	 * read keeps failing loudly.
+	 * mode is entered, only for a `'queue'` table, and not while a journaled transaction that wrote the
+	 * table is deferred — this machine's view lacks rows the application was told are committed, so the
+	 * read fails as it would without the mode until the cohort is reached, which puts them back.
 	 */
 	degradesLiveReads(name: string): boolean {
-		return this.entered && this.tablePolicy(name) === 'queue';
+		return this.entered && this.tablePolicy(name) === 'queue' && !(this.restorer?.isDeferredTable(name) ?? false);
 	}
 
 	/**
@@ -312,9 +396,24 @@ export class OfflineMode {
 	 * of every table behind those collections must answer reachable. An entry is one transactor's, so
 	 * in practice that is one gate, the one a live read of the same tables asks. A collection no table
 	 * published a gate for adds none, and with none at all the cohort is reachable.
+	 *
+	 * While a journaled transaction is deferred the answer is `false`, and a restore pass is started:
+	 * nothing queued after the restart is submitted ahead of an older transaction still on disk, and
+	 * the queue's re-check timer is also the restore's retry timer. Such an entry reports
+	 * `waitingFor: 'cohort'`, the closest existing value; the reason is in the pass's log line. The
+	 * pass is started, not awaited: the queue asks the gate inside a drain iteration, and the pass waits
+	 * for the drain to park between iterations.
 	 */
 	private readonly reachability: ICohortReachability = {
 		reachable: async blockIds => {
+			if (this.restorer?.hasDeferred()) {
+				// NOTE: one pass per re-check while anything is deferred — three listings of the journal and
+				// one initialization attempt of the deferred table, at most once per `recheck.maxMs` (60 s by
+				// default). If a record deferred for days ever shows up in profiles, back the pass off on its
+				// own timer instead of riding the queue's.
+				this.restorer.run().catch(error => log('offline:restore-pass-failed from=gate: %o', error));
+				return false;
+			}
 			const gates = new Set<ICohortReachability>();
 			for (const id of blockIds) {
 				for (const name of this.bridge.tablesOf(id)?.keys() ?? []) {
@@ -337,8 +436,11 @@ export class OfflineMode {
 	 * then any whose removal is still in progress).
 	 */
 	assertNoQueuedEntries(table: QualifiedTableName, operation: StorageShapeChange): void {
+		const name = qualifiedTableName(table);
+		// A journaled transaction not yet put back carries rows an index built now would miss.
+		const deferred = this.restorer?.records().filter(record => record.tables.includes(name)).map(record => record.transactionId) ?? [];
 		const collections = new Set(this.bridge.collectionsOf(table));
-		if (collections.size === 0) return;
+		if (collections.size === 0 && deferred.length === 0) return;
 		const listed = this.queue.entries()
 			.filter(entry => entry.collections.some(id => collections.has(id)))
 			.map(entry => entry.id);
@@ -350,9 +452,8 @@ export class OfflineMode {
 		// tables over one URI become a supported shape.
 		const registry = this.bridge.getCollectionRegistry();
 		const stillSealed = [...collections].flatMap(id => registry.get(id)?.sealedEntries() ?? []);
-		const blocking = [...new Set([...listed, ...stillSealed])];
+		const blocking = [...new Set([...listed, ...deferred, ...stillSealed])];
 		if (blocking.length === 0) return;
-		const name = qualifiedTableName(table);
 		log('offline:schema-change-refused table=%s operation=%s transactions=%o', name, operation, blocking);
 		throw new QueuedEntriesBlockSchemaChangeError(name, operation, blocking);
 	}
@@ -388,26 +489,40 @@ export class OfflineMode {
 		};
 	}
 
-	/** The queued transactions, in queue order, each with its current status. */
+	/** The queued transactions, in queue order, each with its current status, then the journaled ones
+	 * the restore has not put back yet, each `queued` with `waitingFor: 'restore'`. */
 	entries(): QueuedTransaction[] {
-		return this.queue.entries().map(entry => this.listed(entry));
+		const queued = this.queue.entries().map(entry => this.listed(entry));
+		const deferred = this.restorer?.records()
+			.filter(record => this.queue.status(record.transactionId) === undefined)
+			.map(record => this.listedDeferred(record)) ?? [];
+		return [...queued, ...deferred];
 	}
 
-	/** A queued transaction's current status, else its retained terminal outcome, else `undefined`. */
+	/** A queued transaction's current status (a deferred one's included), else its retained terminal
+	 * outcome, else `undefined`. */
 	status(transactionId: string): QueuedTransactionStatus | undefined {
 		const live = this.queue.status(transactionId);
 		if (live !== undefined) return this.translateListed(live);
+		const deferred = this.restorer?.find(transactionId);
+		if (deferred !== undefined) return this.deferredStatus(deferred);
 		this.pruneOutcomes();
 		return this.retainedOutcomes.get(transactionId)?.status;
 	}
 
 	/**
 	 * Withdraw a never-sent transaction: it fails with reason `discarded` and its rows leave this
-	 * machine's view. Throws `EntryNotDiscardableError` once it has been sent (it may already be
-	 * saved) or while it is being submitted, and `UnknownEntryError` for an id not queued.
+	 * machine's view. A journaled transaction the restore has not put back is withdrawn the same way
+	 * (its records are deleted; nothing of it was staged, so no table is announced). Throws
+	 * `EntryNotDiscardableError` once it has been sent (it may already be saved) or while it is being
+	 * submitted, and `UnknownEntryError` for an id not queued.
 	 */
 	discard(transactionId: string): void {
-		this.queue.discard(transactionId);
+		try {
+			this.queue.discard(transactionId);
+		} catch (error) {
+			if (!(error instanceof UnknownEntryError) || this.restorer?.discard(transactionId) !== true) throw error;
+		}
 	}
 
 	/**
@@ -644,6 +759,32 @@ export class OfflineMode {
 		};
 	}
 
+	/** A journaled transaction not yet put back, as {@link entries} lists it: from its record alone. */
+	private listedDeferred(record: DeferredRecord): QueuedTransaction {
+		return {
+			transactionId: record.transactionId,
+			seq: record.seq,
+			queuedAt: record.queuedAt,
+			tables: record.tables,
+			persisted: true,
+			status: this.deferredStatus(record),
+		};
+	}
+
+	private deferredStatus(record: DeferredRecord): QueuedTransactionStatus {
+		return {
+			kind: 'queued',
+			transactionId: record.transactionId,
+			seq: record.seq,
+			tables: record.tables,
+			queuedAt: record.queuedAt,
+			attempts: record.attempts,
+			inDoubt: record.inDoubt,
+			waitingFor: 'restore',
+			persisted: true,
+		};
+	}
+
 	/** The qualified names of the tables `ids` back, each once, in order of first appearance. */
 	private tablesOf(ids: readonly CollectionId[]): string[] {
 		return [...this.tablesBehind(ids).keys()];
@@ -673,6 +814,12 @@ export class OfflineMode {
 	private retain(outcome: RetainedOutcome): void {
 		this.pruneOutcomes();
 		this.retainedOutcomes.set(outcome.status.transactionId, outcome);
+	}
+
+	/** An outcome read back from its journal record by the restore: retained unless this process has
+	 * settled the same transaction since, whose outcome is the fresher. */
+	private retainRead(outcome: RetainedOutcome): void {
+		if (!this.retainedOutcomes.has(outcome.status.transactionId)) this.retainedOutcomes.set(outcome.status.transactionId, outcome);
 	}
 
 	// NOTE: walks every retained outcome on each access and each new outcome; fine while a machine

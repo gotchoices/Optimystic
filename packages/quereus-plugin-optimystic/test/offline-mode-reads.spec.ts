@@ -7,18 +7,17 @@
  *
  * Two nodes on the in-process mesh (`mesh-node-harness.ts`). The mesh's own failure switches cut a
  * node off from cluster rounds but leave it reading its own replica, so unreachability is driven
- * through node A's transactor instead: wrapped, and registered under the key the factory resolves
- * (`shared:test`), its `get` answers every block `unavailable: 'cohort-unreachable'` while
- * {@link Isolation.armed} is set — what a refresh meets on a node that cannot reach its cohort. A
+ * through node A's transactor instead (`Isolation` in `isolation.ts`): wrapped, and registered under
+ * the key the factory resolves (`shared:test`), its `get` answers every block `unavailable:
+ * 'cohort-unreachable'` while armed — what a refresh meets on a node that cannot reach its cohort. A
  * reachability gate registered on A's factory stands in for stage 6's.
  */
 
 import { expect } from 'chai';
 import type { SqlValue } from '@quereus/quereus';
-import { BlockUnavailableError } from '@optimystic/db-core';
-import type { BlockGets, GetBlockResults, ITransactor } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import type { QueuedTransactionStatus } from '../dist/index.js';
+import { Isolation, unavailableIn } from './isolation.js';
 import { countTreeEntries, createMeshDbNode, startMockMesh, type MeshDbNode } from './mesh-node-harness.js';
 import { captureThrown, expectLookupsAgreeWithScan, queryAll } from './query-helpers.js';
 
@@ -28,30 +27,6 @@ const createNotesIndex = 'create index NotesBody on Notes (body)';
 
 /** Node A's registration: the drain's re-check timer shortened so a reconnect is noticed quickly. */
 const offlineConfig = { offline: { recheck: { baseMs: 20, maxMs: 100 } } } as unknown as Record<string, SqlValue>;
-
-/** Node A's transactor, wrapped so its reads can be made to meet an unreachable cohort, and counted. */
-class Isolation {
-	/** While set, every block `get` answers `unavailable: 'cohort-unreachable'`. */
-	armed = false;
-	/** Every `get` the wrapped transactor received. */
-	gets = 0;
-
-	wrap(inner: ITransactor): ITransactor {
-		return new Proxy(inner, {
-			get: (target, property) => {
-				if (property === 'get') return (blockGets: BlockGets) => this.get(target, blockGets);
-				const value: unknown = Reflect.get(target, property, target);
-				return typeof value === 'function' ? value.bind(target) : value;
-			},
-		});
-	}
-
-	private async get(inner: ITransactor, blockGets: BlockGets): Promise<GetBlockResults> {
-		this.gets++;
-		if (!this.armed) return inner.get(blockGets);
-		return Object.fromEntries(blockGets.blockIds.map(id => [id, { state: {}, unavailable: 'cohort-unreachable' as const }]));
-	}
-}
 
 interface TwoNodes {
 	a: MeshDbNode;
@@ -81,14 +56,6 @@ async function twoNodes(): Promise<TwoNodes> {
 }
 
 const notesOf = (node: MeshDbNode): Promise<Record<string, unknown>[]> => queryAll(node.db, 'select id, body from Notes order by id');
-
-/** The `BlockUnavailableError` somewhere along `error`'s `cause` chain, if there is one. */
-function unavailableIn(error: unknown): BlockUnavailableError | undefined {
-	for (let cause = error; cause instanceof Error; cause = cause.cause) {
-		if (cause instanceof BlockUnavailableError) return cause;
-	}
-	return undefined;
-}
 
 describe('Offline mode: live reads while the cohort cannot be reached', function () {
 	this.timeout(60_000);

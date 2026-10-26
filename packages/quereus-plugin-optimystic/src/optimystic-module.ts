@@ -17,7 +17,7 @@ import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchem
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
-import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Collection, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
@@ -1005,6 +1005,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
       this.publishOfflinePolicy();
+      // A journaled offline transaction deferred because this table could not be reached is put back
+      // now that it can (docs/offline-sync.md §Restore after a restart); scheduled, never awaited here.
+      this.txnBridge.getOfflineMode()?.tableReadable(this.qualifiedTable);
 
       // This is one of two paths on which doInitialize runs TWICE for a table — the
       // upgrade after a provisional pass, and a retry after a failed attempt (see
@@ -1635,10 +1638,13 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.reachedCohort(offline);
   }
 
-  /** A live refresh of this table reached the cohort: its episode of locally served reads, if any, is over. */
+  /** A live refresh of this table reached the cohort: its episode of locally served reads, if any, is
+   * over, and a journaled offline transaction deferred because the table could not be reached can be
+   * put back (`OfflineMode.tableReadable`). */
   private reachedCohort(offline: OfflineMode | undefined): void {
     this.readsServedLocally = false;
     offline?.noteLiveRefresh(false);
+    offline?.tableReadable(this.qualifiedTable);
   }
 
   /** A live read of this table is served from this machine's own view; the first of an episode is logged. */
@@ -4907,6 +4913,28 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
 
     return { tables, indexes };
+  }
+
+  /**
+   * The collections `table` backs — its main tree and its index trees, the instances every statement
+   * reads and stages through — after initializing the table as a statement's first touch would
+   * ({@link resolveConnectedTable}'s live path: instantiated from the engine's catalog if no statement
+   * has used it yet, initialized, its connection registered). `undefined` when the engine's catalog
+   * does not know the table. For the offline mode's restore after a restart
+   * (`OfflineMode.restore`), which re-stages a journaled transaction's segments into these instances
+   * (docs/offline-sync.md §Restore after a restart). Whatever initialization throws propagates: the
+   * restore reads a `BlockUnavailableError` along the cause chain as "defer", anything else as a fault.
+   */
+  async collectionsOfTable(db: Database, table: QualifiedTableName): Promise<readonly Collection<any>[] | undefined> {
+    const resolved = await this.lookupOrInstantiate(db, table.schemaName, table.tableName);
+    if (!resolved) return undefined;
+    await resolved.table.initialize();
+    if (resolved.fresh) await resolved.table.ensureConnectionRegistered();
+    const registry = this.txnBridge.getCollectionRegistry();
+    return this.txnBridge.collectionsOf(table).flatMap(id => {
+      const collection = registry.get(id);
+      return collection === undefined ? [] : [collection];
+    });
   }
 
   /**

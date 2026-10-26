@@ -14,6 +14,7 @@ import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPo
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
+import type { DurabilityWindowFor } from '../storage/durability-window.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { claimFromConsultAnswer, fitConsultContent, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
 import type { SyncBlockAnswer } from '../sync/protocol.js';
@@ -68,6 +69,16 @@ export interface MeshOptions {
 	 * with a crashing proxy, or by restart tests to rebuild over preserved state.
 	 */
 	rawStorageFactory?: (index: number) => IRawStorage;
+	/**
+	 * How long a node's apply of a consensus record may let its storage sync wait, from the size of
+	 * the cohort the record ran on — the harness analogue of the `durabilityWindowFor` a real node
+	 * binds from `NodeOptions.storageDurability` (`durabilityWindowMs` in
+	 * `../storage/durability-window.ts`), handed to every member and coordinator here. Omitted →
+	 * every apply is strict, as every direct constructor's is. A power-loss spec whose node store is a
+	 * `WriteGroupDriver` over a `MemoryBatchBackend({ deferSync: true })` passes one so an apply can
+	 * be committed and then lost.
+	 */
+	durabilityWindowFor?: DurabilityWindowFor;
 	/**
 	 * Per-node member-side cluster derivation for the membership admission gate — the harness
 	 * analogue of `libp2p-node-base`'s `deriveExpectedCluster` (findCluster + FRET confidence).
@@ -304,8 +315,14 @@ export interface Mesh {
 	 * a retry the old process owed cannot quietly deliver after the restart and pass for healing.
 	 *
 	 * Reachability (`failures`) is untouched: a node that was unreachable stays unreachable.
+	 *
+	 * `options.rawStorage` replaces the storage the node is rebuilt over, for a power-loss spec: a
+	 * node whose store is a `WriteGroupDriver` over a `MemoryBatchBackend` keeps writes not yet
+	 * durable in the driver's overlay, so after the backend's `powerLoss()` the OLD driver still
+	 * serves them; the spec passes a fresh `new KvRawStorage(new WriteGroupDriver(backend))` here,
+	 * as the conformance reopen case opens a fresh driver, and later restarts reuse it.
 	 */
-	restart(node: MeshNode): void;
+	restart(node: MeshNode, options?: { rawStorage?: IRawStorage }): void;
 	/**
 	 * How many latest-revision consult requests `asker`'s coordinator has sent `target` — each one
 	 * `sync` request in production, whether it named one block or several. A node asking itself is
@@ -567,7 +584,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// Production shape (`libp2p-node-base`): the member's consensus applies stamp its own node's
 			// read-repair window. Read at call time, so it reaches the coordinator built after this member,
 			// and after a restart the rebuilt one.
-			onCohortCommitApplied: (applied) => meshNode.coordinatorRepo.noteCohortCommitApplied(applied)
+			onCohortCommitApplied: (applied) => meshNode.coordinatorRepo.noteCohortCommitApplied(applied),
+			durabilityWindowFor: options.durabilityWindowFor
 		});
 	};
 
@@ -695,7 +713,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
-			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders)),
+			durabilityWindowFor: options.durabilityWindowFor
 		});
 	};
 
@@ -730,10 +749,13 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		buildCoordinator(node, lifetimeByPeer.get(node.peerId.toString())!);
 	}
 
-	const restart = (node: MeshNode): void => {
+	const restart = (node: MeshNode, restartOptions: { rawStorage?: IRawStorage } = {}): void => {
 		const peerIdStr = node.peerId.toString();
 		if (!nodes.includes(node)) {
 			throw new Error(`restart: ${peerIdStr} is not a node of this mesh`);
+		}
+		if (restartOptions.rawStorage !== undefined) {
+			durableByPeer.set(peerIdStr, { ...durableByPeer.get(peerIdStr)!, rawStorage: restartOptions.rawStorage });
 		}
 		// NOTE: this severs the old instance's traffic to OTHER nodes, not its in-process path to its own
 		// member and storage repo, which still write the shared raw storage if called. After a restart
@@ -943,12 +965,29 @@ function selfFirstReadKeyNetwork(shared: IKeyNetwork, self: MeshNode): IKeyNetwo
  * reaching itself, get neither end, as in production.
  */
 function repoAsReachedBy(target: MeshNode, reader: MeshNode | undefined, wrapRepo: BuildTransactorOptions['wrapRepo']): IRepo {
-	const coordinator = target.coordinatorRepo as unknown as IRepo;
+	const coordinator = currentCoordinatorOf(target);
 	if (!reader || reader === target) return wrapRepo ? wrapRepo(coordinator, target) : coordinator;
 	const received = arrivingFrom(coordinator, reader.peerId.toString());
 	const sent = wrapRepo ? wrapRepo(received, target) : received;
 	// The reader's store is looked up per read: `Mesh.restart` gives a node a new one.
 	return stateHoldingsOnReads(sent, { heldRevisions: blockIds => reader.storageRepo.heldRevisions(blockIds) });
+}
+
+/**
+ * `node`'s coordinator as an `IRepo`, resolved on every call rather than bound to the instance:
+ * `Mesh.restart` gives the node a new coordinator, and a transactor built before the restart has to
+ * reach the new one — the old instance is inert, and its storage repo is the old store's.
+ */
+function currentCoordinatorOf(node: MeshNode): IRepo {
+	const current = (): IRepo => node.coordinatorRepo as unknown as IRepo;
+	return {
+		get: (blockGets, options) => current().get(blockGets, options),
+		pend: (request, options) => current().pend(request, options),
+		cancel: (actionRef, options) => current().cancel(actionRef, options),
+		commit: (request, options) => current().commit(request, options),
+		pendMany: (requests, options) => current().pendMany!(requests, options),
+		commitMany: (requests, options) => current().commitMany!(requests, options)
+	};
 }
 
 /** `repo` as `RepoService` hands it a read that arrived over a connection from `asker`. */

@@ -4,7 +4,8 @@ import type { SqlCommitDurability } from './commit-durability.js';
 /**
  * What `plugin.offline` reports about each locally acknowledged transaction (docs/offline-sync.md
  * §Following transactions): the db-core queue's `EntryStatus` with tables (`schema.table`) in place
- * of collection ids and the transaction's `StampId()` in place of the entry id, and `persisted`. The
+ * of collection ids and the transaction's `StampId()` in place of the entry id, `persisted`, and one
+ * waiting state of the plugin's own, `'restore'` (docs/offline-sync.md §Restore after a restart). The
  * fields later stages add there (`outlook`, `effect`) are absent until they land.
  */
 
@@ -25,7 +26,10 @@ export type QueuedTransactionStatus =
 		/** Whether an attempt may have landed: such a transaction can neither be discarded nor expired,
 		 * and is re-sent only under its own action id. */
 		inDoubt: boolean;
-		waitingFor: EntryWaitingFor | undefined;
+		/** The queue's three states, or `'restore'`: the transaction is in the journal but not yet back in
+		 * the queue after a restart, because a table it wrote cannot be reached or is not declared
+		 * (docs/offline-sync.md §Restore after a restart); it is put back when the table can be read. */
+		waitingFor: EntryWaitingFor | 'restore' | undefined;
 		/** What the last attempt failed with, when one has. */
 		lastError?: unknown;
 		/** The tables already durably committed, once a submission committed part of the transaction

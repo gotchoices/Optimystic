@@ -28,8 +28,23 @@ const log = createLogger('offline-journal');
  */
 
 /** The version every record this build writes carries. A reader meeting another refuses it rather
- * than guess at its shape. */
+ * than guess at its shape ({@link OfflineJournalError}). */
 export const JOURNAL_RECORD_VERSION = 1;
+
+/**
+ * Thrown by the restore after a restart (docs/offline-sync.md §Restore after a restart) for a journal
+ * record this build cannot read: `'unknown-version'`, a record whose `v` is not
+ * {@link JOURNAL_RECORD_VERSION}, written by a newer build. The record, and every record after it in
+ * queue order, is left as it is: skipping it would drain later transactions ahead of one that must go
+ * first, and dropping it would lose a change the application was told is committed. Out of
+ * `plugin.hydrate` and `plugin.offline.restore()`; the transactions before it are back in the queue.
+ */
+export class OfflineJournalError extends Error {
+	constructor(readonly reason: 'unknown-version', readonly key: string, readonly version: unknown) {
+		super(`offline journal: record ${key} has version ${String(version)}, which this build cannot read (it reads version ${JOURNAL_RECORD_VERSION}); it was written by a newer build and is left in the store, with every record after it`);
+		this.name = 'OfflineJournalError';
+	}
+}
 
 /** One key segment every `IKVStore` can hold: `FileKVStore` makes each `/`-separated segment a
  * directory or file name, so nothing a filesystem treats specially. Every transaction id (a
@@ -98,6 +113,22 @@ export type OutcomeRecordV1 = {
 export interface RetainedOutcome {
 	readonly at: number;
 	readonly status: TransactionOutcome;
+}
+
+/** One record as {@link OfflineJournal.scan} lists it: its key and its parsed value, not yet checked
+ * against the shape this build reads ({@link decodeEntryRecord} and its siblings do that, so the
+ * restore meets an unreadable record where it sits in queue order rather than at the listing). */
+export interface ScannedRecord {
+	readonly key: string;
+	readonly value: unknown;
+}
+
+/** Everything one label holds, listed once: entry records in queue order (their keys sort as
+ * strings), drive records by the `seq` segment of their key, and outcome records. */
+export interface JournalScan {
+	readonly entries: readonly ScannedRecord[];
+	readonly drives: ReadonlyMap<string, ScannedRecord>;
+	readonly outcomes: readonly ScannedRecord[];
 }
 
 /** What the journal asks of its owner, `OfflineMode`. */
@@ -217,6 +248,51 @@ export class OfflineJournal implements IOfflineJournal {
 		await this.store.delete(this.keys.outcome(transactionId));
 	}
 
+	/**
+	 * Register a journaled transaction's sequence number, for one the restore after a restart puts back
+	 * (`OfflineRestore`): its records were written by an earlier process, so this journal never saw its
+	 * {@link queued}, and without this its first {@link driving} would find no entry record and abort
+	 * the send. Also ahead of {@link settled} for a journaled transaction settled without being queued —
+	 * a discarded one the restore could not put back — so the outcome write deletes its records.
+	 */
+	adopt(transactionId: string, seq: number): void {
+		this.seqs.set(transactionId, seq);
+	}
+
+	/** Every record under this label, read once ({@link JournalScan}); the restore's one listing per pass. */
+	async scan(): Promise<JournalScan> {
+		const [entries, drives, outcomes] = await Promise.all([
+			this.readAll(this.keys.entries),
+			this.readAll(this.keys.drives),
+			this.readAll(this.keys.outcomes),
+		]);
+		return {
+			entries,
+			drives: new Map(drives.map(record => [record.key.slice(this.keys.drives.length), record])),
+			outcomes,
+		};
+	}
+
+	/** Delete a transaction's entry and drive records (not flushed): one the restore found settled, or
+	 * one it is putting back whose outcome it writes through {@link settled} instead. */
+	async deleteRecords(seq: number): Promise<void> {
+		await this.store.delete(this.keys.entry(seq));
+		await this.store.delete(this.keys.drive(seq));
+	}
+
+	/** The records under `prefix`, in key order, each value parsed as JSON. */
+	private async readAll(prefix: string): Promise<ScannedRecord[]> {
+		const keys = (await this.store.list(prefix)).sort();
+		const records: ScannedRecord[] = [];
+		for (const key of keys) {
+			const value = await this.store.get(key);
+			// A key listed and gone before it was read was deleted by the drain meanwhile; it was settled.
+			if (value === undefined) continue;
+			records.push({ key, value: JSON.parse(value) as unknown });
+		}
+		return records;
+	}
+
 	private entryRecord(record: JournalEntryRecord): EntryRecordV1 {
 		if (!JOURNAL_KEY_SEGMENT.test(record.id)) {
 			throw new Error(`offline journal: transaction id '${record.id}' cannot key its outcome record (letters, digits, '_' and '-' only)`);
@@ -272,6 +348,29 @@ export class OfflineJournal implements IOfflineJournal {
 			log('offline:journal-take-back-failed key=%s: %o', key, error);
 		}
 	}
+}
+
+/** `record` as an entry record, or {@link OfflineJournalError} for a version this build does not read. */
+export function decodeEntryRecord(record: ScannedRecord): EntryRecordV1 {
+	return versioned<EntryRecordV1>(record);
+}
+
+/** `record` as a drive record, or {@link OfflineJournalError} for a version this build does not read. */
+export function decodeDriveRecord(record: ScannedRecord): DriveRecordV1 {
+	return versioned<DriveRecordV1>(record);
+}
+
+/** `record` as an outcome record, or {@link OfflineJournalError} for a version this build does not read. */
+export function decodeOutcomeRecord(record: ScannedRecord): OutcomeRecordV1 {
+	return versioned<OutcomeRecordV1>(record);
+}
+
+/** The one check every record shares: its `v` is the version this build writes. The shape behind it
+ * is trusted, since this build wrote it (the store is as protected as block storage). */
+function versioned<T extends { readonly v: 1 }>(record: ScannedRecord): T {
+	const version = typeof record.value === 'object' && record.value !== null ? (record.value as { v?: unknown }).v : undefined;
+	if (version !== JOURNAL_RECORD_VERSION) throw new OfflineJournalError('unknown-version', record.key, version);
+	return record.value as T;
 }
 
 /** The outcome as its record holds it ({@link PersistedOutcome}). */

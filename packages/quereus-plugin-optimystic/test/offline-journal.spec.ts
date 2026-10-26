@@ -11,13 +11,14 @@
 
 import { expect } from 'chai';
 import type { Database, SqlValue } from '@quereus/quereus';
-import { Log, transactionDurability, type CollectionId, type LogEntry, type WriteDurability } from '@optimystic/db-core';
+import { transactionDurability, type CollectionId, type WriteDurability } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { MemoryKVStore, type IKVStore } from '@optimystic/db-p2p';
 import { PowerLossKVStore, type Mesh } from '@optimystic/db-p2p/testing';
 import type { QueuedTransactionStatus, TransactionOutcome } from '../dist/index.js';
 import { decodeOutcome, encodeOutcome, type DriveRecordV1, type EntryRecordV1, type OutcomeRecordV1 } from '../src/optimystic-adapter/offline-journal.js';
-import { createMeshDbNode, openFreshTree, startMockMesh, type MeshDbNode, type Plugin } from './mesh-node-harness.js';
+import { keysOf, record } from './journal-records.js';
+import { createMeshDbNode, loggedUnder, startMockMesh, type MeshDbNode } from './mesh-node-harness.js';
 import { queryAll } from './query-helpers.js';
 
 type QueuedStatus = Extract<QueuedTransactionStatus, { kind: 'queued' }>;
@@ -68,32 +69,8 @@ async function insertNote(db: Database, id: number, body: string): Promise<strin
 	return row.stamp_id;
 }
 
-/** The keys of one journal sub-namespace (`entries`, `drives`, `outcomes`) under `label`, sorted. */
-async function keysOf(store: IKVStore, kind: 'entries' | 'drives' | 'outcomes', label = 'default'): Promise<string[]> {
-	return (await store.list(`optimystic-offline/${label}/${kind}/`)).sort();
-}
-
-async function record<T>(store: IKVStore, key: string): Promise<T> {
-	const value = await store.get(key);
-	expect(value, `a record at ${key}`).to.be.a('string');
-	return JSON.parse(value!) as T;
-}
-
 const queuedOf = (statuses: readonly QueuedTransactionStatus[], transactionId: string): QueuedStatus | undefined =>
 	statuses.find((s): s is QueuedStatus => s.kind === 'queued' && s.transactionId === transactionId);
-
-/** The action entries of `collectionUri`'s committed log under `actionId`, read on this node through a fresh handle. */
-async function loggedUnder(plugin: Plugin, collectionUri: string, actionId: string): Promise<LogEntry<unknown>[]> {
-	const tree = await openFreshTree(plugin, collectionUri);
-	await tree.update();
-	const collection = tree.getCollection();
-	const log = await Log.open<unknown>(collection.tracker, collection.id);
-	const entries: LogEntry<unknown>[] = [];
-	for await (const entry of log?.select() ?? []) {
-		if (entry.action?.actionId === actionId) entries.push(entry);
-	}
-	return entries;
-}
 
 describe('Offline mode: the journal over a key-value store', function () {
 	this.timeout(60_000);

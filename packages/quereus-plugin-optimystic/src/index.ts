@@ -37,6 +37,7 @@ export type {
 // the table, the db-core errors its queries throw, and the statuses it reports. Exported from `./plugin` too.
 export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError, OfflineCommitTimeoutError, QueuedEntriesBlockSchemaChangeError } from './optimystic-adapter/offline-mode.js';
 export type { StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+export { OfflineJournalError } from './optimystic-adapter/offline-journal.js';
 export type { OfflineConfig } from './optimystic-adapter/offline-config.js';
 export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
 export type {
