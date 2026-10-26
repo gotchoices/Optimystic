@@ -236,6 +236,12 @@ export class OfflineJournal implements IOfflineJournal {
 			await this.write(this.keys.outcome(status.entryId), value);
 		} finally {
 			if (seq !== undefined) {
+				// NOTE: a crash between these two deletes leaves a drive record (the transforms of every retained
+				// attempt) with no entry record beside it, which no restore pass lists or deletes, so it stays
+				// in the store. Rare and bounded by one record per such crash; if a store ever accumulates
+				// them, have the restore delete a drive record whose sequence number is at or below the
+				// highest listed entry record's and has no entry record — never one above it, which a
+				// transaction enqueued during the listing may be writing.
 				await this.store.delete(this.keys.entry(seq));
 				await this.store.delete(this.keys.drive(seq));
 			}

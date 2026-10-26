@@ -105,16 +105,25 @@ export type QueuedEntry = {
 };
 
 /** Thrown by `OfflineQueue.discard` for an entry that cannot be withdrawn: it has been sent at least
- * once and so may already be saved (`inDoubt`), or it is being submitted right now. */
+ * once and so may already be saved (`inDoubt`), or it is being submitted right now — and by the
+ * plugin's restore after a restart for a journaled entry a pass is putting back right now
+ * (`restoring`): withdrawn then, its outcome would be written while the queue goes on to admit and
+ * drive it. */
 export class EntryNotDiscardableError extends Error {
 	constructor(
 		readonly entryId: EntryId,
-		readonly because: 'in-doubt' | 'submitting',
+		readonly because: 'in-doubt' | 'submitting' | 'restoring',
 	) {
-		super(because === 'in-doubt'
-			? `entry ${entryId} has been sent at least once and may already be saved; it cannot be discarded`
-			: `entry ${entryId} is being submitted; it cannot be discarded`);
+		super(notDiscardableMessage(entryId, because));
 		this.name = 'EntryNotDiscardableError';
+	}
+}
+
+function notDiscardableMessage(entryId: EntryId, because: EntryNotDiscardableError['because']): string {
+	switch (because) {
+		case 'in-doubt': return `entry ${entryId} has been sent at least once and may already be saved; it cannot be discarded`;
+		case 'submitting': return `entry ${entryId} is being submitted; it cannot be discarded`;
+		case 'restoring': return `entry ${entryId} is being put back from its journal record; it cannot be discarded until the pass has put it back`;
 	}
 }
 

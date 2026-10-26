@@ -1259,7 +1259,10 @@ it is discarded; it counts as queued for a network-acknowledged commit (which wa
 session mode's refusal, and for the DDL gate on its tables. `discard` of one that is not in doubt
 deletes its records and fails it with reason `discarded` and empty `changedTables` (nothing was
 staged, so nothing is announced); one in doubt is refused with `EntryNotDiscardableError`, as a
-queued one is. A dropped table with an in-doubt record is therefore stuck until the table exists
+queued one is, and so is the one record a pass is putting back at that moment (`because:
+'restoring'`): it is still listed as deferred while the queue registers it, and the queue refuses it
+as unknown until it is admitted, so accepting it would write its outcome and delete its records
+while the queue went on to drive it. A dropped table with an in-doubt record is therefore stuck until the table exists
 again or the record is removed from the store by hand, logged once as `offline:restore-stuck` and
 recorded as an accepted tradeoff at the discard site. A restored entry's `queued` status is emitted
 during the pass, before `hydrate` returns, so a listener registered before `hydrate` hears it; one
@@ -1620,8 +1623,9 @@ each reported committed once with one log entry; a crash after the local acknowl
 entry in doubt and drained once under the recorded action id; an unknown-version record; two labels
 over one store; a table dropped while down, deferred and discarded; a table unreadable at restore,
 deferred and put back by the first read that reaches the cohort; a new offline commit waiting behind
-a deferred record and draining after it; a restored entry refused by a guard; an entry record left
-beside its outcome; and `restore()` refused inside a transaction. Of the list below, what is left
+a deferred record and draining after it; `discard` refused for the record a pass is putting back at
+that moment; a restored entry refused by a guard; an entry record left beside its outcome; and
+`restore()` refused inside a transaction. Of the list below, what is left
 waits for its stage: the two-machine group with one member away, and `expireAfterMs` reached while
 unreachable, which needs stage 6's gate to keep an entry unsent and so expirable; and the outlook
 (stages 7 to 10).

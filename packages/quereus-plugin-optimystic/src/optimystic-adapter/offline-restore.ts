@@ -170,11 +170,15 @@ export class OfflineRestore {
 	 * empty `changedCollections` (nothing was staged, so nothing is announced). Answers `false` for an id
 	 * that is not deferred, so the caller can throw its own `UnknownEntryError`.
 	 * @throws EntryNotDiscardableError for a record in doubt: a change the network may hold is not
-	 * withdrawn on this machine's say-so, as for a queued entry.
+	 * withdrawn on this machine's say-so, as for a queued entry; and for the record a pass is putting
+	 * back right now (`restoring`): it is still listed here while the queue registers it, and the queue
+	 * refuses it as unknown until it is admitted, so accepting it here would write its outcome and
+	 * delete its records while the queue went on to drive it.
 	 */
 	discard(transactionId: string): boolean {
 		const record = this.deferred.get(transactionId);
 		if (record === undefined) return false;
+		if (transactionId === this.attempting) throw new EntryNotDiscardableError(transactionId, 'restoring');
 		// NOTE: accepted tradeoff — an in-doubt record whose table was dropped while this machine was
 		// down is stuck: its table will not come back, and this refusal keeps it from being withdrawn,
 		// so it stays listed `waitingFor: 'restore'` until the table exists again or the record is
@@ -237,6 +241,9 @@ export class OfflineRestore {
 			await this.walk(scan.entries, scan.drives, settled, next, handled);
 			completed = true;
 		} finally {
+			// A record listed behind the stopping one and discarded while the walk went on (its settlement
+			// is chained behind this pass, so it is still in `discarding`) must not come back as deferred.
+			for (const id of this.discarding) next.delete(id);
 			if (completed) {
 				this.deferred = next;
 			} else {
@@ -453,8 +460,8 @@ function highestSeq(entries: readonly ScannedRecord[], prefix: string): number {
 }
 
 /** The `BlockUnavailableError` along `error`'s `cause` chain, if any: a table's initialization wraps
- * the one its collection's open threw. */
-function unavailableIn(error: unknown): BlockUnavailableError | undefined {
+ * the one its collection's open threw, as the vtab wraps a read's. */
+export function unavailableIn(error: unknown): BlockUnavailableError | undefined {
 	for (let cause: unknown = error; cause instanceof Error; cause = cause.cause) {
 		if (cause instanceof BlockUnavailableError) return cause;
 	}

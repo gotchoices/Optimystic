@@ -7,16 +7,20 @@
  * cannot reach its cohort. Writes and every other call pass through untouched.
  */
 
-import { BlockUnavailableError } from '@optimystic/db-core';
 import type { BlockGets, BlockId, GetBlockResults, ITransactor } from '@optimystic/db-core';
 
-/** The `BlockUnavailableError` somewhere along `error`'s `cause` chain, if there is one: the plugin
- * wraps a read's or an initialization's failure, and the typed cause survives underneath. */
-export function unavailableIn(error: unknown): BlockUnavailableError | undefined {
-	for (let cause: unknown = error; cause instanceof Error; cause = cause.cause) {
-		if (cause instanceof BlockUnavailableError) return cause;
-	}
-	return undefined;
+export { unavailableIn } from '../src/optimystic-adapter/offline-restore.js';
+
+/** `inner` with its block reads answered by `read` (handed the transactor to read through); writes
+ * and every other call pass through untouched. */
+export function withReads(inner: ITransactor, read: (inner: ITransactor, blockGets: BlockGets) => Promise<GetBlockResults>): ITransactor {
+	return new Proxy(inner, {
+		get: (target, property) => {
+			if (property === 'get') return (blockGets: BlockGets) => read(target, blockGets);
+			const value: unknown = Reflect.get(target, property, target);
+			return typeof value === 'function' ? value.bind(target) : value;
+		},
+	});
 }
 
 export class Isolation {
@@ -34,13 +38,7 @@ export class Isolation {
 	constructor(private readonly unreachable: (blockId: BlockId) => boolean = () => true) {}
 
 	wrap(inner: ITransactor): ITransactor {
-		return new Proxy(inner, {
-			get: (target, property) => {
-				if (property === 'get') return (blockGets: BlockGets) => this.get(target, blockGets);
-				const value: unknown = Reflect.get(target, property, target);
-				return typeof value === 'function' ? value.bind(target) : value;
-			},
-		});
+		return withReads(inner, (target, blockGets) => this.get(target, blockGets));
 	}
 
 	private async get(inner: ITransactor, blockGets: BlockGets): Promise<GetBlockResults> {

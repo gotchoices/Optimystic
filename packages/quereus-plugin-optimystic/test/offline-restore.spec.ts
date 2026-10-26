@@ -22,7 +22,7 @@ import { KvRawStorage, MemoryRawStorage, WriteGroupDriver, durabilityWindowMs, r
 import { MemoryBatchBackend, PowerLossKVStore, type Mesh } from '@optimystic/db-p2p/testing';
 import { EntryNotDiscardableError, OfflineJournalError, type QueuedTransactionStatus } from '../dist/index.js';
 import type { DriveRecordV1 } from '../src/optimystic-adapter/offline-journal.js';
-import { Isolation, unavailableIn } from './isolation.js';
+import { Isolation, unavailableIn, withReads } from './isolation.js';
 import { keysOf, record } from './journal-records.js';
 import { countTreeEntries, createMeshDbNode, loggedUnder, startMockMesh, type MeshDbNode, type MockMeshOptions } from './mesh-node-harness.js';
 import { captureThrown, expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
@@ -105,6 +105,37 @@ class CrashesAtOutcome extends PowerLossKVStore {
 			this.powerLoss();
 		}
 		return super.set(key, value);
+	}
+}
+
+/** A transactor whose next block read, once {@link park} is called, is held until {@link release}:
+ * the moment a restore pass is initializing a table, with the record it is putting back still listed
+ * as deferred. */
+class ParkedReads {
+	private hold: Promise<void> | undefined;
+	private open: (() => void) | undefined;
+	private arrived!: () => void;
+	/** Resolves once a read is parked. */
+	readonly parked = new Promise<void>(resolve => { this.arrived = resolve; });
+
+	park(): void {
+		this.hold = new Promise(resolve => { this.open = resolve; });
+	}
+
+	release(): void {
+		this.open?.();
+	}
+
+	wrap(inner: ITransactor): ITransactor {
+		return withReads(inner, async (target, blockGets) => {
+			const hold = this.hold;
+			if (hold !== undefined) {
+				this.hold = undefined;
+				this.arrived();
+				await hold;
+			}
+			return target.get(blockGets);
+		});
 	}
 }
 
@@ -353,6 +384,43 @@ describe('Offline mode: restoring the queue from its journal after a restart', f
 		expect(a2.plugin.offline.status(transactionId)?.kind, 'the outcome is retained').to.equal('failed');
 		expect(await keysOf(reopened, 'entries')).to.deep.equal([]);
 		expect(await keysOf(reopened, 'outcomes')).to.deep.equal([`optimystic-offline/default/outcomes/${transactionId}`]);
+	});
+
+	it('discard of a deferred record while a pass is putting that record back is refused, and the pass queues it', async () => {
+		const { transactorFor } = await startMockMesh(2);
+		const isolation = new Isolation(blockId => blockId.startsWith(NOTES_COLLECTION));
+		const parking = new ParkedReads();
+		const transactorA = parking.wrap(isolation.wrap(transactorFor(0)));
+		const store = new PowerLossKVStore();
+		const gate = new Gate(false);
+		const a = openA(transactorA, store, { gate });
+		const b = createMeshDbNode(transactorFor(1));
+		await a.db.exec(createNotes);
+		await b.db.exec(createNotes);
+		a.plugin.offline.enter();
+		const transactionId = await insertNote(a.db, 1, 'contested');
+		const reopened = await crashA(store, a);
+
+		isolation.armed = true;
+		const a2 = openA(transactorA, reopened, { gate });
+		await a2.plugin.hydrate(a2.db);
+		expect(a2.plugin.offline.status(transactionId)).to.include({ kind: 'queued', waitingFor: 'restore' });
+
+		// The table can be read again; the pass that puts the record back is parked on its first read of it.
+		isolation.armed = false;
+		parking.park();
+		const pass = a2.plugin.offline.restore();
+		await parking.parked;
+		expect(() => a2.plugin.offline.discard(transactionId)).to.throw(EntryNotDiscardableError).with.property('because', 'restoring');
+		parking.release();
+		await pass;
+
+		const queued = a2.plugin.offline.status(transactionId) as QueuedStatus;
+		expect(queued).to.include({ kind: 'queued', inDoubt: false });
+		expect(queued.waitingFor, 'back in the queue').to.not.equal('restore');
+		gate.open = true;
+		await a2.plugin.offline.whenDrained();
+		expect(await notesOf(b.db)).to.deep.equal([{ id: 1, body: 'contested' }]);
 	});
 
 	it('a table whose blocks cannot be read at restore: the record is deferred, a read of the table fails even in offline mode, and the first read that reaches the cohort puts the entry back and drains it', async () => {
