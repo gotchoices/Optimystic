@@ -1,8 +1,8 @@
-import type { IBlock, BlockId, Action, ActionId, WriteDurability } from "../index.js";
+import type { IBlock, BlockId, Action, ActionId, Transforms, WriteDurability } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
-import type { InFlightAttempt } from "./collection.js";
+import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
 
 export type CollectionId = BlockId;
 
@@ -81,6 +81,35 @@ function sealedSegmentsMessage(collectionId: CollectionId, sealedEntries: EntryI
 			return `collection ${collectionId}: a head commit of entry ${entryId} is in flight on this instance`;
 	}
 }
+
+/** Exactly what one write attempt sent to the transactor — enough to send the same thing again.
+ * Retained by `Collection.retainInFlightAttempt` so that a refresh which then finds this attempt's
+ * own log entry can land the blocks the attempt left behind, at the same action id and revision
+ * (see `Collection.completeOwnEntry`).
+ *
+ * Also the shape a caller RECORDS before an attempt is sent and hands back on a later cycle
+ * ({@link HeadCommitOptions.recordAttempt} and {@link HeadCommitOptions.resume};
+ * docs/offline-sync.md §Identity across attempts), so it must stay plain data — ids, numbers and the
+ * transforms as the wire carries them, nothing with object identity and no functions: the
+ * offline-sync journal serialises it as JSON. */
+export type InFlightAttempt = {
+	/** The action id the attempt was sent under — the one every attempt of the write reuses, and
+	 * the one a cycle that resumes from this record must run under. */
+	actionId: ActionId;
+	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
+	rev: number;
+	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
+	 * it will not mutate; the collection keeps it as given. */
+	transforms: Transforms;
+	/** The attempt's log tail block, committed first. */
+	tailId: BlockId;
+	/** The per-block content declarations the attempt's commit carried, if any. */
+	blockDigests?: BlockContentDigests;
+	/** The per-block bases the attempt's pend carried, if any (see `PendRequest.baseRevs`). Kept
+	 * with the transforms because they describe them: a re-send of these operations must name the
+	 * same bases they were computed against. */
+	baseRevs?: BlockBaseRevs;
+};
 
 /** What `Collection.commitHead` commits the head segment under, beside the retry bounds of
  * {@link SyncOptions}. Both fields are the queue's (docs/offline-sync.md §Identity across

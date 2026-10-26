@@ -1,4 +1,4 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, ActionLineage, BlockContentDigests, GetBlockResult, CommitResult } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, ActionLineage, GetBlockResult, CommitResult } from "../index.js";
 import { Log } from "../log/log.js";
 import type { LogBlock } from "../log/log.js";
 import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
@@ -6,13 +6,13 @@ import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
-import type { BlockBaseRevs, BlockGets } from "../network/struct.js";
+import type { BlockGets } from "../network/struct.js";
 import { copyTransforms, emptyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
-import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, SyncOptions, TornActionReason } from "./index.js";
+import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, InFlightAttempt, SyncOptions, TornActionReason } from "./index.js";
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
 import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
@@ -51,34 +51,6 @@ type DivergenceSite = 'refresh' | 'attach';
  * there — what {@link Collection.earliestFork} reports and `collection:lineage-divergence` prints
  * as `forkRev=` / `heldAction=` / `readAction=`. */
 type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
-
-/** Exactly what one failed write attempt sent to the transactor — enough to send the same thing
- * again. Retained by {@link Collection.retainInFlightAttempt} so that a refresh which then finds
- * this attempt's own log entry can land the blocks the attempt left behind, at the same action id
- * and revision (see {@link Collection.completeOwnEntry}).
- *
- * Also the shape a caller RECORDS before an attempt is sent and hands back on a later cycle
- * (`HeadCommitOptions.recordAttempt` and `resume`; docs/offline-sync.md §Identity across attempts),
- * so it must stay plain data — ids, numbers and the transforms as the wire carries them, nothing
- * with object identity and no functions: the offline-sync journal serialises it as JSON. */
-export type InFlightAttempt = {
-	/** The action id the attempt was sent under — the one every attempt of the write reuses, and
-	 * the one a cycle that resumes from this record must run under. */
-	actionId: ActionId;
-	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
-	rev: number;
-	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
-	 * it will not mutate; the collection keeps it as given. */
-	transforms: Transforms;
-	/** The attempt's log tail block, committed first. */
-	tailId: BlockId;
-	/** The per-block content declarations the attempt's commit carried, if any. */
-	blockDigests?: BlockContentDigests;
-	/** The per-block bases the attempt's pend carried, if any (see `PendRequest.baseRevs`). Kept
-	 * with the transforms because they describe them: a re-send of these operations must name the
-	 * same bases they were computed against. */
-	baseRevs?: BlockBaseRevs;
-};
 
 /** What one refresh ({@link Collection.refreshInFlight}, and the refresh inside a sync) found out
  * about the write in flight on the instance's behalf. The caller hands in an empty report and the
@@ -2367,7 +2339,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			},
 			retake: async () => {
 				assertUsable('retake', false);
-				release = await Latches.acquire(this.latchId);
+				const retaken = await Latches.acquire(this.latchId);
+				if (closed) {
+					// close() ran while the latch was being acquired: it has already cleared the marks
+					// latch-free, so keeping this latch would leak it for the life of the instance.
+					retaken();
+					throw new Error(`Collection ${this.id}: head commit of ${entryId} was closed while retake() was waiting; `
+						+ `a driver closes its handle only after retaking`);
+				}
+				release = retaken;
 				held = true;
 				this.headInFlight = undefined;
 			},

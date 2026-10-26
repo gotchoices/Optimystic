@@ -499,7 +499,9 @@ the point of the mode.
 So the head commit (`Collection.commitHead`) runs its attempts on a **head tracker** — the head
 segment's actions alone, staged over the committed state, built once per revision the attempt
 requests and reused across retries — and releases the live latch for exactly the one `await` on the
-network, the pend-and-commit round trip. Everything else runs under the latch: the refresh that
+network, the pend-and-commit round trip (the `release` and `retake` steps of `HeadCommitHandle` in
+`packages/db-core/src/collection/head-commit.ts`, which every driver brackets the round trip with).
+Everything else runs under the latch: the refresh that
 opens the cycle, building the head tracker and the attempt, the refresh and backoff between
 attempts, and applying the outcome (remove the head segment, fold the attempt's transforms into the
 cache, adopt the revision, replay what remains). This makes live the case the `NOTE` after a
@@ -574,7 +576,7 @@ rule across drain attempts and restarts:
 > only under the action id and revision of the attempt that may have landed.**
 
 The queue records the attempt's identity — action id, revision, and the retained attempt itself,
-one `InFlightAttempt` in `packages/db-core/src/collection/collection.ts` — **before** sending it (in
+one `InFlightAttempt` in `packages/db-core/src/collection/struct.ts` — **before** sending it (in
 the journal, when persistence is on), and clears it only once the outcome is known. The head commit
 hands it the attempt at exactly that point: `HeadCommitOptions.recordAttempt` in
 `packages/db-core/src/collection/struct.ts` is called with each attempt after it is built and before

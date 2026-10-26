@@ -13,8 +13,8 @@ import { TransactionExpiredError } from "../network/transaction-expired-error.js
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
 import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
-import type { CollectionId, SyncOptions } from "./struct.js";
-import type { InFlightAttempt, RefreshReport } from "./collection.js";
+import type { CollectionId, InFlightAttempt, SyncOptions } from "./struct.js";
+import type { RefreshReport } from "./collection.js";
 import { clampPriority, SlotHoldAfterLosses } from "../transaction/transaction.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 import type { JitteredBackoffConfig, RandFn } from "../utility/backoff.js";
@@ -169,8 +169,11 @@ export async function stageAttempt<TAction>(
  * the write-ahead hook (`HeadCommitOptions.recordAttempt`): a refused commit is not proof nothing
  * landed, and if the refresh that follows finds the attempt's own log entry these are the
  * transforms that finish the action. The attempt's tracker is abandoned once this is taken, so its
- * transforms are handed over as they are, uncopied; nothing downstream mutates them (a fold clones
- * the inserts and applies the updates to the cache's own blocks). */
+ * transforms are handed over as they are, uncopied.
+ * NOTE: the same object reaches the write-ahead hook and is retained for the re-send; nothing in
+ * the tree mutates it (a fold clones the inserts and applies the updates to the cache's own blocks),
+ * but a hook that mutated its argument would corrupt the re-send. If a hook ever needs to, copy
+ * here (`copyTransforms`) rather than at the hook. */
 export function retainedAttempt(staged: StagedAttempt, actionId: ActionId): InFlightAttempt {
 	return {
 		actionId,
