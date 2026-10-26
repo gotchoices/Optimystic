@@ -410,7 +410,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: async () => {} };
 			const invented = { ...base, describe: () => 'double/invented', committedRevision: () => undefined };
 			const numbered = { ...base, describe: () => 'double/numbered', committedRevision: () => 7 };
 			const unaskable = { ...base, describe: () => 'double/unaskable' };
@@ -448,7 +448,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: async () => {} };
 			// Revision present, no action recorded at it: the shape a real Collection produces
 			// when the log gave its current revision slot to a checkpoint or invalidation entry.
 			const aged = {
@@ -496,7 +496,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
-			const base = { sync: async () => undefined, snapshot: () => ({}), restore: () => {} };
+			const base = { sync: async () => undefined, snapshot: () => ({}), restore: async () => {} };
 			// A realistic session-mode action id (colon-bearing) under a colon-bearing id.
 			const stamped = {
 				...base, describe: () => 'tree://double/stamped',
@@ -543,7 +543,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 			const bridge = plugin.txnBridge;
 
 			await bridge.beginTransaction(defaultOptions);
-			bridge.markDirty({ sync: async () => undefined, snapshot: () => ({}), restore: () => {}, describe: () => 'double/tagged' });
+			bridge.markDirty({ sync: async () => undefined, snapshot: () => ({}), restore: async () => {}, describe: () => 'double/tagged' });
 
 			const lines = await captureTrace(async () => {
 				await bridge.commitTransaction();
@@ -662,20 +662,22 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 	});
 
 	describe('savepoint operations', () => {
-		it('depth-keyed savepoint methods are idempotent no-throws on a bare bridge', () => {
+		it('depth-keyed savepoint methods are idempotent no-throws on a bare bridge', async () => {
 			const { plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
 
 			// With no collections registered and no active session, the depth-keyed
 			// savepoint operations reduce to no-ops. They must be safe (and
 			// idempotent — the shared bridge is broadcast to once per connection).
+			// The rollback is async (a restore can replay), so it is awaited: a rejection
+			// fails the test the way a throw would.
 			expect(() => bridge.createSavepoint(0)).to.not.throw();
 			expect(() => bridge.createSavepoint(0)).to.not.throw();
-			expect(() => bridge.rollbackToSavepoint(0)).to.not.throw();
-			expect(() => bridge.rollbackToSavepoint(0)).to.not.throw();
+			await bridge.rollbackToSavepoint(0);
+			await bridge.rollbackToSavepoint(0);
 			expect(() => bridge.releaseSavepoint(0)).to.not.throw();
 			// Rolling back / releasing an absent depth is a clean no-op.
-			expect(() => bridge.rollbackToSavepoint(5)).to.not.throw();
+			await bridge.rollbackToSavepoint(5);
 			expect(() => bridge.releaseSavepoint(5)).to.not.throw();
 		});
 
@@ -738,7 +740,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				expect(queuedValues(a), 'staged before rollback').to.deep.equal(['a1']);
 				expect(queuedValues(b), 'staged before rollback').to.deep.equal(['b1']);
 
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				expect(queuedValues(a), 'eagerly-captured collection is emptied').to.deep.equal([]);
 				expect(queuedValues(b), 'late-registered collection is emptied too').to.deep.equal([]);
@@ -759,11 +761,11 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				bridge.registerCollection(b);
 
 				await stageInto(b, 'first');
-				bridge.rollbackToSavepoint(2);
+				await bridge.rollbackToSavepoint(2);
 				expect(queuedValues(b), 'depth 2 discards the first stage').to.deep.equal([]);
 
 				await stageInto(b, 'second');
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 				expect(queuedValues(b), 'depth 1 discards the second stage too').to.deep.equal([]);
 			});
 
@@ -781,7 +783,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				// after it has staged this statement's rows.
 				bridge.registerCollection(a);
 
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				expect(queuedValues(a), 'the staged row is still discarded').to.deep.equal([]);
 			});
@@ -803,7 +805,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				bridge.registerCollection(replacement);
 				await stageInto(replacement, 'on-replacement');
 
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				// Both instances are tracked (by object identity, not id) and rewound to
 				// their own capture — the replacement must not be silently skipped just
@@ -827,7 +829,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				bridge.registerCollection(b);
 
 				await stageInto(b, 'b1');
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				expect(queuedValues(b), 'the DML staged after the capture is discarded').to.deep.equal([]);
 				expect(b.hasUnsyncedChanges(), 'the structural baseline survives the rollback').to.be.true;
@@ -846,7 +848,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				// Release absorbs the staged work into the enclosing scope; it must never
 				// restore, and a subsequent rollback of the released depth is a no-op.
 				bridge.releaseSavepoint(1);
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				expect(queuedValues(b), 'released work stays staged for commit').to.deep.equal(['b1']);
 			});
@@ -866,7 +868,7 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 				await stageInto(b, 'b1');
 				bridge.createSavepoint(1);
 
-				bridge.rollbackToSavepoint(1);
+				await bridge.rollbackToSavepoint(1);
 
 				expect(queuedValues(b), 'the row staged before the re-broadcast is still discarded').to.deep.equal([]);
 			});

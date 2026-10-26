@@ -37,7 +37,13 @@ export interface DirtyTree {
    */
   sync(): Promise<WriteDurability | undefined>;
   snapshot(): unknown;
-  restore(snapshot: unknown): void;
+  /**
+   * Restore the staged state `snapshot` captured. Resolves once the restore is complete: a
+   * restore across a change to the collection's sealed segments (an offline-sync entry drained
+   * or refused while the transaction was open) replays them, which runs the action handlers
+   * (`Collection.restorePending`).
+   */
+  restore(snapshot: unknown): Promise<void>;
   /**
    * Optional refresh-without-flush (a Tree forwards to `Collection.update()`): adopt the
    * newest committed revision and replay this tree's staged actions against it. Only the
@@ -1219,7 +1225,7 @@ export class TransactionBridge {
       return await coordinator.commit(await this.legacyTransaction());
     } catch (error) {
       if (error instanceof CoordinatorPartialCommitError) {
-        this.restoreUncommittedTrees(new Set(error.committedCollections));
+        await this.restoreUncommittedTrees(new Set(error.committedCollections));
       }
       throw error;
     }
@@ -1245,11 +1251,11 @@ export class TransactionBridge {
    * trees are left alone — the coordinator already folded them, and their memory matches
    * storage too. Restoring a clean tree is a no-op, as in the fallback sweep.
    */
-  private restoreUncommittedTrees(committed: ReadonlySet<CollectionId>): void {
+  private async restoreUncommittedTrees(committed: ReadonlySet<CollectionId>): Promise<void> {
     for (const [tree, snapshot] of this.dirtyTrees) {
       const id = tree.getCollection?.()?.id;
       if (id === undefined || !committed.has(id)) {
-        tree.restore(snapshot);
+        await tree.restore(snapshot);
       }
     }
   }
@@ -1338,7 +1344,7 @@ export class TransactionBridge {
         // classify a partially-committed failing tree as persisted here.
         const unsynced = trees.filter(t => !synced.includes(t));
         for (const t of unsynced) {
-          t.restore(this.dirtyTrees.get(t));
+          await t.restore(this.dirtyTrees.get(t));
         }
 
         const label = (t: DirtyTree) => treeLabel(t, trees.indexOf(t));
@@ -1400,7 +1406,7 @@ export class TransactionBridge {
     //     never-synced collection's header/root intact so it stays readable.
     if (!this.session) {
       for (const [tree, snapshot] of this.dirtyTrees) {
-        tree.restore(snapshot);
+        await tree.restore(snapshot);
       }
     }
     this.dirtyTrees.clear();
@@ -1616,14 +1622,22 @@ export class TransactionBridge {
    * Idempotent / no-op when `depth` is absent (session mode, or already released).
    * `restorePending` is itself idempotent, so the repeated per-connection
    * broadcast restores to the same state each time.
+   *
+   * Awaited per collection: a restore across a change to the collection's sealed segments
+   * (an offline-sync entry drained or refused while the transaction was open) replays them
+   * (`Collection.restorePending`). Quereus awaits each connection's hook in turn
+   * (`_rollbackToSavepointBroadcast` in `@quereus/quereus/src/core/database.ts`) before the
+   * statement continues, so no two restores of one collection overlap and nothing is staged
+   * into it while one runs — the latch-free contract `restorePending` relies on. While no
+   * segment is sealed the restore is the verbatim arm, as it was when this was synchronous.
    */
-  rollbackToSavepoint(depth: number): void {
+  async rollbackToSavepoint(depth: number): Promise<void> {
     const snapshots = this.savepoints.get(depth);
     if (!snapshots) {
       return;
     }
     for (const [collection, snapshot] of snapshots) {
-      collection.restorePending(snapshot as Parameters<Collection<any>['restorePending']>[0]);
+      await collection.restorePending(snapshot as Parameters<Collection<any>['restorePending']>[0]);
     }
     for (const openDepth of this.savepoints.keys()) {
       if (openDepth > depth) {

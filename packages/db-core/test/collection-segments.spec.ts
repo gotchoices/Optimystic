@@ -278,6 +278,126 @@ describe('Collection sealed segments', function () {
 		});
 	});
 
+	describe('a snapshot covers the open segment only (ticket offline-sync-open-segment-snapshot)', () => {
+		it('restoring across a dropped segment replays what remains: the dropped entry is not put back, the open action is gone, the pins are current, and the snapshot\'s read view still sees the entry', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'one')]]);
+			await sealAs(tree, 'E2', [[5, entry(5, 'seed-updated')]]);	// updates the committed row
+
+			// The bridge's markDirty moment: captured over two sealed segments, with nothing open.
+			const snapshot = collection.snapshotPending();
+			expect(snapshot.pending, 'the open segment only').to.deep.equal([]);
+			expect(snapshot.sealedVersion).to.equal(2);
+			await tree.stage([[2, entry(2, 'open')]]);
+			// The drain commits E1 and removes it while the snapshot is outstanding (dropSealed stands
+			// in for the head commit the next ticket adds; both bump the version).
+			await collection.dropSealed('E1');
+
+			await collection.restorePending(snapshot);
+
+			expect(collection.sealedEntries(), 'the dropped segment is not put back').to.deep.equal(['E2']);
+			expect(await tree.get(1), 'nor its effect').to.be.undefined;
+			expect(await tree.get(2), 'the open action staged after the capture is gone').to.be.undefined;
+			expect(await tree.get(5), 'the remaining segment is re-staged').to.deep.equal(entry(5, 'seed-updated'));
+			expect(collection.snapshotPending().sealedVersion, 'a new snapshot carries the changed version').to.not.equal(snapshot.sealedVersion);
+
+			// The tracker equals a fresh replay of the remaining state: E2 alone over the committed base.
+			const fresh = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			await fresh.stage([[5, entry(5, 'seed-updated')]]);
+			expect(collection.tracker.transforms).to.deep.equal(fresh.getCollection().tracker.transforms);
+
+			// Pins through the replay arm: the re-staged update names the revision the cache holds for
+			// its block (every block is at the seed commit's revision), and nothing reads as moved.
+			const updated = Object.keys(collection.tracker.transforms.updates ?? {});
+			expect(updated, 'E2 updated a committed block').to.not.be.empty;
+			const bases = collection.tracker.stagedBaseRevs(updated);
+			expect(Object.keys(bases)).to.have.members(updated);
+			for (const rev of Object.values(bases)) {
+				expect(rev).to.equal(collection.committedRevision());
+			}
+			expect(collection.tracker.movedBases()).to.deep.equal([]);
+
+			// The snapshot's transforms still hold E1's effect: a committed read view built from it
+			// sees the entry the SQL layer was told had committed, after E1 was dropped live.
+			expect(await tree.readView(snapshot).get(1)).to.deep.equal(entry(1, 'one'));
+		});
+
+		it('restoring while a refused segment was removed keeps the later segment refused rather than retrying it', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			const one = entry(1, 'one');
+			await sealAs(tree, 'E1', [[1, one, { kind: 'absent' }]]);
+			// E2 updates the row E1 inserted, so it holds only while E1 does.
+			await sealAs(tree, 'E2', [[1, entry(1, 'one-updated'), { kind: 'unchanged', expected: one }]]);
+			const savepoint = collection.snapshotPending();
+			await tree.stage([[2, entry(2, 'open')]]);
+			await collection.dropSealed('E1');	// the replay refuses E2: its row is gone
+			expect(refusals.map(r => r.entryId)).to.deep.equal(['E2']);
+
+			await collection.restorePending(savepoint);
+
+			expect(collection.sealedEntries()).to.deep.equal(['E2']);
+			expect(collection.sealedRefusal('E2'), 'still refused, by the same refusal').to.equal(refusals[0]!.error);
+			expect(refusals, 'the restore\'s replay skipped it rather than retrying and re-reporting it').to.have.length(1);
+			expect(await tree.get(1)).to.be.undefined;
+			expect(await tree.get(2), 'the open action is gone').to.be.undefined;
+			expect(await tree.get(5), 'the committed row reads through').to.deep.equal(entry(5, 'seed'));
+		});
+
+		it('restoring an invented collection across a dropped segment replays from its baseline, so it stays readable', async () => {
+			const transactor = new TestTransactor();
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, 'fresh', byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'one')]]);
+			const snapshot = collection.snapshotPending();
+			await tree.stage([[2, entry(2, 'open')]]);
+			await collection.dropSealed('E1');
+
+			await collection.restorePending(snapshot);
+
+			expect(collection.committedRevision(), 'still invented').to.be.undefined;
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(await tree.get(1)).to.be.undefined;
+			expect(await tree.get(2)).to.be.undefined;
+			expect(collection.hasUnsyncedChanges(), 'the invented header is still staged').to.be.true;
+			await tree.stage([[3, entry(3, 'three')]]);
+			expect(await tree.get(3), 'the tree is readable and writable').to.deep.equal(entry(3, 'three'));
+		});
+
+		it('a refusal of the restored open segment inside the replay arm propagates, after the sealed segments were re-staged', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[10, entry(10, 'ten')]]);
+			const outer = collection.snapshotPending();
+			await tree.stage([[1, entry(1, 'live'), { kind: 'absent' }]]);
+			const inner = collection.snapshotPending();	// a nested savepoint carrying the guarded open action
+			expect(inner.pending).to.have.length(1);
+			await collection.restorePending(outer);	// verbatim: nothing sealed changed, nothing moved
+			expect(await tree.get(1)).to.be.undefined;
+			await sealAs(tree, 'E2', [[20, entry(20, 'twenty')]]);	// the sealed list changes
+			await rivalWrites(transactor, 1, 'rival');	// and a rival takes the open action's key
+			await tree.update();	// adopted cleanly: nothing is open, and both segments hold
+
+			const err = await capture(() => collection.restorePending(inner));
+
+			expect(err, 'the live transaction\'s own refusal').to.be.instanceOf(TreeKeyTakenError);
+			expect(refusals, 'the callback is for sealed segments only').to.be.empty;
+			expect(collection.sealedEntries()).to.deep.equal(['E1', 'E2']);
+			expect(await tree.get(10), 'the sealed segments were re-staged before the refusal').to.deep.equal(entry(10, 'ten'));
+			expect(await tree.get(20)).to.deep.equal(entry(20, 'twenty'));
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'rival'));
+		});
+	});
+
 	describe('whole-collection commits over sealed segments', () => {
 		it('sync refuses with SealedSegmentsError, leaves everything staged, and the coordinator restores every participant', async () => {
 			const transactor = new TestTransactor();

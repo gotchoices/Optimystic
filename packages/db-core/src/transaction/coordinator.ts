@@ -902,7 +902,7 @@ export class TransactionCoordinator {
 			// to its pre-append snapshot — a genuinely clean rollback that leaves each
 			// tracker pristine for retry (see txn-failed-commit-leaves-staged-log-entry).
 			for (const { collectionId, collection } of collectionData) {
-				collection.restorePending(preCommitSnapshots.get(collectionId)!);
+				await collection.restorePending(preCommitSnapshots.get(collectionId)!);
 			}
 			throw err;
 		}
@@ -932,26 +932,32 @@ export class TransactionCoordinator {
 				// while another failed permanently. A uniform pre-append restore would
 				// corrupt the committed half — re-staging its already-durable actions as
 				// still-pending, so tracker memory would disagree with cluster storage.
-				// Split the local handling instead:
+				// Split the local handling instead, in two passes: the committed half is folded
+				// first, in one await-free pass (so a committed read observes every committed
+				// participant pre-fold or post-fold, as the success fold below promises), and the
+				// failed half is restored after it — a restore can replay, so it is awaited, which
+				// admits no interleaved stage because every participant's latch is held across
+				// this span.
 				for (const { collectionId, collection } of collectionData) {
-					if (committed.has(collectionId)) {
-						// Committed → the success-path local treatment (see below): fold the
-						// committed transforms into the read cache BEFORE resetting the tracker,
-						// then drop the now-durable pending actions so a retry cannot re-log them.
-						// NOTE: no-double-apply on retry depends on clearPendingActions() running for
-						// EVERY committed collection here before any re-drive of commit(). If a committed
-						// collection kept its pending queue, a subsequent commit() would re-append and
-						// re-log its already-durable actions — a duplicate log entry on the winner. The
-						// no-double-apply-on-retry test in transaction.spec.ts locks this.
-						const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
-						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
-						collection.tracker.reset();
-						collection.clearPendingActions();
-					} else {
-						// Failed / never-committed → restore the pre-append snapshot so a retry
-						// re-appends cleanly (no duplicate log entry).
-						collection.restorePending(preCommitSnapshots.get(collectionId)!);
-					}
+					if (!committed.has(collectionId)) continue;
+					// Committed → the success-path local treatment (see below): fold the
+					// committed transforms into the read cache BEFORE resetting the tracker,
+					// then drop the now-durable pending actions so a retry cannot re-log them.
+					// NOTE: no-double-apply on retry depends on clearPendingActions() running for
+					// EVERY committed collection here before any re-drive of commit(). If a committed
+					// collection kept its pending queue, a subsequent commit() would re-append and
+					// re-log its already-durable actions — a duplicate log entry on the winner. The
+					// no-double-apply-on-retry test in transaction.spec.ts locks this.
+					const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
+					collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
+					collection.tracker.reset();
+					collection.clearPendingActions();
+				}
+				for (const { collectionId, collection } of collectionData) {
+					if (committed.has(collectionId)) continue;
+					// Failed / never-committed → restore the pre-append snapshot so a retry
+					// re-appends cleanly (no duplicate log entry).
+					await collection.restorePending(preCommitSnapshots.get(collectionId)!);
 				}
 				const failed = [...(coordResult.failedCollections ?? new Set<CollectionId>())];
 				if (coordResult.staleLoss) {
@@ -992,7 +998,7 @@ export class TransactionCoordinator {
 			// EMPTY committed set: PEND failed, or the whole commit failed cleanly with
 			// nothing durable. Restore every tracker so each is pristine for retry.
 			for (const { collectionId, collection } of collectionData) {
-				collection.restorePending(preCommitSnapshots.get(collectionId)!);
+				await collection.restorePending(preCommitSnapshots.get(collectionId)!);
 			}
 			// Distinguish a genuine optimistic-concurrency conflict (a stale loss / pending
 			// contention — retryable after a re-read) from a hard failure (unavailable transactor,
@@ -1092,8 +1098,11 @@ export class TransactionCoordinator {
 		// Accepted: the tracker half already discards their transforms, and symmetric is the safer
 		// state — leaving such an action queued while its transforms are gone is exactly the
 		// phantom that a conflicting sync's replayActions would resurrect as live data.
+		// Awaited: a restore across a change to the collection's sealed segments replays them
+		// (Collection.restorePending), and the single-call-path assumption above is what keeps a
+		// stage from landing on the collection while that replay runs.
 		for (const [collection, snapshot] of data.preSnapshot) {
-			collection.restorePending(snapshot);
+			await collection.restorePending(snapshot);
 		}
 	}
 
@@ -1373,8 +1382,12 @@ export class TransactionCoordinator {
 				// pending queues aren't left mis-tracking already-durable state; the failed subset
 				// is unwound to its pre-staging snapshot, and the stamp tracking is dropped so no
 				// unsafe all-or-nothing undo handle survives (rollback() would rewind the winner).
-				// Kept await-free for the same reason the success fold is — restorePending is
-				// synchronous and latch-free by contract, so it is safe inside this latched span.
+				// Two passes, as in commitOnceLatched: the committed subset's fold is kept
+				// await-free for the same reason the success fold is, and the failed subset's
+				// restore comes after it. That restore is awaited — it can replay the collection's
+				// sealed segments — and the await admits no interleaved stage, because every
+				// participant's latch is held across this span (restorePending stays latch-free by
+				// contract and relies on exactly that).
 				// NOTE: execute() has no retry loop at all, so a returned refusal after a sibling
 				// committed is reported here at once, where commit() would re-drive the refused
 				// collection forward (the partial-retry branch of commitOnceLatched). No production
@@ -1387,23 +1400,24 @@ export class TransactionCoordinator {
 				if (committed.size > 0) {
 					for (const collectionId of batches.keys()) {
 						const collection = this.collections.get(collectionId);
-						if (!collection) continue;
-						if (committed.has(collectionId)) {
-							const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
-							collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
-							collection.tracker.reset();
-							collection.clearPendingActions();
-						} else {
-							// NOTE: blind overwrite of this collection's staged state — anything
-							// staged on it between the pre-stage snapshot above and here is discarded.
-							// No sibling stamp can be that writer (at most one stamp is open), so the
-							// only source is the untracked Tree.stage / Collection.act path, and this
-							// is the same single-call-path assumption rollback() documents. It cannot
-							// be softened by re-applying those actions here: collection.act takes the
-							// same non-reentrant instance latch this span already holds.
-							const snapshot = preStageSnapshots.get(collectionId);
-							if (snapshot) collection.restorePending(snapshot);
-						}
+						if (!collection || !committed.has(collectionId)) continue;
+						const rev = collection.recordCommitted(transaction.id, pendedRevs.get(collectionId)!);
+						collection.applyCommittedToCache(collectionTransforms.get(collectionId)!, rev);
+						collection.tracker.reset();
+						collection.clearPendingActions();
+					}
+					for (const collectionId of batches.keys()) {
+						const collection = this.collections.get(collectionId);
+						if (!collection || committed.has(collectionId)) continue;
+						// NOTE: blind overwrite of this collection's staged state — anything
+						// staged on it between the pre-stage snapshot above and here is discarded.
+						// No sibling stamp can be that writer (at most one stamp is open), so the
+						// only source is the untracked Tree.stage / Collection.act path, and this
+						// is the same single-call-path assumption rollback() documents. It cannot
+						// be softened by re-applying those actions here: collection.act takes the
+						// same non-reentrant instance latch this span already holds.
+						const snapshot = preStageSnapshots.get(collectionId);
+						if (snapshot) await collection.restorePending(snapshot);
 					}
 					// The undo handle is now unsafe: rollback() is all-or-nothing and would rewind
 					// the collections that DID durably commit. Drop it, matching commitOnceLatched.

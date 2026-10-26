@@ -209,13 +209,15 @@ export interface CollectionSnapshot<TAction> {
 	pins?: BasePins;
 	/** The OPEN segment's actions at snapshot time (see {@link SegmentList}). Sealed segments are
 	 * not captured as actions — their effects are in `transforms`, which is what a committed read
-	 * view built from this snapshot must include.
-	 *
-	 * NOTE: a restore across a change to the sealed list — a segment sealed, dropped or refused
-	 * while the snapshot was outstanding — still reinstates `transforms` verbatim, which would put
-	 * a dropped segment's effects back. No caller seals yet; the version-aware restore is ticket
-	 * `offline-sync-open-segment-snapshot`. */
+	 * view built from this snapshot must include — and a restore never puts one back: whether it
+	 * reinstates `transforms` verbatim or rebuilds the tracker from the sealed segments as they are
+	 * then is decided by {@link sealedVersion} (see {@link Collection.restorePending}). */
 	pending: Action<TAction>[];
+	/** {@link SegmentList.version} at capture: a restore that finds the sealed list changed since —
+	 * a segment sealed, dropped or refused while the snapshot was outstanding — replays rather than
+	 * reinstating `transforms`, which would put a dropped segment's effects back. Absent on a
+	 * snapshot built by hand, which reads as "unchanged". */
+	sealedVersion?: number;
 	/** The committed boundary (action context) the staged state sat on when captured.
 	 *  `undefined` for a collection with no committed revision yet (an invented
 	 *  collection whose header/root still live in the tracker). A read view built
@@ -1550,6 +1552,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			transforms: copyTransforms(this.tracker.transforms),
 			pins: this.tracker.pins.copy(),
 			pending: [...this.segments.open],
+			sealedVersion: this.segments.version,
 			context: structuredClone(this.source.actionContext),
 		};
 	}
@@ -1558,32 +1561,72 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * mutations staged since. Reads through the collection then observe exactly the
 	 * snapshot state again; storage is untouched because nothing was ever synced.
 	 *
-	 * A snapshot is only restorable VERBATIM onto the committed boundary it was captured
-	 * on. If this collection has since ADOPTED a newer committed revision — a rival's
-	 * commit folded in by a refresh while the snapshot's transaction was in flight, e.g.
-	 * the conflict replay that refused a guarded insert (TreeKeyTakenError) — the
-	 * snapshot's transforms describe block state at the OLD boundary, and reinstalling
-	 * them would shadow committed blocks with stale structure. The observed case: an
-	 * INVENTED collection's pre-commit header/root transforms restored over the rival's
-	 * now-committed collection make every later read descend an empty tree, silently
-	 * hiding the committed rows. When the snapshot's pending queue is empty (the
-	 * transaction-rollback shape: the capture predates the transaction's first stage),
-	 * the correct restore target IS the committed state — reset the tracker empty and
-	 * let reads flow through to the adopted revision.
+	 * The snapshot describes the OPEN segment only (docs/offline-sync.md §Rollback and savepoints
+	 * only touch the open segment): its `pending` is the open segment's actions, while its
+	 * `transforms` are the whole tracker at capture, the sealed segments' effects included. Which
+	 * arm a restore takes is decided from three facts — whether the sealed list has changed since
+	 * the capture ({@link CollectionSnapshot.sealedVersion} against {@link SegmentList.version}),
+	 * whether the committed boundary has moved (this collection has since ADOPTED a newer
+	 * revision), and whether any segment is sealed now:
 	 *
-	 * NOTE: a snapshot that carries PENDING actions across a moved boundary (a
-	 * mid-transaction savepoint captured before a mid-transaction refresh adopted a
-	 * rival's commit) still restores verbatim below — rebasing it would require an async
-	 * replay this synchronous method cannot run. That shape predates this guard and
-	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
-	 * belongs in an async caller that can replay the pending queue (see replayActions).
+	 * - **Verbatim**, when the sealed list is unchanged and the boundary has not moved: the tracker
+	 *   is reset to a copy of the captured transforms, the captured pins are restored, and the open
+	 *   segment is set to the captured actions. This keeps an INVENTED collection's header, log
+	 *   block and root, which live in the tracker until the first sync and would be lost by a
+	 *   reset. It is the arm every restore took before segments existed, so while nothing is ever
+	 *   sealed nothing behaves differently.
+	 * - **Replay**, when the sealed list has changed — a segment sealed, dropped or refused while
+	 *   the snapshot was outstanding — or when the boundary has moved while a segment is sealed:
+	 *   the open segment is set to the captured actions and the tracker is rebuilt by
+	 *   {@link replayActions}, the sealed segments as they are NOW (refused ones skipped, a newly
+	 *   refused one recorded and reported) and then the restored open actions. Reinstating the
+	 *   captured transforms would put a dropped segment's effects back — the drain removes the
+	 *   head segment after committing it, and the next head commit would commit it a second time
+	 *   — and a reset would drop the sealed segments' effects.
+	 * - A moved boundary with NOTHING sealed keeps the two arms it had before segments. An empty
+	 *   captured open segment (the transaction-rollback shape: the capture predates the
+	 *   transaction's first stage) resets the tracker empty, because the captured transforms
+	 *   describe block state at the OLD boundary and reinstalling them would shadow committed
+	 *   blocks with stale structure — the observed case being an INVENTED collection's pre-commit
+	 *   header/root restored over a rival's now-committed collection, after the conflict replay
+	 *   that refused a guarded insert (TreeKeyTakenError), making every later read descend an
+	 *   empty tree. A non-empty one restores verbatim (the NOTE below).
+	 *
+	 * The staged-base rule (docs/internals.md §Staged Edits Keep Their Base: an update names the
+	 * base it was computed against, and a rollback never pairs operations with the bases of some
+	 * later re-stage) is met differently by the two arms. The verbatim arm restores the captured
+	 * pins beside the captured operations. The replay arm restores none: its reset clears the pin
+	 * store, and every re-staged update pins its base from the read cache as it is now, which IS
+	 * the base the re-staged operations were computed against.
+	 *
+	 * A refusal of the OPEN segment inside the replay arm propagates, as it would out of a
+	 * refresh's replay: the caller rolling back is told that its transaction's own actions no
+	 * longer apply at the boundary the collection is now at. Rare — it needs a sealed change, or a
+	 * sealed segment across a moved boundary, AND a rival between capture and restore — and the
+	 * honest answer; the tracker is then as {@link updateInternal}'s note on a throw out of
+	 * `replayActions` describes.
+	 *
+	 * Latch-free by contract, like {@link snapshotPending}: every caller holds this instance's
+	 * latch or runs on the single call path that excludes a concurrent stage (the coordinator's
+	 * `rollback` and the bridge's savepoint rollback document that assumption).
+	 *
+	 * NOTE: a snapshot that carries PENDING actions across a moved boundary with nothing sealed (a
+	 * mid-transaction savepoint captured before a mid-transaction refresh adopted a rival's commit)
+	 * still restores verbatim. That shape predates the moved-boundary guard and keeps its old
+	 * behaviour; if it is ever observed producing stale reads, route it through the replay arm too.
 	 * The WRITE side of that shape is closed here: the snapshot's base pins are restored with
 	 * its transforms, so the restored operations name the bases they were computed on, and the
 	 * pre-pend re-validation (restageIfBasesMoved) finds those bases moved and re-stages. */
-	restorePending(snapshot: CollectionSnapshot<TAction>): void {
+	async restorePending(snapshot: CollectionSnapshot<TAction>): Promise<void> {
+		const sealedChanged = snapshot.sealedVersion !== undefined && snapshot.sealedVersion !== this.segments.version;
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
 		const boundaryMoved = currentRev !== undefined && (capturedRev === undefined || currentRev > capturedRev);
+		if (sealedChanged || (boundaryMoved && this.segments.hasSealed())) {
+			this.segments.open = [...snapshot.pending];
+			await this.replayActions();
+			return;
+		}
 		if (boundaryMoved && snapshot.pending.length === 0) {
 			this.tracker.reset();
 			this.segments.open = [];

@@ -851,7 +851,7 @@ describe('Collection', () => {
       await collection2.update()
 
       // Roll back collection2's own pending transaction.
-      collection2.restorePending(preTransactionSnapshot)
+      await collection2.restorePending(preTransactionSnapshot)
 
       // With the local pending action gone, a read of the shared block must show collection1's
       // committed value — not stale pre-commit content the conflict replay re-cached.
@@ -880,7 +880,7 @@ describe('Collection', () => {
       await collection2.update() // conflict replay: the append is re-staged on v2-committed
       expect(collection2.tracker.stagedBaseRevs([sharedBlockId as BlockId])).to.not.deep.equal(basesAtStage)
 
-      collection2.restorePending(savepoint)
+      await collection2.restorePending(savepoint)
       expect(collection2.tracker.stagedBaseRevs([sharedBlockId as BlockId]), 'the restored operations name the base they were built on').to.deep.equal(basesAtStage)
       expect(collection2.tracker.movedBases()).to.deep.equal([sharedBlockId])
 

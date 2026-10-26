@@ -323,9 +323,12 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	/** Restore the staged state captured by {@link snapshot}, discarding mutations
 	 * staged since. Counterpart to {@link stage} for transaction rollback —
-	 * preserves a never-synced collection's header/root rather than wiping it. */
-	restore(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): void {
-			this.collection.restorePending(snapshot);
+	 * preserves a never-synced collection's header/root rather than wiping it.
+	 * Resolves once the restore is complete: a restore across a change to the
+	 * collection's sealed segments replays them, which runs the action handlers
+	 * (see {@link Collection.restorePending}). */
+	async restore(snapshot: CollectionSnapshot<TreeReplaceAction<TKey, TEntry>>): Promise<void> {
+			await this.collection.restorePending(snapshot);
 	}
 
 	/** Build a read-only view of this tree as captured by an earlier {@link snapshot}

@@ -460,7 +460,7 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 			// (a) Never-staged: snapshot then restore must not throw and must leave
 			// the (empty) tree readable.
 			const emptySnap = tree.snapshot();
-			tree.restore(emptySnap);
+			await tree.restore(emptySnap);
 			let count = 0;
 			for await (const p of tree.range(new KeyRange<string>(undefined, undefined, true))) {
 				if (tree.isValid(p)) count++;
@@ -473,7 +473,7 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 			await tree.stage([['k1', ['k1', 'v1']]] as never);
 			await tree.sync();
 			const syncedSnap = tree.snapshot();
-			tree.restore(syncedSnap);
+			await tree.restore(syncedSnap);
 			await tree.update();
 			let after = 0;
 			for await (const p of tree.range(new KeyRange<string>(undefined, undefined, true))) {

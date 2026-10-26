@@ -373,7 +373,12 @@ actions and transforms, and a restore rebuilds the tracker from the sealed segme
 **now** plus the restored open segment. When nothing sealed has changed since the capture, the
 restore reinstates the captured transforms verbatim, as it does today (which keeps an invented
 collection's header, a case `restorePending` already documents). When something has, the restore
-replays: sealed segments in order, then the open segment's restored actions.
+replays: sealed segments in order, then the open segment's restored actions. A restore across a
+moved committed boundary replays too while any segment is sealed: the empty reset that case took
+before segments would drop the sealed segments' effects, and a verbatim restore would reinstate them
+at the old boundary. A refusal of the open segment in that replay propagates out of the restore, as
+it would out of a refresh's replay, so the restore is asynchronous and every caller awaits it (the
+arm table is in [internals.md §Staged actions are segments](internals.md#staged-actions-are-segments)).
 
 The committed read view (`Tree.readView`) keeps working unchanged: the view is a point-in-time
 tracker seeded with the transforms captured at `markDirty`, which include the sealed segments, so a

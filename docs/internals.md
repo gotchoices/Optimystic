@@ -167,7 +167,7 @@ segment; `Collection.sealPending` closes it into a sealed segment owned by an en
 log block and root are not an action and are never sealed); `Collection.sealedEntries`,
 `Collection.sealedRefusal` and `Collection.dropSealed` list, inspect and remove them. While nothing
 is sealed every path behaves exactly as it did with one list, because the open segment IS that
-list. Four rules follow from the split:
+list. Five rules follow from the split:
 
 - **A replay starts from the invented baseline, not from empty, while the collection holds no
   committed revision.** `Collection.inventedBaseline` is the tracker's transforms right after
@@ -217,8 +217,41 @@ list. Four rules follow from the split:
   the open segment only; `filterAgainstEntry` (the `filterConflict` hook) and `consumeOwnEntry`
   apply to the open segment only, a sealed segment's action list being the entry's own and never
   rewritten. A sealed segment is committed on its own by the head commit (ticket
-  `offline-sync-collection-segments`), and the version counter on `SegmentList` is what the
-  version-aware snapshot restore (ticket `offline-sync-open-segment-snapshot`) branches on.
+  `offline-sync-collection-segments`); the version counter on `SegmentList` is what the snapshot
+  restore (next rule) branches on.
+- **A snapshot covers the open segment, and its restore is version-aware.** `CollectionSnapshot`
+  (`Collection.snapshotPending`) captures the WHOLE tracker's transforms — the sealed segments'
+  effects included, which is what `Tree.readView` builds a committed read view from, so a
+  `committed.<Table>` read inside a transaction sees every queued entry the SQL layer was told had
+  committed — but as actions only the OPEN segment's, and it records `SegmentList.version` as
+  `sealedVersion`. `Collection.restorePending` is async, because one of its arms replays, and it
+  chooses from three facts: whether the sealed list has changed since the capture, whether the
+  committed boundary has moved, and whether any segment is sealed now. Nothing changed and nothing
+  moved: the tracker is reset to the captured transforms, the captured pins are restored and the
+  open segment is set to the captured actions — the **verbatim** arm, the restore as it always was,
+  which keeps an invented collection's header. The sealed list changed (a segment sealed, dropped
+  or refused while the snapshot was outstanding), or the boundary moved while a segment is sealed:
+  the open segment is set to the captured actions and the tracker is rebuilt by
+  `Collection.replayActions` — the sealed segments as they are NOW, refused ones skipped, a newly
+  refused one recorded and reported, then the restored open actions — the **replay** arm, because
+  a verbatim restore would put a drained segment's effects back (the next head commit would then
+  commit it a second time) and a reset would drop the sealed segments'. The boundary moved with
+  nothing sealed keeps the two arms it had before segments: an empty captured open segment resets
+  the tracker empty, a non-empty one restores verbatim. The pins differ per arm: the verbatim arm
+  restores the captured pins beside the captured operations; the replay arm restores none, since
+  its reset clears the pin store and each re-staged update pins its base from the read cache as it
+  is now, which is the base it was computed against
+  ([Staged Edits Keep Their Base](#staged-edits-keep-their-base)). A refusal of the open segment
+  inside the replay arm propagates out of `restorePending`, as it would out of a refresh's replay:
+  the caller rolling back is told its transaction's own actions no longer apply at the boundary
+  the collection is now at. Every caller awaits the restore — `TransactionCoordinator`'s five
+  sites, `Tree.restore`, and the Quereus bridge's `rollbackToSavepoint` and `rollbackTransaction`;
+  Quereus types the connection hook as `MaybePromise<void>` and awaits it for each connection in
+  turn (`_rollbackToSavepointBroadcast` in `@quereus/quereus/src/core/database.ts`), so a statement
+  does not continue until every restore has finished. The coordinator's two partial-commit arms
+  fold the committed participants first, in one await-free pass, and restore the failed ones after
+  it, so the committed subset keeps the event-loop atomicity the success fold promises.
+  `Collection.unstage` keeps its own verbatim-or-replay split.
 
 `packages/db-core/test/collection-segments.spec.ts` pins each of these.
 
@@ -477,10 +510,12 @@ One consequence for rollback: the refusal happens *after* the loser's refresh ad
 the rival's committed revision, so the pre-transaction snapshot its rollback restores
 was captured on an older committed boundary. `Collection.restorePending`
 (`packages/db-core/src/collection/collection.ts`) detects the moved boundary and, for
-a snapshot with an empty pending queue, resets the tracker empty instead of
+a snapshot with an empty pending queue and nothing sealed, resets the tracker empty instead of
 reinstalling the snapshot's transforms — restoring them verbatim would shadow the
 now-committed blocks with stale structure (an invented collection's pre-commit
-header/root making the whole tree read empty being the observed case).
+header/root making the whole tree read empty being the observed case). With a sealed
+segment in place it replays instead, which a reset would have dropped (see
+[Staged actions are segments](#staged-actions-are-segments)).
 
 #### Committed reads are pinned, not shared-cache
 
@@ -1388,8 +1423,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   travel with the operations wherever the operations travel: an atomic's flush into its parent
   (`Tracker.absorb`) hands over the atomic's pins as the bases of the flushed operations rather than
   re-probing a cache that may have moved on, and a staged-state snapshot
-  (`Collection.snapshotPending` / `restorePending`) carries and restores them, so a rollback never
-  pairs operations with the bases of some later re-stage.
+  (`Collection.snapshotPending` / `restorePending`) carries them and restores them on the verbatim
+  arm, so a rollback never pairs operations with the bases of some later re-stage. The replay arm
+  restores none: it re-stages the operations, and each re-staged update pins the base it was just
+  computed against (see [Staged actions are segments](#staged-actions-are-segments)).
 - **A pending action is never pended over a moved base; it is re-staged first.**
   `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
   every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`
