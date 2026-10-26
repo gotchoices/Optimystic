@@ -1820,7 +1820,9 @@ under a natural one; an update of a row an earlier queued entry inserted under a
 with that entry in `dependsOn`; an update of a row committed before going offline, exposed with its
 key; an insert under a fresh key into a table with natural UNIQUE columns, exposed on each decoded
 value; `CommitOutlook()` inside an open transaction and outside one; and an assured update failing
-through the discard of the entry it depends on, neither re-judged on the way nor counted. On a
+through the discard of the entry it depends on, neither re-judged on the way nor counted, and one
+whose failure the queue attributes to a nearer failed entry it never depended on, not counted
+either because the entry it did depend on failed. On a
 two-node mesh whose first node's gate the test opens: an update of a single-writer table's row an
 earlier entry inserted under a natural key, exposed only through that entry and told
 `outlook-changed` to assured after it commits and before the update is sent; and a false

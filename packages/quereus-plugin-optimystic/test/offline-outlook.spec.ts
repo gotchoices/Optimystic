@@ -228,4 +228,21 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		expect(node.statuses.filter(status => status.kind === 'outlook-changed'), 'a failure is not a change of outlook').to.deep.equal([]);
 		expectAssuredFailures(node.plugin, 0);
 	});
+
+	it('an assured transaction whose failure the queue attributes to a nearer failed one it never depended on is not counted when the one it did depend on failed', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		const insert = await queuedOutlook(node, `begin; insert into Notes (id, body) values ('n5', 'a'); insert into Notes (id, body) values ('n6', 'a'); commit`);
+		const first = await queuedOutlook(node, `update Notes set body = 'b' where id = 'n5'`);
+		const second = await queuedOutlook(node, `update Notes set body = 'b' where id = 'n6'`);
+		expect(second.outlook, 'depends on the insert alone').to.deep.equal(assured([{ transactionId: insert.transactionId, via: 'guard' }]));
+
+		node.plugin.offline.discard(insert.transactionId);
+		await node.plugin.offline.whenDrained();
+
+		const failed = node.statuses.find((status): status is FailedStatus => status.kind === 'failed' && status.transactionId === second.transactionId);
+		expect(failed?.reason).to.equal('concurrent-modification');
+		expect(failed?.causedBy, 'the nearest failing transaction ahead of it').to.equal(first.transactionId);
+		expectAssuredFailures(node.plugin, 0);
+	});
 });

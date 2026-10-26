@@ -33,6 +33,9 @@ export function expectAssuredFailures(plugin: TrackedPlugin, count: number): voi
 	tracked.delete(plugin);
 }
 
+// NOTE: a failing root hook makes mocha skip every remaining test of the run, so one false assured
+// outlook hides whatever else that run would have reported. Fine while the count stays at zero; if
+// this hook ever fires routinely, fail the test itself instead (check inside the specs' own helpers).
 afterEach(function () {
 	const failures = [...tracked].map(plugin => plugin.offline.queueState().assuredFailures);
 	tracked.clear();
