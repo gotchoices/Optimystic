@@ -79,10 +79,10 @@ type VerifyOutcome =
  * This member's promise-round decision on a record: approve, or one of two *different kinds* of no.
  *
  * The distinction is the whole reason the type exists. `invalid` is a refusal the coordinator counts
- * toward the permanent-rejection threshold — it becomes a `reject` vote. `held` is "not right now": the pend's blocks are reserved
- * by a different unresolved action in this member's storage, a condition that disappears the moment
- * that rival commits or cancels, and it becomes a `held` vote counted toward neither approvals nor
- * rejections.
+ * toward the permanent-rejection threshold — it becomes a `reject` vote. `held` is "not right now":
+ * the pend's blocks are reserved by a different unresolved action in this member's storage, a
+ * condition that disappears the moment that rival commits or cancels, and it becomes a `held` vote
+ * counted toward neither approvals nor rejections.
  *
  * A boolean plus prose cannot carry that difference, and collapsing the two was a real defect rather
  * than a tidiness question: on a cohort of three or fewer members `maxAllowedRejections` is zero at
@@ -100,8 +100,9 @@ type VerifyOutcome =
  *
  * `invalid` covers every refusal that is not `held` or `expired` — a stale revision, a membership
  * refusal, a content-digest disagreement, a checker fault — so most `invalid` verdicts are NOT
- * judgements that the transaction itself is wrong, and a stale one can clear on a retry after a re-read. The ones that are carry `validity`, which only the
- * transaction checker sets (see {@link ValidityRejection}); it becomes the vote's signed marker.
+ * judgements that the transaction itself is wrong, and a stale one can clear on a retry after a
+ * re-read. The ones that are carry `validity`, which only the transaction checker sets (see
+ * {@link ValidityRejection}); it becomes the vote's signed marker.
  */
 type PromiseVerdict =
 	| { valid: true }
@@ -213,6 +214,11 @@ const refusalLogTag: Record<Extract<PromiseVerdict, { valid: false }>['kind'], s
  * for one record. A differing marker on a re-delivered reject is therefore a re-signed vote — the same
  * equivocation as a type flip — and it matters as much, since the marker is what decides whether a
  * writer treats the refusal as final. The first-seen vote is kept, as for a type flip.
+ *
+ * NOTE: "an honest member signs once" assumes it remembers its vote. A member that forgot the record
+ * (a restart) and re-judged it later could sign a marked reject the first time and a stale, unmarked
+ * one the second — the same exposure an approve-then-stale-reject re-vote already has. If honest
+ * members are ever seen penalized this way, key the check on what the member could not re-judge.
  */
 function equivocationKey(sig: Signature): string {
 	return sig.type === 'reject' && sig.validity !== undefined
