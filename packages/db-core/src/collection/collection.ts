@@ -1787,6 +1787,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.segments.entryIds();
 	}
 
+	/** The log tail block id the most recent header read named ({@link logTailId}), for a caller that
+	 * resolves this collection's cohorts from routing keys without a read — the offline queue's
+	 * reachability gate (docs/offline-sync.md §When to submit). `undefined` before the first header
+	 * read of an invented collection; possibly stale by one roll-over, which costs that caller nothing
+	 * worse than asking about a block the collection has moved on from. */
+	knownLogTailId(): BlockId | undefined {
+		return this.logTailId;
+	}
+
 	/** The refusal recorded for `entryId`'s segment by a replay that excluded it (see
 	 * {@link replayActions}), or `undefined` when the segment is not refused — or not sealed here. */
 	sealedRefusal(entryId: EntryId): ActionRefusedError | undefined {

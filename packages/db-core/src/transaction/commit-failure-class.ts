@@ -5,6 +5,7 @@ import { TransactionExpiredError } from "../network/transaction-expired-error.js
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError } from "../network/block-size.js";
 import { SyncRetryExhaustedError, TornActionError } from "../collection/struct.js";
+import type { ActionRefusedError } from "../collection/struct.js";
 import { TreeEntryChangedError, TreeGuardRefusedError } from "../collections/tree/struct.js";
 import { CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
 
@@ -87,8 +88,7 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 		// vocabulary; the tree is the only collection type that refuses today. If another type ever
 		// throws an `ActionRefusedError`, widen this arm (and the `error` type on `guard-refused`)
 		// to the base, or its refusal sorts as `unknown` and the drain retries a final failure.
-		const refusal = error instanceof TreeEntryChangedError ? 'concurrent-modification' : 'constraint';
-		return { kind: 'guard-refused', refusal, error };
+		return { kind: 'guard-refused', refusal: refusalReason(error), error };
 	}
 	if (error instanceof ValidityRejectedError) {
 		return { kind: 'rejected', error };
@@ -106,4 +106,16 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 		return { kind: 'partial', error };
 	}
 	return { kind: 'unknown', error };
+}
+
+/**
+ * The failure reason a guard refusal reports to an application: `concurrent-modification` for a lost
+ * update ({@link TreeEntryChangedError}), `constraint` for every other refusal — a uniqueness refusal,
+ * or a refusal by a collection type other than the tree, which has no finer vocabulary. The ONE
+ * mapping {@link classifyCommitFailure}'s `guard-refused` arm and the offline queue share — for the
+ * refusals a collection reports through `onSealedRefused`, which never pass through a commit — so the
+ * two cannot disagree about one error.
+ */
+export function refusalReason(error: ActionRefusedError): 'constraint' | 'concurrent-modification' {
+	return error instanceof TreeEntryChangedError ? 'concurrent-modification' : 'constraint';
 }

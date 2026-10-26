@@ -678,12 +678,16 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 export class RefusesPendsAsShortfall extends DelegatingTransactor {
 	/** Pends refused so far. */
 	pends = 0;
+	/** While `true` every pend is refused; set `false` to let pends through again — the cohort back
+	 *  in reach, for a test of what waits on it. */
+	refusing = true;
 
 	constructor(inner: TestTransactor) {
 		super(inner);
 	}
 
-	override async pend(_request: PendRequest): Promise<PendResult> {
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (!this.refusing) return this.inner.pend(request);
 		this.pends++;
 		return {
 			success: false,
