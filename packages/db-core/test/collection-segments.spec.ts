@@ -26,13 +26,18 @@ import {
 	createTransactionStamp,
 	createTransactionId,
 	ACTIONS_ENGINE_ID,
+	type CommitRequest,
+	type CommitResult,
 	type HeadCommitOptions,
 	type ITransactor,
+	type PendRequest,
+	type PendResult,
 	type Transaction,
 	type TreeReplaceAction,
 } from '../src/index.js';
 import {
 	TestTransactor,
+	DelegatingTransactor,
 	GatedCommitTransactor,
 	GatedPendTransactor,
 	RecordsAttemptsRefusesFirstCommit,
@@ -112,6 +117,30 @@ async function withinMs<T>(ms: number, promise: Promise<T>, what: string): Promi
 		return await Promise.race([promise, timeout]);
 	} finally {
 		clearTimeout(timer);
+	}
+}
+
+/** Lands the first commit durably and then throws, as a connection dropped after the answer left
+ * the coordinator would: the write is saved and the writer not told. Every later call delegates. */
+class CommitLandsThenThrows extends DelegatingTransactor {
+	pends = 0;
+	commits = 0;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		this.pends++;
+		return this.inner.pend(request);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		const result = await this.inner.commit(request);	// durable FIRST
+		if (this.commits++ === 0) {
+			throw new Error('connection reset after the commit landed');
+		}
+		return result;
 	}
 }
 
@@ -708,6 +737,35 @@ describe('Collection sealed segments', function () {
 			expect(await tree.get(2)).to.deep.equal(entry(2, 'two'));
 			expect(await tree.get(3)).to.deep.equal(entry(3, 'open'));
 			expect(await committedKeys(inner)).to.deep.equal([[5]]);
+		});
+
+		it('a re-drive under the same action id after a commit that landed but was never answered: the opening refresh recognises the entry as the write\'s own, consumes the head, sends nothing again, and answers undefined', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new CommitLandsThenThrows(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E1', [[1, entry(1, 'queued')]]);
+			await sealAs(tree, 'E2', [[3, entry(3, 'behind')]]);
+
+			const err = await capture(() => collection.commitHead('E1', headOptions('A1')));
+			expect(err).to.be.instanceOf(Error);
+			expect((err as Error).message).to.include('connection reset');
+			expect(collection.sealedEntries(), 'in doubt: nothing was applied').to.deep.equal(['E1', 'E2']);
+			expect(collection.committedRevision()).to.equal(1);
+			await tree.stage([[2, entry(2, 'open')]]);
+
+			const durability = await collection.commitHead('E1', headOptions('A1'));	// the queue re-supplies the id
+
+			expect(durability, 'saved without re-sending, so who holds it is not known').to.equal(undefined);
+			expect(transactor.pends, 'only the first attempt was sent').to.equal(1);
+			expect(transactor.commits).to.equal(1);
+			expect(collection.sealedEntries(), 'the head was consumed; E2 was not').to.deep.equal(['E2']);
+			expect(collection.committedRevision()).to.equal(2);
+			expect(await committedKeys(inner), 'the head is logged once').to.deep.equal([[5], [1]]);
+			expect(await tree.get(1)).to.deep.equal(entry(1, 'queued'));
+			expect(await tree.get(2), 'the open action is still staged').to.deep.equal(entry(2, 'open'));
+			expect(await tree.get(3), 'E2 is re-staged over the committed head').to.deep.equal(entry(3, 'behind'));
 		});
 	});
 

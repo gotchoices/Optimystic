@@ -827,18 +827,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// finish. `getStatus` is the cheap first question; it judges a block by who holds its
 			// LATEST revision, so a block this action landed and a later action has since built on
 			// reads there as not committed — those are asked again, properly, by settleUnfinished.
-			// Both write paths retain an attempt before any refresh can run, so production only
-			// reaches this branch when the entry sits at a revision the retained attempt was not
-			// made at — a forked lineage.
+			// A write's own cycle retains an attempt before any refresh can run, so from inside a cycle
+			// this branch is reached only when the entry sits at a revision the retained attempt was
+			// not made at — a forked lineage. The ordinary way here is a NEW cycle under an old id:
+			// the queue re-driving an entry whose earlier head commit ended in doubt
+			// ({@link commitHead}, whose opening refresh runs with nothing retained).
 			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
 			if (entry.blockIds.every((_, i) => status?.statuses[i] === 'committed')) {
 				// Whole, and saved: the refresh reports it as finished (see RefreshReport), so the
 				// coordinator counts this participant as committed. Only WHO holds it is unknown.
-				// NOTE: a sync whose only commit was recognised here therefore answers `undefined` —
-				// the "nothing was written" answer — for a write that is saved, because the sync reads
-				// the report's durability, not the finished flag. Reachable only on the forked-lineage
-				// path above; if that path ever becomes ordinary, take the durability from
-				// `getLineage` (as settleUnfinished does) instead of stopping at the status read.
+				// NOTE: a write whose only commit was recognised here therefore answers `undefined` for
+				// a write that is saved, because both write paths read the report's durability, not the
+				// finished flag. For a sync that is the "nothing was written" answer, reachable only on
+				// the forked-lineage path above; for a head commit it is unambiguous (a head segment is
+				// never empty) and is how a re-driven entry is answered. If the queue ever needs a
+				// durability class for a re-driven entry, take it from `getLineage` (as
+				// settleUnfinished does) instead of stopping at the status read.
 				return undefined;
 			}
 			return await this.settleUnfinished(entry, rev, undefined, 'transforms-not-held',
@@ -2393,6 +2397,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await this.stageInto(tracker, ...segment.actions);
 		} catch (err) {
 			if (err instanceof ActionRefusedError) {
+				// NOTE: the live tracker still holds this segment's effects from its last replay, which
+				// judged the same committed state and did not refuse; a reader sees them until the next
+				// replay (the queue's drop of the refused segment). Reachable only if a base re-read
+				// catches up between the two stagings; if that is ever seen, replay here after recording.
 				this.recordSealedRefusal(segment, err);
 			}
 			throw err;
