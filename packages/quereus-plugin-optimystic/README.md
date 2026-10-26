@@ -205,7 +205,7 @@ The cost is one flush per commit, one per submission and one per terminal outcom
 
 `journal` takes any `IKVStore` — `FileKVStore` from `@optimystic/db-p2p-storage-fs`, the IndexedDB, React Native and NativeScript stores, or the instance the node uses as its `kvStore`. Its keys all start with `optimystic-offline/`, which is in db-p2p's `NODE_KV_NAMESPACES`, so a file store sharing a directory with block storage never mistakes them for blocks. A store without `flush` is accepted, since the interface defines that as "every write is already durable". A `MemoryKVStore` is refused: a journal lost with the process is the configuration without one, so leave `journal` off instead. A `journal` given as a function is called once, inside `register`.
 
-The records are keyed under `optimystic-offline/<journalLabel>/`. **Two `Database`s over one store need two labels**: two with the same label list and delete each other's records, which corrupts both queues, and nothing in the store can detect it. The label is letters, digits, `_` and `-`, and is refused without a `journal`.
+The records are keyed under `optimystic-offline/<journalLabel>/`. **Two `Database`s over one store need two labels**: two with the same label list and delete each other's records, which corrupts both queues, and nothing in the store can detect it. The label is lowercase letters, digits, `_` and `-` (lowercase because a filesystem that ignores case would file `One` and `one` together), and is refused without a `journal`.
 
 #### Reading while the other machines cannot be reached
 

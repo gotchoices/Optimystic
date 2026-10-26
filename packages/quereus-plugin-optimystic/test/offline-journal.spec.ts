@@ -249,7 +249,8 @@ describe('Offline mode: the journal over a key-value store', function () {
 		expect(refused({ journal: () => new MemoryKVStore() })).to.match(/MemoryKVStore/);
 		expect(refused({ journal: { get: async () => undefined, set: async () => {}, delete: async () => {} } })).to.match(/missing: list/);
 		expect(refused({ journalLabel: 'main' })).to.match(/refused without offline\.journal/);
-		expect(refused({ journal: new PowerLossKVStore(), journalLabel: 'a/b' })).to.match(/journalLabel must be letters/);
+		expect(refused({ journal: new PowerLossKVStore(), journalLabel: 'a/b' })).to.match(/journalLabel must be lowercase letters/);
+		expect(refused({ journal: new PowerLossKVStore(), journalLabel: 'Main' }), 'a case-insensitive filesystem would merge it with main').to.match(/journalLabel must be lowercase letters/);
 
 		let calls = 0;
 		createMeshDbNode(transactorFor(0), journaled(() => { calls++; return new PowerLossKVStore(); }));

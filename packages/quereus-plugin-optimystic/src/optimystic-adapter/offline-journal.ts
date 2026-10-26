@@ -32,8 +32,9 @@ const log = createLogger('offline-journal');
 export const JOURNAL_RECORD_VERSION = 1;
 
 /** One key segment every `IKVStore` can hold: `FileKVStore` makes each `/`-separated segment a
- * directory or file name, so nothing a filesystem treats specially. The journal label and every
- * transaction id (a `StampId()`, base64url) have this shape. */
+ * directory or file name, so nothing a filesystem treats specially. Every transaction id (a
+ * `StampId()`, base64url) has this shape. Mixed case is safe here even where the filesystem ignores
+ * case: each id carries 128 random bits, so two that differ only in case are as unlikely as two that are equal. */
 export const JOURNAL_KEY_SEGMENT = /^[A-Za-z0-9_-]+$/;
 
 /** One sealed segment as journaled: the db-core segment, plus the table its collection backs, which a

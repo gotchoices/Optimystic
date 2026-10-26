@@ -1,5 +1,4 @@
 import { MemoryKVStore, type IKVStore } from '@optimystic/db-p2p';
-import { JOURNAL_KEY_SEGMENT } from './offline-journal.js';
 
 /**
  * The `offline` block of the plugin's registration config (README § Offline mode), as `register`
@@ -13,7 +12,7 @@ export interface OfflineConfig {
 	journal?: IKVStore | (() => IKVStore);
 	/** The journal's records are keyed under `optimystic-offline/<journalLabel>/`, so two `Database`s
 	 * over one store keep apart by giving each its own label; two with the same label corrupt each
-	 * other's queue. Letters, digits, `_` and `-`. Default `'default'`; refused without `journal`. */
+	 * other's queue. Lowercase letters, digits, `_` and `-`. Default `'default'`; refused without `journal`. */
 	journalLabel?: string;
 	/** Fail a queued transaction that stays unsettled this long, with reason `expired`. Default: no limit. */
 	expireAfterMs?: number;
@@ -33,6 +32,14 @@ export type ParsedOfflineConfig = Omit<OfflineConfig, 'journal'> & { journal?: I
 
 /** The journal label when none is given. */
 export const DEFAULT_JOURNAL_LABEL = 'default';
+
+/** A label is one key segment and a directory name under `FileKVStore`; lowercase only, because a
+ * filesystem that ignores case (Windows, macOS by default) would put `One` and `one` in one directory,
+ * which is the two-`Database`s-one-label corruption by another route. */
+// NOTE: a Windows device name (`con`, `nul`, `aux`, …) passes this and fails every journal write
+// under `FileKVStore` on Windows — loudly, as a failed commit, never as corruption. If an application
+// ever meets it, refuse those names here.
+const JOURNAL_LABEL = /^[a-z0-9_-]+$/;
 
 const offlineKeys: ReadonlySet<string> = new Set(['journal', 'journalLabel', 'expireAfterMs', 'outcomeRetentionMs', 'recheck', 'networkCommitTimeoutMs']);
 const recheckKeys: ReadonlySet<string> = new Set(['baseMs', 'maxMs']);
@@ -91,8 +98,8 @@ function journalStore(declared: unknown): IKVStore {
 function parseJournalLabel(value: unknown, journaled: boolean): string | undefined {
 	if (value === undefined) return undefined;
 	if (!journaled) throw new Error('offline.journalLabel names the journal\'s records, and is refused without offline.journal');
-	if (typeof value !== 'string' || !JOURNAL_KEY_SEGMENT.test(value)) {
-		throw new Error(`offline.journalLabel must be letters, digits, '_' and '-'; got ${typeof value === 'string' ? `'${value}'` : typeof value}`);
+	if (typeof value !== 'string' || !JOURNAL_LABEL.test(value)) {
+		throw new Error(`offline.journalLabel must be lowercase letters, digits, '_' and '-'; got ${typeof value === 'string' ? `'${value}'` : typeof value}`);
 	}
 	return value;
 }

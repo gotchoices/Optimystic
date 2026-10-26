@@ -163,7 +163,7 @@ const plugin = register(db, {
 });
 ```
 
-`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `allowSoloCommit` is refused until its stage lands rather than silently ignored. It also refuses a `journal` that is not shaped like an `IKVStore` (naming the methods it lacks), and a `journalLabel` given without a `journal` or with anything but letters, digits, `_` and `-` — the label is one key segment, which every store can hold.
+`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `allowSoloCommit` is refused until its stage lands rather than silently ignored. It also refuses a `journal` that is not shaped like an `IKVStore` (naming the methods it lacks), and a `journalLabel` given without a `journal` or with anything but lowercase letters, digits, `_` and `-` — the label is one key segment, which every store can hold, and a filesystem that ignores case would file two labels differing only in case together.
 
 Persistence is a registration-time choice, not a per-entry one, for two reasons: entries have to be
 restored before the application's first statement after a restart, which happens before any
