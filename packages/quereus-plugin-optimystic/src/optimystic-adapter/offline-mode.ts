@@ -195,10 +195,13 @@ export class OfflineMode {
 		this.publishState();
 	}
 
-	/** Transactions begun from now on get network acknowledgement. Entries already queued keep draining. */
+	/** Transactions begun from now on get network acknowledgement. Entries already queued keep draining.
+	 * Clears `readsServedLocally`: outside the mode no read is served locally, and a read that fails
+	 * reports nothing, so the flag would otherwise outlive the mode until a refresh succeeded. */
 	exit(): void {
 		if (!this.entered) return;
 		this.entered = false;
+		this.readsServedLocally = false;
 		log('offline:exited');
 		this.publishState();
 	}
@@ -285,7 +288,8 @@ export class OfflineMode {
 	/**
 	 * Record how a live read's refresh went: `true` when the read was served from this machine's own
 	 * view because the cohort could not be reached, `false` when the refresh reached it.
-	 * `readsServedLocally` on the queue state is the last report's value, published when it changes.
+	 * `readsServedLocally` on the queue state is the last report's value, published when it changes;
+	 * {@link exit} clears it.
 	 */
 	noteLiveRefresh(servedLocally: boolean): void {
 		if (this.readsServedLocally === servedLocally) return;

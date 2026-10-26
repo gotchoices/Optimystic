@@ -19,6 +19,10 @@ Stage 6 of [docs/offline-sync.md §Implementation stages](../../docs/offline-syn
 
 A node whose routing view is self-only because peers are still mid-identify (must read unreachable, not alone); a one-machine deployment with no bootstrap peers (reachable — alone); a bootstrap peer refused by the network-membership predicate (`isNetworkMember`) while it serves this network (still awaited — see internals.md *Network Membership Predicate*); a restart with persisted network state; the header and log tail resolving to different cohorts. The two-machine scenario from the doc's test plan (one away; an offline-mode write on the other is queued, not committed alone, and drains when the partner returns) on the in-process mesh.
 
+## Arm from the stage-4 review (live reads)
+
+The plugin's offline live-read degrade (`refreshLive` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, docs/offline-sync.md §Reads in offline mode) absorbs only a `BlockUnavailableError` with reason `cohort-unreachable` or `peers-unreachable`. On a `network` transactor whose every request to a remote coordinator fails in transport, `NetworkTransactor.get` throws the untyped `Some peers did not complete` aggregate instead (its `missingIds` branch), so the read fails rather than being served locally — the README's "Not yet" list says so. The gate this stage registers is what closes it: while the gate answers unreachable, the read skips the refresh. The two-machine scenario should therefore also run a live read of a `'queue'` table on the machine left alone, in offline mode, and expect the queued row back with `readsServedLocally` set. If the gate can answer reachable while that read still meets the aggregate (a view that changes between the check and the refresh), decide whether `NetworkTransactor.get` should raise a typed unreachability error there; the `NOTE:` in `refreshLive` names that remedy.
+
 ## Done when
 
 The two-machine scenario passes, docs/offline-sync.md marks the stage implemented, and docs/internals.md mentions the reachability handle where it lists node attachments.

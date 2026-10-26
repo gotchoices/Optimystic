@@ -197,7 +197,7 @@ Every live read first pulls what the other machines have committed, so outside o
 
 - A table tagged `"optimystic.offline" = 'network'` (below) keeps failing, in the mode and out of it.
 - The mode does not make data appear. Rows this machine does not hold still fail the read with `BlockUnavailableError` — a table it has never read, say. To read a table offline, read it while online first.
-- `readsServedLocally` on the queue state (see [Following a queued transaction](#following-a-queued-transaction--pluginofflineonstatuslistener)) is `true` while the last live read was served this way, and the next read that reaches the other machines sets it back. The first such read of each table, and the first after each reconnect, is logged as `offline:read-served-locally`.
+- `readsServedLocally` on the queue state (see [Following a queued transaction](#following-a-queued-transaction--pluginofflineonstatuslistener)) is `true` while the last live read was served this way; the next read that reaches the other machines sets it back, and so does `exit()`. The first such read of each table, and the first after each reconnect, is logged as `offline:read-served-locally`.
 - A committed read (`committed.<Table>`) never pulls, and is unchanged.
 
 #### Tables that are always acknowledged by the network — `optimystic.offline`
@@ -289,7 +289,7 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 #### Not yet in this stage
 
 - **Nothing survives a restart.** Queued transactions and retained outcomes live in memory.
-- **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally; the consequence for `discard` is above. A later stage adds the check both consult.
+- **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally. On a networked node a pull whose every request fails in transport, rather than being answered, ends in a plain `Some peers did not complete` error that the read does not recognise as unreachability, so that read fails instead; the consequence for `discard` is above. A later stage adds the check both consult.
 - **No SQL view of the queue.** `plugin.offline.entries()` is the only listing; an `optimystic_queue` virtual table is in the backlog.
 
 ## Reactive Watching

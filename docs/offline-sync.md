@@ -1059,7 +1059,8 @@ failure is absorbed only when `isCohortUnreachableRead` in
 `classifyCommitFailure` sorts the same errors by; every other failure propagates, a
 `BlockUnavailableError` with another reason and a `BlockPossiblyStaleError` included. Each outcome is
 reported (`OfflineMode.noteLiveRefresh`): `readsServedLocally` is the last report's value, published
-when it changes, so a refresh that reaches the cohort, in or out of the mode, clears it. The first
+when it changes, so a refresh that reaches the cohort, in or out of the mode, clears it, and so does
+leaving the mode. The first
 locally served read of a table is logged as `offline:read-served-locally`, and again the first one
 after a refresh has reached the cohort. The degrade has no transaction branch, so a live read inside
 an open transaction degrades the same way. A committed read (`committed.<Table>`) never refreshes
