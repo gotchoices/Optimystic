@@ -185,6 +185,49 @@ export function retainedAttempt(staged: StagedAttempt, actionId: ActionId): InFl
 	};
 }
 
+/**
+ * The inverse of {@link retainedAttempt}, for a head commit opened with `resume`
+ * (`HeadCommitOptions.resume`): the attempt an earlier cycle recorded, as a {@link StagedAttempt}
+ * that sends exactly what that cycle sent, while `rev` — the revision the next attempt would
+ * request — equals the recorded one; `undefined` otherwise, and the attempt is built as usual.
+ * The tracker is over the handle's read cache, with a COPY of the recorded transforms (a fold
+ * resets it and folds what it holds, and the record stays the caller's) and pins of its own, since
+ * it stages nothing.
+ *
+ * The recorded attempt IS the attempt that may have landed: it can sit on a minority of its cohort,
+ * hidden from the refresh by a coordinator lagging that cohort, and storage accepts a retry of one
+ * `(action id, revision)` as the same write, so anything but these transforms under that pair forks
+ * the block on the machines that hold the first (docs/offline-sync.md §Identity across attempts).
+ * Three departures from how an attempt is otherwise built are deliberate:
+ * - **Keyed on `resume`, not on the retained attempt.** Within one cycle a retry at an unchanged
+ *   revision reuses the head tracker and the minted log block ids, so it is byte-identical already,
+ *   and keeps the re-judging of its base pins before each attempt (`Collection.headTrackerFor`).
+ *   The recorded attempt is re-sent as it was, unjudged: a base that moved under it is judged by
+ *   storage's own base guard, which refuses it on every machine whose base moved — the exception
+ *   `Collection.completeOwnEntry`'s re-send of a retained attempt already takes.
+ * - **No invented baseline.** A head tracker over a collection with no committed revision starts
+ *   from the invented baseline so the header, log block and root ride in the head's commit; the
+ *   recorded transforms already carry those inserts.
+ * - **Only equality switches it on.** A refresh that moves the revision past `attempt.rev` adopted a
+ *   rival's entry there, which proves the recorded attempt lost at that revision, and the write is
+ *   rebuilt at the higher one. A revision BELOW it is not reachable inside one process (the held
+ *   revision never lowers); a new handle after a restart that reaches one has read a view behind the
+ *   attempt, and the ordinary build handles it as it would without `resume` — the recorded revision
+ *   is not adopted to get there.
+ */
+export function resumedAttempt(cache: CacheSource<IBlock>, attempt: InFlightAttempt | undefined, rev: number): StagedAttempt | undefined {
+	if (attempt === undefined || attempt.rev !== rev) {
+		return undefined;
+	}
+	return {
+		tracker: new Tracker(cache, copyTransforms(attempt.transforms)),
+		rev: attempt.rev,
+		tailId: attempt.tailId,
+		blockDigests: attempt.blockDigests,
+		baseRevs: attempt.baseRevs ?? {},
+	};
+}
+
 /** The refresh a write path runs between attempts — `Collection.updateInternal`, under the
  * collection latch, with the write's action marked in flight so the refresh recognises the write's
  * own log entry. `lastChance` says the budget ends with this round; `tailFloor` is the highest

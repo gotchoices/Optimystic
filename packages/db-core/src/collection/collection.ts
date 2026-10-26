@@ -18,7 +18,7 @@ import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
 import type { ActionContext } from "./action.js";
 import { actionIdAt } from "./action.js";
-import { AttemptCycle, retainedAttempt, stageAttempt } from "./write-attempts.js";
+import { AttemptCycle, resumedAttempt, retainedAttempt, stageAttempt } from "./write-attempts.js";
 import type { AttemptTarget, Refresh, StagedAttempt, WriteIdentity } from "./write-attempts.js";
 import { driveHeadCommit } from "./head-commit.js";
 import type { HeadCommitHandle } from "./head-commit.js";
@@ -2246,7 +2246,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * a sync's is, so the refresh between attempts recognises the write's own entry; sets
 	 * {@link headCommitEntry}, which tells {@link consumeOwnEntry} that such an entry records the head
 	 * segment; and seeds the retained attempt with `resume` when one is given, so that the opening
-	 * refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}).
+	 * refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) — and
+	 * `stage()` re-sends it verbatim while the next attempt would request its revision
+	 * ({@link resumedAttempt}).
 	 *
 	 * **The target.** The live tracker holds every sealed segment and the open one, cumulatively, so
 	 * an attempt cannot run on a copy of it the way a sync's does. It runs on a HEAD TRACKER instead
@@ -2300,14 +2302,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (resume !== undefined) {
 			this.retainInFlightAttempt(resume);
 		}
-		return this.headCommitHandle(entryId, identity, release, endInFlight);
+		return this.headCommitHandle(entryId, identity, release, endInFlight, resume);
 	}
 
 	/** The handle {@link openHeadCommit} returns: closures over this instance's private state, so
 	 * nothing private becomes public. `release` is the latch release of the latch the caller took;
 	 * `endInFlight` the disposer of the in-flight mark. The head tracker lives here, per handle, so it
-	 * is reused across the attempts of one cycle exactly as the in-line loop reused it. */
-	private headCommitHandle(entryId: EntryId, identity: WriteIdentity, release: () => void, endInFlight: () => void): HeadCommitHandle {
+	 * is reused across the attempts of one cycle exactly as the in-line loop reused it. `resume` is
+	 * the attempt the cycle was opened with, which `stage()` re-sends verbatim while the next attempt
+	 * would request its revision ({@link resumedAttempt}). */
+	private headCommitHandle(entryId: EntryId, identity: WriteIdentity, release: () => void, endInFlight: () => void,
+		resume: InFlightAttempt | undefined): HeadCommitHandle {
 		let held = true;
 		let closed = false;
 		let head: HeadTracker | undefined;
@@ -2333,6 +2338,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 			stage: async () => {
 				assertUsable('stage', true);
 				const segment = this.committableHead(entryId);
+				const resumed = resumedAttempt(this.sourceCache, resume, this.getNextRev());
+				if (resumed !== undefined) {
+					return resumed;
+				}
 				head = await this.headTrackerFor(segment, head);
 				return this.buildAttempt({ actions: segment.actions, transforms: head.tracker.transforms, pins: head.tracker.pins }, identity);
 			},

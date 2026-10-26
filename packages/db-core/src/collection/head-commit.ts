@@ -48,7 +48,9 @@ export interface HeadCommitHandle {
 	heldRev(): number | undefined;
 	/** Re-check the head is still committable (a refresh may have refused it meanwhile — the
 	 * recorded refusal is thrown), then build the attempt at {@link nextRev} on the head tracker,
-	 * reused while the revision and the bases under it are unchanged (`Collection.headTrackerFor`). */
+	 * reused while the revision and the bases under it are unchanged (`Collection.headTrackerFor`) —
+	 * or, for a cycle opened with a recorded attempt to resume, answer that attempt itself while
+	 * {@link nextRev} is its revision (`resumedAttempt`). */
 	stage(): Promise<StagedAttempt>;
 	/** Send one attempt through this collection's own transactor source — the one-collection
 	 * path's pend-and-commit, under the cycle's aged retry `priority`. The coordinator never calls

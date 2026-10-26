@@ -304,7 +304,15 @@ list. Five rules follow from the split:
     refusing the same segment on a refresh — which usually finds it first, since the cycle opens
     with a refresh (like `updateAndSync`) that, with the action already marked in flight, also
     recognises an earlier attempt's own entry and finishes or consumes it rather than committing a
-    second copy.
+    second copy. A cycle opened with `resume` builds no head tracker while the revision the next
+    attempt requests equals the recorded attempt's: the handle's `stage` step sends the recorded
+    attempt verbatim (`resumedAttempt` in `packages/db-core/src/collection/write-attempts.ts`),
+    since it is the attempt that may have landed and a rebuild would mint fresh ids under its
+    `(action id, revision)`. It deliberately skips two things the head tracker does: re-judging the
+    base pins, leaving a moved base to storage's base guard as `completeOwnEntry`'s re-send does,
+    and the invented baseline, whose inserts the recorded transforms already carry. The rule is in
+    the `stage` step, so the coordinator's per-entry commit, which opens its handles with
+    `EntryCommit.resume` and calls the same step, shares it.
   - **The latch is released around the one network `await`.** The handle's `release` and `retake`
     (`HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`) bracket `source.transact`
     alone, the retake in a `finally`, so nothing on the instance is touched without the latch and

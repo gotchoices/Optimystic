@@ -610,7 +610,17 @@ of stage 5 fills. A later drain of an in-doubt entry marks that action in flight
 it instead of committing a second copy — from the recorded attempt, which the drain hands back as
 `HeadCommitOptions.resume` (one collection) or `EntryCommit.resume` in
 `packages/db-core/src/transaction/entry-commit.ts` (several); without it the refresh can only
-recognise an attempt that landed whole, and refuses a torn one as `transforms-not-held`.
+recognise an attempt that landed whole, and refuses a torn one as `transforms-not-held`. The
+recorded attempt is also what the cycle re-SENDS when that refresh finds nothing new: the earlier
+attempt may sit on a minority of its cohort, hidden from the refresh by a coordinator lagging its
+cohort, so while the revision the next attempt would request is still the recorded one, the head
+commit's `stage` step sends the recorded attempt verbatim instead of building a new one, whose
+freshly minted block ids would fork the log on the machines holding the first
+(`resumedAttempt` in `packages/db-core/src/collection/write-attempts.ts`). The three outcomes of
+that opening refresh are together what makes the rule above hold across cycles: the write's own
+entry found, and finished from the recorded attempt; a rival's entry adopted, and the write rebuilt
+at the higher revision, which proves the recorded attempt lost at its own; or nothing new, and the
+recorded attempt re-sent.
 
 An entry keeps **one action id for its whole life**, minted when it is queued. Re-driving under it is
 always safe — storage treats a re-send at the same revision as finishing the write and one at a new

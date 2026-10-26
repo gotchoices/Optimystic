@@ -139,7 +139,9 @@ export type HeadCommitOptions = SyncOptions & {
 	 * it from these transforms (`Collection.completeOwnEntry`) instead of refusing it as torn with
 	 * `transforms-not-held`. Without it a re-drive can recognise only an attempt that landed whole.
 	 * The revision check still applies: an attempt recorded at a revision other than the entry's is
-	 * refused as before. */
+	 * refused as before. And when that refresh finds nothing new, this attempt is what the cycle
+	 * re-sends, verbatim, while the next attempt would request its revision (`resumedAttempt`), since
+	 * it may have landed on machines the refresh did not hear from. */
 	resume?: InFlightAttempt;
 };
 
