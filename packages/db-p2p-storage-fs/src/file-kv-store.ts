@@ -138,7 +138,7 @@ export class FileKVStore implements IKVStore {
 		// NOTE: `/`-separated keys become nested dirs, so a key's first segment shares the top-level
 		// namespace with FileRawStorage's <blockId>/ dirs. Safe while no block id's first segment
 		// (a block id containing `/` nests too) equals a key's first segment — the node's keys all start with a fixed word (`under-replicated`,
-		// `coordinator`, `participant`, `executed`) — and if one ever could, give the two stores
+		// `coordinator`, `participant`, `executed`, and the Quereus plugin's offline journal's `optimystic-offline`) — and if one ever could, give the two stores
 		// separate basePaths (see README Usage). FileRawStorage.listBlockIds walks the tree but skips
 		// these root namespaces (db-p2p's NODE_KV_NAMESPACES — a new namespace must be added there),
 		// so a KV key whose last segment is `meta` is never enumerated as a block. Their bytes do

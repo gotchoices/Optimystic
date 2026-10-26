@@ -444,7 +444,7 @@ describe('Offline mode: entering, sealing a commit, following it to the other no
 	it('register refuses an offline block it does not understand', () => {
 		const db = new Database();
 		try {
-			expect(() => register(db, { offline: { journal: 'later' } as unknown as SqlValue })).to.throw(/offline\.journal is not a registration option/);
+			expect(() => register(db, { offline: { allowSoloCommit: true } as unknown as SqlValue })).to.throw(/offline\.allowSoloCommit is not a registration option/);
 			expect(() => register(db, { offline: { expireAfterMs: -1 } as unknown as SqlValue })).to.throw(/offline\.expireAfterMs must be a positive number/);
 			expect(() => register(db, { offline: { recheck: { base: 1 } } as unknown as SqlValue })).to.throw(/offline\.recheck\.base is not a registration option/);
 		} finally {

@@ -140,9 +140,12 @@ The members below exist, under `plugin.offline` (`OfflineMode` in `packages/quer
 const plugin = register(db, {
   default_transactor: 'network',
   offline: {
-    // Persist queued transactions. An IKVStore, or a factory for one. Absent: the queue lives in
-    // memory and a crash loses whatever was queued.
+    // Persist queued transactions. An IKVStore, or a factory for one (called once, inside register).
+    // Absent: the queue lives in memory and a crash loses whatever was queued.
     journal: () => new FileKVStore(path.join(dataDir, 'offline')),
+    // The journal's records are keyed under optimystic-offline/<journalLabel>/. Needed only when
+    // several Databases share one store: each then takes its own (see "Which store"). Default 'default'.
+    journalLabel: 'main',
     // How long an entry may stay unsettled before it fails with reason 'expired'. Default: no limit.
     expireAfterMs: 7 * 24 * 3600_000,
     // How long a terminal outcome stays queryable after a restart (see "Outcomes after a restart").
@@ -160,7 +163,7 @@ const plugin = register(db, {
 });
 ```
 
-`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `journal` and `allowSoloCommit` are refused until their stages land rather than silently ignored.
+`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-config.ts`), so `allowSoloCommit` is refused until its stage lands rather than silently ignored. It also refuses a `journal` that is not shaped like an `IKVStore` (naming the methods it lacks), and a `journalLabel` given without a `journal` or with anything but letters, digits, `_` and `-` — the label is one key segment, which every store can hold.
 
 Persistence is a registration-time choice, not a per-entry one, for two reasons: entries have to be
 restored before the application's first statement after a restart, which happens before any
@@ -201,7 +204,7 @@ const off = plugin.offline.onStatus(status => {
 });
 ```
 
-Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts`; `persisted` is stage 5's, `outlook` and `outlook-changed` stage 7's, `effect` stage 10's):
+Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts`; `outlook` and `outlook-changed` are stage 7's, `effect` stage 10's):
 
 ```typescript
 type QueuedTransactionStatus =
@@ -254,9 +257,9 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 `committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
 `failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
 what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
-plugin passes through. `outlook` and `outlook-changed` arrive with stage 7, `effect` with stage 10
-and `persisted` with stage 5; `followed`, the per-table `tables` map and `changedTables` landed with
-stage 4.
+plugin passes through. `outlook` and `outlook-changed` arrive with stage 7 and `effect` with stage
+10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4, and `persisted`
+(on `queued`, and on each item `entries()` lists) with stage 5.
 
 Queue-wide state, for a status bar:
 
@@ -1078,11 +1081,9 @@ attempts — which the queue hands to a journal through one port, `IOfflineJourn
 `packages/db-core/src/offline/journal.ts`, at the moments [Write ordering](#write-ordering) names.
 The port never sees a table name or a key-value store, so db-core keeps its no-storage rule and a
 `Tree`/`Diary` application without SQL can journal too; the plugin's journal over `IKVStore`
-(stage 5, part two) adds what db-core does not know — the table each collection backs
-(`schema.table`, to initialize the table on restore) and the acknowledgement — and keys each record
-under a prefix the plugin owns (proposed `optimystic-offline/`, followed by a database label the
-application supplies when it runs more than one `Database` over one store, then the entry's
-sequence number, zero-padded so a prefix listing returns queue order).
+(`OfflineJournal` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-journal.ts`,
+below) adds what db-core does not know — the table each collection backs, to initialize it on
+restore — and a third record, the outcome.
 
 **The entry record**, written once, at enqueue (`IOfflineJournal.queued`):
 
@@ -1113,8 +1114,28 @@ type JournalDriveState = {
 
 An entry restored with a drive record is in doubt whenever its `attempts` or `committed` is
 non-empty; one restored without was never sent, and gets a fresh action id. The terminal status
-(`IOfflineJournal.settled`) is written before it is emitted, and the two records it settles are
-removed with it (part two).
+(`IOfflineJournal.settled`) is written before it is emitted, and the plugin's journal removes the
+two records it settles once the outcome is written (below).
+
+**In the key-value store** the plugin writes three records per transaction under
+`optimystic-offline/<label>/` (`OFFLINE_JOURNAL_KEY_PREFIX` in
+`packages/db-p2p/src/storage/node-kv-namespaces.ts`, then the `journalLabel`), each in its own
+sub-namespace, so listing one never walks another. `<seq>` is the entry's sequence number
+zero-padded to 12 digits, so a listing sorted as strings is queue order, and every value carries a
+version, `v: 1`, which a reader that does not know it refuses rather than guesses at:
+
+| Key | Written | Value |
+|---|---|---|
+| `entries/<seq>` | once, at enqueue (`queued`) | `{ v, transactionId, seq, queuedAt, expiresAt?, segments: [{ collectionId, table, actions }] }` |
+| `drives/<seq>` | before each send, after a partial commit, after an identity renewal (`driving`) | `{ v, transactionId, actionId, attempts: [[collectionId, InFlightAttempt]…], committed: [[collectionId, WriteDurability \| null]…] }` |
+| `outcomes/<transactionId>` | at a terminal outcome (`settled`), before the other two are deleted | `{ v, at, status }`, `status` the outcome as [Outcomes after a restart](#outcomes-after-a-restart) describes |
+
+The entry record's `table` is one table its collection backs, as `{ schemaName, tableName }` — the
+first the bridge recorded; a collection backing two tables is logged
+`offline:journal-ambiguous-table`, since any table that opens the collection serves a restore, and a
+collection backing none fails the commit, since nothing could restore it. The transaction id keys
+the outcome record, which works because a `StampId()` is base64url. Maps are written as pairs, and a
+collection saved with its holders unknown as `null`.
 
 **Actions, not transforms.** Transforms are block operations relative to the base the actions were
 staged on. After a restart, or after a rival's commit, the base is different, and the actions have
@@ -1139,6 +1160,12 @@ and inherits that section's rules.
    queued or reported, and the transaction rolls back, as a network failure does today — the rollback
    restores the pre-transaction snapshot by replay, since the sealed list changed, and ends with the
    transaction's actions gone. So "acknowledged" always implies "journaled" when persistence is on.
+   The journal takes back a record whose write failed (deleted and flushed, best effort), since the
+   transaction it would restore was rolled back. The cost of flushing before resolving is the
+   opposite case: a crash after the flush and before `commit` resolves leaves a record for a
+   transaction whose application never heard it committed, which the restore puts back and drains.
+   Resolving first and writing after would break the acknowledgement's promise instead, so the
+   journal takes that cost.
 2. **Before each send.** Write the drive record and flush, then send: `IOfflineJournal.driving`,
    called from the queue's write-ahead wrapper (`OfflineQueue.recordAttempts`) with the attempts
    about to go; a throw aborts the cycle with nothing sent, and the entry stays queued, not in doubt,
@@ -1146,12 +1173,17 @@ and inherits that section's rules.
    crash. The same record is rewritten right after an identity renewal, so the fresh action id is on
    disk before anything runs under it; a throw there is logged (`offline:journal-write-failed`) and
    the drain goes on, since the next send's write repeats the state.
-3. **On a terminal outcome.** Write the outcome record (below), then delete the entry record:
-   `IOfflineJournal.settled` is told the `committed` or `failed` status before it is emitted, and a
-   throw there is logged, never raised into the drain — the network has the write, or the segments
-   are gone, and the stale record is what the restore after a restart resolves. A crash between the
-   network commit and this step leaves an in-doubt record, which the next drain resolves by finding
-   its own log entry.
+3. **On a terminal outcome.** Write the outcome record and flush, then delete the entry and drive
+   records, without flushing: `IOfflineJournal.settled` is told the `committed` or `failed` status
+   before it is emitted, and a throw there is logged, never raised into the drain — the network has
+   the write, or the segments are gone, and the stale record is what the restore after a restart
+   resolves. The plugin's journal deletes the two records even when the outcome write fails: an entry
+   record with no outcome beside it would be restored and driven again, so a discarded transaction
+   would be sent after all, while a lost outcome only means the application does not hear it again
+   after a restart. A crash between the network commit and this step leaves an in-doubt record,
+   which the next drain resolves by finding its own log entry; a crash after the outcome is flushed
+   and before the deletes are leaves all three records, which the rule in
+   [Restore after a restart](#restore-after-a-restart) resolves.
 4. **On partial commit, before the next send.** Write the drive record with the committed
    collections (`OfflineQueue.partiallyCommitted`). It cannot be written before the committed
    segments are consumed: they are consumed inside `TransactionCoordinator.commitEntry`, before
@@ -1175,6 +1207,10 @@ A collection whose base blocks this machine cannot read (it never held them, and
 unreachable) cannot be re-staged. Its entries stay journaled and are restored on that table's first
 successful read; until then, reads of the table fail as they would without the mode. No journaled
 entry is dropped for this.
+
+**An entry record whose transaction has an outcome record is settled.** The deletes that follow an
+outcome are not flushed, so a crash can leave the entry and drive records beside the outcome; the
+restore deletes them and restores nothing, and the outcome is listed by `outcomes()` as any other.
 
 A host that does not call `hydrate` calls `plugin.offline.restore()` itself, with the same rule.
 
@@ -1211,18 +1247,35 @@ what that callback does:
 
 Status listeners are in memory. An application killed between an entry's settlement and its own
 handling of the status event would otherwise never learn the outcome. With persistence on, each
-terminal outcome is kept in the journal (`transactionId`, kind, reason, `causedBy`, the durability
-summary) for `outcomeRetentionMs` or until `acknowledge(transactionId)`, and `outcomes()` returns
-them. Without persistence there is nothing to restart into.
+terminal outcome is kept in the journal for `outcomeRetentionMs` or until
+`acknowledge(transactionId)`, and `outcomes()` returns them. Without persistence there is nothing to
+restart into.
+
+The record holds the outcome reduced to what JSON carries (`PersistedOutcome` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-journal.ts`): a `committed` one's
+`transactionId`, `durability` (per collection and `overall`) and per-table `tables`, without
+`followed`; a `failed` one's `transactionId`, `reason`, `causedBy`, `changedTables`,
+`committedTables`, and `error` as its name and message. Read back (`decodeOutcome`, same file), a
+`committed` outcome says `followed: false`, since nothing is followed across a restart, and a
+`failed` one carries a plain `Error` with the original's name and message and no `cause`. Its
+record is written when the outcome is settled, before it is reported, and deleted, without a
+flush, when it is acknowledged or found past the retention window by `status` or `outcomes`; a
+delete a crash loses lists the outcome once more after the restart.
 
 ### Which store
 
 `journal` takes the `IKVStore` interface (in `packages/db-p2p/src/storage/i-kv-store.ts`), which the
 filesystem, IndexedDB, React Native LevelDB and NativeScript SQLite packages all implement, so no new
 storage adapter is needed. A host may hand in the same instance it passes the node as
-`NodeOptions.kvStore`; the plugin's key prefix then has to be added to `NODE_KV_NAMESPACES` (in
+`NodeOptions.kvStore`: the plugin's key prefix, `optimystic-offline/`, is in `NODE_KV_NAMESPACES` (in
 `packages/db-p2p/src/storage/node-kv-namespaces.ts`), which is how a file-backed store sharing a
-base path with block storage keeps block listings from walking it. A write to these stores is not
+base path with block storage keeps block listings from walking it.
+
+Two `Database`s may share one store only under different `journalLabel`s: every listing is under
+`optimystic-offline/<label>/`, so two labels never see each other's records. Two `Database`s with
+the same label over one store list and delete each other's records and corrupt both queues' order,
+and neither can detect it from the inside — no `IKVStore` offers a lock — so keeping labels apart is
+the application's responsibility. A write to these stores is not
 guaranteed to survive a power cut until a `flush()` called after it resolves (the contract `IKVStore`
 points to, and [packages/db-p2p/docs/storage.md](../packages/db-p2p/docs/storage.md) describes), so
 the local commit flushes the journal before it resolves, which is what makes step 1's "journaled"
@@ -1439,8 +1492,9 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    `optimystic.offline` tag, network acknowledgement behind a non-empty queue, the DDL gate, the
    invented-collection probe, and the live-read degrade with the per-transactor reachability gate it
    and the queue share.
-5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
-   `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
+5. **Persistence** (in three tickets; the first two implemented). The journal port in db-core with
+   the queue's write ordering and restore operations; the journal over `IKVStore`, retained outcomes
+   in it, and the `NODE_KV_NAMESPACES` entry; restore in `hydrate` and `offline.restore`.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on
    connection events, and the solo-refusing write option, set by every drain unless the application
    opts out with `allowSoloCommit`.
@@ -1502,8 +1556,12 @@ transaction that wrote the table is queued, allowed once it settles),
 through an index and a scan alike, the fail-loud read outside the mode and for a `'network'` table,
 a read and the queue waiting on one gate, a table never read failing, and a write's uniqueness probe
 degrading); `packages/db-core/test/invented-collection-adoption.spec.ts` pins the invented-collection
-probe at the collection tier. Of the list below, what is left waits for its stage: the crash cases
-(stage 5); the two-machine group with one member away, and `expireAfterMs` reached while
+probe at the collection tier. `packages/quereus-plugin-optimystic/test/offline-journal.spec.ts` pins
+the write side of stage 5: the records an offline commit over a table and its index leaves, in queue
+order, and what its drain leaves; a journal that refuses the entry record failing the commit; what
+survives a crash after the drain committed and before the deletes were flushed, and after one
+refused send; two labels over one store. Of the list below, what is left waits for its stage: the
+restore side of the crash cases (stage 5); the two-machine group with one member away, and `expireAfterMs` reached while
 unreachable, which needs stage 6's gate to keep an entry unsent and so expirable; and the outlook
 (stages 7 to 10).
 
@@ -1519,7 +1577,8 @@ unreachable, which needs stage 6's gate to keep an entry unsent and so expirable
   the entry is committed exactly once (the double-commit the open-segment snapshot rule prevents).
 - A savepoint rollback while the drain removes a refused entry.
 - Crash after the network commit and before the journal delete
-  (`MemoryBatchBackend({ deferSync: true })` and `powerLoss()` for the journal and the node store):
+  (`PowerLossKVStore` for the journal and `MemoryBatchBackend({ deferSync: true })` for the node
+  store, each with `powerLoss()`):
   after restart the entry is reported committed and the log holds one entry for it.
 - Crash after the local acknowledgement: the entry is restored by `hydrate`, visible before the first
   network contact, and drains on reconnect.

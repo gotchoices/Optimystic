@@ -4,8 +4,8 @@ import type { SqlCommitDurability } from './commit-durability.js';
 /**
  * What `plugin.offline` reports about each locally acknowledged transaction (docs/offline-sync.md
  * §Following transactions): the db-core queue's `EntryStatus` with tables (`schema.table`) in place
- * of collection ids and the transaction's `StampId()` in place of the entry id. The fields later
- * stages add there (`persisted`, `outlook`, `effect`) are absent until they land.
+ * of collection ids and the transaction's `StampId()` in place of the entry id, and `persisted`. The
+ * fields later stages add there (`outlook`, `effect`) are absent until they land.
  */
 
 export type { QueuedFailureReason } from '@optimystic/db-core';
@@ -31,6 +31,9 @@ export type QueuedTransactionStatus =
 		/** The tables already durably committed, once a submission committed part of the transaction
 		 * (docs/offline-sync.md §Partial commits); absent while none is. */
 		committedTables?: readonly string[];
+		/** Whether the transaction is in the journal (`offline.journal` is configured): its entry record
+		 * was flushed before its commit resolved, so it survives a crash of this process. */
+		persisted: boolean;
 	}
 	| { kind: 'submitting'; transactionId: string; attempt: number }
 	/** The same report `onCommitDurability` listeners received for this commit, which they did, before
@@ -60,7 +63,10 @@ export type QueuedTransactionStatus =
 		committedTables?: readonly string[];
 	};
 
-/** A terminal status, as `plugin.offline.outcomes()` retains it. */
+/** A terminal status, as `plugin.offline.outcomes()` retains it. One read back from the journal's
+ * outcome record (`decodeOutcome` in `offline-journal.ts`) has lost two things: a `committed` one has
+ * `followed: false`, since nothing is followed across a restart, and a `failed` one's `error` is a
+ * plain `Error` with the original's name and message and no `cause`. */
 export type TransactionOutcome = Extract<QueuedTransactionStatus, { kind: 'committed' | 'failed' }>;
 
 /** One queued transaction as `plugin.offline.entries()` lists it: its identity and its current status. */
@@ -71,6 +77,8 @@ export type QueuedTransaction = {
 	readonly tables: readonly string[];
 	/** As on the `queued` status: the tables already committed, once part of the transaction is. */
 	readonly committedTables?: readonly string[];
+	/** As on the `queued` status: whether the transaction is in the journal. */
+	readonly persisted: boolean;
 	readonly status: QueuedTransactionStatus;
 };
 

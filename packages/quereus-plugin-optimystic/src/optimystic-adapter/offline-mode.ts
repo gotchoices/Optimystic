@@ -2,11 +2,12 @@ import type { Database } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError, alwaysReachable } from '@optimystic/db-core';
 import type {
-	ActionRefusedError, BlockId, Collection, CollectionId, EntryId, EntryStatus, ICohortReachability, OfflineQueueOptions,
-	OfflineQueueState, QueuedEntry, TransactionDurability,
+	ActionRefusedError, BlockId, Collection, CollectionId, EntryId, EntryStatus, ICohortReachability, JournalSettledStatus,
+	OfflineQueueOptions, OfflineQueueState, QueuedEntry, TransactionDurability,
 } from '@optimystic/db-core';
 import type { TransactionBridge } from './txn-bridge.js';
-import type { OfflineConfig } from './offline-config.js';
+import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-config.js';
+import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { addListener, notifyListeners } from './listeners.js';
 import { announceExternalChange } from './external-change.js';
@@ -110,12 +111,6 @@ type StateListener = (state: OfflineModeState) => void;
 /** Called with a transaction's terminal outcome, or `undefined` when the controller was disposed first. */
 type SettleWaiter = (outcome: TransactionOutcome | undefined) => void;
 
-/** A retained terminal status and when it was emitted, for the retention window. */
-interface RetainedOutcome {
-	readonly at: number;
-	readonly status: TransactionOutcome;
-}
-
 /**
  * Everything an application sees under `plugin.offline` (docs/offline-sync.md §Application
  * interface): the mode flag, one `OfflineQueue` per `Database`, and the translation of the queue's
@@ -134,9 +129,15 @@ interface RetainedOutcome {
  * None of the bridge's single-writer state is read or written here: the drain owns the sealed
  * segments and the queue, the open SQL transaction owns the open segment, and the collection latch
  * serialises their in-memory steps (docs/offline-sync.md §The single-writer bridge).
+ *
+ * With `offline.journal` configured the queue writes through an {@link OfflineJournal} over that
+ * store (docs/offline-sync.md §Persistence): a commit resolves only once its entry record is flushed,
+ * each send is preceded by its drive record, and each terminal outcome is written before it is
+ * reported — and deleted again when it is acknowledged or ages out of the retention window.
  */
 export class OfflineMode {
 	private readonly queue: OfflineQueue;
+	private readonly journal: OfflineJournal | undefined;
 	private readonly outcomeRetentionMs: number;
 	private readonly now = Date.now;
 	private entered = false;
@@ -149,6 +150,9 @@ export class OfflineMode {
 	private readonly stateListeners = new Set<StateListener>();
 	/** Terminal statuses since they were emitted, oldest first, pruned lazily (no timer). */
 	private readonly retainedOutcomes = new Map<string, RetainedOutcome>();
+	/** The outcome {@link journalOutcome} translated for the journal, held from then until the queue
+	 * emits the same status ({@link onQueueStatus}), which takes it rather than translating again. */
+	private readonly journaledOutcomes = new Map<string, RetainedOutcome>();
 	private readonly networkCommitTimeoutMs: number;
 	/** Each table's policy and reachability gate, keyed by its `schema.table` rendering, as its vtab
 	 * published them; a table absent here takes `'queue'` and is always reachable. */
@@ -157,8 +161,13 @@ export class OfflineMode {
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
 	private disposed = false;
 
-	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: OfflineConfig = {}) {
+	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: ParsedOfflineConfig = {}) {
+		this.journal = config.journal === undefined ? undefined : new OfflineJournal(config.journal, config.journalLabel ?? DEFAULT_JOURNAL_LABEL, {
+			tablesOf: id => this.bridge.tablesOf(id),
+			outcomeOf: status => this.journalOutcome(status),
+		});
 		const options: OfflineQueueOptions = { reachability: this.reachability };
+		if (this.journal !== undefined) options.journal = this.journal;
 		if (config.expireAfterMs !== undefined) options.expireAfterMs = config.expireAfterMs;
 		if (config.recheck !== undefined) options.recheck = { ...config.recheck };
 		this.queue = new OfflineQueue(options);
@@ -494,20 +503,42 @@ export class OfflineMode {
 		return [...this.retainedOutcomes.values()].map(outcome => outcome.status);
 	}
 
-	/** Forget one retained outcome. */
+	/** Forget one retained outcome, and delete its journal record. */
 	acknowledge(transactionId: string): void {
 		this.retainedOutcomes.delete(transactionId);
+		this.deleteOutcomeRecord(transactionId);
 	}
 
 	// ── translation ────────────────────────────────────────────────────────────────────────────
 
 	private onQueueStatus(status: EntryStatus): void {
-		const translated = this.translate(status);
-		if (translated.kind === 'committed' || translated.kind === 'failed') this.retain(translated);
+		const outcome = status.kind === 'committed' || status.kind === 'failed' ? this.outcomeOf(status) : undefined;
+		const translated = outcome?.status ?? this.translate(status);
+		if (outcome !== undefined) this.retain(outcome);
 		notifyListeners(this.statusListeners, translated,
 			error => log('offline:status-listener-threw transaction=%s kind=%s: %o', translated.transactionId, translated.kind, error));
 		if (status.kind === 'failed') this.announceChanged(status.entryId, status.changedCollections);
-		if (translated.kind === 'committed' || translated.kind === 'failed') this.settle(translated);
+		if (outcome !== undefined) this.settle(outcome.status);
+	}
+
+	/**
+	 * The outcome the journal records for a terminal status, called by its `settled` just before the
+	 * queue emits the same status. Translating it reports a committed transaction's durability
+	 * ({@link committed}), so the translation is kept for {@link outcomeOf} rather than made twice: the
+	 * report then comes one call earlier than without a journal, still before the status is delivered.
+	 */
+	private journalOutcome(status: JournalSettledStatus): RetainedOutcome {
+		const outcome: RetainedOutcome = { at: this.now(), status: this.translateOutcome(status) };
+		this.journaledOutcomes.set(status.entryId, outcome);
+		return outcome;
+	}
+
+	/** A terminal status's outcome: the one {@link journalOutcome} translated, else translated now. */
+	private outcomeOf(status: JournalSettledStatus): RetainedOutcome {
+		const journaled = this.journaledOutcomes.get(status.entryId);
+		if (journaled === undefined) return { at: this.now(), status: this.translateOutcome(status) };
+		this.journaledOutcomes.delete(status.entryId);
+		return journaled;
 	}
 
 	/**
@@ -525,15 +556,13 @@ export class OfflineMode {
 		}
 	}
 
-	/** Every status the queue emits, in SQL terms. Reached only from the queue's own emission: the
-	 * `committed` arm reports the commit's durability to the bridge, once per drained commit. */
+	/** Every status the queue emits, in SQL terms; {@link onQueueStatus} takes a terminal one through
+	 * {@link outcomeOf} instead, so it is translated once. */
 	private translate(status: EntryStatus): QueuedTransactionStatus {
 		switch (status.kind) {
 			case 'queued':
 			case 'submitting':
 				return this.translateListed(status);
-			case 'committed':
-				return this.committed(status.entryId, status.durability);
 			case 'partially-committed':
 				return {
 					kind: 'partially-committed',
@@ -542,6 +571,18 @@ export class OfflineMode {
 					pendingTables: this.tablesOf(status.pendingCollections),
 					cause: status.cause,
 				};
+			case 'committed':
+			case 'failed':
+				return this.translateOutcome(status);
+		}
+	}
+
+	/** A terminal status in SQL terms. Reached once per settled entry, from {@link journalOutcome} or
+	 * {@link outcomeOf}: the `committed` arm reports the commit's durability to the bridge. */
+	private translateOutcome(status: JournalSettledStatus): TransactionOutcome {
+		switch (status.kind) {
+			case 'committed':
+				return this.committed(status.entryId, status.durability);
 			case 'failed':
 				return {
 					kind: 'failed',
@@ -571,6 +612,7 @@ export class OfflineMode {
 					waitingFor: status.waitingFor,
 					...(status.lastError === undefined ? {} : { lastError: status.lastError }),
 					...(status.committedCollections === undefined ? {} : { committedTables: this.tablesOf(status.committedCollections) }),
+					persisted: this.journal !== undefined,
 				};
 			case 'submitting':
 				return { kind: 'submitting', transactionId: status.entryId, attempt: status.attempt };
@@ -585,7 +627,7 @@ export class OfflineMode {
 	 * (docs/offline-sync.md §Durability reports and the full-replication event). The report is always
 	 * demanded, listeners or not, because `outcomes()` retains it.
 	 */
-	private committed(transactionId: string, durability: TransactionDurability): QueuedTransactionStatus {
+	private committed(transactionId: string, durability: TransactionDurability): TransactionOutcome {
 		const report = this.bridge.reportCommitDurability(transactionId, durability, true);
 		return Object.freeze({ kind: 'committed' as const, ...report });
 	}
@@ -597,6 +639,7 @@ export class OfflineMode {
 			queuedAt: entry.queuedAt,
 			tables: this.tablesOf(entry.collections),
 			...(entry.committedCollections === undefined ? {} : { committedTables: this.tablesOf(entry.committedCollections) }),
+			persisted: this.journal !== undefined,
 			status: this.translateListed(entry.status),
 		};
 	}
@@ -627,9 +670,9 @@ export class OfflineMode {
 
 	// ── retained outcomes ──────────────────────────────────────────────────────────────────────
 
-	private retain(status: TransactionOutcome): void {
+	private retain(outcome: RetainedOutcome): void {
 		this.pruneOutcomes();
-		this.retainedOutcomes.set(status.transactionId, { at: this.now(), status });
+		this.retainedOutcomes.set(outcome.status.transactionId, outcome);
 	}
 
 	// NOTE: walks every retained outcome on each access and each new outcome; fine while a machine
@@ -638,8 +681,18 @@ export class OfflineMode {
 	private pruneOutcomes(): void {
 		const cutoff = this.now() - this.outcomeRetentionMs;
 		for (const [transactionId, outcome] of this.retainedOutcomes) {
-			if (outcome.at <= cutoff) this.retainedOutcomes.delete(transactionId);
+			if (outcome.at > cutoff) continue;
+			this.retainedOutcomes.delete(transactionId);
+			this.deleteOutcomeRecord(transactionId);
 		}
+	}
+
+	/** Delete a transaction's outcome record from the journal, if there is one. Fire-and-forget and
+	 * logged on failure: it runs on read paths (`status`, `outcomes`) that must not throw for it, and a
+	 * record left behind is only an outcome a restart lists once more. */
+	private deleteOutcomeRecord(transactionId: string): void {
+		this.journal?.deleteOutcome(transactionId).catch(error =>
+			log('offline:journal-outcome-delete-failed transaction=%s: %o', transactionId, error));
 	}
 
 	private publishState(): void {

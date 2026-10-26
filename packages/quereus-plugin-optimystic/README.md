@@ -165,14 +165,16 @@ The listener runs synchronously, from the event that covered the commit's last b
 
 ### Offline mode — `plugin.offline`
 
-A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after stage 4 of that design, and says at the end what is still missing.
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands, partway through stage 5 of that design, and says at the end what is still missing.
 
-**A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
+**A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. With `journal` configured each queued transaction is saved on this machine before its commit resolves (see [Saving the queue on this machine](#saving-the-queue-on-this-machine--offlinejournal)); putting the saved transactions back after a restart is the next part of this stage, so for now a restart still leaves them unqueued.
 
 ```typescript
 const plugin = register(db, {
   default_transactor: 'network',
   offline: {
+    journal: () => new FileKVStore(path.join(dataDir, 'offline')), // save queued transactions in this IKVStore (or a function returning one); default: memory only
+    journalLabel: 'main',                       // keys the journal's records; give each Database sharing one store its own; default: 'default'
     expireAfterMs: 7 * 24 * 3600_000,          // fail a transaction unsettled this long with reason 'expired'; default: no limit
     outcomeRetentionMs: 7 * 24 * 3600_000,     // how long a terminal outcome stays in outcomes() / status(); default: 7 days
     recheck: { baseMs: 1_000, maxMs: 60_000 }, // advanced: the drain's re-check timer while the cohort is unreachable
@@ -185,11 +187,25 @@ plugin.offline.exit();               // transactions begun from now on are ackno
 await plugin.offline.whenDrained();  // resolves once the queue is empty; rejects with QueueDisposedError on plugin.dispose()
 ```
 
-`offline` and every key in it are optional. A key the plugin does not know is refused at `register`, so a misspelt option is an error rather than a silently different configuration; the persistence (`journal`) and solo-commit options of later stages are refused until they land. Object-typed, so it is passed through `register()`, like `rawStorageFactory`.
+`offline` and every key in it are optional. A key the plugin does not know is refused at `register`, so a misspelt option is an error rather than a silently different configuration; the solo-commit option of a later stage is refused until it lands. Object-typed, so it is passed through `register()`, like `rawStorageFactory`.
 
 The acknowledgement a transaction gets is fixed when it **begins**: `enter()` or `exit()` during an open transaction changes nothing about it. Leaving the mode does not stop the drain. Session mode and offline mode refuse each other in either order: `enter()` throws `OfflineModeRefusedError` while `configureTransactionMode` has been called, and `configureTransactionMode` throws `SessionModeRefusedError` while the mode is entered or transactions are still queued.
 
 A commit in offline mode seals every table it wrote into one queue entry, including a table's index trees. One shape cannot be queued and is acknowledged by the network instead, logged as `offline:local-ack-unavailable`: two tables declared over one collection URI written in one transaction. Everything else that holds for an online commit holds for the queued one: a commit that wrote nothing queues nothing, and the constraint and concurrent-modification refusals arrive as the same errors, on the `failed` status instead of out of `commit`.
+
+#### Saving the queue on this machine — `offline.journal`
+
+With `journal` set, every queued transaction is written to that store, and each write a promise depends on is flushed (`IKVStore.flush`) before the step it guards goes on:
+
+- **A commit resolves only once its transaction is saved.** What each table and index tree staged is flushed before `commit` returns, so "acknowledged" means "on disk". A write or flush that fails fails the commit with the store's error: the transaction is rolled back, as a network failure rolls it back, and nothing is queued or reported. The `queued` status and each item `entries()` lists carry `persisted: true` (`false` without a journal).
+- **Every send is recorded first.** Before each submission the queue flushes the action id it sends under and what it sends, so a restart re-sends the same write under the same id rather than a second copy. A record that cannot be written stops that submission before anything is sent; the transaction stays queued and is tried again after the backoff.
+- **Each terminal outcome is saved before it is reported**, and stays in the store until `acknowledge(transactionId)`, or until `outcomeRetentionMs` has passed and `status` or `outcomes` next looks. The transaction's other records are deleted once its outcome is written.
+
+The cost is one flush per commit, one per submission and one per terminal outcome, each waiting for the store to sync; deletes are not flushed, so a crash can bring back a record already deleted, which the restore of the next part of this stage resolves. A network-acknowledged commit waiting behind the queue is saved like any queued transaction. The records hold the transaction's rows, so protect the store as you protect block storage.
+
+`journal` takes any `IKVStore` — `FileKVStore` from `@optimystic/db-p2p-storage-fs`, the IndexedDB, React Native and NativeScript stores, or the instance the node uses as its `kvStore`. Its keys all start with `optimystic-offline/`, which is in db-p2p's `NODE_KV_NAMESPACES`, so a file store sharing a directory with block storage never mistakes them for blocks. A store without `flush` is accepted, since the interface defines that as "every write is already durable". A `MemoryKVStore` is refused: a journal lost with the process is the configuration without one, so leave `journal` off instead. A `journal` given as a function is called once, inside `register`.
+
+The records are keyed under `optimystic-offline/<journalLabel>/`. **Two `Database`s over one store need two labels**: two with the same label list and delete each other's records, which corrupts both queues, and nothing in the store can detect it. The label is letters, digits, `_` and `-`, and is refused without a `journal`.
 
 #### Reading while the other machines cannot be reached
 
@@ -264,7 +280,7 @@ const unsubscribe = plugin.offline.onStatus(status => {
 ```
 
 - `transactionId` is what `StampId()` returned inside the transaction. `tables` names the tables it changed, as `schema.table`.
-- `queued` is delivered synchronously inside the commit, before `db.exec` resolves, by the rule `onCommitDurability` uses, which is how an autocommit statement's caller learns the id it never selected. It carries `seq` (the drain order), `waitingFor` (`'earlier-entry'`, `'cohort'`, `'backoff'`, or undefined for the head about to be sent), `attempts`, `inDoubt` (an attempt may have landed), `lastError`, and `committedTables` once part of the transaction has committed. It is delivered again whenever one of those changes.
+- `queued` is delivered synchronously inside the commit, before `db.exec` resolves, by the rule `onCommitDurability` uses, which is how an autocommit statement's caller learns the id it never selected. It carries `seq` (the drain order), `waitingFor` (`'earlier-entry'`, `'cohort'`, `'backoff'`, or undefined for the head about to be sent), `attempts`, `inDoubt` (an attempt may have landed), `lastError`, `committedTables` once part of the transaction has committed, and `persisted` (it is saved in the journal). It is delivered again whenever one of those changes.
 - `committed` is the `SqlCommitDurability` an online commit reports (`durability`, `tables`, `followed`) with `kind` added. `onCommitDurability` listeners received that same report a moment earlier, and `onCommitFullyHeld` follows the commit exactly as it follows an online one. Unlike an online report it arrives during no `db.exec`; the transaction id is the attribution.
 - `partially-committed` names the `committedTables` the network already holds and the `pendingTables` the next submission drives; the transaction stays queued, in doubt.
 - `failed` carries `reason` (`'constraint'`, `'concurrent-modification'`, `'rejected'`, `'too-large'`, `'expired'`, `'discarded'`), `error` as an online commit would have thrown it (a `ConstraintError` reading `UNIQUE constraint failed: …`, a `ConcurrentModificationError`, with the db-core refusal reachable through `cause`), `changedTables` (whose rows the removal changed), `causedBy` naming the earlier transaction whose removal made this one fail, and `committedTables` when part of it had committed first — the network then holds half of the transaction.
@@ -288,7 +304,7 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 
 #### Not yet in this stage
 
-- **Nothing survives a restart.** Queued transactions and retained outcomes live in memory.
+- **Queued transactions are journaled but not yet restored after a restart.** With `journal` configured the store holds every queued transaction and retained outcome across a restart, but nothing reads them back yet; without it they live in memory.
 - **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally. On a networked node a pull whose every request fails in transport, rather than being answered, ends in a plain `Some peers did not complete` error that the read does not recognise as unreachability, so that read fails instead; the consequence for `discard` is above. A later stage adds the check both consult.
 - **No SQL view of the queue.** `plugin.offline.entries()` is the only listing; an `optimystic_queue` virtual table is in the backlog.
 
