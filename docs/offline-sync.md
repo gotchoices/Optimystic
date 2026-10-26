@@ -1203,7 +1203,7 @@ catalog content.
 In the plugin the check is `OfflineMode.assertNoQueuedEntries`, which reads a table's collections
 from the bridge's collection-to-table record (`TransactionBridge.collectionsOf`) and throws
 `QueuedEntriesBlockSchemaChangeError` (`StatusCode.BUSY`, with the table, the operation and the
-queued transaction ids in queue order) when a queued entry wrote any of them; an entry being
+queued transaction ids in queue order, then any failed one whose removal is still dropping its segments) when a queued entry wrote any of them; an entry being
 submitted or in doubt counts like any other. The DDL hooks of `OptimysticModule` call it after
 draining the pending catalog tag writes and before writing anything, so inside `apply schema` a
 refused step stages nothing into the catalog batch and the engine unwinds the apply as for any

@@ -33,8 +33,8 @@ export type {
 	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
 } from './optimystic-adapter/commit-durability.js';
 // Offline mode (README § Offline mode): the controller under `plugin.offline`, its two refusals, the
-// timeout a commit waiting behind the queue throws, the refusal of DDL while queued transactions wrote the table, the db-core errors its queries throw, and the
-// statuses it reports. Exported from `./plugin` too.
+// timeout a commit waiting behind the queue throws, the refusal of DDL while queued transactions wrote
+// the table, the db-core errors its queries throw, and the statuses it reports. Exported from `./plugin` too.
 export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError, OfflineCommitTimeoutError, QueuedEntriesBlockSchemaChangeError } from './optimystic-adapter/offline-mode.js';
 export type { StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 export type { OfflineConfig } from './optimystic-adapter/offline-config.js';

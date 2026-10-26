@@ -76,8 +76,9 @@ export type StorageShapeChange = 'create table' | 'create index' | 'drop index' 
  * wrote it are still queued (docs/offline-sync.md §Schema changes): an index built now would index
  * rows the network does not hold yet, and a queued transaction carries no write for an index added
  * after it. Nothing was written; the same statement succeeds once the transactions settle
- * (`plugin.offline.whenDrained()`). {@link transactionIds} lists them in queue order — one being
- * submitted, or in doubt, counts like any other.
+ * (`plugin.offline.whenDrained()`). {@link transactionIds} lists the queued ones in queue order — one
+ * being submitted, or in doubt, counts like any other — then any failed one whose removal is still
+ * dropping its rows from this machine's view.
  *
  * Carries `StatusCode.BUSY`: the statement was not judged wrong, it has to wait.
  */
@@ -246,7 +247,8 @@ export class OfflineMode {
 	 * Refuse `operation`, a change to how `table`'s rows are stored, while any queued transaction wrote
 	 * one of the table's collections — its main tree or an index tree, as the bridge recorded them
 	 * (`TransactionBridge.collectionsOf`). Called by each such DDL hook before it writes anything.
-	 * @throws QueuedEntriesBlockSchemaChangeError naming those transactions in queue order.
+	 * @throws QueuedEntriesBlockSchemaChangeError naming those transactions (queued ones in queue order,
+	 * then any whose removal is still in progress).
 	 */
 	assertNoQueuedEntries(table: QualifiedTableName, operation: StorageShapeChange): void {
 		const collections = new Set(this.bridge.collectionsOf(table));
@@ -256,6 +258,10 @@ export class OfflineMode {
 			.map(entry => entry.id);
 		// A failed entry leaves the queue at once, while its removal is still dropping its segments; until
 		// the drops finish its rows are still in this machine's view, so a segment still sealed counts too.
+		// NOTE: the registry holds one instance per collection id, the last registered; with two tables
+		// declared over one URI this reads the other table's instance and can miss a removal still in
+		// progress. Only that window is affected (the queue arm above is per entry); revisit if two
+		// tables over one URI become a supported shape.
 		const registry = this.bridge.getCollectionRegistry();
 		const stillSealed = [...collections].flatMap(id => registry.get(id)?.sealedEntries() ?? []);
 		const blocking = [...new Set([...listed, ...stillSealed])];
