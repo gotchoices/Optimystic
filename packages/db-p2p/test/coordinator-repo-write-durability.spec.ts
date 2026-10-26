@@ -16,9 +16,9 @@ import { expect } from 'chai';
 import type {
 	IRepo, IKeyNetwork, ClusterPeers, BlockGets, GetBlockResults, PendRequest, PendResult, CommitRequest, CommitResult,
 	ActionBlocks, MessageOptions, BlockId, ClusterRecord, RepoMessage, StaleFailure, FindCoordinatorOptions, WriteDurability,
-	BlockDurabilityReachedEvent
+	BlockDurabilityReachedEvent, SoloRefusalReason
 } from '@optimystic/db-core';
-import { isFullyDurable, localDurability } from '@optimystic/db-core';
+import { isFullyDurable, isShortfallFailure, localDurability } from '@optimystic/db-core';
 import type { PeerId } from '@libp2p/interface';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
@@ -77,6 +77,8 @@ interface SeamOptions {
 	onBlockDurabilityReached?: (event: BlockDurabilityReachedEvent) => void;
 	/** What the key network says belongs in the cohort but is missing from it; absent → it cannot say. */
 	absentMembers?: readonly string[];
+	/** Whether the key network is still waiting to hear from a configured bootstrap peer; absent → it cannot say. */
+	awaitingBootstrap?: boolean;
 }
 
 /**
@@ -99,7 +101,8 @@ const makeRepo = (storage: IRepo, self: PeerId | undefined, seam: SeamOptions): 
 		async findCluster(_key: Uint8Array): Promise<ClusterPeers> {
 			return Object.fromEntries(responsibilityView.map(id => [id, { multiaddrs: [], publicKey: '' }]));
 		},
-		...(seam.absentMembers === undefined ? {} : { absentCohortMembers: async () => [...seam.absentMembers!] })
+		...(seam.absentMembers === undefined ? {} : { absentCohortMembers: async () => [...seam.absentMembers!] }),
+		...(seam.awaitingBootstrap === undefined ? {} : { awaitingBootstrapContact: async () => seam.awaitingBootstrap! })
 	};
 	const repo = coordinatorRepo(keyNetwork, (_p: PeerId) => ({} as unknown as ClusterClient), { clusterSize: 3 })({
 		storageRepo: storage,
@@ -201,6 +204,29 @@ describe('CoordinatorRepo — a successful write says who holds it', () => {
 
 			expect(result.success).to.equal(false);
 			expect(result).to.not.have.property('durability');
+		});
+
+		it('a pend that asked not to be committed alone is refused as a shortfall naming why, unless this node is genuinely alone', async () => {
+			const partner = (await makePeerId()).toString();
+			const other = (await makePeerId()).toString();
+			const cases: [SeamOptions, SoloRefusalReason | undefined][] = [
+				[{ cohort: { resolved: true, peerIds: [selfId] }, absentMembers: [partner] }, 'absent-members'],
+				[{ cohort: { resolved: true, peerIds: [selfId] }, absentMembers: [], awaitingBootstrap: true }, 'awaiting-bootstrap'],
+				[{ cohort: { resolved: false, reason: 'findCluster threw' } }, 'unrouted'],
+				[{ cohort: { resolved: true, peerIds: [other] } }, 'unrouted'],
+				[{ cohort: { resolved: true, peerIds: [selfId] }, absentMembers: [], awaitingBootstrap: false }, undefined]
+			];
+			for (const [seam, reason] of cases) {
+				const result = await makeRepo(storageRepo(), self, seam).pend({ ...PEND, refuseSolo: true });
+				if (reason === undefined) {
+					expect(successOf(result).durability.quorum, 'genuinely alone: a correct one-machine write').to.equal('local');
+					continue;
+				}
+				if (result.success || !isShortfallFailure(result)) throw new Error(`expected a shortfall, got ${JSON.stringify(result)}`);
+				expect(result.shortfall.soloRefused, JSON.stringify(seam)).to.equal(reason);
+				expect(result.shortfall.silentPeers).to.deep.equal(reason === 'absent-members' ? [partner] : []);
+				expect(result.shortfall.approvals, 'short of the bar').to.be.below(result.shortfall.needed);
+			}
 		});
 
 		it('a commit that asked not to be committed alone is refused, conflict-shaped, while a member is known absent — and nothing is applied', async () => {
