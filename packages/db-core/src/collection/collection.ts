@@ -409,10 +409,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * a poll of many collections whose logs stayed on their blocks is one request, however many it
 	 * names; the per-block judgement is {@link readLogEnds}'s, through the same helpers.
 	 *
-	 * A request that throws is not every collection's failure: `NetworkTransactor.get` fails as a
-	 * whole when any block in it gets no answer, so {@link readAttributed} then reads each block
-	 * alone and only the collections whose blocks failed report an error. That fallback costs what
-	 * reading each collection separately costs, and only when a request fails. */
+	 * A block no coordinator answered comes back flagged and fails only its own collection, through
+	 * the per-block judgement. A request that throws as a whole — `NetworkTransactor.get` does when a
+	 * coordinator's answer leaves a block out — is not every collection's failure either:
+	 * {@link readAttributed} then reads each block alone and only the collections whose blocks failed
+	 * report an error. That fallback costs what reading each collection separately costs, and only
+	 * when a request fails. */
 	static async readCommittedTails(transactor: ITransactor, queries: ReadonlyArray<CommittedTailQuery>): Promise<Map<CollectionId, CommittedTailAnswer>> {
 		const knownTails = new Map(queries.map(query => [query.id, query.knownTailId]));
 		const ends = await Collection.readAttributed(transactor,
@@ -2762,13 +2764,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * than kept, because nothing proves it is current at the revision the refresh will pin to.
 	 *
 	 * Both answers pass {@link answeredBlock}'s checks as unpinned reads, header first, so a doubted
-	 * header or tail throws exactly as it would through {@link TransactorSource.tryGet}.
-	 *
-	 * NOTE: a batched get fails as a whole when any block in it gets no answer
-	 * (`NetworkTransactor.get` throws on a missing id), so an unreachable out-of-date tail fails a
-	 * refresh that would not have needed it. Harmless today: the log has no checkpoints, so a
-	 * refresh that finds a new tail walks back through the old one anyway. If checkpoints start
-	 * letting that walk stop short, read the known tail in its own request instead.
+	 * header or tail throws exactly as it would through {@link TransactorSource.tryGet}. An
+	 * out-of-date tail no coordinator answered comes back flagged (`NetworkTransactor.get` flags that
+	 * one block rather than failing the request), and its answer is dropped unjudged.
 	 *
 	 * `tailFloor` (see {@link updateInternal}) goes on whichever request reads the tail — never on
 	 * the header, which is rewritten only when the tail rolls over or the collection changes it

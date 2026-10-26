@@ -2460,7 +2460,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `GetBlockResult` carries an optional `unavailable` field
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)) that a repo sets ONLY when it
   knows its own answer is a guess; an absent field means authoritative, so every producer that
-  never sets it (including `TestTransactor`) keeps its existing meaning. Two producers set it:
+  never sets it (including `TestTransactor`) keeps its existing meaning. Three producers set it:
   `StorageRepo.get` flags `'unmaterializable'` when the block reads as absent but this node holds
   records proving it exists — the missing-base promotion refusal above, a `getBlock()` throw on a
   `latest` this node cannot materialize (truncated history, or a failed restore of a revision whose
@@ -2488,6 +2488,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
   | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
+
+  The third producer is the transactor, one layer up. `NetworkTransactor.get` returns a block for
+  which no coordinator it asked gave any response — every request carrying it threw, timed out or
+  was still in flight at the deadline, through its second-chance round — as `'peers-unreachable'`
+  with no block, the reason the table gives a consult that threw, so the read of that block fails
+  typed while the other blocks of the same read are returned. A coordinator that responded and left
+  a requested block out is a protocol fault rather than unreachability, and still fails the whole
+  read with its `Some peers did not complete` aggregate.
 
   Note the second row: `'cohort-unreachable'` is *silence from machines this node knows about*, not
   isolation in general. A node whose routing view yields no cohort member at all, and whose

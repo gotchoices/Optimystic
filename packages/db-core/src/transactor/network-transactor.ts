@@ -426,20 +426,34 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				}
 			}
 		}
-		// Ensure we have at least one response per requested block id
-		const missingIds = distinctBlockIds.filter(bid => !resultEntries.has(bid));
-		if (missingIds.length > 0) {
-			log('get:missing blockIds=%o', missingIds);
+		// A block with no entry is one of two things. When no batch carrying it got any response — each
+		// threw, timed out or was still in flight at the deadline — no coordinator was heard from, the
+		// `'peers-unreachable'` answer `CoordinatorRepo` gives for a consult that threw: flagged, so the
+		// read of THAT block fails typed (`BlockUnavailableError`) while its siblings are returned. When
+		// some coordinator responded and left it out, that is a protocol fault, not unreachability, and
+		// fails the whole read as it always has. Flagged entries are added after the merge, so they
+		// never compete with a real answer.
+		const responded = respondedBlocks(batches);
+		const omittedIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && responded.has(bid));
+		const unansweredIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && !responded.has(bid));
+		const rootCause = firstBatchError(batches) ?? error;
+		if (omittedIds.length > 0) {
+			log('get:missing blockIds=%o', omittedIds);
 			const details = this.formatBatchStatuses(batches,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const rootCause = firstBatchError(batches) ?? error;
 			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
 			(aggregate as any).cause = rootCause;
 			throw aggregate;
+		}
+		if (unansweredIds.length > 0) {
+			log('get:unanswered blockIds=%o root=%s', unansweredIds, errorMessage(rootCause));
+			for (const bid of unansweredIds) {
+				resultEntries.set(bid, { state: {}, unavailable: 'peers-unreachable' } satisfies GetBlockResult);
+			}
 		}
 
 		log('get:done blockIds=%d ms=%d', distinctBlockIds.length, Date.now() - t0);
@@ -1610,7 +1624,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		} catch (e) {
 			error = asError(e);
 		}
-		return { batches, discharged: dischargedBlocks(batches), error };
+		return { batches, discharged: respondedBlocks(batches), error };
 	}
 
 	/**
@@ -1666,17 +1680,18 @@ function bestCoveringPeer(peerBlocks: Map<string, BlockId[]>, uncovered: Set<Blo
 }
 
 /**
- * The block ids some batch in the tree got an ANSWER for. A cancel batch that errored, or never
- * responded, discharged nothing — its blocks' pending records are still standing. Batch payloads
- * are block-id lists (built with {@link mergeBlocks}), including the retry batches
- * `processBatches` re-homes, so the union across the whole tree is the discharged set.
+ * The block ids some batch in the tree got an ANSWER for, whatever the answer said. A cancel batch
+ * that errored, or never responded, discharged nothing — its blocks' pending records are still
+ * standing — so for a cancel this is the discharged set. For a read it separates a block no
+ * coordinator answered from one a coordinator answered without. Batch payloads are block-id lists,
+ * including the retry batches `processBatches` re-homes, so the union across the whole tree counts.
  */
-function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<BlockId> {
-	const discharged = new Set<BlockId>();
+function respondedBlocks<TResponse>(batches: CoordinatorBatch<BlockId[], TResponse>[]): Set<BlockId> {
+	const responded = new Set<BlockId>();
 	for (const b of allBatches(batches, bb => bb.request?.isResponse === true)) {
-		for (const bid of b.payload) discharged.add(bid);
+		for (const bid of b.payload) responded.add(bid);
 	}
-	return discharged;
+	return responded;
 }
 
 /**

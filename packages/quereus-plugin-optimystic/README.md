@@ -312,7 +312,7 @@ plugin.offline.acknowledge(transactionId); // forget one retained outcome
 
 #### Not yet in this stage
 
-- **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally. On a networked node a pull whose every request fails in transport, rather than being answered, ends in a plain `Some peers did not complete` error that the read does not recognise as unreachability, so that read fails instead; the consequence for `discard` is above. A later stage adds the check both consult.
+- **No check that the other machines can be reached before trying.** The drain sends the head transaction at once, and a live read in offline mode pulls every time, paying the network's timeouts before it is served locally. The consequence for `discard` is above. A later stage adds the check both consult.
 - **No SQL view of the queue.** `plugin.offline.entries()` is the only listing; an `optimystic_queue` virtual table is in the backlog.
 
 ## Reactive Watching

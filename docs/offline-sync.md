@@ -1067,7 +1067,10 @@ tables whose policy is `'queue'`:
 
 - A live read whose refresh fails for unreachability (the same classification as the drain's
   "cohort unreachable" row) serves this machine's view — committed blocks it holds plus every queued
-  entry — and sets `readsServedLocally` on the queue state.
+  entry — and sets `readsServedLocally` on the queue state. That includes a refresh in which no
+  machine answered at all for some block, every request for it having failed in transport:
+  `NetworkTransactor.get` reports that block `peers-unreachable` rather than failing the read
+  untyped.
 - While the reachability gate reports the cohort unreachable, a live read skips the refresh instead
   of paying the dial timeouts on every read. The gate is asked on every read, so the first read after
   it answers reachable refreshes again.

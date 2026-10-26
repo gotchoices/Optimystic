@@ -1626,11 +1626,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     try {
       await tree.update();
     } catch (error) {
-      // NOTE: a `network` transactor whose every request fails in transport throws the untyped
-      // `Some peers did not complete` aggregate, which this does not absorb — the drain's rule sorts
-      // it `unknown` too. Stage 6's gate (ticket `offline-sync-cohort-reachability`) skips the refresh
-      // first; if reads still meet the aggregate with the gate wired, type that failure in
-      // `NetworkTransactor.get` rather than widening this predicate.
+      // A block whose every request failed in transport is typed by the transactor itself
+      // (`NetworkTransactor.get` flags it `peers-unreachable`), so this predicate covers it.
       if (!isCohortUnreachableRead(error)) throw error;
       this.servedLocally(offline, error.reason);
       return;
