@@ -14,8 +14,9 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability, withBlockRevs } from "../network/durability.js";
-import { highestStaleAt, isExpiryFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
+import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
 import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, ICollection, SyncOptions, TornActionReason } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { ActionContext } from "./action.js";
@@ -2073,6 +2074,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 					// tracked with the other leftover-entry exits in
 					// tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
 					throw new TransactionExpiredError(attempt.expired);
+				}
+				if (isShortfallFailure(attempt)) {
+					// Too few cohort members answered the promise round, and every coordinator of the
+					// cohort meets the same silent members, so a retry would fall short the same way.
+					// Stopped by name, as an expiry is, with nothing on this instance touched. Only a pend
+					// answers this way, so nothing of the attempt was stored.
+					throw new PromiseShortfallError(attempt.shortfall);
 				}
 				consecutiveFailures++;
 				lastReason = attempt.reason ?? lastReason;

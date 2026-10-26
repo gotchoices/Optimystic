@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, TransactionExpiredError, canonicalJson, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, canonicalJson, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -1012,11 +1012,19 @@ export class ClusterCoordinator {
 			// broadcast would be an unauthenticated "forget this" that any caller could use to clear a
 			// live transaction out of a member's reservation table. Members that DID vote are freed by
 			// their own staleness sweep instead.
-			// NOTE: the message below is load-bearing wire text — the consuming repo
-			// (sereus cadre-core control-write-retry) matches it verbatim to retry a genuinely-silent
-			// cohort. Keep it byte-identical, and never fold `conflict` or `held` votes into its
-			// rejection count.
-			throw new Error(`Failed to get super-majority: ${approvalCount}/${peerCount} approvals (needed ${superMajority}, ${rejectionCount} rejections)`);
+			// NOTE: `PromiseShortfallError`'s message is the sentence this branch has always thrown, kept
+			// byte-identical because a downstream repository (sereus cadre-core control-write-retry)
+			// matches it to retry a genuinely-silent cohort. Consumers here test `instanceof
+			// PromiseShortfallError`, or `isShortfallFailure` on the refusal `CoordinatorRepo.pend`
+			// returns for it — never the text. Never fold `conflict` or `held` votes into its rejection
+			// count: they are peeled off above.
+			throw new PromiseShortfallError({
+				approvals: approvalCount,
+				rejections: rejectionCount,
+				peerCount,
+				needed: superMajority,
+				silentPeers: Object.keys(peers).filter(peerId => promises[peerId] === undefined),
+			});
 		}
 
 		// Mark as disputed when minority rejections exist but super-majority approves

@@ -4,6 +4,7 @@ export * from "./block-size.js";
 export * from "./durability.js";
 export * from "./i-repo.js";
 export * from "./lineage.js";
+export * from "./promise-shortfall-error.js";
 export * from "./repo-protocol.js";
 export * from "./routing-key.js";
 export * from "./stale-failure.js";

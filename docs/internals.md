@@ -1422,8 +1422,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reading, folded into the signed bytes (`clusterVoteSigningPayload`); the timer-driven
   `handleExpiration` signs the same vote. The reason is the same one that makes a checker fault a
   reject rather than an escape: a throw reaches the coordinator as silence — no vote, a
-  `ConsensusTimeout` penalty against an honest member, and the "super-majority" shortfall a writer
-  retries as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
+  `ConsensusTimeout` penalty against an honest member, and the promise shortfall
+  (`PromiseShortfallError`) a writer stops on as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
   `TransactionExpiredError` (db-core's, the one class every layer raises — deliberately not a
   `ValidatorRejectionError`) when every reject that sank the transaction is an expiry vote, which
   `CoordinatorRepo` returns to the writer as an `ExpiredFailure` (see *Pend retryability is an
@@ -1720,16 +1720,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
   aggregate refusal from the per-batch responses (`refusalFrom`, which the commit side shares), so
   it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict. The
   commit side is deliberately untouched: it keys on `CommitResult` shape (next bullet).
-  **Beside `conflict` sits the one refusal that is never retryable: an expiry.** A pend or commit the
-  cohort refused because the transaction had already expired by its members' clocks comes back as
-  its own failure shape, `ExpiredFailure` (a sibling of `StaleFailure` in `PendResult` and
-  `CommitResult`, carrying the clocks as `TransactionExpiry`), decided by the one predicate
-  `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and `.commit` return it ahead of their
-  stale classifiers, because a thrown answer reaches a remote writer as a reset stream; the rebuild
-  makes an expiry in any batch the whole answer; `isConflictFailure` is false for it; and
-  `Collection.syncAttempts`, `TransactionCoordinator`'s pend phase and its commit phase all stop on
-  it with `TransactionExpiredError` instead of re-driving — a retry's expiration comes from the same
-  clock. See [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  **Beside `conflict` sit the two refusals that are never retryable: an expiry and a promise
+  shortfall.** A pend or commit the cohort refused because the transaction had already expired by
+  its members' clocks comes back as its own failure shape, `ExpiredFailure` (a sibling of
+  `StaleFailure` in `PendResult` and `CommitResult`, carrying the clocks as `TransactionExpiry`),
+  decided by the one predicate `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and
+  `.commit` return it ahead of their stale classifiers, because a thrown answer reaches a remote
+  writer as a reset stream; the rebuild makes an expiry in any batch the whole answer;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts`, `TransactionCoordinator`'s
+  pend phase and its commit phase all stop on it with `TransactionExpiredError` instead of
+  re-driving — a retry's expiration comes from the same clock. See
+  [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  A pend whose promise round fell short because too few cohort members answered — no conflict or
+  held vote, too few rejections for a rejection — comes back the same way, as `ShortfallFailure`
+  (carrying `approvals`, `rejections`, `peerCount`, `needed` and the `silentPeers` that cast no vote,
+  as `PromiseShortfall`), decided by `isShortfallFailure`: `ClusterCoordinator` raises
+  `PromiseShortfallError`, `CoordinatorRepo.pend` returns it ahead of the stale classifier, the
+  rebuild makes a shortfall in any batch the answer when no batch expired, `isConflictFailure` is
+  false for it, and `Collection.syncAttempts` and `TransactionCoordinator`'s pend phase stop on it by
+  name — every coordinator of that cohort meets the same silent members. The error's message is the
+  sentence the coordinator always threw ("Failed to get super-majority: …"), kept byte-identical for
+  a downstream repository that matches it. Two consequences of returning rather than throwing: the
+  writer's transactor no longer re-picks another coordinator for a shortfall (the accepted-tradeoff
+  `NOTE:` in `CoordinatorRepo.pendThroughCluster`), and a local writer meets the error itself rather
+  than as the `cause` of a `Some peers did not complete` aggregate. **A pend answer only:**
+  `CoordinatorRepo.commit` still throws a commit-phase shortfall, because the commit side reads a
+  returned refusal as a confirmed conflict (the `NOTE:` at its catch).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its

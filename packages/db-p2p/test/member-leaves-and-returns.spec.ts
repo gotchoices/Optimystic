@@ -273,9 +273,9 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 
 				expect(refusal, `with C away B's write must be refused (it returned ${JSON.stringify(durability)})`).to.not.equal(undefined);
 				const shortfall = expectPromiseShortfall(refusal);
-				expect(shortfall, 'the numbers an application would branch on').to.deep.equal({ approvals: 2, peers: MACHINES, needed: MACHINES, rejections: 0 });
+				expect(shortfall, 'the numbers an application would branch on').to.deep.equal({ approvals: 2, rejections: 0, peerCount: MACHINES, needed: MACHINES, silentPeers: [c.peerId.toString()] });
 				expect(committed(phaseAttempts), 'a refused write commits nothing').to.deep.equal([]);
-				report.refusal = `refused (${shortfall.approvals}/${shortfall.peers} promises) in ${refusalMs}ms`;
+				report.refusal = `refused (${shortfall.approvals}/${shortfall.peerCount} promises) in ${refusalMs}ms`;
 
 				await expectReadable([a, b], acknowledged, 'A and B with C away');
 				for (const reader of [a, b]) {

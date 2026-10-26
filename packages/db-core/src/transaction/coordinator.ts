@@ -1,9 +1,10 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability, BlockContentDigests } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { isConflictFailure, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
+import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
@@ -53,20 +54,21 @@ class PendRejectedError extends Error {
 }
 
 /** The error a refused pend of `collectionIds` stands for: its expiry — never retried, since a re-drive's
- * expiration comes from the same clock — or a rejection carrying whether a re-read can clear it.
+ * expiration comes from the same clock — or its promise shortfall — never retried, since a re-drive
+ * meets the same silent members — or a rejection carrying whether a re-read can clear it.
  * Retryability comes from the response itself: a producer that classified the failure sets `conflict`,
  * and only where none did is it inferred from `missing`/`pending` (`isConflictFailure`). */
-function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): TransactionExpiredError | PendRejectedError {
-	return isExpiryFailure(refusal)
-		? new TransactionExpiredError(refusal.expired)
-		: new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
+function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): TransactionExpiredError | PromiseShortfallError | PendRejectedError {
+	if (isExpiryFailure(refusal)) return new TransactionExpiredError(refusal.expired);
+	if (isShortfallFailure(refusal)) return new PromiseShortfallError(refusal.shortfall);
+	return new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
 }
 
 /** A transaction refused before anything was sent: its pend, or a block it would leave, too large to send. */
 type TooLargeError = TransactionTooLargeError | BlockTooLargeError;
 
 /** How the pend phase failed. */
-type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; tooLarge?: TooLargeError };
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
 
 /** Per collection, what its commit declares about its blocks (`CommitRequest.blockDigests`), described
  * once before the pend ({@link TransactionCoordinator.declareTouchedBlocks}). */
@@ -77,19 +79,21 @@ type DeclaredDigests = ReadonlyMap<CollectionId, BlockContentDigests>;
  * The error text is the first reason's. The attempt is a retryable clean stale loss only if at least one
  * reason was a conflicting pend ({@link PendRejectedError}`.conflict`) AND none was a hard failure: a
  * single hard failure (storage/policy rejection, or a thrown/unavailable transactor) will not clear on a
- * re-read, so re-driving it would just burn the retry budget. An expiry, and a pend or a block too large
- * to send, are hard failures carried whole: each is the error the commit surfaces.
+ * re-read, so re-driving it would just burn the retry budget. An expiry, a promise shortfall, and a pend
+ * or a block too large to send, are hard failures carried whole: each is the error the commit surfaces.
  */
 function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const first = reasons[0];
 	const conflicts = reasons.filter(reason => reason instanceof PendRejectedError && reason.conflict);
 	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
+	const shortfall = reasons.find((reason): reason is PromiseShortfallError => reason instanceof PromiseShortfallError);
 	const tooLarge = reasons.find((reason): reason is TooLargeError => reason instanceof TransactionTooLargeError || reason instanceof BlockTooLargeError);
 	return {
 		success: false,
 		error: first instanceof Error ? first.message : String(first),
 		staleLoss: conflicts.length > 0 && conflicts.length === reasons.length,
 		...(expired === undefined ? {} : { expired }),
+		...(shortfall === undefined ? {} : { shortfall }),
 		...(tooLarge === undefined ? {} : { tooLarge }),
 	};
 }
@@ -182,6 +186,9 @@ type CoordinationResult =
 		/** Present when a pend or a commit was refused because the transaction had expired by the
 		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
 		expired?: TransactionExpiredError;
+		/** Present when a pend was refused because too few cohort members answered its promise round:
+		 * the error the commit surfaces, never a stale loss. */
+		shortfall?: PromiseShortfallError;
 		/** Present when the transaction was refused before anything was sent because its pend, or a block
 		 * it would leave, was too large to send: the error the commit surfaces, never a stale loss. */
 		tooLarge?: TooLargeError;
@@ -426,7 +433,8 @@ export class TransactionCoordinator {
 	 * unavailable transactor, unreachable cluster) also propagates without retry — including a pend
 	 * or commit the cohort refused because the transaction had expired by its members' clocks, which
 	 * surfaces as {@link TransactionExpiredError} (inside a partial commit's `reason` once a sibling
-	 * has landed).
+	 * has landed), and a pend too few of the cohort's members answered, which surfaces as
+	 * {@link PromiseShortfallError}.
 	 *
 	 * A participant can also be SAVED between attempts: an attempt that reported a loss may still
 	 * have stored that participant's log tail, and the refresh before the next attempt then finishes
@@ -988,6 +996,10 @@ export class TransactionCoordinator {
 			// expiration from the same clock.
 			if (coordResult.expired !== undefined) {
 				throw coordResult.expired;
+			}
+			// So is a promise shortfall: the retry's pend would meet the same silent members.
+			if (coordResult.shortfall !== undefined) {
+				throw coordResult.shortfall;
 			}
 			if (coordResult.tooLarge !== undefined) {
 				throw coordResult.tooLarge;

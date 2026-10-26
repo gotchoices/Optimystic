@@ -228,6 +228,9 @@ export type StaleFailure = {
 	staleAt?: { blockId: BlockId; rev: number };
 	/** Never set on a lost race — an expiry is its own failure shape, {@link ExpiredFailure}. */
 	expired?: never;
+	/** Never set on a lost race — a cohort too few of whose members answered is its own failure
+	 *  shape, {@link ShortfallFailure}. */
+	shortfall?: never;
 };
 
 /**
@@ -264,10 +267,52 @@ export type ExpiredFailure = {
 	missing?: never;
 	pending?: never;
 	staleAt?: never;
+	shortfall?: never;
+};
+
+/**
+ * Why a cohort's promise round fell short with no member refusing it as a lost race or a held block,
+ * and too few rejecting it for a rejection: too few members answered. Plain data, so it crosses the
+ * JSON repo protocol intact. `PromiseShortfallError` is built from it, wherever it is raised.
+ */
+export type PromiseShortfall = {
+	/** Approve votes the round received. */
+	approvals: number;
+	/** Reject votes the round received — fewer than would make the round a rejection. */
+	rejections: number;
+	/** How many members the cohort the round ran on has. */
+	peerCount: number;
+	/** The approvals the round needed: `ceil(peerCount × superMajorityThreshold)`. */
+	needed: number;
+	/** Peer-id strings of the cohort members that cast no promise vote at all. */
+	silentPeers: string[];
+};
+
+/**
+ * The cohort refused the pend because too few of its members ANSWERED the promise round for it to
+ * reach its bar — silence, not a judgement of the write and not a lost race. Not retryable by a write
+ * path: every coordinator of that cohort meets the same silent members, so a re-read and re-pend fails
+ * the same way until they come back. A sibling of {@link StaleFailure} and {@link ExpiredFailure},
+ * with the fields it can never carry typed `never`, so a consumer reads `reason`, `missing` or
+ * `staleAt` off any of them unnarrowed. Tell it apart with `isShortfallFailure`, never by reading
+ * `reason`. A pend answer only: a commit that falls short is still thrown (see
+ * `CoordinatorRepo.commit`).
+ */
+export type ShortfallFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: silence is not a conflict a re-read can win. */
+	conflict: false;
+	shortfall: PromiseShortfall;
+	missing?: never;
+	pending?: never;
+	staleAt?: never;
+	expired?: never;
 };
 
 /** Every way a pend or a commit can be refused with an answer rather than a throw. */
-export type WriteFailure = StaleFailure | ExpiredFailure;
+export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure;
 
 export type PendResult = PendSuccess | WriteFailure;
 

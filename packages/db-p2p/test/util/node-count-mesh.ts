@@ -21,9 +21,9 @@
  */
 import { expect } from 'chai';
 import {
-	NetworkTransactor, SyncRetryExhaustedError, routingKeyForBlock,
+	NetworkTransactor, PromiseShortfallError, routingKeyForBlock,
 	type ActionId, type BlockId, type CommitRequest, type CommitResult, type IKeyNetwork, type IRepo, type ITransactor,
-	type PendRequest, type PendResult, type PeerId as DbPeerId
+	type PendRequest, type PendResult, type PeerId as DbPeerId, type PromiseShortfall
 } from '@optimystic/db-core';
 import { createMesh, type Mesh, type MeshNode, type MeshOptions } from '../../src/testing/mesh-harness.js';
 import { DEFAULT_CLUSTER_SIZE } from '../../src/cluster/cluster-policy.js';
@@ -196,38 +196,30 @@ export async function durableHolders(nodes: readonly MeshNode[], commit: Attempt
 // ── The promise-phase refusal ────────────────────────────────────────────────────────────────────────
 
 /**
- * The promise-phase shortfall, verbatim. This text is load-bearing wire text a downstream consumer matches
- * byte-for-byte (see the NOTE at the throw in `ClusterCoordinator.executeTransaction`), and is what
- * `cluster-coordinator-supermajority.spec.ts` (three peers) and `mesh-sanity.spec.ts` Suite 2 (three nodes)
- * already pin, so the numbers an application would branch on are parsed out of it here too.
+ * The promise-phase shortfall's message, verbatim. A downstream consumer matches this text byte-for-byte
+ * (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text`), so it is pinned here
+ * against the error's own fields, beside `cluster-coordinator-supermajority.spec.ts` (three peers).
  */
 const SUPER_MAJORITY_SHORTFALL = /^Failed to get super-majority: (\d+)\/(\d+) approvals \(needed (\d+), (\d+) rejections\)$/;
-
-export interface PromiseShortfall {
-	approvals: number;
-	peers: number;
-	needed: number;
-	rejections: number;
-}
 
 /**
  * Assert that `refusal` — what a `Tree` write threw — is the promise-phase shortfall in the shape an
  * application sees, and return its numbers.
  *
- * NOT the retry loop's `SyncRetryExhaustedError`: a promise-phase shortfall is thrown by the transactor, not
- * returned as a conflict, so `Collection.sync` does not retry it and it surfaces from the first attempt. The
- * transactor's aggregate carries the coordinator's own error as its `cause`.
+ * NOT the retry loop's `SyncRetryExhaustedError`: a promise-phase shortfall is returned as its own refusal,
+ * which `Collection.sync` stops on by name, so it surfaces from the first attempt as a `PromiseShortfallError`.
  */
 export function expectPromiseShortfall(refusal: unknown): PromiseShortfall {
-	expect(refusal).to.be.instanceOf(Error);
-	expect(refusal, `a promise shortfall is not retried: ${String((refusal as Error)?.message ?? refusal)}`).to.not.be.instanceOf(SyncRetryExhaustedError);
-	const error = refusal as Error & { cause?: unknown };
-	// This sentence is also a downstream consumer's retry discriminator — see backlog
-	// `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text` before rewording it.
-	expect(error.message, 'the transactor aggregate').to.match(/^Some peers did not complete: /);
-	expect(error.cause, `the aggregate carries the coordinator's error as its cause: ${error.message}`).to.be.instanceOf(Error);
-	const shortfall = SUPER_MAJORITY_SHORTFALL.exec((error.cause as Error).message);
-	expect(shortfall, `the cause is the promise-phase shortfall: ${(error.cause as Error).message}`).to.not.equal(null);
-	const [, approvals, peers, needed, rejections] = shortfall!.map(Number) as [number, number, number, number, number];
-	return { approvals, peers, needed, rejections };
+	expect(refusal, `a promise shortfall, by type: ${String((refusal as Error)?.message ?? refusal)}`).to.be.instanceOf(PromiseShortfallError);
+	const error = refusal as PromiseShortfallError;
+	expect(error.message, 'the sentence a downstream consumer matches')
+		.to.equal(`Failed to get super-majority: ${error.approvals}/${error.peerCount} approvals (needed ${error.needed}, ${error.rejections} rejections)`)
+		.and.to.match(SUPER_MAJORITY_SHORTFALL);
+	return {
+		approvals: error.approvals,
+		rejections: error.rejections,
+		peerCount: error.peerCount,
+		needed: error.needed,
+		silentPeers: [...error.silentPeers].sort()
+	};
 }

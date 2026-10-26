@@ -1,5 +1,5 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, TransactionExpiredError, assertTransactionFits } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, assertTransactionFits } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -2607,8 +2607,8 @@ export class CoordinatorRepo implements IRepo {
 	 *  local-verdict arms, and the catch that turns each optimistic-concurrency refusal into a retryable
 	 *  answer — the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError})
 	 *  directly, and a validator rejection only through {@link classifyStaleRejection} — and an expiry
-	 *  into the non-retryable answer that names it. Every refusal, whichever request's blocks it came
-	 *  from, answers the whole batch. */
+	 *  or a promise shortfall into the non-retryable answer that names it. Every refusal, whichever
+	 *  request's blocks it came from, answers the whole batch. */
 	private async pendThroughCluster(batch: PendBatch, options?: MessageOptions): Promise<PendResult> {
 		const coordinatingBlockIds = options?.coordinatingBlockIds ?? batch.blockIds;
 
@@ -2735,6 +2735,18 @@ export class CoordinatorRepo implements IRepo {
 			// even where local storage also shows a newer revision, a re-read and re-pend would be
 			// refused by the same clocks.
 			if (error instanceof TransactionExpiredError) {
+				return error.toFailure();
+			}
+			// So is a promise shortfall, for the same two reasons: a remote writer would otherwise see a
+			// reset stream, and too few members answering is not a revision loss the classifier could
+			// confirm, whatever local storage shows.
+			// NOTE: accepted tradeoff — a thrown pend made the writer's transactor exclude this
+			// coordinator and re-pick another (`processBatches`); a returned refusal does not. The other
+			// coordinators of this cohort meet the same silent members, and in a two-member cohort the
+			// only other candidate is the absent machine, so the re-pick cost a dial timeout and bought
+			// nothing. Revisit if a shortfall is ever specific to the coordinator that ran the round (one
+			// whose own links to the cohort are down while another coordinator's are up).
+			if (error instanceof PromiseShortfallError) {
 				return error.toFailure();
 			}
 			// A lost conflict race is an optimistic-concurrency loss, not a fault: surface it as the
@@ -3390,6 +3402,14 @@ export class CoordinatorRepo implements IRepo {
 			if (error instanceof TransactionExpiredError) {
 				return error.toFailure();
 			}
+			// NOTE: a `PromiseShortfallError` is deliberately rethrown below, not returned as the pend's
+			// is: `NetworkTransactor.commitTailThenSweep` reads a RETURNED commit refusal as a confirmed
+			// conflict and a THROWN sweep as a tolerated torn success, so returning it would turn that
+			// tolerated sweep into a refused write with its log tail left behind. A remote writer
+			// therefore still sees a commit-phase shortfall as a reset stream, which is right for a
+			// commit attempt — it is in doubt until a refresh settles it. If a writer ever needs to tell
+			// a commit-phase silent cohort from other commit faults, return it here — but first make the
+			// sweep treat a returned shortfall as transport-shaped.
 			// A lost commit-consensus race is an optimistic-concurrency loss, not a fault — mirror
 			// `pend`'s conversion above. At the moment this is thrown, zero members approved and the
 			// members hold the winner: nothing of the loser landed, so a retryable-conflict answer is

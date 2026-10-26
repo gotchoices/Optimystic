@@ -1,6 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
@@ -1696,6 +1696,9 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * - An **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first one. No
  *   retry can succeed while that cohort's clocks disagree with the writer's, so a conflict beside it
  *   must not make the write look retryable, and its numbers must reach the writer whole.
+ * - Otherwise a **promise shortfall** anywhere ({@link isShortfallFailure}) is the answer, verbatim —
+ *   the first one, for the same reason: no retry can succeed while that cohort's members are silent.
+ *   Below an expiry because a shortfall clears when the members come back, and an expiry does not.
  * - Otherwise a {@link StaleFailure}: `reason` is the first one any response gave (the only diagnostic
  *   that survives an exhausted retry budget and the coordinator's error text — a refusal whose reason
  *   is `commit-not-durable` must not read as "stale commit", a rival's win); `staleAt` is the highest
@@ -1712,9 +1715,9 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
 function refusalFrom(responses: WriteFailure[]): WriteFailure {
-	const expired = responses.find(isExpiryFailure);
-	if (expired !== undefined) {
-		return expired;
+	const unretryable = responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
+	if (unretryable !== undefined) {
+		return unretryable;
 	}
 	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
 	const reason = responses.map(r => r.reason).find(r => r !== undefined);

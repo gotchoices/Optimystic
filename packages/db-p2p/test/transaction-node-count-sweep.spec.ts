@@ -382,15 +382,15 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					} else {
 						expect(refusal, `with ${size - 1} of ${size} reachable the write must be refused (it returned ${JSON.stringify(durability)})`).to.not.equal(undefined);
 						// The shape an application sees — see `expectPromiseShortfall`.
-						const { approvals, peers, needed, rejections } = expectPromiseShortfall(refusal);
-						expect({ approvals, peers, needed, rejections }, 'the numbers an application would branch on')
-							.to.deep.equal({ approvals: size - 1, peers: size, needed: promiseBar(size), rejections: 0 });
+						const shortfall = expectPromiseShortfall(refusal);
+						expect(shortfall, 'the numbers an application would branch on')
+							.to.deep.equal({ approvals: size - 1, rejections: 0, peerCount: size, needed: promiseBar(size), silentPeers: [away.peerId.toString()] });
 						// Nothing committed, so no reachable node reads the refused row.
 						expect(committed(oneAwayAttempts).length, 'a refused write commits nothing').to.equal(0);
 						for (const reader of mesh.nodes.filter(n => n !== away)) {
 							expect(await readRow(driven(reader), key), `${peerLabel(mesh, reader)} does not read the refused row`).to.equal(undefined);
 						}
-						row.observedOneAway = `refused (${approvals}/${peers} promises, needed ${needed}) in ${elapsedMs}ms`;
+						row.observedOneAway = `refused (${shortfall.approvals}/${shortfall.peerCount} promises, needed ${shortfall.needed}) in ${elapsedMs}ms`;
 					}
 				});
 			}
