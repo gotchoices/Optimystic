@@ -3,6 +3,13 @@ prereq: offline-sync-plugin-offline-mode
 architecture: docs/offline-sync.md#predicting-whether-an-entry-will-commit
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts (new), packages/quereus-plugin-optimystic/src/functions/commit-outlook.ts (new), packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/schema/index-manager.ts, packages/quereus-plugin-optimystic/src/plugin.ts, packages/quereus-plugin-optimystic/src/index.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/offline/status.ts, packages/quereus-plugin-optimystic/test/offline-outlook.spec.ts (new), packages/quereus-plugin-optimystic/test/adapter-integration.spec.ts, packages/quereus-plugin-optimystic/README.md, docs/offline-sync.md, docs/internals.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-26T18:27:03.894Z (agent: claude)
+  Log file: C:\projects\optimystic\tickets\.logs\7-offline-sync-outlook-from-guards.review.2026-10-26T18-27-03-894Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 
 First half of stage 7 of [docs/offline-sync.md §Implementation stages](../../docs/offline-sync.md#implementation-stages): the `CommitOutlook` of a queued transaction, computed from its staged guards and the queue alone, delivered on the `queued` status, and answered for an open transaction by `CommitOutlook()`. No Quereus change. The second half (keeping the outlook current as earlier entries settle, `outlook-changed`, `offline:assured-entry-failed`) is `tickets/implement/7.1-offline-sync-outlook-follows-the-queue.md`, which builds on this.
 

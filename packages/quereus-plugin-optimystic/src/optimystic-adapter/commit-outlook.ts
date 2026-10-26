@@ -12,7 +12,7 @@ export type CommitOutlook = {
 	 * transaction it depends on is assured. `'exposed'`: some can; `exposures` and `dependsOn` say which. */
 	readonly kind: 'assured' | 'exposed';
 	/** What another writer would have to do for one of the transaction's checks to refuse it, one per
-	 * check that can, in staging order. Empty when assured. */
+	 * check that can: collection by collection, in staging order within each. Empty when assured. */
 	readonly exposures: readonly Exposure[];
 	/** Earlier unsettled transactions whose failure would fail this one, each once, in queue order. */
 	readonly dependsOn: readonly OutlookDependency[];
@@ -244,7 +244,8 @@ export function judgeTransaction(
 }
 
 /**
- * Judge every check the transaction's staged actions carry, in staging order
+ * Judge every check the transaction's staged actions carry, collection by collection and in staging
+ * order within each
  * (docs/offline-sync.md §Judging each guard): which another writer can refuse — each an exposure —
  * and what each covers, for {@link outlookFrom} to match against earlier transactions' writes.
  *

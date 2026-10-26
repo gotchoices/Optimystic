@@ -704,6 +704,18 @@ export class OfflineMode {
 	 * journaled transactions numbered below it that are still deferred. It is not judged again, so a
 	 * tag changed later, or an earlier entry settling, changes nothing here.
 	 */
+	/** {@link judgeQueued}, isolated: it runs ahead of the status's translation and delivery, and a
+	 * defect in the judgement (a description or a decoder that throws) must not keep the `queued`
+	 * status from the application. The status then carries no outlook, and the entry's next `queued`
+	 * status judges it again. */
+	private tryJudgeQueued(entryId: string): void {
+		try {
+			this.judgeQueued(entryId);
+		} catch (error) {
+			log('offline:outlook-unjudged transaction=%s: the judgement threw: %o', entryId, error);
+		}
+	}
+
 	private judgeQueued(entryId: string): void {
 		const entries = this.queue.entries();
 		const position = entries.findIndex(entry => entry.id === entryId);
@@ -767,7 +779,7 @@ export class OfflineMode {
 	// ── translation ────────────────────────────────────────────────────────────────────────────
 
 	private onQueueStatus(status: EntryStatus): void {
-		if (status.kind === 'queued' && !this.outlooks.has(status.entryId)) this.judgeQueued(status.entryId);
+		if (status.kind === 'queued' && !this.outlooks.has(status.entryId)) this.tryJudgeQueued(status.entryId);
 		const outcome = status.kind === 'committed' || status.kind === 'failed' ? this.outcomeOf(status) : undefined;
 		const translated = outcome?.status ?? this.translate(status);
 		if (outcome !== undefined) {

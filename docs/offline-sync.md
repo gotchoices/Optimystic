@@ -961,7 +961,8 @@ Two refinements matter in practice:
   estimate probabilities; a username, an email address or a date-keyed row is exposed, with the key
   in `exposures`, and the application decides how to present that.
 
-The judgement is one pass over the entry's elements, in staging order (`judgeTransaction` in
+The judgement is one pass over the entry's elements, collection by collection in the order the entry
+sealed them and in staging order within each (`judgeTransaction` in
 `packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`), one exposure per
 guard that can be refused:
 
