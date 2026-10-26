@@ -146,6 +146,9 @@ const plugin = register(db, {
     expireAfterMs: 7 * 24 * 3600_000,
     // How long a terminal outcome stays queryable after a restart (see "Outcomes after a restart").
     outcomeRetentionMs: 7 * 24 * 3600_000,
+    // Let a drain commit alone while this node knows of absent cohort members. Default: false — a
+    // queued entry is committed only by a commit its cohort reached consensus on.
+    allowSoloCommit: false,
   },
 });
 ```
@@ -426,14 +429,19 @@ node's routing view has dropped its partners takes the solo commit path (`soloCo
 `packages/db-p2p/src/repo/coordinator-repo.ts`) and commits alone at `local` durability — the
 lone-survivor write that backlog `6.5-partition-healing` records as a source of forked collections.
 The gate is a heuristic, though: the view can change between the check and the commit. The hard form
-is a per-write option, proposed for `SyncOptions`, that makes the solo short-circuit **refuse** a
-write while it knows of absent members, instead of committing it `local` with those members named as
-owed. The refusal is transient to the queue, so the entry waits and is retried when the members
-return. `6.5-partition-healing` records a maintainer decision not to choose a lone-write rule at the
-solo short-circuit for writes in general; this option does not do that, since it applies only to
-writes whose application already accepted waiting by choosing offline mode, but it touches the same
-code and needs the same sign-off. Until it lands, the queue gives no guarantee against solo commits
-beyond the gate.
+is a per-write option on `SyncOptions`, carried on the pend and commit requests, that makes the solo
+short-circuit **refuse** a write while it knows of absent members, instead of committing it `local`
+with those members named as owed. The refusal is transient to the queue, so the entry waits and is
+retried when the members return.
+
+**Decision (maintainer, 2026-10-25): every drain sets the option by default.** A queued entry is
+settled as `committed` only by a commit its cohort reached consensus on — never by a lone write made
+while this node knows of absent members. A node that is genuinely alone (no known absent member, no
+awaited bootstrap peer) is its whole cohort and still commits. An application that prefers the
+lone-write behaviour opts out with `offline.allowSoloCommit: true`. This does not choose a lone-write
+rule for writes in general, which `6.5-partition-healing` records a decision against: writes outside
+offline mode keep today's solo short-circuit. A coordinator on a build that predates the field
+ignores it, so in a mixed-version group the gate is the only protection.
 
 ### One entry, one network transaction
 
@@ -1073,8 +1081,8 @@ session mode is configured, until a later stage designs those points.
   for the local acknowledgement.
 - **`6.5-partition-healing`.** The forked collections that ticket records come from machines that
   committed alone. Offline mode is an alternative an application can choose instead: the change is
-  queued on the machine, not committed into its storage, and the reachability gate (and, once
-  approved, the refusing solo option) keeps the drain from committing it alone. It does not fix
+  queued on the machine, not committed into its storage, and the reachability gate and the solo-refusing option every drain sets by default keep the drain from
+  committing it alone. It does not fix
   forks created by writes outside the mode.
 - **`feat-long-lived-pend-completes-as-members-appear`.** That ticket names a durable client outbox
   that resubmits on reconnect as "the cheap half" of its large-network regime; this design is that
@@ -1107,8 +1115,9 @@ session mode is configured, until a later stage designs those points.
   means, and each `queued` status says `persisted: false`.
 - **Expiry fails an entry the network might still have accepted.** `expireAfterMs` is the
   application's bound, and it is off by default.
-- **The reachability gate can be wrong for a moment,** and until the refusing solo option is
-  approved, a drain that runs inside that moment can commit alone.
+- **A lone commit is still possible in two cases:** an application that set `allowSoloCommit`, and
+  a mixed-version group whose coordinator predates the solo-refusing option, where the reachability
+  gate — which can be wrong for a moment — is the only protection.
 
 ## Implementation stages
 
@@ -1133,8 +1142,8 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
 5. **Persistence.** The journal over `IKVStore`, write ordering, restore in `hydrate` and
    `offline.restore`, retained outcomes, the `NODE_KV_NAMESPACES` entry.
 6. **Reachability in `db-p2p`.** The key-network implementation of `ICohortReachability`, wake-ups on
-   connection events, and — subject to the maintainer sign-off noted above — the solo-refusing write
-   option.
+   connection events, and the solo-refusing write option, set by every drain unless the application
+   opts out with `allowSoloCommit`.
 7. **The outlook from guards alone.** Compute `CommitOutlook` from the actions' guards and the queue,
    with no Quereus change: every `absent` and `absentRange` guard is exposed unless its column is
    tagged fresh, every `unchanged` guard is exposed unless its row was inserted by an unsettled entry
@@ -1142,7 +1151,7 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    (reported as not computed). Deliver it on `queued`, `outlook-changed` as dependencies settle, the
    `CommitOutlook()` function, and the `offline:assured-entry-failed` log. Useful on its own for
    applications that generate ids in the app.
-8. **The write description in Quereus** (a ticket in the Quereus repository): `Statement.getWriteScope()`
+8. **The write description in Quereus** (Quereus ticket `statement-write-scope`, filed 2026-10-25): `Statement.getWriteScope()`
    and the module hook that hands it to the vtab for the executing statement — the DML read scope
    with binding modes, per-column value provenance, target-row selection, and constraint
    classification.
