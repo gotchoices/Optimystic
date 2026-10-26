@@ -1796,6 +1796,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   never marks, so its rejects never produce it. With disputes enabled, a marked rejection beside
   approvals is held for a ruling first, and its writer is answered with the dispute's refusal instead
   (backlog `dispute-writer-sees-disputed-pend`).
+  What a writer gets once these refusals have become errors is sorted in one place,
+  `classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts`: by class and
+  structured field alone, and only the error thrown, never its `cause` (see
+  [offline-sync.md §Classifying an attempt's outcome](offline-sync.md#classifying-an-attempts-outcome)).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its

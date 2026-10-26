@@ -1,6 +1,7 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: proposal. Nothing in this document is implemented.** It describes an opt-in operating
+**Status: stage 1 of [Implementation stages](#implementation-stages) is implemented; the rest is a
+proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
 transaction's progress to the application until it is committed or has failed.
@@ -213,6 +214,7 @@ type QueuedFailureReason =
   | 'constraint'               // a UNIQUE / PRIMARY KEY refusal on rebase (ConstraintError)
   | 'concurrent-modification'  // the row an UPDATE/DELETE read was changed or removed (ConcurrentModificationError)
   | 'rejected'                 // a validator refused the transaction as invalid
+  | 'too-large'                // the transaction, or a block it writes, is over the size limit
   | 'expired'                  // expireAfterMs passed before it settled
   | 'discarded';               // the application called discard()
 ```
@@ -485,28 +487,33 @@ message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-
 | Outcome | Example | Entry becomes |
 |---|---|---|
 | Committed | the sync or coordinator commit returns | `committed` |
-| Cohort unreachable, nothing sent | `BlockUnavailableError` (in `packages/db-core/src/network/struct.ts`) with reason `cohort-unreachable` or `peers-unreachable`; a refused solo write (proposed above); the gate saying no | `queued`, `waitingFor: 'cohort'` |
-| Contention the sync loop could not get past | `SyncRetryExhaustedError`, `SyncRevisionStalledError` (in `packages/db-core/src/collection/struct.ts`) | `queued`, `waitingFor: 'backoff'` |
+| Cohort unreachable, nothing sent | `PromiseShortfallError` (in `packages/db-core/src/network/promise-shortfall-error.ts`): too few members answered the pend; `BlockUnavailableError` (in `packages/db-core/src/network/struct.ts`) with reason `cohort-unreachable` or `peers-unreachable`; a refused solo write (proposed above); the gate saying no | `queued`, `waitingFor: 'cohort'` |
+| Contention the sync loop could not get past | `SyncRetryExhaustedError`, `SyncRevisionStalledError` (in `packages/db-core/src/collection/struct.ts`); `CoordinatorStaleLossError` (in `packages/db-core/src/transaction/errors.ts`), the coordinator's counterpart | `queued`, `waitingFor: 'backoff'` |
 | Guard refusal on rebase | `TreeGuardRefusedError` and its subclasses | `failed`: `constraint` or `concurrent-modification` |
 | Validity rejection | `ValidityRejectedError` (in `packages/db-core/src/network/validity-rejected-error.ts`): every member that sank the pend signed it as a judgement of the transaction | `failed`: `rejected` |
+| Too large to commit | `TransactionTooLargeError` (in `packages/db-core/src/network/transaction-size.ts`), `BlockTooLargeError` (in `packages/db-core/src/network/block-size.ts`): the write can never commit as it is | `failed`: `too-large` |
 | Attempt expired | `TransactionExpiredError` | `queued`; the next attempt is a new attempt with a fresh expiry |
 | Torn, provably not saved | `TornActionError` (in `packages/db-core/src/collection/struct.ts`) with `final: true` | `queued`; resubmitting stores it once, which is what `final: true` promises |
 | Torn, outcome unknown | `TornActionError` with `final: false` | `submitting`, in doubt; see below |
 | Part of the entry committed | `CoordinatorPartialCommitError` (in `packages/db-core/src/transaction/errors.ts`) | `partially-committed`; see below |
 
-Two of these rows needed typed errors. The super-majority shortfall a cohort with absent members
-produces on a pend now reaches the writer as `PromiseShortfallError` (in
-`packages/db-core/src/network/promise-shortfall-error.ts`), carrying the counts and the silent
-members; a commit-phase shortfall is still thrown inside the transactor's plain aggregate, and is in
-doubt rather than "nothing sent". A validator rejection reaches the writer as `ValidityRejectedError`
-only when every member that sank the pend signed it as a judgement of the transaction (expiry votes
+`classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts` sorts an
+error into these rows, as a `CommitFailureClass`. It follows two rules. It reads only an error's
+class and its structured fields (`BlockUnavailableError.reason`, `TornActionError.final`), never its
+message. And it reads only the error it is given, never its `cause`: a commit-phase shortfall still
+reaches a local writer as the `cause` of the transactor's plain `Some peers did not complete`
+aggregate, and that write is in doubt rather than "nothing sent", so it sorts as `unknown`. The
+Quereus bridge's mapped errors are not recognised either; stage 4 classifies the db-core error it
+holds before mapping it. A validator rejection reaches the writer as `ValidityRejectedError` only
+when every member that sank the pend signed it as a judgement of the transaction (expiry votes
 aside) and the coordinator's own storage confirms no revision loss; a validity vote beside any other
 reject stays the unclassified throw it always was, since it may be a stale revision only members
 ahead of the coordinator can see (see "A pend rejection is returned only when it is classified" in
 [internals.md §Consensus Execution](internals.md#consensus-execution)). Anything the drain cannot
-classify is treated as transient, logged with the entry id, and counted, so an unclassified failure
-is retried rather than silently dropping a change the application was told was committed;
-`expireAfterMs` bounds how long that can go on.
+classify (`unknown`) is treated as transient, logged with the entry id, and counted, so an
+unclassified failure is retried rather than silently dropping a change the application was told was
+committed; it is re-sent only under the attempt's own identity (below), and `expireAfterMs` bounds
+how long that can go on.
 
 ### Identity across attempts
 
@@ -1130,7 +1137,7 @@ session mode is configured, until a later stage designs those points.
 Each stage is meant to become one ticket. Stages 1–6 are gated in order; stage 7 needs only stage 4,
 stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
 
-1. **Typed classification.** Give the super-majority shortfall and the validator rejection stable
+1. **Typed classification** (implemented). Give the super-majority shortfall and the validator rejection stable
    error classes at the writer, and add one db-core predicate that sorts a commit failure into the
    classification table above. Useful without offline mode; prerequisite of the drain.
 2. **Segments in `Collection`.** `sealPending`, `sealedEntries`, `dropSealed`; segment-aware replay
