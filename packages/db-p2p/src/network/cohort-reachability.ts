@@ -75,7 +75,8 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 	/** One entry per `onChange` call, so a listener subscribed twice is two subscriptions. */
 	private readonly listeners = new Set<{ readonly listener: () => void }>();
 	private readonly onNetworkChange = (): void => this.scheduleWake();
-	private eventsSubscribed = false;
+	/** The event source while subscribed to it: from the first listener until the last unsubscribes, or {@link stop}. */
+	private subscribedTo: NetworkChangeEvents | undefined;
 	private cancelWake: (() => void) | undefined;
 	private stopped = false;
 	/** The previous call's answer, so the log marks each change rather than each call. */
@@ -172,8 +173,8 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 
 	private subscribeEvents(): void {
 		const events = this.deps.events;
-		if (this.eventsSubscribed || events === undefined) return;
-		this.eventsSubscribed = true;
+		if (this.subscribedTo !== undefined || events === undefined) return;
+		this.subscribedTo = events;
 		events.addEventListener('connection:open', this.onNetworkChange);
 		events.addEventListener('peer:identify', this.onNetworkChange);
 	}
@@ -181,10 +182,11 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 	private releaseEvents(): void {
 		this.cancelWake?.();
 		this.cancelWake = undefined;
-		if (!this.eventsSubscribed) return;
-		this.eventsSubscribed = false;
-		this.deps.events!.removeEventListener('connection:open', this.onNetworkChange);
-		this.deps.events!.removeEventListener('peer:identify', this.onNetworkChange);
+		const events = this.subscribedTo;
+		if (events === undefined) return;
+		this.subscribedTo = undefined;
+		events.removeEventListener('connection:open', this.onNetworkChange);
+		events.removeEventListener('peer:identify', this.onNetworkChange);
 	}
 
 	/** Only reconnection-shaped events wake: a departure can only close the gate, which the asker's next re-check reads. */
