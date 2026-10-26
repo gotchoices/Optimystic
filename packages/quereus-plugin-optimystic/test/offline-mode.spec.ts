@@ -32,6 +32,7 @@ import {
 } from '../dist/index.js';
 import { countTreeEntries, createMeshDbNode, startMockMesh, type MeshDbNode, type Plugin } from './mesh-node-harness.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
+import { trackPredictions } from './outlook-predictions.js';
 
 type Row = Record<string, SqlValue>;
 type QueuedStatus = Extract<QueuedTransactionStatus, { kind: 'queued' }>;
@@ -99,6 +100,7 @@ async function waitFor(predicate: () => boolean, description: string, timeoutMs 
 function createTestDb(): { db: Database; plugin: Plugin } {
 	const db = new Database();
 	const plugin = register(db, { default_transactor: 'test', default_key_network: 'test', enable_cache: false });
+	trackPredictions(plugin);
 	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
 	for (const func of plugin.functions) db.registerFunction(func.schema);
 	return { db, plugin };
@@ -401,6 +403,7 @@ describe('Offline mode: entering, sealing a commit, following it to the other no
 		// Model: test/legacy-batch-shared-collection-id.spec.ts, which drives the bridge directly.
 		const db = new Database();
 		const plugin = register(db, { default_transactor: 'local', default_key_network: 'test', enable_cache: false });
+		trackPredictions(plugin);
 		const transactor = new TestTransactor();
 		plugin.collectionFactory.registerTransactor('local:test', transactor);
 		const collectionId = 'offline/shared-id';

@@ -1,5 +1,6 @@
 import type { SqlValue } from '@quereus/quereus';
-import type { Action, CollectionId } from '@optimystic/db-core';
+import { TreeRangeTakenError } from '@optimystic/db-core';
+import type { Action, CollectionId, QueuedFailureReason, TreeGuardRefusedError } from '@optimystic/db-core';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 
 /**
@@ -130,10 +131,33 @@ type StringRange = { readonly first?: StringBound; readonly last?: StringBound }
 
 /** The part of an outlook that depends on nothing but the transaction and what was queued when it
  * was judged — its own exposures, with the collection each came from, and what each judged check
- * covers — against which its dependencies are matched. */
-type OwnJudgement = {
+ * covers — against which its dependencies are matched. Fixed when the transaction is judged
+ * (docs/offline-sync.md §The outlook); only a partial commit narrows it ({@link followOutlooks}). */
+export type OwnJudgement = {
 	readonly exposures: readonly { readonly collectionId: CollectionId; readonly exposure: Exposure }[];
 	readonly guarded: readonly { readonly collectionId: CollectionId; readonly span: GuardSpan }[];
+};
+
+/** A queued transaction's outlook beside the own judgement it was computed from, which is what
+ * {@link followOutlooks} recomputes the outlook from as the queue changes. */
+export type QueuedJudgement = { readonly own: OwnJudgement; readonly outlook: CommitOutlook };
+
+/** One queued transaction as {@link followOutlooks} reads it, in queue order. */
+export type FollowedEntry = {
+	readonly transactionId: string;
+	readonly seq: number;
+	/** The segments it still holds — not those a partial commit already committed. */
+	readonly writes: StagedWrites;
+	/** `schema.table` of every table behind those segments. */
+	readonly tables: readonly string[];
+	/** The collections a partial commit has committed: their checks have passed and can no longer refuse. */
+	readonly committedCollections: readonly CollectionId[];
+	/** Its judgement as held; `undefined` when it was never judged (its judgement threw, or a restore
+	 * has registered it and not yet admitted it), which counts as not assured. */
+	readonly judgement: QueuedJudgement | undefined;
+	/** A replay has refused one of its segments: it is about to fail, so its outlook is left as it was
+	 * judged — the failure, not a change of outlook, is what reports it. */
+	readonly refused: boolean;
 };
 
 // ── reading staged actions ───────────────────────────────────────────────────────────────────
@@ -184,28 +208,14 @@ function withinRange(key: string, range: StringRange): boolean {
 
 // ── what earlier entries wrote ───────────────────────────────────────────────────────────────
 
-/** Per collection, the keys a transaction's segment writes, and those it inserts under an `absent`
- * check; `'unreadable'` when anything in the segment cannot be read, which counts as writing every key. */
-type WrittenKeys = { readonly written: ReadonlySet<string>; readonly insertedAbsent: ReadonlySet<string> } | 'unreadable';
-
-// NOTE: rebuilt from every earlier entry's segments on each judgement, so an enqueue behind a long
-// queue is linear in the queue's staged elements, and a range check scans one collection's earlier
-// writes linearly. If enqueue ever shows up slow behind a long queue, keep this index incrementally
-// as entries are queued and settle.
-function writtenKeysOf(writes: StagedWrites): Map<CollectionId, WrittenKeys> {
-	const index = new Map<CollectionId, WrittenKeys>();
-	for (const [collectionId, actions] of writes) {
-		index.set(collectionId, actions === undefined ? 'unreadable' : writtenKeysIn(actions));
-	}
-	return index;
-}
-
-function writtenKeysIn(actions: readonly Action<unknown>[]): WrittenKeys {
+/** The keys one segment writes, and those it inserts under an `absent` check; `undefined` when
+ * anything in it cannot be read, which counts as writing every key. */
+function writtenKeysIn(actions: readonly Action<unknown>[]): { written: Set<string>; insertedAbsent: Set<string> } | undefined {
 	const written = new Set<string>();
 	const insertedAbsent = new Set<string>();
 	for (const action of actions) {
 		const elements = replaceElements(action);
-		if (elements === undefined) return 'unreadable';
+		if (elements === undefined) return undefined;
 		for (const element of elements) {
 			written.add(element.key);
 			if (element.upsert && element.guard?.kind === 'absent') insertedAbsent.add(element.key);
@@ -214,33 +224,136 @@ function writtenKeysIn(actions: readonly Action<unknown>[]): WrittenKeys {
 	return { written, insertedAbsent };
 }
 
-function writesWithin(keys: WrittenKeys | undefined, span: GuardSpan): boolean {
-	if (keys === undefined) return false;
-	if (keys === 'unreadable' || span.kind === 'whole') return true;
-	if (span.kind === 'key') return keys.written.has(span.key);
-	for (const key of keys.written) {
-		if (withinRange(key, span.range)) return true;
-	}
-	return false;
-}
+/** What the entries indexed so far write in one collection. */
+type CollectionWrites = {
+	/** Each key written, with the entries that wrote it, each once, in queue order. */
+	readonly byKey: Map<string, EarlierEntry[]>;
+	/** Every entry with a segment here, in queue order: what a check over the whole collection depends on. */
+	readonly writers: EarlierEntry[];
+	/** The entries whose segment here cannot be read, which count as writing every key. */
+	readonly unreadable: EarlierEntry[];
+	/** Keys an entry inserted under an `absent` check, from the segments that can be read. */
+	readonly insertedAbsent: Set<string>;
+};
 
-/** An earlier entry with its segments indexed by key, built once per judgement. */
-type IndexedEntry = { readonly entry: EarlierEntry; readonly keys: ReadonlyMap<CollectionId, WrittenKeys> };
+/**
+ * What the entries ahead of a transaction write, per collection, added one entry at a time in queue
+ * order: matching a check against everything ahead of it is a lookup rather than a pass over the
+ * queue, so judging a whole queue in order ({@link followOutlooks}) indexes each segment once.
+ */
+class WriteIndex {
+	private readonly collections = new Map<CollectionId, CollectionWrites>();
+
+	add(entry: EarlierEntry): void {
+		for (const [collectionId, actions] of entry.writes) {
+			const writes = this.writesIn(collectionId);
+			writes.writers.push(entry);
+			const keys = actions === undefined ? undefined : writtenKeysIn(actions);
+			if (keys === undefined) {
+				writes.unreadable.push(entry);
+				continue;
+			}
+			for (const key of keys.written) {
+				const writers = writes.byKey.get(key);
+				if (writers === undefined) writes.byKey.set(key, [entry]);
+				else writers.push(entry);
+			}
+			for (const key of keys.insertedAbsent) writes.insertedAbsent.add(key);
+		}
+	}
+
+	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` check. */
+	insertedAbsent(collectionId: CollectionId, key: string): boolean {
+		return this.collections.get(collectionId)?.insertedAbsent.has(key) ?? false;
+	}
+
+	/** Every indexed entry that writes inside `span` in `collectionId`, an entry possibly more than once.
+	 * NOTE: a range is matched by scanning every key the collection's indexed entries write, so a
+	 * unique check behind a long queue of writes to one index is linear in those writes. If judging
+	 * ever shows up slow there, keep the keys sorted and seek the range. */
+	*writersWithin(collectionId: CollectionId, span: GuardSpan): Iterable<EarlierEntry> {
+		const writes = this.collections.get(collectionId);
+		if (writes === undefined) return;
+		if (span.kind === 'whole') {
+			yield* writes.writers;
+			return;
+		}
+		yield* writes.unreadable;
+		if (span.kind === 'key') {
+			yield* writes.byKey.get(span.key) ?? [];
+			return;
+		}
+		for (const [key, writers] of writes.byKey) {
+			if (withinRange(key, span.range)) yield* writers;
+		}
+	}
+
+	private writesIn(collectionId: CollectionId): CollectionWrites {
+		let writes = this.collections.get(collectionId);
+		if (writes === undefined) {
+			writes = { byKey: new Map(), writers: [], unreadable: [], insertedAbsent: new Set() };
+			this.collections.set(collectionId, writes);
+		}
+		return writes;
+	}
+}
 
 // ── the judgement ────────────────────────────────────────────────────────────────────────────
 
 /**
  * The outlook of `transaction` were it queued behind `ahead` (docs/offline-sync.md §Predicting
  * whether an entry will commit): its own exposures ({@link ownJudgement}) and what it depends on
- * ({@link outlookFrom}). Holds no state: everything it reads comes through its arguments.
+ * ({@link outlookFrom}), with the own judgement beside it for {@link followOutlooks}. Holds no state:
+ * everything it reads comes through its arguments.
+ * NOTE: indexes every earlier entry's segments on each call, so an enqueue behind a long queue is
+ * linear in the queue's staged elements. If enqueue ever shows up slow there, keep one index of the
+ * queue in the controller, add each entry as it is judged, and rebuild it only when an entry settles.
  */
 export function judgeTransaction(
 	transaction: JudgedTransaction,
 	describe: (collectionId: CollectionId) => CollectionDescription,
 	ahead: QueueAhead,
-): CommitOutlook {
-	const earlier = ahead.earlier.map(entry => ({ entry, keys: writtenKeysOf(entry.writes) }));
-	return outlookFrom(ownJudgement(transaction.writes, describe, earlier), transaction.tables, earlier, ahead.deferred);
+): QueuedJudgement {
+	const index = new WriteIndex();
+	for (const entry of ahead.earlier) index.add(entry);
+	const own = ownJudgement(transaction.writes, describe, index);
+	return { own, outlook: outlookFrom(own, transaction.tables, index, ahead.deferred) };
+}
+
+/**
+ * Bring every queued transaction's outlook up to date with the queue as it is now
+ * (docs/offline-sync.md §The outlook): walking `queue` in order, each judged transaction keeps its
+ * own judgement, less the exposures and checks in collections a partial commit has committed, and
+ * gets its dependencies again against the entries ahead of it as they are now — written-key index
+ * built as the walk goes, so each segment is indexed once — and against the `deferred` journaled
+ * transactions numbered below it; its kind follows from both, each dependency's kind as computed
+ * earlier in the same walk. The own judgement is never redone, so a tag changed since does not move
+ * it. A transaction never judged, or already refused, is not recomputed, and counts with the kind it
+ * has (none for one never judged) for those behind it. Answers the recomputed judgements.
+ */
+export function followOutlooks(queue: readonly FollowedEntry[], deferred: readonly DeferredTransaction[]): Map<string, QueuedJudgement> {
+	const index = new WriteIndex();
+	const followed = new Map<string, QueuedJudgement>();
+	for (const entry of queue) {
+		let judgement = entry.judgement;
+		if (judgement !== undefined && !entry.refused) {
+			const own = withoutCollections(judgement.own, new Set(entry.committedCollections));
+			const ahead = deferred.filter(record => record.seq < entry.seq);
+			judgement = { own, outlook: outlookFrom(own, entry.tables, index, ahead) };
+			followed.set(entry.transactionId, judgement);
+		}
+		index.add({ transactionId: entry.transactionId, seq: entry.seq, writes: entry.writes, assured: judgement?.outlook.kind === 'assured' });
+	}
+	return followed;
+}
+
+/** `own` without what it judged in `collections`. */
+function withoutCollections(own: OwnJudgement, collections: ReadonlySet<CollectionId>): OwnJudgement {
+	if (collections.size === 0) return own;
+	return {
+		exposures: own.exposures.filter(({ collectionId }) => !collections.has(collectionId)),
+		guarded: own.guarded.filter(({ collectionId }) => !collections.has(collectionId)),
+	};
 }
 
 /**
@@ -266,7 +379,7 @@ export function judgeTransaction(
 function ownJudgement(
 	writes: StagedWrites,
 	describe: (collectionId: CollectionId) => CollectionDescription,
-	earlier: readonly IndexedEntry[],
+	earlier: WriteIndex,
 ): OwnJudgement {
 	const exposures: OwnJudgement['exposures'][number][] = [];
 	const guarded: OwnJudgement['guarded'][number][] = [];
@@ -289,7 +402,7 @@ class CollectionJudge {
 	constructor(
 		private readonly collectionId: CollectionId,
 		private readonly description: CollectionDescription,
-		private readonly earlier: readonly IndexedEntry[],
+		private readonly earlier: WriteIndex,
 		private readonly exposures: OwnJudgement['exposures'][number][],
 		private readonly guarded: OwnJudgement['guarded'][number][],
 	) {}
@@ -328,7 +441,7 @@ class CollectionJudge {
 			case 'unchanged':
 				if (description.kind !== 'main') return this.unreadable();
 				this.cover({ kind: 'key', key });
-				if (!description.singleWriter && !(description.freshKey && this.insertedEarlierAbsent(key))) {
+				if (!description.singleWriter && !(description.freshKey && this.earlier.insertedAbsent(this.collectionId, key))) {
 					this.exposeKey(description, 'row', key);
 				}
 				return;
@@ -351,14 +464,6 @@ class CollectionJudge {
 	private exposeKey(description: MainTreeDescription, rule: 'primary-key' | 'row', key: string): void {
 		const values = description.decodeKey(key);
 		this.expose({ table: description.table, rule: values === undefined ? 'row' : rule, key: values });
-	}
-
-	/** Whether an earlier entry of the queue inserted `key` here under an `absent` check. */
-	private insertedEarlierAbsent(key: string): boolean {
-		return this.earlier.some(({ keys }) => {
-			const written = keys.get(this.collectionId);
-			return written !== undefined && written !== 'unreadable' && written.insertedAbsent.has(key);
-		});
 	}
 
 	// NOTE: one exposure per judged check, so a bulk offline write of N natural-key rows lists N on one
@@ -385,29 +490,78 @@ class CollectionJudge {
 function outlookFrom(
 	own: OwnJudgement,
 	ownTables: readonly string[],
-	earlier: readonly IndexedEntry[],
+	earlier: WriteIndex,
 	deferred: readonly DeferredTransaction[],
 ): CommitOutlook {
-	const dependencies: { readonly seq: number; readonly transactionId: string; readonly assured: boolean }[] = [];
-	for (const { entry, keys } of earlier) {
-		if (own.guarded.some(({ collectionId, span }) => writesWithin(keys.get(collectionId), span))) {
-			dependencies.push({ seq: entry.seq, transactionId: entry.transactionId, assured: entry.assured });
+	const dependencies = new Map<string, { readonly seq: number; readonly assured: boolean }>();
+	for (const { collectionId, span } of own.guarded) {
+		for (const writer of earlier.writersWithin(collectionId, span)) {
+			dependencies.set(writer.transactionId, { seq: writer.seq, assured: writer.assured });
 		}
 	}
 	const tables = new Set(ownTables);
 	for (const record of deferred) {
 		if (record.tables.some(table => tables.has(table))) {
-			dependencies.push({ seq: record.seq, transactionId: record.transactionId, assured: false });
+			dependencies.set(record.transactionId, { seq: record.seq, assured: false });
 		}
 	}
-	dependencies.sort((a, b) => a.seq - b.seq);
-	const assured = own.exposures.length === 0 && dependencies.every(dependency => dependency.assured);
+	const ordered = [...dependencies].sort(([, a], [, b]) => a.seq - b.seq);
+	const assured = own.exposures.length === 0 && ordered.every(([, dependency]) => dependency.assured);
 	return {
 		kind: assured ? 'assured' : 'exposed',
 		exposures: own.exposures.map(({ exposure }) => exposure),
-		dependsOn: dependencies.map(({ transactionId }) => ({ transactionId, via: 'guard' as const })),
+		dependsOn: ordered.map(([transactionId]) => ({ transactionId, via: 'guard' as const })),
 		unchecked: 'not-computed',
 	};
+}
+
+// ── checking a prediction against an outcome ─────────────────────────────────────────────────
+
+/** The failure reasons an outlook predicts: a check refused because of what another writer did, or
+ * because an earlier queued transaction failed. Expiry, discard, a validator's rejection and the size
+ * limit are properties of this write and this machine, not of other writers. */
+const PREDICTED_FAILURES: ReadonlySet<QueuedFailureReason> = new Set<QueuedFailureReason>(['constraint', 'concurrent-modification']);
+
+/** A failed transaction, as {@link outlookContradicted} weighs it. */
+export type FailureAgainstOutlook = {
+	readonly reason: QueuedFailureReason;
+	/** The earlier transaction the queue attributes the failure to, when one is. */
+	readonly causedBy: string | undefined;
+	/** Whether a transaction the outlook lists in `dependsOn` failed while it was listed there. */
+	readonly dependencyFailed: boolean;
+};
+
+/**
+ * Whether a failure is one `outlook` said could not happen (docs/offline-sync.md §Conservative by
+ * construction): the transaction was assured, a check refused, and not because a transaction it
+ * depends on failed — neither `causedBy` nor any other dependency. Such a failure is a false
+ * `optimystic.fresh` or `optimystic.single_writer` tag, or a defect in the analysis.
+ *
+ * `dependencyFailed` stands beside `causedBy` because the queue names the NEAREST earlier failing
+ * transaction as the cause (`OfflineQueue.causeOf`), which in a chain of failures can be one this
+ * transaction never depended on while the one it did depend on failed further up the chain.
+ */
+export function outlookContradicted(outlook: CommitOutlook | undefined, failure: FailureAgainstOutlook): boolean {
+	if (outlook?.kind !== 'assured' || !PREDICTED_FAILURES.has(failure.reason)) return false;
+	if (failure.causedBy === undefined) return true;
+	return !failure.dependencyFailed && !outlook.dependsOn.some(({ transactionId }) => transactionId === failure.causedBy);
+}
+
+/** What a guard refusal names, in the terms of an exposure: the table, and the refused primary key —
+ * or, out of a unique index, the unique value — decoded by the collection's description; the key
+ * `undefined` when it does not decode. */
+export function refusedCheck(refusal: TreeGuardRefusedError, description: CollectionDescription): { readonly table: string; readonly key: readonly SqlValue[] | undefined } {
+	const table = description.table ?? refusal.collectionId;
+	switch (description.kind) {
+		case 'main':
+			return { table, key: typeof refusal.key === 'string' ? description.decodeKey(refusal.key) : undefined };
+		case 'unique-index': {
+			const value = refusal instanceof TreeRangeTakenError ? readRange(refusal.range)?.first?.key : undefined;
+			return { table, key: value === undefined ? undefined : description.decodeValue(value) };
+		}
+		default:
+			return { table, key: undefined };
+	}
 }
 
 // ── rendering ────────────────────────────────────────────────────────────────────────────────
@@ -424,11 +578,18 @@ export function renderCommitOutlook(outlook: CommitOutlook): string {
 		dependsOn: outlook.dependsOn,
 		unchecked: outlook.unchecked,
 	};
-	return JSON.stringify(shape, (_field, value: unknown) => {
-		if (typeof value === 'bigint') {
-			return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
-		}
-		if (value instanceof Uint8Array) return `0x${uint8ArrayToString(value, 'base16')}`;
-		return value;
-	});
+	return JSON.stringify(shape, sqlValueJson);
+}
+
+/** A key's values as JSON, rendered as {@link renderCommitOutlook} renders them; `null` when unknown. */
+export function renderKey(key: readonly SqlValue[] | undefined): string {
+	return JSON.stringify(key ?? null, sqlValueJson);
+}
+
+function sqlValueJson(_field: string, value: unknown): unknown {
+	if (typeof value === 'bigint') {
+		return value >= BigInt(Number.MIN_SAFE_INTEGER) && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString();
+	}
+	if (value instanceof Uint8Array) return `0x${uint8ArrayToString(value, 'base16')}`;
+	return value;
 }

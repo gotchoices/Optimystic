@@ -1,9 +1,9 @@
 import type {
   ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Transaction, TransactionDurability,
-  WriteDurability,
+  TreeGuardRefusedError, WriteDurability,
 } from '@optimystic/db-core';
 import {
-  TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError, TreeGuardRefusedError,
+  TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError,
   TreeKeyTakenError, createTransactionId, createTransactionStamp, recordCollectionDurability, transactionDurability,
   visitEveryThenThrow,
 } from '@optimystic/db-core';
@@ -13,6 +13,7 @@ import { CollectionFactory } from './collection-factory.js';
 import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurability, type SqlCommitDurabilityListener } from './commit-durability.js';
 import { DurabilityFollower } from './durability-follower.js';
 import { addListener, notifyListeners } from './listeners.js';
+import { guardRefusalIn } from './guard-refusal.js';
 import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
 import type { TransactionOutcome } from './offline-status.js';
@@ -791,16 +792,13 @@ export class TransactionBridge {
    * narrower there than at a commit-time refusal, which never passes through that translation.
    */
   mapCommitRefusal(error: unknown): unknown {
-    for (let cursor: unknown = error; cursor instanceof Error; cursor = cursor.cause) {
-      if (cursor instanceof TreeGuardRefusedError) {
-        const mapped = this.mapRefusal(cursor);
-        if (mapped === undefined || !(error instanceof Error) || error.message === mapped.message) {
-          return error;
-        }
-        return mapped.raise(error);
-      }
+    const refusal = guardRefusalIn(error);
+    if (refusal === undefined) return error;
+    const mapped = this.mapRefusal(refusal);
+    if (mapped === undefined || !(error instanceof Error) || error.message === mapped.message) {
+      return error;
     }
-    return error;
+    return mapped.raise(error);
   }
 
   /**

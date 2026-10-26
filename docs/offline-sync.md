@@ -212,7 +212,7 @@ type QueuedTransactionStatus =
       attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
       persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | 'restore' | undefined;
       outlook?: CommitOutlook }        // absent while waitingFor is 'restore' (and on a logged defect)
-  | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
+  | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }   // its outlook's kind changed
   | { kind: 'submitting'; transactionId: string; attempt: number }
   | { kind: 'committed'; transactionId: string; durability: TransactionDurability;
       tables: ReadonlyMap<string, WriteDurability | undefined>; followed: boolean;
@@ -253,7 +253,11 @@ type QueuedFailureReason =
   restore puts it back carries one. `QueuedTransaction.status` carries it the same way. The one
   other absence is a defect: a judgement that throws is logged (`offline:outlook-unjudged`) and the
   status is delivered without an outlook rather than withheld, and the entry's next `queued` status
-  judges it again.
+  judges it again. Its `dependsOn` and `kind` are kept current as earlier entries settle, and what
+  `status` and `entries` answer is the current outlook (see [The outlook](#the-outlook)).
+- `outlook-changed` is delivered when an entry's outlook changes `kind` — an entry exposed only
+  through `dependsOn` becoming assured once those entries commit — after the status of the entry
+  whose settling changed it, and never terminal. A `dependsOn` that only narrows is not announced.
 - `committedTables` on `failed` is set only when part of the transaction committed and the rest was
   then refused permanently; see [Partial commits](#partial-commits).
 - `waitingFor: 'restore'` is the plugin's own state, absent from the db-core queue: the transaction is
@@ -270,7 +274,7 @@ plugin passes through. It carries no `outlook`: judging a guard needs the catalo
 tables' key decoding, which only the plugin has, so the outlook is the plugin's own and `effect`
 arrives with stage 10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4,
 `persisted` (on `queued`, and on each item `entries()` lists) and the `'restore'` waiting state with
-stage 5, and `outlook` on `queued` with stage 7.
+stage 5, and `outlook` on `queued` and the `outlook-changed` status with stage 7.
 
 Queue-wide state, for a status bar:
 
@@ -279,6 +283,7 @@ plugin.offline.onQueueState(state => …);   // and plugin.offline.queueState() 
 type OfflineModeState = OfflineQueueState & {   // db-core's queue state: depth, oldestQueuedAt, draining,
   mode: 'offline' | 'online';                   //   waitingFor ('cohort' | 'backoff' | undefined), unclassifiedFailures
   readsServedLocally: boolean;   // the last live read was served from this machine's own view (see "Reads")
+  assuredFailures: number;       // assured entries that failed anyway (see "Conservative by construction")
 };
 ```
 
@@ -909,14 +914,34 @@ The outlook is computed at local commit and delivered on the `queued` status, so
 before `commit` resolves. More exactly, it is computed when the queue emits the entry's first
 `queued` status — inside the enqueue, after sealing, or inside the restore after a restart that
 puts the entry back — from the sealed segments, and the controller holds it per transaction id until
-the entry settles. The entry's own judgement (its exposures, below) is fixed then and never
-recomputed: a tag changed later, or an earlier entry committing, does not re-judge it, which is what
-makes the outlook move in one direction only. Nothing of it is journaled; a restart judges a restored
-entry again, against the entries restored before it. It changes in one direction only while the entry is queued: an entry that
-was exposed only through `dependsOn` becomes assured when those entries commit, and the queue
-delivers an `outlook-changed` status. Nothing makes an assured entry exposed later, because its own
-guards and its position in the queue do not change; a rival commit that refuses an exposed entry's
-guard is not a change of outlook but a failure, and is reported as one.
+the entry settles. The entry's own judgement (its exposures, below, and what each of its guards
+covers) is fixed then and never recomputed: a tag changed later does not re-judge it. Nothing of it
+is journaled; a restart judges a restored entry again, against the entries restored before it.
+
+The rest follows the queue. After every status that changes what is queued — an entry committed,
+partly committed or failed, or one a restore put back ahead of others — the controller walks the
+queue in order (`followOutlooks` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`). For each entry it
+drops the exposures and guards in collections a partial commit has committed, since those have
+passed; computes `dependsOn` again, by the rule in [Dependencies between
+entries](#dependencies-between-entries), against the entries ahead of it as they are now and the
+deferred records numbered below it; and derives `kind` from both, each dependency's kind being the
+one computed earlier in the same walk. An entry whose segment a replay has already refused keeps its
+outlook: it is about to fail, and the failure reports it. The walk waits while an entry that has left
+the queue has not had its terminal status yet, since its segments may still be dropping, and runs at
+that status.
+
+So the outlook changes in one direction only while the entry is queued: an entry that was exposed
+only through `dependsOn` becomes assured when those entries commit, and gets an `outlook-changed`
+status, delivered after the status of the entry whose commit changed it. Nothing makes an assured
+entry exposed later, because its own guards and its position in the queue do not change, with one
+exception the host contract rules out: an entry committed before `hydrate` (or `offline.restore`)
+read the journal can find a journaled transaction put back ahead of it, a dependency it was judged
+without. That change is delivered like any other and logged as `offline:outlook-regressed`; an
+outlook the queue contradicts is never kept. `outlook-changed` is delivered only when `kind`
+changes: a `dependsOn` that narrows while the entry stays assured, or stays exposed, is read from
+`status` and `entries`. A rival commit that refuses an exposed entry's guard is not a change of
+outlook but a failure, and is reported as one.
 
 `kind` answers "will it go in". `unchecked` answers a different question — "could it go in wrong" —
 and is kept apart on purpose: a message that references a conversation another machine might
@@ -1094,8 +1119,9 @@ record:
   device's own settings). Its `unchanged` guards count as not refusable by others.
 
 A hint changes the prediction and nothing else: every guard is still enforced at rebase. A false
-hint produces an assured entry that fails, which the queue logs as `offline:assured-entry-failed`
-with the guard that refused.
+hint produces an assured entry that fails, which the plugin logs as `offline:assured-entry-failed`
+with the guard that refused and counts in `assuredFailures` (see [Conservative by
+construction](#conservative-by-construction)).
 
 ### Conservative by construction
 
@@ -1105,6 +1131,20 @@ provenance it cannot trace. That is the rule Quereus's own row classification fo
 uncertain, classify as 'global'"). An assured entry that fails anyway, other than for reasons 3 and
 4, is therefore a defect in the analysis or a false hint, and is logged as such rather than treated
 as an ordinary failure.
+
+Concretely, the plugin reads the outlook the entry held when it fails (`outlookContradicted` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`) and logs
+`offline:assured-entry-failed transaction=… reason=… refusal=… table=… key=… causedBy=…` when it
+was assured, the reason is `constraint` or `concurrent-modification`, and the failure did not come
+through an entry it depends on: `causedBy` is absent, or names an entry not in its `dependsOn` while
+no entry in its `dependsOn` has failed. The second half is there because the queue names the nearest
+failing earlier entry as the cause, which in a chain of failures can be one this entry never
+depended on while the one it did depend on failed further up. `refusal` is the class of the guard
+refusal in the failure's cause chain, and `table` and `key` name what it refused, decoded as an
+exposure is. `expired`, `discarded`, `rejected` and `too-large` are never logged: the size limit is a
+property of this write, not of other writers, and the other three are reasons 3 and 4. Each line
+also adds one to `assuredFailures` on the queue-wide state, which, like the queue's
+`unclassifiedFailures`, is zero in a correct deployment.
 
 ### Guards that make idempotent writes assured
 
@@ -1689,7 +1729,7 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    every drain unless the application opts out with `allowSoloCommit`; the typed answer for a block
    no machine answered; and the plugin wiring: the node's gate registered on the `network`
    transactor, its wake routed through the controller, and `offline.allowSoloCommit`.
-7. **The outlook from guards alone.** Compute `CommitOutlook` from the actions' guards and the queue,
+7. **The outlook from guards alone** (implemented, in two tickets). Compute `CommitOutlook` from the actions' guards and the queue,
    with no Quereus change: every `absent` and `absentRange` guard is exposed unless its column is
    tagged fresh, every `unchanged` guard is exposed unless its row was inserted by an unsettled entry
    under a tagged-fresh key or the table is tagged single-writer, and `unchecked` is left empty
@@ -1773,14 +1813,25 @@ the drain on B's return reported `queued`, `submitting` and `committed` once eac
 with the re-check timer too long to explain it; and `expireAfterMs` reached while B is away, the entry
 failing `expired`, never sent.
 
-The first half of stage 7 pins the outlook from guards in
-`packages/quereus-plugin-optimystic/test/offline-outlook.spec.ts`, on one node whose gate never opens:
+Stage 7 pins the outlook from guards in
+`packages/quereus-plugin-optimystic/test/offline-outlook.spec.ts`. On one node whose gate never opens:
 an insert then an update in one transaction, assured under a fresh key and exposed once on the key
 under a natural one; an update of a row an earlier queued entry inserted under a fresh key, assured
 with that entry in `dependsOn`; an update of a row committed before going offline, exposed with its
 key; an insert under a fresh key into a table with natural UNIQUE columns, exposed on each decoded
-value; and `CommitOutlook()` inside an open transaction and outside one. Of the list below, what is
-left waits for its stage: the rest of the outlook (stages 7 to 10).
+value; `CommitOutlook()` inside an open transaction and outside one; and an assured update failing
+through the discard of the entry it depends on, neither re-judged on the way nor counted. On a
+two-node mesh whose first node's gate the test opens: an update of a single-writer table's row an
+earlier entry inserted under a natural key, exposed only through that entry and told
+`outlook-changed` to assured after it commits and before the update is sent; and a false
+`"optimystic.fresh"` tag, the entry assured, failed with `constraint` when the other node takes its
+key, logged as `offline:assured-entry-failed` with the table and key, and counted. Every offline spec
+also checks its predictions against their outcomes (the last item below):
+`packages/quereus-plugin-optimystic/test/outlook-predictions.ts`
+tracks each plugin `createMeshDbNode` and the offline specs' own helpers register, and a root
+`afterEach` fails a test that leaves any tracked plugin's `assuredFailures` above zero, unless the
+test declared the count with `expectAssuredFailures`. Of the list below, what is left waits for its
+stage: the rest of the outlook (stages 8 to 10).
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.
@@ -1826,8 +1877,8 @@ left waits for its stage: the rest of the outlook (stages 7 to 10).
   entries commit, the second with `effect: 'already-applied'`. Two machines increment the same
   counter offline: the second still fails with `concurrent-modification`.
 - Every assured prediction in the suite above that ends in `failed` for a reason other than expiry,
-  discard or a validator rejection fails the test: the prediction is checked against the outcome,
-  not only computed.
+  discard, a validator rejection or the size limit fails the test: the prediction is checked against
+  the outcome, not only computed.
 
 ## Open questions
 

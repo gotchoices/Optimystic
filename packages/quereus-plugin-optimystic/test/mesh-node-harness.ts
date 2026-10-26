@@ -18,6 +18,7 @@ import type { ITransactor, LogEntry } from '@optimystic/db-core';
 import { KeyRange, Log } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactors, type BuildTransactorOptions, type Mesh, type MeshOptions } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
+import { trackPredictions } from './outlook-predictions.js';
 
 export type Plugin = ReturnType<typeof register>;
 
@@ -88,6 +89,8 @@ export async function startMockMesh(size: number, options: MockMeshOptions = {})
 /**
  * Build a `Database` whose every collection rides `transactor`'s stack. `config` is spread over
  * the registration defaults, for a spec that registers the plugin with more (an `offline` block).
+ * The plugin's offline outlooks are checked against their outcomes when the test ends
+ * (`outlook-predictions.ts`).
  *
  * The factory keys its transactor cache on `${transactor}:${keyNetwork}`, so registering
  * under `shared:test` is what binds this Database to THIS mesh node rather than to a
@@ -102,6 +105,7 @@ export function createMeshDbNode(transactor: ITransactor, config: Record<string,
 		...config,
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, registration);
+	trackPredictions(plugin);
 	plugin.collectionFactory.registerTransactor('shared:test', transactor);
 	for (const vtable of plugin.vtables) {
 		db.registerModule(vtable.name, vtable.module, vtable.auxData);

@@ -40,13 +40,18 @@ export type QueuedTransactionStatus =
 		 * was flushed before its commit resolved, so it survives a crash of this process. */
 		persisted: boolean;
 		/** Whether anything another writer does could make the transaction fail (docs/offline-sync.md
-		 * §Predicting whether an entry will commit), judged when it was queued. Present on every
-		 * transaction the queue holds; absent while `waitingFor` is `'restore'`, since a
-		 * transaction not back in the queue cannot be judged — its first `queued` status after it is put
-		 * back carries one. Absent too, as a logged defect, when the judgement threw
-		 * (`offline:outlook-unjudged`). */
+		 * §Predicting whether an entry will commit): judged when it was queued, its `dependsOn` and
+		 * `kind` kept current as the transactions ahead of it settle. Present on every transaction the
+		 * queue holds; absent while `waitingFor` is `'restore'`, since a transaction not back in the
+		 * queue cannot be judged — its first `queued` status after it is put back carries one. Absent
+		 * too, as a logged defect, when the judgement threw (`offline:outlook-unjudged`). */
 		outlook?: CommitOutlook;
 	}
+	/** A queued transaction's outlook changed `kind` — normally from `'exposed'` to `'assured'`, once
+	 * every transaction it was exposed through has committed. Delivered after the status of the
+	 * transaction whose settling changed it; a narrower `dependsOn` alone is not announced, and is read
+	 * from `status` and `entries`. Never terminal. */
+	| { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
 	| { kind: 'submitting'; transactionId: string; attempt: number }
 	/** The same report `onCommitDurability` listeners received for this commit, which they did, before
 	 * this status was delivered. */
@@ -95,10 +100,16 @@ export type QueuedTransaction = {
 	readonly status: QueuedTransactionStatus;
 };
 
-/** Queue-wide state, for a status bar: the db-core queue's, plus which mode the database is in and
+/** Queue-wide state, for a status bar: the db-core queue's, plus which mode the database is in,
  * whether the last live read was served from this machine's own copy because the cohort could not be
- * reached (docs/offline-sync.md §Reads in offline mode). */
+ * reached (docs/offline-sync.md §Reads in offline mode), and how many transactions reported assured
+ * have failed anyway. */
 export type OfflineModeState = OfflineQueueState & {
 	readonly mode: 'offline' | 'online';
 	readonly readsServedLocally: boolean;
+	/** Transactions whose outlook was `'assured'` that failed because a check refused, other than
+	 * through the failure of one they depended on (`offline:assured-entry-failed`). Zero in a correct
+	 * deployment, like the queue's `unclassifiedFailures`: a rising count means a false
+	 * `optimystic.fresh` or `optimystic.single_writer` tag, or a defect in the prediction. */
+	readonly assuredFailures: number;
 };
