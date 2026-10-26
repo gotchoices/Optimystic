@@ -104,6 +104,25 @@ export type PendRequest = ActionTransforms & {
 	 * an older build ignores it, and then delivers at once as it always did.
 	 */
 	soleReservation?: true;
+	/**
+	 * The writer's word that this write must not be committed by a lone node that knows it is not
+	 * alone (`SyncOptions.refuseSoloCommit`). A coordinator whose cohort for the write is only itself
+	 * refuses the pend — before reserving anything — when it knows of cohort members it could not
+	 * place in the cohort, is still waiting to hear from a configured bootstrap peer, or could not
+	 * route the write to itself, answering with a {@link ShortfallFailure} whose
+	 * {@link PromiseShortfall.soloRefused} names which (`CoordinatorRepo.pendSolo` in db-p2p). A
+	 * coordinator that is genuinely alone ignores it and pends as it always did, and so does every
+	 * coordinator whose cohort has more than one member.
+	 *
+	 * Carried by every send of the write's attempt cycle, the re-send a refresh makes to finish a torn
+	 * attempt included (`Collection.completeOwnEntry`). Every per-coordinator rebuild of the request
+	 * keeps it (`pendRequestForBatch` in `NetworkTransactor`), since a batch that dropped it would
+	 * lose the protection for that coordinator's share. Omitted rather than `false`, for the same
+	 * preimage reason as {@link baseRevs}: a write that does not set it serializes exactly as before.
+	 * A coordinator on an older build ignores it and commits alone at `local`; in a group of mixed
+	 * versions the offline queue's reachability gate is then the only protection.
+	 */
+	refuseSolo?: true;
 };
 
 export type BlockActionStatus = ActionBlocks & {
@@ -290,7 +309,27 @@ export type PromiseShortfall = {
 	needed: number;
 	/** Peer-id strings of the cohort members that cast no promise vote at all. */
 	silentPeers: string[];
+	/**
+	 * Set only when no consensus round ran: a coordinator whose cohort for the write was only itself
+	 * refused to write alone, because the write asked it to (`PendRequest.refuseSolo`). The other
+	 * fields then describe the cohort the coordinator expected rather than one it asked: one approval
+	 * (its own), no rejections, the members it knows of and could not reach as `silentPeers`, and the
+	 * bar a cohort of that size would set. Absent on a shortfall a consensus round produced, so a log
+	 * or an application can tell "refused to write alone" from "a round heard too few".
+	 */
+	soloRefused?: SoloRefusalReason;
 };
+
+/**
+ * Why a lone coordinator refused a write that asked not to be committed alone
+ * (`PendRequest.refuseSolo`, `CommitRequest.refuseSolo`):
+ *  - `absent-members`: its cohort for the write was only itself, and it knows of cohort members it
+ *    could not place in that cohort (`IKeyNetwork.absentCohortMembers`);
+ *  - `awaiting-bootstrap`: its cohort was only itself and it is still waiting to hear from a peer it
+ *    was configured to join through (`IKeyNetwork.awaitingBootstrapContact`);
+ *  - `unrouted`: the cohort lookup failed, named nobody, or named one peer that is not this node.
+ */
+export type SoloRefusalReason = 'absent-members' | 'awaiting-bootstrap' | 'unrouted';
 
 /**
  * The cohort refused the pend because too few of its members ANSWERED the promise round for it to
@@ -424,6 +463,17 @@ export type CommitRequest = ActionBlocks & {
 	// by literally writing `undefined`. Revisit if undeclared commits ever become common enough to show
 	// up as replication-factor decay.
 	blockDigests?: BlockContentDigests;
+	/**
+	 * {@link PendRequest.refuseSolo}, on the commit. A coordinator whose cohort for the commit is only
+	 * itself refuses it on the same rule, before minting a proof or applying anything, with a
+	 * conflict-shaped refusal (`SOLO_COMMIT_REFUSED_REASON` in db-p2p), since a commit cannot answer
+	 * with a shortfall. That is reached when the pend ran on a real cohort and the partner dropped
+	 * before the commit: the writer cancels and retries, and the retry's pend meets the pend-side
+	 * refusal. Carried through every per-coordinator rebuild of the commit (`repoCommitRequest` in
+	 * `NetworkTransactor`); omitted rather than `false` for the preimage reason
+	 * {@link blockDigests} is.
+	 */
+	refuseSolo?: true;
 };
 
 /**

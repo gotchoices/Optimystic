@@ -95,6 +95,18 @@ export function isCommitNotDurableFailure(result: CommitResult): boolean {
 	return !result.success && (result.reason?.startsWith(COMMIT_NOT_DURABLE_REASON) ?? false);
 }
 
+/**
+ * Stable, greppable prefix on the failure reason `CoordinatorRepo.commit` answers with when it refused
+ * to commit a write alone that asked not to be (`CommitRequest.refuseSolo`): its cohort for the commit
+ * was only itself, and it knows of absent cohort members, still awaits a bootstrap peer, or could not
+ * route the write (`PromiseShortfall.soloRefused` names the same three on the pend side). Same
+ * convention as {@link COMMIT_NOT_DURABLE_REASON}. Conflict-shaped (`conflict: true`), because a commit
+ * cannot answer with a shortfall — the commit side reads any returned refusal as a confirmed conflict —
+ * so the writer cancels and retries, and the retry's pend meets the pend-side refusal. Nothing of the
+ * commit was applied or proven by the refusing node.
+ */
+export const SOLO_COMMIT_REFUSED_REASON = 'solo-commit-refused';
+
 /** Whether one {@link StorageRepo.get} entered a block write latch, which decides whether it ends with a flush. */
 type ReadWrites = { wrote: boolean };
 

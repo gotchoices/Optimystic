@@ -1,4 +1,4 @@
-import type { PromiseShortfall, ShortfallFailure } from "./struct.js";
+import type { PromiseShortfall, ShortfallFailure, SoloRefusalReason } from "./struct.js";
 
 /**
  * A pend the cohort could not accept because too few of its members answered the promise round: the
@@ -30,6 +30,9 @@ export class PromiseShortfallError extends Error {
 	readonly needed: number;
 	/** Peer-id strings of the cohort members that cast no promise vote at all. */
 	readonly silentPeers: readonly string[];
+	/** Why a lone coordinator refused to write alone, when that is what this shortfall is
+	 * ({@link PromiseShortfall.soloRefused}); absent when a consensus round fell short. */
+	readonly soloRefused?: SoloRefusalReason;
 
 	constructor(shortfall: PromiseShortfall) {
 		// NOTE: `shortfall` off the wire is trusted as shaped (`isShortfallFailure` checks only presence),
@@ -43,6 +46,7 @@ export class PromiseShortfallError extends Error {
 		this.peerCount = shortfall.peerCount;
 		this.needed = shortfall.needed;
 		this.silentPeers = [...shortfall.silentPeers];
+		if (shortfall.soloRefused !== undefined) this.soloRefused = shortfall.soloRefused;
 	}
 
 	/** The refusal a coordinating repo returns for this error, so it crosses the repo protocol as an
@@ -58,6 +62,7 @@ export class PromiseShortfallError extends Error {
 				peerCount: this.peerCount,
 				needed: this.needed,
 				silentPeers: [...this.silentPeers],
+				...(this.soloRefused === undefined ? {} : { soloRefused: this.soloRefused }),
 			},
 		};
 	}

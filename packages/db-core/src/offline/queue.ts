@@ -47,6 +47,13 @@ export type OfflineQueueOptions = {
 	recheck?: { baseMs?: number; maxMs?: number; rand?: RandFn };
 	/** Retry bounds handed to each submission (`Collection.commitHead` / `TransactionCoordinator.commitEntry`). */
 	submit?: Pick<SyncOptions, 'maxAttempts' | 'deadlineMs' | 'baseBackoffMs' | 'maxBackoffMs' | 'maxStalledAttempts'>;
+	/** Let an entry be committed by a lone node that knows it is not alone. Unless this is `true`,
+	 * every submission sets `SyncOptions.refuseSoloCommit`, so a coordinator whose cohort is only
+	 * itself refuses the entry while it knows of absent members, awaits a bootstrap peer or cannot
+	 * route the write, and the entry waits for its cohort (`waitingFor: 'cohort'`) rather than settling
+	 * `committed` on a write only this machine holds (docs/offline-sync.md §When to submit: the
+	 * reachability gate). A node that is genuinely alone commits either way. Default `false`. */
+	allowSoloCommit?: boolean;
 	/** The durable journal (docs/offline-sync.md §Persistence), called at every moment the design's
 	 * write ordering names: before `queued` is emitted, before each send, after a partial commit and
 	 * an identity renewal, and before each terminal status. Absent, nothing is journaled and the queue
@@ -198,6 +205,7 @@ export class OfflineQueue {
 	private readonly reachability: ICohortReachability;
 	private readonly waker: DrainWaker;
 	private readonly submitOptions: OfflineQueueOptions['submit'];
+	private readonly refuseSoloCommit: boolean;
 	private readonly expireAfterMs: number | undefined;
 	private readonly journal: IOfflineJournal | undefined;
 	private readonly now: () => number;
@@ -255,6 +263,7 @@ export class OfflineQueue {
 			{ baseMs: options.recheck?.baseMs ?? DefaultRecheckBaseMs, capMs: options.recheck?.maxMs ?? DefaultRecheckMaxMs },
 			options.recheck?.rand);
 		this.submitOptions = options.submit;
+		this.refuseSoloCommit = options.allowSoloCommit !== true;
 		this.expireAfterMs = options.expireAfterMs;
 		this.journal = options.journal;
 		this.now = options.now ?? Date.now;
@@ -705,9 +714,10 @@ export class OfflineQueue {
 	/** One submission: `commitHead` for an entry over one collection, the coordinator's per-entry
 	 * slice over several — built on the transactor the remaining collections share, since a queue
 	 * holds collections of whatever transactor each was opened on — each under the entry's action id
-	 * and local commit time, resuming from the attempts retained under that id. */
+	 * and local commit time, resuming from the attempts retained under that id, and — unless the queue
+	 * allows it — refusing to be committed by a lone node that knows it is not alone. */
 	private async send(entry: Entry, remaining: readonly Collection<any>[], signal: AbortSignal): Promise<TransactionDurability> {
-		const submit: SyncOptions = { ...this.submitOptions, signal };
+		const submit: SyncOptions = { ...this.submitOptions, signal, ...(this.refuseSoloCommit ? { refuseSoloCommit: true } : {}) };
 		const recordAttempt = (attempts: ReadonlyMap<CollectionId, InFlightAttempt>) => this.recordAttempts(entry, attempts);
 		if (remaining.length === 1) {
 			const collection = remaining[0]!;

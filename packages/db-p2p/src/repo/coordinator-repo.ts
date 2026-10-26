@@ -1,4 +1,4 @@
-import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
+import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason } from "@optimystic/db-core";
 import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -11,7 +11,7 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
-import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
+import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -25,7 +25,7 @@ import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibil
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
-import { commitBatchOf, pendBatchOf, type CommitBatch, type PendBatch } from "./request-batch.js";
+import { commitBatchOf, pendBatchOf, refusesSolo, type CommitBatch, type PendBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
 import { HeldBlockConsults } from "./held-block-consults.js";
 import { withDeadline } from "../with-deadline.js";
@@ -2812,13 +2812,54 @@ export class CoordinatorRepo implements IRepo {
 	/**
 	 * The solo short-circuit of {@link pendMany}: a cohort of at most one peer runs no consensus, and the
 	 * pends go straight to local storage exactly as before. What changes is the answer's class —
-	 * see {@link soloCohortDurability} for the four-way split. A refusal is returned untouched.
+	 * see {@link soloCohortOf} for the split. A refusal is returned untouched.
+	 *
+	 * A batch that asked not to be committed alone ({@link refusesSolo}) is refused first, before
+	 * anything is reserved, unless this node is genuinely alone ({@link soloRefusalFor},
+	 * {@link refuseSoloPend}).
 	 */
 	private async pendSolo(batch: PendBatch, blockId: BlockId, cohort: CohortResolution, options?: MessageOptions): Promise<PendResult> {
+		const solo = await this.soloCohortOf(cohort, blockId);
+		if (refusesSolo(batch)) {
+			const awaitingBootstrap = await this.awaitingBootstrapContact();
+			const reason = soloRefusalFor(solo, awaitingBootstrap);
+			if (reason !== undefined) return this.refuseSoloPend(batch, blockId, reason, solo, awaitingBootstrap);
+		}
 		// Strict, no `syncWithinMs`: no consensus ran, and only this machine holds the write, so it
 		// is synced before the writer is answered.
 		const result = await this.applyPendsInOrder(batch, options);
-		return result.success ? { ...result, durability: await this.soloCohortDurability(cohort, blockId) } : result;
+		return result.success ? { ...result, durability: soloCohortDurability(solo) } : result;
+	}
+
+	/**
+	 * {@link pendSolo}'s refusal of a batch that asked not to be committed alone: a promise shortfall,
+	 * built where every shortfall's answer is ({@link PromiseShortfallError.toFailure}), so it rides the
+	 * path every shortfall takes — returned rather than thrown, kept whole by the writer's transactor,
+	 * stopped on by name by every write path, and sorted `cohort-unreachable` by
+	 * `classifyCommitFailure`, so an offline queue waits for the cohort. It describes the cohort this
+	 * node expected rather than one it asked: its own approval, the members it knows of and could not
+	 * reach as silent, and the bar a cohort of that size sets — never below two, the least a cohort that
+	 * is not one machine has. `soloRefused` names the reason; the message stays the class's fixed
+	 * sentence.
+	 */
+	private refuseSoloPend(batch: PendBatch, blockId: BlockId, reason: SoloRefusalReason, solo: SoloCohort, awaitingBootstrap: boolean): ShortfallFailure {
+		const absent = solo.kind === 'self' ? solo.absent : [];
+		this.log('pend:solo-refused', { actionId: batch.actionId, blockId, reason, ...soloLogFields(absent, awaitingBootstrap) });
+		const peerCount = 1 + absent.length;
+		return new PromiseShortfallError({
+			approvals: 1,
+			rejections: 0,
+			peerCount,
+			needed: Math.max(2, Math.ceil(this.superMajorityThreshold * peerCount)),
+			silentPeers: [...absent],
+			soloRefused: reason,
+		}).toFailure();
+	}
+
+	/** Whether a configured bootstrap peer has never been heard from (`IKeyNetwork.awaitingBootstrapContact`);
+	 *  `false` for a key network that cannot say. */
+	private async awaitingBootstrapContact(): Promise<boolean> {
+		return await this.keyNetwork.awaitingBootstrapContact?.() ?? false;
 	}
 
 	/**
@@ -2838,17 +2879,18 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * The class of a write that took the solo short-circuit, from the cohort resolution that put it
-	 * there, for the block whose cohort that was. Policy-free: the write already happened, this only
-	 * says what it was.
+	 * Where the solo short-circuit's cohort put a write, from the cohort resolution that put it there,
+	 * for the block whose cohort that was. Read once per solo write: it gives the write's durability
+	 * class ({@link soloCohortDurability}) and, for a write that asked not to be committed alone, the ground
+	 * of its refusal ({@link soloRefusalFor}).
 	 *  - not resolved (the lookup threw, or named nobody) → `unrouted`;
-	 *  - resolved to exactly this node → `local`, naming as unconfirmed every member the key network
-	 *    knows belongs in this cohort but could not place in it ({@link absentCohortMembers}) — the
-	 *    write is owed to them. With none, a correct and complete one-machine write;
+	 *  - resolved to exactly this node → `self`, beside every member the key network knows belongs in
+	 *    this cohort but could not place in it ({@link absentCohortMembers}) — the write is owed to
+	 *    them. With none, a correct and complete one-machine write;
 	 *  - resolved to exactly one peer that is NOT this node → `unrouted` — this node wrote somewhere
 	 *    the cohort does not look, which is a write whose destination is wrong, not a solo write.
 	 * With no local peer id (direct constructors, single-node and test wiring) a resolved cohort of
-	 * one reads as `local`: the same posture `responsibilityFor` takes for a node with no
+	 * one reads as `self`: the same posture `responsibilityFor` takes for a node with no
 	 * identity, and a node with no identity cannot be in any cohort but its own.
 	 *
 	 * Both `unrouted` arms are defence in depth now, not the main guard: {@link verifyResponsibility}
@@ -2857,12 +2899,12 @@ export class CoordinatorRepo implements IRepo {
 	 * staleness window, or when a second lookup fails moments after the first succeeded — and then it
 	 * still reports honestly rather than posing as `local`.
 	 */
-	private async soloCohortDurability(cohort: CohortResolution, blockId: BlockId): Promise<WriteDurability> {
-		if (!cohort.resolved) return unroutedDurability();
+	private async soloCohortOf(cohort: CohortResolution, blockId: BlockId): Promise<SoloCohort> {
+		if (!cohort.resolved) return { kind: 'unrouted' };
 		const sole = cohort.peerIds[0]!;
-		if (this.localPeerId !== undefined && sole !== this.localPeerId.toString()) return unroutedDurability();
+		if (this.localPeerId !== undefined && sole !== this.localPeerId.toString()) return { kind: 'unrouted' };
 		const absent = (await this.absentCohortMembers(blockId)).filter(peerId => peerId !== sole);
-		return localDurability(sole, absent);
+		return { kind: 'self', sole, absent };
 	}
 
 	/**
@@ -3825,11 +3867,13 @@ export class CoordinatorRepo implements IRepo {
 	 * verifyBlockCommitProofClaim), so gating the mint on cohort composition would buy no safety while
 	 * opening a silent no-proof hole exactly when routing is degraded.
 	 *
-	 * The policy is unchanged — every write accepted here before is accepted now. What changes is
-	 * that the answer says which situation it was: the `commit:solo-cohort` log line (how an operator
-	 * tells a real cohort of one — cohortSize 1, soleIsSelf true — from a routing failure) now also
-	 * carries the `quorum` the writer is told, and both come from {@link soloCohortDurability}, so the
-	 * log and the answer cannot disagree.
+	 * Every write accepted here before is accepted now, except one that asked not to be committed
+	 * alone ({@link refusesSolo}) while this node is not genuinely alone ({@link soloRefusalFor}),
+	 * which is refused before the proof is minted or anything applied ({@link refuseSoloCommit}). The
+	 * answer says which situation it was: the `commit:solo-cohort` log line (how an operator tells a
+	 * real cohort of one — cohortSize 1, soleIsSelf true — from a routing failure) carries the `quorum`
+	 * the writer is told, and both come from {@link soloCohortDurability}, so the log and the answer
+	 * cannot disagree.
 	 *
 	 * Two more fields tell apart the three ways a node that is part of a group comes to write alone:
 	 * `knownAbsent` counts the members it knows of and could not reach (named in `absentPeers`), and
@@ -3841,17 +3885,21 @@ export class CoordinatorRepo implements IRepo {
 		const blockIds = batch.blockIds;
 		const cohortPeerIds = cohort.resolved ? cohort.peerIds : [];
 		const peerCount = cohortPeerIds.length;
-		const soloDurability = await this.soloCohortDurability(cohort, blockIds[0]!);
+		const solo = await this.soloCohortOf(cohort, blockIds[0]!);
+		const soloDurability = soloCohortDurability(solo);
 		const absent = soloDurability.unconfirmed ?? [];
+		const awaitingBootstrap = await this.awaitingBootstrapContact();
+		if (refusesSolo(batch)) {
+			const reason = soloRefusalFor(solo, awaitingBootstrap);
+			if (reason !== undefined) return this.refuseSoloCommit(batch, reason, absent, awaitingBootstrap);
+		}
 		this.log('commit:solo-cohort', {
 			blockId: blockIds[0],
 			cohortSize: peerCount,
 			soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
 				&& cohortPeerIds[0] === this.localPeerId.toString(),
 			quorum: soloDurability.quorum,
-			knownAbsent: absent.length,
-			...(absent.length === 0 ? {} : { absentPeers: absent.map(peerId => peerId.substring(0, 12)) }),
-			awaitingBootstrap: await this.keyNetwork.awaitingBootstrapContact?.() ?? false,
+			...soloLogFields(absent, awaitingBootstrap),
 			...(cohort.resolved ? {} : { reason: cohort.reason })
 		});
 		// Same message shape the multi-peer path produces — executeClusterTransaction stamps
@@ -3880,6 +3928,29 @@ export class CoordinatorRepo implements IRepo {
 		// consult storm bounded at one per window).
 		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
 		return await this.acknowledgeCommit(batch, { ...result, durability: soloDurability }, true);
+	}
+
+	/**
+	 * {@link commitSolo}'s refusal of a batch that asked not to be committed alone, made before the proof
+	 * is minted or anything applied, so this node stores and proves nothing of it. Conflict-shaped
+	 * ({@link SOLO_COMMIT_REFUSED_REASON}) rather than a shortfall: a shortfall is a pend answer only,
+	 * and the commit side reads any returned refusal as a confirmed conflict. Reached when the write's
+	 * pend ran on a real cohort and the partner dropped before the commit resolved a cohort of one: the
+	 * writer cancels and retries, and the retry's pend meets {@link pendSolo}'s refusal, which ends the
+	 * write as `cohort-unreachable`.
+	 */
+	private refuseSoloCommit(batch: CommitBatch, reason: SoloRefusalReason, absent: readonly string[], awaitingBootstrap: boolean): StaleFailure {
+		this.log('commit:solo-refused', {
+			actionId: batch.actionId,
+			blockId: batch.blockIds[0],
+			reason,
+			...soloLogFields(absent, awaitingBootstrap)
+		});
+		return {
+			success: false,
+			conflict: true,
+			reason: `${SOLO_COMMIT_REFUSED_REASON}: ${reason}; the write asked not to be committed by this node alone (${describeRevisions(batch)} of action ${batch.actionId})`
+		};
 	}
 
 	/**
@@ -3934,6 +4005,52 @@ interface CommitRival {
 
 /** What one commit request's blocks say about who holds its revision — see `CoordinatorRepo.commitRevisionHolder`. */
 type CommitRevisionHolder = 'own-durable' | CommitRival | undefined;
+
+/**
+ * Where the solo short-circuit's cohort put a write (`CoordinatorRepo.soloCohortOf`): nowhere the cohort
+ * looks, or on this node alone, beside the members the key network knows belong in that cohort and could
+ * not place in it.
+ */
+type SoloCohort =
+	| { readonly kind: 'unrouted' }
+	| { readonly kind: 'self'; readonly sole: string; readonly absent: readonly string[] };
+
+/** The durability class of a write that took the solo short-circuit. Policy-free: the write already
+ *  happened, this only says what it was — `local`, naming the absent members as the write's owed
+ *  copies, or `unrouted`. */
+function soloCohortDurability(solo: SoloCohort): WriteDurability {
+	return solo.kind === 'unrouted' ? unroutedDurability() : localDurability(solo.sole, solo.absent);
+}
+
+/**
+ * Why a solo write that asked not to be committed alone (`PendRequest.refuseSolo`,
+ * `CommitRequest.refuseSolo`) is refused — the one rule `CoordinatorRepo.pendSolo` and
+ * `CoordinatorRepo.commitSolo` both apply — or `undefined` when this node is genuinely alone: its cohort
+ * resolved to it, it knows of no absent member, and it awaits no bootstrap peer, so the write is a
+ * correct one-machine write and commits at `local` as any solo write does.
+ *
+ * NOTE: a write made while an identify exchange is in flight on this node is not refused here: the rule
+ * is absent members or an awaited bootstrap peer, and the offline queue's reachability gate covers the
+ * identify window (`KeyNetworkCohortReachability`). If a lone commit is ever traced to a write made while
+ * identify was in flight, add the gate's `identifying` arm here too — it needs `IdentifyProgress` in
+ * reach of `CoordinatorRepo`, whose constructor is already long: add it to an options object, not as
+ * another positional parameter.
+ */
+function soloRefusalFor(solo: SoloCohort, awaitingBootstrap: boolean): SoloRefusalReason | undefined {
+	if (solo.kind === 'unrouted') return 'unrouted';
+	if (solo.absent.length > 0) return 'absent-members';
+	return awaitingBootstrap ? 'awaiting-bootstrap' : undefined;
+}
+
+/** The log fields every solo line carries: the members known absent (short ids) and whether a
+ *  bootstrap peer is still awaited. */
+function soloLogFields(absent: readonly string[], awaitingBootstrap: boolean): { knownAbsent: number; absentPeers?: string[]; awaitingBootstrap: boolean } {
+	return {
+		knownAbsent: absent.length,
+		...(absent.length === 0 ? {} : { absentPeers: absent.map(peerId => peerId.substring(0, 12)) }),
+		awaitingBootstrap
+	};
+}
 
 /** The revisions a commit batch asks for, as prose: `rev 5` for one request, `revs 5, 3` for several. */
 function describeRevisions(batch: CommitBatch): string {

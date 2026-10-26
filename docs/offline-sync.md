@@ -506,16 +506,39 @@ node's routing view has dropped its partners takes the solo commit path (`soloCo
 `packages/db-p2p/src/repo/coordinator-repo.ts`) and commits alone at `local` durability — the
 lone-survivor write that backlog `6.5-partition-healing` records as a source of forked collections.
 The gate is a heuristic, though: the view can change between the check and the commit. The hard form
-is a per-write option on `SyncOptions`, carried on the pend and commit requests, that makes the solo
-short-circuit **refuse** a write while it knows of absent members, instead of committing it `local`
-with those members named as owed. The refusal is transient to the queue, so the entry waits and is
-retried when the members return.
+is a per-write option, `SyncOptions.refuseSoloCommit` in `packages/db-core/src/collection/struct.ts`,
+that makes the solo short-circuit **refuse** the write instead of committing it `local` with the
+missing members named as owed. It travels as `refuseSolo` on every pend and commit request of the
+write's attempt cycle (`PendRequest.refuseSolo` and `CommitRequest.refuseSolo` in
+`packages/db-core/src/network/struct.ts`), the re-send that finishes a torn attempt included, and is
+omitted rather than sent as `false`, so a write that does not set it is signed exactly as before. A
+coordinator whose cohort for the write is only itself refuses it for one of three reasons, decided in
+one place (`soloRefusalFor` in `packages/db-p2p/src/repo/coordinator-repo.ts`):
+
+- `absent-members`: it knows of cohort members it could not place in the cohort (`absentCohortMembers`);
+- `awaiting-bootstrap`: a configured bootstrap peer has never been heard from (`awaitingBootstrapContact`);
+- `unrouted`: the cohort lookup failed, named nobody, or named one peer that is not this node.
+
+With none of them the node is genuinely alone and commits at `local` as before. The pend is refused
+before anything is reserved, as a promise shortfall: `PromiseShortfallError` in
+`packages/db-core/src/network/promise-shortfall-error.ts`, its `soloRefused` field naming the reason,
+its `silentPeers` the members known absent — the path every shortfall already takes, so the queue sorts
+it `cohort-unreachable` and the entry waits for its cohort and is retried when the members return. The
+commit, which cannot answer with a shortfall, is refused conflict-shaped, with the reason prefix
+`SOLO_COMMIT_REFUSED_REASON` in `packages/db-p2p/src/storage/storage-repo.ts`, before any proof is
+minted or anything applied: that is reached when the pend ran on a real cohort and the partner dropped
+before the commit, and the writer then cancels and retries, and the retry's pend meets the shortfall. A
+refused entry stays in doubt, as after any shortfall once it has been sent (see
+[Identity across attempts](#identity-across-attempts)). The coordinator logs `pend:solo-refused` and
+`commit:solo-refused`, each with the reason, `knownAbsent`, `absentPeers` and `awaitingBootstrap`.
 
 **Decision (maintainer, 2026-10-25): every drain sets the option by default.** A queued entry is
 settled as `committed` only by a commit its cohort reached consensus on — never by a lone write made
 while this node knows of absent members. A node that is genuinely alone (no known absent member, no
 awaited bootstrap peer) is its whole cohort and still commits. An application that prefers the
-lone-write behaviour opts out with `offline.allowSoloCommit: true`. This does not choose a lone-write
+lone-write behaviour opts out with `offline.allowSoloCommit: true` (`OfflineQueueOptions.allowSoloCommit`
+in `packages/db-core/src/offline/queue.ts`; unless it is `true`, `OfflineQueue` sets
+`refuseSoloCommit` on every submission). This does not choose a lone-write
 rule for writes in general, which `6.5-partition-healing` records a decision against: writes outside
 offline mode keep today's solo short-circuit. A coordinator on a build that predates the field
 ignores it, so in a mixed-version group the gate is the only protection.
@@ -590,7 +613,7 @@ message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-
 | Outcome | Example | Entry becomes |
 |---|---|---|
 | Committed | the sync or coordinator commit returns | `committed` |
-| Cohort unreachable, nothing sent | `PromiseShortfallError` (in `packages/db-core/src/network/promise-shortfall-error.ts`): too few members answered the pend; `BlockUnavailableError` (in `packages/db-core/src/network/struct.ts`) with reason `cohort-unreachable` or `peers-unreachable`; a refused solo write (proposed above); the gate saying no | `queued`, `waitingFor: 'cohort'` |
+| Cohort unreachable, nothing sent | `PromiseShortfallError` (in `packages/db-core/src/network/promise-shortfall-error.ts`): too few members answered the pend; `BlockUnavailableError` (in `packages/db-core/src/network/struct.ts`) with reason `cohort-unreachable` or `peers-unreachable`; a refused solo write (a `PromiseShortfallError` whose `soloRefused` is set, above); the gate saying no | `queued`, `waitingFor: 'cohort'` |
 | Contention the sync loop could not get past | `SyncRetryExhaustedError`, `SyncRevisionStalledError` (in `packages/db-core/src/collection/struct.ts`); `CoordinatorStaleLossError` (in `packages/db-core/src/transaction/errors.ts`), the coordinator's counterpart | `queued`, `waitingFor: 'backoff'` |
 | Guard refusal on rebase | `TreeGuardRefusedError` and its subclasses | `failed`: `constraint` or `concurrent-modification` |
 | Validity rejection | `ValidityRejectedError` (in `packages/db-core/src/network/validity-rejected-error.ts`): every member that sank the pend signed it as a judgement of the transaction | `failed`: `rejected` |

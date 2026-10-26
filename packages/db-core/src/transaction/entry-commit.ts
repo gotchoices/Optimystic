@@ -4,10 +4,11 @@ import { clampPriority } from "./transaction.js";
 import type { Collection, RefreshReport } from "../collection/collection.js";
 import type { HeadCommitHandle } from "../collection/head-commit.js";
 import type { EntryId } from "../collection/segments.js";
-import type { InFlightAttempt } from "../collection/struct.js";
+import type { InFlightAttempt, InFlightCycle } from "../collection/struct.js";
 import type { StagedAttempt } from "../collection/write-attempts.js";
 import { retainedAttempt } from "../collection/write-attempts.js";
 import { visitEveryThenThrow } from "../utility/visit-every.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 
 /**
  * What the coordinator's phases know about the write they are sending — everything they used to
@@ -26,16 +27,22 @@ export type WriteContext = {
 	readonly reads: readonly ReadDependency[];
 	/** Already clamped (`clampPriority`); 0 on a first attempt. */
 	readonly priority: number;
+	/** The write refuses to be committed by a lone coordinator that knows it is not alone
+	 * (`SyncOptions.refuseSoloCommit`): spread onto every pend and commit request the phases build
+	 * (`PendRequest.refuseSolo`, `CommitRequest.refuseSolo`). Absent rather than `false`. */
+	readonly refuseSolo?: true;
 };
 
 /** The write context of a transaction's attempt, read when the attempt starts: `commitAttempts` ages
- * the transaction's priority between attempts, so it is read per attempt rather than once. */
-export function writeContextOf(transaction: Transaction): WriteContext {
+ * the transaction's priority between attempts, so it is read per attempt rather than once. `cycle`
+ * is what the commit was asked of every send ({@link InFlightCycle}). */
+export function writeContextOf(transaction: Transaction, cycle: InFlightCycle = {}): WriteContext {
 	return {
 		actionId: transaction.id as ActionId,
 		timestamp: transaction.stamp.timestamp,
 		reads: transaction.reads,
 		priority: clampPriority(transaction.priority),
+		...refuseSoloField(cycle.refuseSolo),
 	};
 }
 
@@ -98,9 +105,11 @@ export class EntryParticipants {
 	 * before opening anything — a defect of the caller — when the entry names no collection, names
 	 * one twice (opening it twice would deadlock on its own latch) or names one `collections` does
 	 * not hold; and closes the handles already opened when a later `openHeadCommit` throws (a
-	 * `SealedSegmentsError` precondition, say), so no latch is left held.
+	 * `SealedSegmentsError` precondition, say), so no latch is left held. Every handle's cycle carries
+	 * `cycle` ({@link InFlightCycle}), so a refresh that finishes a torn attempt re-sends it on the
+	 * same terms the coordinator's own round sends it.
 	 */
-	static async open(collections: ReadonlyMap<CollectionId, Collection<any>>, entry: EntryCommit): Promise<EntryParticipants> {
+	static async open(collections: ReadonlyMap<CollectionId, Collection<any>>, entry: EntryCommit, cycle: InFlightCycle = {}): Promise<EntryParticipants> {
 		if (entry.collectionIds.length === 0) {
 			throw new Error(`commitEntry ${entry.entryId}: an entry commit names at least one collection`);
 		}
@@ -118,8 +127,10 @@ export class EntryParticipants {
 		const handles = new Map<CollectionId, HeadCommitHandle>();
 		try {
 			for (const { collectionId, collection } of participants) {
+				const resume = entry.resume?.get(collectionId);
 				handles.set(collectionId, await collection.openHeadCommit(entry.entryId,
-					{ actionId: entry.actionId, timestamp: entry.timestamp }, entry.resume?.get(collectionId)));
+					{ actionId: entry.actionId, timestamp: entry.timestamp },
+					{ ...cycle, ...(resume === undefined ? {} : { resume }) }));
 			}
 		} catch (err) {
 			closeAll(handles);

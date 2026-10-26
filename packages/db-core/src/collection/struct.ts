@@ -207,7 +207,33 @@ export interface SyncOptions {
 	 * {@link deadlineMs} is still checked first, so a sync that is both past its deadline and
 	 * stalled reports the deadline (as {@link SyncRetryExhaustedError}), not the stall. */
 	maxStalledAttempts?: number;
+	/** Refuse to let this write be committed by a lone node — a coordinator whose cohort for the
+	 * write is only itself — while that node knows of members of the cohort it could not reach, is
+	 * still waiting to hear from a peer it was configured to join through, or could not route the
+	 * write at all. A node that is genuinely alone (no absent member known, nothing awaited, routed to
+	 * itself) still commits. The refusal is a promise shortfall (`PromiseShortfallError`, with
+	 * `soloRefused` naming the reason), so the write stops and is classified `cohort-unreachable`.
+	 * Rides on every send of the write's attempt cycle as `PendRequest.refuseSolo` and
+	 * `CommitRequest.refuseSolo`. Default off: only the offline queue sets it (docs/offline-sync.md
+	 * §When to submit: the reachability gate). A coordinator on a build that predates the field
+	 * ignores it and commits alone as before. */
+	refuseSoloCommit?: boolean;
 }
+
+/** What a write's attempt cycle carries besides its identity, recorded beside the in-flight mark
+ * (`Collection.beginInFlightAction`) so that every send of the cycle carries it: each attempt, and
+ * the re-send a refresh makes to finish a torn one (`Collection.completeOwnEntry`). */
+export type InFlightCycle = {
+	/** {@link SyncOptions.refuseSoloCommit}, for this cycle. */
+	readonly refuseSolo?: boolean;
+};
+
+/** What `Collection.openHeadCommit` opens a head commit with besides its identity: the cycle's
+ * {@link InFlightCycle}, and the attempt an earlier cycle under the same action id recorded and did
+ * not resolve ({@link HeadCommitOptions.resume}). */
+export type OpenHeadCommitOptions = InFlightCycle & {
+	readonly resume?: InFlightAttempt;
+};
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget
  * (attempt count or deadline) is exhausted while the transactor keeps returning stale failures.

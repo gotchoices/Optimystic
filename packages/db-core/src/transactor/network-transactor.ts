@@ -10,6 +10,7 @@ import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-no
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
@@ -1150,7 +1151,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * its tail, and for a {@link commitInOneRound} that threw.
 	 */
 	private async commitTailThenSweep(request: CommitRequest, remainingBlocks: BlockId[]): Promise<CommitResult> {
-		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
+		const tailResult = await this.commitBlock(commitOf(request, [request.tailId]));
 		if (!tailResult.success) {
 			// NOTE: a refused tail is NOT an absent tail. The coordinator's durability gate answers
 			// `commit-not-durable` whenever fewer than a majority hold the revision — even though
@@ -1182,7 +1183,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// walk. Sweeping before the tail would also let a committed header point at a never-committed
 		// tail: a dangling pointer, strictly worse than an orphaned block.
 		if (remainingBlocks.length > 0) {
-			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
+			const { batches, error } = await this.commitBlocks(commitOf(request, remainingBlocks));
 			cohortReports.push(...confirmedDurabilities(batches));
 			if (error) {
 				// Split by the failure's NATURE, exactly as commitBlock does for the tail: a RETURNED
@@ -1296,8 +1297,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return abandoned;
 	}
 
-	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId, blockDigests });
+	/** Commits `request`'s one block (the tail), returning a confirmed conflict and throwing a transient fault. */
+	private async commitBlock(request: RepoCommitRequest): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks(request);
 		if (tailError) {
 			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
 			// is the CALLER's responsibility (coordinator cancelPhase; TransactorSource.transact),
@@ -1742,8 +1744,16 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
  * cohort sign for blocks the request is not committing; and `processBatches` re-batches failed blocks
  * onto different coordinators, so only a send-time subset stays correct across retries.
  */
-function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests }: RepoCommitRequest): RepoCommitRequest {
-	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds) };
+function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests, refuseSolo }: RepoCommitRequest): RepoCommitRequest {
+	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds), ...refuseSoloField(refuseSolo) };
+}
+
+/** `request`'s commit of `blockIds` alone, for {@link NetworkTransactor}'s two-step path to hand to its
+ * batching: everything the write carries, with its declarations still action-wide — every send goes
+ * through {@link repoCommitRequest}, which narrows them to the blocks that send commits. */
+function commitOf(request: CommitRequest, blockIds: BlockId[]): RepoCommitRequest {
+	return { blockIds, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests,
+		...refuseSoloField(request.refuseSolo) };
 }
 
 /** `request`'s blocks with its log tail first, each once — the order a coordinator commits them in. */
@@ -1784,7 +1794,9 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
  *
  * `soleReservation` survives only on a batch carrying every block of the action: a pend split across
  * coordinators — by `consolidateCoordinators`, or by `processBatches` re-batching a failed batch — is
- * several reservations, which the field must never claim to be. Decided per send, like the bases. */
+ * several reservations, which the field must never claim to be. Decided per send, like the bases.
+ * Every other field goes on every batch as given — `refuseSolo` included, whose loss on one batch would
+ * let that coordinator's share be written by a lone node the write asked not to be written by. */
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
 	const { baseRevs, soleReservation, ...rest } = action;
 	const batchBlockIds = blockIdsForTransforms(payload);

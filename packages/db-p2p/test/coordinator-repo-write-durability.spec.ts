@@ -29,6 +29,7 @@ import type { IUnderReplicationLedger, UnderReplicatedEntry } from '../src/repo/
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { commitBatchOf, type CommitBatch } from '../src/repo/request-batch.js';
+import { SOLO_COMMIT_REFUSED_REASON } from '../src/storage/storage-repo.js';
 import { captureLog, hasTag } from './support/capture-log.js';
 
 const BLOCK = 'block-write-durability' as BlockId;
@@ -200,6 +201,22 @@ describe('CoordinatorRepo — a successful write says who holds it', () => {
 
 			expect(result.success).to.equal(false);
 			expect(result).to.not.have.property('durability');
+		});
+
+		it('a commit that asked not to be committed alone is refused, conflict-shaped, while a member is known absent — and nothing is applied', async () => {
+			// The pend ran on a real cohort; the partner dropped before the commit resolved a cohort of one.
+			let applied = 0;
+			const counting = storageRepo(async () => { applied++; return { success: true, durability: localDurability() }; });
+			const partner = (await makePeerId()).toString();
+			const repo = makeRepo(counting, self, { cohort: { resolved: true, peerIds: [selfId] }, absentMembers: [partner] });
+
+			const result = await repo.commit({ ...COMMIT, refuseSolo: true });
+
+			expect(result.success).to.equal(false);
+			if (result.success) throw new Error('unreachable');
+			expect(result.conflict, 'the writer cancels and retries; its pend then meets the shortfall').to.equal(true);
+			expect(result.reason?.startsWith(SOLO_COMMIT_REFUSED_REASON), result.reason).to.equal(true);
+			expect(applied, 'nothing of the write reached storage').to.equal(0);
 		});
 	});
 

@@ -6,10 +6,31 @@ import { withBlockRevs } from "../network/durability.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 import type { BlockFloorCheck } from "./block-floors.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('transactor-source');
+
+/** {@link TransactorSource.transact}'s optional parts of one attempt. Each is omitted from the
+ * request it rides on when unset, so a caller that sets nothing sends exactly the requests it always
+ * did — every one of them is hashed verbatim into the cohort signature preimages. */
+export type TransactOptions = {
+	/** Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
+	 * single-collection sync out-ranks fresh rivals in a concurrent race (`resolveRace`);
+	 * fairness-only, never affects validity. Omitted from the pend when 0. */
+	readonly priority?: number;
+	/** Per-block content declarations for the commit (see {@link BlockContentDigests}), computed by
+	 * the caller from the same tracker that produced the transforms. */
+	readonly blockDigests?: BlockContentDigests;
+	/** Per-block base revisions for the pend (see `PendRequest.baseRevs`): the committed revision each
+	 * update-only block's operations were computed against, from the same tracker
+	 * (`Tracker.stagedBaseRevs`). */
+	readonly baseRevs?: BlockBaseRevs;
+	/** Refuse to be committed by a lone coordinator that knows it is not alone
+	 * (`SyncOptions.refuseSoloCommit`): set on both the pend and the commit as `refuseSolo`. */
+	readonly refuseSolo?: boolean;
+};
 
 /** The block `entry` answers for `id`, for a read at `context` (`undefined` for an unpinned "give me
  * latest" read) — `undefined` when the block is absent — or a throw when the entry is not an answer
@@ -218,16 +239,8 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * that creates it.
 	 * @param tailId - The Id of the collection's log tail block.  This block's transform is committed FIRST
 	 * (prior to the rest of the block operations), to resolve the "winner" of a race to commit to the collection.
-	 * @param priority - Aged, advisory retry priority (default 0). Rides on the pend so a repeatedly-losing
-	 * single-collection sync out-ranks fresh rivals in a concurrent race (`resolveRace`); fairness-only, never
-	 * affects validity. Omitted from the pend when 0 so the common first-attempt pend serializes exactly as before.
-	 * @param blockDigests - Optional per-block content declarations for this commit (see {@link BlockContentDigests}),
-	 * computed by the caller from the same tracker that produced `transform`. Omitted from the commit request when
-	 * undefined, so a caller that declares nothing produces exactly the request shape as before — the field rides
-	 * inside every cohort signature's hash preimage, so keeping the shape clean keeps those preimages clean.
-	 * @param baseRevs - Optional per-block base revisions for the pend (see {@link PendRequest.baseRevs}): the
-	 * committed revision each update-only block's operations were computed against, from the same tracker
-	 * (`Tracker.stagedBaseRevs`). Omitted from the pend request when empty, for the same preimage reason.
+	 * @param options - The attempt's optional parts ({@link TransactOptions}); each is left off the request it
+	 * rides on when unset.
 	 * @returns The transactor's own verdict, unflattened: a {@link CommitSuccess} carrying the
 	 * {@link WriteDurability} of the committed revision — naming every block it committed at `rev`
 	 * (`blockRevs`) — or a {@link StaleFailure} if the pend or the commit was refused. Success is
@@ -236,13 +249,15 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * `result.success`. Test "is this completely saved" through `isFullyDurable`, never
 	 * by comparing `quorum` (see {@link WriteDurability}).
 	 */
-	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, priority = 0, blockDigests?: BlockContentDigests, baseRevs?: BlockBaseRevs): Promise<CommitResult> {
+	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, options: TransactOptions = {}): Promise<CommitResult> {
+		const { priority = 0, blockDigests, baseRevs, refuseSolo } = options;
 		const pendResult = await this.transactor.pend({
 			transforms: transform, actionId, rev, policy: 'r',
 			...(priority > 0 ? { priority } : {}),
 			...baseRevsField(baseRevs),
 			// One collection, pended whole and then committed: the shape `PendRequest.soleReservation` names.
-			soleReservation: true
+			soleReservation: true,
+			...refuseSoloField(refuseSolo)
 		});
 		if (!pendResult.success) {
 			return pendResult;
@@ -255,7 +270,8 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				blockIds: pendResult.blockIds,
 				actionId,
 				rev,
-				...blockDigestsField(blockDigests)
+				...blockDigestsField(blockDigests),
+				...refuseSoloField(refuseSolo)
 			});
 			if (!commitResult.success) {
 				// A confirmed conflict has to be RETURNED as the StaleFailure, because `Collection.sync`

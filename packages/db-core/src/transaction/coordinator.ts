@@ -7,10 +7,11 @@ import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
 import { ValidityRejectedError } from "../network/validity-rejected-error.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
-import type { SyncOptions } from "../collection/index.js";
+import type { InFlightCycle, SyncOptions } from "../collection/index.js";
 import type { StagedAttempt } from "../collection/write-attempts.js";
 import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
@@ -165,7 +166,16 @@ type CommitCycle = {
 	 * carries who holds it, `undefined` where the refresh that saved it could not say (see
 	 * {@link TransactionDurability}). */
 	saved: Map<CollectionId, WriteDurability | undefined>;
+	/** What every send of the commit carries ({@link InFlightCycle}) — recorded with each
+	 * participant's in-flight mark, so a refresh that finishes a torn attempt re-sends it on the same
+	 * terms, and read into every attempt's {@link WriteContext}. Taken from the commit's options. */
+	readonly inFlight: InFlightCycle;
 };
+
+/** What a commit's `options` ask of every send of its cycle. */
+function inFlightCycleOf(options: SyncOptions | undefined): InFlightCycle {
+	return options?.refuseSoloCommit === true ? { refuseSolo: true } : {};
+}
 
 /** How one collection's commit ended ({@link TransactionCoordinator.commitCollection}, or its share of
  * a batched commit's one answer). */
@@ -644,6 +654,7 @@ export class TransactionCoordinator {
 			inFlightDisposers: [],
 			participants: new Set(),
 			saved: new Map(),
+			inFlight: inFlightCycleOf(options),
 		};
 		const driver: AttemptDriver = {
 			opensWithRefresh: false,
@@ -977,7 +988,7 @@ export class TransactionCoordinator {
 				// (Collection.completeOwnEntry). `transaction.id` is stable across retries, so re-marking on a
 				// later attempt re-states the same fact. Only participants are marked; a registered
 				// non-participant is left unmarked and its refresh behaves exactly as a reader's.
-				cycle.inFlightDisposers.push(collection.beginInFlightAction(transaction.id));
+				cycle.inFlightDisposers.push(collection.beginInFlightAction(transaction.id, cycle.inFlight));
 			}
 			return await this.commitOnceLatched(transaction, collectionData, cycle);
 		} finally {
@@ -1048,7 +1059,7 @@ export class TransactionCoordinator {
 		}
 
 		// Read per attempt: commitAttempts ages the transaction's priority between attempts.
-		const context = writeContextOf(transaction);
+		const context = writeContextOf(transaction, cycle.inFlight);
 		let coordResult: CoordinationResult;
 		try {
 			for (const { collectionId, collection } of collectionData) {
@@ -1265,12 +1276,14 @@ export class TransactionCoordinator {
 			throw new Error(`commitEntry ${entry.entryId}: a queued entry commits through a coordinator built with `
 				+ `pendValidation: 'none' — it has no statements for a member to re-execute`);
 		}
-		const participants = await EntryParticipants.open(this.collections, entry);
+		const inFlight = inFlightCycleOf(options);
+		const participants = await EntryParticipants.open(this.collections, entry, inFlight);
 		const cycle: CommitCycle = {
 			// The handles own the in-flight marks (closed with them), so none to dispose here.
 			inFlightDisposers: [],
 			participants: new Set(participants.ids()),
 			saved: new Map(),
+			inFlight,
 		};
 		const driver: AttemptDriver = {
 			opensWithRefresh: true,
@@ -1322,7 +1335,13 @@ export class TransactionCoordinator {
 		if (entry.recordAttempt !== undefined) {
 			await entry.recordAttempt(participants.retainedAttempts(staged));
 		}
-		const context: WriteContext = { actionId: entry.actionId, timestamp: entry.timestamp, reads: [], priority };
+		const context: WriteContext = {
+			actionId: entry.actionId,
+			timestamp: entry.timestamp,
+			reads: [],
+			priority,
+			...refuseSoloField(cycle.inFlight.refuseSolo),
+		};
 		const attempts = new Map(Array.from(staged, ([collectionId, attempt]) => [collectionId, collectionAttemptOf(attempt)]));
 
 		participants.release();
@@ -1947,7 +1966,7 @@ export class TransactionCoordinator {
 
 		// 3. COMMIT phase: commit to all critical blocks (with retry for forward recovery)
 		const tCommit = Date.now();
-		const commitResult = await this.commitPhase(context.actionId, attempts, pendResult.pendedBlockIds);
+		const commitResult = await this.commitPhase(context, attempts, pendResult.pendedBlockIds);
 		const commitMs = Date.now() - tCommit;
 		if (!commitResult.success) {
 			// Targeted cancel: only cancel collections that are still pending (not already committed)
@@ -2239,7 +2258,8 @@ export class TransactionCoordinator {
 				: { validation }),
 			...baseRevsField(attempt.baseRevs),
 			superclusterNominees: nominees,
-			...(sole ? { soleReservation: true as const } : {})
+			...(sole ? { soleReservation: true as const } : {}),
+			...refuseSoloField(context.refuseSolo)
 		};
 	}
 
@@ -2253,7 +2273,7 @@ export class TransactionCoordinator {
 	 * the caller can do targeted cancel.
 	 */
 	private async commitPhase(
-		actionId: ActionId,
+		context: WriteContext,
 		attempts: ReadonlyMap<CollectionId, CollectionAttempt>,
 		pendedBlockIds: Map<CollectionId, BlockId[]>
 	): Promise<{
@@ -2266,7 +2286,7 @@ export class TransactionCoordinator {
 		expired?: TransactionExpiredError;
 	}> {
 		const together = pendedBlockIds.size > 1 && this.transactor.commitMany
-			? await this.commitTogether(actionId, attempts, pendedBlockIds)
+			? await this.commitTogether(context, attempts, pendedBlockIds)
 			: undefined;
 		// NOTE: a fallback after a batched pend leaves the multi-collection residual in place: the
 		// pend's decision may have been held back for a commit that now goes per collection, so a member
@@ -2278,7 +2298,7 @@ export class TransactionCoordinator {
 		// cache's TTL is at least a minute, its size cap 1000 transactions), so a live lookup can split
 		// the blocks. If that ever shows up, pin the commit to the coordinator the batched pend answered
 		// from. See docs/correctness.md §2 Definitions.
-		const outcomes = together ?? await this.commitEach(actionId, attempts, pendedBlockIds);
+		const outcomes = together ?? await this.commitEach(context, attempts, pendedBlockIds);
 
 		const committedCollections = new Map<CollectionId, WriteDurability>();
 		const failedCollections = new Set<CollectionId>();
@@ -2331,13 +2351,14 @@ export class TransactionCoordinator {
 	 * request, and a throw is the per-collection path's to retry.
 	 */
 	private async commitTogether(
-		actionId: ActionId,
+		context: WriteContext,
 		attempts: ReadonlyMap<CollectionId, CollectionAttempt>,
 		pendedBlockIds: Map<CollectionId, BlockId[]>
 	): Promise<CollectionCommitOutcome[] | undefined> {
+		const actionId = context.actionId;
 		const requests: { collectionId: CollectionId; request: CommitRequest }[] = [];
 		for (const [collectionId, blockIds] of pendedBlockIds) {
-			const request = this.commitRequestFor(actionId, collectionId, attempts.get(collectionId)!, blockIds);
+			const request = this.commitRequestFor(context, collectionId, attempts.get(collectionId)!, blockIds);
 			if (typeof request === 'string') return undefined;
 			requests.push({ collectionId, request });
 		}
@@ -2356,13 +2377,13 @@ export class TransactionCoordinator {
 
 	/** Commits each collection on its own, concurrently ({@link commitCollection}), one outcome per collection. */
 	private async commitEach(
-		actionId: ActionId,
+		context: WriteContext,
 		attempts: ReadonlyMap<CollectionId, CollectionAttempt>,
 		pendedBlockIds: Map<CollectionId, BlockId[]>
 	): Promise<CollectionCommitOutcome[]> {
 		const entries = Array.from(pendedBlockIds.entries());
 		const settled = await Promise.allSettled(entries.map(([collectionId, blockIds]) =>
-			this.commitCollection(actionId, collectionId, attempts.get(collectionId)!, blockIds)
+			this.commitCollection(context, collectionId, attempts.get(collectionId)!, blockIds)
 		));
 		// commitCollection resolves rather than rejects, but treat any unexpected rejection as a (hard)
 		// failure of its collection so the partitioned sets stay honest.
@@ -2378,13 +2399,13 @@ export class TransactionCoordinator {
 	 * {@link commitEach} can aggregate every result.
 	 */
 	private async commitCollection(
-		actionId: ActionId,
+		context: WriteContext,
 		collectionId: CollectionId,
 		/** Its revision is the one this collection PENDED at (see {@link commitRequestFor}). */
 		attempt: CollectionAttempt,
 		blockIds: BlockId[]
 	): Promise<CollectionCommitOutcome> {
-		const commitRequest = this.commitRequestFor(actionId, collectionId, attempt, blockIds);
+		const commitRequest = this.commitRequestFor(context, collectionId, attempt, blockIds);
 		if (typeof commitRequest === 'string') {
 			return { collectionId, committed: false, error: commitRequest };
 		}
@@ -2415,7 +2436,7 @@ export class TransactionCoordinator {
 	 * — or, as a string, why there is none.
 	 */
 	private commitRequestFor(
-		actionId: ActionId,
+		context: WriteContext,
 		collectionId: CollectionId,
 		/** Its revision is the one this collection PENDED at, threaded from the log append — the same
 		 * bug family as pendCollection's: recomputing `getNextRev()` here, after the pend round trips,
@@ -2434,11 +2455,12 @@ export class TransactionCoordinator {
 		// member side. Only the client can declare this — CoordinatorRepo.commit forwards without
 		// materializing.
 		return {
-			actionId,
+			actionId: context.actionId,
 			blockIds,
 			tailId: attempt.tailId,
 			rev: attempt.rev,
-			...blockDigestsField(attempt.blockDigests)
+			...blockDigestsField(attempt.blockDigests),
+			...refuseSoloField(context.refuseSolo)
 		};
 	}
 

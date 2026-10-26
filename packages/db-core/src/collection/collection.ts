@@ -12,7 +12,7 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
-import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, InFlightAttempt, SyncOptions, TornActionReason } from "./index.js";
+import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
 import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
@@ -247,6 +247,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * read by {@link logAppendBlockIds}, cleared with the rest of the in-flight state by
 	 * {@link beginInFlightAction} and its disposer. */
 	private mintedLogBlockIds?: { rev: number; ids: BlockId[] };
+
+	/** What the cycle marked in {@link inFlightActionId} asked of every send it makes
+	 * ({@link InFlightCycle}) — read by {@link send} and by the re-send {@link completeOwnEntry} makes
+	 * to finish a torn attempt, so neither needs it threaded through. Set by
+	 * {@link beginInFlightAction} and cleared by its disposer. */
+	private inFlightCycle: InFlightCycle = {};
 
 	/** The sealed segment a head commit on this instance is committing ({@link openHeadCommit}), for
 	 * the whole cycle — set and cleared beside {@link inFlightActionId}. Read by
@@ -842,7 +848,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// pair is not obviously right either: a member re-executing the transaction after a sibling
 		// participant has landed no longer sees the state it was staged against. Tracked as an arm
 		// of tickets/backlog/feat-no-deployment-validates-transactions-at-pend.
-		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests, attempt.baseRevs);
+		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, {
+			blockDigests: attempt.blockDigests,
+			baseRevs: attempt.baseRevs,
+			refuseSolo: this.inFlightCycle.refuseSolo
+		});
 		if (result.success) {
 			return result.durability;
 		}
@@ -2072,8 +2082,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * path, which is the same assumption the participant selection in
 	 * `TransactionCoordinator.commitOnce` and its `rollback` already rest on. If a second writer is
 	 * ever allowed to drive the SAME instance concurrently, this must become a per-attempt token (a
-	 * mark object compared by identity, refusing to replace a live one) rather than a bare id. */
-	beginInFlightAction(actionId: ActionId): () => void {
+	 * mark object compared by identity, refusing to replace a live one) rather than a bare id.
+	 *
+	 * `cycle` is what every send of the cycle carries ({@link InFlightCycle}); a re-mark replaces it,
+	 * which is harmless because every caller re-marks with what it marked. */
+	beginInFlightAction(actionId: ActionId, cycle: InFlightCycle = {}): () => void {
 		if (this.inFlightActionId !== actionId) {
 			// A different action's failed attempt cannot finish this one. Re-marking the SAME id (a
 			// coordinator re-marks on every attempt) keeps what the previous attempt retained — that
@@ -2083,11 +2096,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			this.mintedLogBlockIds = undefined;
 		}
 		this.inFlightActionId = actionId;
+		this.inFlightCycle = cycle;
 		return () => {
 			if (this.inFlightActionId === actionId) {
 				this.inFlightActionId = undefined;
 				this.inFlightAttempt = undefined;
 				this.mintedLogBlockIds = undefined;
+				this.inFlightCycle = {};
 			}
 		};
 	}
@@ -2200,7 +2215,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			timestamp: Date.now(),
 		};
 
-		const endInFlight = this.beginInFlightAction(identity.actionId);
+		const endInFlight = this.beginInFlightAction(identity.actionId, { refuseSolo: options?.refuseSoloCommit });
 		try {
 			return await this.syncAttempts(identity, options);
 		} finally {
@@ -2271,10 +2286,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			store => this.logAppendBlockIds(store, identity.actionId, rev));
 	}
 
-	/** Send one attempt — pend, then commit — under the cycle's aged retry `priority`. */
+	/** Send one attempt — pend, then commit — under the cycle's aged retry `priority`, carrying what
+	 * the cycle asked of every send ({@link inFlightCycle}). */
 	private send(staged: StagedAttempt, identity: WriteIdentity, priority: number): Promise<CommitResult> {
-		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId,
-			priority, staged.blockDigests, staged.baseRevs);
+		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId, {
+			priority,
+			blockDigests: staged.blockDigests,
+			baseRevs: staged.baseRevs,
+			refuseSolo: this.inFlightCycle.refuseSolo
+		});
 	}
 
 	/** Fold a committed attempt's transforms — the log append included — into this instance's read
@@ -2316,7 +2336,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * when a refresh or the head tracker's staging refused it during the cycle; whatever
 	 * `options.recordAttempt` throws, before anything is sent; otherwise what {@link sync} throws. */
 	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
-		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, options.resume);
+		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, {
+			refuseSolo: options.refuseSoloCommit,
+			...(options.resume === undefined ? {} : { resume: options.resume })
+		});
 		try {
 			return await driveHeadCommit(handle, options);
 		} finally {
@@ -2332,10 +2355,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * preconditions; marks the action in flight for the whole cycle ({@link beginInFlightAction}), as
 	 * a sync's is, so the refresh between attempts recognises the write's own entry; sets
 	 * {@link headCommitEntry}, which tells {@link consumeOwnEntry} that such an entry records the head
-	 * segment; and seeds the retained attempt with `resume` when one is given, so that the opening
-	 * refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) — and
-	 * `stage()` re-sends it verbatim while the next attempt would request its revision
-	 * ({@link resumedAttempt}).
+	 * segment; and seeds the retained attempt with `options.resume` when one is given, so that the
+	 * opening refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) —
+	 * and `stage()` re-sends it verbatim while the next attempt would request its revision
+	 * ({@link resumedAttempt}). The rest of `options` is the cycle's ({@link InFlightCycle}), recorded
+	 * with the in-flight mark, so the handle's `send()` and a refresh's re-send of a torn attempt both
+	 * carry it.
 	 *
 	 * **The target.** The live tracker holds every sealed segment and the open one, cumulatively, so
 	 * an attempt cannot run on a copy of it the way a sync's does. It runs on a HEAD TRACKER instead
@@ -2367,12 +2392,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * order, the order `TransactionCoordinator.commitOnce` takes the same latches in; see the
 	 * interface.
 	 *
-	 * @throws Error before the latch is taken when `resume` was recorded under an action other than
+	 * @throws Error before the latch is taken when `options.resume` was recorded under an action other than
 	 * `identity.actionId` — a caller defect, since the attempt would be re-sent under the wrong id;
 	 * SealedSegmentsError, with the latch released again, when `entryId` is not the head segment
 	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
 	 * this instance (`in-flight`). */
-	async openHeadCommit(entryId: EntryId, identity: WriteIdentity, resume?: InFlightAttempt): Promise<HeadCommitHandle> {
+	async openHeadCommit(entryId: EntryId, identity: WriteIdentity, options: OpenHeadCommitOptions = {}): Promise<HeadCommitHandle> {
+		const { resume, ...cycle } = options;
 		if (resume !== undefined && resume.actionId !== identity.actionId) {
 			throw new Error(`Collection ${this.id}: an attempt recorded under action ${resume.actionId} cannot resume `
 				+ `a head commit of ${entryId} under action ${identity.actionId}`);
@@ -2384,7 +2410,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			release();
 			throw err;
 		}
-		const endInFlight = this.beginInFlightAction(identity.actionId);
+		const endInFlight = this.beginInFlightAction(identity.actionId, cycle);
 		this.headCommitEntry = entryId;
 		if (resume !== undefined) {
 			this.retainInFlightAttempt(resume);
