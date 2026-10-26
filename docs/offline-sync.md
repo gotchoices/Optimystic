@@ -211,7 +211,7 @@ type QueuedTransactionStatus =
   | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[]; queuedAt: number;
       attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
       persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | 'restore' | undefined;
-      outlook?: CommitOutlook }        // absent exactly while waitingFor is 'restore'
+      outlook?: CommitOutlook }        // absent while waitingFor is 'restore' (and on a logged defect)
   | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
   | { kind: 'submitting'; transactionId: string; attempt: number }
   | { kind: 'committed'; transactionId: string; durability: TransactionDurability;
@@ -248,9 +248,12 @@ type QueuedFailureReason =
 - `outlook` says whether anything another writer does can make the entry fail, and if so what; an
   application uses it to decide whether a pending change needs the user's attention or only a
   progress indicator. See [Predicting whether an entry will commit](#predicting-whether-an-entry-will-commit).
-  It is present on every entry the queue holds and absent exactly while `waitingFor` is `'restore'`:
+  It is present on every entry the queue holds and absent while `waitingFor` is `'restore'`:
   a transaction not back in the queue cannot be judged, and its first `queued` status after the
-  restore puts it back carries one. `QueuedTransaction.status` carries it the same way.
+  restore puts it back carries one. `QueuedTransaction.status` carries it the same way. The one
+  other absence is a defect: a judgement that throws is logged (`offline:outlook-unjudged`) and the
+  status is delivered without an outlook rather than withheld, and the entry's next `queued` status
+  judges it again.
 - `committedTables` on `failed` is set only when part of the transaction committed and the rest was
   then refused permanently; see [Partial commits](#partial-commits).
 - `waitingFor: 'restore'` is the plugin's own state, absent from the db-core queue: the transaction is

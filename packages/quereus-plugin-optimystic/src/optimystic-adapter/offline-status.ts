@@ -41,9 +41,10 @@ export type QueuedTransactionStatus =
 		persisted: boolean;
 		/** Whether anything another writer does could make the transaction fail (docs/offline-sync.md
 		 * §Predicting whether an entry will commit), judged when it was queued. Present on every
-		 * transaction the queue holds; absent exactly while `waitingFor` is `'restore'`, since a
+		 * transaction the queue holds; absent while `waitingFor` is `'restore'`, since a
 		 * transaction not back in the queue cannot be judged — its first `queued` status after it is put
-		 * back carries one. */
+		 * back carries one. Absent too, as a logged defect, when the judgement threw
+		 * (`offline:outlook-unjudged`). */
 		outlook?: CommitOutlook;
 	}
 	| { kind: 'submitting'; transactionId: string; attempt: number }

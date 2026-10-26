@@ -697,13 +697,6 @@ export class OfflineMode {
 		return this.judge(writes, collections.map(collection => collection.id), this.queueAhead(this.queue.entries(), Infinity));
 	}
 
-	/**
-	 * Judge the queued transaction `entryId` when the queue first reports it `queued` — inside the
-	 * enqueue, before its commit resolves, or inside the restore that put it back — and hold the
-	 * outlook until it settles: its segments, against the entries ahead of it in queue order and the
-	 * journaled transactions numbered below it that are still deferred. It is not judged again, so a
-	 * tag changed later, or an earlier entry settling, changes nothing here.
-	 */
 	/** {@link judgeQueued}, isolated: it runs ahead of the status's translation and delivery, and a
 	 * defect in the judgement (a description or a decoder that throws) must not keep the `queued`
 	 * status from the application. The status then carries no outlook, and the entry's next `queued`
@@ -716,6 +709,13 @@ export class OfflineMode {
 		}
 	}
 
+	/**
+	 * Judge the queued transaction `entryId` when the queue first reports it `queued` — inside the
+	 * enqueue, before its commit resolves, or inside the restore that put it back — and hold the
+	 * outlook until it settles: its segments, against the entries ahead of it in queue order and the
+	 * journaled transactions numbered below it that are still deferred. It is not judged again, so a
+	 * tag changed later, or an earlier entry settling, changes nothing here.
+	 */
 	private judgeQueued(entryId: string): void {
 		const entries = this.queue.entries();
 		const position = entries.findIndex(entry => entry.id === entryId);

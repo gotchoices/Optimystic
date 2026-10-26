@@ -1,16 +1,8 @@
-description: When a transaction is committed offline, the application is now told whether anything another user does could make it fail — worked out from the checks the transaction carries and from two new table/column tags — and can ask the same question inside an open transaction with a SQL function. Review the implementation.
+description: When a transaction is committed offline, the application is now told whether anything another user does could make it fail — worked out from the checks the transaction carries and from two new table/column tags — and can ask the same question inside an open transaction with a SQL function.
 prereq: offline-sync-plugin-offline-mode
 architecture: docs/offline-sync.md#predicting-whether-an-entry-will-commit
 files: packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts (new), packages/quereus-plugin-optimystic/src/functions/commit-outlook.ts (new), packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/schema/index-manager.ts, packages/quereus-plugin-optimystic/src/plugin.ts, packages/quereus-plugin-optimystic/src/index.ts, packages/db-core/src/collection/collection.ts, packages/db-core/src/offline/status.ts, packages/quereus-plugin-optimystic/test/offline-outlook.spec.ts (new), packages/quereus-plugin-optimystic/test/adapter-integration.spec.ts, packages/quereus-plugin-optimystic/README.md, docs/offline-sync.md, docs/internals.md
 ----
-<!-- resume-note -->
-RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-10-26T18:27:03.894Z (agent: claude)
-  Log file: C:\projects\optimystic\tickets\.logs\7-offline-sync-outlook-from-guards.review.2026-10-26T18-27-03-894Z.log
-Read the log to see what was done. Resume where it left off.
-If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
-<!-- /resume-note -->
-
 First half of stage 7 of [docs/offline-sync.md §Implementation stages](../../docs/offline-sync.md#implementation-stages): the `CommitOutlook` of a queued transaction, computed from its staged guards and the queue alone, delivered on the `queued` status, and answered for an open transaction by `CommitOutlook()`. No Quereus change. The second half (keeping the outlook current as earlier entries settle, `outlook-changed`, `offline:assured-entry-failed`) is `tickets/implement/7.1-offline-sync-outlook-follows-the-queue.md`, which builds on this.
 
 ## What was built
@@ -58,3 +50,27 @@ Validation run: plugin build + `typecheck` clean; full plugin suite once (1126 p
 ## Covered by inspection only (no test)
 
 `single_writer` (update not exposed, natural-key insert still is); primary-key move (delete half `unchanged` on the old key, insert half `absent` on the new, judged independently); REPLACE / eviction (`unchanged` → `row`); a deferred journaled record in `dependsOn` making the entry exposed; a restored entry re-judged against entries restored before it; a segment already refused when judged; a savepoint rollback before `CommitOutlook()` (the open segment is replaced on restore, `openActions` reads the current one).
+
+## Review findings
+
+Reviewed the diff of `ticket(implement): offline-sync-outlook-from-guards` first, then the handoff. This review resumed an interrupted run, whose edits (status isolation, the ordering wording) had already been committed with the resume note.
+
+**Correctness — checked, two fixed.**
+- The judgement ran inline in `OfflineMode.onQueueStatus`, ahead of the status's translation and delivery, so a throw from a table's description or a decoder would have kept the `queued` status from every listener and escaped into the queue's emit. Fixed (prior run): `tryJudgeQueued` logs `offline:outlook-unjudged` and delivers the status without an outlook; the next `queued` status judges again. This run moved the `judgeQueued` doc comment back onto `judgeQueued` (the prior run had stacked it above `tryJudgeQueued`), and corrected "absent exactly while `'restore'`" in `offline-status.ts` and docs/offline-sync.md (status shape and §Following transactions) to name the logged-defect absence too.
+- Exposures were documented as "in staging order", but the judgement walks collection by collection. Fixed (prior run) in `commit-outlook.ts`, the README and docs/offline-sync.md.
+- Range matching (`withinRange`, plain string `<`/`>`) agrees with the trees: `CollectionFactory.resolveTreeArgs` gives every plugin tree plain string comparison, and `absentRange` ranges come only from `indexValueRange`. Checked, no change.
+- Covering soundness (an earlier `absent`/`unchanged` covers a later exact-key check; `absentRange` never covered): checked the delete-then-reinsert and insert-then-update shapes by hand; sound. Partial UNIQUE constraints are not guarded (`guardedUniqueIndexes` skips them) and are not described as unique (`describeUniqueIndex` skips them), so the two agree. Only unique index trees carry guards (`IndexManager` stages `uniquePrefixGuard` only for them).
+- Terminal statuses (`committed`, `failed` including `discarded`) clear the `outlooks` map; a partial commit's re-emitted `queued` keeps the frozen outlook by design.
+- Judgement calls in the handoff (undecodable key reported `'row'`; unreadable earlier segment = writes everything; restore-registered entry without outlook; refused-not-yet-failed counting as dependencies): all conservative in the documented direction; left as they are.
+
+**Follow-up hand-off — fixed.** The own judgement is computed and discarded; `tickets/implement/7.1-offline-sync-outlook-follows-the-queue.md` now says what it must export and hold (`{ own, outlook }`), and that an entry left unjudged by `tryJudgeQueued` has no own judgement to recompute from.
+
+**Type safety, cleanup, DRY, modularity.** `commit-outlook.ts` (433 lines, `wc -l`) is pure and split into reading, indexing, judging and rendering; no `any` beyond the bridge's existing `Collection<any>` idiom. Nothing to release (in-memory map only). No change.
+
+**Performance.** Each judgement rebuilds the earlier entries' written-key index (linear in the queue) — already parked as a `NOTE:` at `writtenKeysOf`; one exposure per check on bulk writes — `NOTE:` at `CollectionJudge.expose`. The follow-up ticket already asks for the incremental index. No new tripwire.
+
+**Tests.** The five cases in `test/offline-outlook.spec.ts` each pin a distinct rule end to end (covering, rule 4 with `dependsOn`, `row` exposure, unique decoding under two affinities, `CommitOutlook()` JSON and NULL); none restates the implementation. Nothing added: the fixes are an isolation wrapper on a defect path and wording. `single_writer`, PK moves, deferred-record dependencies and restore re-judging remain covered by inspection only, as the handoff says.
+
+**Docs.** README § Offline mode, docs/offline-sync.md (§Following transactions, §Judging each guard, §Using the outlook before committing, §Test plan) and docs/internals.md read against the code; corrected as above. `yarn lint:docs` clean.
+
+**Validation.** Plugin `yarn build` + `yarn typecheck` clean; eslint over the changed adapter files clean; full plugin `yarn test` 1127 passing, 14 pending; full db-core `yarn test` 1998 passing. Not run: `yarn check:rn` (the new `atob` in `decodeIndexKey` is supported by Hermes in the pinned React Native 0.83 toolchain, but not verified by a bundle run here) and `yarn test:integration`.
