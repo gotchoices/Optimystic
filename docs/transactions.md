@@ -610,7 +610,7 @@ Additionally, for SQL validation:
 
 ### Core Principles
 
-1. **Coordinator-centric API**: TransactionCoordinator is the ONLY interface for all mutations (single or multi-collection)
+1. **Coordinator-centric API**: TransactionCoordinator is the ONLY interface for all mutations (single or multi-collection). Its `commit` commits whatever its collections have staged; its `commitEntry` commits one queued entry's slice of several collections for the offline-sync queue (see [offline-sync.md §One entry, one network transaction](offline-sync.md#one-entry-one-network-transaction))
 2. **Immediate local execution**: Actions are executed immediately through collections to update local snapshots
 3. **Transaction session orchestration**: TransactionSession coordinates multi-collection commits
 4. **Snapshot isolation**: Collections maintain local trackers that reflect pending changes before network commit
@@ -1904,7 +1904,7 @@ validators hash, rather than re-deriving the serialization and risking drift.
 
 **Key Files**:
 - `packages/db-core/src/transaction/transaction.ts` - Transaction types (TransactionStamp, Transaction, StampId)
-- `packages/db-core/src/transaction/coordinator.ts` - TransactionCoordinator (applyActions, commit, rollback)
+- `packages/db-core/src/transaction/coordinator.ts` - TransactionCoordinator (applyActions, commit, commitEntry, rollback)
 - `packages/db-core/src/transaction/session.ts` - TransactionSession (execute, commit, rollback)
 - `packages/db-core/src/transaction/actions-engine.ts` - Built-in ActionsEngine
 - `packages/db-core/src/transactor/transactor.ts` - Updated PendRequest with transaction validation

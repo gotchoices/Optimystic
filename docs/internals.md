@@ -336,8 +336,43 @@ list. Five rules follow from the split:
     segment, which may have grown while the attempt was in flight, untouched. `commitHead` then
     answers the refresh's durability, or `undefined` when the refresh established the write was
     saved without re-sending (the status-read fallback of `completeOwnEntry`).
+- **An entry that wrote several collections is committed by the coordinator's per-entry slice,
+  `TransactionCoordinator.commitEntry` in `packages/db-core/src/transaction/coordinator.ts`.** It
+  drives the head commit's steps in lock-step across every collection the entry wrote, through one
+  `HeadCommitHandle` per participant (`EntryParticipants` in
+  `packages/db-core/src/transaction/entry-commit.ts`), opened in sorted collection-id order — the
+  order `commitOnce` acquires the same latches in, so a concurrent whole-collection commit over
+  overlapping collections cannot deadlock against it — held for the whole cycle and closed in
+  reverse. The cycle opens with a refresh round through the handles, as `commitHead` opens with one,
+  so a re-drive under the id of an attempt that may have landed finishes and consumes that attempt's
+  entry in each participant that holds it (such a participant is recorded as saved and leaves the
+  set) instead of committing a second copy; the whole answer is `undefined` when that refresh found
+  every participant saved and sent nothing. Each attempt then builds every remaining participant's
+  attempt on its head tracker (`stage`), hands them all to the write-ahead hook
+  (`EntryCommit.recordAttempt`, awaited under every latch; a throw aborts with nothing sent),
+  releases every latch, runs the coordinator's own phases over them — every participant pended, then
+  committed, the ordering that keeps a refusal at one participant's pend from leaving any part of the
+  entry durable — and retakes every latch in sorted order before applying the outcome: on a commit,
+  `fold` on every participant in one await-free pass and then `replay` on each, the event-loop
+  atomicity the whole-collection success fold promises; on a partial landing, the committed
+  participants folded, replayed and recorded as saved, the rest refused (their recorded refusal
+  re-checked, their attempt retained), and the refused ones re-driven forward by the retry loop
+  `commit` runs (`commitAttempts`, shared through an `AttemptDriver`), or
+  `CoordinatorPartialCommitError` on a hard failure; on a clean refusal, every participant refused
+  and the failure thrown by its class. The phases read the write off a `WriteContext` — the action
+  id, timestamp, reads and aged priority `commit` and `execute` used to read off their
+  `Transaction` — so the slice fabricates no stamp. It also takes no pre-commit snapshots and runs no
+  `restorePending` (an attempt never touches the live tracker, so a failed one leaves it as it was),
+  no `getPendingActions` or `tracker.reset` (the head segment is dropped and folded through the
+  handle), no stamp (a slice may run while a stamp is open on another coordinator over the same
+  collections — the plugin's open SQL transaction — and the collection latch is what serialises
+  them), and no expiry check. It requires `pendValidation: 'none'`, as the coordinator
+  `commitBatchLegacy` builds is, since an entry has no statements for a member to re-execute. Its
+  refresh rounds refresh the entry's participants only, never the coordinator's whole map, and pass
+  no tail floor (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision` covers the
+  slice too). `packages/db-core/test/coordinator-entry-commit.spec.ts` pins it.
 
-`packages/db-core/test/collection-segments.spec.ts` pins each of these.
+`packages/db-core/test/collection-segments.spec.ts` pins each of the head commit's rules.
 
 #### A block re-read after a refresh can be answered too old, and is never remembered
 

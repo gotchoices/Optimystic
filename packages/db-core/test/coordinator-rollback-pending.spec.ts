@@ -328,9 +328,9 @@ describe('TransactionCoordinator.rollback: pending queue', () => {
 		} catch (e) { err = e; }
 		expect(err, 'partial landing surfaces the partial signal').to.be.instanceOf(CoordinatorPartialCommitError);
 
-		// The stampData entry is deleted when the partial landing is reported (reportSaved, once the
-		// retry budget ends) precisely so rollback cannot rewind the collection that DID durably
-		// commit. That must stay true.
+		// The stampData entry is deleted when the partial landing is reported (commit's catch, on the
+		// partial error reportSaved returns once the retry budget ends) precisely so rollback cannot
+		// rewind the collection that DID durably commit. That must stay true.
 		const winnerLogBefore = await logValues(collections.get(winner)!);
 		await coordinator.rollback(staged.stampId);
 

@@ -479,11 +479,15 @@ loop, restricted to the head segment's actions.
 
 An entry that wrote several collections (a table and its index trees, or several tables) commits
 through a per-entry coordinator, as a multi-tree legacy commit does today (`commitBatchLegacy`):
-pend every collection's head segment, then commit. `TransactionCoordinator` (in
-`packages/db-core/src/transaction/coordinator.ts`) today commits whatever each registered collection
-has staged; it gains a way to commit a named slice — for each collection, the actions of one
-segment. The existing pend-all-then-commit ordering is what keeps a refusal at pend (the common
-case: a rival took the key) from leaving any part of the entry durable.
+pend every collection's head segment, then commit. `TransactionCoordinator.commit` (in
+`packages/db-core/src/transaction/coordinator.ts`) commits whatever each registered collection
+has staged; `TransactionCoordinator.commitEntry` commits a named slice — for each collection, the
+actions of one sealed segment, the entry's head — by driving the head commit's steps
+(`HeadCommitHandle`) in lock-step across the entry's collections, with the whole-collection commit's
+own phases and retry loop between them (see
+[internals.md §Staged actions are segments](internals.md#staged-actions-are-segments)). The existing
+pend-all-then-commit ordering is what keeps a refusal at pend (the common case: a rival took the
+key) from leaving any part of the entry durable.
 
 The log entry's timestamp is the entry's local commit time, passed down where
 `Collection.syncInternal` mints one today. Nothing reads `LogEntry.timestamp` for logic, and the

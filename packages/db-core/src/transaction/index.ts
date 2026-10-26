@@ -42,6 +42,7 @@ export { classifyCommitFailure } from './commit-failure-class.js';
 export type { CommitFailureClass } from './commit-failure-class.js';
 export { transactionDurability, recordCollectionDurability } from './durability.js';
 export type { TransactionDurability } from './durability.js';
+export type { EntryCommit } from './entry-commit.js';
 export { TransactionSession } from './session.js';
 export { TransactionValidator } from './validator.js';
 export type { EngineRegistration, ValidationCoordinatorFactory, BlockStateProvider } from './validator.js';
