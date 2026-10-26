@@ -914,7 +914,7 @@ export class TransactionBridge {
       if (this.session) {
         durability = await this.commitSession(this.session);
       } else if (route !== undefined) {
-        queued = this.sealIntoQueue(route.collections, transactionId);
+        queued = await this.sealIntoQueue(route.collections, transactionId);
       } else {
         // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
@@ -1117,11 +1117,13 @@ export class TransactionBridge {
   /**
    * Seal every collection's open segment into one queue entry under the transaction's id
    * (docs/offline-sync.md §Entry lifecycle), which the drain commits later under that same id. The
-   * `queued` status is delivered synchronously inside the enqueue, before this commit returns.
-   * Answers whether an entry was queued: `false` when nothing was staged, which queues nothing and
-   * reports nothing, as a commit that wrote nothing reports nothing.
+   * `queued` status is delivered inside the enqueue, before this commit returns. Answers whether an
+   * entry was queued: `false` when nothing was staged, which queues nothing and reports nothing, as a
+   * commit that wrote nothing reports nothing. An enqueue the queue's journal refuses throws with
+   * every segment unsealed again, and the commit then rolls the transaction back as for any failed
+   * commit ({@link afterFailedCommit}).
    */
-  private sealIntoQueue(collections: readonly Collection<any>[], transactionId: string): boolean {
+  private async sealIntoQueue(collections: readonly Collection<any>[], transactionId: string): Promise<boolean> {
     if (log.enabled) {
       this.logCommitCollections('offline', [...this.dirtyTrees.keys()].map((tree, i) => ({
         id: treeLabel(tree, i),
@@ -1130,7 +1132,7 @@ export class TransactionBridge {
         action: treeActionId(tree),
       })));
     }
-    return this.offline!.enqueue(collections, transactionId) !== undefined;
+    return await this.offline!.enqueue(collections, transactionId) !== undefined;
   }
 
   /**

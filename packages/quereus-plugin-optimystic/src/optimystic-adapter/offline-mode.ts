@@ -350,11 +350,13 @@ export class OfflineMode {
 
 	/**
 	 * Seal each collection's open segment under `transactionId` and queue the entry, emitting its
-	 * `queued` status synchronously (so the commit it is in can be attributed). `undefined` when no
+	 * `queued` status before resolving (so the commit it is in can be attributed). `undefined` when no
 	 * collection had anything staged: nothing queued, nothing reported, as a commit that wrote nothing.
+	 * Rejects, with every segment unsealed again and nothing queued, when the queue's journal refuses
+	 * the entry record (docs/offline-sync.md §Write ordering).
 	 */
-	enqueue(collections: readonly Collection<any>[], transactionId: string): QueuedTransaction | undefined {
-		const entry = this.queue.enqueue(collections, { id: transactionId, timestamp: this.now() });
+	async enqueue(collections: readonly Collection<any>[], transactionId: string): Promise<QueuedTransaction | undefined> {
+		const entry = await this.queue.enqueue(collections, { id: transactionId, timestamp: this.now() });
 		return entry === undefined ? undefined : this.listed(entry);
 	}
 

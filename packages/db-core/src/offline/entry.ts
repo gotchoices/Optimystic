@@ -4,6 +4,7 @@ import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
 import type { EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
+import type { JournalDriveState } from './journal.js';
 
 /** One queued entry, as `OfflineQueue` holds it, and the projections of it the queue reports. */
 export type Entry = {
@@ -86,4 +87,16 @@ export function queuedStatusChanged(previous: QueuedStatus | undefined, status: 
 		|| previous.lastError !== status.lastError
 		// The committed set only grows, so its size says whether it changed.
 		|| previous.committedCollections?.length !== status.committedCollections?.length;
+}
+
+/** The entry's drive state as the journal records it (`IOfflineJournal.driving`): its action id,
+ * the attempts retained under it — with `attempts`, the ones about to be sent, laid over them when
+ * given — and the collections already committed. Copies, so the journal serialises a state the
+ * drain cannot change under it. */
+export function driveState(entry: Entry, attempts?: ReadonlyMap<CollectionId, InFlightAttempt>): JournalDriveState {
+	return {
+		actionId: entry.actionId,
+		attempts: new Map([...entry.retained, ...(attempts ?? [])]),
+		committed: new Map(entry.committed),
+	};
 }

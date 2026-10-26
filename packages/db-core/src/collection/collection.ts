@@ -16,7 +16,7 @@ import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailA
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
 import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
-import type { ActionContext } from "./action.js";
+import type { ActionContext, ActionRev } from "./action.js";
 import { actionIdAt } from "./action.js";
 import { AttemptCycle, resumedAttempt, retainedAttempt, stageAttempt } from "./write-attempts.js";
 import type { AttemptTarget, Refresh, StagedAttempt, WriteIdentity } from "./write-attempts.js";
@@ -1802,6 +1802,85 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.segments.find(entryId)?.refused;
 	}
 
+	/** The sealed segment `entryId` owns here: its actions, the array the segment holds (never
+	 * mutated by a caller; the offline journal serialises it), or `undefined` when the entry is not
+	 * sealed here. Synchronous and latch-free, like {@link sealedEntries}. */
+	sealedActions(entryId: EntryId): readonly Action<TAction>[] | undefined {
+		return this.segments.find(entryId)?.actions;
+	}
+
+	/** The exact inverse of {@link sealPending}, list-only and latch-free by the same contract: move
+	 * the segment's actions back into the open segment, for an enqueue whose journal write failed
+	 * after sealing (`OfflineQueue.enqueue`, which unseals every collection it sealed, in reverse
+	 * order, and rethrows). Requires the segment to be the NEWEST sealed one and the open segment to
+	 * be empty — both true at that one call site, which has just sealed and staged nothing since —
+	 * and throws otherwise (`SegmentList.unseal`). The tracker is untouched: its transforms are
+	 * already what they were before the seal. The segment version moves, so a snapshot taken before
+	 * the transaction restores by replay ({@link restorePending}), which ends with the transaction's
+	 * actions gone once the caller rolls it back. */
+	unseal(entryId: EntryId): void {
+		this.segments.unseal(entryId);
+	}
+
+	/** Whether this collection's committed context names `attempt.actionId` at `attempt.rev`: the
+	 * write that attempt sent is committed here, and this handle has adopted it. This is how a restore
+	 * after a restart recognises, before re-staging a journaled segment, that the segment's network
+	 * commit landed and the crash came after it (docs/offline-sync.md §Restore after a restart):
+	 * re-staging such a segment would run its own guards against its own committed rows (`absent`
+	 * refuses on a present key) and fail the entry with `constraint`, the opposite of the truth.
+	 * `false` for an invented collection, which has no context. Synchronous and latch-free.
+	 *
+	 * NOTE: `actionIdAt` reaches back only to the most recent checkpoint, and no checkpoint is written
+	 * today (backlog `debt-the-collection-log-never-writes-a-checkpoint`); if that changes, read the
+	 * log's entry at `attempt.rev` instead, since a committed attempt behind a checkpoint would
+	 * otherwise answer `false` and be re-staged against itself. */
+	holdsCommitted(attempt: ActionRev): boolean {
+		const context = this.source.actionContext;
+		return context !== undefined && context.rev >= attempt.rev && actionIdAt(context, attempt.rev) === attempt.actionId;
+	}
+
+	/**
+	 * Put a sealed segment back, holding `actions` under `entryId`, at `position` in the sealed list —
+	 * ahead of the segment `before` names, or last — and rebuild the tracker by replaying every
+	 * replayable segment in order ({@link replayActions}), for the offline queue's restore after a
+	 * restart (`OfflineQueue.restore`; docs/offline-sync.md §Restore after a restart). A record
+	 * restored late belongs ahead of entries queued since, in the queue and in each collection's
+	 * sealed list alike, or the head commit's "head is first" rule and the queue's order disagree;
+	 * hence insertion rather than appending, at the cost of the one replay every insertion costs.
+	 *
+	 * The replay records and reports each refusal it meets as a refresh's would — EXCEPT this
+	 * segment's own, which is recorded on the segment and RETURNED rather than reported through
+	 * `onSealedRefused`: the queue registers the entry and hears the result from its own `stage`
+	 * callback, since the collection cannot report it to a queue that does not yet list the entry. A
+	 * later segment the replay newly refuses (this segment inserts the key it also inserts, say) is
+	 * reported through `onSealedRefused` as any replay's would be.
+	 *
+	 * Takes the collection latch, like {@link dropSealed}. Throws before anything changes when the
+	 * open segment is non-empty (a transaction is open, and its actions were staged over state without
+	 * this segment; the only caller refuses to restore mid-transaction), when a head commit is in
+	 * flight ({@link SealedSegmentsError}, `in-flight`), when `entryId` is already sealed here, or when
+	 * `before` names no segment here. A replay error that is not a refusal propagates with the segment
+	 * left in place, the shape a refresh's replay has.
+	 *
+	 * @returns this segment's own refusal, when the replay refused it; `undefined` when it staged. */
+	async restoreSealed(entryId: EntryId, actions: readonly Action<TAction>[], position: { before: EntryId } | 'last'): Promise<ActionRefusedError | undefined> {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			if (this.segments.open.length > 0) {
+				throw new Error(`Collection ${this.id}: cannot restore sealed segment ${entryId} while a transaction has `
+					+ `${this.segments.open.length} action(s) staged in the open segment`);
+			}
+			if (this.headInFlight !== undefined) {
+				throw new SealedSegmentsError(this.id, this.segments.entryIds(), 'in-flight', this.headInFlight.entryId);
+			}
+			this.segments.insert(entryId, actions, position === 'last' ? undefined : position.before);
+			await this.replayActions(entryId);
+			return this.segments.find(entryId)?.refused;
+		} finally {
+			release();
+		}
+	}
+
 	/** Remove the sealed segment owned by `entryId`, wherever it sits, and rebuild the tracker by
 	 * replaying what remains ({@link replayActions}). A later segment whose guard now refuses — one
 	 * that updated a row the dropped segment inserted, say — is recorded and reported through
@@ -2576,8 +2655,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * per-segment refusal). Any error that is not a refusal propagates from either.
 	 *
 	 * Each re-staged update pins its base through `Atomic.commit` → `Tracker.absorb`, the path
-	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on. */
-	private async replayActions(): Promise<void> {
+	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on.
+	 *
+	 * @param unreported - a segment whose refusal is recorded but NOT reported through
+	 * `onSealedRefused`: the one {@link restoreSealed} is inserting, whose caller reads the recorded
+	 * refusal off the segment itself. */
+	private async replayActions(unreported?: EntryId): Promise<void> {
 		this.tracker.reset(this.replayBaseline());
 		for (const segment of this.segments.replayable()) {
 			try {
@@ -2586,7 +2669,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				if (!(err instanceof ActionRefusedError)) {
 					throw err;
 				}
-				this.recordSealedRefusal(segment, err);
+				this.recordSealedRefusal(segment, err, segment.entryId !== unreported);
 			}
 		}
 		for (const action of this.segments.open) {
@@ -2602,13 +2685,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 			: emptyTransforms();
 	}
 
-	/** Record a replay's refusal of a sealed segment and report it once, under the latch. The
-	 * callback's throw is logged rather than raised: the refusal is already recorded, and the rest
-	 * of the replay must still run. */
-	private recordSealedRefusal(segment: SealedSegment<TAction>, error: ActionRefusedError): void {
+	/** Record a replay's refusal of a sealed segment and, when `report` says so, report it once,
+	 * under the latch. The callback's throw is logged rather than raised: the refusal is already
+	 * recorded, and the rest of the replay must still run. */
+	private recordSealedRefusal(segment: SealedSegment<TAction>, error: ActionRefusedError, report = true): void {
 		this.segments.refuse(segment.entryId, error);
-		log('collection:sealed-segment-refused id=%s tag=%s entry=%s error=%s',
-			this.id, this.instanceTag, segment.entryId, error.message);
+		log('collection:sealed-segment-refused id=%s tag=%s entry=%s reported=%s error=%s',
+			this.id, this.instanceTag, segment.entryId, report, error.message);
+		if (!report) {
+			return;
+		}
 		try {
 			this.onSealedRefused?.(segment.entryId, error);
 		} catch (err) {

@@ -30,10 +30,10 @@ export class SegmentList<TAction> {
 	private readonly sealed: SealedSegment<TAction>[] = [];
 	/** The open segment: what the current transaction has staged. */
 	open: Action<TAction>[] = [];
-	/** Bumped on every change to the sealed list — a seal, a drop, a refusal recorded. Captured by a
-	 * snapshot so a restore can tell whether the sealed segments it was taken over are still the ones
-	 * in place (ticket `offline-sync-open-segment-snapshot`). Read and written only under the
-	 * collection latch or from synchronous callers. */
+	/** Bumped on every change to the sealed list — a seal, an unseal, an insert, a drop, a refusal
+	 * recorded. Captured by a snapshot so a restore can tell whether the sealed segments it was taken
+	 * over are still the ones in place (ticket `offline-sync-open-segment-snapshot`). Read and written
+	 * only under the collection latch or from synchronous callers. */
 	version = 0;
 
 	/** Close the open segment into a sealed segment owned by `entryId`. Returns `false` and changes
@@ -50,6 +50,42 @@ export class SegmentList<TAction> {
 		this.open = [];
 		this.version++;
 		return true;
+	}
+
+	/** The exact inverse of {@link seal}: move the newest sealed segment's actions back into the open
+	 * segment, for an enqueue whose journal write failed after sealing (`OfflineQueue.enqueue`).
+	 * Requires the segment to be the NEWEST sealed one and the open segment to be empty — both true at
+	 * that one call site, which has just sealed and staged nothing since — and throws otherwise, since
+	 * putting an older segment's actions behind a newer one's would reorder what was staged. Bumps
+	 * `version`: the sealed list changed, even though the tracker did not (the transforms are already
+	 * what they were). */
+	unseal(entryId: EntryId): void {
+		const newest = this.sealed[this.sealed.length - 1];
+		if (newest === undefined || newest.entryId !== entryId) {
+			throw new Error(`entry ${entryId} is not the newest sealed segment (${newest?.entryId ?? 'nothing is sealed'}); only the newest can be unsealed`);
+		}
+		if (this.open.length > 0) {
+			throw new Error(`entry ${entryId} cannot be unsealed over a non-empty open segment`);
+		}
+		this.sealed.pop();
+		this.open = [...newest.actions];
+		this.version++;
+	}
+
+	/** Insert a sealed segment owned by `entryId` holding `actions`, ahead of the segment `before`
+	 * names, or last when `before` is `undefined` — a segment put back from a journal after a restart
+	 * (`Collection.restoreSealed`), which belongs wherever its entry sits in queue order. Throws when
+	 * `entryId` is already sealed or `before` names no segment here, before anything changes. */
+	insert(entryId: EntryId, actions: readonly Action<TAction>[], before: EntryId | undefined): void {
+		if (this.find(entryId) !== undefined) {
+			throw new Error(`entry ${entryId} is already sealed in this collection`);
+		}
+		const index = before === undefined ? this.sealed.length : this.sealed.findIndex(segment => segment.entryId === before);
+		if (index < 0) {
+			throw new Error(`entry ${before} is not sealed in this collection; cannot insert ${entryId} before it`);
+		}
+		this.sealed.splice(index, 0, { entryId, actions: [...actions] });
+		this.version++;
 	}
 
 	/** Remove the segment owned by `entryId`, wherever it sits. Throws for an unknown id. */

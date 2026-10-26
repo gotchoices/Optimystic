@@ -36,6 +36,7 @@ import {
 	type PendRequest,
 	type PendResult,
 	type Transaction,
+	type Action,
 	type Transforms,
 	type TreeReplaceAction,
 } from '../src/index.js';
@@ -217,6 +218,35 @@ describe('Collection sealed segments', function () {
 			expect(list.version).to.equal(4);
 			expect(list.head()?.entryId).to.equal('E2');
 			expect(() => list.drop('E1')).to.throw(/not sealed/);
+		});
+
+		it('unseals only the newest segment over an empty open segment, and inserts before a named segment or last (ticket offline-sync-journal-port)', () => {
+			const list = new SegmentList<number>();
+			list.open.push({ type: 'a', data: 1 });
+			list.seal('E1');
+			list.open.push({ type: 'a', data: 2 });
+			list.seal('E2');
+			expect(() => list.unseal('E1'), 'an older segment cannot be unsealed').to.throw(/newest/);
+			list.open.push({ type: 'a', data: 3 });
+			expect(() => list.unseal('E2'), 'nor the newest over a staged action').to.throw(/open segment/);
+			list.open = [];
+			const version = list.version;
+
+			list.unseal('E2');
+
+			expect(list.open, 'its actions are the open segment again').to.deep.equal([{ type: 'a', data: 2 }]);
+			expect(list.entryIds()).to.deep.equal(['E1']);
+			expect(list.version, 'the sealed list changed').to.equal(version + 1);
+
+			list.open = [];
+			list.insert('R', [{ type: 'a', data: 9 }], 'E1');
+			expect(list.entryIds(), 'ahead of the named segment').to.deep.equal(['R', 'E1']);
+			list.insert('L', [{ type: 'a', data: 10 }], undefined);
+			expect(list.entryIds(), 'last when none is named').to.deep.equal(['R', 'E1', 'L']);
+			expect(list.replayable().map(segment => segment.actions.map(action => action.data))).to.deep.equal([[9], [1], [10]]);
+			expect(() => list.insert('R', [], undefined)).to.throw(/already sealed/);
+			expect(() => list.insert('X', [], 'nope')).to.throw(/not sealed/);
+			expect(list.version).to.equal(version + 3);
 		});
 	});
 
@@ -969,6 +999,104 @@ describe('Collection sealed segments', function () {
 			expect((err as Error).message).to.include('A1').and.include('A2');
 			expect(collection.sealedEntries()).to.deep.equal(['E1']);
 			await withinMs(500, tree.stage([[2, entry(2, 'open')]]), 'staging after the refused open');
+		});
+	});
+
+	describe('restoreSealed and holdsCommitted (ticket offline-sync-journal-port)', () => {
+		const replaceAction = (data: TreeReplaceAction<number, Entry>): Action<TreeReplaceAction<number, Entry>> => ({ type: 'replace', data });
+
+		it('returns its own refusal rather than reporting it: the segment is listed as refused, the callback is not called, and the read proceeds without it', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+
+			const refused = await collection.restoreSealed('R', [replaceAction([[5, entry(5, 'again'), { kind: 'absent' }]])], 'last');
+
+			expect(refused, "the handler's refusal, returned").to.be.instanceOf(TreeKeyTakenError);
+			expect(collection.sealedRefusal('R'), 'recorded on the segment').to.equal(refused);
+			expect(collection.sealedEntries(), 'listed until dropped').to.deep.equal(['R']);
+			expect(refusals, 'not reported: the queue hears it from its own restore').to.be.empty;
+			expect(await tree.get(5)).to.deep.equal(entry(5, 'seed'));
+		});
+
+		it('inserts ahead of a named segment and reports a later segment the replay newly refuses; the restored one is staged', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const refusals: Refusal[] = [];
+			const tree = await openReporting(transactor, refusals);
+			const collection = tree.getCollection();
+			await sealAs(tree, 'E2', [[1, entry(1, 'later'), { kind: 'absent' }]]);
+			await sealAs(tree, 'E3', [[2, entry(2, 'two')]]);
+
+			const refused = await collection.restoreSealed('R', [replaceAction([[1, entry(1, 'restored'), { kind: 'absent' }]])], { before: 'E2' });
+
+			expect(refused, 'the restored segment staged over the committed state').to.be.undefined;
+			expect(collection.sealedEntries()).to.deep.equal(['R', 'E2', 'E3']);
+			expect(refusals.map(r => r.entryId), 'the later segment that inserts the same key is refused and reported').to.deep.equal(['E2']);
+			expect(refusals[0]!.error).to.be.instanceOf(TreeKeyTakenError);
+			expect(collection.sealedRefusal('E2')).to.equal(refusals[0]!.error);
+			expect(await tree.get(1), 'the restored row is what reads see').to.deep.equal(entry(1, 'restored'));
+			expect(await tree.get(2), 'the segment behind it is re-staged').to.deep.equal(entry(2, 'two'));
+		});
+
+		it('refuses to restore over a non-empty open segment, before an unknown segment, under an id already sealed, and while a head commit is in flight — changing nothing', async () => {
+			const inner = new TestTransactor();
+			await seedUsers(inner);
+			const transactor = new GatedCommitTransactor(inner);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			const actions = [replaceAction([[3, entry(3, 'restored')]])];
+			await tree.stage([[2, entry(2, 'open')]]);
+
+			const overOpen = await capture(() => collection.restoreSealed('R', actions, 'last'));
+			expect((overOpen as Error).message).to.match(/open segment/);
+			expect(collection.sealedEntries()).to.deep.equal([]);
+			expect(await tree.get(2), 'the open action is still staged').to.deep.equal(entry(2, 'open'));
+			expect(await tree.get(3)).to.be.undefined;
+
+			expect(collection.sealPending('E1')).to.be.true;
+			const unknownBefore = await capture(() => collection.restoreSealed('R', actions, { before: 'nope' }));
+			expect((unknownBefore as Error).message).to.match(/not sealed/);
+			const alreadySealed = await capture(() => collection.restoreSealed('E1', actions, 'last'));
+			expect((alreadySealed as Error).message).to.match(/already sealed/);
+			expect(collection.sealedEntries()).to.deep.equal(['E1']);
+
+			const committing = collection.commitHead('E1', headOptions('A1'));
+			await transactor.commitParked;
+			const inFlight = await capture(() => collection.restoreSealed('R', actions, 'last'));
+			expect(inFlight).to.be.instanceOf(SealedSegmentsError);
+			expect((inFlight as SealedSegmentsError).reason).to.equal('in-flight');
+			expect(collection.sealedEntries()).to.deep.equal(['E1']);
+			transactor.openGate();
+			await committing;
+			expect(collection.sealedEntries()).to.deep.equal([]);
+
+			expect(await collection.restoreSealed('R', actions, 'last'), 'allowed once the commit is done').to.be.undefined;
+			expect(collection.sealedEntries()).to.deep.equal(['R']);
+			expect(await tree.get(3)).to.deep.equal(entry(3, 'restored'));
+		});
+
+		it('holdsCommitted names the committed context: true for the action at its revision, false past the held revision, under another action, and on an invented collection', async () => {
+			const transactor = new TestTransactor();
+			await seedUsers(transactor);
+			const tree = await Tree.createOrOpen<number, Entry>(transactor, USERS, byKey);
+			const collection = tree.getCollection();
+			const actionId = collection.committedActionId()!;
+			const rev = collection.committedRevision()!;
+
+			expect(collection.holdsCommitted({ actionId, rev })).to.be.true;
+			expect(collection.holdsCommitted({ actionId, rev: rev + 1 }), 'a revision this handle has not adopted').to.be.false;
+			expect(collection.holdsCommitted({ actionId: 'another', rev }), 'another action at the held revision').to.be.false;
+
+			await rivalWrites(transactor, 1, 'rival');
+			await tree.update();
+			expect(collection.holdsCommitted({ actionId, rev }), 'still named once a later revision is adopted').to.be.true;
+			expect(collection.holdsCommitted({ actionId, rev: rev + 1 }), 'the next revision is the rival\'s').to.be.false;
+
+			const invented = (await Tree.createOrOpen<number, Entry>(transactor, 'fresh', byKey)).getCollection();
+			expect(invented.holdsCommitted({ actionId, rev }), 'no context, nothing held').to.be.false;
 		});
 	});
 

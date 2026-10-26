@@ -233,9 +233,10 @@ type QueuedFailureReason =
   ones with the same code. One property of today's report does not carry over: an online report
   arrives during the `db.exec` that committed, and a drained one does not. The `transactionId` is
   the only attribution.
-- `queued` is delivered synchronously, before `commit` resolves, by the same rule
-  `onCommitDurability` uses today, so a host wrapping `db.exec` can attribute it to the call — which
-  is how an autocommit statement's caller learns the id it never selected with `StampId()`.
+- `queued` is delivered before `commit` resolves — inside the enqueue, once the journal holds the
+  entry record when persistence is on — by the same rule `onCommitDurability` uses today, so a host
+  wrapping `db.exec` can attribute it to the call — which is how an autocommit statement's caller
+  learns the id it never selected with `StampId()`.
 - `error` on `failed` is the error an online commit would have thrown for the same refusal, after
   `TransactionBridge.mapCommitRefusal` (so `ConstraintError` with the `UNIQUE constraint failed: …`
   message, or `ConcurrentModificationError`), with the db-core refusal reachable through `cause`.
@@ -628,9 +629,11 @@ hands it the attempt at exactly that point: `HeadCommitOptions.recordAttempt` in
 `packages/db-core/src/collection/struct.ts` is called with each attempt after it is built and before
 the collection latch is released for the network, and a throw out of it aborts the cycle with nothing
 sent; the coordinator's per-entry commit calls its own hook the same way, with every participant's
-attempt at once. The queue wraps both, and hands what it records on to its own hook,
-`OfflineQueueOptions.recordAttempt` in `packages/db-core/src/offline/queue.ts`, the seam the journal
-of stage 5 fills. A later drain of an in-doubt entry marks that action in flight on the collection
+attempt at once. The queue wraps both (`OfflineQueue.recordAttempts` in
+`packages/db-core/src/offline/queue.ts`) and writes what it records to the journal's drive record
+first, `IOfflineJournal.driving` in `packages/db-core/src/offline/journal.ts` — the write-ahead of
+[Write ordering](#write-ordering), which a journal that cannot write refuses by throwing, so nothing
+is sent. A later drain of an in-doubt entry marks that action in flight on the collection
 (`beginInFlightAction`) and refreshes first, so a refresh that finds the entry's log entry completes
 it instead of committing a second copy — from the recorded attempt, which the drain hands back as
 `HeadCommitOptions.resume` (one collection) or `EntryCommit.resume` in
@@ -1070,32 +1073,48 @@ and is unchanged.
 
 ### What is journaled
 
-One record per entry, written to the `journal` store under a key prefix owned by the plugin
-(proposed `optimystic-offline/`, followed by a database label the application supplies when it
-runs more than one `Database` over one store, then the entry's sequence number, zero-padded so a
-prefix listing returns queue order):
+Two records per entry, in the queue's own terms — entry ids, collection ids, actions, the retained
+attempts — which the queue hands to a journal through one port, `IOfflineJournal` in
+`packages/db-core/src/offline/journal.ts`, at the moments [Write ordering](#write-ordering) names.
+The port never sees a table name or a key-value store, so db-core keeps its no-storage rule and a
+`Tree`/`Diary` application without SQL can journal too; the plugin's journal over `IKVStore`
+(stage 5, part two) adds what db-core does not know — the table each collection backs
+(`schema.table`, to initialize the table on restore) and the acknowledgement — and keys each record
+under a prefix the plugin owns (proposed `optimystic-offline/`, followed by a database label the
+application supplies when it runs more than one `Database` over one store, then the entry's
+sequence number, zero-padded so a prefix listing returns queue order).
+
+**The entry record**, written once, at enqueue (`IOfflineJournal.queued`):
 
 ```typescript
-type JournaledEntry = {
-  v: 1;
-  transactionId: string;        // StampId() of the local transaction
+type JournalEntryRecord = {
+  id: EntryId;                  // the plugin's entry id is the StampId() of the local transaction
   seq: number;
   queuedAt: number;
   expiresAt?: number;
-  ack: 'local' | 'network';
-  segments: Array<{
-    collectionId: string;
-    table: string;              // schema.table, to initialize the table on restore
-    actions: Action<unknown>[]; // the segment's staged actions, guards included
+  segments: Array<{             // one per collection the entry sealed a segment in, in sealing order
+    collectionId: CollectionId;
+    actions: Action<unknown>[]; // the segment's staged actions, guards included, verbatim
   }>;
-  attempt?: {                   // present while the entry is in doubt
-    actionId: string;
-    rev: number;
-    retained: Record<string, unknown>;   // the per-collection retained attempt
-  };
-  committedCollections?: string[];       // set while partially committed
 };
 ```
+
+**The drive record**, rewritten before each send, after a partial commit and after an identity
+renewal (`IOfflineJournal.driving`), so a crash at any point leaves on disk the identity the next
+drive has to run under:
+
+```typescript
+type JournalDriveState = {
+  actionId: ActionId;                                   // renewed after torn-not-saved
+  attempts: ReadonlyMap<CollectionId, InFlightAttempt>; // recorded under actionId, not yet resolved: what a later cycle resumes
+  committed: ReadonlyMap<CollectionId, WriteDurability | undefined>; // what a partial commit has already committed
+};
+```
+
+An entry restored with a drive record is in doubt whenever its `attempts` or `committed` is
+non-empty; one restored without was never sent, and gets a fresh action id. The terminal status
+(`IOfflineJournal.settled`) is written before it is emitted, and the two records it settles are
+removed with it (part two).
 
 **Actions, not transforms.** Transforms are block operations relative to the base the actions were
 staged on. After a restart, or after a rival's commit, the base is different, and the actions have
@@ -1113,16 +1132,34 @@ and inherits that section's rules.
 
 ### Write ordering
 
-1. **Local commit.** Seal the open segments, then write the record and flush the store, then resolve
-   `commit`. A journal write that fails fails the commit: the segments are unsealed and the
-   transaction rolls back, as a network failure does today. So "acknowledged" always implies
-   "journaled" when persistence is on.
-2. **Before each send.** Write `attempt` and flush, then send. This is the write-ahead that makes the
-   identity rule above survive a crash.
-3. **On a terminal outcome.** Write the outcome record (below), then delete the entry record. A
-   crash between the network commit and this step leaves an in-doubt record, which the next drain
-   resolves by finding its own log entry.
-4. **On partial commit.** Write `committedCollections` before consuming the committed segments.
+1. **Local commit.** Seal the open segments, then write the entry record and flush the store, then
+   resolve `commit`: `OfflineQueue.enqueue` writes before it admits the entry and emits `queued`. A
+   journal write that fails fails the commit: every segment is unsealed again (`Collection.unseal`,
+   the exact inverse of `sealPending`, which puts the actions back into the open segment), nothing is
+   queued or reported, and the transaction rolls back, as a network failure does today — the rollback
+   restores the pre-transaction snapshot by replay, since the sealed list changed, and ends with the
+   transaction's actions gone. So "acknowledged" always implies "journaled" when persistence is on.
+2. **Before each send.** Write the drive record and flush, then send: `IOfflineJournal.driving`,
+   called from the queue's write-ahead wrapper (`OfflineQueue.recordAttempts`) with the attempts
+   about to go; a throw aborts the cycle with nothing sent, and the entry stays queued, not in doubt,
+   re-driven after the backoff. This is the write-ahead that makes the identity rule above survive a
+   crash. The same record is rewritten right after an identity renewal, so the fresh action id is on
+   disk before anything runs under it; a throw there is logged (`offline:journal-write-failed`) and
+   the drain goes on, since the next send's write repeats the state.
+3. **On a terminal outcome.** Write the outcome record (below), then delete the entry record:
+   `IOfflineJournal.settled` is told the `committed` or `failed` status before it is emitted, and a
+   throw there is logged, never raised into the drain — the network has the write, or the segments
+   are gone, and the stale record is what the restore after a restart resolves. A crash between the
+   network commit and this step leaves an in-doubt record, which the next drain resolves by finding
+   its own log entry.
+4. **On partial commit, before the next send.** Write the drive record with the committed
+   collections (`OfflineQueue.partiallyCommitted`). It cannot be written before the committed
+   segments are consumed: they are consumed inside `TransactionCoordinator.commitEntry`, before
+   `CoordinatorPartialCommitError` reaches the queue. The window between that fold and the write is
+   covered by the in-doubt rule: a crash there leaves a drive record whose attempts name the
+   committed collections too, and a restore resumes them under the recorded action id, where the
+   opening refresh finds each committed collection's own log entry and consumes it rather than
+   committing it again (`Collection.completeOwnEntry`, `EntryCommit.resume`).
 
 ### Restore after a restart
 
@@ -1140,6 +1177,32 @@ successful read; until then, reads of the table fail as they would without the m
 entry is dropped for this.
 
 A host that does not call `hydrate` calls `plugin.offline.restore()` itself, with the same rule.
+
+Both go through `OfflineQueue.restore` in `packages/db-core/src/offline/queue.ts`, the only way to
+register an entry whose segments `enqueue` did not seal. It holds the drain for the whole call — it
+waits until the loop is parked between iterations, so no submission is on the network and no removal
+is under way while segments are inserted — registers the entry first, inserted into the queue by its
+recorded `seq`, and then calls back per collection to put the segment in place. Two rules decide
+what that callback does:
+
+- **A segment whose recorded attempt the collection already holds committed is not re-staged.**
+  Before re-staging, the restore asks the collection whether its committed context names the
+  recorded attempt's action id at its revision (`Collection.holdsCommitted`). If it does, the network
+  commit landed and the crash came after it; re-staging would run the segment's own guards against
+  its own committed rows (`absent` refuses on a present key) and fail the entry with `constraint`,
+  the opposite of the truth. Such a collection is recorded as committed with its class unknown — the
+  same shape a head commit answers when a refresh established the write was saved without
+  re-sending — and an entry every collection of which answers so is settled `committed` at once,
+  with no `queued` status.
+- **A segment is inserted by sequence, not appended.** A record restored late — deferred until its
+  table can be read — belongs ahead of entries queued after the restart began, in the queue and in
+  each collection's sealed list alike, or the head commit's "head is first" rule and the queue's
+  order disagree. `Collection.restoreSealed` inserts the segment at the position the queue reports
+  and rebuilds the tracker by replaying every segment in order; the restored segment's own refusal is
+  returned to the restore rather than reported, and the restore fails the entry through the ordinary
+  cascade with no `causedBy`. A later segment the replay newly refuses is reported through
+  `onSealedRefused` as any replay's would be, and is attributed to no earlier entry either, since a
+  restore removes nothing. An insertion costs one replay, the cost every drop already pays.
 
 ### Outcomes after a restart
 

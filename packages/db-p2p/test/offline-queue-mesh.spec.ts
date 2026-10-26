@@ -72,15 +72,20 @@ async function twoNodes(batches: BatchCounter): Promise<{ a: ITransactor; b: ITr
 	return { a, b };
 }
 
-/** An offline queue over `transactor`, recording every status and every attempt its write-ahead hook
- * sees; `beforeSend` runs inside the hook, after the attempt is built and before it is sent. */
+/** An offline queue over `transactor`, recording every status and every attempt its journal's
+ * write-ahead sees; `beforeSend` runs inside the journal's `driving`, after the attempt is built and
+ * before it is sent. */
 function openQueue(beforeSend?: () => Promise<void>) {
 	const statuses: EntryStatus[] = [];
 	const recorded: ReadonlyMap<CollectionId, InFlightAttempt>[] = [];
 	const queue = new OfflineQueue({
-		recordAttempt: async (_entryId, attempts) => {
-			recorded.push(attempts);
-			await beforeSend?.();
+		journal: {
+			queued: async () => {},
+			driving: async (_entryId, state) => {
+				recorded.push(state.attempts);
+				await beforeSend?.();
+			},
+			settled: async () => {},
 		},
 	});
 	queue.onStatus(status => statuses.push(status));
@@ -120,7 +125,7 @@ describe('OfflineQueue on a two-member mesh', function () {
 		await table.stage([['u1', row('u1', 'Ada')]]);
 		await index.stage([['Ada', row('Ada', 'u1')]]);
 
-		expect(queue.enqueue([table.getCollection(), index.getCollection()], { id: 'E1' })).to.not.equal(undefined);
+		expect(await queue.enqueue([table.getCollection(), index.getCollection()], { id: 'E1' })).to.not.equal(undefined);
 		await queue.whenDrained();
 
 		expect(statuses.map(s => s.kind)).to.deep.equal(['queued', 'submitting', 'committed']);
@@ -150,7 +155,7 @@ describe('OfflineQueue on a two-member mesh', function () {
 		await table.stage([['u1', row('u1', 'Ada'), { kind: 'absent' }]]);
 		await index.stage([['Ada', row('Ada', 'u1')]]);
 
-		queue.enqueue([table.getCollection(), index.getCollection()], { id: 'E1' });
+		await queue.enqueue([table.getCollection(), index.getCollection()], { id: 'E1' });
 		await queue.whenDrained();
 
 		const failed = statuses.find((s): s is FailedStatus => s.kind === 'failed' && s.entryId === 'E1');

@@ -19,6 +19,7 @@ import {
 	OfflineQueue,
 	QueueDisposedError,
 	SyncRetryExhaustedError,
+	UnknownEntryError,
 	Tree,
 	TreeEntryChangedError,
 	TreeKeyTakenError,
@@ -29,14 +30,20 @@ import {
 	type EntryStatus,
 	type ICohortReachability,
 	type InFlightAttempt,
+	type IOfflineJournal,
 	type ITransactor,
+	type JournalDriveState,
+	type JournalEntryRecord,
+	type JournalSettledStatus,
 	type LogEntry,
 	type OfflineQueueOptions,
 	type OfflineQueueState,
 	type PendRequest,
 	type PendResult,
 	type QueuedEntry,
+	type RestoredSegment,
 	type TreeReplaceAction,
+	type Action,
 } from '../src/index.js';
 import {
 	DelegatingTransactor,
@@ -117,22 +124,57 @@ type Harness = {
 	queue: OfflineQueue;
 	statuses: EntryStatus[];
 	states: OfflineQueueState[];
-	/** What the write-ahead hook saw, in order. */
-	recorded: { entryId: string; attempts: ReadonlyMap<CollectionId, InFlightAttempt> }[];
+	/** Every drive record the journal double was handed, in order — the write-ahead before each send,
+	 * and the rewrites after a partial commit or a renewal. */
+	recorded: { entryId: string; attempts: ReadonlyMap<CollectionId, InFlightAttempt>; state: JournalDriveState }[];
+	journal: JournalDouble;
 };
+
+/** A journal in memory that records what it is told; each step can be made to throw. */
+class JournalDouble implements IOfflineJournal {
+	readonly entries: JournalEntryRecord[] = [];
+	readonly drives: { entryId: string; state: JournalDriveState }[] = [];
+	readonly settledStatuses: JournalSettledStatus[] = [];
+	queuedThrows: Error | undefined;
+	drivingThrows: Error | undefined;
+	settledThrows: Error | undefined;
+
+	async queued(record: JournalEntryRecord): Promise<void> {
+		if (this.queuedThrows !== undefined) throw this.queuedThrows;
+		this.entries.push(record);
+	}
+
+	async driving(entryId: string, state: JournalDriveState): Promise<void> {
+		if (this.drivingThrows !== undefined) throw this.drivingThrows;
+		this.drives.push({ entryId, state });
+	}
+
+	async settled(status: JournalSettledStatus): Promise<void> {
+		if (this.settledThrows !== undefined) throw this.settledThrows;
+		this.settledStatuses.push(status);
+	}
+}
 
 function openQueue(options: OfflineQueueOptions = {}): Harness {
 	const statuses: EntryStatus[] = [];
 	const states: OfflineQueueState[] = [];
 	const recorded: Harness['recorded'] = [];
+	const journal = new JournalDouble();
 	const queue = new OfflineQueue({
 		...fast,
-		recordAttempt: async (entryId, attempts) => { recorded.push({ entryId, attempts }); },
+		journal: {
+			queued: record => journal.queued(record),
+			driving: async (entryId, state) => {
+				await journal.driving(entryId, state);
+				recorded.push({ entryId, attempts: state.attempts, state });
+			},
+			settled: status => journal.settled(status),
+		},
 		...options,
 	});
 	queue.onStatus(status => statuses.push(status));
 	queue.onQueueState(state => states.push(state));
-	return { queue, statuses, states, recorded };
+	return { queue, statuses, states, recorded, journal };
 }
 
 /** A tree whose collection reports sealed-segment refusals to `queue`. */
@@ -155,7 +197,7 @@ async function queueEntry(queue: OfflineQueue, id: string, ...staged: [Tree<numb
 	for (const [tree, actions] of staged) {
 		await tree.stage(actions);
 	}
-	const queued = queue.enqueue(staged.map(([tree]) => tree.getCollection()), { id });
+	const queued = await queue.enqueue(staged.map(([tree]) => tree.getCollection()), { id });
 	expect(queued, `${id} queued`).to.not.equal(undefined);
 	return queued!;
 }
@@ -217,6 +259,22 @@ async function partiallyCommitted(statuses: EntryStatus[], entryId: string): Pro
 	return statuses.find((s): s is PartialStatus => s.kind === 'partially-committed' && s.entryId === entryId)!;
 }
 
+const replaceAction = (data: TreeReplaceAction<number, Entry>): Action<TreeReplaceAction<number, Entry>> => ({ type: 'replace', data });
+
+/** A `stage` answer for a segment `Collection.restoreSealed` put in place, with its refusal if any. */
+const stagedSegment = (refused: Error | undefined): RestoredSegment =>
+	refused === undefined ? { kind: 'staged' } : { kind: 'staged', refused: refused as never };
+
+/** What `promise` rejected with; fails the test if it resolved. */
+async function rejectionOf(promise: Promise<unknown>): Promise<unknown> {
+	try {
+		await promise;
+	} catch (err) {
+		return err;
+	}
+	throw new Error('expected a rejection, but it resolved');
+}
+
 /** The action id the write-ahead hook saw for `entryId` in `collectionId`. */
 function actionIdOf(recorded: Harness['recorded'], entryId: string, collectionId: CollectionId): string {
 	const seen = recorded.find(r => r.entryId === entryId)?.attempts.get(collectionId);
@@ -231,15 +289,25 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS, ITEMS);
 		let clock = T0;
-		const { queue, statuses, states, recorded } = openQueue({ now: () => clock });
+		const { queue, statuses, states, recorded, journal } = openQueue({ now: () => clock });
 		const users = await openTree(inner, queue, USERS);
 		const items = await openTree(inner, queue, ITEMS);
 
-		expect(queue.enqueue([users.getCollection(), items.getCollection()]), 'nothing staged: nothing queued').to.equal(undefined);
+		expect(await queue.enqueue([users.getCollection(), items.getCollection()]), 'nothing staged: nothing queued').to.equal(undefined);
 		expect(users.getCollection().sealedEntries(), 'and nothing sealed').to.deep.equal([]);
+		expect(journal.entries, 'and nothing journaled').to.deep.equal([]);
 
 		await users.stage([[1, entry(1, 'one')]]);
-		const e1 = queue.enqueue([users.getCollection(), items.getCollection()], { id: 'E1' })!;
+		let queuedDuringEnqueue: EntryStatus[] | undefined;
+		const enqueued = queue.enqueue([users.getCollection(), items.getCollection()], { id: 'E1' })
+			.then(queued => { queuedDuringEnqueue = statusesOf(statuses, 'E1'); return queued; });
+		expect(kindsOf(statuses, 'E1'), 'nothing is admitted before the journal has the record').to.deep.equal([]);
+		const e1 = (await enqueued)!;
+		expect(queuedDuringEnqueue?.map(s => s.kind), 'queued was emitted before enqueue resolved').to.deep.equal(['queued']);
+		expect(journal.entries.map(r => ({ id: r.id, seq: r.seq, queuedAt: r.queuedAt, segments: r.segments.map(seg => seg.collectionId) })),
+			'the entry record was written first, naming the sealed collection and its actions')
+			.to.deep.equal([{ id: 'E1', seq: 1, queuedAt: T0, segments: [USERS] }]);
+		expect(journal.entries[0]!.segments[0]!.actions, "the segment's actions, verbatim").to.deep.equal(users.getCollection().sealedActions('E1'));
 		expect(e1.collections, 'only the sibling that staged something is part of the entry').to.deep.equal([USERS]);
 		expect(items.getCollection().sealedEntries()).to.deep.equal([]);
 		expect(asQueued(e1.status, 'E1 is queued on return').waitingFor, 'the head waits for nothing').to.equal(undefined);
@@ -267,6 +335,10 @@ describe('OfflineQueue', function () {
 		expect(await fresh.get(1)).to.deep.equal(entry(1, 'one'));
 		expect(await fresh.get(2)).to.deep.equal(entry(2, 'two'));
 		expect(users.getCollection().sealedEntries(), 'both segments were committed').to.deep.equal([]);
+		expect(journal.drives.map(d => [d.entryId, d.state.actionId, [...d.state.attempts.keys()]]), 'one drive record ahead of each send')
+			.to.deep.equal([['E1', a1, [USERS]], ['E2', a2, [USERS]]]);
+		expect(journal.settledStatuses.map(s => `${s.entryId}:${s.kind}`), 'each terminal status reached the journal').to.deep.equal(['E1:committed', 'E2:committed']);
+		expect(journal.settledStatuses[0], 'the status the journal heard is the status emitted').to.equal(statuses[order.indexOf('E1:committed')]);
 		expect(queue.entries()).to.deep.equal([]);
 		expect(queue.status('E1'), 'a settled entry has left the queue').to.equal(undefined);
 		expect(queue.queueState()).to.deep.equal({ depth: 0, oldestQueuedAt: undefined, draining: false, waitingFor: undefined, unclassifiedFailures: 0 });
@@ -438,15 +510,13 @@ describe('OfflineQueue', function () {
 		await second.queue.dispose();
 	});
 
-	it('a write-ahead hook that throws keeps the entry queued with nothing sent and NOT in doubt, so it can still be discarded; whenDrained waits for that discard\'s removal', async () => {
+	it('a journal whose write-ahead throws keeps the entry queued with nothing sent and NOT in doubt, so it can still be discarded; whenDrained waits for that discard\'s removal', async () => {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
 		const transactor = new RecordsPends(inner);
 		const journalFull = new Error('journal write failed');
-		const { queue, statuses } = openQueue({
-			recordAttempt: async () => { throw journalFull; },
-			recheck: { baseMs: 60_000, maxMs: 60_000 },
-		});
+		const { queue, statuses, journal } = openQueue({ recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		journal.drivingThrows = journalFull;
 		const users = await openTree(transactor, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
 		await waitFor(() => statuses.some(s => s.kind === 'queued' && s.entryId === 'E1' && s.waitingFor === 'backoff'),
@@ -673,9 +743,217 @@ describe('OfflineQueue', function () {
 		expect(kindsOf(statuses, 'E2'), 'never submitted').to.deep.equal(['queued']);
 		expect(users.getCollection().sealedEntries(), 'left sealed for the application').to.deep.equal(['E2']);
 		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
-		expect(() => queue.enqueue([users.getCollection()])).to.throw(QueueDisposedError);
+		await expectRejects(queue.enqueue([users.getCollection()]), QueueDisposedError);
 		await expectRejects(queue.whenDrained(), QueueDisposedError);
 		await queue.dispose();	// idempotent
+	});
+});
+
+describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', function () {
+	this.timeout(20_000);
+
+	it("a journal that refuses the entry record fails the enqueue with every collection unsealed and nothing queued or reported; the caller's rollback then leaves the transaction's actions gone, and the next enqueue takes the same seq", async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS, ITEMS);
+		const { queue, statuses, journal } = openQueue();
+		const users = await openTree(inner, queue, USERS);
+		const items = await openTree(inner, queue, ITEMS);
+		// The caller's pre-transaction snapshots, taken before the first stage as the plugin's markDirty does.
+		const usersBefore = users.getCollection().snapshotPending();
+		const itemsBefore = items.getCollection().snapshotPending();
+		await users.stage([[1, entry(1, 'one')]]);
+		await items.stage([[7, entry(7, 'seven')]]);
+		journal.queuedThrows = new Error('journal store is full');
+
+		const err = await rejectionOf(queue.enqueue([users.getCollection(), items.getCollection()], { id: 'E1' }));
+
+		expect(err, "the journal's own error").to.equal(journal.queuedThrows);
+		expect(statuses, 'nothing was reported').to.deep.equal([]);
+		expect(queue.entries()).to.deep.equal([]);
+		expect(queue.status('E1')).to.equal(undefined);
+		expect(users.getCollection().sealedEntries(), 'unsealed again').to.deep.equal([]);
+		expect(items.getCollection().sealedEntries()).to.deep.equal([]);
+		expect(users.getCollection().getPendingActions(), 'the actions are the open segment again').to.have.length(1);
+		expect(items.getCollection().getPendingActions()).to.have.length(1);
+		expect(await users.get(1), 'still staged, as before the enqueue').to.deep.equal(entry(1, 'one'));
+
+		// The caller rolls the transaction back as for any failed commit: the segment version moved, so
+		// the restore replays, and ends with the transaction's actions gone.
+		await users.getCollection().restorePending(usersBefore);
+		await items.getCollection().restorePending(itemsBefore);
+		expect(await users.get(1), "the transaction's actions are gone").to.equal(undefined);
+		expect(await items.get(7)).to.equal(undefined);
+		expect(users.getCollection().getPendingActions()).to.deep.equal([]);
+		expect(users.getCollection().hasUnsyncedChanges()).to.equal(false);
+		expect(items.getCollection().hasUnsyncedChanges()).to.equal(false);
+
+		journal.queuedThrows = undefined;
+		const e1 = await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		expect(e1.seq, 'the refused enqueue took no sequence number').to.equal(1);
+		await queue.whenDrained();
+		expect(kindsOf(statuses, 'E1')).to.deep.equal(['queued', 'submitting', 'committed']);
+		expect(journal.entries.map(r => r.seq)).to.deep.equal([1]);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		await queue.dispose();
+	});
+
+	it('a journal whose settled write rejects: the committed status is still emitted, the entry leaves the queue, the failure is logged, and whenDrained resolves', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS);
+		const { queue, statuses, journal } = openQueue();
+		journal.settledThrows = new Error('journal store is full');
+		const users = await openTree(inner, queue, USERS);
+
+		const lines = await captureLog('optimystic:db-core:offline', async () => {
+			await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+			await queue.whenDrained();
+		});
+
+		expect(kindsOf(statuses, 'E1')).to.deep.equal(['queued', 'submitting', 'committed']);
+		expect(queue.entries()).to.deep.equal([]);
+		expect(journal.settledStatuses, 'the write failed').to.deep.equal([]);
+		expect(lines.some(line => line.includes('offline:journal-write-failed') && line.includes('step=settled') && line.includes('entry=E1')),
+			`logged: ${lines.join('\n')}`).to.equal(true);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		await queue.dispose();
+	});
+
+	it("restore while a submission is in flight waits for its outcome: the entry is inserted by seq ahead of the one queued behind the head, its segment first in the collection, and it drains next", async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS);
+		const gated = new GatedCommitTransactor(inner);
+		const { queue, statuses, journal } = openQueue();
+		const users = await openTree(gated, queue, USERS);
+		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		await queueEntry(queue, 'E2', [users, [[2, entry(2, 'two')]]]);
+		await gated.commitParked;
+
+		const listedAtStage: string[] = [];
+		const restoring = queue.restore({ id: 'R', seq: 1.5, queuedAt: T0, collections: [users.getCollection()] }, async collection => {
+			listedAtStage.push(queue.entries().map(e => `${e.id}:${(e.status as QueuedStatus).waitingFor ?? 'head'}`).join(','));
+			return stagedSegment(await collection.restoreSealed('R', [replaceAction([[3, entry(3, 'restored')]])], { before: 'E2' }));
+		});
+		await delay(30);
+		expect(listedAtStage, "stage has not run: the head's commit is still on the network").to.deep.equal([]);
+		expect(users.getCollection().sealedEntries()).to.deep.equal(['E1', 'E2']);
+		expect(() => queue.discard('R'), 'not yet admitted, so not discardable').to.throw(UnknownEntryError);
+
+		gated.openGate();
+		const restored = await restoring;
+
+		expect(listedAtStage, "stage ran after the head's outcome was applied, with the entry listed at its position").to.deep.equal(['R:head,E2:earlier-entry']);
+		expect(restored?.id).to.equal('R');
+		expect(asQueued(restored?.status, 'R is queued').waitingFor, 'the head').to.equal(undefined);
+		expect(users.getCollection().sealedEntries(), 'the restored segment is first').to.deep.equal(['R', 'E2']);
+		expect(queue.entries().map(e => e.id), 'the queue lists it first').to.deep.equal(['R', 'E2']);
+		expect(journal.entries.map(r => r.id), 'a restore writes no entry record: the journal already holds it').to.deep.equal(['E1', 'E2']);
+
+		await queue.whenDrained();
+
+		expect(kindsOf(statuses, 'E1'), 'the parked entry committed once').to.deep.equal(['queued', 'submitting', 'committed']);
+		expect(kindsOf(statuses, 'R'), 'the restored entry drained next').to.deep.equal(['queued', 'submitting', 'committed']);
+		expect(kindsOf(statuses, 'E2')).to.deep.equal(['queued', 'submitting', 'committed']);
+		const order = statuses.map(s => `${s.entryId}:${s.kind}`);
+		expect(order.indexOf('E1:committed')).to.be.lessThan(order.indexOf('R:queued'));
+		expect(order.indexOf('R:committed')).to.be.lessThan(order.indexOf('E2:submitting'));
+		expect(journal.drives.map(d => d.entryId), 'one drive record ahead of each send').to.deep.equal(['E1', 'R', 'E2']);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1], [3], [2]]);
+		await queue.dispose();
+	});
+
+	it("restore of an entry every collection already holds committed settles it at once — one committed status with unknown classes, the journal told, nothing sent, nothing sealed — and a restored segment the replay refuses fails through the ordinary cascade", async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS);
+		const transactor = new RecordsPends(inner);
+		const first = openQueue();
+		const users = await openTree(transactor, first.queue, USERS);
+		await queueEntry(first.queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		await first.queue.whenDrained();
+		const drive = first.journal.drives.find(d => d.entryId === 'E1')!.state;
+		await first.queue.dispose();
+		expect(transactor.pends).to.have.length(1);
+
+		// A restart: a second queue over fresh handles, which open over the committed log.
+		const { queue, statuses, journal } = openQueue();
+		const users2 = await openTree(transactor, queue, USERS);
+		const attempt = drive.attempts.get(USERS)!;
+		const restored = await queue.restore(
+			{ id: 'E1', seq: 1, queuedAt: T0, collections: [users2.getCollection()], drive },
+			async collection => collection.holdsCommitted(attempt) ? { kind: 'already-committed' } : { kind: 'staged' });
+
+		expect(restored, 'settled, not queued').to.equal(undefined);
+		expect(kindsOf(statuses, 'E1'), 'committed at once, never queued').to.deep.equal(['committed']);
+		const committed = committedOf(statuses, 'E1');
+		expect([...committed.durability.collections.entries()], 'saved; who holds it is unknown').to.deep.equal([[USERS, undefined]]);
+		expect(committed.durability.overall).to.equal(undefined);
+		expect(journal.settledStatuses).to.deep.equal([committed]);
+		expect(transactor.pends, 'nothing was sent').to.have.length(1);
+		expect(users2.getCollection().sealedEntries()).to.deep.equal([]);
+		expect(queue.entries()).to.deep.equal([]);
+		await queue.whenDrained();
+
+		const refusedRestore = await queue.restore({ id: 'E2', seq: 2, queuedAt: T0, collections: [users2.getCollection()] },
+			async collection => stagedSegment(await collection.restoreSealed('E2', [replaceAction([[1, entry(1, 'again'), { kind: 'absent' }]])], 'last')));
+		expect(refusedRestore?.id).to.equal('E2');
+		await queue.whenDrained();
+
+		const failed = failedOf(statuses, 'E2');
+		expect(failed.reason).to.equal('constraint');
+		expect(failed.error).to.be.instanceOf(TreeKeyTakenError);
+		expect(failed.causedBy, 'the committed state refused it, no earlier entry').to.equal(undefined);
+		expect(kindsOf(statuses, 'E2')).to.deep.equal(['queued', 'failed']);
+		expect(journal.settledStatuses.at(-1)).to.equal(failed);
+		expect(users2.getCollection().sealedEntries()).to.deep.equal([]);
+		expect(transactor.pends, 'still nothing sent').to.have.length(1);
+		await queue.dispose();
+	});
+
+	it('restore of a partly committed entry: the committed collection answers already-committed and is recorded, the rest is staged, the entry is queued in doubt with its committed half, and the next submission drives only the rest under the recorded action id', async () => {
+		const inner = new TestTransactor();
+		await seed(inner, USERS, ITEMS);
+		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
+		const first = openQueue({ recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		const users = await openTree(throwing, first.queue, USERS);
+		const items = await openTree(throwing, first.queue, ITEMS);
+		await queueEntry(first.queue, 'E1', [users, [[1, entry(1, 'one')]]], [items, [[7, entry(7, 'seven')]]]);
+		await partiallyCommitted(first.statuses, 'E1');
+		const drive = first.journal.drives.at(-1)!.state;
+		expect([...drive.committed.keys()], 'the drive record was rewritten after the partial commit').to.deep.equal([ITEMS]);
+		expect([...drive.attempts.keys()], 'with the attempt still to resolve').to.deep.equal([USERS]);
+		const record = first.journal.entries.find(r => r.id === 'E1')!;
+		await first.queue.dispose();
+
+		throwing.armed = false;
+		const { queue, statuses, journal } = openQueue();
+		const users2 = await openTree(throwing, queue, USERS);
+		const items2 = await openTree(throwing, queue, ITEMS);
+		const restored = await queue.restore(
+			{ id: 'E1', seq: record.seq, queuedAt: record.queuedAt, collections: [users2.getCollection(), items2.getCollection()], drive },
+			async collection => {
+				if (drive.committed.has(collection.id)) return { kind: 'already-committed' };
+				const actions = record.segments.find(segment => segment.collectionId === collection.id)!.actions;
+				return stagedSegment(await collection.restoreSealed('E1', actions, 'last'));
+			});
+
+		const between = asQueued(restored?.status, 'E1 is queued');
+		expect(between.inDoubt).to.equal(true);
+		expect(between.committedCollections, 'the committed half, recorded').to.deep.equal([ITEMS]);
+		expect(between.attempts, 'a drive record proves at least one send').to.equal(1);
+		expect(users2.getCollection().sealedEntries(), 'the rest is sealed').to.deep.equal(['E1']);
+		expect(items2.getCollection().sealedEntries(), 'nothing staged for the committed half').to.deep.equal([]);
+		expect(() => queue.discard('E1')).to.throw(EntryNotDiscardableError);
+
+		await queue.whenDrained();
+
+		expect(kindsOf(statuses, 'E1')).to.deep.equal(['queued', 'submitting', 'committed']);
+		expect(journal.drives.map(d => [d.entryId, d.state.actionId, [...d.state.attempts.keys()]]), 'the remainder alone, under the recorded id')
+			.to.deep.equal([['E1', drive.actionId, [USERS]]]);
+		expect([...committedOf(statuses, 'E1').durability.collections.keys()].sort(), 'every collection the entry wrote').to.deep.equal([ITEMS, USERS]);
+		expect(await entriesUnder(inner, USERS, drive.actionId)).to.have.length(1);
+		expect(await entriesUnder(inner, ITEMS, drive.actionId)).to.have.length(1);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		expect(await committedKeys(inner, ITEMS)).to.deep.equal([[5], [7]]);
+		await queue.dispose();
 	});
 });
 
