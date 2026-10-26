@@ -273,6 +273,11 @@ Key aspects of the sync process:
   `memberClocks`, `coordinatorClock` and `apparentSkewMs` (how far the refusing members' clocks
   appear to be from this device's), and its message is written for a person. The staged actions
   stay staged, so a `sync()` after the clock is corrected sends them.
+- **No retry on a short cohort or an invalid transaction**: a pend too few cohort members answered
+  (a `ShortfallFailure`) ends `sync()` with `PromiseShortfallError`, and a pend the members that sank
+  it judged invalid (a `RejectedFailure`) ends it with `ValidityRejectedError`, naming each refusing
+  member and its reason (both in [transactor.md](transactor.md)). Either is thrown after that one
+  attempt, with the staged actions still staged.
 - **A half-landed write is finished before it is acknowledged**: a write's log tail is committed
   before its other blocks, and a commit can answer "failed" after the tail was stored (the tail's
   revision is held by fewer than a majority, or a later block lost a race). The retry's refresh then
