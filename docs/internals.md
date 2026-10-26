@@ -444,6 +444,20 @@ are true of it:
   [debugging.md](debugging.md#did-a-re-read-come-back-older-than-the-log-says)), which is the only
   trace it leaves.
 
+**An open floors what its log tail names.** An open walks no entries, but it has read the log tail
+block, and each action entry there names the blocks that action changed at its revision.
+`Collection.floorTailEntries` in `packages/db-core/src/collection/collection.ts` raises a floor for
+each, as the walk raises one for each entry it walks. Without it, a handle opened over a repo whose
+copy of such a block was older than its own log tail read the block as it was before the commit, with
+nothing to say otherwise. Two ways to get there: a coordinator that missed the commit, and a node
+whose crash kept a commit's log tail and lost its other blocks inside the store's durability window,
+whose first read of a held block after the restart is answered from that copy while the consult runs
+behind it. The second was seen as a table row whose index entry was missing after an offline-queue
+restore (`packages/quereus-plugin-optimystic/test/offline-restore.spec.ts`). With the floor, the
+coordinator consults its cohort before answering (see *The asker's floor rides out on the request*
+under Key Invariants) and the transactor re-asks another machine for an answer still below it. Only
+the tail block: it holds the newest commits, which are the ones a durability window can tear.
+
 One `BlockFloors` is shared by every read source the handle builds, the way the
 `ReadDependencyCollector` is: a pinned read view created right after a refresh would otherwise fetch
 the changed block through a source that knows no floor.
@@ -545,8 +559,9 @@ read itself, since the floor makes it consult past its window (see *The asker's 
 the request* under Key Invariants), so the old content outlasts one read only when no reachable cohort
 member can corroborate the revision — a partition, or a log entry whose blocks never landed, which
 sets a floor no machine can ever meet, and there the below-floor content is the *correct* content
-(the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
-invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
+(the accepted-tradeoff `NOTE:` at `mayRetain`). At open it floors only the blocks named by the log tail
+block's entries, not those of older log blocks, and it sets no floor for the blocks an invalidation
+entry reverts. A write staged over a too-old read keeps the revision it was really
 computed against: once storage catches up, the base under the staged edits is re-judged as moved and
 the edits are re-staged before they are pended, never re-described at the newer revision (see
 [Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect

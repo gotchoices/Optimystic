@@ -478,7 +478,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return { source, sourceCache, tracker, floors, ends };
 	}
 
-	/** A new handle's floors: none yet (opening walks no entries), wired to report every below-floor
+	/** A new handle's floors: none yet (an open raises them from its log tail,
+	 * {@link floorTailEntries}), wired to report every below-floor
 	 * answer any of the handle's read sources receives. The line is the only trace such an answer
 	 * leaves — the read itself succeeds (see the accepted-tradeoff NOTE at
 	 * `TransactorSource.mayRetain`) — so repeated lines for one block with `servedRev` short of
@@ -510,6 +511,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
 		Collection.bootstrapContext(source, ends.tail);
+		Collection.floorTailEntries(floors, ends);
 		// The walk starts from the header and the tail, which the probe just read: keep them, so the
 		// walk reads neither again. Its first read of each through the cache then records the read
 		// dependency the probe's own read of the header used to.
@@ -523,6 +525,31 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// tail or the tail block carries zero entries, and that must not erase the revision
 		// bootstrapContext just read off the committed tail.
 		Collection.advanceContext(source, id, instanceTag, 'attach', await collectionLog.getActionContext());
+	}
+
+	/** Floor every block an action entry in the opened log's tail block names, at that entry's
+	 * revision — what a refresh's walk does for the entries it walks ({@link raiseFloors}), for the
+	 * entries an open has read but does not walk.
+	 *
+	 * An open adopts the revision the tail names, then reads each block it needs for the first time.
+	 * When the answering repo's copy of such a block is older than an entry the tail holds — a node
+	 * whose crash kept a commit's log tail but lost its other blocks within the store's durability
+	 * window, or a coordinator that missed the commit — nothing else tells the read so, and the
+	 * repo serves its held copy (a held block's first read after a restart is answered locally while
+	 * the consult runs behind it). The handle then shows, say, a table row whose index entry is
+	 * missing. With the floor, the read carries the revision the tail proves, so the repo consults
+	 * its cohort before answering and the transactor re-asks another machine for an answer still
+	 * below it (see {@link BlockFloors}).
+	 *
+	 * Only the tail block's entries: they are what the open read, and they hold the newest commits —
+	 * the ones a durability window can tear. Invalidation entries set no floor, as on a refresh. */
+	private static floorTailEntries(floors: BlockFloors, ends: LogEnds): void {
+		const tail = ends.tail?.block as LogBlock<unknown> | undefined;
+		for (const entry of tail?.entries ?? []) {
+			if (entry.action !== undefined) {
+				floors.raise(entry.action.blockIds, { rev: entry.rev, actionId: entry.action.actionId });
+			}
+		}
 	}
 
 	/** Adopt a freshly-read action context WITHOUT ever lowering the revision already held.

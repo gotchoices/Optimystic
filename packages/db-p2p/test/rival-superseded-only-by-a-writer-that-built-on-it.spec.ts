@@ -12,18 +12,25 @@
  *     refused with a transport-shaped throw, so it falls back to the tail, then the rest. R's TAIL commit
  *     lands everywhere — D reconciles it, since it holds no pend — and R's data-block commit is held on the
  *     writer's side, so the log names R while no member's data block holds R's row.
- *  3. **N reads through D and writes.** A fresh handle driven by D opens the tree: the log (current on D)
- *     names R, but D holds no record to promote, so it serves the data block without R's row, and the handle
- *     — which has walked no entry and so holds no floor for the block — accepts it. N pends past R's slot,
+ *  3. **N reads through D, and only D, and writes.** A fresh handle driven by D opens the tree: the log
+ *     (current on D) names R, but D holds no record to promote, so it serves the data block without R's
+ *     row. The handle floors the block at R's revision from the log tail it opened on, so D consults the
+ *     cohort before answering and the handle's read re-asks another machine — and A, B or C would promote
+ *     R's record for a read whose context names R as committed, so N would build on R and land with both
+ *     rows. Here D is cut off from the cohort on the read path (A, B and C are silent to its consult) and
+ *     N's reads reach no machine but D, so D's answer, below the floor, is what the handle gets: the shape
+ *     the floor cannot repair, which leaves the promise vote as the only defence. N pends past R's slot,
  *     declaring the stale revision as its base. A, B and C still hold R's record; under the revision rule
  *     they approved, because N's revision was past R's slot, and N's commit then applied over the stale base
  *     and swept R's record. With the base rule they HOLD at the promise vote — four members can reach the
  *     promise bar without one, so the vote reads N's base, and N's base is below R's claim. (Two- and
  *     three-member cohorts cannot miss a pend this way, and their vote keeps the revision rule.)
  *  4. **R's commit is released.** R lands on every machine. N's write is either saved with both rows or
- *     refused — today it is refused: its handle never re-reads the block it was served short, so every
- *     retry re-pends on the stale base and the fork guard refuses the data-block commit (backlog
- *     `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`). Never acknowledged over R.
+ *     refused, never acknowledged over R. Today it is saved: the block N was served short is under its
+ *     floor, so that answer was never kept, a retry re-reads it, finds R's change, and re-stages N over it.
+ *     (Before an open floored the blocks its log tail names, N's handle kept the short answer, every retry
+ *     re-pended on the stale base, and the fork guard refused the data-block commit — backlog
+ *     `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`.)
  *  5. **The application retries N** from a fresh handle through D, which now holds R's change: it lands,
  *     and every machine reads both rows.
  *
@@ -74,6 +81,8 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 	/** N — the newcomer, reading through D. */
 	let newcomerAttempts: Attempt[] = [];
 	let newcomerWrite: Promise<WriteDurability | undefined> | undefined;
+	/** While set, N's reads are answered by D alone: a read N sends to any other machine fails. */
+	let newcomerReadsOnlyThroughD = false;
 
 	const label = (node: MeshNode): string => 'ABCD'[mesh.nodes.indexOf(node)]!;
 
@@ -110,6 +119,7 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 	after(() => {
 		mesh.failures.onClusterDelivery = undefined;
 		mesh.failures.dropCarried = undefined;
+		mesh.failures.silentPeers = undefined;
 		releaseRival();
 	});
 
@@ -175,7 +185,18 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 
 	it('phase 3 — N reads through D and writes past R\'s slot: it is held, not landed over R\'s change', async () => {
 		newcomerAttempts = [];
-		newcomerWrite = writeWith(recording(transactorDrivenBy(mesh, d), newcomerAttempts), 'row-N', 'written-by-N');
+		newcomerReadsOnlyThroughD = true;
+		mesh.failures.silentPeers = new Set([a, b, c].map(node => node.peerId.toString()));
+		const dId = d.peerId.toString();
+		const wrapRepo = (peer: string, repo: IRepo): IRepo => ({
+			get: gets => peer !== dId && newcomerReadsOnlyThroughD
+				? Promise.reject(new Error(`injected: N's read does not reach ${peer}`))
+				: repo.get(gets),
+			cancel: ref => repo.cancel(ref),
+			pend: request => repo.pend(request),
+			commit: request => repo.commit(request)
+		});
+		newcomerWrite = writeWith(recording(transactorDrivenBy(mesh, d, { wrapRepo }), newcomerAttempts), 'row-N', 'written-by-N');
 		newcomerWrite.catch(() => { /* observed in phase 4 */ });
 
 		const refusedPend = () => newcomerAttempts.some(at => at.kind === 'pend' && (at.thrown !== undefined || at.result?.success === false));
@@ -195,15 +216,17 @@ describe('A rival pend is superseded only by a writer that built on it (four mac
 		releaseRival();
 		mesh.failures.onClusterDelivery = undefined;
 		mesh.failures.dropCarried = undefined;
+		newcomerReadsOnlyThroughD = false;
+		mesh.failures.silentPeers = undefined;
 		await rivalWrite;
 		acknowledged.set('row-R', 'written-by-R');
 
-		// N's handle never re-reads the data block after the held refusal: it read it once through D, one
-		// change short, and every retry re-pends on that base. With R's record promoted the pend is
-		// admitted, and the fork guard (`StorageRepo.internalCommit`) refuses its data-block commit on
-		// every member, so the write ends torn — refused, not acknowledged. That is the gap backlog
-		// `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy` owns; what this phase pins
-		// is the safety half: whatever N's write reports, R's row is on every machine.
+		// N's handle read the data block through D one change short, below the floor its log tail set, so
+		// it kept nothing: once R's change is readable, a retry re-reads the block, the base under N's
+		// staged edit has moved, and N is re-staged over R and saved. A handle that kept the short answer
+		// would re-pend on that base on every retry and end torn, refused by the fork guard
+		// (`StorageRepo.internalCommit`) — backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`.
+		// What this phase pins is the safety half: whatever N's write reports, R's row is on every machine.
 		let newcomerOutcome: string;
 		try {
 			await newcomerWrite;
