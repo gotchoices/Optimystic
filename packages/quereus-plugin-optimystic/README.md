@@ -163,6 +163,78 @@ Read `isFullyDurable(overall)` as "saved now" and `onCommitFullyHeld` as "saved 
 
 The listener runs synchronously, from the event that covered the commit's last block or from a later commit through this plugin that wrote those blocks at full replication, with the same discipline as `onCommitDurability`. Followed commits live in memory: a restart or `plugin.dispose()` forgets them, and so does a cap on how many can be pending at once (10 000, oldest dropped first). A forgotten commit is never reported, though its copies still reach the other members.
 
+### Offline mode — `plugin.offline`
+
+A commit normally resolves once the network holds what it wrote. In offline mode it resolves as soon as the transaction is **queued on this machine**, and the plugin submits it to the network later, in order, as soon as the other machines can be reached. The design is [docs/offline-sync.md](../../docs/offline-sync.md); this section is the interface as it stands after the first plugin stage, and says at the end what is still missing.
+
+**A local acknowledgement is a promise to try, not a promise that the network will accept.** The transaction's rows are in every later read on this machine; the plugin submits the transaction under the same `StampId()` once every earlier queued transaction has settled; and it ends in exactly one terminal status, `committed` (with the same durability report an online commit produces) or `failed` (with a typed reason), after which a failed transaction's rows are removed from this machine's view. Nothing is persisted yet: a restart loses whatever was queued.
+
+```typescript
+const plugin = register(db, {
+  default_transactor: 'network',
+  offline: {
+    expireAfterMs: 7 * 24 * 3600_000,          // fail a transaction unsettled this long with reason 'expired'; default: no limit
+    outcomeRetentionMs: 7 * 24 * 3600_000,     // how long a terminal outcome stays in outcomes() / status(); default: 7 days
+    recheck: { baseMs: 1_000, maxMs: 60_000 }, // advanced: the drain's re-check timer while the cohort is unreachable
+  },
+});
+
+plugin.offline.enter();              // transactions begun from now on are acknowledged locally
+plugin.offline.exit();               // transactions begun from now on are acknowledged by the network
+await plugin.offline.whenDrained();  // resolves once the queue is empty; rejects with QueueDisposedError on plugin.dispose()
+```
+
+`offline` and every key in it are optional. A key the plugin does not know is refused at `register`, so a misspelt option is an error rather than a silently different configuration; the persistence (`journal`) and solo-commit options of later stages are refused until they land. Object-typed, so it is passed through `register()`, like `rawStorageFactory`.
+
+The acknowledgement a transaction gets is fixed when it **begins**: `enter()` or `exit()` during an open transaction changes nothing about it. Leaving the mode does not stop the drain. Session mode and offline mode refuse each other in either order: `enter()` throws `OfflineModeRefusedError` while `configureTransactionMode` has been called, and `configureTransactionMode` throws `SessionModeRefusedError` while the mode is entered or transactions are still queued.
+
+A commit in offline mode seals every table it wrote into one queue entry, including a table's index trees. One shape cannot be queued and is acknowledged by the network instead, logged as `offline:local-ack-unavailable`: two tables declared over one collection URI written in one transaction. Everything else that holds for an online commit holds for the queued one: a commit that wrote nothing queues nothing, and the constraint and concurrent-modification refusals arrive as the same errors, on the `failed` status instead of out of `commit`.
+
+#### Following a queued transaction — `plugin.offline.onStatus(listener)`
+
+```typescript
+import { isFullyDurable } from '@optimystic/quereus-plugin-optimystic';
+
+const unsubscribe = plugin.offline.onStatus(status => {
+  switch (status.kind) {
+    case 'queued':              ui.mark(status.transactionId, 'pending'); break;
+    case 'submitting':          ui.mark(status.transactionId, 'sending'); break;
+    case 'committed':           ui.mark(status.transactionId, status.durability.overall !== undefined && isFullyDurable(status.durability.overall) ? 'saved' : 'saved, replicating'); break;
+    case 'partially-committed': ui.mark(status.transactionId, 'sending'); break;
+    case 'failed':              ui.fail(status.transactionId, status.reason, status.error, status.causedBy); break;
+  }
+});
+```
+
+- `transactionId` is what `StampId()` returned inside the transaction. `tables` names the tables it changed, as `schema.table`.
+- `queued` is delivered synchronously inside the commit, before `db.exec` resolves, by the rule `onCommitDurability` uses, which is how an autocommit statement's caller learns the id it never selected. It carries `seq` (the drain order), `waitingFor` (`'earlier-entry'`, `'cohort'`, `'backoff'`, or undefined for the head about to be sent), `attempts`, `inDoubt` (an attempt may have landed), `lastError`, and `committedTables` once part of the transaction has committed. It is delivered again whenever one of those changes.
+- `committed` is the `SqlCommitDurability` an online commit reports (`durability`, `tables`, `followed`) with `kind` added. `onCommitDurability` listeners received that same report a moment earlier, and `onCommitFullyHeld` follows the commit exactly as it follows an online one. Unlike an online report it arrives during no `db.exec`; the transaction id is the attribution.
+- `partially-committed` names the `committedTables` the network already holds and the `pendingTables` the next submission drives; the transaction stays queued, in doubt.
+- `failed` carries `reason` (`'constraint'`, `'concurrent-modification'`, `'rejected'`, `'too-large'`, `'expired'`, `'discarded'`), `error` as an online commit would have thrown it (a `ConstraintError` reading `UNIQUE constraint failed: …`, a `ConcurrentModificationError`, with the db-core refusal reachable through `cause`), `changedTables` (whose rows the removal changed), `causedBy` naming the earlier transaction whose removal made this one fail, and `committedTables` when part of it had committed first — the network then holds half of the transaction.
+- A listener that throws is logged and the rest still run. The returned function unsubscribes and is safe to call twice.
+
+Queue-wide state, for a status bar: `plugin.offline.onQueueState(listener)`, published whenever the queue or the mode changes, and `plugin.offline.queueState()` for the current value. It carries `mode` (`'offline'` or `'online'`), `depth`, `oldestQueuedAt`, `draining` (a submission is on the network), `waitingFor` (`'cohort'` or `'backoff'` for the head), `unclassifiedFailures` (attempts the drain could not classify; a rising count with a stuck depth is the signal), and `readsServedLocally`, always `false` until live reads degrade in offline mode.
+
+#### Queries and actions
+
+```typescript
+plugin.offline.entries();                  // the queued transactions, in order, each with its current status
+plugin.offline.status(transactionId);      // the queued status, else a retained terminal outcome, else undefined
+plugin.offline.discard(transactionId);     // withdraw a never-sent transaction: it fails with reason 'discarded'
+plugin.offline.outcomes();                 // the terminal outcomes retained since they were emitted
+plugin.offline.acknowledge(transactionId); // forget one retained outcome
+```
+
+`discard` throws `EntryNotDiscardableError` for a transaction that has been sent at least once (the plugin can no longer say whether it landed) or is being submitted, and `UnknownEntryError` for one not queued; both classes are exported from both entries. One consequence of the current stage: the drain tries the head at once, with no check that the cohort can be reached first, so a transaction queued while the other machines are unreachable is usually sent, and refused, before an application can withdraw it. It is in doubt from then on: `discard` refuses it and a passed `expireAfterMs` is deferred until it settles. The reachability gate of a later stage is what keeps such a transaction unsent.
+
+#### Not yet in this stage
+
+- **A network-acknowledged commit does not wait behind the queue.** After `exit()`, or in a transaction begun before `enter()`, a commit that writes a table with queued transactions fails with `SealedSegmentsError` (rolled back cleanly; retry it after `whenDrained()`), and one that writes other tables commits ahead of the queue.
+- **Every table takes the mode's acknowledgement**; the per-table `optimystic.offline` tag is later.
+- **Schema changes are not refused** while a table's transactions are queued; await `whenDrained()` before DDL on such a table.
+- **Live reads while the cohort is unreachable fail as they do today**, and a `Database.watch` on a table is not told when a failed transaction's rows are removed.
+- **Nothing survives a restart.**
+
 ## Reactive Watching
 
 Tables backed by Optimystic drive Quereus's reactive watch API. When a commit

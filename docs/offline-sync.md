@@ -132,7 +132,7 @@ cohort and this machine owes the missing copies.
 
 ## Application interface
 
-All of this is proposed; none of these names exist yet.
+The members below exist, under `plugin.offline` (`OfflineMode` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts`), except where a later stage is named: those are still proposed.
 
 ### Registration
 
@@ -153,6 +153,8 @@ const plugin = register(db, {
   },
 });
 ```
+
+`register` refuses a key under `offline` it does not know (`parseOfflineConfig` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts`), so `journal` and `allowSoloCommit` are refused until their stages land rather than silently ignored.
 
 Persistence is a registration-time choice, not a per-entry one, for two reasons: entries have to be
 restored before the application's first statement after a restart, which happens before any
@@ -193,22 +195,23 @@ const off = plugin.offline.onStatus(status => {
 });
 ```
 
-Proposed status shape:
+Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts`; `persisted` is stage 5's, `outlook` and `outlook-changed` stage 7's, `effect` stage 10's):
 
 ```typescript
 type QueuedTransactionStatus =
-  | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[];
+  | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[]; queuedAt: number;
+      attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
       persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | undefined;
       outlook: CommitOutlook }
   | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
   | { kind: 'submitting'; transactionId: string; attempt: number }
   | { kind: 'committed'; transactionId: string; durability: TransactionDurability;
       tables: ReadonlyMap<string, WriteDurability | undefined>; followed: boolean;
-      effect: 'applied' | 'already-applied' }
+      effect: 'applied' | 'already-applied' }                 // i.e. { kind: 'committed' } & SqlCommitDurability
   | { kind: 'partially-committed'; transactionId: string; committedTables: readonly string[];
       pendingTables: readonly string[]; cause: Error }
   | { kind: 'failed'; transactionId: string; reason: QueuedFailureReason; error: Error;
-      causedBy?: string; committedTables?: readonly string[] };
+      causedBy?: string; changedTables: readonly string[]; committedTables?: readonly string[] };
 
 type QueuedFailureReason =
   | 'constraint'               // a UNIQUE / PRIMARY KEY refusal on rebase (ConstraintError)
@@ -243,20 +246,17 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 `collections` on `queued`, `committedCollections` and `pendingCollections` on `partially-committed`,
 `committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
 `failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
-what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`). `outlook`
-and `outlook-changed` arrive with stage 7, `effect` with stage 10, `persisted` with stage 5, and
-`followed` and the per-table `tables` map with stage 4.
+what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
+plugin passes through. `outlook` and `outlook-changed` arrive with stage 7, `effect` with stage 10
+and `persisted` with stage 5; `followed`, the per-table `tables` map and `changedTables` landed with
+stage 4.
 
 Queue-wide state, for a status bar:
 
 ```typescript
-plugin.offline.onQueueState(state => …);
-type OfflineQueueState = {
-  mode: 'offline' | 'online';
-  depth: number;
-  oldestQueuedAt: number | undefined;
-  draining: boolean;
-  waitingFor: 'cohort' | 'backoff' | undefined;
+plugin.offline.onQueueState(state => …);   // and plugin.offline.queueState() for the current value
+type OfflineModeState = OfflineQueueState & {   // db-core's queue state: depth, oldestQueuedAt, draining,
+  mode: 'offline' | 'online';                   //   waitingFor ('cohort' | 'backoff' | undefined), unclassifiedFailures
   readsServedLocally: boolean;   // the last live read could not reach the cohort (see "Reads")
 };
 ```

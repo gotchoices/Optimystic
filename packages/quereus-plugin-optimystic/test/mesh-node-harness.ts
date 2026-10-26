@@ -80,20 +80,22 @@ export async function startMockMesh(size: number, options: MockMeshOptions = {})
 }
 
 /**
- * Build a `Database` whose every collection rides `transactor`'s stack.
+ * Build a `Database` whose every collection rides `transactor`'s stack. `config` is spread over
+ * the registration defaults, for a spec that registers the plugin with more (an `offline` block).
  *
  * The factory keys its transactor cache on `${transactor}:${keyNetwork}`, so registering
  * under `shared:test` is what binds this Database to THIS mesh node rather than to a
  * default one — get that key wrong and the spec silently runs both nodes on one stack.
  */
-export function createMeshDbNode(transactor: ITransactor): MeshDbNode {
+export function createMeshDbNode(transactor: ITransactor, config: Record<string, SqlValue> = {}): MeshDbNode {
 	const db = new Database();
-	const config = {
+	const registration = {
 		default_transactor: 'shared',
 		default_key_network: 'test',
 		enable_cache: false,
+		...config,
 	} as unknown as Record<string, SqlValue>;
-	const plugin = register(db, config);
+	const plugin = register(db, registration);
 	plugin.collectionFactory.registerTransactor('shared:test', transactor);
 	for (const vtable of plugin.vtables) {
 		db.registerModule(vtable.name, vtable.module, vtable.auxData);

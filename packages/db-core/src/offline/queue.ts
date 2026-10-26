@@ -88,6 +88,21 @@ function entryDurability(entry: Entry, written: TransactionDurability | undefine
 }
 
 /**
+ * The one transactor `remaining` share, which the per-entry coordinator commits through. An entry
+ * whose collections sit on different transactors cannot be one network transaction (each transactor
+ * is its own storage); the queue's callers never seal such a set together, so this is a defect that
+ * stops the drain rather than a failure of the entry.
+ */
+function sharedTransactor(entry: Entry, remaining: readonly Collection<any>[]): ITransactor {
+	const transactor = remaining[0]!.transactor;
+	const stranger = remaining.find(collection => collection.transactor !== transactor);
+	if (stranger !== undefined) {
+		throw new Error(`offline queue: entry ${entry.id} spans collections on different transactors (${remaining[0]!.id} and ${stranger.id}); an entry is one network transaction on one transactor`);
+	}
+	return transactor;
+}
+
+/**
  * The offline-sync queue (docs/offline-sync.md §Draining): an in-memory list of locally committed
  * entries, each the sealed segments one local commit left in the collections it wrote, drained one
  * at a time in queue order once the cohort can be reached.
@@ -155,7 +170,7 @@ export class OfflineQueue {
 	 * threw): `whenDrained` rejects with it and `enqueue` refuses. */
 	private defect: unknown;
 
-	constructor(private readonly transactor: ITransactor, options: OfflineQueueOptions = {}) {
+	constructor(options: OfflineQueueOptions = {}) {
 		this.reachability = options.reachability ?? alwaysReachable;
 		this.waker = new DrainWaker(
 			{ baseMs: options.recheck?.baseMs ?? DefaultRecheckBaseMs, capMs: options.recheck?.maxMs ?? DefaultRecheckMaxMs },
@@ -493,8 +508,9 @@ export class OfflineQueue {
 	}
 
 	/** One submission: `commitHead` for an entry over one collection, the coordinator's per-entry
-	 * slice over several, each under the entry's action id and local commit time, resuming from the
-	 * attempts retained under that id. */
+	 * slice over several — built on the transactor the remaining collections share, since a queue
+	 * holds collections of whatever transactor each was opened on — each under the entry's action id
+	 * and local commit time, resuming from the attempts retained under that id. */
 	private async send(entry: Entry, remaining: readonly Collection<any>[], signal: AbortSignal): Promise<TransactionDurability> {
 		const submit: SyncOptions = { ...this.submitOptions, signal };
 		const recordAttempt = (attempts: ReadonlyMap<CollectionId, InFlightAttempt>) => this.recordAttempts(entry, attempts);
@@ -510,7 +526,7 @@ export class OfflineQueue {
 			});
 			return transactionDurability(new Map([[collection.id, written]]));
 		}
-		const coordinator = new TransactionCoordinator(this.transactor,
+		const coordinator = new TransactionCoordinator(sharedTransactor(entry, remaining),
 			new Map(remaining.map(collection => [collection.id, collection])), { pendValidation: 'none' });
 		const resume = new Map([...entry.retained].filter(([collectionId]) => remaining.some(collection => collection.id === collectionId)));
 		return coordinator.commitEntry({

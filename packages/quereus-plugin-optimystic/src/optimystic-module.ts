@@ -3724,7 +3724,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     };
     const tree = await this.collectionFactory.createOrGetCollection(
       indexOptions,
-      transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
+      transactor ? { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network' } : undefined
     );
     log(
       'index:tree-open table=%s index=%s uri=%s collection=%s node=%s',
@@ -4254,7 +4254,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         rawStorageFactory: tableOptions.rawStorageFactory,
       };
       const txnState = transactor
-        ? { transactor, isActive: true, collections: new Map(), stampId: '' }
+        ? { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network' as const }
         : undefined;
       // Write paths bring the catalog into existence; read paths must observe an
       // absent catalog as absent (undefined) rather than as a table-less database.

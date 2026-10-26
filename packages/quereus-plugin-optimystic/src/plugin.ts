@@ -9,6 +9,7 @@ import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
 import { TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import { OfflineMode, parseOfflineConfig } from './optimystic-adapter/offline-mode.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
@@ -28,6 +29,14 @@ export { isFullyDurable } from '@optimystic/db-core';
 export type {
 	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
 } from './optimystic-adapter/commit-durability.js';
+// Offline mode (README § Offline mode): the controller under `plugin.offline`, its two refusals, the
+// db-core errors its queries throw, and the statuses it reports.
+export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError } from './optimystic-adapter/offline-mode.js';
+export type { OfflineConfig } from './optimystic-adapter/offline-mode.js';
+export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
+export type {
+	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
+} from './optimystic-adapter/offline-status.js';
 
 /**
  * Plugin registration function
@@ -41,6 +50,11 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
 	const txnBridge = new TransactionBridge(collectionFactory);
+	// One offline queue per Database, idle until the first locally acknowledged commit. Wired before
+	// any table opens: every tree the factory opens from here on reports sealed-segment refusals to it.
+	const offline = new OfflineMode(txnBridge, parseOfflineConfig(config.offline));
+	txnBridge.attachOfflineMode(offline);
+	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
 
 	// Create the StampId function
@@ -126,6 +140,16 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		onCommitFullyHeld: (listener: CommitFullyHeldListener) =>
 			txnBridge.onCommitFullyHeld(listener),
 		/**
+		 * Offline mode (README § Offline mode): `enter()` makes every transaction begun from then on
+		 * resolve its commit once the transaction is queued on this machine, to be submitted to the
+		 * network in order as soon as the cohort can be reached; `exit()` returns to network
+		 * acknowledgement. Follow each queued transaction through `onStatus`, the queue through
+		 * `onQueueState`, and query it through `entries`, `status`, `outcomes`; `discard` withdraws a
+		 * never-sent transaction and `whenDrained` resolves once the queue is empty. Configured by the
+		 * registration config's `offline` block.
+		 */
+		offline,
+		/**
 		 * Resolves once every tag change made so far on an Optimystic table is saved to the table's
 		 * catalog record — so a later `hydrate` restores it. A tag change made by `apply schema` is
 		 * saved before the apply returns; an imperative `alter … set|add|drop tags` (on a table, a
@@ -139,7 +163,9 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		/**
 		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
 		 * full-replication events (forgetting every commit still followed, see
-		 * `TransactionBridge.dispose`), and its LEASES on the raw-storage read caches behind
+		 * `TransactionBridge.dispose`), the offline queue's drain (`OfflineMode.dispose`: a
+		 * submission in flight is aborted after its current network step, nothing further is sent,
+		 * and queued entries stay sealed in their collections), and its LEASES on the raw-storage read caches behind
 		 * `local` transactors over host-supplied storage (see `CollectionFactory.dispose`). Call
 		 * after `db.close()`. Quereus has no close hook that reaches the plugin, so this is explicit.
 		 *
@@ -154,6 +180,9 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		dispose: async () => {
 			await optimysticModule.whenCatalogPersisted();
 			txnBridge.dispose();
+			// After the bridge: a pending `whenDrained` rejects with QueueDisposedError, and entries
+			// still queued stay sealed in their collections (nothing of the application's is dropped).
+			await offline.dispose();
 			await collectionFactory.dispose();
 		},
 	};

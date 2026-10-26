@@ -1,4 +1,4 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions } from '@optimystic/db-core';
 import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
@@ -90,6 +90,29 @@ export class CollectionFactory {
    * idle tick one request however many tables are watched.
    */
   private tailReaders = new WeakMap<ITransactor, CollectionTailReader>();
+  /**
+   * The sealed-segment refusal callback every tree this factory opens is built with
+   * ({@link setSealedRefusedListener}): the offline queue's, so a replay that refuses a queued
+   * entry's segment reaches the queue whichever of this `Database`'s collections reported it.
+   * `Collection.onSealedRefused` is fixed at construction and the collections open before any
+   * `plugin.offline.enter()`, which is why the listener is set once, at registration, rather than
+   * per tree.
+   */
+  private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
+
+  /**
+   * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
+   * Once: a second controller would silently take the first's refusals.
+   */
+  setSealedRefusedListener(listener: NonNullable<TreeCollectionOptions['onSealedRefused']>): void {
+    if (this.sealedRefusedListener !== undefined) throw new Error('a sealed-segment refusal listener is already set on this factory');
+    this.sealedRefusedListener = listener;
+  }
+
+  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set. */
+  private treeOptions(): TreeCollectionOptions | undefined {
+    return this.sealedRefusedListener === undefined ? undefined : { onSealedRefused: this.sealedRefusedListener };
+  }
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -110,7 +133,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
 
     this.cacheCollection(options, txnState, collection);
@@ -140,7 +165,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
     if (!collection) {
       return undefined;

@@ -74,10 +74,10 @@ async function twoNodes(batches: BatchCounter): Promise<{ a: ITransactor; b: ITr
 
 /** An offline queue over `transactor`, recording every status and every attempt its write-ahead hook
  * sees; `beforeSend` runs inside the hook, after the attempt is built and before it is sent. */
-function openQueue(transactor: ITransactor, beforeSend?: () => Promise<void>) {
+function openQueue(beforeSend?: () => Promise<void>) {
 	const statuses: EntryStatus[] = [];
 	const recorded: ReadonlyMap<CollectionId, InFlightAttempt>[] = [];
-	const queue = new OfflineQueue(transactor, {
+	const queue = new OfflineQueue({
 		recordAttempt: async (_entryId, attempts) => {
 			recorded.push(attempts);
 			await beforeSend?.();
@@ -114,7 +114,7 @@ describe('OfflineQueue on a two-member mesh', function () {
 	it('drains an entry over a table and its index as one record per phase: node B reads both rows, and each log holds one entry under the entry\'s action id', async () => {
 		const batches = new BatchCounter();
 		const { a, b } = await twoNodes(batches);
-		const { queue, statuses, recorded } = openQueue(a);
+		const { queue, statuses, recorded } = openQueue();
 		const table = await openTree(a, queue, TABLE);
 		const index = await openTree(a, queue, INDEX);
 		await table.stage([['u1', row('u1', 'Ada')]]);
@@ -140,7 +140,7 @@ describe('OfflineQueue on a two-member mesh', function () {
 		const { a, b } = await twoNodes(batches);
 		const rival = await Tree.createOrOpen<string, Row>(b, TABLE, keyOf);
 		let rivalDue = true;
-		const { queue, statuses, recorded } = openQueue(a, async () => {
+		const { queue, statuses, recorded } = openQueue(async () => {
 			if (!rivalDue) return;
 			rivalDue = false;
 			await rival.replace([['u1', row('u1', 'Rival')]]);

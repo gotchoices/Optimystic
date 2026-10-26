@@ -10,8 +10,11 @@ import {
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
-import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurabilityListener } from './commit-durability.js';
+import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurability, type SqlCommitDurabilityListener } from './commit-durability.js';
 import { DurabilityFollower } from './durability-follower.js';
+import { addListener, notifyListeners } from './listeners.js';
+import { SessionModeRefusedError } from './offline-mode.js';
+import type { OfflineMode } from './offline-mode.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { createLogger, revisionToken } from '../logger.js';
 
@@ -110,32 +113,6 @@ const treeLabel = (tree: DirtyTree, index: number): string => tree.describe?.() 
  * was gathered — nothing was written, or no tree that wrote could say (a test double). */
 const writtenDurability = (written: ReadonlyMap<CollectionId, WriteDurability | undefined>): TransactionDurability | undefined =>
   written.size === 0 ? undefined : transactionDurability(written);
-
-/** Add `listener` to `listeners`, returning an idempotent unsubscribe. */
-function addListener<L>(listeners: Set<L>, listener: L): () => void {
-  listeners.add(listener);
-  let unsubscribed = false;
-  return () => {
-    if (unsubscribed) return;
-    unsubscribed = true;
-    listeners.delete(listener);
-  };
-}
-
-/**
- * Call every listener with `event`, in registration order. Over a snapshot, so a listener that
- * (un)subscribes while being called changes the next delivery, not this one; a listener that throws
- * is logged and the next still runs.
- */
-function notifyListeners<E>(listeners: ReadonlySet<(event: E) => void>, event: E, what: string, transactionId: string): void {
-  for (const listener of [...listeners]) {
-    try {
-      listener(event);
-    } catch (error) {
-      log('commit:%s-listener-threw transaction=%s: %o', what, transactionId, error);
-    }
-  }
-}
 
 /**
  * The committed revision to print for a dirty tree in the `commit:collections` trace.
@@ -402,8 +379,9 @@ export class TransactionBridge {
   /**
    * The tables (`schema.table`) each registered collection backs — its main tree or one of its
    * index trees — recorded by {@link registerCollection}. A set because two tables declared over
-   * one collection URI share its collections. Read only to build a commit report's per-table view
-   * ({@link reportCommitDurability}).
+   * one collection URI share its collections. Read to build a commit report's per-table view
+   * ({@link reportCommitDurability}) and, through {@link tablesOf}, the table-level statuses of the
+   * offline queue.
    */
   private collectionTables = new Map<CollectionId, Set<string>>();
   /**
@@ -503,9 +481,26 @@ export class TransactionBridge {
   private engine: ITransactionEngine | null = null;
   /** Schema hash provider function */
   private schemaHashProvider: (() => Promise<string>) | null = null;
+  /**
+   * The offline-mode controller of the `Database` this bridge serves ({@link attachOfflineMode}):
+   * read when a transaction begins, to fix its acknowledgement, and handed the dirty trees of a
+   * locally acknowledged commit to seal ({@link sealForLocalAcknowledgement}). Absent for a bridge
+   * built bare (tests); every transaction is then network-acknowledged.
+   */
+  private offline: OfflineMode | undefined;
 
   constructor(collectionFactory: CollectionFactory) {
     this.collectionFactory = collectionFactory;
+  }
+
+  /**
+   * Attach the offline-mode controller. A setter rather than a constructor argument because the two
+   * refer to each other (the controller reports drained commits through this bridge) and the bare
+   * constructor is what tests build. Set once by the plugin's `register`.
+   */
+  attachOfflineMode(offline: OfflineMode): void {
+    if (this.offline !== undefined) throw new Error('an offline-mode controller is already attached to this bridge');
+    this.offline = offline;
   }
 
   /**
@@ -537,6 +532,13 @@ export class TransactionBridge {
    * the same guarantee: resolve from a warm cache, never by re-entering the db while
    * a statement is in flight.
    *
+   * ## Refused while offline mode is in use
+   *
+   * A queued session transaction would be stale by the time it drains (docs/offline-sync.md
+   * §Session mode), so the two modes cannot be combined in either order: this throws
+   * `SessionModeRefusedError` while offline mode is entered or locally acknowledged transactions are
+   * queued, and `plugin.offline.enter()` throws while session mode is configured.
+   *
    * @param coordinator - The transaction coordinator
    * @param engine - The transaction engine (e.g., QuereusEngine)
    * @param schemaHashProvider - Non-re-entrant function to get the current schema hash
@@ -546,6 +548,8 @@ export class TransactionBridge {
     engine: ITransactionEngine,
     schemaHashProvider: () => Promise<string>
   ): void {
+    if (this.offline?.isEntered()) throw new SessionModeRefusedError('offline-mode');
+    if (this.offline?.hasQueuedEntries()) throw new SessionModeRefusedError('queued-entries');
     this.coordinator = coordinator;
     this.engine = engine;
     this.schemaHashProvider = schemaHashProvider;
@@ -629,6 +633,13 @@ export class TransactionBridge {
         this.collectionTables.delete(id);
       }
     }
+  }
+
+  /** The tables (`schema.table`) collection `id` backs, as {@link registerCollection} recorded them;
+   * `undefined` for a collection no table was registered for (a test double). Read by the
+   * offline-mode controller to name tables on its statuses. */
+  tablesOf(id: CollectionId): ReadonlySet<string> | undefined {
+    return this.collectionTables.get(id);
   }
 
   /**
@@ -842,6 +853,10 @@ export class TransactionBridge {
       isActive: true,
       collections: new Map(),
       stampId: transactionId,
+      // Fixed here, not at commit: a mode change during an open transaction changes nothing about
+      // it (docs/offline-sync.md §Entering and leaving the mode). Never 'local' in session mode,
+      // which offline mode refuses to enter beside, and vice versa.
+      acknowledgement: this.offline?.isEntered() === true ? 'local' : 'network',
     };
 
     return this.currentTransaction;
@@ -850,8 +865,10 @@ export class TransactionBridge {
   /**
    * Commit the current transaction.
    *
-   * If transaction mode is enabled, commits through TransactionSession
-   * for distributed consensus. Otherwise, uses legacy direct sync.
+   * If transaction mode is enabled, commits through TransactionSession for distributed consensus.
+   * A transaction that began with local acknowledgement (offline mode, `TransactionState.acknowledgement`)
+   * is sealed into the offline queue instead of reaching storage ({@link sealForLocalAcknowledgement}).
+   * Otherwise, uses legacy direct sync.
    */
   async commitTransaction(): Promise<void> {
     if (!this.currentTransaction?.isActive) {
@@ -860,9 +877,14 @@ export class TransactionBridge {
     const transactionId = this.currentTransaction.stampId;
 
     let durability: TransactionDurability | undefined;
+    // A local acknowledgement reaches no storage, so it reconciles nothing: the degraded latch is
+    // left as it was rather than released (see degradedReason).
+    let reconciled = true;
     try {
       if (this.session) {
         durability = await this.commitSession(this.session);
+      } else if (this.currentTransaction.acknowledgement === 'local' && this.sealForLocalAcknowledgement(transactionId)) {
+        reconciled = false;
       } else {
         // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
@@ -890,7 +912,7 @@ export class TransactionBridge {
       this.savepoints.clear();
       // A clean commit reconciles the local view — release the degraded latch so
       // committed reads answer again (see degradedReason).
-      this.degradedReason = null;
+      if (reconciled) this.degradedReason = null;
 
     } catch (error) {
       if (error instanceof PartialCommitError) {
@@ -943,7 +965,70 @@ export class TransactionBridge {
       }
       throw this.mapCommitRefusal(error);
     }
-    this.reportCommitDurability(transactionId, durability);
+    if (durability !== undefined) this.reportCommitDurability(transactionId, durability);
+  }
+
+  /**
+   * The offline route of a commit whose transaction began with local acknowledgement: seal every
+   * staged dirty tree's open segment into one queue entry under the transaction's id, so the commit
+   * resolves once the entry is queued and the drain commits it later under that same id
+   * (docs/offline-sync.md §Entry lifecycle). The `queued` status is delivered synchronously inside
+   * the enqueue, before this commit returns. Answers `false`, sealing nothing, when the dirty set
+   * cannot be one entry ({@link localAcknowledgementSet}): the caller then takes the network route
+   * for this transaction. `true` otherwise, including when nothing was staged — nothing is queued
+   * and nothing is reported then, as a commit that wrote nothing reports nothing.
+   */
+  private sealForLocalAcknowledgement(transactionId: string): boolean {
+    const offline = this.offline;
+    if (offline === undefined) return false;
+    const trees = [...this.dirtyTrees.keys()];
+    const collections = this.localAcknowledgementSet(trees);
+    if (collections === undefined) return false;
+    if (log.enabled) {
+      this.logCommitCollections('offline', trees.map((tree, i) => ({
+        id: treeLabel(tree, i),
+        staged: tree.hasUnsyncedChanges?.(),
+        rev: treeRevision(tree),
+        action: treeActionId(tree),
+      })));
+    }
+    offline.enqueue(collections, transactionId);
+    return true;
+  }
+
+  /**
+   * The collections one locally acknowledged commit seals: every staged dirty tree's, or `undefined`
+   * when the set cannot be one entry. The shape is {@link legacyBatch}'s, with the single-tree case
+   * allowed (the queue commits one collection through `Collection.commitHead`): a tree with no
+   * collection to seal, collections on different transactor instances (an entry is one network
+   * transaction on one transactor), or two trees that are separate instances over one collection id,
+   * whose two segments under one entry id the per-entry coordinator's id-keyed map would collapse —
+   * the reason the sweep refuses to batch them too. A refused set is logged
+   * `offline:local-ack-unavailable` with its reason.
+   */
+  private localAcknowledgementSet(trees: readonly DirtyTree[]): Collection<any>[] | undefined {
+    const staged = trees.filter(tree => tree.hasUnsyncedChanges?.() !== false);
+    const collections: Collection<any>[] = [];
+    for (const [index, tree] of staged.entries()) {
+      const collection = tree.getCollection?.();
+      if (collection === undefined) {
+        return this.localAcknowledgementUnavailable(`${treeLabel(tree, index)} has no collection to seal`);
+      }
+      collections.push(collection);
+    }
+    const transactor = collections[0]?.transactor;
+    if (collections.some(collection => collection.transactor !== transactor)) {
+      return this.localAcknowledgementUnavailable('the collections sit on different transactors');
+    }
+    if (new Set(collections.map(collection => collection.id)).size !== collections.length) {
+      return this.localAcknowledgementUnavailable('two trees are separate instances over one collection id');
+    }
+    return collections;
+  }
+
+  private localAcknowledgementUnavailable(reason: string): undefined {
+    log('offline:local-ack-unavailable reason=%s: this transaction is acknowledged by the network', reason);
+    return undefined;
   }
 
   /**
@@ -989,22 +1074,30 @@ export class TransactionBridge {
 
   /**
    * Deliver one commit's durability to every {@link onCommitDurability} listener, following it
-   * first so the report can say whether {@link onCommitFullyHeld} will fire for it. A commit that
-   * wrote nothing (`undefined`) reaches nobody, and with no listener of either kind it is neither
-   * followed nor reported. Each listener runs isolated: a throw is logged and the next still runs.
+   * first so the report can say whether {@link onCommitFullyHeld} will fire for it, and answer the
+   * report it built. With no listener of either kind, and nobody demanding the report, the commit is
+   * neither followed nor reported (`undefined`). Each listener runs isolated: a throw is logged and
+   * the next still runs.
    *
    * Whatever the listeners, the collections the commit wrote at full replication then cover any
    * earlier followed commit waiting on those blocks.
+   *
+   * Called for an online commit that wrote something by {@link commitTransaction}, and for a drained
+   * offline-queue entry by the offline-mode controller, which `demands` the report (its `committed`
+   * status IS the report, and it retains it), so a drained commit reaches `onCommitDurability`
+   * listeners, the follower and `onCommitFullyHeld` exactly as an online one does
+   * (docs/offline-sync.md §Durability reports and the full-replication event).
    */
-  private reportCommitDurability(transactionId: string, durability: TransactionDurability | undefined): void {
-    if (durability === undefined) {
-      return;
-    }
-    if (this.durabilityListeners.size > 0 || this.fullyHeldListeners.size > 0) {
+  reportCommitDurability(transactionId: string, durability: TransactionDurability, demanded: true): SqlCommitDurability;
+  reportCommitDurability(transactionId: string, durability: TransactionDurability, demanded?: boolean): SqlCommitDurability | undefined;
+  reportCommitDurability(transactionId: string, durability: TransactionDurability, demanded = false): SqlCommitDurability | undefined {
+    let report: SqlCommitDurability | undefined;
+    if (demanded || this.durabilityListeners.size > 0 || this.fullyHeldListeners.size > 0) {
       const verdict = this.durabilityFollower.follow(
         transactionId, durability, { selfPeerId: this.peerId, notifier: this.durabilityNotifier });
-      const report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id), verdict !== 'unfollowed');
-      notifyListeners(this.durabilityListeners, report, 'durability', transactionId);
+      report = sqlCommitDurability(transactionId, durability, id => this.collectionTables.get(id), verdict !== 'unfollowed');
+      notifyListeners(this.durabilityListeners, report,
+        error => log('commit:durability-listener-threw transaction=%s: %o', transactionId, error));
       // Every block's event came before the commit's answer did: fully held already, but reported
       // so only after the commit itself has been.
       if (verdict === 'covered') {
@@ -1012,15 +1105,18 @@ export class TransactionBridge {
       }
     }
     this.durabilityFollower.coverHeld(durability, this.durabilityNotifier);
+    return report;
   }
 
   /** Tell every {@link onCommitFullyHeld} listener that a followed commit is fully held. */
   private reportFullyHeld(transactionId: string): void {
-    notifyListeners(this.fullyHeldListeners, Object.freeze({ transactionId }), 'fully-held', transactionId);
+    notifyListeners(this.fullyHeldListeners, Object.freeze({ transactionId }),
+      error => log('commit:fully-held-listener-threw transaction=%s: %o', transactionId, error));
   }
 
   /**
-   * Emit the one line that answers "which collections did this write carry?" — a
+   * Emit the one line that answers "which collections did this write carry?" (`mode=offline` for a
+   * commit sealed into the offline queue, which carries them to the network later) — a
    * table with a secondary index is backed by several collections (the table tree
    * plus one tree per maintained index, opened by `OptimysticTable.openIndexTree`,
    * which prints the companion `index:tree-open` line), and a write has to carry all
@@ -1083,7 +1179,7 @@ export class TransactionBridge {
    * Costs nothing when the namespace is off: both call sites build their entry array
    * inside an `if (log.enabled)` guard.
    */
-  private logCommitCollections(mode: 'legacy' | 'session', entries: readonly CommitCollectionTrace[]): void {
+  private logCommitCollections(mode: 'legacy' | 'session' | 'offline', entries: readonly CommitCollectionTrace[]): void {
     const sorted = [...entries].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
     const marks = sorted
       .map(e => `${e.id}=${e.staged === undefined ? 'unknown' : e.staged ? 'staged' : 'clean'}`)

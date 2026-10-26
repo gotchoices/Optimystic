@@ -121,11 +121,11 @@ type Harness = {
 	recorded: { entryId: string; attempts: ReadonlyMap<CollectionId, InFlightAttempt> }[];
 };
 
-function openQueue(transactor: ITransactor, options: OfflineQueueOptions = {}): Harness {
+function openQueue(options: OfflineQueueOptions = {}): Harness {
 	const statuses: EntryStatus[] = [];
 	const states: OfflineQueueState[] = [];
 	const recorded: Harness['recorded'] = [];
-	const queue = new OfflineQueue(transactor, {
+	const queue = new OfflineQueue({
 		...fast,
 		recordAttempt: async (entryId, attempts) => { recorded.push({ entryId, attempts }); },
 		...options,
@@ -231,7 +231,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS, ITEMS);
 		let clock = T0;
-		const { queue, statuses, states, recorded } = openQueue(inner, { now: () => clock });
+		const { queue, statuses, states, recorded } = openQueue({ now: () => clock });
 		const users = await openTree(inner, queue, USERS);
 		const items = await openTree(inner, queue, ITEMS);
 
@@ -277,7 +277,7 @@ describe('OfflineQueue', function () {
 	it('commits an entry over two trees through the coordinator\'s per-entry slice: one action id in both logs', async () => {
 		const inner = new TestTransactor();
 		await seed(inner, USERS, ITEMS);
-		const { queue, statuses, recorded } = openQueue(inner);
+		const { queue, statuses, recorded } = openQueue();
 		const users = await openTree(inner, queue, USERS);
 		const items = await openTree(inner, queue, ITEMS);
 
@@ -303,7 +303,7 @@ describe('OfflineQueue', function () {
 		await seed(inner, USERS);
 		const transactor = new RecordsPends(inner);
 		const gate = new Gate(false);
-		const { queue, statuses } = openQueue(transactor, { reachability: gate });
+		const { queue, statuses } = openQueue({ reachability: gate });
 		const users = await openTree(transactor, queue, USERS);
 
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
@@ -338,7 +338,7 @@ describe('OfflineQueue', function () {
 		await seed(inner, USERS);
 		const transactor = new RecordsPends(inner);
 		const gate = new Gate(false);
-		const { queue, statuses } = openQueue(transactor, { reachability: gate });
+		const { queue, statuses } = openQueue({ reachability: gate });
 		const users = await openTree(transactor, queue, USERS);
 		const one = entry(1, 'one');
 		const oneUpdated = entry(1, 'one-updated');
@@ -381,7 +381,7 @@ describe('OfflineQueue', function () {
 		await seed(inner, USERS);
 		const transactor = new RecordsPends(inner);
 		const gate = new Gate(false);
-		const { queue, statuses } = openQueue(transactor, { reachability: gate });
+		const { queue, statuses } = openQueue({ reachability: gate });
 		const users = await openTree(transactor, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one'), { kind: 'absent' }]]]);
 
@@ -405,7 +405,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
 		const shortfall = new RefusesPendsAsShortfall(inner);
-		const { queue, statuses } = openQueue(shortfall);
+		const { queue, statuses } = openQueue();
 		const users = await openTree(shortfall, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
 		await waitFor(() => statuses.some(s => s.kind === 'queued' && s.entryId === 'E1' && s.waitingFor === 'cohort'),
@@ -425,7 +425,7 @@ describe('OfflineQueue', function () {
 		await queue.dispose();
 
 		const throwing = new ThrowsFirstCommit(inner);
-		const second = openQueue(throwing);
+		const second = openQueue();
 		const users2 = await openTree(throwing, second.queue, USERS);
 		await queueEntry(second.queue, 'E2', [users2, [[2, entry(2, 'two')]]]);
 		await second.queue.whenDrained();
@@ -443,7 +443,7 @@ describe('OfflineQueue', function () {
 		await seed(inner, USERS);
 		const transactor = new RecordsPends(inner);
 		const journalFull = new Error('journal write failed');
-		const { queue, statuses } = openQueue(transactor, {
+		const { queue, statuses } = openQueue({
 			recordAttempt: async () => { throw journalFull; },
 			recheck: { baseMs: 60_000, maxMs: 60_000 },
 		});
@@ -471,7 +471,7 @@ describe('OfflineQueue', function () {
 		const torn = new TailLandsButReportsStale(inner, 1);
 		const gate = new Gate(true);
 		let clock = T0;
-		const { queue, statuses, recorded } = openQueue(torn, {
+		const { queue, statuses, recorded } = openQueue({
 			reachability: gate,
 			now: () => clock,
 			expireAfterMs: 10,
@@ -525,7 +525,7 @@ describe('OfflineQueue', function () {
 		await seed(inner, USERS, ITEMS);
 		// `users` sorts after `items`, so its commit is the one that fails after its sibling's landed.
 		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
-		const { queue, statuses, recorded } = openQueue(throwing, { recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		const { queue, statuses, recorded } = openQueue({ recheck: { baseMs: 60_000, maxMs: 60_000 } });
 		const users = await openTree(throwing, queue, USERS);
 		const items = await openTree(throwing, queue, ITEMS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]], [items, [[7, entry(7, 'seven')]]]);
@@ -570,7 +570,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS, ITEMS);
 		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
-		const { queue, statuses } = openQueue(throwing, { recheck: { baseMs: 60_000, maxMs: 60_000 } });
+		const { queue, statuses } = openQueue({ recheck: { baseMs: 60_000, maxMs: 60_000 } });
 		const users = await openTree(throwing, queue, USERS);
 		const items = await openTree(throwing, queue, ITEMS);
 		const one = entry(1, 'one');
@@ -603,7 +603,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
 		const gated = new GatedCommitTransactor(inner);
-		const { queue, statuses } = openQueue(gated);
+		const { queue, statuses } = openQueue();
 		const users = await openTree(gated, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
 		await queueEntry(queue, 'E2', [users, [[2, entry(2, 'two')]]]);
@@ -632,7 +632,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
 		const gated = new GatedCommitTransactor(inner);
-		const { queue, statuses } = openQueue(gated);
+		const { queue, statuses } = openQueue();
 		const users = await openTree(gated, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
 		await gated.commitParked;
@@ -654,7 +654,7 @@ describe('OfflineQueue', function () {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
 		const gated = new GatedCommitTransactor(inner);
-		const { queue, statuses } = openQueue(gated);
+		const { queue, statuses } = openQueue();
 		const users = await openTree(gated, queue, USERS);
 		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
 		await queueEntry(queue, 'E2', [users, [[2, entry(2, 'two')]]]);

@@ -106,4 +106,12 @@ export interface TransactionState {
   isActive: boolean;
   collections: Map<string, any>; // Tree collections used in this transaction
   stampId: string; // Unique identifier for this transaction (stable within transaction, cycles between)
+  /**
+   * Who acknowledges this transaction's commit, fixed when it began (`TransactionBridge.beginTransaction`):
+   * `'network'`, the commit resolves once storage holds it; `'local'`, offline mode was entered when
+   * the transaction began, and the commit resolves once the transaction is queued on this machine
+   * (docs/offline-sync.md §Entering and leaving the mode). A mode change while the transaction is
+   * open changes nothing about it.
+   */
+  acknowledgement: 'local' | 'network';
 }

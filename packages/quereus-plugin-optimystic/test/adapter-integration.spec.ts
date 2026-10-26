@@ -128,6 +128,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			isActive: true,
 			collections: new Map(),
 			stampId: 'test-stamp',
+			acknowledgement: 'network',
 		};
 
 		const col1 = await factory.createOrGetCollection(options, txnState);
@@ -154,6 +155,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			isActive: false,
 			collections: new Map(),
 			stampId: 'test-stamp',
+			acknowledgement: 'network',
 		};
 
 		await factory.createOrGetCollection(options, txnState);
