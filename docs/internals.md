@@ -1600,7 +1600,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   content digests the failed attempt declared. Only then does it **consume** the entry
   (`Collection.consumeOwnEntry`) instead of running it through the conflict filter and replaying
   it — replaying re-appends content the committed tail already holds, leaving the same action
-  recorded twice in the log. Consuming drops the entry's actions off the head of `pending` and
+  recorded twice in the log. Consuming drops the entry's actions off the head of the open segment and
   forces the replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write
   reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
   refresh has changed anything on the instance, so when it cannot finish, the staged actions, the

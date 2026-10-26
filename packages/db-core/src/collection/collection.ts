@@ -1695,7 +1695,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * `true` does not promise that {@link sync} can push it: while any segment is sealed, `sync`
 	 * refuses with {@link SealedSegmentsError} rather than committing the sealed effects as one
 	 * entry, so a caller that loops on this over a sealed collection gets that typed error, never
-	 * a silent no-op. Check {@link sealedEntries} first, or commit the head segment. */
+	 * a silent no-op. Check {@link sealedEntries} first, or commit the head segment.
+	 *
+	 * Nor does `false` promise that nothing is sealed. A sealed segment leaves no tracker transform
+	 * when every one of its actions is refused, or wrote nothing (a blind delete of a key nobody
+	 * holds), so over an otherwise empty tracker this reads `false` while {@link sealedEntries} is
+	 * non-empty. The queue drives off {@link sealedEntries}, never off this predicate. */
 	hasUnsyncedChanges(): boolean {
 		return this.segments.open.length > 0 || !isTransformsEmpty(this.tracker.transforms);
 	}
@@ -1743,7 +1748,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	/** The refusal every whole-collection commit path makes while a segment is sealed (see
 	 * {@link SealedSegmentsError}). */
 	private assertNoSealedSegments(): void {
-		if (this.segments.sealed.length > 0) {
+		if (this.segments.hasSealed()) {
 			throw new SealedSegmentsError(this.id, this.segments.entryIds());
 		}
 	}

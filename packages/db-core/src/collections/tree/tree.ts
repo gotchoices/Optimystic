@@ -111,7 +111,7 @@ interface BTreeHolder<TKey, TEntry> {
 /** The collection options a tree's opener may set — the ones that are not the tree's own to
  * decide. Today that is the sealed-segment refusal callback the offline-sync queue installs
  * (see {@link CollectionInitOptions.onSealedRefused}). */
-export type TreeCollectionOptions<TKey, TEntry> = Pick<CollectionInitOptions<TreeReplaceAction<TKey, TEntry>>, 'onSealedRefused'>;
+export type TreeCollectionOptions = Pick<CollectionInitOptions<unknown>, 'onSealedRefused'>;
 
 export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
@@ -136,7 +136,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		/** See {@link Tree.createOrOpen}'s `nodeCapacity`. */
 		nodeCapacity?: number,
 		/** See {@link Tree.createOrOpen}'s `options`. */
-		options?: TreeCollectionOptions<TKey, TEntry>,
+		options?: TreeCollectionOptions,
 	): Promise<Tree<TKey, TEntry> | undefined> {
 		const held: BTreeHolder<TKey, TEntry> = {};
 		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
@@ -163,7 +163,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		nodeCapacity?: number,
 		/** Collection options the opener sets rather than the tree: the sealed-segment refusal
 		 *  callback (see {@link TreeCollectionOptions}). Omit for a tree nothing seals. */
-		options?: TreeCollectionOptions<TKey, TEntry>,
+		options?: TreeCollectionOptions,
 	): Promise<Tree<TKey, TEntry>> {
 		const held: BTreeHolder<TKey, TEntry> = {};
 		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
@@ -179,7 +179,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		compare: (a: TKey, b: TKey) => number,
 		nodeCapacity: number | undefined,
 		held: BTreeHolder<TKey, TEntry>,
-		options: TreeCollectionOptions<TKey, TEntry> | undefined,
+		options: TreeCollectionOptions | undefined,
 	): CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> {
 		return {
 			...options,

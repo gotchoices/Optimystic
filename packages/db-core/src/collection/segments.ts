@@ -24,8 +24,10 @@ export type SealedSegment<TAction> = {
  * touches the tracker or the collection latch stays on `Collection`.
  */
 export class SegmentList<TAction> {
-	/** Sealed segments in queue order, oldest first (invariant 1). */
-	sealed: SealedSegment<TAction>[] = [];
+	/** Sealed segments in queue order, oldest first (invariant 1). Private so every change goes
+	 * through a method that bumps `version`; read it through {@link replayable}, {@link find},
+	 * {@link head} and {@link entryIds}. */
+	private readonly sealed: SealedSegment<TAction>[] = [];
 	/** The open segment: what the current transaction has staged. */
 	open: Action<TAction>[] = [];
 	/** Bumped on every change to the sealed list — a seal, a drop, a refusal recorded. Captured by a
@@ -82,6 +84,11 @@ export class SegmentList<TAction> {
 
 	entryIds(): EntryId[] {
 		return this.sealed.map(segment => segment.entryId);
+	}
+
+	/** Whether any segment is sealed, refused ones included. */
+	hasSealed(): boolean {
+		return this.sealed.length > 0;
 	}
 
 	/** The sealed segments a replay re-stages, in order: every one not refused. */

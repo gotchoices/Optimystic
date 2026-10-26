@@ -82,6 +82,11 @@ export function classifyCommitFailure(error: unknown): CommitFailureClass {
 	if (error instanceof TreeGuardRefusedError) {
 		// Every guard refusal other than a lost update is a uniqueness refusal, including a subclass
 		// added later: the hierarchy's contract is that a refusal is never downgraded to retryable.
+		// NOTE: matched at the tree's class, not at its base `ActionRefusedError`, because the
+		// `constraint` / `concurrent-modification` split and the bridge's `mapRefusal` are tree
+		// vocabulary; the tree is the only collection type that refuses today. If another type ever
+		// throws an `ActionRefusedError`, widen this arm (and the `error` type on `guard-refused`)
+		// to the base, or its refusal sorts as `unknown` and the drain retries a final failure.
 		const refusal = error instanceof TreeEntryChangedError ? 'concurrent-modification' : 'constraint';
 		return { kind: 'guard-refused', refusal, error };
 	}
