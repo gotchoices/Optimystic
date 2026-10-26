@@ -14,9 +14,10 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { mergeDurability, withBlockRevs } from "../network/durability.js";
-import { highestStaleAt, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
+import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, ICollection, SyncOptions, TornActionReason } from "./index.js";
 import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { ActionContext } from "./action.js";
@@ -847,6 +848,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// round until the budget's last round settles it — unlike a fresh attempt's shortfall, which
 		// ends the write at once. If a silent cohort is ever seen holding torn writes for the whole
 		// budget, settle it at once here too.
+		// A validity rejection (`isRejectedFailure`) cannot answer the re-send: it carries no
+		// `validation` pair (above), so no checker judges it.
 		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is
 		// pointless, but the lineage question is asked only this once, so a member that is silent
 		// just now makes the answer `final: false`. If unsettled outcomes ever show up often under
@@ -2086,6 +2089,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 					// Stopped by name, as an expiry is, with nothing on this instance touched. Only a pend
 					// answers this way, so nothing of the attempt was stored.
 					throw new PromiseShortfallError(attempt.shortfall);
+				}
+				if (isRejectedFailure(attempt)) {
+					// The members that sank the pend judged the transaction invalid, and the next attempt
+					// sends the same content to the same checks. Stopped by name, with nothing on this
+					// instance touched, so the staged actions are still staged for the caller to discard.
+					throw new ValidityRejectedError(attempt.rejected);
 				}
 				consecutiveFailures++;
 				lastReason = attempt.reason ?? lastReason;

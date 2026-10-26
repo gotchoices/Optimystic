@@ -1,5 +1,5 @@
 import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending } from "@optimystic/db-core";
-import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, assertTransactionFits } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -2706,10 +2706,11 @@ export class CoordinatorRepo implements IRepo {
 				if (isConflictFailure(localPendResult)) {
 					return answerWithCohortRefusal(localPendResult);
 				}
-				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault)
-				// stays tolerated local divergence: consensus is authoritative and the pend may well
-				// have landed on the rest of the cohort. It still falls through to the rule below, so
-				// a sibling's refusal is not lost just because this node also had local trouble.
+				// A bare-reason refusal (no pending/missing — e.g. a local validation-hook fault, or this
+				// node's storage judging invalid a pend the cohort approved) stays tolerated local
+				// divergence: consensus is authoritative and the pend may well have landed on the rest
+				// of the cohort. It still falls through to the rule below, so a sibling's refusal is not
+				// lost just because this node also had local trouble.
 				this.log('coordinator-repo:pend-local-fault-tolerated', {
 					actionId: batch.actionId,
 					reason: localPendResult.reason
@@ -2794,6 +2795,16 @@ export class CoordinatorRepo implements IRepo {
 			}
 			const stale = await this.classifyStaleRejection(error, batch);
 			if (stale) return stale;
+			// A rejection every sinking member signed as a judgement of the transaction is returned as
+			// final, for the same reason an expiry is returned rather than thrown. Behind the stale
+			// classifier, not ahead of it: a revision loss this node confirms means the writer rebases
+			// and sends different content, so a verdict on the old content settles nothing.
+			if (error instanceof ValidatorRejectionError && error.validity !== undefined) {
+				return new ValidityRejectedError(error.validity).toFailure();
+			}
+			// Anything left is unclassified and stays thrown: an unconfirmed rejection is often a
+			// revision loss only members ahead of this node can see, and calling it final would make
+			// the writer drop a change the network would accept after a rebase.
 			throw error;
 		}
 	}

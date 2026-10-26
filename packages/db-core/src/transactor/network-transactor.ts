@@ -1,6 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
@@ -1693,9 +1693,13 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * {@link NetworkTransactor.pend} and the commit paths use, since the action-level answer is rebuilt
  * from per-batch ones rather than forwarded, and anything not carried here is lost.
  *
- * - An **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first one. No
- *   retry can succeed while that cohort's clocks disagree with the writer's, so a conflict beside it
- *   must not make the write look retryable, and its numbers must reach the writer whole.
+ * - A **validity rejection** anywhere ({@link isRejectedFailure}) is the answer, verbatim — the first
+ *   one. Members judged the content, which no retry changes. Above an expiry for the reason a cohort
+ *   that judged the content outranks clock votes inside one record: reporting the verdict as a clock
+ *   problem would invite a retry the verdict already refuses.
+ * - Otherwise an **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first
+ *   one. No retry can succeed while that cohort's clocks disagree with the writer's, so a conflict
+ *   beside it must not make the write look retryable, and its numbers must reach the writer whole.
  * - Otherwise a **promise shortfall** anywhere ({@link isShortfallFailure}) is the answer, verbatim —
  *   the first one, for the same reason: no retry can succeed while that cohort's members are silent.
  *   Below an expiry because a shortfall clears when the members come back, and an expiry does not.
@@ -1715,7 +1719,7 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
 function refusalFrom(responses: WriteFailure[]): WriteFailure {
-	const unretryable = responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
+	const unretryable = responses.find(isRejectedFailure) ?? responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
 	if (unretryable !== undefined) {
 		return unretryable;
 	}

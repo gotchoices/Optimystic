@@ -1,5 +1,5 @@
 import type { ActionId, ActionRev } from "../collection/action.js";
-import type { ExpiredFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
+import type { ExpiredFailure, RejectedFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
 
 /**
  * The single rule for "is this non-success retryable after a re-read?" Both write paths and the
@@ -8,11 +8,11 @@ import type { ExpiredFailure, ShortfallFailure, StaleFailure, WriteFailure } fro
  * {@link StaleFailure.conflict} is authoritative when present. The `missing`/`pending` fallback
  * covers producers that have not been taught the field, including a remote peer on an older build
  * (the repo protocol is plain JSON, so an unset field simply arrives absent). An expiry
- * ({@link isExpiryFailure}) and a promise shortfall ({@link isShortfallFailure}) are never a
- * conflict, whatever else arrived beside them.
+ * ({@link isExpiryFailure}), a promise shortfall ({@link isShortfallFailure}) and a validity
+ * rejection ({@link isRejectedFailure}) are never a conflict, whatever else arrived beside them.
  */
 export function isConflictFailure(failure: WriteFailure): boolean {
-	if (isExpiryFailure(failure) || isShortfallFailure(failure)) return false;
+	if (isExpiryFailure(failure) || isShortfallFailure(failure) || isRejectedFailure(failure)) return false;
 	return failure.conflict ?? Boolean(failure.missing?.length || failure.pending?.length);
 }
 
@@ -36,6 +36,17 @@ export function isExpiryFailure(failure: WriteFailure): failure is ExpiredFailur
  */
 export function isShortfallFailure(failure: WriteFailure): failure is ShortfallFailure {
 	return failure.shortfall !== undefined;
+}
+
+/**
+ * The single rule for "did the cohort refuse this pend because the members that sank it judged the
+ * transaction invalid?" ({@link RejectedFailure}). Every write path stops on it rather than retrying,
+ * since re-sending the same content to the same checks is refused the same way. Decided by the
+ * structured field, never the reason text; a coordinator on a build that predates the field throws the
+ * rejection instead of returning it, which a writer sees as it always did.
+ */
+export function isRejectedFailure(failure: WriteFailure): failure is RejectedFailure {
+	return failure.rejected !== undefined;
 }
 
 /**

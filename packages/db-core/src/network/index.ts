@@ -12,3 +12,4 @@ export * from "./struct.js";
 export * from "./transaction-expired-error.js";
 export * from "./transaction-size.js";
 export * from "./types.js";
+export * from "./validity-rejected-error.js";

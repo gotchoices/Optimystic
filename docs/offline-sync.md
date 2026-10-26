@@ -488,21 +488,25 @@ message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-
 | Cohort unreachable, nothing sent | `BlockUnavailableError` (in `packages/db-core/src/network/struct.ts`) with reason `cohort-unreachable` or `peers-unreachable`; a refused solo write (proposed above); the gate saying no | `queued`, `waitingFor: 'cohort'` |
 | Contention the sync loop could not get past | `SyncRetryExhaustedError`, `SyncRevisionStalledError` (in `packages/db-core/src/collection/struct.ts`) | `queued`, `waitingFor: 'backoff'` |
 | Guard refusal on rebase | `TreeGuardRefusedError` and its subclasses | `failed`: `constraint` or `concurrent-modification` |
-| Validity rejection | a validator's reject, which `isConflictFailure` (in `packages/db-core/src/network/stale-failure.ts`) does not class as a lost race | `failed`: `rejected` |
+| Validity rejection | `ValidityRejectedError` (in `packages/db-core/src/network/validity-rejected-error.ts`): every member that sank the pend signed it as a judgement of the transaction | `failed`: `rejected` |
 | Attempt expired | `TransactionExpiredError` | `queued`; the next attempt is a new attempt with a fresh expiry |
 | Torn, provably not saved | `TornActionError` (in `packages/db-core/src/collection/struct.ts`) with `final: true` | `queued`; resubmitting stores it once, which is what `final: true` promises |
 | Torn, outcome unknown | `TornActionError` with `final: false` | `submitting`, in doubt; see below |
 | Part of the entry committed | `CoordinatorPartialCommitError` (in `packages/db-core/src/transaction/errors.ts`) | `partially-committed`; see below |
 
-Two of these rows need typed errors. The super-majority shortfall a cohort with absent members
+Two of these rows needed typed errors. The super-majority shortfall a cohort with absent members
 produces on a pend now reaches the writer as `PromiseShortfallError` (in
 `packages/db-core/src/network/promise-shortfall-error.ts`), carrying the counts and the silent
 members; a commit-phase shortfall is still thrown inside the transactor's plain aggregate, and is in
-doubt rather than "nothing sent". The validator rejection has no stable class at the writer yet;
-typing it is a prerequisite of the drain, listed in
-[Implementation stages](#implementation-stages). Anything the drain cannot classify is treated as transient, logged with the entry id, and counted, so an
-unclassified failure is retried rather than silently dropping a change the application was told was
-committed; `expireAfterMs` bounds how long that can go on.
+doubt rather than "nothing sent". A validator rejection reaches the writer as `ValidityRejectedError`
+only when every member that sank the pend signed it as a judgement of the transaction (expiry votes
+aside) and the coordinator's own storage confirms no revision loss; a validity vote beside any other
+reject stays the unclassified throw it always was, since it may be a stale revision only members
+ahead of the coordinator can see (see "A pend rejection is returned only when it is classified" in
+[internals.md §Consensus Execution](internals.md#consensus-execution)). Anything the drain cannot
+classify is treated as transient, logged with the entry id, and counted, so an unclassified failure
+is retried rather than silently dropping a change the application was told was committed;
+`expireAfterMs` bounds how long that can go on.
 
 ### Identity across attempts
 

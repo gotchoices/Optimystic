@@ -1,10 +1,11 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability, BlockContentDigests } from "../index.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure, isExpiryFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
+import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
@@ -53,12 +54,14 @@ class PendRejectedError extends Error {
 	}
 }
 
-/** The error a refused pend of `collectionIds` stands for: its expiry — never retried, since a re-drive's
+/** The error a refused pend of `collectionIds` stands for: its validity rejection — never retried, since
+ * a re-drive sends the same content to the same checks — its expiry — never retried, since a re-drive's
  * expiration comes from the same clock — or its promise shortfall — never retried, since a re-drive
  * meets the same silent members — or a rejection carrying whether a re-read can clear it.
  * Retryability comes from the response itself: a producer that classified the failure sets `conflict`,
  * and only where none did is it inferred from `missing`/`pending` (`isConflictFailure`). */
-function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): TransactionExpiredError | PromiseShortfallError | PendRejectedError {
+function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): ValidityRejectedError | TransactionExpiredError | PromiseShortfallError | PendRejectedError {
+	if (isRejectedFailure(refusal)) return new ValidityRejectedError(refusal.rejected);
 	if (isExpiryFailure(refusal)) return new TransactionExpiredError(refusal.expired);
 	if (isShortfallFailure(refusal)) return new PromiseShortfallError(refusal.shortfall);
 	return new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
@@ -68,7 +71,7 @@ function pendRefusalError(collectionIds: readonly CollectionId[], refusal: Write
 type TooLargeError = TransactionTooLargeError | BlockTooLargeError;
 
 /** How the pend phase failed. */
-type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; rejected?: ValidityRejectedError; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
 
 /** Per collection, what its commit declares about its blocks (`CommitRequest.blockDigests`), described
  * once before the pend ({@link TransactionCoordinator.declareTouchedBlocks}). */
@@ -79,12 +82,14 @@ type DeclaredDigests = ReadonlyMap<CollectionId, BlockContentDigests>;
  * The error text is the first reason's. The attempt is a retryable clean stale loss only if at least one
  * reason was a conflicting pend ({@link PendRejectedError}`.conflict`) AND none was a hard failure: a
  * single hard failure (storage/policy rejection, or a thrown/unavailable transactor) will not clear on a
- * re-read, so re-driving it would just burn the retry budget. An expiry, a promise shortfall, and a pend
- * or a block too large to send, are hard failures carried whole: each is the error the commit surfaces.
+ * re-read, so re-driving it would just burn the retry budget. A validity rejection, an expiry, a promise
+ * shortfall, and a pend or a block too large to send, are hard failures carried whole: each is the error
+ * the commit surfaces.
  */
 function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const first = reasons[0];
 	const conflicts = reasons.filter(reason => reason instanceof PendRejectedError && reason.conflict);
+	const rejected = reasons.find((reason): reason is ValidityRejectedError => reason instanceof ValidityRejectedError);
 	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
 	const shortfall = reasons.find((reason): reason is PromiseShortfallError => reason instanceof PromiseShortfallError);
 	const tooLarge = reasons.find((reason): reason is TooLargeError => reason instanceof TransactionTooLargeError || reason instanceof BlockTooLargeError);
@@ -92,6 +97,7 @@ function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 		success: false,
 		error: first instanceof Error ? first.message : String(first),
 		staleLoss: conflicts.length > 0 && conflicts.length === reasons.length,
+		...(rejected === undefined ? {} : { rejected }),
 		...(expired === undefined ? {} : { expired }),
 		...(shortfall === undefined ? {} : { shortfall }),
 		...(tooLarge === undefined ? {} : { tooLarge }),
@@ -183,6 +189,9 @@ type CoordinationResult =
 		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
 		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
 		staleLoss?: boolean;
+		/** Present when a pend was refused because the members that sank it judged the transaction
+		 * invalid: the error the commit surfaces, never a stale loss. */
+		rejected?: ValidityRejectedError;
 		/** Present when a pend or a commit was refused because the transaction had expired by the
 		 * cohort's clocks: the error the commit surfaces, never a stale loss. */
 		expired?: TransactionExpiredError;
@@ -433,8 +442,9 @@ export class TransactionCoordinator {
 	 * unavailable transactor, unreachable cluster) also propagates without retry — including a pend
 	 * or commit the cohort refused because the transaction had expired by its members' clocks, which
 	 * surfaces as {@link TransactionExpiredError} (inside a partial commit's `reason` once a sibling
-	 * has landed), and a pend too few of the cohort's members answered, which surfaces as
-	 * {@link PromiseShortfallError}.
+	 * has landed), a pend too few of the cohort's members answered, which surfaces as
+	 * {@link PromiseShortfallError}, and a pend the members that sank it judged invalid, which surfaces
+	 * as {@link ValidityRejectedError}.
 	 *
 	 * A participant can also be SAVED between attempts: an attempt that reported a loss may still
 	 * have stored that participant's log tail, and the refresh before the next attempt then finishes
@@ -991,6 +1001,11 @@ export class TransactionCoordinator {
 			// immediately (preserving the historical fail-fast behaviour for hard failures).
 			if (coordResult.staleLoss) {
 				throw new CoordinatorStaleLossError([...(coordResult.failedCollections ?? new Set(allCollectionIds))], coordResult.error);
+			}
+			// A validity rejection is surfaced by name and never re-driven: the retry's pend would send
+			// the same content to the same checks.
+			if (coordResult.rejected !== undefined) {
+				throw coordResult.rejected;
 			}
 			// An expiry is surfaced by name and never re-driven: the retry's pend would carry an
 			// expiration from the same clock.

@@ -231,6 +231,9 @@ export type StaleFailure = {
 	/** Never set on a lost race — a cohort too few of whose members answered is its own failure
 	 *  shape, {@link ShortfallFailure}. */
 	shortfall?: never;
+	/** Never set on a lost race — a write judged invalid is its own failure shape,
+	 *  {@link RejectedFailure}. */
+	rejected?: never;
 };
 
 /**
@@ -268,6 +271,7 @@ export type ExpiredFailure = {
 	pending?: never;
 	staleAt?: never;
 	shortfall?: never;
+	rejected?: never;
 };
 
 /**
@@ -309,10 +313,61 @@ export type ShortfallFailure = {
 	pending?: never;
 	staleAt?: never;
 	expired?: never;
+	rejected?: never;
+};
+
+/**
+ * One refusal behind a {@link TransactionInvalidity}: a cohort member's validity-marked reject vote
+ * (`Signature`'s `validity`), or the validity verdict of the coordinating node's own storage-tier check
+ * (`StorageRepo.pend`, for a cohort of one, where no vote is cast).
+ */
+export type ValidityRefusal = ValidityRejection & {
+	/** The refusing member's peer-id string. Absent for a refusal a node's storage made without a vote. */
+	peerId?: string;
+	/** The refuser's description, free-form, for a log line. Never branch on it. */
+	reason?: string;
+};
+
+/**
+ * Why a write was refused as INVALID: the members that sank it judged the transaction itself wrong
+ * (see {@link ValidityRejection} for which refusals qualify), and no refusal of any other kind sank it
+ * beside them, bar expiry votes. Plain data, so it crosses the JSON repo protocol intact.
+ * `ValidityRejectedError` is built from it, wherever it is raised.
+ */
+export type TransactionInvalidity = {
+	/** Every validity refusal that sank the write. Never empty. */
+	refusals: ValidityRefusal[];
+};
+
+/**
+ * The cohort refused the write because the members that sank it judged it INVALID — the transaction
+ * failed its re-execution, its operations hash, its stamp or its client signature. Never retryable:
+ * re-sending the same content to the same checks is refused the same way. A sibling of
+ * {@link StaleFailure}, {@link ExpiredFailure} and {@link ShortfallFailure}, with the fields it can
+ * never carry typed `never`, so a consumer reads `reason`, `missing` or `staleAt` off any of them
+ * unnarrowed. Tell it apart with `isRejectedFailure`, never by reading `reason`.
+ *
+ * A pend answer only, and only when nothing else could explain the rejection: a reject vote with no
+ * validity marker beside the marked ones (a stale revision, a member on an older build) leaves the
+ * rejection unclassified, and a revision loss the coordinator's own storage confirms is returned as
+ * the {@link StaleFailure} it is, since the writer's rebase sends different content.
+ */
+export type RejectedFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: a verdict on the content is not a conflict a re-read can win. */
+	conflict: false;
+	rejected: TransactionInvalidity;
+	missing?: never;
+	pending?: never;
+	staleAt?: never;
+	expired?: never;
+	shortfall?: never;
 };
 
 /** Every way a pend or a commit can be refused with an answer rather than a throw. */
-export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure;
+export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure | RejectedFailure;
 
 export type PendResult = PendSuccess | WriteFailure;
 

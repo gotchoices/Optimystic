@@ -1,5 +1,5 @@
 import { peerIdFromString } from "@libp2p/peer-id";
-import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome } from "@optimystic/db-core";
+import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome, TransactionInvalidity, ValidityRefusal } from "@optimystic/db-core";
 import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, canonicalJson, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
@@ -108,17 +108,43 @@ function membersAwaitingConsensus(deliveries: readonly MemberDelivery[]): string
  * rejection reasons — those are free-form text that is part of each member's signed vote payload
  * (see cluster-repo's `computeSigningPayload`), so their wording must never become control flow.
  * `CoordinatorRepo.pend` uses this to decide whether a rejection is a retryable stale-revision
- * loss (confirmed against local storage) or a genuine validation fault.
+ * loss (confirmed against local storage), a validity rejection it returns to the writer as final
+ * ({@link validity}), or a fault it cannot classify and rethrows.
  */
 export class ValidatorRejectionError extends Error {
 	constructor(
 		message: string,
 		/** Per-peer reject reasons, verbatim from the vote signatures (free-form, wire-visible). */
-		readonly rejectReasons: Record<string, string>
+		readonly rejectReasons: Record<string, string>,
+		/** Present only when the votes classify the rejection as a judgement of the transaction itself
+		 *  ({@link validityRejectionOf}); absent means "not known to be final", never "not invalid". */
+		readonly validity?: TransactionInvalidity
 	) {
 		super(message);
 		this.name = 'ValidatorRejectionError';
 	}
+}
+
+type PromiseVote = ClusterRecord['promises'][string];
+
+/** The clock a vote signed as an expiry vote, or `undefined` when it is not one. Typed as a number, but
+ *  it arrived off the wire, and the coordinator does not verify votes. */
+function expiryClockOf(sig: PromiseVote): number | undefined {
+	return sig.type === 'reject' && typeof sig.expiredAt === 'number' && Number.isFinite(sig.expiredAt) ? sig.expiredAt : undefined;
+}
+
+/** The refusal a vote signed as a validity vote, or `undefined` when it is not one. Typed, but it arrived
+ *  off the wire, and the coordinator does not verify votes: a marker that is not an object is no marker. */
+function validityRefusalOf(peerId: string, sig: PromiseVote): ValidityRefusal | undefined {
+	if (sig.type !== 'reject' || typeof sig.validity !== 'object' || sig.validity === null) {
+		return undefined;
+	}
+	const { computedHash } = sig.validity;
+	return {
+		peerId,
+		...(sig.rejectReason === undefined ? {} : { reason: sig.rejectReason }),
+		...(typeof computedHash === 'string' ? { computedHash } : {}),
+	};
 }
 
 /**
@@ -127,16 +153,42 @@ export class ValidatorRejectionError extends Error {
  * member judged the content, and that verdict must not be reported as a clock problem.
  */
 function expiryRejectionClocks(promises: ClusterRecord['promises']): Record<string, number> | undefined {
-	const rejects = Object.entries(promises).flatMap(([peerId, sig]) => sig.type === 'reject' ? [[peerId, sig] as const] : []);
+	const rejects = Object.entries(promises).filter(([, sig]) => sig.type === 'reject');
 	const clocks: Record<string, number> = {};
 	for (const [peerId, sig] of rejects) {
-		// Typed as a number, but it arrived off the wire, and the coordinator does not verify votes.
-		if (typeof sig.expiredAt !== 'number' || !Number.isFinite(sig.expiredAt)) {
+		const clock = expiryClockOf(sig);
+		if (clock === undefined) {
 			return undefined;
 		}
-		clocks[peerId] = sig.expiredAt;
+		clocks[peerId] = clock;
 	}
 	return rejects.length > 0 ? clocks : undefined;
+}
+
+/**
+ * The validity class of a rejected record, from its promise votes: `undefined` unless every reject in
+ * `promises` is a validity vote or an expiry vote, and at least one is a validity vote. The refusals are
+ * the validity votes alone; an expiry vote beside them is a clock verdict on a transaction a member has
+ * already judged, so it neither blocks the class nor joins it.
+ *
+ * Any other reject beside them — an unmarked one: a stale revision, a reservation, a member that could
+ * not judge, a member on a build that predates the marker — leaves the rejection unclassified. That tilt
+ * is deliberate: a false "invalid" makes an offline drain drop a change the network would have accepted
+ * after a rebase, while a false "unclassified" costs a retry. The cross-vote analogue of
+ * {@link expiryRejectionClocks}' "a mix stays a plain validator rejection".
+ */
+export function validityRejectionOf(promises: ClusterRecord['promises']): TransactionInvalidity | undefined {
+	const refusals: ValidityRefusal[] = [];
+	for (const [peerId, sig] of Object.entries(promises)) {
+		if (sig.type !== 'reject') continue;
+		const refusal = validityRefusalOf(peerId, sig);
+		if (refusal !== undefined) {
+			refusals.push(refusal);
+		} else if (expiryClockOf(sig) === undefined) {
+			return undefined;
+		}
+	}
+	return refusals.length > 0 ? { refusals } : undefined;
 }
 
 /**
@@ -915,13 +967,15 @@ export class ClusterCoordinator {
 				.map(([peerId, reason]) => `${peerId}: ${reason}`)
 				.join('; ');
 			const memberClocks = expiryRejectionClocks(promises);
+			const validity = validityRejectionOf(promises);
 			log('cluster-tx:rejected-by-validators', {
 				messageHash: record.messageHash,
 				peerCount,
 				rejections: rejectionCount,
 				maxAllowed: maxAllowedRejections,
 				reasons: rejectReasons,
-				...(memberClocks === undefined ? {} : { expiredAt: memberClocks, expiration: record.message.expiration })
+				...(memberClocks === undefined ? {} : { expiredAt: memberClocks, expiration: record.message.expiration }),
+				...(validity === undefined ? {} : { invalid: validity.refusals.length })
 			});
 			this.updateTransactionRecord(promised.record, 'rejected-by-validators');
 			// Abandoning here without telling anyone leaves every member that voted holding this
@@ -941,7 +995,8 @@ export class ClusterCoordinator {
 			}
 			throw new ValidatorRejectionError(
 				`Transaction rejected by validators (${rejectionCount}/${peerCount} rejected): ${rejectReasons}`,
-				rejectReasonsByPeer);
+				rejectReasonsByPeer,
+				validity);
 		}
 
 		// A conflict-answered shortfall is a LOST RACE, not a validator verdict and not silence.

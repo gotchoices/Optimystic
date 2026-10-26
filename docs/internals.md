@@ -1436,10 +1436,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   already accepted: an older member verifying a marked vote builds the old preimage and reports
   `InvalidSignature` against an honest member, tolerable because no deployment re-validates
   transactions yet, so marked votes are rare, while the common stale-revision reject keeps its
-  encoding byte for byte. Nothing acts on the marker yet: the writer's typed failure (ticket
-  `offline-sync-typed-validity-rejection`) and limiting dispute evidence to marked rejects (backlog
-  `dispute-validity-reject-marker`) are its consumers. The classification is the design of record
-  in [right-is-right.md §Which rejections are disputes](right-is-right.md#which-rejections-are-disputes).
+  encoding byte for byte. The writer's typed failure reads it (`ValidityRejectedError`, see *A pend
+  rejection is returned only when it is classified* below); limiting dispute evidence to marked
+  rejects (backlog `dispute-validity-reject-marker`) is its other consumer. The classification is the
+  design of record in [right-is-right.md §Which rejections are disputes](right-is-right.md#which-rejections-are-disputes).
 - **An expired record is answered with a vote, not a throw.** Expiry is a promise *verdict*, decided
   first in `ClusterMember.evaluatePromise` (and ahead of the conflict race in `getTransactionPhase`,
   so an expired record cannot clear a live rival's reservation), never a check in `validateRecord`,
@@ -1458,16 +1458,25 @@ saveMaterializedBlock(block): store(structuredClone(block));
   slow-transaction case, not the skew case. The one delivery it applies is one whose signed votes
   already prove the record rejected (the abandonment broadcast), since that only clears it. See
   [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
-- **A pend rejection is returned only when local storage confirms a revision loss.** When
-  enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
-  carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then
-  re-reads the affected blocks from its own storage: if any block's `latest.rev >= request.rev`
-  — the same rule the members vote by — the rejection is *returned* as a `StaleFailure` carrying
-  `conflict: true`, so `Collection.sync`'s bounded re-read/rebase/retry loop picks it up instead
-  of an error escaping mid-batch and splitting a multi-tree commit. Every unconfirmed rejection
-  still **throws** — including one whose confirmation read failed, and one only remote members
-  could see (local storage behind). The reject-reason text is never parsed; confirmation is
-  purely the local revision comparison.
+- **A pend rejection is returned only when it is classified: local storage confirms a revision
+  loss, or every member that sank it marked it a validity judgement.** When enough members vote
+  reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError` carrying the (free-form,
+  wire-visible) reject reasons. `CoordinatorRepo.pend` then re-reads the affected blocks from its
+  own storage: if any block's `latest.rev >= request.rev` — the same rule the members vote by — the
+  rejection is *returned* as a `StaleFailure` carrying `conflict: true`, so `Collection.sync`'s
+  bounded re-read/rebase/retry loop picks it up instead of an error escaping mid-batch and splitting
+  a multi-tree commit. Otherwise, when every reject in the record is a validity vote or an expiry
+  vote and at least one is a validity vote (`validityRejectionOf` in
+  `packages/db-p2p/src/repo/cluster-coordinator.ts`, carried as `ValidatorRejectionError.validity`),
+  it is returned as a `RejectedFailure` (see *Pend retryability is an explicit field* below). That
+  order is deliberate: a confirmed revision loss means the writer rebases and sends different
+  content, so a verdict on the old content settles nothing. Every other rejection still **throws** — including one whose confirmation read
+  failed, one only remote members could see (local storage behind), and a validity vote beside an
+  unmarked reject, which may be exactly such a loss: a false "invalid" would make an offline drain
+  drop a change a rebase would have saved, a false "unclassified" costs a retry. The reject-reason
+  text is never parsed; confirmation is purely the local revision comparison and the signed markers.
+  Commit records never run the transaction checker, so `CoordinatorRepo.commit` never meets a marked
+  reject and is unchanged.
 - **…except against the writer's own durable work.** A write touching several blocks commits them
   a group at a time, so it can end up with some blocks durable and the rest refused — a *torn
   action* — and its retry reuses the same action id. Every revision comparison above therefore
@@ -1746,8 +1755,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   aggregate refusal from the per-batch responses (`refusalFrom`, which the commit side shares), so
   it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict. The
   commit side is deliberately untouched: it keys on `CommitResult` shape (next bullet).
-  **Beside `conflict` sit the two refusals that are never retryable: an expiry and a promise
-  shortfall.** A pend or commit the cohort refused because the transaction had already expired by
+  **Beside `conflict` sit the three refusals that are never retryable: an expiry, a promise
+  shortfall and a validity rejection.** A pend or commit the cohort refused because the transaction had already expired by
   its members' clocks comes back as its own failure shape, `ExpiredFailure` (a sibling of
   `StaleFailure` in `PendResult` and `CommitResult`, carrying the clocks as `TransactionExpiry`),
   decided by the one predicate `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and
@@ -1772,6 +1781,21 @@ saveMaterializedBlock(block): store(structuredClone(block));
   than as the `cause` of a `Some peers did not complete` aggregate. **A pend answer only:**
   `CoordinatorRepo.commit` still throws a commit-phase shortfall, because the commit side reads a
   returned refusal as a confirmed conflict (the `NOTE:` at its catch).
+  A pend the members that sank it judged invalid (bullet above) comes back as `RejectedFailure`,
+  carrying `TransactionInvalidity` — one `ValidityRefusal` per validity vote, with the member's peer
+  id, its reason and the operations hash it computed — decided by `isRejectedFailure`.
+  `CoordinatorRepo.pend` returns it behind the stale classifier; a cohort of one returns it from its
+  storage tier, when `StorageRepo.pend`'s own check gives a verdict marked `validity` (one refusal, no
+  peer id), while its unmarked refusals (`PEND_NOT_VALIDATABLE`, `VALIDATOR_FAULT`) stay bare reasons a
+  writer retries. The rebuild makes a validity rejection in any batch the whole answer, ahead even of
+  an expiry, for the reason a cohort that judged the content outranks clock votes inside one record;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts` and `TransactionCoordinator`'s
+  pend phase stop on it with `ValidityRejectedError` (`packages/db-core/src/network/validity-rejected-error.ts`),
+  which `commit()` throws by name and `execute()` reports as failed. A writer on an older build
+  receiving it retries it as a reason-only refusal until its budget ends; a member on an older build
+  never marks, so its rejects never produce it. With disputes enabled, a marked rejection beside
+  approvals is held for a ruling first, and its writer is answered with the dispute's refusal instead
+  (backlog `dispute-writer-sees-disputed-pend`).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its
