@@ -1126,17 +1126,20 @@ table of this plugin whose every pinned row encodes to a main-tree key — the r
 table's primary key, in any order, and every value encodes — matches an earlier entry whose segment
 in that main tree wrote one of those keys (an unreadable segment counts as writing every key), the
 lookup an `absent` guard makes. Every other decision — `group` or `global`, a `row` read pinned by a
-key other than the primary key, or one on a table no vtab of this plugin published — matches every
-earlier entry with a segment in any collection of the table, its main tree or an index tree. The
-encoding is the table's own (`TableOutlookSource.mainTree`, built as a point lookup builds its seek
-key), resolved when the entry is judged and fixed with its judgement. This is the change-scope
-lattice's intersection, applied to a read scope and a write set, with the key encoding standing in
-for `intersectScopes`.
+key other than the primary key, or one on a table no vtab of this plugin published or has not yet
+initialized — matches every earlier entry with a segment in any collection of the table, its main
+tree or an index tree. The encoding is the table's own (`TableOutlookSource.mainTree`, built as a
+point lookup builds its seek key), resolved when the entry is judged and fixed with its judgement; a
+published table is named by its `schema.table` rendering whether or not it is initialized, so a
+decision read before the table is first touched in this process (a restored entry's) still matches by
+table. This is the change-scope lattice's intersection, applied to a read scope and a write set, with
+the key encoding standing in for `intersectScopes`.
 
 "Earlier" means before the entry in the queue's order. A journaled transaction the restore after a
 restart still defers (see [Restore after a restart](#restore-after-a-restart)) with a lower sequence
-number counts too, whenever it wrote one of the entry's tables or a table one of its decisions is
-matched by: its writes are not staged, so they cannot be matched by key, and it is never assured.
+number counts too, whenever it wrote one of the entry's tables or a table one of its decisions read,
+a `row` read included: its writes are not staged, so they cannot be matched by key, and it is never
+assured.
 Each transaction is listed once, in queue order. `CommitOutlook()` judges the open transaction as an
 entry sealed behind everything queued now, so every queued entry and every deferred record counts as
 earlier.

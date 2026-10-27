@@ -967,12 +967,12 @@ export class OfflineMode {
 		return { kind: 'unknown', table: tables === undefined ? undefined : [...tables.keys()][0] };
 	}
 
-	/** The published table Quereus names (lowercased), with its main tree's keys, when it is initialized. */
+	/** The published table Quereus names (lowercased), with its main tree's keys once it is initialized. */
 	private publishedTable(name: QualifiedName): ReturnType<OutlookSchema['table']> {
 		const rendered = this.tablesByLowerName.get(`${name.schema}.${name.table}`.toLowerCase());
 		if (rendered === undefined) return undefined;
 		const tree = this.tables.get(rendered)?.outlook.mainTree();
-		return tree === undefined ? undefined : { name: rendered, collectionId: tree.collectionId, rowKey: tree.rowKey };
+		return tree === undefined ? { name: rendered } : { name: rendered, tree };
 	}
 
 	// ── translation ────────────────────────────────────────────────────────────────────────────

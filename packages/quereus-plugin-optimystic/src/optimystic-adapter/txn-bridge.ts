@@ -1994,15 +1994,16 @@ export class TransactionBridge {
    * object records the statement and later calls — the other rows, the upsert `DO UPDATE` arm handed
    * the INSERT's object — add nothing. A write with no description (an FK cascade child write) records
    * instead that a write of the transaction went undescribed, after which its decisions cannot be
-   * listed in full. Kept, discarded and folded as {@link noteWriteFacts}'s records are; a no-op with no
-   * active transaction.
+   * listed in full — once per run of such writes, since a cascade hands one per child row and the fold
+   * reads the record as a flag. Kept, discarded and folded as {@link noteWriteFacts}'s records are; a
+   * no-op with no active transaction.
    */
   noteWriteDescription(write: TableWrite | undefined): void {
     const transaction = this.currentTransaction;
     if (!transaction?.isActive) return;
     const facts = transaction.writeFacts;
     if (write === undefined) {
-      facts.records.push({ kind: 'undescribed' });
+      if (facts.records.at(-1)?.kind !== 'undescribed') facts.records.push({ kind: 'undescribed' });
       return;
     }
     if (facts.described.has(write)) return;
