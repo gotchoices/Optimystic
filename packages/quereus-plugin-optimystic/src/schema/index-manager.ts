@@ -6,13 +6,13 @@
  * of indexed column values.
  */
 
-import type { Tree, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Tree, TreeReadView, TreeUpsertGuard } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
 import { repositionIndexColumns } from './schema-manager.js';
-import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
+import { encodeKeyTuple, KEY_PREFIX_END, splitKeyTuple } from './key-encoding.js';
 import type { IndexColumnTuple, UnbrandedValues } from './key-tuples.js';
 
 /**
@@ -70,6 +70,39 @@ export function serializeIndexValue(value: SqlValue): string | null {
 	}
 	// Fallback
 	return String(value);
+}
+
+/** What {@link serializeIndexValue} emits for a BLOB: standard, padded base64. */
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/**
+ * Decode a framed index tuple (an {@link indexKeyFromValues} result, or the leading index-value half
+ * of an {@link indexEntryKey}) back into its values, one per framed element, each under the affinity
+ * at its position — the rendering-only inverse of {@link serializeIndexValue}, for a report that names
+ * a unique value a human can match back to their SQL (the offline outlook's exposures). A NULL element
+ * is `null`; a numeric affinity's payload parses back to a number (a bigint was already lossy in the
+ * encoding, see the `NOTE:` on {@link serializeIndexValue}); a BLOB's restores its bytes; any other
+ * payload, and one that does not parse, stays its string. Never throws: a renderer must not be the
+ * second failure. The caller checks the arity, since a truncated tuple decodes to fewer values.
+ */
+export function decodeIndexKey(indexKey: IndexKey, affinities: readonly (string | undefined)[]): SqlValue[] {
+	return splitKeyTuple(indexKey).map((element, i) =>
+		element.isNull ? null : indexPayloadToValue(element.payload, affinities[i]));
+}
+
+function indexPayloadToValue(payload: string, affinity: string | undefined): SqlValue {
+	switch (affinity?.toUpperCase()) {
+		case 'INTEGER':
+		case 'REAL':
+		case 'NUMERIC': {
+			const value = Number(payload);
+			return payload.trim() === '' || Number.isNaN(value) ? payload : value;
+		}
+		case 'BLOB':
+			return BASE64.test(payload) ? Uint8Array.from(atob(payload), char => char.charCodeAt(0)) : payload;
+		default:
+			return payload;
+	}
 }
 
 /**
@@ -195,7 +228,7 @@ export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
  * proves the value clear in this writer's own snapshot. The exact-key `absent` guard
  * cannot express this: the two rows sit at different tree keys inside one prefix.
  */
-export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey, IndexEntry> {
+export function uniquePrefixGuard(indexKey: IndexKey): TreeUpsertGuard<IndexKey, IndexEntry> {
 	return { kind: 'absentRange', range: indexValueRange(indexKey) };
 }
 
@@ -454,7 +487,7 @@ export class IndexManager {
 		index: StoredIndexSchema,
 		indexKey: IndexKey,
 		uniqueIndexes: ReadonlySet<string> | undefined,
-	): TreeEntryGuard<IndexKey, IndexEntry> | undefined {
+	): TreeUpsertGuard<IndexKey, IndexEntry> | undefined {
 		return uniqueIndexes?.has(index.name) ? uniquePrefixGuard(indexKey) : undefined;
 	}
 

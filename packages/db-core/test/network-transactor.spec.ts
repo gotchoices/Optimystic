@@ -393,6 +393,62 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]!.unavailable).to.equal('peers-unreachable')
     })
 
+    // Ticket network-get-names-unreachable-blocks: `answered` routes to peer-A, `unanswered` to
+    // peer-B, then peer-C, then nobody — through `processBatches`' re-batch and the second-chance round.
+    const splitRouteTransactor = (repos: Record<string, IRepo>) => {
+      const routes: Record<string, string[]> = { 'answered-block': ['peer-A'], 'unanswered-block': ['peer-B', 'peer-C'] }
+      const net: IKeyNetwork = {
+        async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()))
+          const pick = routes[new TextDecoder().decode(key)]!.find(p => !excluded.has(p))
+          if (!pick) throw new Error('No coordinator found')
+          return peerIdFromString(pick)
+        },
+        async findCluster(): Promise<ClusterPeers> { return {} },
+      }
+      return new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retrySleep: async () => { },
+      })
+    }
+    const answersAbsent = () => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => Object.fromEntries(blockIds.map(bid => [bid, { state: {} }])))
+
+    // A block no coordinator answered at all — every request for it failed in transport — is
+    // flagged 'peers-unreachable' rather than failing its siblings with an untyped aggregate.
+    it('flags a block no coordinator answered and still returns its answered sibling', async () => {
+      const asked: string[] = []
+      const unreachable = (peer: string) => makeGetOnlyRepo(async () => { asked.push(peer); throw new Error('dial timeout') })
+      const networkTransactor = splitRouteTransactor({ 'peer-A': answersAbsent(), 'peer-B': unreachable('peer-B'), 'peer-C': unreachable('peer-C') })
+
+      const result = await networkTransactor.get({ blockIds: ['answered-block' as BlockId, 'unanswered-block' as BlockId] })
+
+      expect(asked).to.deep.equal(['peer-B', 'peer-C'])
+      expect(result['answered-block']).to.deep.equal({ state: {} })
+      expect(result['unanswered-block']).to.deep.equal({ state: {}, unavailable: 'peers-unreachable' })
+    })
+
+    // The other side of that split: a coordinator that responded and left the block out is a
+    // protocol fault, not unreachability, so the read fails whole — even when the coordinator
+    // asked after it failed in transport.
+    it('fails the whole read when a coordinator responded without a requested block', async () => {
+      const networkTransactor = splitRouteTransactor({
+        'peer-A': answersAbsent(),
+        'peer-B': makeGetOnlyRepo(async () => ({})),
+        'peer-C': makeGetOnlyRepo(async () => { throw new Error('dial timeout') }),
+      })
+
+      let thrown: unknown
+      try {
+        await networkTransactor.get({ blockIds: ['answered-block' as BlockId, 'unanswered-block' as BlockId] })
+      } catch (e) {
+        thrown = e
+      }
+      expect((thrown as Error | undefined)?.message).to.match(/^Some peers did not complete/)
+    })
+
     // Ticket absence-verdict-names-the-evidence (review pass): the reason now travels out
     // verbatim and callers act on it — 'cohort-unreachable' is the one a caller may treat
     // permissively (proceed with its own empty view). So a partitioned coordinator answering

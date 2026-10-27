@@ -1,6 +1,6 @@
 import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } from "../index.js";
 import type { ActionContext, ActionRev } from "../collection/action.js";
-import type { Transaction } from "../transaction/transaction.js";
+import type { Transaction, ValidityRejection } from "../transaction/transaction.js";
 import type { DisputeResolutionProof } from "../log/struct.js";
 import type { PeerId } from "./types.js";
 
@@ -104,6 +104,25 @@ export type PendRequest = ActionTransforms & {
 	 * an older build ignores it, and then delivers at once as it always did.
 	 */
 	soleReservation?: true;
+	/**
+	 * The writer's word that this write must not be committed by a lone node that knows it is not
+	 * alone (`SyncOptions.refuseSoloCommit`). A coordinator whose cohort for the write is only itself
+	 * refuses the pend — before reserving anything — when it knows of cohort members it could not
+	 * place in the cohort, is still waiting to hear from a configured bootstrap peer, or could not
+	 * route the write to itself, answering with a {@link ShortfallFailure} whose
+	 * {@link PromiseShortfall.soloRefused} names which (`CoordinatorRepo.pendSolo` in db-p2p). A
+	 * coordinator that is genuinely alone ignores it and pends as it always did, and so does every
+	 * coordinator whose cohort has more than one member.
+	 *
+	 * Carried by every send of the write's attempt cycle, the re-send a refresh makes to finish a torn
+	 * attempt included (`Collection.completeOwnEntry`). Every per-coordinator rebuild of the request
+	 * keeps it (`pendRequestForBatch` in `NetworkTransactor`), since a batch that dropped it would
+	 * lose the protection for that coordinator's share. Omitted rather than `false`, for the same
+	 * preimage reason as {@link baseRevs}: a write that does not set it serializes exactly as before.
+	 * A coordinator on an older build ignores it and commits alone at `local`; in a group of mixed
+	 * versions the offline queue's reachability gate is then the only protection.
+	 */
+	refuseSolo?: true;
 };
 
 export type BlockActionStatus = ActionBlocks & {
@@ -228,6 +247,12 @@ export type StaleFailure = {
 	staleAt?: { blockId: BlockId; rev: number };
 	/** Never set on a lost race — an expiry is its own failure shape, {@link ExpiredFailure}. */
 	expired?: never;
+	/** Never set on a lost race — a cohort too few of whose members answered is its own failure
+	 *  shape, {@link ShortfallFailure}. */
+	shortfall?: never;
+	/** Never set on a lost race — a write judged invalid is its own failure shape,
+	 *  {@link RejectedFailure}. */
+	rejected?: never;
 };
 
 /**
@@ -264,10 +289,124 @@ export type ExpiredFailure = {
 	missing?: never;
 	pending?: never;
 	staleAt?: never;
+	shortfall?: never;
+	rejected?: never;
+};
+
+/**
+ * Why a cohort's promise round fell short with no member refusing it as a lost race or a held block,
+ * and too few rejecting it for a rejection: too few members answered. Plain data, so it crosses the
+ * JSON repo protocol intact. `PromiseShortfallError` is built from it, wherever it is raised.
+ */
+export type PromiseShortfall = {
+	/** Approve votes the round received. */
+	approvals: number;
+	/** Reject votes the round received — fewer than would make the round a rejection. */
+	rejections: number;
+	/** How many members the cohort the round ran on has. */
+	peerCount: number;
+	/** The approvals the round needed: `ceil(peerCount × superMajorityThreshold)`. */
+	needed: number;
+	/** Peer-id strings of the cohort members that cast no promise vote at all. */
+	silentPeers: string[];
+	/**
+	 * Set only when no consensus round ran: a coordinator whose cohort for the write was only itself
+	 * refused to write alone, because the write asked it to (`PendRequest.refuseSolo`). The other
+	 * fields then describe the cohort the coordinator expected rather than one it asked: one approval
+	 * (its own), no rejections, the members it knows of and could not reach as `silentPeers`, and the
+	 * bar a cohort of that size would set. Absent on a shortfall a consensus round produced, so a log
+	 * or an application can tell "refused to write alone" from "a round heard too few".
+	 */
+	soloRefused?: SoloRefusalReason;
+};
+
+/**
+ * Why a lone coordinator refused a write that asked not to be committed alone
+ * (`PendRequest.refuseSolo`, `CommitRequest.refuseSolo`):
+ *  - `absent-members`: its cohort for the write was only itself, and it knows of cohort members it
+ *    could not place in that cohort (`IKeyNetwork.absentCohortMembers`);
+ *  - `awaiting-bootstrap`: its cohort was only itself and it is still waiting to hear from a peer it
+ *    was configured to join through (`IKeyNetwork.awaitingBootstrapContact`);
+ *  - `unrouted`: the cohort lookup failed, named nobody, or named one peer that is not this node.
+ */
+export type SoloRefusalReason = 'absent-members' | 'awaiting-bootstrap' | 'unrouted';
+
+/**
+ * The cohort refused the pend because too few of its members ANSWERED the promise round for it to
+ * reach its bar — silence, not a judgement of the write and not a lost race. Not retryable by a write
+ * path: every coordinator of that cohort meets the same silent members, so a re-read and re-pend fails
+ * the same way until they come back. A sibling of {@link StaleFailure} and {@link ExpiredFailure},
+ * with the fields it can never carry typed `never`, so a consumer reads `reason`, `missing` or
+ * `staleAt` off any of them unnarrowed. Tell it apart with `isShortfallFailure`, never by reading
+ * `reason`. A pend answer only: a commit that falls short is still thrown (see
+ * `CoordinatorRepo.commit`).
+ */
+export type ShortfallFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: silence is not a conflict a re-read can win. */
+	conflict: false;
+	shortfall: PromiseShortfall;
+	missing?: never;
+	pending?: never;
+	staleAt?: never;
+	expired?: never;
+	rejected?: never;
+};
+
+/**
+ * One refusal behind a {@link TransactionInvalidity}: a cohort member's validity-marked reject vote
+ * (`Signature`'s `validity`), or the validity verdict of the coordinating node's own storage-tier check
+ * (`StorageRepo.pend`, for a cohort of one, where no vote is cast).
+ */
+export type ValidityRefusal = ValidityRejection & {
+	/** The refusing member's peer-id string. Absent for a refusal a node's storage made without a vote. */
+	peerId?: string;
+	/** The refuser's description, free-form, for a log line. Never branch on it. */
+	reason?: string;
+};
+
+/**
+ * Why a write was refused as INVALID: the members that sank it judged the transaction itself wrong
+ * (see {@link ValidityRejection} for which refusals qualify), and no refusal of any other kind sank it
+ * beside them, bar expiry votes. Plain data, so it crosses the JSON repo protocol intact.
+ * `ValidityRejectedError` is built from it, wherever it is raised.
+ */
+export type TransactionInvalidity = {
+	/** Every validity refusal that sank the write. Never empty. */
+	refusals: ValidityRefusal[];
+};
+
+/**
+ * The cohort refused the write because the members that sank it judged it INVALID — the transaction
+ * failed its re-execution, its operations hash, its stamp or its client signature. Never retryable:
+ * re-sending the same content to the same checks is refused the same way. A sibling of
+ * {@link StaleFailure}, {@link ExpiredFailure} and {@link ShortfallFailure}, with the fields it can
+ * never carry typed `never`, so a consumer reads `reason`, `missing` or `staleAt` off any of them
+ * unnarrowed. Tell it apart with `isRejectedFailure`, never by reading `reason`.
+ *
+ * A pend answer only, and only when nothing else could explain the rejection: a reject vote with no
+ * validity marker beside the marked ones (a stale revision, a member on an older build) leaves the
+ * rejection unclassified, and a revision loss the coordinator's own storage confirms is returned as
+ * the {@link StaleFailure} it is, since the writer's rebase sends different content.
+ */
+export type RejectedFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: a verdict on the content is not a conflict a re-read can win. */
+	conflict: false;
+	rejected: TransactionInvalidity;
+	missing?: never;
+	pending?: never;
+	staleAt?: never;
+	expired?: never;
+	shortfall?: never;
 };
 
 /** Every way a pend or a commit can be refused with an answer rather than a throw. */
-export type WriteFailure = StaleFailure | ExpiredFailure;
+export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure | RejectedFailure;
 
 export type PendResult = PendSuccess | WriteFailure;
 
@@ -324,6 +463,17 @@ export type CommitRequest = ActionBlocks & {
 	// by literally writing `undefined`. Revisit if undeclared commits ever become common enough to show
 	// up as replication-factor decay.
 	blockDigests?: BlockContentDigests;
+	/**
+	 * {@link PendRequest.refuseSolo}, on the commit. A coordinator whose cohort for the commit is only
+	 * itself refuses it on the same rule, before minting a proof or applying anything, with a
+	 * conflict-shaped refusal (`SOLO_COMMIT_REFUSED_REASON` in db-p2p), since a commit cannot answer
+	 * with a shortfall. That is reached when the pend ran on a real cohort and the partner dropped
+	 * before the commit: the writer cancels and retries, and the retry's pend meets the pend-side
+	 * refusal. Carried through every per-coordinator rebuild of the commit (`repoCommitRequest` in
+	 * `NetworkTransactor`); omitted rather than `false` for the preimage reason
+	 * {@link blockDigests} is.
+	 */
+	refuseSolo?: true;
 };
 
 /**
@@ -573,6 +723,8 @@ export type PendValidationResult = {
 	valid: boolean;
 	/** Reason for validation failure (if valid=false) */
 	reason?: string;
+	/** Set only on a failure that judges the transaction itself wrong; see {@link ValidityRejection}. */
+	validity?: ValidityRejection;
 };
 
 /**

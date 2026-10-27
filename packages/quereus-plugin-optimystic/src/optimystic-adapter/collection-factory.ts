@@ -1,4 +1,4 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
 import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
@@ -22,6 +22,7 @@ import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
+import { LateBoundCohortReachability } from './late-bound-reachability.js';
 
 const log = createLogger('collection-factory');
 
@@ -90,6 +91,35 @@ export class CollectionFactory {
    * idle tick one request however many tables are watched.
    */
   private tailReaders = new WeakMap<ITransactor, CollectionTailReader>();
+  /**
+   * The sealed-segment refusal callback every tree this factory opens is built with
+   * ({@link setSealedRefusedListener}): the offline queue's, so a replay that refuses a queued
+   * entry's segment reaches the queue whichever of this `Database`'s collections reported it.
+   * `Collection.onSealedRefused` is fixed at construction and the collections open before any
+   * `plugin.offline.enter()`, which is why the listener is set once, at registration, rather than
+   * per tree.
+   */
+  private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
+  /**
+   * The one stable gate per transactor key that {@link getCohortReachability} hands out, standing in
+   * for the gate registered for the key ({@link registerCohortReachability}) and for the always-open
+   * gate until one is.
+   */
+  private cohortGates = new Map<string, LateBoundCohortReachability>();
+
+  /**
+   * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
+   * Once: a second controller would silently take the first's refusals.
+   */
+  setSealedRefusedListener(listener: NonNullable<TreeCollectionOptions['onSealedRefused']>): void {
+    if (this.sealedRefusedListener !== undefined) throw new Error('a sealed-segment refusal listener is already set on this factory');
+    this.sealedRefusedListener = listener;
+  }
+
+  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set. */
+  private treeOptions(): TreeCollectionOptions | undefined {
+    return this.sealedRefusedListener === undefined ? undefined : { onSealedRefused: this.sealedRefusedListener };
+  }
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -110,7 +140,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
 
     this.cacheCollection(options, txnState, collection);
@@ -140,7 +172,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
     if (!collection) {
       return undefined;
@@ -353,6 +387,7 @@ export class CollectionFactory {
     }
 
     const { node, coordinatedRepo, blockChangeNotifier } = nodeInfo;
+    this.registerNodeCohortReachability(this.getTransactorKey(options), node);
 
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
@@ -405,6 +440,17 @@ export class CollectionFactory {
       // peers go to this node and its own writes skip the network hop.
       localPeerId: node.peerId,
     });
+  }
+
+  /**
+   * Register `node`'s reachability gate (`node.cohortReachability`) for the transactor under `key`,
+   * unless a gate is registered there already: one a test or host registered explicitly wins. A node a
+   * host injected without building it through `createLibp2pNode` may carry none; its transactor then
+   * stays always reachable, and nothing wakes the drain but its own re-check timer.
+   */
+  private registerNodeCohortReachability(key: string, node: FactoryNode): void {
+    const gate = this.cohortGateFor(key);
+    if (node.cohortReachability !== undefined && !gate.bound) gate.bind(node.cohortReachability);
   }
 
   /**
@@ -751,6 +797,40 @@ export class CollectionFactory {
    */
   registerTransactor(key: string, transactor: ITransactor): void {
     this.transactors.set(key, transactor);
+  }
+
+  /**
+   * The gate saying whether the cohort behind `options`' transactor can be reached now
+   * (`ICohortReachability`, docs/offline-sync.md §When to submit: the reachability gate). The offline
+   * queue asks it before submitting an entry, and a live read in offline mode before it refreshes
+   * (docs/offline-sync.md §Reads in offline mode), so both ask one gate; the offline-mode controller
+   * also subscribes to its `onChange`, which wakes the drain. The same object for every call with one
+   * transactor key, late-bound to the registration ({@link LateBoundCohortReachability}): a gate
+   * registered after a table took this one is the one it asks and hears. A transactor with no gate
+   * registered is always reachable and never wakes anyone — `local`, `test` and `mesh-test` have no
+   * cohort to lose; the `network` transactor registers its node's ({@link createNetworkTransactor}).
+   */
+  getCohortReachability(options: ParsedOptimysticOptions): ICohortReachability {
+    return this.cohortGateFor(this.getTransactorKey(options));
+  }
+
+  /**
+   * Register the reachability gate for the transactor under `key` — `${transactor}:${keyNetwork}`, the
+   * key {@link registerTransactor} takes. For tests and hosts; the `network` transactor registers its
+   * node's gate itself unless one is registered here first. Replaces any gate registered under `key`
+   * before, moving every wake subscription to it.
+   */
+  registerCohortReachability(key: string, reachability: ICohortReachability): void {
+    this.cohortGateFor(key).bind(reachability);
+  }
+
+  private cohortGateFor(key: string): LateBoundCohortReachability {
+    let gate = this.cohortGates.get(key);
+    if (gate === undefined) {
+      gate = new LateBoundCohortReachability();
+      this.cohortGates.set(key, gate);
+    }
+    return gate;
   }
 
   /**

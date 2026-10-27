@@ -57,6 +57,9 @@ export type RepoCommitRequest = {
 	// durable commit proof and so cannot gain holders by push. Full rationale and the measured cost of
 	// making it required live at {@link CommitRequest.blockDigests} in `struct.ts`; keep the two in sync.
 	blockDigests?: BlockContentDigests;
+	/** {@link CommitRequest.refuseSolo}: present on every per-coordinator commit of a write that asked
+	 * not to be committed alone, and omitted otherwise. */
+	refuseSolo?: true;
 };
 
 export type IRepo = {

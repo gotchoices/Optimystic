@@ -249,7 +249,9 @@ sensibly. Each variant's extra field (`rejectReason`, `conflictWith`) is folded 
 payload (`clusterVoteSigningPayload` in db-core), so neither can be rewritten in transit.
 
 The coordinator counts the three kinds separately and reports a promise-phase shortfall as whichever
-it actually was: `ValidatorRejectionError` (invalid — permanent), `ConflictRaceLostError` (lost race
+it actually was: `ValidatorRejectionError` (enough members rejected — which `CoordinatorRepo.pend`
+returns as a `RejectedFailure` when every reject was a signed validity vote or an expiry vote, and
+otherwise throws unless its own storage confirms a revision loss), `ConflictRaceLostError` (lost race
 — surfaced by BOTH `CoordinatorRepo.pend` and `CoordinatorRepo.commit` as a retryable `StaleFailure`
 with `conflict: true`, never as a throw: db-core retries a thrown commit verbatim, and a re-driven
 dead commit can assemble a consensus no member will durably store), or the legacy super-majority

@@ -1,4 +1,4 @@
-import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, ActionLineage, BlockContentDigests, GetBlockResult } from "../index.js";
+import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, BlockStore, Transforms, ActionId, ActionLineage, GetBlockResult, CommitResult } from "../index.js";
 import { Log } from "../log/log.js";
 import type { LogBlock } from "../log/log.js";
 import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
@@ -6,28 +6,27 @@ import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
-import { describeTouchedBlocks, baseRevsField } from "../transform/digest.js";
-import { oversizedBlock } from "../network/block-size.js";
-import type { BlockBaseRevs, BlockGets } from "../network/struct.js";
-import { copyTransforms, isTransformsEmpty } from "../transform/helpers.js";
+import type { BlockGets } from "../network/struct.js";
+import { copyTransforms, emptyTransforms, isTransformsEmpty } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
-import { mergeDurability, withBlockRevs } from "../network/durability.js";
-import { highestStaleAt, isExpiryFailure } from "../network/stale-failure.js";
-import { TransactionExpiredError } from "../network/transaction-expired-error.js";
-import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, ICollection, SyncOptions, TornActionReason } from "./index.js";
-import { CollectionHeaderVanishedError, SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
-import type { ActionContext } from "./action.js";
-import { actionIdAt } from "./action.js";
+import { withBlockRevs } from "../network/durability.js";
+import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
+import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
+import { SegmentList } from "./segments.js";
+import type { EntryId, SealedSegment } from "./segments.js";
+import type { ActionContext, ActionRev, AlreadyAppliedTally } from "./action.js";
+import { actionIdAt, addTallies, ZeroTally } from "./action.js";
+import { AttemptCycle, resumedAttempt, retainedAttempt, stageAttempt } from "./write-attempts.js";
+import type { AttemptTarget, Refresh, StagedAttempt, WriteIdentity } from "./write-attempts.js";
+import { driveHeadCommit } from "./head-commit.js";
+import type { HeadCommitHandle } from "./head-commit.js";
 import type { ReadDependency } from "../transaction/transaction.js";
-import { clampPriority, SlotHoldAfterLosses } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
-import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
-import type { JitteredBackoffConfig, RandFn } from "../utility/backoff.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('collection');
@@ -52,26 +51,6 @@ type DivergenceSite = 'refresh' | 'attach';
  * there — what {@link Collection.earliestFork} reports and `collection:lineage-divergence` prints
  * as `forkRev=` / `heldAction=` / `readAction=`. */
 type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
-
-/** Exactly what one failed write attempt sent to the transactor — enough to send the same thing
- * again. Retained by {@link Collection.retainInFlightAttempt} so that a refresh which then finds
- * this attempt's own log entry can land the blocks the attempt left behind, at the same action id
- * and revision (see {@link Collection.completeOwnEntry}). */
-export type InFlightAttempt = {
-	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
-	rev: number;
-	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
-	 * it will not mutate; the collection keeps it as given. */
-	transforms: Transforms;
-	/** The attempt's log tail block, committed first. */
-	tailId: BlockId;
-	/** The per-block content declarations the attempt's commit carried, if any. */
-	blockDigests?: BlockContentDigests;
-	/** The per-block bases the attempt's pend carried, if any (see `PendRequest.baseRevs`). Kept
-	 * with the transforms because they describe them: a re-send of these operations must name the
-	 * same bases they were computed against. */
-	baseRevs?: BlockBaseRevs;
-};
 
 /** What one refresh ({@link Collection.refreshInFlight}, and the refresh inside a sync) found out
  * about the write in flight on the instance's behalf. The caller hands in an empty report and the
@@ -108,50 +87,19 @@ type LogEnds = {
 type AttributedRead = { entry: GetBlockResult | undefined } | { error: unknown };
 type AttributedReads = Map<BlockId, AttributedRead>;
 
-/** Default base backoff (and historical fixed delay) between sync retries, in ms. */
-const PendingRetryDelayMs = 100;
-/** Default max consecutive no-progress stale-failure retries before {@link Collection.sync} gives up. */
-const DefaultMaxAttempts = 10;
-/** Default ceiling on a single exponential-backoff sleep, in ms. */
-const DefaultMaxBackoffMs = 5000;
-/** Default consecutive stalled refreshes — ones that moved this collection's revision NOWHERE
- * while a responder CONFIRMED a revision at or above the one being requested — before
- * {@link Collection.sync} gives up. Two, not one, so a single transiently-lagging read is absorbed.
- *
- * NOTE: two is a judgement call, not a measurement — nothing here counts how often a legitimate
- * loser reads a view that moves nowhere for two consecutive rounds. The check only strikes when the
- * refresh made NO progress at all, so a client merely catching up is already excluded; if a
- * spurious `SyncRevisionStalledError` ever shows up under real contention anyway, raise this. */
-const DefaultMaxStalledAttempts = 2;
-
-/**
- * The sleep before the refresh that follows a write's `failures`-th consecutive loss.
- *
- * The jittered backoff exists to separate a herd of writers that lost the SAME race, so they do not
- * re-collide on the next tick. A loss to a rival that had already committed (the refusal carried a
- * confirmed `staleAt`) is not a herd, and once this write has taken `SlotHoldAfterLosses` such losses
- * (`confirmedLosses`, counted over the whole write as a member counts its stale refusals of one
- * action) the members that refused it hold the next slot for it — so sleeping only spends that hold.
- * Both sides count the same refusals against the same constant, so the writer stops sleeping on the
- * loss after which a member holds, with nothing said over the wire. A loss the latest refusal did not
- * confirm (`latestConfirmed` false — a race against something still in flight) keeps the jitter.
- *
- * NOTE: against members that do not hold (an earlier release, `slotHoldWindowMs: 0`, or a member the
- * refused pends did not reach) this retries without sleeping and so spends the same attempt budget
- * sooner, at about twice one writer's pend rate (measured in the plan stage of
- * `slot-hold-for-an-aged-writer`). Accepted: the backoff bought that writer nothing either, it only
- * delayed the same give-up.
- */
-function retryBackoffMs(failures: number, confirmedLosses: number, latestConfirmed: boolean,
-	config: JitteredBackoffConfig, rand?: RandFn): number {
-	if (latestConfirmed && confirmedLosses >= SlotHoldAfterLosses) {
-		return 0;
-	}
-	return jitteredBackoffMs(failures - 1, config, rand);
-}
+/** The tracker a head commit's attempts are built from: the head segment's actions staged over the
+ * committed state, and the revision the attempt built from it requests (see
+ * {@link Collection.headTrackerFor}). */
+type HeadTracker = {
+	rev: number;
+	tracker: Tracker<IBlock>;
+};
 
 export type CollectionInitOptions<TAction> = {
-	modules: Record<ActionType, ActionHandler<TAction>>;
+	/** One handler per action type. A handler may answer what the action accepted as already applied
+	 * ({@link AlreadyAppliedTally}); one that answers nothing counts as the zero tally, so a collection
+	 * type with no such notion returns nothing. */
+	modules: Record<ActionType, ActionHandler<TAction, AlreadyAppliedTally | void>>;
 	createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => IBlock;
 	/** Called for each local action that is potentially in conflict with a remote action.
 	 * @param action - The local action to check
@@ -160,7 +108,15 @@ export type CollectionInitOptions<TAction> = {
 	 * 	action (return a new instance to apply instead of the original — it is re-staged via
 	 * 	the conflict replay), or undefined to discard this action
 	 */
-	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
+	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined;
+	/** Called once per refusal of a SEALED segment discovered by a replay (see
+	 * {@link Collection.replayActions}): the segment's entry id and the handler's refusal. Called
+	 * synchronously from inside the replay, under the collection latch, so it MUST NOT call a
+	 * latched method of this collection ({@link Collection.update}, {@link Collection.dropSealed},
+	 * {@link Collection.sync}, …) synchronously — the latch is non-reentrant and that would
+	 * deadlock. The queue schedules its reaction instead. A throw out of the callback is caught and
+	 * logged (`collection:refusal-callback-threw`), never allowed to abort the replay. */
+	onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void;
 }
 
 /** Options for building a committed read view (see {@link Collection.createReadTracker}
@@ -195,8 +151,17 @@ export interface CollectionSnapshot<TAction> {
 	 *  were not built on. Absent on a snapshot built by hand; such a restore keeps whatever pins
 	 *  the tracker holds for the restored ids. */
 	pins?: BasePins;
-	/** Pending actions queued at snapshot time. */
+	/** The OPEN segment's actions at snapshot time (see {@link SegmentList}). Sealed segments are
+	 * not captured as actions — their effects are in `transforms`, which is what a committed read
+	 * view built from this snapshot must include — and a restore never puts one back: whether it
+	 * reinstates `transforms` verbatim or rebuilds the tracker from the sealed segments as they are
+	 * then is decided by {@link sealedVersion} (see {@link Collection.restorePending}). */
 	pending: Action<TAction>[];
+	/** {@link SegmentList.version} at capture: a restore that finds the sealed list changed since —
+	 * a segment sealed, dropped or refused while the snapshot was outstanding — replays rather than
+	 * reinstating `transforms`, which would put a dropped segment's effects back. Absent on a
+	 * snapshot built by hand, which reads as "unchanged". */
+	sealedVersion?: number;
 	/** The committed boundary (action context) the staged state sat on when captured.
 	 *  `undefined` for a collection with no committed revision yet (an invented
 	 *  collection whose header/root still live in the tracker). A read view built
@@ -207,8 +172,22 @@ export interface CollectionSnapshot<TAction> {
 }
 
 export class Collection<TAction> implements ICollection<TAction> {
-	private pending: Action<TAction>[] = [];
+	/** The staged actions: sealed segments, one per queued entry, ahead of the open segment the
+	 * current transaction stages into (see {@link SegmentList}). While nothing is sealed this is
+	 * exactly the one pending list it replaced, and every path behaves as it did then. */
+	private readonly segments = new SegmentList<TAction>();
 	private readonly latchId: string;
+
+	/** The transforms an INVENTED collection starts from — its header, its empty log block and (for
+	 * a tree) its empty root, as {@link createOrOpen}'s create branch staged them. A replay resets
+	 * the tracker to a copy of this, rather than to empty, for as long as no committed revision has
+	 * been adopted: those blocks are then nowhere but the tracker, and resetting to empty would drop
+	 * them and leave the collection unreadable (the hazard {@link mustReplay} and
+	 * {@link snapshotPending} describe). Never cleared — it is read only while
+	 * `source.actionContext` is undefined, and once a context is adopted the blocks are in storage
+	 * and the empty reset is the right one. `undefined` for a collection opened over a committed
+	 * header, which never replays from a baseline. */
+	private inventedBaseline?: Transforms;
 
 	/** The action id of a write currently in flight ON THIS INSTANCE'S BEHALF, or `undefined`
 	 * outside a write. Read by {@link updateInternal}: if the committed log now carries an entry
@@ -259,7 +238,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * Only the latest attempt is kept. An own entry can only be visible at the revision of an
 	 * attempt whose tail landed, and a later attempt at a DIFFERENT revision is only made after a
 	 * refresh adopted somebody else's entry at the earlier one — which is proof the earlier tail did
-	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch. */
+	 * not land. {@link completeOwnEntry} still checks the revision and refuses on a mismatch.
+	 *
+	 * A head commit may be opened with one already in hand ({@link openHeadCommit}'s `resume`): the
+	 * attempt an earlier cycle under the same action id recorded through `HeadCommitOptions.recordAttempt`
+	 * before sending it, which the cycle's opening refresh can then finish from. */
 	private inFlightAttempt?: InFlightAttempt;
 
 	/** The log data-block ids the append of the action marked in {@link inFlightActionId} has
@@ -267,6 +250,32 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * read by {@link logAppendBlockIds}, cleared with the rest of the in-flight state by
 	 * {@link beginInFlightAction} and its disposer. */
 	private mintedLogBlockIds?: { rev: number; ids: BlockId[] };
+
+	/** What the cycle marked in {@link inFlightActionId} asked of every send it makes
+	 * ({@link InFlightCycle}) — read by {@link send} and by the re-send {@link completeOwnEntry} makes
+	 * to finish a torn attempt, so neither needs it threaded through. Set by
+	 * {@link beginInFlightAction} and cleared by its disposer. */
+	private inFlightCycle: InFlightCycle = {};
+
+	/** The head commit running on this instance ({@link openHeadCommit}), for the whole cycle — set and
+	 * cleared beside {@link inFlightActionId}: the sealed segment it is committing, and the hook told
+	 * what that segment accepted as already applied when it is dropped as committed
+	 * ({@link HeadCommitOptions.onCommittedHead}). Read by {@link consumeOwnEntry}: the entry a head
+	 * commit's own refresh finds under the in-flight action id records the HEAD segment's actions, not
+	 * the open segment's, so consuming it removes that segment — and reports it through the hook, as
+	 * the handle's `fold` does. */
+	private headCommit?: { readonly entryId: EntryId; readonly onCommitted?: (applied: AlreadyAppliedTally) => void };
+
+	/** Set only while a head commit has RELEASED the collection latch for its one network round trip
+	 * ({@link HeadCommitHandle.release}), and cleared the moment it is retaken, so anything that runs under the
+	 * latch in that window can tell. Two things must: a refresh ({@link updateInternal}) that walks
+	 * into the in-flight entry returns without adopting it, since it can neither finish it as the
+	 * write's own (nothing failed, nothing is retained) nor replay it as a stranger's (that would
+	 * re-stage the head over state that already contains it); and {@link dropSealed} refuses to drop
+	 * the segment the commit is carrying. A second {@link commitHead} meets it as its `in-flight`
+	 * precondition. Gated on THIS field, not on {@link inFlightActionId}: the head commit's own
+	 * refreshes run with it cleared and must take the own-entry path. */
+	private headInFlight?: { entryId: EntryId; actionId: ActionId };
 
 	/** The log tail block id the most recent header read named. A refresh asks for this block in the
 	 * same request as the header ({@link readLogEnds}): the tail id only changes when the tail block
@@ -277,7 +286,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	protected constructor(
 		public readonly id: CollectionId,
 		public readonly transactor: ITransactor,
-		private readonly handlers: Record<ActionType, ActionHandler<TAction>>,
+		private readonly handlers: Record<ActionType, ActionHandler<TAction, AlreadyAppliedTally | void>>,
 		private readonly source: TransactorSource<IBlock>,
 		/** Cache of unmodified blocks from the source */
 		private readonly sourceCache: CacheSource<IBlock>,
@@ -288,6 +297,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		 * {@link BlockFloors}). */
 		private readonly floors: BlockFloors,
 		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
+		/** See {@link CollectionInitOptions.onSealedRefused}. */
+		private readonly onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void,
 		/** Short random tag naming THIS instance (see {@link newInstanceTag}). Open paths generate
 		 * it BEFORE construction (so pre-construction diagnostics such as attachToLog can carry it);
 		 * the default covers direct construction in tests. */
@@ -338,7 +349,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return undefined;
 		}
 		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, instanceTag);
 		collection.logTailId = ends.header.tailId;
 		return collection;
 	}
@@ -354,6 +365,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const instanceTag = Collection.newInstanceTag();
 		const { source, sourceCache, tracker, floors, ends } = await Collection.probeHeader(transactor, id, instanceTag);
 
+		let inventedBaseline: Transforms | undefined;
 		if (ends) {	// Collection already exists
 			await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
 		} else {	// Collection does not exist
@@ -362,10 +374,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			tracker.insert(headerBlock);
 			source.actionContext = undefined;
 			await Log.open<Action<TAction>>(tracker, id);
+			// Everything staged so far — the header (with the tail id Log.open wrote into it), the
+			// empty log block, and whatever createHeaderBlock staged beside the header — is what a
+			// replay has to put back while this collection has no committed revision.
+			inventedBaseline = copyTransforms(tracker.transforms);
 		}
 
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, instanceTag);
 		collection.logTailId = ends?.header.tailId;
+		collection.inventedBaseline = inventedBaseline;
 		return collection;
 	}
 
@@ -397,10 +414,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * a poll of many collections whose logs stayed on their blocks is one request, however many it
 	 * names; the per-block judgement is {@link readLogEnds}'s, through the same helpers.
 	 *
-	 * A request that throws is not every collection's failure: `NetworkTransactor.get` fails as a
-	 * whole when any block in it gets no answer, so {@link readAttributed} then reads each block
-	 * alone and only the collections whose blocks failed report an error. That fallback costs what
-	 * reading each collection separately costs, and only when a request fails. */
+	 * A block no coordinator answered comes back flagged and fails only its own collection, through
+	 * the per-block judgement. A request that throws as a whole — `NetworkTransactor.get` does when a
+	 * coordinator's answer leaves a block out — is not every collection's failure either:
+	 * {@link readAttributed} then reads each block alone and only the collections whose blocks failed
+	 * report an error. That fallback costs what reading each collection separately costs, and only
+	 * when a request fails. */
 	static async readCommittedTails(transactor: ITransactor, queries: ReadonlyArray<CommittedTailQuery>): Promise<Map<CollectionId, CommittedTailAnswer>> {
 		const knownTails = new Map(queries.map(query => [query.id, query.knownTailId]));
 		const ends = await Collection.readAttributed(transactor,
@@ -464,7 +483,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return { source, sourceCache, tracker, floors, ends };
 	}
 
-	/** A new handle's floors: none yet (opening walks no entries), wired to report every below-floor
+	/** A new handle's floors: none yet (an open raises them from its log tail,
+	 * {@link floorTailEntries}), wired to report every below-floor
 	 * answer any of the handle's read sources receives. The line is the only trace such an answer
 	 * leaves — the read itself succeeds (see the accepted-tradeoff NOTE at
 	 * `TransactorSource.mayRetain`) — so repeated lines for one block with `servedRev` short of
@@ -496,6 +516,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
 		Collection.bootstrapContext(source, ends.tail);
+		Collection.floorTailEntries(floors, ends);
 		// The walk starts from the header and the tail, which the probe just read: keep them, so the
 		// walk reads neither again. Its first read of each through the cache then records the read
 		// dependency the probe's own read of the header used to.
@@ -509,6 +530,31 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// tail or the tail block carries zero entries, and that must not erase the revision
 		// bootstrapContext just read off the committed tail.
 		Collection.advanceContext(source, id, instanceTag, 'attach', await collectionLog.getActionContext());
+	}
+
+	/** Floor every block an action entry in the opened log's tail block names, at that entry's
+	 * revision — what a refresh's walk does for the entries it walks ({@link raiseFloors}), for the
+	 * entries an open has read but does not walk.
+	 *
+	 * An open adopts the revision the tail names, then reads each block it needs for the first time.
+	 * When the answering repo's copy of such a block is older than an entry the tail holds — a node
+	 * whose crash kept a commit's log tail but lost its other blocks within the store's durability
+	 * window, or a coordinator that missed the commit — nothing else tells the read so, and the
+	 * repo serves its held copy (a held block's first read after a restart is answered locally while
+	 * the consult runs behind it). The handle then shows, say, a table row whose index entry is
+	 * missing. With the floor, the read carries the revision the tail proves, so the repo consults
+	 * its cohort before answering and the transactor re-asks another machine for an answer still
+	 * below it (see {@link BlockFloors}).
+	 *
+	 * Only the tail block's entries: they are what the open read, and they hold the newest commits —
+	 * the ones a durability window can tear. Invalidation entries set no floor, as on a refresh. */
+	private static floorTailEntries(floors: BlockFloors, ends: LogEnds): void {
+		const tail = ends.tail?.block as LogBlock<unknown> | undefined;
+		for (const entry of tail?.entries ?? []) {
+			if (entry.action !== undefined) {
+				floors.raise(entry.action.blockIds, { rev: entry.rev, actionId: entry.action.actionId });
+			}
+		}
 	}
 
 	/** Adopt a freshly-read action context WITHOUT ever lowering the revision already held.
@@ -687,21 +733,37 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	private async actInternal(...actions: Action<TAction>[]) {
 		await this.internalTransact(...actions);
-		this.pending.push(...actions);
+		// Staging appends to the OPEN segment: a sealed segment is closed to further staging.
+		this.segments.open.push(...actions);
 	}
 
-	private async internalTransact(...actions: Action<TAction>[]) {
-		const atomic = new Atomic(this.tracker);
+	private internalTransact(...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
+		return this.stageInto(this.tracker, ...actions);
+	}
+
+	/** Run `actions` through their handlers over `tracker` as ONE atomic unit: a throw from any
+	 * handler leaves none of their writes staged. The live tracker's path ({@link internalTransact})
+	 * and a head commit's tracker ({@link buildHeadTracker}) share it.
+	 *
+	 * @returns the sum of what the handlers accepted as already applied ({@link AlreadyAppliedTally});
+	 * a handler that answers nothing adds the zero tally. */
+	private async stageInto(tracker: Tracker<IBlock>, ...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
+		const atomic = new Atomic(tracker);
+		let applied = ZeroTally;
 
 		for (const action of actions) {
 			const handler = this.handlers[action.type];
 			if (!handler) {
 				throw new Error(`No handler for action type ${action.type}`);
 			}
-			await handler(action, atomic);
+			const tally = await handler(action, atomic);
+			if (tally !== undefined) {
+				applied = addTallies(applied, tally);
+			}
 		}
 
 		atomic.commit();
+		return applied;
 	}
 
 	/** Load external changes and update our context to the latest log revision - resolve any conflicts with our pending actions. */
@@ -791,18 +853,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// finish. `getStatus` is the cheap first question; it judges a block by who holds its
 			// LATEST revision, so a block this action landed and a later action has since built on
 			// reads there as not committed — those are asked again, properly, by settleUnfinished.
-			// Both write paths retain an attempt before any refresh can run, so production only
-			// reaches this branch when the entry sits at a revision the retained attempt was not
-			// made at — a forked lineage.
+			// A write's own cycle retains an attempt before any refresh can run, so from inside a cycle
+			// this branch is reached only when the entry sits at a revision the retained attempt was
+			// not made at — a forked lineage. The ordinary way here is a NEW cycle under an old id:
+			// the queue re-driving an entry whose earlier head commit ended in doubt without handing
+			// back the attempt it recorded ({@link openHeadCommit}, whose opening refresh runs with
+			// nothing retained unless `resume` seeds it).
 			const [status] = await this.transactor.getStatus([{ actionId: entry.actionId, blockIds: entry.blockIds }]);
 			if (entry.blockIds.every((_, i) => status?.statuses[i] === 'committed')) {
 				// Whole, and saved: the refresh reports it as finished (see RefreshReport), so the
 				// coordinator counts this participant as committed. Only WHO holds it is unknown.
-				// NOTE: a sync whose only commit was recognised here therefore answers `undefined` —
-				// the "nothing was written" answer — for a write that is saved, because the sync reads
-				// the report's durability, not the finished flag. Reachable only on the forked-lineage
-				// path above; if that path ever becomes ordinary, take the durability from
-				// `getLineage` (as settleUnfinished does) instead of stopping at the status read.
+				// NOTE: a write whose only commit was recognised here therefore answers `undefined` for
+				// a write that is saved, because both write paths read the report's durability, not the
+				// finished flag. For a sync that is the "nothing was written" answer, reachable only on
+				// the forked-lineage path above; for a head commit it is unambiguous (a head segment is
+				// never empty) and is how a re-driven entry is answered. If the queue ever needs a
+				// durability class for a re-driven entry, take it from `getLineage` (as
+				// settleUnfinished does) instead of stopping at the status read.
 				return undefined;
 			}
 			return await this.settleUnfinished(entry, rev, undefined, 'transforms-not-held',
@@ -823,7 +890,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// pair is not obviously right either: a member re-executing the transaction after a sibling
 		// participant has landed no longer sees the state it was staged against. Tracked as an arm
 		// of tickets/backlog/feat-no-deployment-validates-transactions-at-pend.
-		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, 0, attempt.blockDigests, attempt.baseRevs);
+		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, {
+			blockDigests: attempt.blockDigests,
+			baseRevs: attempt.baseRevs,
+			refuseSolo: this.inFlightCycle.refuseSolo
+		});
 		if (result.success) {
 			return result.durability;
 		}
@@ -841,6 +912,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// needs the clocks to start disagreeing between a write's attempts, since an expiry on the
 		// attempt itself ends the write before any refresh. If it is ever seen burning a budget,
 		// settle it at once beside the confirmed rival.
+		// NOTE: a promise shortfall of the re-send (`isShortfallFailure`) lands in the same arm, and
+		// there it can genuinely clear (the silent members come back), so the write is re-sent each
+		// round until the budget's last round settles it — unlike a fresh attempt's shortfall, which
+		// ends the write at once. If a silent cohort is ever seen holding torn writes for the whole
+		// budget, settle it at once here too.
+		// A validity rejection (`isRejectedFailure`) cannot answer the re-send: it carries no
+		// `validation` pair (above), so no checker judges it.
 		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is
 		// pointless, but the lineage question is asked only this once, so a member that is silent
 		// just now makes the answer `final: false`. If unsettled outcomes ever show up often under
@@ -957,47 +1035,122 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * {@link completeOwnEntry} has returned for this entry — the entry alone is not proof the write
 	 * is saved.
 	 *
-	 * `addActions` wrote exactly the snapshot pending list under this action id, and the entry's
-	 * actions are therefore the LEADING `entry.actions.length` items of `this.pending` — anything
-	 * staged since is behind them, because {@link actInternal} appends. Under
-	 * {@link syncInternal} nothing can even be staged mid-cycle (`act()` shares the collection
-	 * latch); under `TransactionCoordinator.commit` the mark spans a latch-free inter-attempt
-	 * window, so an `act()` there CAN grow `pending` — still only at the tail, so the slice stays
-	 * right.
+	 * A whole-collection write (`sync`) wrote exactly the snapshot of the OPEN segment under this
+	 * action id, and the entry's actions are therefore the LEADING `entry.actions.length` items of
+	 * the open segment — anything staged since is behind them, because {@link actInternal}
+	 * appends. Under {@link syncInternal} nothing can even be staged mid-cycle (`act()` shares the
+	 * collection latch); under `TransactionCoordinator.commit` the mark spans a latch-free
+	 * inter-attempt window, so an `act()` there CAN grow the open segment — still only at the
+	 * tail, so the slice stays right. No sealed segment can exist for such a write: every
+	 * whole-collection path refuses while one does ({@link SealedSegmentsError}).
 	 *
-	 * The guard below is the load-bearing part: `slice` fails SILENTLY if that correspondence ever
-	 * breaks, dropping actions that were never committed, so an entry longer than `pending` throws
-	 * instead of losing work. (See the sibling note on `syncInternal`'s post-commit replay, which
-	 * rests on the same invariant.) */
-	private consumeOwnEntry(entry: ActionEntry<Action<TAction>>) {
-		if (entry.actions.length > this.pending.length) {
-			throw new Error(
-				`Collection ${this.id}: own committed entry for action ${entry.actionId} holds `
-				+ `${entry.actions.length} actions but only ${this.pending.length} are pending; `
-				+ `consuming it would drop actions that were never committed`);
+	 * A head commit ({@link commitHead}, which marks {@link headCommit} for its cycle) wrote the
+	 * HEAD sealed segment's actions, so its entry is consumed by removing that segment — the open
+	 * segment, which may have grown while the commit was on the network, is untouched. The sealed
+	 * segments behind the head are never touched by either arm.
+	 *
+	 * The guards are the load-bearing part: `slice` fails SILENTLY if the open correspondence ever
+	 * breaks, dropping actions that were never committed, so an entry longer than the open segment
+	 * throws instead of losing work, and an entry whose action count is not the head's throws rather
+	 * than removing a segment the entry does not record. (See the sibling note on `syncInternal`'s
+	 * post-commit replay, which rests on the same invariant.)
+	 *
+	 * @returns whether the staged set changed — always true here: even for a zero-action entry the
+	 * tracker still holds this action's staged transforms, and only the replay at the end of
+	 * `updateInternal` — which resets the tracker and re-stages just what remains — drops them.
+	 * That reset is what turns `hasUnsyncedChanges()` false so the sync loop exits reporting the
+	 * success the writer is owed (the action IS durable). */
+	private consumeOwnEntry(entry: ActionEntry<Action<TAction>>): boolean {
+		if (this.headCommit !== undefined) {
+			this.consumeHead(entry, this.headCommit.entryId);
+		} else {
+			this.segments.open = this.consumedFromOpen(entry);
 		}
-		// `mutated` is unconditional, even for a zero-action entry: the tracker still holds this
-		// action's staged transforms, and only the replay at the end of `updateInternal` — which
-		// resets the tracker and re-stages just what remains — drops them. That reset is what turns
-		// `hasUnsyncedChanges()` false so the sync loop exits reporting the success the writer is
-		// owed (the action IS durable).
-		return { after: this.pending.slice(entry.actions.length), mutated: true };
+		return true;
 	}
 
-	/** Maps each pending action to its effective form against a remote entry: the original, a
-	 * replacement, or dropped. A replacement or a discard changes the pending set; the tracker still
+	/** Remove the head segment `entryId` because `entry`, its own committed log entry, made it
+	 * durable — the head arm of {@link consumeOwnEntry}. Bumps the segment version, so an outstanding
+	 * snapshot restores by replay rather than putting the committed segment back, and reports the
+	 * dropped segment's tally through the cycle's hook ({@link reportCommittedHead}), as the handle's
+	 * `fold` does for an attempt that committed. */
+	private consumeHead(entry: ActionEntry<Action<TAction>>, entryId: EntryId): void {
+		const head = this.segments.head();
+		if (head === undefined || head.entryId !== entryId) {
+			throw new Error(
+				`Collection ${this.id}: own committed entry for action ${entry.actionId} records head segment `
+				+ `${entryId}, but the head is ${head?.entryId ?? 'nothing'}`);
+		}
+		if (entry.actions.length !== head.actions.length) {
+			throw new Error(
+				`Collection ${this.id}: own committed entry for action ${entry.actionId} holds `
+				+ `${entry.actions.length} actions but head segment ${entryId} holds ${head.actions.length}; `
+				+ `consuming it would drop actions that were never committed`);
+		}
+		this.reportCommittedHead(this.segments.drop(entryId));
+	}
+
+	/** Hand the tally recorded on `segment` — the head segment just made durable and dropped — to the
+	 * cycle's `onCommittedHead` hook ({@link HeadCommitOptions.onCommittedHead}), under the latch, from
+	 * the two places that drop a head segment as committed: the handle's `fold`, and
+	 * {@link consumeHead}. A segment with no recorded tally is a defect, answered with the zero tally
+	 * and logged rather than thrown: every sealed segment is staged by {@link buildHeadTracker} before
+	 * its first send and by a replay when put back ({@link restoreSealed}), and the resume path that
+	 * re-sends a recorded attempt verbatim runs after one of those. A throw out of the hook is logged,
+	 * never raised — the commit is already durable. */
+	private reportCommittedHead(segment: SealedSegment<TAction>): void {
+		let applied = segment.applied;
+		if (applied === undefined) {
+			log('collection:committed-head-tally-missing id=%s tag=%s entry=%s: the head segment was committed without a recorded staging',
+				this.id, this.instanceTag, segment.entryId);
+			applied = ZeroTally;
+		}
+		const hook = this.headCommit?.onCommitted;
+		if (hook === undefined) {
+			return;
+		}
+		try {
+			hook(applied);
+		} catch (err) {
+			log('collection:committed-head-callback-threw id=%s tag=%s entry=%s error=%s',
+				this.id, this.instanceTag, segment.entryId, err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	/** The open segment with the leading actions `entry` made durable dropped off it. */
+	private consumedFromOpen(entry: ActionEntry<Action<TAction>>): Action<TAction>[] {
+		const open = this.segments.open;
+		if (entry.actions.length > open.length) {
+			throw new Error(
+				`Collection ${this.id}: own committed entry for action ${entry.actionId} holds `
+				+ `${entry.actions.length} actions but only ${open.length} are pending; `
+				+ `consuming it would drop actions that were never committed`);
+		}
+		return open.slice(entry.actions.length);
+	}
+
+	/** Maps each OPEN-segment action to its effective form against a remote entry: the original, a
+	 * replacement, or dropped. A replacement or a discard changes the staged set; the tracker still
 	 * holds the pre-filter transforms, so report it as mutated to force a replay that re-stages
 	 * against the effective actions. Identity comparison per the contract: keep => same instance,
 	 * replace => new instance.
+	 *
+	 * A SEALED segment's action list is the queue entry's own and is never rewritten (invariant 3
+	 * of docs/offline-sync.md §The segment model), so the hook is not offered them. `Tree` and
+	 * `Diary` install no hook, so nothing observable changes for them either way.
+	 *
 	 * NOTE: a filterConflict hook that always allocates a fresh (but equal) instance instead of
 	 * returning the same one forces a replay on every update — if that ever shows up as a hot path,
-	 * compare by value/id here instead of by reference. */
-	private filterAgainstEntry(entry: ActionEntry<Action<TAction>>) {
-		const before = this.pending;
+	 * compare by value/id here instead of by reference.
+	 *
+	 * @returns whether the open segment changed. */
+	private filterAgainstEntry(entry: ActionEntry<Action<TAction>>): boolean {
+		const before = this.segments.open;
 		const after = before
 			.map(p => this.doFilterConflict(p, entry.actions))
 			.filter((a): a is Action<TAction> => a !== undefined);
-		return { after, mutated: after.length !== before.length || after.some((a, i) => a !== before[i]) };
+		this.segments.open = after;
+		return after.length !== before.length || after.some((a, i) => a !== before[i]);
 	}
 
 	/** Refresh this instance against the stored log: adopt the latest committed revision, resolve
@@ -1089,6 +1242,21 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const collectionLog = await Log.open<Action<TAction>>(tracker, this.id);
 		const latest = collectionLog ? await collectionLog.getFrom(actionContext?.rev ?? 0) : undefined;
 
+		// A refresh that runs while this instance's own head commit is on the network — a reader's,
+		// the latch being released for that round trip — and walks into that commit's entry adopts
+		// NOTHING (see {@link headInFlight}): the entry is not failed, so it is not finished and consumed
+		// as the write's own below, and it is not a stranger's, so it is not filtered and replayed. The
+		// head commit applies its own outcome when it retakes the latch, after which the next refresh
+		// finds nothing new. The reader is served the state before this collection's own write, which it
+		// sees staged anyway. Entries behind it in the same walk wait with it — an own entry is always
+		// the first above the held revision, since the attempt requested exactly that revision.
+		const headInFlight = this.headInFlight;
+		if (headInFlight !== undefined && latest?.entries.some(entry => entry.actionId === headInFlight.actionId)) {
+			log('collection:refresh-deferred-to-head-commit id=%s tag=%s entry=%s action=%s',
+				this.id, this.instanceTag, headInFlight.entryId, headInFlight.actionId);
+			return;
+		}
+
 		// This write's own entry, if its log tail landed despite the failure that sent us here.
 		// Decided ONCE, here: the mark can be cleared latch-free while the completion below is
 		// awaiting (see {@link inFlightActionId}), and an entry that was finished as our own must
@@ -1112,11 +1280,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// Process the entries and track the blocks they affect
 		let anyConflicts = false;
 		for (const entry of latest?.entries ?? []) {
-			const isOwnEntry = entry === ownEntry;
-			const { after, mutated } = isOwnEntry
+			const mutated = entry === ownEntry
 				? this.consumeOwnEntry(entry)
 				: this.filterAgainstEntry(entry);
-			this.pending = after;
 			anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
 		}
 
@@ -1128,7 +1294,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// block; over-inclusive by design (over-invalidation just resubmits — it never wrongly retains).
 		const invalidations = collectionLog ? await collectionLog.getInvalidationsFrom(actionContext?.rev ?? 0) : [];
 		const revertedBlockIds = [...new Set(invalidations.flatMap(inv => inv.reverted.map(r => r.blockId)))];
-		if (invalidations.length > 0 && this.pending.length > 0) {
+		if (invalidations.length > 0 && this.segments.replayableCount() > 0) {
 			anyConflicts = true;
 		}
 
@@ -1136,15 +1302,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
-		// Re-stage the pending actions against the adopted revision. The affected
+		// Re-stage the staged actions against the adopted revision. The affected
 		// blocks were already dropped from sourceCache above (per log entry / per invalidation),
 		// so the replay's reads re-materialize from the transactor.
-		// NOTE: a throw out of replayActions leaves the tracker holding only the transforms
-		// replayed so far while `pending` still lists them all; the caller's error handling is
-		// expected to abort/reset the collection rather than keep staging. The coordinator's partial
-		// report after a refresh-saved sibling does not (backlog: debt-a-failed-refresh-can-leave-a-
-		// collection-half-restaged). If replay ever gains a
-		// routinely-throwing read path, rebuild into a scratch tracker and swap on success.
+		// NOTE: a throw out of replayActions — a refusal of the OPEN segment, or any non-refusal
+		// error — leaves the tracker holding only the transforms replayed so far while the open
+		// segment still lists all of its actions; the caller's error handling is expected to
+		// abort/reset the collection rather than keep staging. The coordinator's partial report
+		// after a refresh-saved sibling does not (backlog: debt-a-failed-refresh-can-leave-a-
+		// collection-half-restaged). A SEALED segment is not left half-replayed: it is staged
+		// atomically, and a refusal of one is recorded and skipped rather than thrown. If replay ever
+		// gains a routinely-throwing read path, rebuild into a scratch tracker and swap on success.
 		if (this.mustReplay(anyConflicts, actionContext)) {
 			await this.replayActions();
 		}
@@ -1363,8 +1531,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		});
 	}
 
-	/** Whether {@link updateInternal} must re-stage `pending` after adopting `latest`, given the
-	 * context it held BEFORE the refresh.
+	/** Whether {@link updateInternal} must re-stage the staged actions after adopting `latest`,
+	 * given the context it held BEFORE the refresh.
 	 *
 	 * The answer is deliberately NOT just "a conflict was found". A conflict is detected by an
 	 * incoming log entry naming a block this tracker already holds a transform for — so an action
@@ -1379,16 +1547,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * The advance test rests on {@link advanceContext} being monotonic (it refuses to lower), which
 	 * is what makes "the adopted rev differs from the held one" mean "it went up".
 	 *
-	 * The second conjunct is `pending.length` and deliberately NOT {@link hasUnsyncedChanges},
-	 * which also counts tracker transforms. A collection {@link createOrOpen} just INVENTED holds
-	 * its staged header/root in the tracker with NO pending action naming them, and
-	 * {@link replayActions} resets the tracker before re-staging — so counting transforms here
-	 * would drop those blocks and leave a brand-new collection unreadable (the same hazard
-	 * {@link snapshotPending} documents). Nothing to re-stage means nothing to replay.
+	 * The second conjunct counts the REPLAYABLE actions — every non-refused sealed segment's plus
+	 * the open segment's, since a refresh that adopts a newer revision must re-stage the sealed
+	 * segments too — and deliberately NOT {@link hasUnsyncedChanges}, which also counts tracker
+	 * transforms. A collection {@link createOrOpen} just INVENTED holds its staged header/root in
+	 * the tracker with NO staged action naming them; {@link replayActions} now restores them from
+	 * {@link inventedBaseline}, but nothing to re-stage still means nothing to replay, and a replay
+	 * over no actions would be a wasted tracker rebuild.
 	 *
-	 * NOTE: this makes a refresh that adopts a newer revision O(pending) rather than free, so a
-	 * read taken mid-transaction while a rival keeps committing re-stages every action staged so
-	 * far, on each such read. Measured as no change to the storage-op budgets
+	 * NOTE: this makes a refresh that adopts a newer revision O(staged actions) rather than free,
+	 * so a read taken mid-transaction while a rival keeps committing re-stages every action staged
+	 * so far, on each such read. Measured as no change to the storage-op budgets
 	 * (`index-backfill-cost.spec.ts`, `cold-apply-cost.spec.ts`), because the replay's reads are
 	 * served from `sourceCache`. If a long transaction's reads ever show up as slow, narrow the
 	 * replay to the actions whose reads the adopted entries actually invalidated — NOT back to
@@ -1398,7 +1567,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return true;
 		}
 		const adoptedRev = this.source.actionContext?.rev;
-		if (adoptedRev !== undefined && adoptedRev !== priorContext?.rev && this.pending.length > 0) {
+		const replayable = this.segments.replayableCount();
+		if (adoptedRev !== undefined && adoptedRev !== priorContext?.rev && replayable > 0) {
 			return true;
 		}
 		// Third reason: a staged block's base has MOVED — the read cache no longer describes it at
@@ -1406,22 +1576,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// that adopted nothing and found no conflict can still be standing over such a block: a
 		// concurrent read served content the cache then kept at a newer revision, say. Re-staging
 		// is the only repair; declaring the pinned revision on the pend would merely get it refused.
-		return this.pending.length > 0 && this.logMovedBases(this.tracker.movedBases()) > 0;
+		return replayable > 0 && this.logMovedBases(this.tracker.movedBases()) > 0;
 	}
 
 	/** Re-judge every staged update's pinned base against the read cache and re-stage the pending
 	 * queue if any has moved. Runs immediately before each pend attempt — {@link syncAttempts} and
-	 * the coordinator's commit span both call it — because that is the last moment before the
-	 * base the pend declares is put on the wire, and nothing between a refused attempt and the
-	 * re-pend reads the block again (the refresh may have moved nothing and so replayed nothing).
+	 * the coordinator's commit span both call it, and {@link headTrackerFor} re-judges a head
+	 * commit's tracker the same way — because that is the last moment before the base the pend
+	 * declares is put on the wire, and nothing between a refused attempt and the re-pend reads the
+	 * block again (the refresh may have moved nothing and so replayed nothing).
 	 *
-	 * Two steps. First, one read for each pinned block the cache does NOT retain — content handed
-	 * through unkept (a below-floor answer, which the cache re-asks for on every read anyway): the
-	 * pin names the revision last served, storage may have caught up since without the log moving,
-	 * and only a read can tell. An evicted-but-kept base needs no read: its content met every floor
-	 * the handle knows, so storage cannot have moved it without a log entry the next refresh will
-	 * walk (and the pend would be refused as stale on revision alone). Then, one cache probe per
-	 * pinned block ({@link Tracker.movedBases}) and a replay if any moved.
+	 * Two steps. First, one read for each pinned block the cache does NOT retain
+	 * ({@link rereadUnretainedBases}). Then, one cache probe per pinned block
+	 * ({@link Tracker.movedBases}) and a replay if any moved.
 	 *
 	 * Latch-free by contract, like {@link snapshotPending}: the caller holds this instance's latch
 	 * ({@link replayActions} is always run under it).
@@ -1433,16 +1600,28 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * @returns whether the pending queue was re-staged. */
 	async restageIfBasesMoved(): Promise<boolean> {
-		for (const id of this.tracker.unretainedBases()) {
-			// `navigation` never upgrades the purpose the original read recorded (value-wins), and
-			// the revision recorded is the one returned, which the replay below re-records anyway.
-			await this.sourceCache.tryGet(id, 'navigation');
-		}
-		if (this.pending.length === 0 || this.logMovedBases(this.tracker.movedBases()) === 0) {
+		await this.rereadUnretainedBases(this.tracker);
+		// Every replayable action counts, sealed segments included: a moved base under a sealed
+		// segment's operations is re-staged the same way.
+		if (this.segments.replayableCount() === 0 || this.logMovedBases(this.tracker.movedBases()) === 0) {
 			return false;
 		}
 		await this.replayActions();
 		return true;
+	}
+
+	/** One read for each of `tracker`'s pinned blocks the cache does NOT retain — content handed
+	 * through unkept (a below-floor answer, which the cache re-asks for on every read anyway): the
+	 * pin names the revision last served, storage may have caught up since without the log moving,
+	 * and only a read can tell. An evicted-but-kept base needs no read: its content met every floor
+	 * the handle knows, so storage cannot have moved it without a log entry the next refresh will
+	 * walk (and the pend would be refused as stale on revision alone). */
+	private async rereadUnretainedBases(tracker: Tracker<IBlock>): Promise<void> {
+		for (const id of tracker.unretainedBases()) {
+			// `navigation` never upgrades the purpose the original read recorded (value-wins), and
+			// the revision recorded is the one returned, which a replay re-records anyway.
+			await this.sourceCache.tryGet(id, 'navigation');
+		}
 	}
 
 	/** Report each moved base, naming the revision the operations were computed against and the
@@ -1476,7 +1655,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return {
 			transforms: copyTransforms(this.tracker.transforms),
 			pins: this.tracker.pins.copy(),
-			pending: [...this.pending],
+			pending: [...this.segments.open],
+			sealedVersion: this.segments.version,
 			context: structuredClone(this.source.actionContext),
 		};
 	}
@@ -1485,40 +1665,80 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * mutations staged since. Reads through the collection then observe exactly the
 	 * snapshot state again; storage is untouched because nothing was ever synced.
 	 *
-	 * A snapshot is only restorable VERBATIM onto the committed boundary it was captured
-	 * on. If this collection has since ADOPTED a newer committed revision — a rival's
-	 * commit folded in by a refresh while the snapshot's transaction was in flight, e.g.
-	 * the conflict replay that refused a guarded insert (TreeKeyTakenError) — the
-	 * snapshot's transforms describe block state at the OLD boundary, and reinstalling
-	 * them would shadow committed blocks with stale structure. The observed case: an
-	 * INVENTED collection's pre-commit header/root transforms restored over the rival's
-	 * now-committed collection make every later read descend an empty tree, silently
-	 * hiding the committed rows. When the snapshot's pending queue is empty (the
-	 * transaction-rollback shape: the capture predates the transaction's first stage),
-	 * the correct restore target IS the committed state — reset the tracker empty and
-	 * let reads flow through to the adopted revision.
+	 * The snapshot describes the OPEN segment only (docs/offline-sync.md §Rollback and savepoints
+	 * only touch the open segment): its `pending` is the open segment's actions, while its
+	 * `transforms` are the whole tracker at capture, the sealed segments' effects included. Which
+	 * arm a restore takes is decided from three facts — whether the sealed list has changed since
+	 * the capture ({@link CollectionSnapshot.sealedVersion} against {@link SegmentList.version}),
+	 * whether the committed boundary has moved (this collection has since ADOPTED a newer
+	 * revision), and whether any segment is sealed now:
 	 *
-	 * NOTE: a snapshot that carries PENDING actions across a moved boundary (a
-	 * mid-transaction savepoint captured before a mid-transaction refresh adopted a
-	 * rival's commit) still restores verbatim below — rebasing it would require an async
-	 * replay this synchronous method cannot run. That shape predates this guard and
-	 * keeps its old behaviour; if it is ever observed producing stale reads, the rebase
-	 * belongs in an async caller that can replay the pending queue (see replayActions).
+	 * - **Verbatim**, when the sealed list is unchanged and the boundary has not moved: the tracker
+	 *   is reset to a copy of the captured transforms, the captured pins are restored, and the open
+	 *   segment is set to the captured actions. This keeps an INVENTED collection's header, log
+	 *   block and root, which live in the tracker until the first sync and would be lost by a
+	 *   reset. It is the arm every restore took before segments existed, so while nothing is ever
+	 *   sealed nothing behaves differently.
+	 * - **Replay**, when the sealed list has changed — a segment sealed, dropped or refused while
+	 *   the snapshot was outstanding — or when the boundary has moved while a segment is sealed:
+	 *   the open segment is set to the captured actions and the tracker is rebuilt by
+	 *   {@link replayActions}, the sealed segments as they are NOW (refused ones skipped, a newly
+	 *   refused one recorded and reported) and then the restored open actions. Reinstating the
+	 *   captured transforms would put a dropped segment's effects back — the drain removes the
+	 *   head segment after committing it, and the next head commit would commit it a second time
+	 *   — and a reset would drop the sealed segments' effects.
+	 * - A moved boundary with NOTHING sealed keeps the two arms it had before segments. An empty
+	 *   captured open segment (the transaction-rollback shape: the capture predates the
+	 *   transaction's first stage) resets the tracker empty, because the captured transforms
+	 *   describe block state at the OLD boundary and reinstalling them would shadow committed
+	 *   blocks with stale structure — the observed case being an INVENTED collection's pre-commit
+	 *   header/root restored over a rival's now-committed collection, after the conflict replay
+	 *   that refused a guarded insert (TreeKeyTakenError), making every later read descend an
+	 *   empty tree. A non-empty one restores verbatim (the NOTE below).
+	 *
+	 * The staged-base rule (docs/internals.md §Staged Edits Keep Their Base: an update names the
+	 * base it was computed against, and a rollback never pairs operations with the bases of some
+	 * later re-stage) is met differently by the two arms. The verbatim arm restores the captured
+	 * pins beside the captured operations. The replay arm restores none: its reset clears the pin
+	 * store, and every re-staged update pins its base from the read cache as it is now, which IS
+	 * the base the re-staged operations were computed against.
+	 *
+	 * A refusal of the OPEN segment inside the replay arm propagates, as it would out of a
+	 * refresh's replay: the caller rolling back is told that its transaction's own actions no
+	 * longer apply at the boundary the collection is now at. Rare — it needs a sealed change, or a
+	 * sealed segment across a moved boundary, AND a rival between capture and restore — and the
+	 * honest answer; the tracker is then as {@link updateInternal}'s note on a throw out of
+	 * `replayActions` describes.
+	 *
+	 * Latch-free by contract, like {@link snapshotPending}: every caller holds this instance's
+	 * latch or runs on the single call path that excludes a concurrent stage (the coordinator's
+	 * `rollback` and the bridge's savepoint rollback document that assumption).
+	 *
+	 * NOTE: a snapshot that carries PENDING actions across a moved boundary with nothing sealed (a
+	 * mid-transaction savepoint captured before a mid-transaction refresh adopted a rival's commit)
+	 * still restores verbatim. That shape predates the moved-boundary guard and keeps its old
+	 * behaviour; if it is ever observed producing stale reads, route it through the replay arm too.
 	 * The WRITE side of that shape is closed here: the snapshot's base pins are restored with
 	 * its transforms, so the restored operations name the bases they were computed on, and the
 	 * pre-pend re-validation (restageIfBasesMoved) finds those bases moved and re-stages. */
-	restorePending(snapshot: CollectionSnapshot<TAction>): void {
+	async restorePending(snapshot: CollectionSnapshot<TAction>): Promise<void> {
+		const sealedChanged = snapshot.sealedVersion !== undefined && snapshot.sealedVersion !== this.segments.version;
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
 		const boundaryMoved = currentRev !== undefined && (capturedRev === undefined || currentRev > capturedRev);
+		if (sealedChanged || (boundaryMoved && this.segments.hasSealed())) {
+			this.segments.open = [...snapshot.pending];
+			await this.replayActions();
+			return;
+		}
 		if (boundaryMoved && snapshot.pending.length === 0) {
 			this.tracker.reset();
-			this.pending = [];
+			this.segments.open = [];
 			return;
 		}
 		this.tracker.reset(copyTransforms(snapshot.transforms));
 		if (snapshot.pins) this.tracker.pins.replaceWith(snapshot.pins);
-		this.pending = [...snapshot.pending];
+		this.segments.open = [...snapshot.pending];
 	}
 
 	/** A read-only {@link Tracker} pinned to this collection's committed state AS OF the
@@ -1583,35 +1803,213 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return new Tracker(pinnedCache, copyTransforms(transforms));
 	}
 
-	/** The staged (not-yet-synced) actions queued by {@link act}.
+	/** The OPEN segment: the staged (not-yet-synced) actions queued by {@link act} that no
+	 * {@link sealPending} has closed off.
 	 *
 	 * Exposed so a {@link TransactionCoordinator} can append them to the log at
 	 * commit time — mirroring what {@link sync} does internally — when the actions
 	 * were staged directly into this collection (e.g. through a Tree's stage())
-	 * rather than applied via the coordinator's own action path. */
+	 * rather than applied via the coordinator's own action path.
+	 *
+	 * @throws SealedSegmentsError while any segment is sealed: the coordinator's only use is a
+	 * whole-collection append, which would merge the sealed segments' effects (they are in the
+	 * tracker) into one entry under one action id. The throw lands in `commitOnceLatched`'s
+	 * existing catch, which restores every participant. */
 	getPendingActions(): Action<TAction>[] {
-		return this.pending;
+		this.assertNoSealedSegments();
+		return this.segments.open;
 	}
 
-	/** Drop the staged actions after they have been committed through a
-	 * coordinator. Counterpart to {@link getPendingActions}; {@link sync} clears
-	 * its own pending inline, so this is only needed when commit was orchestrated
-	 * externally. */
+	/** Drop the OPEN segment after it has been committed through a coordinator. Counterpart to
+	 * {@link getPendingActions}, which cannot have returned anything while a segment was sealed,
+	 * so only the open segment is ever cleared here; {@link sync} clears its own inline, so this
+	 * is only needed when commit was orchestrated externally. */
 	clearPendingActions(): void {
-		this.pending = [];
+		this.segments.open = [];
 	}
 
-	/** Whether {@link sync} has anything to push: staged actions, or tracker transforms
-	 * that were never committed (an INVENTED collection's header/root blocks live there
-	 * until its first sync, with no pending action to name them).
+	/** Whether {@link sync} has anything to push: staged actions in the open segment, or tracker
+	 * transforms that were never committed — an INVENTED collection's header/root blocks, which
+	 * live there until its first sync with no staged action to name them, and the effects of
+	 * every sealed segment.
 	 *
 	 * This is the exact predicate {@link syncInternal} loops on, so `false` means a sync
 	 * would commit nothing. Exposed so a caller that would otherwise flush
 	 * unconditionally can skip the round trip — note that {@link Tree.sync} routes
 	 * through {@link updateAndSync}, so an unnecessary flush still pays a full,
-	 * cache-bypassing {@link update} before discovering it has nothing to do. */
+	 * cache-bypassing {@link update} before discovering it has nothing to do.
+	 *
+	 * `true` does not promise that {@link sync} can push it: while any segment is sealed, `sync`
+	 * refuses with {@link SealedSegmentsError} rather than committing the sealed effects as one
+	 * entry, so a caller that loops on this over a sealed collection gets that typed error, never
+	 * a silent no-op. Check {@link sealedEntries} first, or commit the head segment.
+	 *
+	 * Nor does `false` promise that nothing is sealed. A sealed segment leaves no tracker transform
+	 * when every one of its actions is refused, or wrote nothing (a blind delete of a key nobody
+	 * holds), so over an otherwise empty tracker this reads `false` while {@link sealedEntries} is
+	 * non-empty. The queue drives off {@link sealedEntries}, never off this predicate. */
 	hasUnsyncedChanges(): boolean {
-		return this.pending.length > 0 || !isTransformsEmpty(this.tracker.transforms);
+		return this.segments.open.length > 0 || !isTransformsEmpty(this.tracker.transforms);
+	}
+
+	/** Close the open segment into a sealed segment owned by `entryId` (see {@link SegmentList}).
+	 * Returns `false` and changes nothing when the open segment is empty: an invented collection's
+	 * header transforms are not an action and are not sealed, so an entry that staged nothing here
+	 * owns no segment here. Throws when `entryId` is already sealed in this collection.
+	 *
+	 * Synchronous and latch-free by contract, like {@link snapshotPending}: the caller brackets it
+	 * (no concurrent act or sync is in flight). */
+	sealPending(entryId: EntryId): boolean {
+		return this.segments.seal(entryId);
+	}
+
+	/** The entry ids of the sealed segments, oldest first — refused ones included, until dropped. */
+	sealedEntries(): EntryId[] {
+		return this.segments.entryIds();
+	}
+
+	/** The log tail block id the most recent header read named ({@link logTailId}), for a caller that
+	 * resolves this collection's cohorts from routing keys without a read — the offline queue's
+	 * reachability gate (docs/offline-sync.md §When to submit). `undefined` before the first header
+	 * read of an invented collection; possibly stale by one roll-over, which costs that caller nothing
+	 * worse than asking about a block the collection has moved on from. */
+	knownLogTailId(): BlockId | undefined {
+		return this.logTailId;
+	}
+
+	/** The refusal recorded for `entryId`'s segment by a replay that excluded it (see
+	 * {@link replayActions}), or `undefined` when the segment is not refused — or not sealed here. */
+	sealedRefusal(entryId: EntryId): ActionRefusedError | undefined {
+		return this.segments.find(entryId)?.refused;
+	}
+
+	/** The sealed segment `entryId` owns here: its actions, the array the segment holds (never
+	 * mutated by a caller; the offline journal serialises it), or `undefined` when the entry is not
+	 * sealed here. Synchronous and latch-free, like {@link sealedEntries}. */
+	sealedActions(entryId: EntryId): readonly Action<TAction>[] | undefined {
+		return this.segments.find(entryId)?.actions;
+	}
+
+	/** The OPEN segment's actions — what the current transaction has staged since the last seal — as
+	 * the array the segment holds (never mutated by a caller). Unlike {@link getPendingActions} it
+	 * answers while segments are sealed, for a reader that judges the open transaction beside the
+	 * queued ones (the Quereus plugin's `CommitOutlook()`). Synchronous and latch-free, like
+	 * {@link sealedActions}. */
+	openActions(): readonly Action<TAction>[] {
+		return this.segments.open;
+	}
+
+	/** The exact inverse of {@link sealPending}, list-only and latch-free by the same contract: move
+	 * the segment's actions back into the open segment, for an enqueue whose journal write failed
+	 * after sealing (`OfflineQueue.enqueue`, which unseals every collection it sealed, in reverse
+	 * order, and rethrows). Requires the segment to be the NEWEST sealed one and the open segment to
+	 * be empty — both true at that one call site, which has just sealed and staged nothing since —
+	 * and throws otherwise (`SegmentList.unseal`). The tracker is untouched: its transforms are
+	 * already what they were before the seal. The segment version moves, so a snapshot taken before
+	 * the transaction restores by replay ({@link restorePending}), which ends with the transaction's
+	 * actions gone once the caller rolls it back. */
+	unseal(entryId: EntryId): void {
+		this.segments.unseal(entryId);
+	}
+
+	/** Whether this collection's committed context names `attempt.actionId` at `attempt.rev`: the
+	 * write that attempt sent is committed here, and this handle has adopted it. This is how a restore
+	 * after a restart recognises, before re-staging a journaled segment, that the segment's network
+	 * commit landed and the crash came after it (docs/offline-sync.md §Restore after a restart):
+	 * re-staging such a segment would run its own guards against its own committed rows (`absent`
+	 * refuses on a present key) and fail the entry with `constraint`, the opposite of the truth.
+	 * `false` for an invented collection, which has no context. Synchronous and latch-free.
+	 *
+	 * NOTE: `actionIdAt` reaches back only to the most recent checkpoint, and no checkpoint is written
+	 * today (backlog `debt-the-collection-log-never-writes-a-checkpoint`); if that changes, read the
+	 * log's entry at `attempt.rev` instead, since a committed attempt behind a checkpoint would
+	 * otherwise answer `false` and be re-staged against itself. */
+	holdsCommitted(attempt: ActionRev): boolean {
+		const context = this.source.actionContext;
+		return context !== undefined && context.rev >= attempt.rev && actionIdAt(context, attempt.rev) === attempt.actionId;
+	}
+
+	/**
+	 * Put a sealed segment back, holding `actions` under `entryId`, at `position` in the sealed list —
+	 * ahead of the segment `before` names, or last — and rebuild the tracker by replaying every
+	 * replayable segment in order ({@link replayActions}), for the offline queue's restore after a
+	 * restart (`OfflineQueue.restore`; docs/offline-sync.md §Restore after a restart). A record
+	 * restored late belongs ahead of entries queued since, in the queue and in each collection's
+	 * sealed list alike, or the head commit's "head is first" rule and the queue's order disagree;
+	 * hence insertion rather than appending, at the cost of the one replay every insertion costs.
+	 *
+	 * The replay records and reports each refusal it meets as a refresh's would — EXCEPT this
+	 * segment's own, which is recorded on the segment and RETURNED rather than reported through
+	 * `onSealedRefused`: the queue registers the entry and hears the result from its own `stage`
+	 * callback, since the collection cannot report it to a queue that does not yet list the entry. A
+	 * later segment the replay newly refuses (this segment inserts the key it also inserts, say) is
+	 * reported through `onSealedRefused` as any replay's would be.
+	 *
+	 * Takes the collection latch, like {@link dropSealed}. Throws before anything changes when the
+	 * open segment is non-empty (a transaction is open, and its actions were staged over state without
+	 * this segment; the only caller refuses to restore mid-transaction), when a head commit is in
+	 * flight ({@link SealedSegmentsError}, `in-flight`), when `entryId` is already sealed here, or when
+	 * `before` names no segment here. A replay error that is not a refusal (a block the replay could
+	 * not read, say) propagates with the segment REMOVED again: the caller's restore rolls back and
+	 * may try this entry again later, which would otherwise meet its own segment as "already sealed".
+	 * The tracker is then half re-staged, the state a refresh's replay that throws leaves too (backlog
+	 * `debt-a-failed-refresh-can-leave-a-collection-half-restaged`); the next replay rebuilds it.
+	 *
+	 * @returns this segment's own refusal, when the replay refused it; `undefined` when it staged. */
+	async restoreSealed(entryId: EntryId, actions: readonly Action<TAction>[], position: { before: EntryId } | 'last'): Promise<ActionRefusedError | undefined> {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			if (this.segments.open.length > 0) {
+				throw new Error(`Collection ${this.id}: cannot restore sealed segment ${entryId} while a transaction has `
+					+ `${this.segments.open.length} action(s) staged in the open segment`);
+			}
+			if (this.headInFlight !== undefined) {
+				throw new SealedSegmentsError(this.id, this.segments.entryIds(), 'in-flight', this.headInFlight.entryId);
+			}
+			this.segments.insert(entryId, actions, position === 'last' ? undefined : position.before);
+			try {
+				await this.replayActions(entryId);
+			} catch (err) {
+				this.segments.drop(entryId);
+				throw err;
+			}
+			return this.segments.find(entryId)?.refused;
+		} finally {
+			release();
+		}
+	}
+
+	/** Remove the sealed segment owned by `entryId`, wherever it sits, and rebuild the tracker by
+	 * replaying what remains ({@link replayActions}). A later segment whose guard now refuses — one
+	 * that updated a row the dropped segment inserted, say — is recorded and reported through
+	 * `onSealedRefused` during that replay; cascading the removal through the queue's other
+	 * collections is the queue's job (docs/offline-sync.md §Removing an entry). Throws for an id
+	 * that is not sealed here, before anything changes, and {@link SealedSegmentsError} (`in-flight`)
+	 * for the segment a {@link commitHead} on this instance is carrying to the network — the only
+	 * segment that cannot be dropped while it waits, since the outcome being applied names it.
+	 * Another segment can be: the replay here rebuilds the live tracker, which the head commit's own
+	 * tracker does not depend on.
+	 *
+	 * Takes the collection latch, like {@link update}. */
+	async dropSealed(entryId: EntryId): Promise<void> {
+		const release = await Latches.acquire(this.latchId);
+		try {
+			if (this.headInFlight?.entryId === entryId) {
+				throw new SealedSegmentsError(this.id, this.segments.entryIds(), 'in-flight', entryId);
+			}
+			this.segments.drop(entryId);
+			await this.replayActions();
+		} finally {
+			release();
+		}
+	}
+
+	/** The refusal every whole-collection commit path makes while a segment is sealed (see
+	 * {@link SealedSegmentsError}). */
+	private assertNoSealedSegments(): void {
+		if (this.segments.hasSealed()) {
+			throw new SealedSegmentsError(this.id, this.segments.entryIds());
+		}
 	}
 
 	/** The committed revision this collection currently READS at, or `undefined` for an
@@ -1764,8 +2162,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * path, which is the same assumption the participant selection in
 	 * `TransactionCoordinator.commitOnce` and its `rollback` already rest on. If a second writer is
 	 * ever allowed to drive the SAME instance concurrently, this must become a per-attempt token (a
-	 * mark object compared by identity, refusing to replace a live one) rather than a bare id. */
-	beginInFlightAction(actionId: ActionId): () => void {
+	 * mark object compared by identity, refusing to replace a live one) rather than a bare id.
+	 *
+	 * `cycle` is what every send of the cycle carries ({@link InFlightCycle}); a re-mark replaces it,
+	 * which is harmless because every caller re-marks with what it marked. */
+	beginInFlightAction(actionId: ActionId, cycle: InFlightCycle = {}): () => void {
 		if (this.inFlightActionId !== actionId) {
 			// A different action's failed attempt cannot finish this one. Re-marking the SAME id (a
 			// coordinator re-marks on every attempt) keeps what the previous attempt retained — that
@@ -1775,11 +2176,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			this.mintedLogBlockIds = undefined;
 		}
 		this.inFlightActionId = actionId;
+		this.inFlightCycle = cycle;
 		return () => {
 			if (this.inFlightActionId === actionId) {
 				this.inFlightActionId = undefined;
 				this.inFlightAttempt = undefined;
 				this.mintedLogBlockIds = undefined;
+				this.inFlightCycle = {};
 			}
 		};
 	}
@@ -1791,12 +2194,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * a path that does not still never reports a half-landed write as saved (the refresh then
 	 * refuses with a `transforms-not-held` {@link TornActionError}), but it cannot recover from one.
 	 *
-	 * A no-op unless `actionId` is the action currently marked, so a late call from an attempt whose
-	 * cycle has already ended cannot plant transforms under somebody else's mark. Latch-free and
+	 * A no-op unless the attempt's action is the one currently marked, so a late call from an attempt
+	 * whose cycle has already ended cannot plant transforms under somebody else's mark. Latch-free and
 	 * synchronous, like the mark itself: `TransactionCoordinator` calls it from inside its commit
 	 * span, where it already holds this instance's latch. */
-	retainInFlightAttempt(actionId: ActionId, attempt: InFlightAttempt): void {
-		if (this.inFlightActionId === actionId) {
+	retainInFlightAttempt(attempt: InFlightAttempt): void {
+		if (this.inFlightActionId === attempt.actionId) {
 			this.inFlightAttempt = attempt;
 		}
 	}
@@ -1869,131 +2272,52 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
+	/** The refresh a write's attempt cycle runs between attempts ({@link AttemptCycle.refreshUntilSettled}):
+	 * {@link updateInternal}, under the latch the write already holds and with its action marked in
+	 * flight, so the refresh recognises the write's own log entry. */
+	private readonly refreshBetweenAttempts: Refresh = (report, lastChance, tailFloor) =>
+		this.updateInternal(report, lastChance, tailFloor);
+
 	/** Mints the one action id this sync reuses across all of its retry attempts, and owns it for
 	 * the WHOLE cycle — including the inter-attempt refresh, which is the only thing that reads it
 	 * (see {@link inFlightActionId}). `sync()`/`updateAndSync()` hold the collection latch across
 	 * all of this, so the mark's lifetime is contained inside the latched span here; the disposer
 	 * runs on every exit, including a throw out of retry exhaustion or an abort. */
 	private async syncInternal(options?: SyncOptions): Promise<WriteDurability | undefined> {
-		const bytes = randomBytes(16);
-		const actionId = uint8ArrayToString(bytes, 'base64url');
-		// One timestamp for the WRITE, minted here beside the action id and for the same reason: an
-		// attempt that takes its own would make the retry's log block differ from the one the
-		// attempt it repeats may already have stored under this `(action id, revision)`.
-		const timestamp = Date.now();
+		// Before an action id is minted: a sync commits the whole tracker as one entry, and over
+		// sealed segments that entry would carry several queue entries' effects.
+		this.assertNoSealedSegments();
+		const identity: WriteIdentity = {
+			actionId: uint8ArrayToString(randomBytes(16), 'base64url'),
+			// One timestamp for the WRITE, minted here beside the action id and for the same reason: an
+			// attempt that takes its own would make the retry's log block differ from the one the
+			// attempt it repeats may already have stored under this `(action id, revision)`.
+			timestamp: Date.now(),
+		};
 
-		const endInFlight = this.beginInFlightAction(actionId);
+		const endInFlight = this.beginInFlightAction(identity.actionId, { refuseSolo: options?.refuseSoloCommit });
 		try {
-			return await this.syncAttempts(actionId, timestamp, options);
+			return await this.syncAttempts(identity, options);
 		} finally {
 			endInFlight();
 		}
 	}
 
-	/** The retry loop behind {@link syncInternal}, run with `actionId` already marked in flight.
+	/** The retry loop behind {@link syncInternal}, run with the action already marked in flight: the
+	 * attempt machinery of {@link AttemptCycle} and {@link stageAttempt}, aimed at the open segment
+	 * over the live tracker. {@link commitHead} drives the same machinery at the head segment.
 	 *
-	 * @param timestamp the WRITE's time, stamped on the log entry every attempt appends — see
-	 * {@link syncInternal}, which mints it.
 	 * @returns the durability of what this sync committed, or `undefined` when the loop never ran a
 	 * commit (nothing staged). See {@link sync}. */
-	private async syncAttempts(actionId: ActionId, timestamp: number, options?: SyncOptions): Promise<WriteDurability | undefined> {
-		const maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
-		const baseBackoffMs = options?.baseBackoffMs ?? PendingRetryDelayMs;
-		const maxBackoffMs = options?.maxBackoffMs ?? DefaultMaxBackoffMs;
-		const maxStalledAttempts = options?.maxStalledAttempts ?? DefaultMaxStalledAttempts;
-		const deadlineMs = options?.deadlineMs;
-		const signal = options?.signal;
-		const startedAt = Date.now();
-
-		// Count of consecutive stale failures that made no forward progress. Reset to 0 on every
-		// successful transact, so the cap bounds only a persistently-failing sync — a legitimate
-		// large multi-batch sync (which iterates many times committing progress) never trips it.
-		let consecutiveFailures = 0;
-		let lastReason: string | undefined;
-		// Highest confirmed revision any responder has reported holding, accumulated with the
-		// codebase's single rule for picking among several candidates. Reported on the error, and
-		// the evidence the stall check below reasons from.
-		let lastStaleAt: { blockId: BlockId; rev: number } | undefined;
-		// Whether the failure most recently handled carried its OWN staleAt. A strike needs the
-		// responder to have re-confirmed the number this round, not merely an older observation
-		// left standing in `lastStaleAt`.
-		let lastFailureConfirmedStaleAt = false;
-		// Refused attempts of this write that carried their own staleAt. Never reset: a member counts
-		// its stale refusals per action for the action's whole life, and this is the writer's view of
-		// that count (see retryBackoffMs).
-		let confirmedLosses = 0;
-		// Consecutive refreshes that moved `getNextRev()` nowhere at all while a confirmed revision
-		// stood at or above it.
-		let consecutiveStalls = 0;
-		// The revision the PREVIOUS iteration would have requested, so the stall check can tell a
-		// refresh that moved nowhere from one that is still climbing toward the confirmed number.
-		let previousRequestedRev: number | undefined;
-		// Who holds what this sync has committed so far. Stays `undefined` while nothing has been
-		// committed, which is also the answer when the loop never runs at all — a sync with nothing
-		// staged writes nothing, and there is no durability to fabricate for it. Failed attempts never
-		// contribute: a refused attempt left nothing behind, so the answer is the committing attempt's.
-		let durability: WriteDurability | undefined;
-
+	private async syncAttempts(identity: WriteIdentity, options?: SyncOptions): Promise<WriteDurability | undefined> {
+		const cycle = new AttemptCycle(this.id, this.instanceTag, options);
 		while (this.hasUnsyncedChanges()) {
-			if (signal?.aborted) {
-				throw makeAbortError(signal);
-			}
-			// Progress-agnostic ceiling: give up if the wall-clock deadline passed. Deliberately
-			// ahead of the stall check: the deadline is the documented outer bound, so a sync that
-			// is both past it and stalled reports the deadline.
-			if (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs) {
-				throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason ?? 'deadline exceeded', lastStaleAt);
-			}
-
-			// Can the attempt about to run possibly differ from the one that just failed? Only when
-			// BOTH of these hold is the answer provably no:
-			//
-			//  - The revision it would request is at or below one a responder CONFIRMED is taken. A
-			//    producer sets `staleAt` only after reading that revision as durably held by someone
-			//    else out of its own storage, revisions are one per-collection counter that every
-			//    commit touches, and a confirmed revision never becomes un-taken (invalidation takes
-			//    a NEW slot). So the request is already lost before it is sent.
-			//  - The refresh in between moved the collection nowhere. `advanceContext` never lowers
-			//    the held revision, so "nowhere" is exactly `requestedRev` unchanged since the last
-			//    iteration. A refresh that moved forward WITHOUT clearing the confirmed number is a
-			//    collection still climbing (it read a replica that lags the holder — the same
-			//    partial catch-up `reportShortfall` exists to report), and its next attempt is a
-			//    genuinely different request that may yet win.
-			//
-			// This is NOT a second answer to "is this failure retryable?" — `isConflictFailure`
-			// remains the sole rule for that, untouched. It only ever stops a loop that rule had
-			// already decided to continue.
-			const requestedRev = this.getNextRev();
-			const refreshMoved = previousRequestedRev !== undefined && requestedRev > previousRequestedRev;
-			previousRequestedRev = requestedRev;
-			if (lastStaleAt !== undefined) {
-				if (requestedRev > lastStaleAt.rev || refreshMoved) {
-					// Either the refresh adopted a revision above the confirmed one — ordinary
-					// contention, where the rival's commit is exactly what we just read — or it made
-					// partial forward progress. Both mean the next attempt differs. Not a stall.
-					consecutiveStalls = 0;
-				} else if (lastFailureConfirmedStaleAt) {
-					consecutiveStalls++;
-					if (log.enabled) {
-						log('collection:sync-stalled id=%s tag=%s heldRev=%s requestedRev=%d staleBlock=%s staleRev=%d strike=%d of=%d',
-							this.id, this.instanceTag, this.source.actionContext?.rev ?? 'none', requestedRev,
-							lastStaleAt.blockId, lastStaleAt.rev, consecutiveStalls, maxStalledAttempts);
-					}
-					// Two strikes, not one: a legitimate loser can transiently read a view that has
-					// not yet caught up with the rival's commit, which looks identical for one round.
-					if (consecutiveStalls >= maxStalledAttempts) {
-						throw new SyncRevisionStalledError(this.id, consecutiveFailures, lastStaleAt,
-							requestedRev, this.source.actionContext?.rev, lastReason);
-					}
-				}
-				// Else: the responder told us nothing new this round. No strike, and no reset either
-				// — the budget stays bounded by maxAttempts.
-			}
+			cycle.beforeAttempt(this.getNextRev(), this.source.actionContext?.rev);
 
 			// A pending action is never pended over a base that has moved under it — before EVERY
 			// attempt, first and retries alike (see restageIfBasesMoved for why the retry needs it).
-			// NOTE: this is the one way the byte-identity the append below relies on can be broken at
-			// an UNCHANGED revision — a replay re-runs the action handlers, which mint fresh ids for
+			// NOTE: this is the one way the byte-identity the append relies on can be broken at an
+			// UNCHANGED revision — a replay re-runs the action handlers, which mint fresh ids for
 			// whatever blocks they insert, so the retry sends different content under this write's
 			// `(action id, revision)`. It needs a base to move without this collection adopting a
 			// newer revision, which takes a block re-read that catches up while the log does not
@@ -2003,219 +2327,63 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// abandon the action id and re-drive as a NEW write rather than to suppress the replay.
 			await this.restageIfBasesMoved();
 
-			// Snapshot the pending actions so that any new actions aren't assumed to be part of this action
-			const pending = [...this.pending];
-
-			// Create a snapshot tracker for the action, so that we can ditch the log changes if we have to retry the action.
-			// It SHARES the live tracker's pin store: the snapshot inherits transforms by copy and never
-			// stages the data-block updates itself, so without the shared pins the digest pass below
-			// could only describe bases still resident in the read cache.
-			// NOTE: an attempt that ends in a stale failure is abandoned WITHOUT reset(), so the log
-			// tail/header bases its append pinned stay in the shared store until the live tracker's
-			// next reset. Bounded and harmless — a few log blocks per attempt, capped by maxAttempts,
-			// each re-validated against the source generation before any use — but if this loop ever
-			// grows a per-attempt footprint beyond the log blocks, reset the abandoned tracker on the
-			// stale-failure branch instead of letting the residue ride to the end of the sync.
-			const snapshot = copyTransforms(this.tracker.transforms);
-			const tracker = new Tracker(this.sourceCache, snapshot, this.tracker.pins);
-
-			// Add the action to the log (in local tracking space). The append is a fixed function of
-			// this write and the revision it is requesting: the timestamp was minted once for the
-			// whole write (syncInternal) and any data block the append has to mint takes the id an
-			// earlier attempt at this revision already minted (logAppendBlockIds).
-			const newRev = this.getNextRev();
-			const collectionLog = await Log.open<Action<TAction>>(tracker, this.id,
-				{ newDataBlockId: this.logAppendBlockIds(tracker, actionId, newRev) });
-			if (!collectionLog) {
-				throw new Error(`Log not found for collection ${this.id}`);
-			}
-			const addResult = await collectionLog.addActions(pending, actionId, newRev,
-				() => tracker.transformedBlockIds(), { timestamp });
-
-			// Declare what each touched block will contain once committed, computed from this snapshot
-			// tracker (which layers over `this.sourceCache`, so the peek/getCachedRevision probes are
-			// live). Purely local — an id whose base is not already cached is simply omitted and falls
-			// back to corroboration on the member side. Computed AFTER the log append so the log tail
-			// and header transforms this attempt just staged are digested too.
-			// NOTE: recomputed from scratch on every retry attempt (the snapshot tracker is rebuilt each
-			// iteration), so a sync that loses N races pays N full hashing passes over its touched
-			// blocks. Unmeasured and cheap relative to the round trips it is retrying; if a
-			// high-contention sync ever shows digest hashing in a profile, memoize per (id, staged ops).
-			const touched = await describeTouchedBlocks(tracker, tracker.transformedBlockIds());
-			// No block may be left larger than one message can carry. Refused here, before anything is
-			// sent, as the transaction limit is at the pend, and judged apart from the declaration, which
-			// never throws: only the blocks it could materialize are measured (see describeTouchedBlocks).
-			// It escapes `sync` unretried — a later attempt would leave the same block — and nothing on
-			// this instance has been touched, since the attempt ran on the snapshot tracker.
-			const tooLarge = oversizedBlock(touched.bytes);
-			if (tooLarge) throw tooLarge;
-			const blockDigests = touched.digests;
-			// The base each update-only block's operations were computed against, for the pend (see
-			// `PendRequest.baseRevs`): the tracker's pinned revisions, which `restageIfBasesMoved` at the
-			// top of this iteration has just re-judged, so a moved base was re-staged before it is named.
-			const baseRevs = tracker.stagedBaseRevs(tracker.transformedBlockIds());
-
-			// Commit the action to the transactor. Carry the aged retry priority derived from the
-			// consecutive-failure count so a sync that keeps losing concurrent races out-ranks fresh
-			// (priority-0) rivals in the cluster's resolveRace (fairness-only; capped at MaxPriority).
-			// First attempt has consecutiveFailures == 0, so priority 0 — the common pend is unchanged.
-			const attempt = await this.source.transact(tracker.transforms, actionId, newRev, this.id, addResult.tailPath.block.header.id, clampPriority(consecutiveFailures), blockDigests, baseRevs);
+			// Snapshot the open segment so that any new actions aren't assumed to be part of this action
+			// (no segment is sealed here — syncInternal refused if one was).
+			const pending = [...this.segments.open];
+			const staged = await this.buildAttempt({ actions: pending, transforms: this.tracker.transforms, pins: this.tracker.pins }, identity);
+			const attempt = await this.send(staged, identity, cycle.priority());
 			if (!attempt.success) {
-				if (isExpiryFailure(attempt)) {
-					// The next attempt's expiration comes from the same clock, so it would be refused the
-					// same way; stop here by name. Nothing on this instance has been touched — the attempt
-					// ran on a snapshot tracker — so the staged actions are still staged for a sync after
-					// the clock is fixed.
-					// NOTE: an expiry refusing a commit SWEEP (`NetworkTransactor.commitTailThenSweep`)
-					// arrives after the log tail was stored, and no refresh follows this throw, so that
-					// attempt's log entry stays behind with none of its data — the state the budget-exhausted
-					// exit below leaves too. Needs a sweep cohort whose clocks disagree while the tail's agree;
-					// tracked with the other leftover-entry exits in
-					// tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
-					throw new TransactionExpiredError(attempt.expired);
-				}
-				consecutiveFailures++;
-				lastReason = attempt.reason ?? lastReason;
-				// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
-				// responder reporting a LOWER number understates the binding constraint. Same rule the
-				// producers and the transactor's aggregation already use.
-				lastStaleAt = highestStaleAt([lastStaleAt, attempt.staleAt]);
-				lastFailureConfirmedStaleAt = attempt.staleAt !== undefined;
-				if (lastFailureConfirmedStaleAt) confirmedLosses++;
-				// Give up once the consecutive no-progress budget is exhausted, so a transactor that
-				// persistently rejects the sync can no longer hold the collection latch forever.
-				// NOTE: this also bounds the legitimate `pending`-wait case (retrying the same action
-				// while another commit is in flight), which used to retry indefinitely. Default 10
-				// attempts ≈ 21s of exponential backoff. If a high-contention workload legitimately
-				// needs to wait longer for a pending commit to clear, raise maxAttempts for that caller.
-				// NOTE: no refresh follows the LAST budgeted attempt, so if that attempt's log tail
-				// landed nobody finds out: the caller gets plain exhaustion over a log that holds an
-				// entry for this write. The write is still never reported saved, which is the rule; what
-				// is lost is the more specific name (TornActionError). The leftover entry itself is
-				// tracked in tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
-				if (consecutiveFailures >= maxAttempts) {
-					throw new SyncRetryExhaustedError(this.id, consecutiveFailures, lastReason, lastStaleAt);
-				}
-				// Keep exactly what this attempt sent. A refused commit is not proof nothing landed:
-				// the log tail is committed first and can be stored while the answer is still a
-				// failure, and `transact` has just cancelled every block that did not land. If the
-				// refresh below finds this attempt's own entry, these are the transforms that finish
-				// the action (see completeOwnEntry). The snapshot tracker is abandoned after this
-				// iteration, so its transforms are handed over as-is, uncopied.
-				this.retainInFlightAttempt(actionId, {
-					rev: newRev,
-					transforms: tracker.transforms,
-					tailId: addResult.tailPath.block.header.id,
-					...(blockDigests === undefined ? {} : { blockDigests }),
-					...baseRevsField(baseRevs),
-				});
-				// Refresh, and keep refreshing while it reports that this write's own half-landed
-				// action could not be finished YET. It must not fall through to a new attempt in that
-				// state: this action's log entry is already durable, and as soon as a refresh adopts a
-				// newer revision a new attempt appends a SECOND entry under the same action id — the
-				// duplicate consumeOwnEntry exists to prevent. (At an unchanged revision the rebuild
-				// is byte-identical — see logAppendBlockIds — so what is at stake is the second entry,
-				// not two versions of one tail block.) Each round is a failure against the same
-				// no-progress budget as a refused attempt.
-				// Whether the failure just handled was a loss to a rival already durably committed. Only
-				// the attempt's own refusal can say so; a refresh refused for a cause that can clear
-				// (below) is a race against something still in flight, and clears it.
-				let latestConfirmed = lastFailureConfirmedStaleAt;
-				for (;;) {
-					// Back off before every retry (any stale failure — reason/missing/pending), growing
-					// exponentially from the base delay up to the cap, with proportional random jitter so a
-					// herd of clients that lost the same race does not re-collide on the next tick (see
-					// utility/backoff.ts) — except once this write has lost to committed rivals often enough
-					// that a member holds the next slot for it (see retryBackoffMs). The abortable sleep lets
-					// an aborted sync reject promptly instead of finishing the sleep.
-					// NOTE: the `missing`/`reason` conflict paths now pay this backoff too (they previously
-					// retried with zero delay); that is what stops the persistent-`reason` hot spin. If a
-					// high-contention workload ever shows this base delay as recovery latency, lower
-					// baseBackoffMs for that caller rather than reintroducing the zero-delay retry.
-					const delay = retryBackoffMs(consecutiveFailures, confirmedLosses, latestConfirmed,
-						{ baseMs: baseBackoffMs, capMs: maxBackoffMs }, options?.rand);
-					await abortableDelay(delay, signal);
-					try {
-						// Fetch latest state - updateInternal() will call replayActions() if there are conflicts.
-						// This sync's actionId is marked in flight for the whole cycle (see syncInternal), so
-						// the refresh recognizes a log entry written by THIS action (its log tail landed but
-						// the commit answered failure), FINISHES that action from the attempt retained
-						// above, and only then consumes the entry rather than replaying it into a duplicate.
-						// The round that would spend the last of the budget settles a half-landed write
-						// instead of asking for another round, so the error that escapes below says
-						// whether the write can still land. (A deadline cannot be foreseen the same
-						// way; a write given up on it escapes unsettled, as `final: false`.)
-						// The highest revision a responder confirmed is taken rides out as the floor of
-						// the refresh's tail read, so a machine that has not caught up to it is not the
-						// last one asked (see updateInternal).
-						const report: RefreshReport = {};
-						await this.updateInternal(report, consecutiveFailures + 1 >= maxAttempts, lastStaleAt?.rev);
-						const completed = report.ownEntryFinished?.durability;
-						if (completed !== undefined) {
-							// The refresh made this sync's write durable: that is a commit, and it is
-							// reported and counted exactly like one made by an attempt (see the success
-							// branch below for why batches fold to the weakest).
-							durability = durability === undefined ? completed : mergeDurability([durability, completed]);
-							consecutiveFailures = 0;
-							lastReason = undefined;
-							lastStaleAt = undefined;
-							lastFailureConfirmedStaleAt = false;
-							consecutiveStalls = 0;
-						}
-						break;
-					} catch (err) {
-						if (!(err instanceof TornActionError) || err.reason !== 'completion-refused') {
-							throw err;
-						}
-						// Refused for a cause that can clear. The error already names the write as torn,
-						// which is the truth if the budget ends here — so it, not a plain exhaustion,
-						// is what escapes: the log holds an entry for a write that was not saved.
-						consecutiveFailures++;
-						lastReason = err.detail;
-						latestConfirmed = false;
-						if (consecutiveFailures >= maxAttempts
-							|| (deadlineMs !== undefined && Date.now() - startedAt >= deadlineMs)) {
-							throw err;
-						}
-					}
-				}
+				cycle.recordRefusal(attempt);
+				this.retainInFlightAttempt(retainedAttempt(staged, identity.actionId));
+				await cycle.refreshUntilSettled(this.refreshBetweenAttempts);
 			} else {
-				// This attempt's commit landed, so its durability is the one to report. A sync that
-				// commits ONCE — every sync that has a caller today — reports exactly that answer,
-				// untouched. A sync whose loop commits more than one batch (the `hasUnsyncedChanges`
-				// condition re-entering after a successful commit) folds the batches with
-				// `mergeDurability`, whose scalar answer is the WEAKEST of them: one batch that only
-				// reached the writer makes the whole sync only-on-the-writer, and reporting the last
-				// batch's class instead would show such a write as saved.
-				durability = durability === undefined ? attempt.durability : mergeDurability([durability, attempt.durability]);
-				// Forward progress: reset the no-progress budget.
-				consecutiveFailures = 0;
-				lastReason = undefined;
-				lastStaleAt = undefined;
-				lastFailureConfirmedStaleAt = false;
-				consecutiveStalls = 0;
-				// Clear the pending actions that were part of this action
-				this.pending = this.pending.slice(pending.length);
-				// Reset cache and replay any actions that were added during the action
-				const transforms = tracker.reset();
-				// NOTE: this replay runs BEFORE the cache fold and the context bump below — the
-				// inverse of the order `updateInternal` and `TransactionCoordinator.commitOnce`
-				// both document as required, where the newly committed state must be visible
-				// before anything re-reads. Dormant today: `act()` and `syncInternal` take the
-				// same collection latch, so `this.pending` cannot grow during the transact above
-				// and the slice always leaves it empty, making this replay a no-op reset. If a
-				// path ever stages outside that latch, move the transformCache + actionContext
-				// lines above this replay — otherwise the replay re-reads at the superseded
-				// revision over a cache that has not yet seen the commit, and re-stages onto a
-				// root the commit already replaced.
+				cycle.recordCommit(attempt.durability);
+				// Clear the open-segment actions that were part of this action
+				this.segments.open = this.segments.open.slice(pending.length);
+				// Fold the committed transforms into the read cache and adopt the revision BEFORE
+				// replaying whatever is still staged — the order `updateInternal` and
+				// `TransactionCoordinator.commitOnceLatched` require, where the newly committed state
+				// must be visible before anything re-reads. It is load-bearing here for an invented
+				// collection's first commit: the replay resets to the invented baseline while no
+				// context is adopted, so replaying first would reinstate the header insert over the
+				// now-committed header and `hasUnsyncedChanges()` would never turn false. (While
+				// `act()` shares this latch nothing new is staged mid-attempt, so the replay re-stages
+				// nothing; {@link commitHead} stages while its transact is in flight and relies on
+				// this order.)
+				this.foldOwnCommit(staged, identity.actionId);
 				await this.replayActions();
-				this.sourceCache.transformCache(transforms, newRev);
-				this.source.actionContext = this.source.actionContext
-					? { committed: [...this.source.actionContext.committed, { actionId, rev: newRev }], rev: newRev }
-					: { committed: [{ actionId, rev: newRev }], rev: newRev };
 			}
 		}
-		return durability;
+		return cycle.durability;
+	}
+
+	/** Build one attempt at the revision this collection would commit at next ({@link stageAttempt});
+	 * the ids its log append may have to mint come from {@link logAppendBlockIds}, so a retry at the
+	 * same revision appends the same entry. */
+	private buildAttempt(target: AttemptTarget<TAction>, identity: WriteIdentity): Promise<StagedAttempt> {
+		const rev = this.getNextRev();
+		return stageAttempt(this.id, this.sourceCache, target, identity, rev,
+			store => this.logAppendBlockIds(store, identity.actionId, rev));
+	}
+
+	/** Send one attempt — pend, then commit — under the cycle's aged retry `priority`, carrying what
+	 * the cycle asked of every send ({@link inFlightCycle}). */
+	private send(staged: StagedAttempt, identity: WriteIdentity, priority: number): Promise<CommitResult> {
+		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId, {
+			priority,
+			blockDigests: staged.blockDigests,
+			baseRevs: staged.baseRevs,
+			refuseSolo: this.inFlightCycle.refuseSolo
+		});
+	}
+
+	/** Fold a committed attempt's transforms — the log append included — into this instance's read
+	 * cache and adopt the revision it committed at. Every caller does this BEFORE replaying what is
+	 * still staged (see the note in {@link syncAttempts}). Takes the transforms out of the attempt's
+	 * tracker, which is finished with. */
+	private foldOwnCommit(staged: StagedAttempt, actionId: ActionId): void {
+		this.sourceCache.transformCache(staged.tracker.reset(), staged.rev);
+		this.recordCommitted(actionId, staged.rev);
 	}
 
 	/** Refresh from the transactor, then push. Same return contract as {@link sync}: the durability of
@@ -2228,6 +2396,287 @@ export class Collection<TAction> implements ICollection<TAction> {
 		} finally {
 			release();
 		}
+	}
+
+	/** Commit exactly the head sealed segment — the oldest, `entryId` — as one log entry under the
+	 * action id and timestamp `options` supplies, for the offline-sync queue's drain
+	 * (docs/offline-sync.md §One entry, one network transaction): {@link openHeadCommit} followed by
+	 * the one-collection driver, `driveHeadCommit` in head-commit.ts, with the handle closed on every
+	 * exit. The attempt machinery is {@link syncAttempts}' ({@link AttemptCycle}, {@link stageAttempt});
+	 * what differs is the target — a head tracker ({@link headTrackerFor}) — and the latch, released
+	 * around the one network `await` ({@link HeadCommitHandle.release}). `options.recordAttempt` is
+	 * called with each attempt before it is sent, and `options.resume` hands back an attempt an
+	 * earlier cycle under the same action id recorded (see {@link HeadCommitOptions}).
+	 *
+	 * @returns what {@link sync} returns: who holds the commit, or `undefined` when the refresh
+	 * established that the write was already saved under `options.actionId` without re-sending.
+	 * @throws SealedSegmentsError before anything is done, when `entryId` is not the head segment
+	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
+	 * this instance (`in-flight`); the head segment's recorded refusal, an {@link ActionRefusedError},
+	 * when a refresh or the head tracker's staging refused it during the cycle; whatever
+	 * `options.recordAttempt` throws, before anything is sent; otherwise what {@link sync} throws. */
+	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
+		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, {
+			refuseSolo: options.refuseSoloCommit,
+			...(options.resume === undefined ? {} : { resume: options.resume }),
+			...(options.onCommittedHead === undefined ? {} : { onCommittedHead: options.onCommittedHead }),
+		});
+		try {
+			return await driveHeadCommit(handle, options);
+		} finally {
+			handle.close();
+		}
+	}
+
+	/** Open a head commit of `entryId` under `identity` and hand back the handle a driver runs it
+	 * through, step by step ({@link HeadCommitHandle}): this is {@link commitHead} with the loop left
+	 * to the caller, for the coordinator's per-entry commit over several collections, which runs each
+	 * step on every collection it wrote in lock-step. Takes the collection latch, which the handle
+	 * holds until its `close()` except around the network round trip; checks the three
+	 * preconditions; marks the action in flight for the whole cycle ({@link beginInFlightAction}), as
+	 * a sync's is, so the refresh between attempts recognises the write's own entry; sets
+	 * {@link headCommit}, which tells {@link consumeOwnEntry} that such an entry records the head
+	 * segment; and seeds the retained attempt with `options.resume` when one is given, so that the
+	 * opening refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) —
+	 * and `stage()` re-sends it verbatim while the next attempt would request its revision
+	 * ({@link resumedAttempt}). The rest of `options` is the cycle's ({@link InFlightCycle}), recorded
+	 * with the in-flight mark, so the handle's `send()` and a refresh's re-send of a torn attempt both
+	 * carry it.
+	 *
+	 * **The target.** The live tracker holds every sealed segment and the open one, cumulatively, so
+	 * an attempt cannot run on a copy of it the way a sync's does. It runs on a HEAD TRACKER instead
+	 * ({@link headTrackerFor}): the head segment's actions alone, staged atomically over the
+	 * committed state, with pins of their own — built once per requested revision and reused across
+	 * attempts, since a rebuild mints fresh ids for the blocks the actions insert and would send
+	 * different content under one `(action id, revision)` (the rule {@link logAppendBlockIds}
+	 * closes). Staging runs the actions' guards against the committed state; a refusal there is the
+	 * segment's refusal, recorded and reported exactly as a replay's would be, and thrown out of
+	 * `stage()`.
+	 *
+	 * **The latch.** Held for every step EXCEPT the one `await` on the network, so `act`,
+	 * `sealPending`, `update` and the rest are not blocked behind a commit that can take seconds
+	 * (docs/offline-sync.md §The drain does not hold the collection latch across the network). While
+	 * it is released {@link headInFlight} is set: a refresh that walks into this commit's entry defers
+	 * to it, and `dropSealed` of the head refuses. A second head commit on this instance waits on the
+	 * latch and then meets the `in-flight` precondition.
+	 *
+	 * **The head's recorded refusal** is re-checked by `stage()` before every attempt and by
+	 * `refused()` after every refused send, because a refresh that adopted a rival — a reader's,
+	 * while the latch was released, or this cycle's own — may have replayed and refused it; each
+	 * throws the recorded refusal in place of another attempt. On success the driver calls `fold()`
+	 * (remove the head segment, bump the segment version, fold the attempt's transforms into the
+	 * cache and adopt its revision) and only THEN `replay()` (the remaining segments and the open
+	 * segment over the committed state that now holds the head) — the fold-before-replay order
+	 * {@link syncAttempts} takes, which anything staged while the commit was on the network relies on.
+	 *
+	 * A driver that opens handles on more than one collection opens them in sorted collection-id
+	 * order, the order `TransactionCoordinator.commitOnce` takes the same latches in; see the
+	 * interface.
+	 *
+	 * @throws Error before the latch is taken when `options.resume` was recorded under an action other than
+	 * `identity.actionId` — a caller defect, since the attempt would be re-sent under the wrong id;
+	 * SealedSegmentsError, with the latch released again, when `entryId` is not the head segment
+	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
+	 * this instance (`in-flight`). */
+	async openHeadCommit(entryId: EntryId, identity: WriteIdentity, options: OpenHeadCommitOptions = {}): Promise<HeadCommitHandle> {
+		const { resume, onCommittedHead, ...cycle } = options;
+		if (resume !== undefined && resume.actionId !== identity.actionId) {
+			throw new Error(`Collection ${this.id}: an attempt recorded under action ${resume.actionId} cannot resume `
+				+ `a head commit of ${entryId} under action ${identity.actionId}`);
+		}
+		const release = await Latches.acquire(this.latchId);
+		try {
+			this.assertHeadCommittable(entryId);
+		} catch (err) {
+			release();
+			throw err;
+		}
+		const endInFlight = this.beginInFlightAction(identity.actionId, cycle);
+		this.headCommit = { entryId, ...(onCommittedHead === undefined ? {} : { onCommitted: onCommittedHead }) };
+		if (resume !== undefined) {
+			this.retainInFlightAttempt(resume);
+		}
+		return this.headCommitHandle(entryId, identity, release, endInFlight, resume);
+	}
+
+	/** The handle {@link openHeadCommit} returns: closures over this instance's private state, so
+	 * nothing private becomes public. `release` is the latch release of the latch the caller took;
+	 * `endInFlight` the disposer of the in-flight mark. The head tracker lives here, per handle, so it
+	 * is reused across the attempts of one cycle exactly as the in-line loop reused it. `resume` is
+	 * the attempt the cycle was opened with, which `stage()` re-sends verbatim while the next attempt
+	 * would request its revision ({@link resumedAttempt}). */
+	private headCommitHandle(entryId: EntryId, identity: WriteIdentity, release: () => void, endInFlight: () => void,
+		resume: InFlightAttempt | undefined): HeadCommitHandle {
+		let held = true;
+		let closed = false;
+		let head: HeadTracker | undefined;
+		const assertUsable = (step: string, needsLatch: boolean) => {
+			if (closed) {
+				throw new Error(`Collection ${this.id}: head commit of ${entryId} is closed; ${step}() is a defect`);
+			}
+			if (held !== needsLatch) {
+				throw new Error(`Collection ${this.id}: head commit of ${entryId} ${held ? 'holds' : 'has released'} the latch; `
+					+ `${step}() is a defect here`);
+			}
+		};
+		return {
+			collectionId: this.id,
+			instanceTag: this.instanceTag,
+			entryId,
+			refresh: (report, lastChance, tailFloor) => {
+				assertUsable('refresh', true);
+				return this.updateInternal(report, lastChance, tailFloor);
+			},
+			nextRev: () => this.getNextRev(),
+			heldRev: () => this.source.actionContext?.rev,
+			stage: async () => {
+				assertUsable('stage', true);
+				const segment = this.committableHead(entryId);
+				const resumed = resumedAttempt(this.sourceCache, resume, this.getNextRev());
+				if (resumed !== undefined) {
+					return resumed;
+				}
+				head = await this.headTrackerFor(segment, head);
+				return this.buildAttempt({ actions: segment.actions, transforms: head.tracker.transforms, pins: head.tracker.pins }, identity);
+			},
+			send: (staged, priority) => {
+				assertUsable('send', false);
+				return this.send(staged, identity, priority);
+			},
+			release: () => {
+				assertUsable('release', true);
+				this.headInFlight = { entryId, actionId: identity.actionId };
+				held = false;
+				release();
+			},
+			retake: async () => {
+				assertUsable('retake', false);
+				const retaken = await Latches.acquire(this.latchId);
+				if (closed) {
+					// close() ran while the latch was being acquired: it has already cleared the marks
+					// latch-free, so keeping this latch would leak it for the life of the instance.
+					retaken();
+					throw new Error(`Collection ${this.id}: head commit of ${entryId} was closed while retake() was waiting; `
+						+ `a driver closes its handle only after retaking`);
+				}
+				release = retaken;
+				held = true;
+				this.headInFlight = undefined;
+			},
+			fold: (staged) => {
+				assertUsable('fold', true);
+				const dropped = this.segments.drop(this.headSegment(entryId).entryId);
+				this.foldOwnCommit(staged, identity.actionId);
+				this.reportCommittedHead(dropped);
+			},
+			replay: () => {
+				assertUsable('replay', true);
+				// NOTE: the remaining sealed segments and the open segment are replayed after EVERY head
+				// commit, so draining a queue of n entries is quadratic in n (docs/offline-sync.md
+				// §Failure modes and accepted tradeoffs). Negligible for tens of entries; if it shows up
+				// for a device that queued thousands, keep per-segment trackers chained over the cache,
+				// so a committed head is popped and folded instead of replayed.
+				return this.replayActions();
+			},
+			refused: (staged) => {
+				assertUsable('refused', true);
+				this.committableHead(entryId);
+				this.retainInFlightAttempt(retainedAttempt(staged, identity.actionId));
+			},
+			close: () => {
+				if (closed) return;
+				closed = true;
+				this.headCommit = undefined;
+				this.headInFlight = undefined;
+				endInFlight();
+				if (held) {
+					held = false;
+					release();
+				}
+			},
+		};
+	}
+
+	/** {@link commitHead}'s preconditions, each a {@link SealedSegmentsError} naming its reason. */
+	private assertHeadCommittable(entryId: EntryId): void {
+		const sealed = this.segments.entryIds();
+		const head = this.segments.head();
+		if (head === undefined || head.entryId !== entryId) {
+			throw new SealedSegmentsError(this.id, sealed, 'not-head', entryId);
+		}
+		if (head.refused !== undefined) {
+			throw new SealedSegmentsError(this.id, sealed, 'refused', entryId);
+		}
+		if (this.headInFlight !== undefined) {
+			throw new SealedSegmentsError(this.id, sealed, 'in-flight', this.headInFlight.entryId);
+		}
+	}
+
+	/** The head segment, which a running head commit may still commit: it is `entryId` — anything
+	 * else is a defect ({@link headSegment}) — and it has not been refused meanwhile. A refresh that
+	 * adopted a rival may have replayed and refused it, and that refusal, not another attempt, is
+	 * then the cycle's answer. */
+	private committableHead(entryId: EntryId): SealedSegment<TAction> {
+		const head = this.headSegment(entryId);
+		if (head.refused !== undefined) {
+			throw head.refused;
+		}
+		return head;
+	}
+
+	/** The head segment, asserted to be `entryId`. Nothing may remove the head while a head commit
+	 * of it runs — a refresh that meets it defers, `dropSealed` of it refuses — so anything else here
+	 * is a defect, thrown as one. */
+	private headSegment(entryId: EntryId): SealedSegment<TAction> {
+		const head = this.segments.head();
+		if (head === undefined || head.entryId !== entryId) {
+			throw new Error(`Collection ${this.id}: head segment ${entryId} was removed while its commit was running `
+				+ `(the head is ${head?.entryId ?? 'nothing'})`);
+		}
+		return head;
+	}
+
+	/** The tracker a head attempt is built from (see {@link commitHead}): `current`, while it was
+	 * built for the revision the next attempt requests and no base under it has moved; otherwise a
+	 * fresh one ({@link buildHeadTracker}). A revision that moved is a write that is genuinely
+	 * different. A base that moved at the same revision is re-judged exactly as
+	 * {@link restageIfBasesMoved} re-judges the live queue before an attempt, and rebuilds.
+	 * NOTE: that rebuild is the same exception to the byte-identical retry that {@link syncAttempts}
+	 * records at its `restageIfBasesMoved` call — fresh ids for the blocks the actions insert under
+	 * an unchanged `(action id, revision)` — reached the same narrow way and refused by storage's
+	 * base guard on the same machines; the same answer applies if it is ever seen. */
+	private async headTrackerFor(segment: SealedSegment<TAction>, current: HeadTracker | undefined): Promise<HeadTracker> {
+		const rev = this.getNextRev();
+		if (current?.rev === rev) {
+			await this.rereadUnretainedBases(current.tracker);
+			if (this.logMovedBases(current.tracker.movedBases()) === 0) {
+				return current;
+			}
+		}
+		return { rev, tracker: await this.buildHeadTracker(segment) };
+	}
+
+	/** A tracker over this instance's read cache, with pins of its own, holding `segment`'s actions
+	 * staged atomically over the committed state — from the invented baseline while this collection
+	 * has no committed revision ({@link replayBaseline}): its header, log block and root then exist
+	 * nowhere else, and the head's commit has to carry them. A refusal is the segment's own,
+	 * recorded and reported ({@link recordSealedRefusal}) and thrown; a live replay that found it
+	 * first has already done the recording, and the caller never gets here. */
+	private async buildHeadTracker(segment: SealedSegment<TAction>): Promise<Tracker<IBlock>> {
+		const tracker = new Tracker<IBlock>(this.sourceCache, this.replayBaseline());
+		try {
+			segment.applied = await this.stageInto(tracker, ...segment.actions);
+		} catch (err) {
+			if (err instanceof ActionRefusedError) {
+				// NOTE: the live tracker still holds this segment's effects from its last replay, which
+				// judged the same committed state and did not refuse; a reader sees them until the next
+				// replay (the queue's drop of the refused segment). Reachable only if a base re-read
+				// catches up between the two stagings; if that is ever seen, replay here after recording.
+				this.recordSealedRefusal(segment, err);
+			}
+			throw err;
+		}
+		return tracker;
 	}
 
 	/** Stage `actions` and flush them as one call that either takes effect or leaves NOTHING behind:
@@ -2251,6 +2700,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	async actAndSync(actions: Action<TAction>[], options?: SyncOptions): Promise<WriteDurability | undefined> {
 		const release = await Latches.acquire(this.latchId);
 		try {
+			// Refused before staging, so there is nothing to unstage: the sync below would refuse
+			// anyway (syncInternal), and staging first would only have to be taken back.
+			this.assertNoSealedSegments();
 			const stagedBefore = copyTransforms(this.tracker.transforms);
 			const revBefore = this.source.actionContext?.rev;
 			await this.actInternal(...actions);
@@ -2271,18 +2723,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * revision from before the actions were staged.
 	 *
 	 * While the held revision has not moved, the earlier transforms are reinstated verbatim rather
-	 * than rebuilt by replay: an INVENTED collection keeps its header and root in the tracker with
-	 * no staged action naming them, and a replay (which resets the tracker first) would drop them —
-	 * the hazard {@link mustReplay} and {@link snapshotPending} document. Once the revision has
-	 * moved those transforms describe blocks at a revision this handle has left, so what remains is
-	 * re-staged against the adopted one, exactly as a refresh would have done. */
+	 * than rebuilt by replay: they are exactly the state before the call, and reinstating them costs
+	 * no handler run (a replay would rebuild the same state from {@link inventedBaseline} and the
+	 * staged actions). Once the revision has moved those transforms describe blocks at a revision
+	 * this handle has left, so what remains is re-staged against the adopted one, exactly as a
+	 * refresh would have done. */
 	private async unstage(actions: Action<TAction>[], stagedBefore: Transforms, revBefore: number | undefined): Promise<void> {
 		// NOTE: matched by identity, which is what `filterAgainstEntry` promises for a kept action.
 		// A `filterConflict` hook that answers a REPLACEMENT instance for one of these actions would
 		// leave the replacement staged here. No collection installs such a hook today (`Tree` and
 		// `Diary` install none); if one ever does, carry a per-call token on the staged actions and
 		// match on that instead.
-		this.pending = this.pending.filter(staged => !actions.includes(staged));
+		// The actions were staged into the OPEN segment (actAndSync refuses over sealed segments).
+		this.segments.open = this.segments.open.filter(staged => !actions.includes(staged));
 		if (this.source.actionContext?.rev === revBefore) {
 			this.tracker.reset(stagedBefore);
 		} else {
@@ -2304,11 +2757,67 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
-	private async replayActions() {
-		this.tracker.reset();
-		// Replay pending actions against the fresh tracker state (always called under latch)
-		for (const action of this.pending) {
+	/** Rebuild the tracker from the staged actions over the committed state this collection now
+	 * reads at (always called under latch): reset to {@link replayBaseline}, then every sealed
+	 * segment in order, then the open segment.
+	 *
+	 * A SEALED segment is staged as ONE atomic unit — one `internalTransact` call over all of its
+	 * actions — so a refusal of any action in it leaves none of its writes staged, and a refusal
+	 * ({@link ActionRefusedError}, the only class caught) is that segment's own: recorded on it,
+	 * reported through `onSealedRefused`, and the replay goes on to the next segment. A segment
+	 * already refused is skipped and not reported again; it stays listed until dropped. The OPEN
+	 * segment keeps the pre-segment behaviour: one `internalTransact` per action, and a refusal
+	 * propagates, since it is the live transaction's own (docs/offline-sync.md §Replay with a
+	 * per-segment refusal). Any error that is not a refusal propagates from either.
+	 *
+	 * Each re-staged update pins its base through `Atomic.commit` → `Tracker.absorb`, the path
+	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on. Each
+	 * sealed segment that staged records what its actions accepted as already applied
+	 * (`SealedSegment.applied`), the tally the head commit reports when the segment is committed.
+	 *
+	 * @param unreported - a segment whose refusal is recorded but NOT reported through
+	 * `onSealedRefused`: the one {@link restoreSealed} is inserting, whose caller reads the recorded
+	 * refusal off the segment itself. */
+	private async replayActions(unreported?: EntryId): Promise<void> {
+		this.tracker.reset(this.replayBaseline());
+		for (const segment of this.segments.replayable()) {
+			try {
+				segment.applied = await this.internalTransact(...segment.actions);
+			} catch (err) {
+				if (!(err instanceof ActionRefusedError)) {
+					throw err;
+				}
+				this.recordSealedRefusal(segment, err, segment.entryId !== unreported);
+			}
+		}
+		for (const action of this.segments.open) {
 			await this.internalTransact(action);
+		}
+	}
+
+	/** What a replay resets the tracker to: a copy of {@link inventedBaseline} while this collection
+	 * holds no committed revision (those blocks exist nowhere else), and nothing otherwise. */
+	private replayBaseline(): Transforms {
+		return this.source.actionContext === undefined && this.inventedBaseline !== undefined
+			? copyTransforms(this.inventedBaseline)
+			: emptyTransforms();
+	}
+
+	/** Record a replay's refusal of a sealed segment and, when `report` says so, report it once,
+	 * under the latch. The callback's throw is logged rather than raised: the refusal is already
+	 * recorded, and the rest of the replay must still run. */
+	private recordSealedRefusal(segment: SealedSegment<TAction>, error: ActionRefusedError, report = true): void {
+		this.segments.refuse(segment.entryId, error);
+		log('collection:sealed-segment-refused id=%s tag=%s entry=%s reported=%s error=%s',
+			this.id, this.instanceTag, segment.entryId, report, error.message);
+		if (!report) {
+			return;
+		}
+		try {
+			this.onSealedRefused?.(segment.entryId, error);
+		} catch (err) {
+			log('collection:refusal-callback-threw id=%s tag=%s entry=%s error=%s',
+				this.id, this.instanceTag, segment.entryId, err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -2337,13 +2846,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * than kept, because nothing proves it is current at the revision the refresh will pin to.
 	 *
 	 * Both answers pass {@link answeredBlock}'s checks as unpinned reads, header first, so a doubted
-	 * header or tail throws exactly as it would through {@link TransactorSource.tryGet}.
-	 *
-	 * NOTE: a batched get fails as a whole when any block in it gets no answer
-	 * (`NetworkTransactor.get` throws on a missing id), so an unreachable out-of-date tail fails a
-	 * refresh that would not have needed it. Harmless today: the log has no checkpoints, so a
-	 * refresh that finds a new tail walks back through the old one anyway. If checkpoints start
-	 * letting that walk stop short, read the known tail in its own request instead.
+	 * header or tail throws exactly as it would through {@link TransactorSource.tryGet}. An
+	 * out-of-date tail no coordinator answered comes back flagged (`NetworkTransactor.get` flags that
+	 * one block rather than failing the request), and its answer is dropped unjudged.
 	 *
 	 * `tailFloor` (see {@link updateInternal}) goes on whichever request reads the tail — never on
 	 * the header, which is rewritten only when the tail rolls over or the collection changes it

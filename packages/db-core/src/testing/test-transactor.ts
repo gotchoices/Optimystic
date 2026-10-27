@@ -668,6 +668,36 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 	}
 }
 
+/**
+ * Answers every pend with a promise shortfall — the cohort's silence, in the shape
+ * `CoordinatorRepo.pend` returns it — and delegates nothing, so nothing is reserved and nothing
+ * lands. For the write paths' "stopped by name" cases: a shortfall is not a conflict a retry can
+ * win, so one attempt is made and `PromiseShortfallError` escapes with every staged action still
+ * staged.
+ */
+export class RefusesPendsAsShortfall extends DelegatingTransactor {
+	/** Pends refused so far. */
+	pends = 0;
+	/** While `true` every pend is refused; set `false` to let pends through again — the cohort back
+	 *  in reach, for a test of what waits on it. */
+	refusing = true;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (!this.refusing) return this.inner.pend(request);
+		this.pends++;
+		return {
+			success: false,
+			conflict: false,
+			reason: 'Failed to get super-majority: injected shortfall',
+			shortfall: { approvals: 1, rejections: 0, peerCount: 3, needed: 3, silentPeers: ['peer-b', 'peer-c'] },
+		};
+	}
+}
+
 /** What one attempt of a write put on the wire: the pend's transforms, with the action id and
  *  revision it was pended under. Recorded by {@link RecordsAttemptsRefusesFirstCommit}. */
 export type RecordedAttempt = {
@@ -867,6 +897,29 @@ export class GatedCommitTransactor extends DelegatingTransactor {
 	}
 
 	openGate(): void { this.gate.resolve(); }
+}
+
+/**
+ * Throws, nothing delegated, on every commit of the collection whose log tail is `tailId` while
+ * `armed` — the hard failure of one participant's commit after its siblings' landed, which a
+ * multi-collection commit reports as `CoordinatorPartialCommitError`. Disarmed, everything delegates.
+ */
+export class ThrowsOnCommitOf extends DelegatingTransactor {
+	/** Commits thrown so far. */
+	thrown = 0;
+	armed = true;
+
+	constructor(inner: TestTransactor, private readonly tailId: BlockId) {
+		super(inner);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.armed && request.tailId === this.tailId) {
+			this.thrown++;
+			throw new Error('connection dropped before the commit was sent');
+		}
+		return this.inner.commit(request);
+	}
 }
 
 /**

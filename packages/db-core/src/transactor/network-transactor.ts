@@ -1,6 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
@@ -10,6 +10,7 @@ import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-no
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
@@ -425,20 +426,34 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				}
 			}
 		}
-		// Ensure we have at least one response per requested block id
-		const missingIds = distinctBlockIds.filter(bid => !resultEntries.has(bid));
-		if (missingIds.length > 0) {
-			log('get:missing blockIds=%o', missingIds);
+		// A block with no entry is one of two things. When no batch carrying it got any response — each
+		// threw, timed out or was still in flight at the deadline — no coordinator was heard from, the
+		// `'peers-unreachable'` answer `CoordinatorRepo` gives for a consult that threw: flagged, so the
+		// read of THAT block fails typed (`BlockUnavailableError`) while its siblings are returned. When
+		// some coordinator responded and left it out, that is a protocol fault, not unreachability, and
+		// fails the whole read as it always has. Flagged entries are added after the merge, so they
+		// never compete with a real answer.
+		const responded = respondedBlocks(batches);
+		const omittedIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && responded.has(bid));
+		const unansweredIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && !responded.has(bid));
+		const rootCause = firstBatchError(batches) ?? error;
+		if (omittedIds.length > 0) {
+			log('get:missing blockIds=%o', omittedIds);
 			const details = this.formatBatchStatuses(batches,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const rootCause = firstBatchError(batches) ?? error;
 			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
 			(aggregate as any).cause = rootCause;
 			throw aggregate;
+		}
+		if (unansweredIds.length > 0) {
+			log('get:unanswered blockIds=%o root=%s', unansweredIds, errorMessage(rootCause));
+			for (const bid of unansweredIds) {
+				resultEntries.set(bid, { state: {}, unavailable: 'peers-unreachable' } satisfies GetBlockResult);
+			}
 		}
 
 		log('get:done blockIds=%d ms=%d', distinctBlockIds.length, Date.now() - t0);
@@ -1150,7 +1165,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * its tail, and for a {@link commitInOneRound} that threw.
 	 */
 	private async commitTailThenSweep(request: CommitRequest, remainingBlocks: BlockId[]): Promise<CommitResult> {
-		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
+		const tailResult = await this.commitBlock(commitOf(request, [request.tailId]));
 		if (!tailResult.success) {
 			// NOTE: a refused tail is NOT an absent tail. The coordinator's durability gate answers
 			// `commit-not-durable` whenever fewer than a majority hold the revision — even though
@@ -1182,7 +1197,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// walk. Sweeping before the tail would also let a committed header point at a never-committed
 		// tail: a dangling pointer, strictly worse than an orphaned block.
 		if (remainingBlocks.length > 0) {
-			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
+			const { batches, error } = await this.commitBlocks(commitOf(request, remainingBlocks));
 			cohortReports.push(...confirmedDurabilities(batches));
 			if (error) {
 				// Split by the failure's NATURE, exactly as commitBlock does for the tail: a RETURNED
@@ -1296,8 +1311,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return abandoned;
 	}
 
-	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId, blockDigests });
+	/** Commits `request`'s one block (the tail), returning a confirmed conflict and throwing a transient fault. */
+	private async commitBlock(request: RepoCommitRequest): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks(request);
 		if (tailError) {
 			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
 			// is the CALLER's responsibility (coordinator cancelPhase; TransactorSource.transact),
@@ -1608,7 +1624,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		} catch (e) {
 			error = asError(e);
 		}
-		return { batches, discharged: dischargedBlocks(batches), error };
+		return { batches, discharged: respondedBlocks(batches), error };
 	}
 
 	/**
@@ -1664,17 +1680,18 @@ function bestCoveringPeer(peerBlocks: Map<string, BlockId[]>, uncovered: Set<Blo
 }
 
 /**
- * The block ids some batch in the tree got an ANSWER for. A cancel batch that errored, or never
- * responded, discharged nothing — its blocks' pending records are still standing. Batch payloads
- * are block-id lists (built with {@link mergeBlocks}), including the retry batches
- * `processBatches` re-homes, so the union across the whole tree is the discharged set.
+ * The block ids some batch in the tree got an ANSWER for, whatever the answer said. A cancel batch
+ * that errored, or never responded, discharged nothing — its blocks' pending records are still
+ * standing — so for a cancel this is the discharged set. For a read it separates a block no
+ * coordinator answered from one a coordinator answered without. Batch payloads are block-id lists,
+ * including the retry batches `processBatches` re-homes, so the union across the whole tree counts.
  */
-function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<BlockId> {
-	const discharged = new Set<BlockId>();
+function respondedBlocks<TResponse>(batches: CoordinatorBatch<BlockId[], TResponse>[]): Set<BlockId> {
+	const responded = new Set<BlockId>();
 	for (const b of allBatches(batches, bb => bb.request?.isResponse === true)) {
-		for (const bid of b.payload) discharged.add(bid);
+		for (const bid of b.payload) responded.add(bid);
 	}
-	return discharged;
+	return responded;
 }
 
 /**
@@ -1693,9 +1710,16 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * {@link NetworkTransactor.pend} and the commit paths use, since the action-level answer is rebuilt
  * from per-batch ones rather than forwarded, and anything not carried here is lost.
  *
- * - An **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first one. No
- *   retry can succeed while that cohort's clocks disagree with the writer's, so a conflict beside it
- *   must not make the write look retryable, and its numbers must reach the writer whole.
+ * - A **validity rejection** anywhere ({@link isRejectedFailure}) is the answer, verbatim — the first
+ *   one. Members judged the content, which no retry changes. Above an expiry for the reason a cohort
+ *   that judged the content outranks clock votes inside one record: reporting the verdict as a clock
+ *   problem would invite a retry the verdict already refuses.
+ * - Otherwise an **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first
+ *   one. No retry can succeed while that cohort's clocks disagree with the writer's, so a conflict
+ *   beside it must not make the write look retryable, and its numbers must reach the writer whole.
+ * - Otherwise a **promise shortfall** anywhere ({@link isShortfallFailure}) is the answer, verbatim —
+ *   the first one, for the same reason: no retry can succeed while that cohort's members are silent.
+ *   Below an expiry because a shortfall clears when the members come back, and an expiry does not.
  * - Otherwise a {@link StaleFailure}: `reason` is the first one any response gave (the only diagnostic
  *   that survives an exhausted retry budget and the coordinator's error text — a refusal whose reason
  *   is `commit-not-durable` must not read as "stale commit", a rival's win); `staleAt` is the highest
@@ -1712,9 +1736,9 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
 function refusalFrom(responses: WriteFailure[]): WriteFailure {
-	const expired = responses.find(isExpiryFailure);
-	if (expired !== undefined) {
-		return expired;
+	const unretryable = responses.find(isRejectedFailure) ?? responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
+	if (unretryable !== undefined) {
+		return unretryable;
 	}
 	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
 	const reason = responses.map(r => r.reason).find(r => r !== undefined);
@@ -1735,8 +1759,16 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
  * cohort sign for blocks the request is not committing; and `processBatches` re-batches failed blocks
  * onto different coordinators, so only a send-time subset stays correct across retries.
  */
-function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests }: RepoCommitRequest): RepoCommitRequest {
-	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds) };
+function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests, refuseSolo }: RepoCommitRequest): RepoCommitRequest {
+	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds), ...refuseSoloField(refuseSolo) };
+}
+
+/** `request`'s commit of `blockIds` alone, for {@link NetworkTransactor}'s two-step path to hand to its
+ * batching: everything the write carries, with its declarations still action-wide — every send goes
+ * through {@link repoCommitRequest}, which narrows them to the blocks that send commits. */
+function commitOf(request: CommitRequest, blockIds: BlockId[]): RepoCommitRequest {
+	return { blockIds, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests,
+		...refuseSoloField(request.refuseSolo) };
 }
 
 /** `request`'s blocks with its log tail first, each once — the order a coordinator commits them in. */
@@ -1777,7 +1809,9 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
  *
  * `soleReservation` survives only on a batch carrying every block of the action: a pend split across
  * coordinators — by `consolidateCoordinators`, or by `processBatches` re-batching a failed batch — is
- * several reservations, which the field must never claim to be. Decided per send, like the bases. */
+ * several reservations, which the field must never claim to be. Decided per send, like the bases.
+ * Every other field goes on every batch as given — `refuseSolo` included, whose loss on one batch would
+ * let that coordinator's share be written by a lone node the write asked not to be written by. */
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
 	const { baseRevs, soleReservation, ...rest } = action;
 	const batchBlockIds = blockIdsForTransforms(payload);

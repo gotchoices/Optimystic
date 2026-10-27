@@ -40,6 +40,13 @@ export function commitBatchOf(requests: readonly CommitRequest[]): CommitBatch {
 	return batchOf(requests, request => ({ commit: request }), request => request.blockIds);
 }
 
+/** Whether any request of `batch` asks not to be committed by a lone coordinator
+ * (`PendRequest.refuseSolo`, `CommitRequest.refuseSolo`). Any one is enough: the batch is one action,
+ * written together or not at all. */
+export function refusesSolo(batch: RequestBatch<{ readonly refuseSolo?: true }>): boolean {
+	return batch.requests.some(request => request.refuseSolo === true);
+}
+
 /** The blocks one pend request writes. */
 function pendBlockIds(request: PendRequest): BlockId[] {
 	return blockIdsForTransforms(request.transforms);

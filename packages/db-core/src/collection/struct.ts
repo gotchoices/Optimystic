@@ -1,8 +1,162 @@
-import type { IBlock, BlockId, Action, WriteDurability } from "../index.js";
+import type { IBlock, BlockId, Action, ActionId, Transforms, WriteDurability } from "../index.js";
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
+import type { EntryId } from "./segments.js";
+import type { AlreadyAppliedTally } from "./action.js";
+import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
 
 export type CollectionId = BlockId;
+
+/**
+ * A handler's statement that an action cannot be applied over the committed state it is being
+ * replayed against — a uniqueness or lost-update check failed. Not a transport failure and never
+ * retryable: the action's staged writes are discarded (the handler runs inside an Atomic), and
+ * nothing downgrades it to a stale failure. `TreeGuardRefusedError` in
+ * `packages/db-core/src/collections/tree/struct.ts` is the tree's subclass, and carries the
+ * contract every refusal obeys.
+ *
+ * Lives here rather than beside the tree so the collection can recognise a refusal without
+ * importing the tree module (which imports the collection). Segment-aware replay
+ * (`Collection.replayActions`) treats a throw of this class from a SEALED segment as that
+ * segment's refusal and keeps going; from the open segment it propagates as it always has.
+ */
+export class ActionRefusedError extends Error {
+	constructor(
+		/** The collection whose handler refused the action. */
+		readonly collectionId: CollectionId,
+		message: string,
+	) {
+		super(message);
+		this.name = 'ActionRefusedError';
+	}
+}
+
+/** Why a sealed segment stood in the way of a commit (see {@link SealedSegmentsError}):
+ * - `whole-collection` — a whole-collection commit was asked for while a segment is sealed.
+ * - `not-head` — `commitHead` named a segment that is not the oldest sealed one.
+ * - `refused` — `commitHead` named a segment a replay has refused; the queue drops it instead.
+ * - `in-flight` — a head commit is on the network for the named segment, so neither a second
+ *   `commitHead` nor a `dropSealed` of it can proceed. */
+export type SealedSegmentsReason = 'whole-collection' | 'not-head' | 'refused' | 'in-flight';
+
+/**
+ * Thrown by the whole-collection commit paths — {@link ICollection.sync},
+ * {@link ICollection.updateAndSync}, `Collection.actAndSync` and `Collection.getPendingActions`
+ * (the coordinator's append) — while the collection holds sealed segments. Those paths commit
+ * everything staged as ONE log entry under one action id; over sealed segments that would merge
+ * several queue entries into one, which the queue's identity rules forbid
+ * (docs/offline-sync.md §Identity across attempts). A sealed segment is committed on its own,
+ * through `Collection.commitHead`, whose own preconditions throw this class too, with a
+ * {@link reason} other than `whole-collection` (see {@link SealedSegmentsReason}).
+ *
+ * Nothing is unstaged or changed when this is thrown: every segment, sealed and open, is exactly
+ * as it was.
+ */
+export class SealedSegmentsError extends Error {
+	constructor(
+		readonly collectionId: CollectionId,
+		/** The sealed segments' entry ids, in order. */
+		readonly sealedEntries: EntryId[],
+		readonly reason: SealedSegmentsReason = 'whole-collection',
+		/** The entry a `commitHead` or `dropSealed` named, for every reason but `whole-collection`. */
+		readonly entryId?: EntryId,
+	) {
+		super(sealedSegmentsMessage(collectionId, sealedEntries, reason, entryId));
+		this.name = 'SealedSegmentsError';
+	}
+}
+
+function sealedSegmentsMessage(collectionId: CollectionId, sealedEntries: EntryId[], reason: SealedSegmentsReason, entryId: EntryId | undefined): string {
+	const listed = sealedEntries.length === 0 ? 'nothing' : sealedEntries.join(', ');
+	switch (reason) {
+		case 'whole-collection':
+			return `collection ${collectionId} holds sealed segment(s) ${listed}; `
+				+ `a whole-collection commit would merge them into one log entry — commit the head segment instead`;
+		case 'not-head':
+			return `collection ${collectionId}: entry ${entryId} is not the head sealed segment (sealed: ${listed}); `
+				+ `only the oldest sealed segment can be committed`;
+		case 'refused':
+			return `collection ${collectionId}: entry ${entryId} carries a recorded refusal; `
+				+ `a refused segment is dropped, never committed`;
+		case 'in-flight':
+			return `collection ${collectionId}: a head commit of entry ${entryId} is in flight on this instance`;
+	}
+}
+
+/** Exactly what one write attempt sent to the transactor — enough to send the same thing again.
+ * Retained by `Collection.retainInFlightAttempt` so that a refresh which then finds this attempt's
+ * own log entry can land the blocks the attempt left behind, at the same action id and revision
+ * (see `Collection.completeOwnEntry`).
+ *
+ * Also the shape a caller RECORDS before an attempt is sent and hands back on a later cycle
+ * ({@link HeadCommitOptions.recordAttempt} and {@link HeadCommitOptions.resume};
+ * docs/offline-sync.md §Identity across attempts), so it must stay plain data — ids, numbers and the
+ * transforms as the wire carries them, nothing with object identity and no functions: the
+ * offline-sync journal serialises it as JSON. */
+export type InFlightAttempt = {
+	/** The action id the attempt was sent under — the one every attempt of the write reuses, and
+	 * the one a cycle that resumes from this record must run under. */
+	actionId: ActionId;
+	/** The revision the attempt's log entry was stamped with, and pended and committed at. */
+	rev: number;
+	/** Every transform the attempt pended — the log blocks included. The caller hands over a copy
+	 * it will not mutate; the collection keeps it as given. */
+	transforms: Transforms;
+	/** The attempt's log tail block, committed first. */
+	tailId: BlockId;
+	/** The per-block content declarations the attempt's commit carried, if any. */
+	blockDigests?: BlockContentDigests;
+	/** The per-block bases the attempt's pend carried, if any (see `PendRequest.baseRevs`). Kept
+	 * with the transforms because they describe them: a re-send of these operations must name the
+	 * same bases they were computed against. */
+	baseRevs?: BlockBaseRevs;
+};
+
+/** What `Collection.commitHead` commits the head segment under, beside the retry bounds of
+ * {@link SyncOptions}. Both fields are the queue's (docs/offline-sync.md §Identity across
+ * attempts): the collection mints neither. */
+export type HeadCommitOptions = SyncOptions & {
+	/** The action id the attempt cycle runs under. The queue mints it, and re-supplies the SAME id
+	 * when it re-drives an entry whose earlier attempt may have landed, so the refresh that opens the
+	 * cycle recognises that attempt's log entry as the write's own and finishes or consumes it
+	 * instead of committing a second copy. */
+	actionId: ActionId;
+	/** The entry's local commit time, stamped on the log entry in place of the time
+	 * `Collection.syncInternal` mints for a sync. Fixed per write, so every attempt appends the same
+	 * entry (see "A write's log append is a fixed function of the write and the revision it is
+	 * requesting" in docs/internals.md). */
+	timestamp: number;
+	/** The write-ahead hook: called with each attempt exactly as it is about to be sent — after it is
+	 * built and BEFORE the collection latch is released for the network — and awaited under that
+	 * latch. It is where the queue records the attempt's identity before sending it
+	 * (docs/offline-sync.md §Identity across attempts) and, later, where the journal writes it. A
+	 * throw aborts the cycle before anything is sent: it escapes `commitHead` unchanged, the handle
+	 * closes, and every segment is exactly as it was. */
+	recordAttempt?: (attempt: InFlightAttempt) => Promise<void>;
+	/** The attempt an earlier cycle under the SAME `actionId` handed to `recordAttempt` and did not
+	 * resolve — it must carry this `actionId`, and `openHeadCommit` throws before touching anything
+	 * when it does not. Seeded as the retained attempt right after the action is marked in flight,
+	 * so the cycle's opening refresh, finding that attempt's log entry with blocks missing, finishes
+	 * it from these transforms (`Collection.completeOwnEntry`) instead of refusing it as torn with
+	 * `transforms-not-held`. Without it a re-drive can recognise only an attempt that landed whole.
+	 * The revision check still applies: an attempt recorded at a revision other than the entry's is
+	 * refused as before. And when that refresh finds nothing new, this attempt is what the cycle
+	 * re-sends, verbatim, while the next attempt would request its revision (`resumedAttempt`), since
+	 * it may have landed on machines the refresh did not hear from. */
+	resume?: InFlightAttempt;
+	/** Called once, with what the head segment's actions accepted as already applied
+	 * ({@link AlreadyAppliedTally}, as recorded on the segment by its last staging over the committed
+	 * state), at the moment the segment is made durable and dropped: when the committed attempt is
+	 * folded (`HeadCommitHandle.fold`), or when the cycle's refresh finds the entry's own log entry and
+	 * consumes the head (`Collection.consumeHead`) — so a re-drive that finds its earlier attempt landed
+	 * reports it too. Runs synchronously under the collection latch, like `onSealedRefused`, so it must
+	 * not call a latched method of the collection; the queue's closure only records into a map. A throw
+	 * out of it is logged, never raised: the commit is already durable. A hook rather than a widened
+	 * return type because the partial-commit path reports the committed half through
+	 * `CoordinatorPartialCommitError` and the refresh-consumed path through `RefreshReport`; one hook
+	 * reaches all three. */
+	onCommittedHead?: (applied: AlreadyAppliedTally) => void;
+};
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
 
@@ -66,7 +220,35 @@ export interface SyncOptions {
 	 * {@link deadlineMs} is still checked first, so a sync that is both past its deadline and
 	 * stalled reports the deadline (as {@link SyncRetryExhaustedError}), not the stall. */
 	maxStalledAttempts?: number;
+	/** Refuse to let this write be committed by a lone node — a coordinator whose cohort for the
+	 * write is only itself — while that node knows of members of the cohort it could not reach, is
+	 * still waiting to hear from a peer it was configured to join through, or could not route the
+	 * write at all. A node that is genuinely alone (no absent member known, nothing awaited, routed to
+	 * itself) still commits. The refusal is a promise shortfall (`PromiseShortfallError`, with
+	 * `soloRefused` naming the reason), so the write stops and is classified `cohort-unreachable`.
+	 * Rides on every send of the write's attempt cycle as `PendRequest.refuseSolo` and
+	 * `CommitRequest.refuseSolo`. Default off: only the offline queue sets it (docs/offline-sync.md
+	 * §When to submit: the reachability gate). A coordinator on a build that predates the field
+	 * ignores it and commits alone as before. */
+	refuseSoloCommit?: boolean;
 }
+
+/** What a write's attempt cycle carries besides its identity, recorded beside the in-flight mark
+ * (`Collection.beginInFlightAction`) so that every send of the cycle carries it: each attempt, and
+ * the re-send a refresh makes to finish a torn one (`Collection.completeOwnEntry`). */
+export type InFlightCycle = {
+	/** {@link SyncOptions.refuseSoloCommit}, for this cycle. */
+	readonly refuseSolo?: boolean;
+};
+
+/** What `Collection.openHeadCommit` opens a head commit with besides its identity: the cycle's
+ * {@link InFlightCycle}, the attempt an earlier cycle under the same action id recorded and did not
+ * resolve ({@link HeadCommitOptions.resume}), and the committed-head hook
+ * ({@link HeadCommitOptions.onCommittedHead}). */
+export type OpenHeadCommitOptions = InFlightCycle & {
+	readonly resume?: InFlightAttempt;
+	readonly onCommittedHead?: (applied: AlreadyAppliedTally) => void;
+};
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget
  * (attempt count or deadline) is exhausted while the transactor keeps returning stale failures.

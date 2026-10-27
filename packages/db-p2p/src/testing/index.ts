@@ -8,3 +8,4 @@
 export * from './mesh-harness.js';
 export * from './memory-batch-backend.js';
 export * from './memory-journal-store.js';
+export * from './power-loss-kv-store.js';

@@ -1667,6 +1667,56 @@ describe('ClusterMember', () => {
 			expect(vote.rejectReason).to.include('Validation failed');
 		});
 
+		it('signs the validity marker a validator returns onto its reject, and a peer refuses the vote with the marker stripped', async () => {
+			// The marker is how a writer tells "refused for good" from "try again", so it must survive the
+			// trip from the validator to the signed vote, and nobody relaying the vote may remove it.
+			const validatingMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				validator: {
+					validate: async () => ({ valid: false, reason: 'Operations hash mismatch', validity: { computedHash: 'ops.v1:aa' } }),
+					getSchemaHash: async () => 'test-hash'
+				}
+			});
+			const other = await makeKeyPair();
+			const otherMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: other.peerId,
+				privateKey: other.privateKey
+			});
+
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, other]);
+			const record = await createClusterRecord(
+				peers,
+				[{
+					pend: {
+						actionId: 'a1',
+						transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] },
+						policy: 'c',
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
+					}
+				}]
+			);
+
+			const result = await validatingMember.update(record);
+
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'reject' || vote.validity === undefined) expect.fail(`expected a marked reject, got ${JSON.stringify(vote)}`);
+			expect(vote.validity).to.deep.equal({ computedHash: 'ops.v1:aa' });
+			const { validity: _stripped, ...unmarked } = vote;
+			let caught: unknown;
+			try {
+				await otherMember.update({ ...result, promises: { [ourId]: unmarked } });
+			} catch (err) {
+				caught = err;
+			}
+			expect((caught as Error | undefined)?.message).to.equal(`Invalid promise signature from ${ourId}`);
+		});
+
 		it('does not retain a transaction it rejected itself', async () => {
 			const validatingMember = clusterMember({
 				storageRepo: mockRepo,

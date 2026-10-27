@@ -15,26 +15,32 @@
  * attempts of one action at one revision produce byte-identical transforms.** Every case therefore
  * asserts on the WHOLE recorded transform set, so it fails for any future per-attempt value.
  *
- * Three cases, because three different code paths mint per-attempt values: the collection write
+ * Four cases, because four different code paths mint per-attempt values: the collection write
  * path with room in the current history block (where only the entry's timestamp varied), the same
  * path with the history block full (where the id of the new history block varied, taking the
- * `nextId`/`tailId` updates of two PRE-EXISTING blocks with it), and the coordinator write path.
+ * `nextId`/`tailId` updates of two PRE-EXISTING blocks with it), the coordinator write path, and the
+ * head commit of a sealed segment (`Collection.commitHead`), whose action id and timestamp are the
+ * queue's and which reaches the log append through the machinery the collection path shares with
+ * it (`write-attempts.ts`), so one case covers it.
  */
 
 import { expect } from 'chai';
 import {
 	ACTIONS_ENGINE_ID,
 	Collection,
+	Log,
 	TransactionCoordinator,
 	createActionsStatements,
 	createTransactionId,
 	createTransactionStamp,
+	type Action,
 	type ActionHandler,
 	type BlockId,
 	type BlockStore,
 	type CollectionActions,
 	type CollectionInitOptions,
 	type IBlock,
+	type LogEntry,
 	type Transaction,
 } from '../src/index.js';
 import { EntriesPerBlock } from '../src/chain/chain.js';
@@ -145,6 +151,26 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		await coordinator.commit(transaction, retryFast);
 
 		expectAttemptsIdentical(transactor.attempts);
+	});
+
+	it('head commit path: a retry re-sends the same entry, under the supplied action id and timestamp', async () => {
+		const collectionId = 'retry-identical-head';
+		const inner = new TestTransactor();
+		const transactor = new RecordsAttemptsRefusesFirstCommit(inner);
+		const collection = await Collection.createOrOpen<SpecAction>(transactor, collectionId, init());
+		await collection.act({ type: 'set', data: { value: 'queued' } });
+		expect(collection.sealPending('E1')).to.equal(true);
+		const timestamp = 1_700_000_000_000;
+
+		await collection.commitHead('E1', { ...retryFast, actionId: 'queue-attempt-1', timestamp });
+
+		expectAttemptsIdentical(transactor.attempts);
+		expect(transactor.attempts[0]!.actionId, 'the action id is the one supplied').to.equal('queue-attempt-1');
+		const log = await Log.open<Action<SpecAction>>(collection.tracker, collectionId);
+		const entries: LogEntry<Action<SpecAction>>[] = [];
+		for await (const entry of log!.select()) entries.push(entry);
+		expect(entries.map(entry => entry.timestamp), 'the log entry carries the supplied timestamp').to.deep.equal([timestamp]);
+		expect(collection.sealedEntries()).to.deep.equal([]);
 	});
 
 	it('the minted ids belong to the marked action alone', async () => {

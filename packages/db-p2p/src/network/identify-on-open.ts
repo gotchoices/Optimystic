@@ -62,6 +62,30 @@ async function identifyConnection(node: IdentifyOnOpenHost, connection: Connecti
 }
 
 /**
+ * One observer that tells each of `observers`, in order. Each call is isolated: a throw from one is
+ * logged and the others are still told, so no observer can cost another its count, nor stop the
+ * exchange it is told about from running.
+ */
+export function combineIdentifyObservers(...observers: IdentifyObserver[]): IdentifyObserver {
+	return {
+		started: peerId => {
+			for (const observer of observers) tellIsolated('started', peerId, () => observer.started(peerId));
+		},
+		settled: (peerId, outcome) => {
+			for (const observer of observers) tellIsolated('settled', peerId, () => observer.settled(peerId, outcome));
+		},
+	};
+}
+
+function tellIsolated(call: 'started' | 'settled', peerId: PeerId, tell: () => void): void {
+	try {
+		tell();
+	} catch (err) {
+		log.error('observer:threw call=%s peer=%s - %o', call, peerId.toString().substring(0, 12), err);
+	}
+}
+
+/**
  * Run identify on every connection `node` opens or accepts from now on. Call before `node.start()`
  * on a node whose identify service was built with `runOnConnectionOpen: false`; installing it on a
  * node that still runs identify by itself would start two exchanges per connection, and the

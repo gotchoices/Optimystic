@@ -42,7 +42,9 @@ import type { ITransactionStateStore } from './cluster/i-transaction-state-store
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
-import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
+import { combineIdentifyObservers, identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
+import { IdentifyProgress } from './network/identify-progress.js';
+import { KeyNetworkCohortReachability } from './network/cohort-reachability.js';
 import { holePunchingWanted } from './network/hole-punching.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
@@ -371,6 +373,14 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * 10000 when neither is declared) — the same defaults spread-on-churn uses. A value set here wins.
 	 */
 	underReplicationDrain?: Partial<UnderReplicationDrainConfig> & { enabled?: boolean; pushDialTimeoutMs?: number; pushResponseTimeoutMs?: number };
+
+	/**
+	 * The node's cohort reachability gate (`node.cohortReachability`), which the offline queue asks
+	 * before it submits. `wakeDebounceMs` is how long after the last `connection:open` or
+	 * `peer:identify` the gate's `onChange` listeners are woken; default `DEFAULT_WAKE_DEBOUNCE_MS`
+	 * (500 ms), long enough to coalesce a connection with the identify that follows it.
+	 */
+	cohortReachability?: { wakeDebounceMs?: number };
 
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
@@ -1305,7 +1315,10 @@ export async function createLibp2pNodeBase(
 	// built here so it observes identify (which this node triggers itself, see the `identify`
 	// service above) before anything can connect.
 	const bootstrapContact = new BootstrapContactTracker(node.peerId, bootstrapTargets);
-	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, bootstrapContact);
+	// Every identify exchange in flight, with any peer: a cohort view that names nobody but this node
+	// while one is in flight may be about to widen, which the cohort reachability gate reads.
+	const identifyProgress = new IdentifyProgress();
+	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, combineIdentifyObservers(bootstrapContact, identifyProgress));
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
@@ -1386,6 +1399,26 @@ export async function createLibp2pNodeBase(
 		}
 		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership, preparedStreams);
 		await keyNetwork.initFromPersistedState();
+		// The offline queue's reachability gate (`node.cohortReachability`). Outside every optional
+		// subsystem's gate: it needs only the key network, the identify count and the node's events. Its
+		// stop wrapper is installed at once, so a startup rollback releases its event listeners too.
+		const cohortReachability = new KeyNetworkCohortReachability({
+			keyNetwork,
+			selfId: node.peerId.toString(),
+			identifying: () => identifyProgress.inFlight(),
+			events: node,
+			wakeDebounceMs: options.cohortReachability?.wakeDebounceMs
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					cohortReachability.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
 		// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
@@ -2208,6 +2241,7 @@ export async function createLibp2pNodeBase(
 			peerPrivateKey: nodePrivateKey,
 			linkDeadlines,
 			reportBlockHeld,
+			cohortReachability,
 		};
 		Object.assign(node, attachments);
 

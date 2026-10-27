@@ -2,14 +2,15 @@ import type {
 	IRepo, MessageOptions, BlockId, CommitRequest, CommitResult, GetBlockResults, PendRequest, PendResult, ActionBlocks,
 	ActionId, BlockGets, ActionPending, PendSuccess, ActionTransform, ActionTransforms, Transform,
 	GetBlockResult, IBlock, ActionRev, BlockUnavailableReason,
-	PendValidationHook, UnvalidatablePendPolicy,
+	PendValidationHook, PendValidationResult, UnvalidatablePendPolicy,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
 	IBlockDurabilityNotifier, BlockDurabilityListener, BlockDurabilityReachedEvent,
 	StaleFailure
 } from "@optimystic/db-core";
 import {
 	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
-	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash, localDurability
+	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash, localDurability,
+	ValidityRejectedError
 } from "@optimystic/db-core";
 import { asyncIteratorToArray } from "../it-utility.js";
 import type { IBlockStorage } from "./i-block-storage.js";
@@ -93,6 +94,18 @@ export const COMMIT_NOT_DURABLE_REASON = 'commit-not-durable';
 export function isCommitNotDurableFailure(result: CommitResult): boolean {
 	return !result.success && (result.reason?.startsWith(COMMIT_NOT_DURABLE_REASON) ?? false);
 }
+
+/**
+ * Stable, greppable prefix on the failure reason `CoordinatorRepo.commit` answers with when it refused
+ * to commit a write alone that asked not to be (`CommitRequest.refuseSolo`): its cohort for the commit
+ * was only itself, and it knows of absent cohort members, still awaits a bootstrap peer, or could not
+ * route the write (`PromiseShortfall.soloRefused` names the same three on the pend side). Same
+ * convention as {@link COMMIT_NOT_DURABLE_REASON}. Conflict-shaped (`conflict: true`), because a commit
+ * cannot answer with a shortfall — the commit side reads any returned refusal as a confirmed conflict —
+ * so the writer cancels and retries, and the retry's pend meets the pend-side refusal. Nothing of the
+ * commit was applied or proven by the refusing node.
+ */
+export const SOLO_COMMIT_REFUSED_REASON = 'solo-commit-refused';
 
 /** Whether one {@link StorageRepo.get} entered a block write latch, which decides whether it ends with a flush. */
 type ReadWrites = { wrote: boolean };
@@ -279,6 +292,20 @@ export interface IHeldRevisionReader {
 	 * it. A block whose local metadata could not be read is left out: this node has no answer for it.
 	 */
 	heldRevisions(blockIds: BlockId[]): Promise<Record<BlockId, ActionRev | null>>;
+}
+
+/**
+ * The answer to a pend this node's check refused. A verdict that judges the transaction itself wrong
+ * (`validity`) is the validity rejection a writer stops on, with this node's check as its one refusal —
+ * no vote was cast, so no `peerId`; it is what a cohort of one's writer receives. Any other refusal (the
+ * node could not judge: `PEND_NOT_VALIDATABLE`, `VALIDATOR_FAULT`) is a bare reason with no `conflict`
+ * flag, which a writer retries until its budget ends.
+ */
+function validationRefusal(validation: PendValidationResult): PendResult {
+	const reason = validation.reason ?? 'Transaction validation failed';
+	return validation.validity === undefined
+		? { success: false, reason }
+		: new ValidityRejectedError({ refusals: [{ ...validation.validity, reason }] }).toFailure();
 }
 
 export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, IBlockReplicaStore, ICommitDigestPreviewer, ILocalApply, IDurableStorage, IRevisionActionReader, IPendingClaimReader, IHeldRevisionReader {
@@ -1001,12 +1028,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				: log('pend validator-fault actionId=%s error=%s', request.actionId, event.error)
 		);
 		if (!validation.valid) {
-			// Hard rejection: no `conflict` flag, because re-driving the same request fails the same
-			// way and would only burn the writer's retry budget.
-			return {
-				success: false,
-				reason: validation.reason ?? 'Transaction validation failed'
-			};
+			return validationRefusal(validation);
 		}
 
 		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));

@@ -155,6 +155,242 @@ rolls back. That is correct, not a leak: only the separate `committed.<Table>` p
 concurrent peer's commit is expected live-read behavior; snapshot isolation is
 opt-in via `queryCommitted()`, not the default for ordinary reads.
 
+#### Staged actions are segments
+
+A collection's staged actions are two parts, not one list, kept in `SegmentList` in
+`packages/db-core/src/collection/segments.ts`: an ordered list of **sealed segments**, one per
+queued entry of the offline-sync queue
+([offline-sync.md §The segment model](offline-sync.md#the-segment-model)), oldest first, ahead of
+the **open segment** the current transaction stages into. `Collection.act` appends to the open
+segment; `Collection.sealPending` closes it into a sealed segment owned by an entry id, answering
+`false` and changing nothing when the open segment is empty (an invented collection's header,
+log block and root are not an action and are never sealed); `Collection.sealedEntries`,
+`Collection.sealedRefusal` and `Collection.dropSealed` list, inspect and remove them. While nothing
+is sealed every path behaves exactly as it did with one list, because the open segment IS that
+list. Five rules follow from the split:
+
+- **A replay starts from the invented baseline, not from empty, while the collection holds no
+  committed revision.** `Collection.inventedBaseline` is the tracker's transforms right after
+  `createOrOpen`'s create branch has staged the header, the empty log block and (for a tree) the
+  empty root, copied after the `Log.open` that writes the tail id into the header. A replay
+  (`Collection.replayActions`) resets the tracker to a copy of it while `source.actionContext` is
+  undefined, and to empty otherwise, since once a context is adopted those blocks are in storage.
+  Before the baseline a replay on an invented collection dropped its header and left the collection
+  unreadable; `mustReplay` kept the paths that reached it behind "a staged action exists", and
+  `dropSealed` on an invented collection with sealed segments is the first path that gets there
+  with one. The baseline also makes the order of `Collection.syncAttempts`' success branch
+  load-bearing: it folds the committed transforms into the cache and adopts the revision BEFORE
+  replaying, the order `updateInternal` and `TransactionCoordinator.commitOnceLatched` already
+  required. A replay first would reinstate the baseline's header insert over the just-committed
+  header on an invented collection's first commit, and `hasUnsyncedChanges` would never turn
+  false.
+- **A sealed segment replays atomically, and its refusal is recorded rather than thrown.**
+  `Collection.replayActions` stages each sealed segment, in order, through one `internalTransact`
+  call over all of its actions, so a throw discards the whole segment's writes (the Atomic inside
+  gives that). A throw of `ActionRefusedError` in `packages/db-core/src/collection/struct.ts`, a
+  handler's statement that the action cannot be applied over the committed state it is being
+  replayed against (`TreeGuardRefusedError` is the tree's subclass, so every guard refusal is one),
+  is recorded on the segment, logged as `collection:sealed-segment-refused`, reported once through
+  the `onSealedRefused` callback `CollectionInitOptions` carries, and the replay goes on to the
+  next segment. A refused segment is skipped by every later replay and stays listed until it is
+  dropped; dropping it and cascading through the entry's other collections is the queue's job
+  ([offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)). The open segment keeps
+  the earlier behaviour, one `internalTransact` per action with a refusal propagating out of the
+  refresh, because that refusal is the live transaction's own. Any error that is not a refusal
+  propagates from either. The callback runs synchronously under the collection latch, so it must
+  not call a latched method of the collection; a throw out of it is logged
+  (`collection:refusal-callback-threw`) and never aborts the replay. `classifyCommitFailure` and
+  the Quereus bridge keep matching `TreeGuardRefusedError`, which the subclass relation leaves
+  unchanged.
+- **Every replayable action counts.** `mustReplay` and `restageIfBasesMoved` count the non-refused
+  sealed segments' actions plus the open segment's, since a refresh that adopts a newer revision
+  must re-stage every sealed segment too. `hasUnsyncedChanges` keeps its formula (open segment
+  non-empty, or tracker transforms non-empty, which now includes the sealed segments' effects) and
+  therefore says `true` over a sealed collection that `sync` will refuse (next rule).
+- **A whole-collection commit refuses over sealed segments.** `sync`, `updateAndSync` and
+  `actAndSync` commit everything staged as one log entry under one action id; over sealed segments
+  that would merge several queue entries into one, which the queue's identity rules forbid. Each
+  throws `SealedSegmentsError` in `packages/db-core/src/collection/struct.ts`, naming the sealed
+  entry ids, before anything is minted or staged, and so does `getPendingActions`, whose only
+  caller is the coordinator's whole-collection append inside `commitOnceLatched`; the throw lands
+  in that method's existing catch, which restores every participant. `clearPendingActions` clears
+  the open segment only; `filterAgainstEntry` (the `filterConflict` hook) and `consumeOwnEntry`
+  apply to the open segment only, a sealed segment's action list being the entry's own and never
+  rewritten — `consumeOwnEntry` has a second arm for the head commit (sixth rule). A sealed segment
+  is committed on its own by the head commit; the version counter on `SegmentList`, bumped by every
+  seal, drop, refusal and head commit, is what the snapshot restore (next rule) branches on.
+- **A snapshot covers the open segment, and its restore is version-aware.** `CollectionSnapshot`
+  (`Collection.snapshotPending`) captures the WHOLE tracker's transforms — the sealed segments'
+  effects included, which is what `Tree.readView` builds a committed read view from, so a
+  `committed.<Table>` read inside a transaction sees every queued entry the SQL layer was told had
+  committed — but as actions only the OPEN segment's, and it records `SegmentList.version` as
+  `sealedVersion`. `Collection.restorePending` is async, because one of its arms replays, and it
+  chooses from three facts: whether the sealed list has changed since the capture, whether the
+  committed boundary has moved, and whether any segment is sealed now. Nothing changed and nothing
+  moved: the tracker is reset to the captured transforms, the captured pins are restored and the
+  open segment is set to the captured actions — the **verbatim** arm, the restore as it always was,
+  which keeps an invented collection's header. The sealed list changed (a segment sealed, dropped
+  or refused while the snapshot was outstanding), or the boundary moved while a segment is sealed:
+  the open segment is set to the captured actions and the tracker is rebuilt by
+  `Collection.replayActions` — the sealed segments as they are NOW, refused ones skipped, a newly
+  refused one recorded and reported, then the restored open actions — the **replay** arm, because
+  a verbatim restore would put a drained segment's effects back (the next head commit would then
+  commit it a second time) and a reset would drop the sealed segments'. The boundary moved with
+  nothing sealed keeps the two arms it had before segments: an empty captured open segment resets
+  the tracker empty, a non-empty one restores verbatim. The pins differ per arm: the verbatim arm
+  restores the captured pins beside the captured operations; the replay arm restores none, since
+  its reset clears the pin store and each re-staged update pins its base from the read cache as it
+  is now, which is the base it was computed against
+  ([Staged Edits Keep Their Base](#staged-edits-keep-their-base)). A refusal of the open segment
+  inside the replay arm propagates out of `restorePending`, as it would out of a refresh's replay:
+  the caller rolling back is told its transaction's own actions no longer apply at the boundary
+  the collection is now at. Every caller awaits the restore — `TransactionCoordinator`'s five
+  sites, `Tree.restore`, and the Quereus bridge's `rollbackToSavepoint` and `rollbackTransaction`;
+  Quereus types the connection hook as `MaybePromise<void>` and awaits it for each connection in
+  turn (`_rollbackToSavepointBroadcast` in `@quereus/quereus/src/core/database.ts`), so a statement
+  does not continue until every restore has finished. The coordinator's two partial-commit arms
+  fold the committed participants first, in one await-free pass, and restore the failed ones after
+  it, so the committed subset keeps the event-loop atomicity the success fold promises. A rollback
+  restores EVERY collection before it propagates a restore's throw — `TransactionCoordinator.rollback`
+  and the bridge's `rollbackTransaction` and `rollbackToSavepoint` loop through `visitEveryThenThrow`
+  in `packages/db-core/src/utility/visit-every.ts` — since each restore is independent and a
+  collection left un-restored would carry the rolled-back statements into the next transaction, or
+  into a `COMMIT` where Quereus swallows the throw (its statement-level savepoint path does). The
+  bridge ends its transaction either way, as Quereus already has, and sets its degraded latch from
+  the failure instead of releasing it; the two partial-commit restores and the failed commit's own
+  rollback log a restore failure (`commit:restore-failed`, `commit:rollback-failed`) rather than let
+  it replace the error they are raising, which would send the bridge down its clean-rollback path and
+  rewind the committed trees. The throwing collection itself stays half re-staged, the state backlog
+  `debt-a-failed-refresh-can-leave-a-collection-half-restaged` describes. `Collection.unstage` keeps
+  its own verbatim-or-replay split.
+- **The head segment is committed on its own, without holding the latch across the network.**
+  `Collection.commitHead(entryId, options)` commits exactly the oldest sealed segment as one log
+  entry under the action id and timestamp `options` supplies (`HeadCommitOptions` in
+  `packages/db-core/src/collection/struct.ts`; the queue mints both, and re-supplies the same action
+  id when it re-drives an entry whose earlier attempt may have landed). Its preconditions each throw
+  `SealedSegmentsError` with a `reason`: `not-head`, `refused` (the queue drops a refused segment, it
+  never commits it), `in-flight`. The cycle is the sync's — the per-attempt tracker and log append,
+  the retry accounting with its stall check, the refresh-until-settled loop — extracted into
+  `AttemptCycle` and `stageAttempt` in `packages/db-core/src/collection/write-attempts.ts` so the two
+  paths share one implementation; `syncAttempts` and `commitHead` each decide only what an attempt
+  is built from and what to do with a commit. The head commit's steps are exposed one at a time
+  through `HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`: `Collection.openHeadCommit`
+  takes the latch, checks the preconditions, marks the action in flight and returns the handle (a
+  closure over the collection's private state), and `driveHeadCommit` in the same file is the
+  one-collection loop `commitHead` runs over it — refresh, then per attempt stage, record, release,
+  send, retake, then fold and replay or refused — so the coordinator's per-entry commit can drive
+  several collections through the same steps in lock-step. Two hooks on `HeadCommitOptions` serve
+  the queue and the journal: `recordAttempt` is called with each attempt (an `InFlightAttempt`, plain
+  data, carrying its action id) after it is built and before the latch is released, and a throw out
+  of it aborts the cycle with nothing sent; `resume` hands back an attempt an earlier cycle under the
+  same action id recorded, seeded as the retained attempt so the opening refresh finishes a torn
+  attempt from it instead of refusing it as `transforms-not-held`. Four things differ:
+  - **The attempt runs on a head tracker, built once per revision.** The live tracker holds every
+    sealed segment and the open one cumulatively, so an attempt cannot run on a copy of it the way a
+    sync's does. `Collection.headTrackerFor` stages the head segment's actions alone, atomically
+    (`Collection.stageInto`, the path `act` uses), over the committed state — from the invented
+    baseline while the collection has no committed revision, so an invented collection's header,
+    log block and root ride in the head's commit — into a `Tracker` over the handle's read cache
+    with pins of its own. It is built once per revision the attempt requests and reused across
+    attempts, because a rebuild re-runs the handlers and mints fresh ids for the blocks they insert,
+    which would send different content under one `(action id, revision)` (the rule
+    `logAppendBlockIds` closes); a refresh that adopts a newer revision rebuilds it, the write being
+    genuinely different then. Before each attempt its pins are re-judged exactly as
+    `restageIfBasesMoved` re-judges the live queue (`Collection.rereadUnretainedBases`, then
+    `Tracker.movedBases`), and a moved base rebuilds at the same revision — the same narrow
+    exception the `NOTE:` at `syncAttempts`' call records. Staging runs the actions' guards against
+    the committed state; a refusal there is the segment's refusal, recorded and reported once
+    (`Collection.recordSealedRefusal`) and thrown out of `commitHead`, equivalent to the live replay
+    refusing the same segment on a refresh — which usually finds it first, since the cycle opens
+    with a refresh (like `updateAndSync`) that, with the action already marked in flight, also
+    recognises an earlier attempt's own entry and finishes or consumes it rather than committing a
+    second copy. A cycle opened with `resume` builds no head tracker while the revision the next
+    attempt requests equals the recorded attempt's: the handle's `stage` step sends the recorded
+    attempt verbatim (`resumedAttempt` in `packages/db-core/src/collection/write-attempts.ts`),
+    since it is the attempt that may have landed and a rebuild would mint fresh ids under its
+    `(action id, revision)`. It deliberately skips two things the head tracker does: re-judging the
+    base pins, leaving a moved base to storage's base guard as `completeOwnEntry`'s re-send does,
+    and the invented baseline, whose inserts the recorded transforms already carry. The rule is in
+    the `stage` step, so the coordinator's per-entry commit, which opens its handles with
+    `EntryCommit.resume` and calls the same step, shares it.
+  - **The latch is released around the one network `await`.** The handle's `release` and `retake`
+    (`HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`) bracket `source.transact`
+    alone, the retake in a `finally`, so nothing on the instance is touched without the latch and
+    `act`, `sealPending`, `update`, a snapshot or restore, and `dropSealed` of another segment all run
+    meanwhile; a second `commitHead` waits on the latch and then meets the `in-flight` precondition.
+    The window is marked by `Collection.headInFlight` — set just before
+    the release, cleared right after the retake, and distinct from `inFlightActionId`, which the
+    head commit's own refreshes run under and must take the own-entry path. Two things read it. A
+    refresh (`updateInternal`) that walks into the in-flight entry returns before `forgetAndAdopt`,
+    changing nothing (`collection:refresh-deferred-to-head-commit`): the entry is not failed, so it
+    is not finished and consumed as the write's own, and it is not a stranger's, so it is not
+    filtered and replayed over state that already contains it; the head commit applies the outcome
+    when it retakes the latch, and the next refresh finds nothing new. And `dropSealed` of the
+    in-flight head throws (`in-flight`). A refresh that finds a rival's entry instead proceeds as
+    any refresh does, and may refuse the head in its replay, so `commitHead` re-checks the head's
+    recorded refusal before every attempt and after every retake, and throws it in place of a retry.
+  - **On success the fold precedes the replay.** Under the retaken latch: the head segment is
+    removed (asserted still first — nothing may remove it while in flight — and the version bumped),
+    the ATTEMPT's transforms — the head's over committed state, plus the log append — are folded
+    into the cache and the revision adopted (`Collection.foldOwnCommit`, shared with the sync), and
+    only then are the remaining sealed segments and the open segment replayed over the committed
+    state that now holds the head. The replay after every head commit is what makes a drain
+    quadratic in the queue length; the tripwire `NOTE:` at that call names the remedy.
+  - **A torn head attempt is finished and consumed as the head.** The refresh between attempts
+    finishes a half-landed attempt from the retained one exactly as a sync's does, and
+    `consumeOwnEntry` then takes its head arm (`Collection.consumeHead`, keyed on
+    `Collection.headCommitEntry`, set for the cycle): the entry records the head segment's actions,
+    so consuming it removes that segment — after asserting the counts agree — and leaves the open
+    segment, which may have grown while the attempt was in flight, untouched. `commitHead` then
+    answers the refresh's durability, or `undefined` when the refresh established the write was
+    saved without re-sending (the status-read fallback of `completeOwnEntry`).
+- **An entry that wrote several collections is committed by the coordinator's per-entry slice,
+  `TransactionCoordinator.commitEntry` in `packages/db-core/src/transaction/coordinator.ts`.** It
+  drives the head commit's steps in lock-step across every collection the entry wrote, through one
+  `HeadCommitHandle` per participant (`EntryParticipants` in
+  `packages/db-core/src/transaction/entry-commit.ts`), opened in sorted collection-id order — the
+  order `commitOnce` acquires the same latches in, so a concurrent whole-collection commit over
+  overlapping collections cannot deadlock against it — held for the whole cycle and closed in
+  reverse. The cycle opens with a refresh round through the handles, as `commitHead` opens with one,
+  so a re-drive under the id of an attempt that may have landed finishes and consumes that attempt's
+  entry in each participant that holds it (such a participant is recorded as saved and leaves the
+  set) instead of committing a second copy. The answer is always a `TransactionDurability`, never
+  `undefined`, since a slice writes at least one collection: a participant the refresh saved without
+  learning who holds it is listed with an `undefined` class, as `commit` lists one. Each attempt then builds every remaining participant's
+  attempt on its head tracker (`stage`), hands them all to the write-ahead hook
+  (`EntryCommit.recordAttempt`, awaited under every latch; a throw aborts with nothing sent),
+  releases every latch, runs the coordinator's own phases over them — every participant pended, then
+  committed, the ordering that keeps a refusal at one participant's pend from leaving any part of the
+  entry durable — and retakes every latch in sorted order before applying the outcome: on a commit,
+  `fold` on every participant in one await-free pass and then `replay` on each, the event-loop
+  atomicity the whole-collection success fold promises; on a partial landing, the committed
+  participants folded, replayed and recorded as saved, the rest refused (their recorded refusal
+  re-checked, their attempt retained), and the refused ones re-driven forward by the retry loop
+  `commit` runs (`commitAttempts`, shared through an `AttemptDriver`), or
+  `CoordinatorPartialCommitError` on a hard failure; on a clean refusal, every participant refused
+  and the failure thrown by its class. The phases read the write off a `WriteContext` — the action
+  id, timestamp, reads and aged priority `commit` and `execute` used to read off their
+  `Transaction` — so the slice fabricates no stamp. It also takes no pre-commit snapshots and runs no
+  `restorePending` (an attempt never touches the live tracker, so a failed one leaves it as it was),
+  no `getPendingActions` or `tracker.reset` (the head segment is dropped and folded through the
+  handle), no stamp (a slice may run while a stamp is open on another coordinator over the same
+  collections — the plugin's open SQL transaction — and the collection latch is what serialises
+  them), and no expiry check. It requires `pendValidation: 'none'`, as the coordinator
+  `commitBatchLegacy` builds is, since an entry has no statements for a member to re-execute. Its
+  refresh rounds refresh the entry's participants only, never the coordinator's whole map, and pass
+  no tail floor (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision` covers the
+  slice too). `packages/db-core/test/coordinator-entry-commit.spec.ts` pins it.
+
+`packages/db-core/test/collection-segments.spec.ts` pins each of the head commit's rules.
+
+#### The offline queue
+
+`OfflineQueue` in `packages/db-core/src/offline/queue.ts` is the in-memory queue over the sealed segments above (docs/offline-sync.md §Draining), usable by a `Tree`/`Diary` application with no SQL. `OfflineQueue.enqueue` seals each given collection's open segment under one entry id (a collection with nothing staged is simply not part of the entry), writes the journal's entry record when a journal is given, and queues the entry, emitting its `queued` status before it resolves so the caller can attribute it to the commit it is in; a journal write that throws unseals every segment again (`Collection.unseal`) and fails the enqueue with nothing queued. The journal is one port, `IOfflineJournal` in `packages/db-core/src/offline/journal.ts`, which the queue writes through at every step of an entry's life and which speaks only the queue's vocabulary (docs/offline-sync.md §What is journaled): the entry record before the entry is admitted, the drive record — action id, retained attempts, committed collections — before each send and again after a partial commit or an identity renewal, and each terminal status before it is emitted. `OfflineQueue.restore` is the inverse, for a journal putting its records back after a restart: it holds the drain — the loop parks at the top of its next iteration, so no submission and no removal of the loop's is under way — registers the entry by its recorded sequence number, inserted ahead of anything queued since, and calls back per collection to insert the segment at that position (`Collection.restoreSealed`, whose replay returns the restored segment's own refusal rather than reporting it) or to say the collection already holds the recorded attempt committed (`Collection.holdsCommitted`), in which case nothing is re-staged. One drain loop per queue then commits the head entry — `Collection.commitHead` for an entry over one collection, `TransactionCoordinator.commitEntry` over several — with **at most one submission on the network at a time**, after asking the reachability gate (`ICohortReachability` in `packages/db-core/src/offline/reachability.ts`, asked with the header id and known log tail id, `Collection.knownLogTailId`, of each collection the head still has to commit; absent, the cohort is always reachable). A networked node's gate is `KeyNetworkCohortReachability` in `packages/db-p2p/src/network/cohort-reachability.ts`, exposed as `node.cohortReachability`: it judges each block's cohort as `findCluster` assembles it now, open when the cohort names another machine, and when it names only this node open only while the node is genuinely alone — no serving member the key network remembers is missing (`absentCohortMembers`), no configured bootstrap peer is still awaited (`awaitingBootstrapContact`), and no identify exchange is in flight on the node (`IdentifyProgress` in `packages/db-p2p/src/network/identify-progress.ts`, since a peer mid-identify is out of every cohort); an empty cohort or a lookup that throws is closed. Its `onChange` (optional on the port, always present on the node's gate) calls a listener, debounced (500 ms by default, `NodeOptions.cohortReachability`), after a connection opens or a peer is identified; a queue used without the Quereus plugin can take it as `wakeOn`, and the plugin routes it through its controller instead (below). The drain then applies each failure by its `classifyCommitFailure` class: a guard refusal, a validator rejection and an oversized write fail the entry; everything else keeps it queued behind one re-check timer the gate and the backoff share. Every submission also asks not to be committed by a lone node that knows it is not alone (`SyncOptions.refuseSoloCommit`, carried as `refuseSolo` on each request), unless the queue was built with `allowSoloCommit: true`: a coordinator whose cohort is only itself then refuses the pend as a `PromiseShortfallError` with `soloRefused` set while it knows of absent members, awaits a bootstrap peer or cannot route the write, so the entry waits for its cohort rather than settling on a write only this machine holds ([offline-sync.md §When to submit: the reachability gate](offline-sync.md#when-to-submit-the-reachability-gate)). Two rules are the queue's own. **One action id for the entry's whole life**, minted at enqueue and re-supplied on every re-drive with the attempts retained under it as `resume`, with one exception: a `torn-not-saved` outcome mints a fresh one, since a re-drive under the old id would find its own stranded log entry on every refresh and loop. **In doubt is sticky**: set the first time the queue's write-ahead wrapper (`OfflineQueue.recordAttempts`, now over `IOfflineJournal.driving`) has written the drive record for an attempt of the entry — the only moment before a send the queue is told about; a write that throws aborts the cycle with nothing sent, so it sets nothing — and cleared only by a terminal outcome or by `torn-not-saved` (except on an entry part of which has committed); an entry in doubt is neither discardable nor expirable. **A partial commit is finished, not rolled back** (`OfflineQueue.partiallyCommitted`): on `CoordinatorPartialCommitError` the entry reports `partially-committed` and stays at the head in doubt with the committed collections recorded on it (listed as `committedCollections` on `queued` and by `entries()`), each later submission drives only the collections still holding its segment under the same action id (a fresh one when the rest failed `torn-not-saved`), the remainder's commit settles it `committed` with one durability over every collection it wrote, and a permanent refusal fails it with `committedCollections` on `failed`. A failed entry's removal cascades through the collections' own refusals: its segments are dropped, each drop's replay reports the later entries it refuses through `onSealedRefused`, and the queue fails those in turn with `causedBy` naming the nearest earlier failing entry (`OfflineQueue.causeOf` says why nearest). The callback records and wakes only; the loop acts, so no latched method is ever called from under the collection latch. `packages/db-core/test/offline-queue.spec.ts` pins it, and `packages/db-p2p/test/offline-queue-mesh.spec.ts` pins the batched path an entry over several collections takes on a real two-member cohort; the rest is in [offline-sync.md §Draining](offline-sync.md#draining) and [§Partial commits](offline-sync.md#partial-commits).
+
+**What a committed entry changed travels through a hook.** `HeadCommitOptions.onCommittedHead` (`packages/db-core/src/collection/struct.ts`) and, per collection, `EntryCommit.onCommittedHead` (`packages/db-core/src/transaction/entry-commit.ts`, threaded into each handle by `EntryParticipants.open` the way `resume` is) are called under the collection latch, once per head segment, with the segment's recorded `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`; see *Conflict replay re-makes the uniqueness decision*, below) at the two places a head segment is dropped as committed: the handle's `fold` when the attempt committed, and `Collection.consumeHead` when the cycle's refresh found the entry's own log entry — so a re-drive that finds its earlier attempt landed reports it too, and the committed half of a partial commit is reported before `CoordinatorPartialCommitError` reaches the queue. A hook rather than a widened return type, because `commitHead`, `commitEntry`, the partial-commit error and `RefreshReport` would otherwise each have to carry tallies. A throw out of it is logged (`collection:committed-head-callback-threw`), never raised, since the commit is durable; a segment with no recorded tally is a defect, logged as `collection:committed-head-tally-missing` and answered with the zero tally. The queue keeps the tallies per collection on the entry (`Entry.applied`, in memory only) and folds them into `effect` on the `committed` status (`CommittedEffect` in `packages/db-core/src/offline/status.ts`, computed by `effectOf` in `packages/db-core/src/offline/entry.ts`): `already-applied` exactly when every collection the entry wrote reported a tally and the sums have `alreadyApplied > 0` and `applied === 0`, `applied` otherwise — an entry with no guarded-variant element included, and any entry one of whose collections has no tally: one a restore found already committed, or the committed half of a partial commit whose tally a restart lost, since that half may have changed rows and a wholly already-applied remainder must not speak for it.
+
+The Quereus plugin layers offline mode on this queue ([offline-sync.md §Application interface](offline-sync.md#application-interface)). One controller per `Database`, `OfflineMode` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts` (`plugin.offline`), owns one `OfflineQueue` — writing through `OfflineJournal` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-journal.ts` when `offline.journal` names a key-value store ([offline-sync.md §What is journaled](offline-sync.md#what-is-journaled)) — hands every tree the factory opens its refusal callback (`CollectionFactory.setSealedRefusedListener`), and translates the queue's statuses into table names under the transaction's `StampId()`, announcing a failed entry's tables to the `Database`'s watchers. It judges each queued transaction's outlook when the queue first reports it `queued` (`judgeTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`) — from the guards its sealed segments carry, the entries ahead of it, and the description of each collection that the collection's table publishes beside its offline policy (`TableOutlookSource`) — and holds it until the transaction settles, working out its dependencies and kind again after every status that changes the queue (`followOutlooks`, same file) and announcing a change of kind as `outlook-changed`; an assured transaction that fails anyway is logged (`offline:assured-entry-failed`) and counted in the queue state's `assuredFailures`. The judgement also reads what the statements' write descriptions said: each vtab opts into Quereus's write scope (`wantWriteScope`) and records, after each arm's last stage, which staged elements carry a fresh value (`freshElementsOf` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`), through `TransactionBridge.noteWriteFacts`, which keeps them with the transaction, truncates them on a savepoint rollback, and folds them into the entry's facts (`EntryFacts`) at commit — and, once per described statement, ahead of its staging, the decisions the statement made against other rows (`uncheckedOf` in the same file, through `TransactionBridge.noteWriteDescription`), from which the judgement lists the entry's `unchecked` and its `via: 'unchecked'` dependencies on the earlier entries whose writes those decisions read ([offline-sync.md §Dependencies between entries](offline-sync.md#dependencies-between-entries)). The facts are journaled in the entry record (`encodeFacts` in the same file) and handed back by the restore ahead of the restored transaction's judgement, so it is judged after a restart as it was before, a `row` read now matched by its table ([offline-sync.md §What is journaled](offline-sync.md#what-is-journaled)). `CommitOutlook()` runs the same judgement over an open transaction's open segments ([offline-sync.md §Predicting whether an entry will commit](offline-sync.md#predicting-whether-an-entry-will-commit)). The gate the queue asks is per transactor: `CollectionFactory.getCohortReachability` hands out one `LateBoundCohortReachability` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/late-bound-reachability.ts`) per transactor key, standing in for the gate registered there — the node's `node.cohortReachability`, which `CollectionFactory.createNetworkTransactor` registers for the `network` transactor unless a test or host registered one first — and forwarding both `reachable` and `onChange` to whichever gate is registered now, so a table that took it early still asks and hears the registered one. Each vtab publishes its transactor's gate with its policy at the start of every full initialization (`OfflineMode.setTablePolicy`), and the controller subscribes once to each distinct gate's `onChange`: a wake first starts a restore pass when a journaled transaction is deferred, then calls `OfflineQueue.wake`. It is routed through the controller rather than handed to the queue as `wakeOn` because of that first step — while the queue is empty no drain iteration asks the gate, so nothing else would retry a deferred record when the cohort returns. `offline.allowSoloCommit` reaches the queue as `OfflineQueueOptions.allowSoloCommit`. A transaction's acknowledgement is fixed when it begins (`TransactionState.acknowledgement`, set in `TransactionBridge.beginTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), and at commit `TransactionBridge.offlineRoute` picks the route: a locally acknowledged transaction is sealed into one entry (`TransactionBridge.sealIntoQueue`, then `OfflineMode.enqueue`) and its commit returns, a network-acknowledged one made while entries are queued is sealed behind them and its commit waits for its own outcome (`TransactionBridge.awaitQueuedCommit`), and every other commit takes the ordinary path. The drain commits what was sealed, so the bridge's single-writer state is never touched by it. After a restart `plugin.hydrate` puts the journaled entries back through `OfflineQueue.restore` (`OfflineMode.restore`, run by `OfflineRestore` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-restore.ts`), where a record whose table cannot be reached is deferred and retried on the table's next initialization or refresh and from the queue's reachability gate ([offline-sync.md §Restore after a restart](offline-sync.md#restore-after-a-restart)). Reads layer on it too: in offline mode a live read of a `'queue'` table whose refresh cannot reach the cohort is served from this machine's own view — `refreshLive` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, the one site every live refresh of the vtab goes through, absorbing only the failures `isCohortUnreachableRead` accepts and skipping the refresh while the transactor's reachability gate (`CollectionFactory.getCohortReachability`), the gate the queue asks, says the cohort is unreachable ([offline-sync.md §Reads in offline mode](offline-sync.md#reads-in-offline-mode)).
+
 #### A block re-read after a refresh can be answered too old, and is never remembered
 
 The trap the replay-ordering rule above closes — the read cache refilled with old content that no
@@ -209,6 +445,20 @@ are true of it:
 - **It is reported**, as `collection:block-below-floor` (fields in
   [debugging.md](debugging.md#did-a-re-read-come-back-older-than-the-log-says)), which is the only
   trace it leaves.
+
+**An open floors what its log tail names.** An open walks no entries, but it has read the log tail
+block, and each action entry there names the blocks that action changed at its revision.
+`Collection.floorTailEntries` in `packages/db-core/src/collection/collection.ts` raises a floor for
+each, as the walk raises one for each entry it walks. Without it, a handle opened over a repo whose
+copy of such a block was older than its own log tail read the block as it was before the commit, with
+nothing to say otherwise. Two ways to get there: a coordinator that missed the commit, and a node
+whose crash kept a commit's log tail and lost its other blocks inside the store's durability window,
+whose first read of a held block after the restart is answered from that copy while the consult runs
+behind it. The second was seen as a table row whose index entry was missing after an offline-queue
+restore (`packages/quereus-plugin-optimystic/test/offline-restore.spec.ts`). With the floor, the
+coordinator consults its cohort before answering (see *The asker's floor rides out on the request*
+under Key Invariants) and the transactor re-asks another machine for an answer still below it. Only
+the tail block: it holds the newest commits, which are the ones a durability window can tear.
 
 One `BlockFloors` is shared by every read source the handle builds, the way the
 `ReadDependencyCollector` is: a pinned read view created right after a refresh would otherwise fetch
@@ -311,8 +561,9 @@ read itself, since the floor makes it consult past its window (see *The asker's 
 the request* under Key Invariants), so the old content outlasts one read only when no reachable cohort
 member can corroborate the revision — a partition, or a log entry whose blocks never landed, which
 sets a floor no machine can ever meet, and there the below-floor content is the *correct* content
-(the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
-invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
+(the accepted-tradeoff `NOTE:` at `mayRetain`). At open it floors only the blocks named by the log tail
+block's entries, not those of older log blocks, and it sets no floor for the blocks an invalidation
+entry reverts. A write staged over a too-old read keeps the revision it was really
 computed against: once storage catches up, the base under the staged edits is re-judged as moved and
 the edits are re-staged before they are pended, never re-described at the newer revision (see
 [Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect
@@ -335,7 +586,9 @@ therefore carries an optional serialized guard stating the statement's intent �
 `keepExisting` (skip silently if the key is present; no SQL statement stages it any
 more, see the `unchanged` paragraph below), `absentRange` (secondary-UNIQUE — no entry OTHER than this
 entry's own key may occupy a key *range*; a foreign hit throws `TreeRangeTakenError`,
-a subclass of `TreeKeyTakenError`), and `unchanged` (the lost-update check, below). The
+a subclass of `TreeKeyTakenError`), `unchanged` (the lost-update check, below), and the
+three already-applied variants `absentOrEqual`, `unchangedOrEqual` and `unchangedOrAbsent`
+(after the `unchanged` paragraphs). The
 `replace` handler (`buildInit` in
 `packages/db-core/src/collections/tree/tree.ts`) enforces the guard on **every** run —
 initial staging and every conflict replay — so the decision is always re-made against
@@ -386,13 +639,25 @@ added without that probe is broken, not merely conservative: the guard refuses a
 visible collision the probe should have resolved (evicting under REPLACE, swallowing
 under IGNORE), and the retry re-refuses forever.
 
-The fourth kind, `unchanged`, is the only one that asserts something must still *be* at the key rather than that nothing may be there — the optimistic-concurrency (lost-update) check. The entry at the key must be present AND structurally equal to the image the staged write read, carried in the guard's `expected` field and compared by `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts` (object key order ignored, `Uint8Array` leaves compared by bytes, an `undefined`-valued property treated as absent — so a guard that crossed an encoding boundary still matches an entry that did not). It is also the only kind a **delete** element may carry: every other kind asserts that nothing is present, which would make a delete a no-op by construction, so the handler rejects them there with `TreeDeleteGuardKindError` — a malformed-action error, deliberately outside the `TreeGuardRefusedError` hierarchy, since "a rival won, retry sequentially" does not describe a caller bug — instead of ignoring them the way it used to ignore every guard on a delete. A mismatch throws `TreeEntryChangedError`, which deliberately does **not** subclass `TreeKeyTakenError` — a lost update is not a uniqueness violation, and the bridge's `UNIQUE constraint failed` mapping would misreport it as one. Both extend `TreeGuardRefusedError`, which is where the contract every guard refusal obeys is written down once: it discards the whole action's staged writes, it is not a `StaleFailure`, and it is never downgraded to a retryable condition.
+The fourth kind, `unchanged`, is the first that asserts something must still *be* at the key rather than that nothing may be there — the optimistic-concurrency (lost-update) check. The entry at the key must be present AND structurally equal to the image the staged write read, carried in the guard's `expected` field and compared by `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts` (object key order ignored, `Uint8Array` leaves compared by bytes, an `undefined`-valued property treated as absent — so a guard that crossed an encoding boundary still matches an entry that did not). It is one of the two kinds a **delete** element may carry (`unchangedOrAbsent`, below, is the other): every other kind asserts that nothing is present, which would make a delete a no-op by construction, so the handler rejects them there with `TreeDeleteGuardKindError` — a malformed-action error, deliberately outside the `TreeGuardRefusedError` hierarchy, since "a rival won, retry sequentially" does not describe a caller bug — instead of ignoring them the way it used to ignore every guard on a delete. The mirror check on an upsert rejects the delete-only `unchangedOrAbsent` with `TreeUpsertGuardKindError`. A mismatch throws `TreeEntryChangedError`, which deliberately does **not** subclass `TreeKeyTakenError` — a lost update is not a uniqueness violation, and the bridge's `UNIQUE constraint failed` mapping would misreport it as one. Both extend `TreeGuardRefusedError`, which is where the contract every guard refusal obeys is written down once: it discards the whole action's staged writes, it is not a `StaleFailure`, and it is never downgraded to a retryable condition.
 
 A guard is plain serialized data that rides in the log beside its action, and the live transport for that log is **JSON** in both directions (`JSON.stringify` in `packages/db-p2p/src/protocol-client.ts`, `JSON.parse` in `packages/db-p2p/src/repo/service.ts`) — not a richer codec. Two consequences the comparison is built around. First, an empty tuple slot comes back as `null` rather than `undefined`, so the handler reads both the entry slot and the guard slot by truthiness; a strict `!== undefined` test would have upserted `null` over a row, or read `.kind` off `null` mid-replay. Second, a guard's `expected` must be a value JSON preserves: a genuinely byte-shaped entry would deserialize as an index-keyed object, which `structuralEquals` reports (correctly) as different, and the guard would then refuse an honest write forever. No entry type is byte-shaped today — the plugin base64-encodes BLOB columns under the `json` encoding, and the `msgpack` encoding that would produce raw bytes throws `not yet implemented` — but a byte-shaped entry type introduced later needs a transport-stable encoding for `expected` before the guard can be trusted over the wire.
 
-**An absent entry counts as changed**, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
+**An absent entry counts as changed** for `unchanged`, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
 
-**Which statements carry `unchanged`.** Every main-table entry whose staged index delta was computed from a pre-write row image carries an `unchanged` guard on the stored entry the statement read (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`; the image comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which now hands back the stored entry beside the decoded row): a same-key UPDATE; both halves of a primary-key move — the delete half on the row it leaves, the insert half `unchanged` on the displaced entry when a REPLACE lands on an occupied key and `absent` otherwise; a DELETE; an INSERT OR REPLACE over an occupied key; and each secondary-UNIQUE eviction. So a racing same-row UPDATE or DELETE **refuses the loser** at commit rather than resolving last-writer-wins. Last-writer-wins cannot be made index-coherent: the loser's index delta was computed against a row the collection no longer holds, and no commit mode replays across collections, so re-applying the main-table action would leave that delta beside the rival's row (an entry no row implies, or a deleted row resurrected). Under concurrency every conflict disposition — `or ignore`, `or replace`, `on conflict … do nothing` — resolves to refusal too: an INSERT at a key its probe found clear is guarded `absent` whatever its disposition, because `keepExisting` would skip only the main-table entry while the statement's index entries replayed beside the rival's row, and an unguarded REPLACE would displace the rival without the index deletes a sequential REPLACE stages. The sequential retry, whose probe then sees the rival's row, honours the disposition. Index trees carry no `unchanged` guard: an index entry is keyed `indexKey ‖ pk`, so a stale delta can only be *prevented* by refusing the main-table action it was derived from, never repaired from inside the index tree. The bridge renders a `TreeEntryChangedError` from the main collection through the renderer the vtab registers (`registerEntryChangedRenderer` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, the framed key decoded back to the row's logical values by `decodePrimaryKey` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` — raised as `ConcurrentModificationError` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), a `QuereusError` with `StatusCode.BUSY` and the refusal in `cause`. It is deliberately **not** a `ConstraintError`: no integrity rule was violated, and the engine rewraps a `ConstraintError` under `or fail` / `or rollback` into keeping the statement's prior rows, which is wrong for a lost update. `BUSY` is the code the engine's own memory table raises for the same optimistic-concurrency loss, so a caller can classify by class or by code. Both mapped types extend `QuereusError`, which is what makes the vtab's DML catch rethrow a mapped refusal verbatim rather than wrap it a second time. Within one transaction a later statement's guard expects the earlier statement's *staged* entry, which is what the pre-write read returns and what replay, re-running the actions in order, has put there; a chain such as `insert; update; delete` therefore never refuses itself. A live read inside the doomed transaction refreshes the tree and so replays the staged action too, and can surface the same refusal early, wrapped as `Query failed: …` rather than mapped — the shape the "a live read inside a doomed transaction" note in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` already accepted for the insert guard, pinned by `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`.
+**Three variants accept a change a rival already made** (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`; the design is [offline-sync.md §Guards that make idempotent writes assured](offline-sync.md#guards-that-make-idempotent-writes-assured)), for the offline queue's rebase of a queued entry: two machines marking one task done, or deleting one row, both intended the final state the second one finds. Each has the outcome its base kind lacks — the element is *skipped as already applied* — beside writing and refusing. `absentOrEqual` (upsert) writes when the key is absent, skips when the present entry is structurally equal to the element's own entry, and otherwise refuses with `TreeKeyTakenError`. `unchangedOrEqual` (upsert, with `expected`) writes when the present entry equals `expected`, skips when it equals the element's own entry — checked second, so a no-op update whose `expected` equals its entry writes — and refuses with `TreeEntryChangedError` on an absent or any other entry; absent is still changed for every upsert kind. `unchangedOrAbsent` (delete, with `expected`) deletes when the present entry equals `expected`, skips when the key is absent, and refuses with `TreeEntryChangedError` on any other entry. The post-image an upsert variant compares against is the element's own entry, not a second copy on the guard, so the guard stays the size its base kind is; a kind on the wrong element is malformed, as above. The handler reports what it accepted as an `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`): for each element carrying one of the three kinds, `alreadyApplied` when it was skipped and `applied` when it was written or deleted; and `applied` for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever they do not refuse and that the SQL layer stages on every main-table element, so an entry of a plain insert beside an already-applied update tallies as `applied`, which is what a host reading `already-applied` as "none of my changes landed" needs. Elements with no guard, `keepExisting` or `absentRange` are not counted — a `keepExisting` skip says nothing about equality, and the other two are the shapes an index tree's entries take, whose writes under an already-applied entry restate what the rival's row already implies and must not make the entry read as `applied`. `Collection.stageInto` sums the handlers' tallies, and `Collection.replayActions` and `Collection.buildHeadTracker` record the sum on the sealed segment they staged (`SealedSegment.applied`, set directly, no version bump), which is how the queue hears it (*The offline queue*, above). A whole-collection `sync` discards the open segment's tally.
+
+**Which guard each statement carries.** Every main-table element a statement stages carries a guard, chosen at staging from the statement's write description (`TableWrite`, which Quereus hands the vtab on `UpdateArgs.writeScope`) and the table's tags. The gates are pure over the description and the arm — `insertAcceptsEqualRow` and `rewriteAcceptsEqualRow` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts` — and the image an `expected` field carries comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which hands back the stored entry beside the decoded row; the guard carries the entry AS READ, never a re-encoding (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). Site by site, in `update()` of the same file:
+
+| Statement (site) | Guard | The already-applied variant instead when… |
+|---|---|---|
+| INSERT whose probe found the key clear (`insertGuard`) | `absent` | the description's disposition says a present row is not an error — `or ignore`, `or replace`, `on conflict do nothing` with no target or targeting the primary-key columns — or the table is tagged `"optimystic.content_key" = true`: `absentOrEqual`. A plain `insert` keeps `absent`. |
+| INSERT OR REPLACE over an occupied key, and a same-key UPDATE (`rewriteGuard`) | `unchanged` on the pre-write entry | the description is of that arm and `selfIndependent` (no `set n = n + 1`, nothing read from other rows): `unchangedOrEqual`. The upsert `DO UPDATE` arm receives the INSERT's description and keeps `unchanged`. |
+| DELETE, and each secondary-UNIQUE eviction's delete (`applyUniqueEvictions`) | `unchangedOrAbsent` on the pre-write entry | always; no description is needed, so a cascade child delete carries it too. |
+| primary-key move, delete half | `unchanged` on the row it leaves | never: accepting the absent delete half while still inserting the new row would create a row the sequential execution never would. |
+| primary-key move, insert half | `absent` at a clear key, `unchanged` on the displaced entry under REPLACE | never. |
+
+Index trees are untouched: an index entry carries no `unchanged` guard and a UNIQUE index entry's `absentRange` is unchanged; under an already-applied entry the index segments replay as no-ops of their own accord (the delete of the old entry finds nothing, the insert of the new one finds an equal entry, and `absentRange` excludes the entry's own key, where the rival's identical entry sits). The `optimystic.content_key` tag says the primary key is a deterministic function of the row's other columns (a blob store keyed by hash), so two machines inserting the same content insert the same row; it is read `=== true` at staging time, as `optimystic.single_writer` is, and the variant still compares the whole row, so an equal key under different content refuses as a plain insert would. The gates are a property of the statement, not of offline mode: session mode stages through the same `update()`, and an online transaction's racing identical write — two deletes of one row — commits instead of refusing, the second's delete skipped as already applied (the DELETE-vs-DELETE case of `packages/quereus-plugin-optimystic/test/concurrent-row-change-refusal.spec.ts`, and the delete-vs-delete arm of the racing oracle in `packages/quereus-plugin-optimystic/test/two-node-index-mutation-sweep.spec.ts`). The acceptance can also be met at INITIAL staging on a mesh, where the tracker the guard scans fetched a rival's commit the pre-stage probe's view had not: a DELETE whose row that commit removed is skipped and the statement returns `ok` for a row the sequential execution would not have found, acceptable since the final state is the statement's intent (the note beside the DML catch in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). So a racing same-row UPDATE or DELETE whose rival made a DIFFERENT change **refuses the loser** at commit rather than resolving last-writer-wins. Last-writer-wins cannot be made index-coherent: the loser's index delta was computed against a row the collection no longer holds, and no commit mode replays across collections, so re-applying the main-table action would leave that delta beside the rival's row (an entry no row implies, or a deleted row resurrected). Under concurrency a conflict disposition — `or ignore`, `or replace`, `on conflict … do nothing` — resolves to refusal too whenever the rival's row DIFFERS: an INSERT at a key its probe found clear is guarded `absent` or `absentOrEqual` whatever its disposition, never `keepExisting`, because `keepExisting` would skip only the main-table entry while the statement's index entries replayed beside the rival's row, and an unguarded REPLACE would displace the rival without the index deletes a sequential REPLACE stages; only a rival's EQUAL row is accepted, and only under the dispositions the table above names. The sequential retry, whose probe then sees the rival's row, honours the disposition. Index trees carry no `unchanged` guard: an index entry is keyed `indexKey ‖ pk`, so a stale delta can only be *prevented* by refusing the main-table action it was derived from, never repaired from inside the index tree. The bridge renders a `TreeEntryChangedError` from the main collection through the renderer the vtab registers (`registerEntryChangedRenderer` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, the framed key decoded back to the row's logical values by `decodePrimaryKey` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` — raised as `ConcurrentModificationError` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), a `QuereusError` with `StatusCode.BUSY` and the refusal in `cause`. It is deliberately **not** a `ConstraintError`: no integrity rule was violated, and the engine rewraps a `ConstraintError` under `or fail` / `or rollback` into keeping the statement's prior rows, which is wrong for a lost update. `BUSY` is the code the engine's own memory table raises for the same optimistic-concurrency loss, so a caller can classify by class or by code. Both mapped types extend `QuereusError`, which is what makes the vtab's DML catch rethrow a mapped refusal verbatim rather than wrap it a second time. Within one transaction a later statement's guard expects the earlier statement's *staged* entry, which is what the pre-write read returns and what replay, re-running the actions in order, has put there; a chain such as `insert; update; delete` therefore never refuses itself. A live read inside the doomed transaction refreshes the tree and so replays the staged action too, and can surface the same refusal early, wrapped as `Query failed: …` rather than mapped — the shape the "a live read inside a doomed transaction" note in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` already accepted for the insert guard, pinned by `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`.
 
 Regression suites:
 `packages/db-core/test/tree-guard.spec.ts` (every guard kind over raw trees),
@@ -410,10 +675,12 @@ One consequence for rollback: the refusal happens *after* the loser's refresh ad
 the rival's committed revision, so the pre-transaction snapshot its rollback restores
 was captured on an older committed boundary. `Collection.restorePending`
 (`packages/db-core/src/collection/collection.ts`) detects the moved boundary and, for
-a snapshot with an empty pending queue, resets the tracker empty instead of
+a snapshot with an empty pending queue and nothing sealed, resets the tracker empty instead of
 reinstalling the snapshot's transforms — restoring them verbatim would shadow the
 now-committed blocks with stale structure (an invented collection's pre-commit
-header/root making the whole tree read empty being the observed case).
+header/root making the whole tree read empty being the observed case). With a sealed
+segment in place it replays instead, which a reset would have dropped (see
+[Staged actions are segments](#staged-actions-are-segments)).
 
 #### Committed reads are pinned, not shared-cache
 
@@ -1022,7 +1289,9 @@ StorageRepo.get()                          # read-driven promotion (context prov
   `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts`.
 - Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
   `OptimysticNodeAttachments` (`db-p2p/src/optimystic-node.ts`), which `createLibp2pNode`'s
-  return type carries, so reading it needs no cast. `NetworkTransactor`
+  return type carries, so reading it needs no cast; the same surface carries
+  `node.cohortReachability`, the offline queue's reachability gate (see *The offline queue*
+  above). `NetworkTransactor`
   re-exposes it via an optional `localChangeNotifier` ctor option (no-op when absent).
 
 #### Reactive Watch Bridge (Quereus vtab)
@@ -1082,6 +1351,12 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   machine's commit wakes watchers twice: once from the storage listener, once from
   the network notification. Both are whole-table invalidations, so the cost is one
   extra re-query; neither path suppresses the other.
+- **A failed offline transaction is announced the same way.** Its rows leave this
+  machine's view with no commit to announce them, so the offline-mode controller
+  makes the same call for each table its removal changed, through the same
+  error-isolating helper (`announceExternalChange` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`;
+  [offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)).
 - **Lifetime.** The subscription is established once after table init and released
   in `OptimysticModule.destroy` (DROP TABLE). It is deliberately NOT released in
   the per-statement `disconnect()` (a no-op that keeps the table initialized across
@@ -1321,8 +1596,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   travel with the operations wherever the operations travel: an atomic's flush into its parent
   (`Tracker.absorb`) hands over the atomic's pins as the bases of the flushed operations rather than
   re-probing a cache that may have moved on, and a staged-state snapshot
-  (`Collection.snapshotPending` / `restorePending`) carries and restores them, so a rollback never
-  pairs operations with the bases of some later re-stage.
+  (`Collection.snapshotPending` / `restorePending`) carries them and restores them on the verbatim
+  arm, so a rollback never pairs operations with the bases of some later re-stage. The replay arm
+  restores none: it re-stages the operations, and each re-staged update pins the base it was just
+  computed against (see [Staged actions are segments](#staged-actions-are-segments)).
 - **A pending action is never pended over a moved base; it is re-staged first.**
   `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
   every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`
@@ -1330,7 +1607,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   and the log append): one read per pinned block the cache does not retain (a below-floor answer, so
   storage may have caught up with no log movement), one cache probe per pinned block, and a replay of
   the pending queue if any base moved (logged as `collection:restage-moved-base`). `mustReplay` has
-  the same test as its third reason, beside conflicts and a revision advance.
+  the same test as its third reason, beside conflicts and a revision advance. A head commit's
+  tracker is re-judged the same way before each of its attempts (`Collection.headTrackerFor`), and
+  rebuilt rather than replayed, since it holds the head segment alone.
 
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
@@ -1414,6 +1693,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
   approval either); what they buy is classification, signed evidence, and an operator-visible count
   of how much traffic went unchecked. A node with no checker configured is unaffected by the policy.
   No composition root supplies a checker today (backlog `feat-no-deployment-validates-transactions-at-pend`).
+  Neither shape is marked as a validity judgement (next bullet): both say this node could not judge
+  the transaction, not that it is wrong.
+- **A reject that judges the transaction itself wrong says so in its signature.** Every member
+  refusal other than a `conflict`, a `held` or an expiry is a `reject` with prose, so a stale
+  revision, a membership refusal, a content-digest disagreement and a checker fault look identical
+  to a writer — and the prose must never become control flow. The five `TransactionValidator`
+  refusals that judge the transaction itself wrong — a tampered stamp, a missing or invalid client
+  signature, a failed re-execution and an operations-hash mismatch — return a `validity` class
+  (`ValidityRejection` in `packages/db-core/src/transaction/transaction.ts`), carrying the operations
+  hash the member computed when it got that far; every other refusal returns none.
+  `checkPendValidation` passes a checker's class through untouched, and the pend-validation branch of
+  `ClusterMember.validatePendOperations` is the one site whose verdict can carry it, which `voteFor`
+  in `packages/db-p2p/src/cluster/cluster-repo.ts` signs as `Signature.validity`: encoded
+  `reject-invalid:<json>` the way `expiredAt` is encoded `reject-expired:`, so it cannot be added,
+  stripped or altered in transit, and the type keeps one vote from carrying both. The marker is
+  positive on purpose, so **absent means "not known to be a validity judgement"**: a member on an older
+  build sends none, and its stale-revision reject must never be read as final. Counting is unchanged
+  everywhere — a marked reject is a reject — and `detectEquivocation` treats a differing marker on a
+  re-delivered reject as a re-signed vote. The mixed-version cost is the one the expiry encoding
+  already accepted: an older member verifying a marked vote builds the old preimage and reports
+  `InvalidSignature` against an honest member, tolerable because no deployment re-validates
+  transactions yet, so marked votes are rare, while the common stale-revision reject keeps its
+  encoding byte for byte. The writer's typed failure reads it (`ValidityRejectedError`, see *A pend
+  rejection is returned only when it is classified* below); limiting dispute evidence to marked
+  rejects (backlog `dispute-validity-reject-marker`) is its other consumer. The classification is the
+  design of record in [right-is-right.md §Which rejections are disputes](right-is-right.md#which-rejections-are-disputes).
 - **An expired record is answered with a vote, not a throw.** Expiry is a promise *verdict*, decided
   first in `ClusterMember.evaluatePromise` (and ahead of the conflict race in `getTransactionPhase`,
   so an expired record cannot clear a live rival's reservation), never a check in `validateRecord`,
@@ -1422,8 +1727,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reading, folded into the signed bytes (`clusterVoteSigningPayload`); the timer-driven
   `handleExpiration` signs the same vote. The reason is the same one that makes a checker fault a
   reject rather than an escape: a throw reaches the coordinator as silence — no vote, a
-  `ConsensusTimeout` penalty against an honest member, and the "super-majority" shortfall a writer
-  retries as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
+  `ConsensusTimeout` penalty against an honest member, and the promise shortfall
+  (`PromiseShortfallError`) a writer stops on as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
   `TransactionExpiredError` (db-core's, the one class every layer raises — deliberately not a
   `ValidatorRejectionError`) when every reject that sank the transaction is an expiry vote, which
   `CoordinatorRepo` returns to the writer as an `ExpiredFailure` (see *Pend retryability is an
@@ -1432,16 +1737,25 @@ saveMaterializedBlock(block): store(structuredClone(block));
   slow-transaction case, not the skew case. The one delivery it applies is one whose signed votes
   already prove the record rejected (the abandonment broadcast), since that only clears it. See
   [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
-- **A pend rejection is returned only when local storage confirms a revision loss.** When
-  enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
-  carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then
-  re-reads the affected blocks from its own storage: if any block's `latest.rev >= request.rev`
-  — the same rule the members vote by — the rejection is *returned* as a `StaleFailure` carrying
-  `conflict: true`, so `Collection.sync`'s bounded re-read/rebase/retry loop picks it up instead
-  of an error escaping mid-batch and splitting a multi-tree commit. Every unconfirmed rejection
-  still **throws** — including one whose confirmation read failed, and one only remote members
-  could see (local storage behind). The reject-reason text is never parsed; confirmation is
-  purely the local revision comparison.
+- **A pend rejection is returned only when it is classified: local storage confirms a revision
+  loss, or every member that sank it marked it a validity judgement.** When enough members vote
+  reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError` carrying the (free-form,
+  wire-visible) reject reasons. `CoordinatorRepo.pend` then re-reads the affected blocks from its
+  own storage: if any block's `latest.rev >= request.rev` — the same rule the members vote by — the
+  rejection is *returned* as a `StaleFailure` carrying `conflict: true`, so `Collection.sync`'s
+  bounded re-read/rebase/retry loop picks it up instead of an error escaping mid-batch and splitting
+  a multi-tree commit. Otherwise, when every reject in the record is a validity vote or an expiry
+  vote and at least one is a validity vote (`validityRejectionOf` in
+  `packages/db-p2p/src/repo/cluster-coordinator.ts`, carried as `ValidatorRejectionError.validity`),
+  it is returned as a `RejectedFailure` (see *Pend retryability is an explicit field* below). That
+  order is deliberate: a confirmed revision loss means the writer rebases and sends different
+  content, so a verdict on the old content settles nothing. Every other rejection still **throws** — including one whose confirmation read
+  failed, one only remote members could see (local storage behind), and a validity vote beside an
+  unmarked reject, which may be exactly such a loss: a false "invalid" would make an offline drain
+  drop a change a rebase would have saved, a false "unclassified" costs a retry. The reject-reason
+  text is never parsed; confirmation is purely the local revision comparison and the signed markers.
+  Commit records never run the transaction checker, so `CoordinatorRepo.commit` never meets a marked
+  reject and is unchanged.
 - **…except against the writer's own durable work.** A write touching several blocks commits them
   a group at a time, so it can end up with some blocks durable and the rest refused — a *torn
   action* — and its retry reuses the same action id. Every revision comparison above therefore
@@ -1498,7 +1812,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   content digests the failed attempt declared. Only then does it **consume** the entry
   (`Collection.consumeOwnEntry`) instead of running it through the conflict filter and replaying
   it — replaying re-appends content the committed tail already holds, leaving the same action
-  recorded twice in the log. Consuming drops the entry's actions off the head of `pending` and
+  recorded twice in the log. Consuming drops the entry's actions off the head of the open segment and
   forces the replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write
   reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
   refresh has changed anything on the instance, so when it cannot finish, the staged actions, the
@@ -1515,14 +1829,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   therefore produce byte-identical transforms, which needs both of the values the append would
   otherwise mint fresh to be per-WRITE:
   - the entry's **timestamp**, minted once beside the action id (`Collection.syncInternal`) and
-    passed down to `Log.addActions`; on the coordinator path it is `transaction.stamp.timestamp`,
-    fixed at BEGIN and already stable across attempts. Nothing in the tree reads
-    `LogEntry.timestamp` for logic — it is informational — so the write's time is a safe value, and
-    arguably the more honest one.
+    passed down to `Log.addActions` as part of the write's identity (`WriteIdentity` in
+    `packages/db-core/src/collection/write-attempts.ts`); on the coordinator path it is
+    `transaction.stamp.timestamp`, fixed at BEGIN and already stable across attempts, and on a head
+    commit (`Collection.commitHead`) it is the entry's local commit time, supplied by the queue as
+    `HeadCommitOptions.timestamp`. Nothing in the tree reads `LogEntry.timestamp` for logic — it is
+    informational — so the write's time is a safe value, and arguably the more honest one.
   - the **id of the data block** the append mints when the current log block is full (32 entries, or
     `BLOCK_TARGET_BYTES` of JSON — see [A transaction's size limit](#a-transactions-size-limit)).
     `Collection.logAppendBlockIds` hands `Log.open` the ids an earlier attempt of this action minted
-    at this revision, in order, and mints fresh past them. This one is worse than a stray orphan
+    at this revision, in order, and mints fresh past them; every write path reaches it through
+    `stageAttempt` (`packages/db-core/src/collection/write-attempts.ts`) or the coordinator's own
+    append, `commitHead` included. This one is worse than a stray orphan
     block: a second id also rewrites `nextId` on the block that was the tail and `tailId` on the
     collection header, so two attempts send different update operations for two blocks that already
     exist — a machine that landed the first reads the log as ending in one block and a machine that
@@ -1639,8 +1957,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
   `updateInternal` reads the field rather than taking the id as a parameter, so no refresh path can
   be correct-only-by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
-  the field unset, and the consume branch cannot fire. Both write paths set it: `Collection.sync`
-  brackets its whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
+  the field unset, and the consume branch cannot fire. Every write path sets it: `Collection.sync`
+  and `Collection.commitHead` each bracket their whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
   right after taking its latch, pushing the disposers into the commit's `CommitCycle`, which
   `commit` clears in a `finally` around the WHOLE retry loop. The coordinator's clear cannot be
   latch-scoped: its inter-attempt refresh (`collection.refreshInFlight`) — the only reader of the
@@ -1720,16 +2038,51 @@ saveMaterializedBlock(block): store(structuredClone(block));
   aggregate refusal from the per-batch responses (`refusalFrom`, which the commit side shares), so
   it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict. The
   commit side is deliberately untouched: it keys on `CommitResult` shape (next bullet).
-  **Beside `conflict` sits the one refusal that is never retryable: an expiry.** A pend or commit the
-  cohort refused because the transaction had already expired by its members' clocks comes back as
-  its own failure shape, `ExpiredFailure` (a sibling of `StaleFailure` in `PendResult` and
-  `CommitResult`, carrying the clocks as `TransactionExpiry`), decided by the one predicate
-  `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and `.commit` return it ahead of their
-  stale classifiers, because a thrown answer reaches a remote writer as a reset stream; the rebuild
-  makes an expiry in any batch the whole answer; `isConflictFailure` is false for it; and
-  `Collection.syncAttempts`, `TransactionCoordinator`'s pend phase and its commit phase all stop on
-  it with `TransactionExpiredError` instead of re-driving — a retry's expiration comes from the same
-  clock. See [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  **Beside `conflict` sit the three refusals that are never retryable: an expiry, a promise
+  shortfall and a validity rejection.** A pend or commit the cohort refused because the transaction had already expired by
+  its members' clocks comes back as its own failure shape, `ExpiredFailure` (a sibling of
+  `StaleFailure` in `PendResult` and `CommitResult`, carrying the clocks as `TransactionExpiry`),
+  decided by the one predicate `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and
+  `.commit` return it ahead of their stale classifiers, because a thrown answer reaches a remote
+  writer as a reset stream; the rebuild makes an expiry in any batch the whole answer;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts`, `TransactionCoordinator`'s
+  pend phase and its commit phase all stop on it with `TransactionExpiredError` instead of
+  re-driving — a retry's expiration comes from the same clock. See
+  [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  A pend whose promise round fell short because too few cohort members answered — no conflict or
+  held vote, too few rejections for a rejection — comes back the same way, as `ShortfallFailure`
+  (carrying `approvals`, `rejections`, `peerCount`, `needed` and the `silentPeers` that cast no vote,
+  as `PromiseShortfall`), decided by `isShortfallFailure`: `ClusterCoordinator` raises
+  `PromiseShortfallError`, `CoordinatorRepo.pend` returns it ahead of the stale classifier, the
+  rebuild makes a shortfall in any batch the answer when no batch expired, `isConflictFailure` is
+  false for it, and `Collection.syncAttempts` and `TransactionCoordinator`'s pend phase stop on it by
+  name — every coordinator of that cohort meets the same silent members. The error's message is the
+  sentence the coordinator always threw ("Failed to get super-majority: …"), kept byte-identical for
+  a downstream repository that matches it. Two consequences of returning rather than throwing: the
+  writer's transactor no longer re-picks another coordinator for a shortfall (the accepted-tradeoff
+  `NOTE:` in `CoordinatorRepo.pendThroughCluster`), and a local writer meets the error itself rather
+  than as the `cause` of a `Some peers did not complete` aggregate. **A pend answer only:**
+  `CoordinatorRepo.commit` still throws a commit-phase shortfall, because the commit side reads a
+  returned refusal as a confirmed conflict (the `NOTE:` at its catch).
+  A pend the members that sank it judged invalid (bullet above) comes back as `RejectedFailure`,
+  carrying `TransactionInvalidity` — one `ValidityRefusal` per validity vote, with the member's peer
+  id, its reason and the operations hash it computed — decided by `isRejectedFailure`.
+  `CoordinatorRepo.pend` returns it behind the stale classifier; a cohort of one returns it from its
+  storage tier, when `StorageRepo.pend`'s own check gives a verdict marked `validity` (one refusal, no
+  peer id), while its unmarked refusals (`PEND_NOT_VALIDATABLE`, `VALIDATOR_FAULT`) stay bare reasons a
+  writer retries. The rebuild makes a validity rejection in any batch the whole answer, ahead even of
+  an expiry, for the reason a cohort that judged the content outranks clock votes inside one record;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts` and `TransactionCoordinator`'s
+  pend phase stop on it with `ValidityRejectedError` (`packages/db-core/src/network/validity-rejected-error.ts`),
+  which `commit()` throws by name and `execute()` reports as failed. A writer on an older build
+  receiving it retries it as a reason-only refusal until its budget ends; a member on an older build
+  never marks, so its rejects never produce it. With disputes enabled, a marked rejection beside
+  approvals is held for a ruling first, and its writer is answered with the dispute's refusal instead
+  (backlog `dispute-writer-sees-disputed-pend`).
+  What a writer gets once these refusals have become errors is sorted in one place,
+  `classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts`: by class and
+  structured field alone, and only the error thrown, never its `cause` (see
+  [offline-sync.md §Classifying an attempt's outcome](offline-sync.md#classifying-an-attempts-outcome)).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its
@@ -2138,7 +2491,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `GetBlockResult` carries an optional `unavailable` field
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)) that a repo sets ONLY when it
   knows its own answer is a guess; an absent field means authoritative, so every producer that
-  never sets it (including `TestTransactor`) keeps its existing meaning. Two producers set it:
+  never sets it (including `TestTransactor`) keeps its existing meaning. Three producers set it:
   `StorageRepo.get` flags `'unmaterializable'` when the block reads as absent but this node holds
   records proving it exists — the missing-base promotion refusal above, a `getBlock()` throw on a
   `latest` this node cannot materialize (truncated history, or a failed restore of a revision whose
@@ -2166,6 +2519,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
   | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
+
+  The third producer is the transactor, one layer up. `NetworkTransactor.get` returns a block for
+  which no coordinator it asked gave any response — every request carrying it threw, timed out or
+  was still in flight at the deadline, through its second-chance round — as `'peers-unreachable'`
+  with no block, the reason the table gives a consult that threw, so the read of that block fails
+  typed while the other blocks of the same read are returned. A coordinator that responded and left
+  a requested block out is a protocol fault rather than unreachability, and still fails the whole
+  read with its `Some peers did not complete` aggregate.
 
   Note the second row: `'cohort-unreachable'` is *silence from machines this node knows about*, not
   isolation in general. A node whose routing view yields no cohort member at all, and whose
@@ -2244,7 +2605,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   named in the answer's `unconfirmed` and in the under-replication ledger, so the copy is pushed to
   that member as soon as it is connected (see
   [packages/db-p2p/docs/repo.md §The durability gate and the under-replication ledger](../packages/db-p2p/docs/repo.md#the-durability-gate-and-the-under-replication-ledger)).
-  Whether such a write should be admitted at all belongs to the partition-healing design (backlog
+  A write that asks not to be committed alone (`refuseSolo`, which only the offline queue sets) is
+  refused instead ([offline-sync.md §When to submit: the reachability gate](offline-sync.md#when-to-submit-the-reachability-gate)).
+  Whether other such writes should be admitted at all belongs to the partition-healing design (backlog
   `6.5-partition-healing`).
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The

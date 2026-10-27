@@ -5,13 +5,16 @@
  * All metadata is in package.json - no manifest export needed.
  */
 
-import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
-import { TEXT_TYPE } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+import { FunctionFlags, TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import { OfflineMode } from './optimystic-adapter/offline-mode.js';
+import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
+import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
@@ -28,12 +31,24 @@ export { isFullyDurable } from '@optimystic/db-core';
 export type {
 	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
 } from './optimystic-adapter/commit-durability.js';
+// Offline mode (README § Offline mode): the controller under `plugin.offline`, its two refusals, the
+// timeout a commit waiting behind the queue throws, the refusal of DDL while queued transactions wrote
+// the table, the db-core errors its queries throw, and the statuses it reports.
+export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError, OfflineCommitTimeoutError, QueuedEntriesBlockSchemaChangeError } from './optimystic-adapter/offline-mode.js';
+export type { StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+export { OfflineJournalError } from './optimystic-adapter/offline-journal.js';
+export type { OfflineConfig } from './optimystic-adapter/offline-config.js';
+export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
+export type {
+	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
+} from './optimystic-adapter/offline-status.js';
+export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
 
 /**
  * Plugin registration function
  * This is called by Quereus when the plugin is loaded
  */
-export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
+export default function register(db: Database, config: Record<string, SqlValue> = {}) {
 	if (config.debug) {
 		log('Optimystic plugin loading with config: %o', config);
 	}
@@ -41,10 +56,19 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
 	const txnBridge = new TransactionBridge(collectionFactory);
+	// One offline queue per Database, idle until the first locally acknowledged commit. Wired before
+	// any table opens: every tree the factory opens from here on reports sealed-segment refusals to it.
+	// It announces a failed transaction's tables to this Database's watchers.
+	const offline = new OfflineMode(txnBridge, db, parseOfflineConfig(config.offline));
+	txnBridge.attachOfflineMode(offline);
+	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
+	// The restore after a restart initializes each journaled transaction's tables through the module.
+	offline.attachTableResolver(optimysticModule);
 
-	// Create the StampId function
+	// Create the StampId and CommitOutlook functions
 	const stampIdFunc = createStampIdFunction(txnBridge);
+	const commitOutlookFunc = createCommitOutlookFunction(txnBridge, offline);
 
 	// Note: Transaction hooks are handled by the virtual table's begin, commit, rollback methods
 
@@ -61,7 +85,14 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 				schema: {
 					name: 'StampId',
 					numArgs: 0,
-					flags: 1 as FunctionFlags, // UTF8
+					// FRESH: a promise to Quereus's write-provenance analysis that no OTHER writer can produce the
+					// value (16 random bytes beside a hash of this peer's id), so an insert keyed by StampId() is
+					// judged assured offline (docs/offline-sync.md §Judging each guard). Quereus words the flag
+					// as "unique per call"; StampId() answers the same value for every call inside one
+					// transaction, which the outlook does not need to be otherwise — two rows inserted under it
+					// in one transaction collide with each other sequentially, and the pre-stage probe refuses
+					// the second before anything is queued (README § Offline mode).
+					flags: FunctionFlags.UTF8 | FunctionFlags.FRESH,
 					returnType: {
 						typeClass: 'scalar' as const,
 						logicalType: TEXT_TYPE,
@@ -71,6 +102,20 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 					implementation: stampIdFunc,
 				},
 			},
+			{
+				schema: {
+					name: 'CommitOutlook',
+					numArgs: 0,
+					flags: FunctionFlags.UTF8,
+					returnType: {
+						typeClass: 'scalar' as const,
+						logicalType: TEXT_TYPE,
+						nullable: true,
+						isReadOnly: true,
+					},
+					implementation: commitOutlookFunc,
+				},
+			},
 		],
 		collations: [],
 		// Expose internal components for testing and advanced usage
@@ -78,13 +123,21 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		txnBridge,
 		/**
 		 * Hydrate Quereus's in-memory catalog from persisted Optimystic vtab
-		 * schemas. Hosts that re-open a `Database` against existing storage
-		 * should call this once after registering the plugin (and before
-		 * running `apply schema` / DDL) so Quereus sees the existing tables in
-		 * its catalog and skips re-emitting CREATE TABLE / CREATE INDEX for
-		 * each one. Idempotent.
+		 * schemas, then put the offline queue's journaled transactions back
+		 * (`plugin.offline.restore()`; README § Offline mode, "Restarting").
+		 * Hosts that re-open a `Database` against existing storage should call
+		 * this once after registering the plugin (and before running `apply
+		 * schema` / DDL) so Quereus sees the existing tables in its catalog and
+		 * skips re-emitting CREATE TABLE / CREATE INDEX for each one, and so the
+		 * first statement sees the queued transactions. Idempotent. Resolves to
+		 * the catalog counts; rejects with `OfflineJournalError` for a journal
+		 * record written by a newer build (every record before it is restored).
 		 */
-		hydrate: (db: Database) => optimysticModule.hydrateCatalog(db, config, config),
+		hydrate: async (db: Database) => {
+			const counts = await optimysticModule.hydrateCatalog(db, config, config);
+			await offline.restore();
+			return counts;
+		},
 		/**
 		 * Compare every secondary index of one table against the table's rows, in both
 		 * directions, and report each disagreement: a row the index holds no entry for
@@ -126,6 +179,16 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		onCommitFullyHeld: (listener: CommitFullyHeldListener) =>
 			txnBridge.onCommitFullyHeld(listener),
 		/**
+		 * Offline mode (README § Offline mode): `enter()` makes every transaction begun from then on
+		 * resolve its commit once the transaction is queued on this machine, to be submitted to the
+		 * network in order as soon as the cohort can be reached; `exit()` returns to network
+		 * acknowledgement. Follow each queued transaction through `onStatus`, the queue through
+		 * `onQueueState`, and query it through `entries`, `status`, `outcomes`; `discard` withdraws a
+		 * never-sent transaction and `whenDrained` resolves once the queue is empty. Configured by the
+		 * registration config's `offline` block.
+		 */
+		offline,
+		/**
 		 * Resolves once every tag change made so far on an Optimystic table is saved to the table's
 		 * catalog record — so a later `hydrate` restores it. A tag change made by `apply schema` is
 		 * saved before the apply returns; an imperative `alter … set|add|drop tags` (on a table, a
@@ -139,7 +202,9 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		/**
 		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
 		 * full-replication events (forgetting every commit still followed, see
-		 * `TransactionBridge.dispose`), and its LEASES on the raw-storage read caches behind
+		 * `TransactionBridge.dispose`), the offline queue's drain (`OfflineMode.dispose`: a
+		 * submission in flight is aborted after its current network step, nothing further is sent,
+		 * and queued entries stay sealed in their collections), and its LEASES on the raw-storage read caches behind
 		 * `local` transactors over host-supplied storage (see `CollectionFactory.dispose`). Call
 		 * after `db.close()`. Quereus has no close hook that reaches the plugin, so this is explicit.
 		 *
@@ -153,6 +218,12 @@ export default function register(_db: Database, config: Record<string, SqlValue>
 		 */
 		dispose: async () => {
 			await optimysticModule.whenCatalogPersisted();
+			// Before the bridge: a submission in flight finishes its current network step, and a commit
+			// it lands is reported through the bridge's follower while that is still live (a report
+			// after the bridge's dispose would subscribe the follower to the node's events again, with
+			// nothing left to release it). A pending `whenDrained` rejects with QueueDisposedError, and
+			// entries still queued stay sealed in their collections (nothing of the application's is dropped).
+			await offline.dispose();
 			txnBridge.dispose();
 			await collectionFactory.dispose();
 		},

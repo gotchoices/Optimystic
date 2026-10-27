@@ -21,7 +21,7 @@ Collections integrate several key systems:
 ```typescript
 // Collection structure
 class Collection<TAction> {
-  private pending: Action<TAction>[] = [];           // Local pending actions
+  private readonly segments = new SegmentList<TAction>(); // Staged actions: sealed segments, then the open one
   private readonly source: TransactorSource<IBlock>; // Network transaction source
   private readonly sourceCache: CacheSource<IBlock>; // Block caching layer
   public readonly tracker: Tracker<IBlock>;          // Change tracking
@@ -91,7 +91,9 @@ await collection.act(localAction);
 // (handled internally by conflict resolution)
 ```
 
-A refresh re-stages the pending queue (`replayActions` in `packages/db-core/src/collection/collection.ts`) for any of three reasons, decided by `mustReplay`: a walked log entry named a block the tracker holds a transform for (a conflict); the committed revision advanced while actions are pending (an action must be applied against the revision it commits over, even one that changed no block); or a staged block's **base moved** — the read cache no longer describes the block at the revision its staged operations were computed against. The third is also checked without a refresh, by `Collection.restageIfBasesMoved`, immediately before every pend attempt (`syncAttempts`, and the coordinator's commit spans), so a pending action is never pended over a moved base; the replay is logged as `collection:restage-moved-base` with the pinned and the current revision.
+The staged actions are kept in two parts, in `SegmentList` in `packages/db-core/src/collection/segments.ts`: the **sealed segments**, one per entry of the offline-sync queue, oldest first, and the **open segment** the current transaction stages into. While nothing is sealed the open segment is the whole list and every path below behaves as it did with one list; the rules the split adds (a replay stages each sealed segment atomically and records its refusal instead of throwing it, and a whole-collection commit refuses while anything is sealed) are in [internals.md §Staged actions are segments](../../../docs/internals.md#staged-actions-are-segments).
+
+A refresh re-stages the staged actions (`replayActions` in `packages/db-core/src/collection/collection.ts`) for any of three reasons, decided by `mustReplay`: a walked log entry named a block the tracker holds a transform for (a conflict); the committed revision advanced while actions are pending (an action must be applied against the revision it commits over, even one that changed no block); or a staged block's **base moved** — the read cache no longer describes the block at the revision its staged operations were computed against. The third is also checked without a refresh, by `Collection.restageIfBasesMoved`, immediately before every pend attempt (`syncAttempts`, and the coordinator's commit spans), so a pending action is never pended over a moved base; the replay is logged as `collection:restage-moved-base` with the pinned and the current revision.
 
 ## Communication with Remote State
 
@@ -135,14 +137,15 @@ async update() {
   // 3. Process remote actions and detect conflicts
   let anyConflicts = false;
   for (const entry of latest?.entries ?? []) {
-    // Map each pending action to its effective form: the original, a replacement,
-    // or dropped (undefined). A rewritten or discarded action mutates the pending set.
-    const before = this.pending;
+    // Map each OPEN-segment action to its effective form: the original, a replacement,
+    // or dropped (undefined). A rewritten or discarded action mutates the staged set.
+    // A sealed segment is never rewritten: its actions are the queue entry's own.
+    const before = this.segments.open;
     const after = before
       .map(p => this.doFilterConflict(p, entry.actions))
       .filter((a): a is Action<TAction> => a !== undefined);
     const mutated = after.length !== before.length || after.some((a, i) => a !== before[i]);
-    this.pending = after;
+    this.segments.open = after;
 
     // Force a replay when filtering mutated pending, or an entry touched a block we staged over
     anyConflicts = anyConflicts || mutated || this.tracker.conflicts(new Set(entry.blockIds)).length > 0;
@@ -185,9 +188,10 @@ async sync() {
   const lockId = `Collection.sync:${this.id}`;
   const release = await Latches.acquire(lockId);
   try {
-    while (this.pending.length || !isTransformsEmpty(this.tracker.transforms)) {
-      // 1. Snapshot current pending actions
-      const pending = [...this.pending];
+    this.assertNoSealedSegments();   // a whole-collection commit refuses while a segment is sealed
+    while (this.segments.open.length || !isTransformsEmpty(this.tracker.transforms)) {
+      // 1. Snapshot the open segment
+      const pending = [...this.segments.open];
       const actionId = generateActionId();
 
       // 2. Create transaction snapshot
@@ -226,14 +230,18 @@ async sync() {
       } else {
         // 5b. Success - reset the no-progress budget and update local state
         consecutiveFailures = 0;
-        this.pending = this.pending.slice(pending.length);
+        this.segments.open = this.segments.open.slice(pending.length);
+        // Fold the commit into the cache and adopt the revision BEFORE replaying what is still
+        // staged: an invented collection's replay resets to its invented baseline until a
+        // revision is adopted, so replaying first would put the baseline's header back over
+        // the one just committed.
         const transforms = tracker.reset();
-        await this.replayActions();
         this.sourceCache.transformCache(transforms, newRev);
         this.source.actionContext = {
           committed: [...(this.source.actionContext?.committed ?? []), { actionId, rev: newRev }],
           rev: newRev
         };
+        await this.replayActions();
       }
     }
   } finally {
@@ -273,6 +281,11 @@ Key aspects of the sync process:
   `memberClocks`, `coordinatorClock` and `apparentSkewMs` (how far the refusing members' clocks
   appear to be from this device's), and its message is written for a person. The staged actions
   stay staged, so a `sync()` after the clock is corrected sends them.
+- **No retry on a short cohort or an invalid transaction**: a pend too few cohort members answered
+  (a `ShortfallFailure`) ends `sync()` with `PromiseShortfallError`, and a pend the members that sank
+  it judged invalid (a `RejectedFailure`) ends it with `ValidityRejectedError`, naming each refusing
+  member and its reason (both in [transactor.md](transactor.md)). Either is thrown after that one
+  attempt, with the staged actions still staged.
 - **A half-landed write is finished before it is acknowledged**: a write's log tail is committed
   before its other blocks, and a commit can answer "failed" after the tail was stored (the tail's
   revision is held by fewer than a majority, or a later block lost a race). The retry's refresh then

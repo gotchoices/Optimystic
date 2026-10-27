@@ -1,4 +1,4 @@
-import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome, GetBlockResults } from "@optimystic/db-core";
+import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome, GetBlockResults, ValidityRejection } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
@@ -78,12 +78,11 @@ type VerifyOutcome =
 /**
  * This member's promise-round decision on a record: approve, or one of two *different kinds* of no.
  *
- * The distinction is the whole reason the type exists. `invalid` is a validity judgement — the record
- * is wrong and will be wrong on every retry — and becomes a `reject` vote the coordinator counts
- * toward the permanent-rejection threshold. `held` is "not right now": the pend's blocks are reserved
- * by a different unresolved action in this member's storage, a condition that disappears the moment
- * that rival commits or cancels, and it becomes a `held` vote counted toward neither approvals nor
- * rejections.
+ * The distinction is the whole reason the type exists. `invalid` is a refusal the coordinator counts
+ * toward the permanent-rejection threshold — it becomes a `reject` vote. `held` is "not right now":
+ * the pend's blocks are reserved by a different unresolved action in this member's storage, a
+ * condition that disappears the moment that rival commits or cancels, and it becomes a `held` vote
+ * counted toward neither approvals nor rejections.
  *
  * A boolean plus prose cannot carry that difference, and collapsing the two was a real defect rather
  * than a tidiness question: on a cohort of three or fewer members `maxAllowedRejections` is zero at
@@ -98,18 +97,29 @@ type VerifyOutcome =
  * structured `expiredAt`, so the coordinator can report a clock disagreement by name. Before this kind
  * existed the member threw instead, and a throw reaches the coordinator as silence: no vote, a
  * `ConsensusTimeout` penalty against an honest peer, and a "super-majority" failure a writer retries.
+ *
+ * `invalid` covers every refusal that is not `held` or `expired` — a stale revision, a membership
+ * refusal, a content-digest disagreement, a checker fault — so most `invalid` verdicts are NOT
+ * judgements that the transaction itself is wrong, and a stale one can clear on a retry after a
+ * re-read. The ones that are carry `validity`, which only the transaction checker sets (see
+ * {@link ValidityRejection}); it becomes the vote's signed marker.
  */
 type PromiseVerdict =
 	| { valid: true }
-	| { valid: false; kind: 'invalid'; reason?: string }
+	| { valid: false; kind: 'invalid'; reason?: string; validity?: ValidityRejection }
 	/** `heldBy` is the rival's ACTION id (storage's pending list), never a messageHash — see {@link Signature}. */
 	| { valid: false; kind: 'held'; reason: string; heldBy: ActionId }
 	/** `expiredAt` is this member's wall-clock reading when it judged the record expired. */
 	| { valid: false; kind: 'expired'; reason: string; expiredAt: number };
 
-/** A refusal that judges the record invalid — the permanent kind, and every kind but the pending-conflict one. */
-function invalidVerdict(reason?: string): PromiseVerdict {
-	return { valid: false, kind: 'invalid', reason };
+/**
+ * A refusal that becomes a plain `reject` vote. `validity` only when the transaction checker judged the
+ * transaction itself wrong; every other caller leaves the vote unmarked.
+ */
+function invalidVerdict(reason?: string, validity?: ValidityRejection): PromiseVerdict {
+	return validity === undefined
+		? { valid: false, kind: 'invalid', reason }
+		: { valid: false, kind: 'invalid', reason, validity };
 }
 
 /**
@@ -176,8 +186,18 @@ function voteFor(verdict: PromiseVerdict): ClusterVote {
 	switch (verdict.kind) {
 		case 'held': return { type: 'held', heldBy: verdict.heldBy };
 		case 'expired': return { type: 'reject', rejectReason: verdict.reason, expiredAt: verdict.expiredAt };
-		case 'invalid': return { type: 'reject', rejectReason: verdict.reason };
+		case 'invalid': return verdict.validity === undefined
+			? { type: 'reject', rejectReason: verdict.reason }
+			: { type: 'reject', rejectReason: verdict.reason, validity: signedValidity(verdict.validity) };
 	}
+}
+
+/**
+ * Exactly the fields of a validity marker the vote's signature covers. The checker may be an embedder's
+ * hook, and anything else it returned would ride on the vote unsigned.
+ */
+function signedValidity({ computedHash }: ValidityRejection): ValidityRejection {
+	return computedHash === undefined ? {} : { computedHash };
 }
 
 /** The log line naming each refusal kind; an operator reads them as three different events. */
@@ -188,10 +208,29 @@ const refusalLogTag: Record<Extract<PromiseVerdict, { valid: false }>['kind'], s
 };
 
 /**
- * Widen a boolean-plus-prose check into a {@link PromiseVerdict}. Every check written this way judges
- * validity, so its refusal is the permanent kind; only the pending-conflict branch of
- * {@link ClusterMember.validatePendOperations} produces the transient one, and it builds its verdict
- * directly.
+ * What two signatures from one member for one record must agree on, or the member signed twice: the
+ * vote's type and, for a reject, its validity marker. A member signs one promise vote per record, so an
+ * honest member cannot send both a marked and an unmarked reject — or two different `computedHash`es —
+ * for one record. A differing marker on a re-delivered reject is therefore a re-signed vote — the same
+ * equivocation as a type flip — and it matters as much, since the marker is what decides whether a
+ * writer treats the refusal as final. The first-seen vote is kept, as for a type flip.
+ *
+ * NOTE: "an honest member signs once" assumes it remembers its vote. A member that forgot the record
+ * (a restart) and re-judged it later could sign a marked reject the first time and a stale, unmarked
+ * one the second — the same exposure an approve-then-stale-reject re-vote already has. If honest
+ * members are ever seen penalized this way, key the check on what the member could not re-judge.
+ */
+function equivocationKey(sig: Signature): string {
+	return sig.type === 'reject' && sig.validity !== undefined
+		? 'reject-invalid:' + JSON.stringify(sig.validity.computedHash ?? null)
+		: sig.type;
+}
+
+/**
+ * Widen a boolean-plus-prose check into a {@link PromiseVerdict}. Every check written this way refuses
+ * with the `invalid` kind, unmarked — none of them re-checks the transaction itself; only
+ * {@link ClusterMember.validatePendOperations} produces the `held` kind and a marked `invalid`, and it
+ * builds those verdicts directly.
  */
 function verdictOf(result: { valid: boolean; reason?: string }): PromiseVerdict {
 	return result.valid ? { valid: true } : invalidVerdict(result.reason);
@@ -1123,7 +1162,8 @@ export class ClusterMember implements ICluster {
 	 * Compares existing vs incoming signatures for the same peers.
 	 * ANY change of vote type is equivocation — the comparison is over `Signature['type']`, so it
 	 * covers every kind without enumerating them (a new kind joins the check by existing): report a
-	 * penalty and keep the first-seen signature.
+	 * penalty and keep the first-seen signature. A reject whose validity marker differs is equivocation
+	 * too, though its type does not change (see {@link equivocationKey}).
 	 * New peers are accepted normally.
 	 */
 	private detectEquivocation(
@@ -1141,19 +1181,21 @@ export class ClusterMember implements ICluster {
 		for (const [peerId, incomingSig] of Object.entries(incoming)) {
 			const existingSig = existing[peerId];
 			if (existingSig) {
-				if (existingSig.type !== incomingSig.type) {
-					// Equivocation detected: peer changed their vote type
+				const existingVote = equivocationKey(existingSig);
+				const incomingVote = equivocationKey(incomingSig);
+				if (existingVote !== incomingVote) {
+					// Equivocation detected: peer changed their vote
 					log('cluster-member:equivocation-detected', {
 						peerId,
 						phase,
 						messageHash,
-						existingType: existingSig.type,
-						incomingType: incomingSig.type
+						existingType: existingVote,
+						incomingType: incomingVote
 					});
 					this.reputation?.reportPeer(
 						peerId,
 						PenaltyReason.Equivocation,
-						`${phase}:${messageHash}:${existingSig.type}->${incomingSig.type}`
+						`${phase}:${messageHash}:${existingVote}->${incomingVote}`
 					);
 					// Keep first-seen signature — do not let the peer flip their vote
 				}
@@ -1962,7 +2004,8 @@ export class ClusterMember implements ICluster {
 						})
 				);
 				if (!validation.valid) {
-					return invalidVerdict(validation.reason);
+					// The one site whose refusal can be a validity judgement: the checker marks it.
+					return invalidVerdict(validation.reason, validation.validity);
 				}
 			}
 		}

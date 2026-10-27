@@ -32,6 +32,20 @@ export { isFullyDurable } from '@optimystic/db-core';
 export type {
 	SqlCommitDurability, SqlCommitDurabilityListener, CommitFullyHeld, CommitFullyHeldListener,
 } from './optimystic-adapter/commit-durability.js';
+// Offline mode (README § Offline mode): the controller under `plugin.offline`, its two refusals, the
+// timeout a commit waiting behind the queue throws, the refusal of DDL while queued transactions wrote
+// the table, the db-core errors its queries throw, and the statuses it reports. Exported from `./plugin` too.
+export { OfflineMode, OfflineModeRefusedError, SessionModeRefusedError, OfflineCommitTimeoutError, QueuedEntriesBlockSchemaChangeError } from './optimystic-adapter/offline-mode.js';
+export type { StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+export { OfflineJournalError } from './optimystic-adapter/offline-journal.js';
+export type { OfflineConfig } from './optimystic-adapter/offline-config.js';
+export { EntryNotDiscardableError, UnknownEntryError, QueueDisposedError } from '@optimystic/db-core';
+export type {
+	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
+} from './optimystic-adapter/offline-status.js';
+// Whether a queued transaction can be made to fail by another writer (README § Offline mode, "Will it
+// go in?"): on the `queued` status, and as the JSON `CommitOutlook()` answers. Exported from `./plugin` too.
+export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';

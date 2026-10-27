@@ -73,6 +73,15 @@ export interface QualifiedTableName {
 }
 
 /**
+ * `schema.table`, the name a commit's durability report and the offline queue's statuses give a
+ * table. Rendered from the pair and never parsed back into it: either part may itself contain a
+ * dot, so a site that needs the two parts keeps the pair beside the string.
+ */
+export function qualifiedTableName(name: QualifiedTableName): string {
+	return `${name.schemaName}.${name.tableName}`;
+}
+
+/**
  * The collection URI of a table declared without an explicit `using optimystic('<uri>')`:
  * `tree://default/<schema>/<table>`. `main` is qualified like any other schema. The table's
  * secondary indexes live under it unchanged (`<uri>/index/<name>`), and the segment counts keep
