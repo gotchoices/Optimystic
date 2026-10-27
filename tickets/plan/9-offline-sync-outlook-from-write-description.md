@@ -3,12 +3,12 @@ prereq: offline-sync-outlook-from-guards
 architecture: docs/offline-sync.md#what-the-analysis-needs-from-quereus
 files: packages/quereus-plugin-optimystic/src/optimystic-module.ts, packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts, docs/offline-sync.md
 difficulty: hard
-tradeoffs: Waits on a Quereus API that does not exist yet, and the guard-only prediction plus the `optimystic.fresh` tag already covers applications that generate ids themselves, so it may never be worth the complexity for current users.
+tradeoffs: The guard-only prediction plus the `optimystic.fresh` tag already covers applications that generate ids themselves, so it may never be worth the complexity for current users.
 ----
 
 Stage 9 of [docs/offline-sync.md §Implementation stages](../../docs/offline-sync.md#implementation-stages).
 
-**Waits on Quereus:** the Quereus ticket `statement-write-scope` (filed in the sibling `quereus` repository on 2026-10-25) must ship in a Quereus release first; then bump the `@quereus/quereus` dev and peer ranges (and `engines.quereus`) together, per AGENTS.md *Dependencies*.
+**Quereus API (shipped in 4.21.0; our ranges already require it):** `Statement.getWriteScope()` and the per-statement module hook `UpdateArgs.writeScope` (`@quereus/quereus/src/planner/analysis/write-scope.ts`), described in the sibling repository's `docs/write-scope.md`. Read that doc before designing; where it differs from what [docs/offline-sync.md §What the analysis needs from Quereus](../../docs/offline-sync.md#what-the-analysis-needs-from-quereus) assumed, update the design doc to match what shipped.
 
 ## What is wanted
 

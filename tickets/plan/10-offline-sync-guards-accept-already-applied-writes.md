@@ -1,14 +1,14 @@
 description: Let a queued offline change that another machine already made identically — both marking the same task done, both deleting the same row — count as committed instead of failing.
-prereq: offline-sync-outlook-from-guards
+prereq: offline-sync-outlook-from-guards, offline-sync-outlook-from-write-description
 architecture: docs/offline-sync.md#guards-that-make-idempotent-writes-assured
 files: packages/db-core/src/collections/tree/struct.ts, packages/db-core/src/collections/tree/tree.ts, packages/quereus-plugin-optimystic/src/optimystic-module.ts, docs/offline-sync.md, docs/internals.md
 difficulty: hard
-tradeoffs: Adds three guard kinds whose soundness rests on facts from a Quereus API that does not exist yet, to rescue a class of conflicts (identical concurrent edits) that applications may rarely hit.
+tradeoffs: Adds three guard kinds whose soundness rests on facts from Quereus's write scope, to rescue a class of conflicts (identical concurrent edits) that applications may rarely hit.
 ----
 
 Stage 10 of [docs/offline-sync.md §Implementation stages](../../docs/offline-sync.md#implementation-stages).
 
-**Waits on Quereus:** needs the self-independence and conflict-disposition facts from the Quereus ticket `statement-write-scope` (sibling `quereus` repository).
+**Quereus API (shipped in 4.21.0; our ranges already require it):** `Statement.getWriteScope()` and the per-statement module hook `UpdateArgs.writeScope` (`@quereus/quereus/src/planner/analysis/write-scope.ts`), described in the sibling repository's `docs/write-scope.md`. Read that doc before designing; where it differs from what [docs/offline-sync.md §What the analysis needs from Quereus](../../docs/offline-sync.md#what-the-analysis-needs-from-quereus) assumed, update the design doc to match what shipped.
 
 ## What is wanted
 
