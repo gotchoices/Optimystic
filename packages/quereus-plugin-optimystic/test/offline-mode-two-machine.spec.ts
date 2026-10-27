@@ -1,17 +1,22 @@
 /**
- * Offline mode on a two-machine group with one member away (docs/offline-sync.md §When to submit: the
- * reachability gate): a transaction made in the mode on the machine left alone is queued, not
- * committed alone; a live read there serves it from that machine's own view; and it is sent the moment
- * the partner returns, woken by the gate rather than found by the re-check timer.
+ * Offline mode on a two-machine group.
  *
- * Two nodes on the in-process mesh (`mesh-node-harness.ts`). Node A's gate is the node's real one,
- * `KeyNetworkCohortReachability` from `@optimystic/db-p2p`, over A's own view of the mesh's key network,
- * registered on A's factory under the transactor's key before any table exists — where a node built by
- * `createLibp2pNode` has its `node.cohortReachability` registered by the factory itself. Its events come
- * from an `EventTarget` the spec dispatches on, standing in for the libp2p node's. "B away" is
- * {@link PartnerAway}: each node's view of the cohort holds only itself and names the other as absent,
- * and every request to B fails. The deterministic counterpart of phase 5 of
- * `packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts`, for writes made in the mode.
+ * One member away (docs/offline-sync.md §When to submit: the reachability gate): a transaction made in
+ * the mode on the machine left alone is queued, not committed alone; a live read there serves it from
+ * that machine's own view; and it is sent the moment the partner returns, woken by the gate rather
+ * than found by the re-check timer. Two nodes on the in-process mesh (`mesh-node-harness.ts`). Node A's
+ * gate is the node's real one, `KeyNetworkCohortReachability` from `@optimystic/db-p2p`, over A's own
+ * view of the mesh's key network, registered on A's factory under the transactor's key before any
+ * table exists — where a node built by `createLibp2pNode` has its `node.cohortReachability` registered
+ * by the factory itself. Its events come from an `EventTarget` the spec dispatches on, standing in for
+ * the libp2p node's. "B away" is {@link PartnerAway}: each node's view of the cohort holds only itself
+ * and names the other as absent, and every request to B fails. The deterministic counterpart of phase 5
+ * of `packages/db-p2p/test/small-deployment-lifecycle.integration.spec.ts`, for writes made in the mode.
+ *
+ * Both members offline, making the same change (docs/offline-sync.md §Guards that make idempotent
+ * writes assured): the second to drain finds its change already made by the first and commits with
+ * `effect: 'already-applied'`, where a different change by the first still refuses it. Each node's gate
+ * here is a switch the case opens when it wants that node to drain.
  */
 
 import { expect } from 'chai';
@@ -113,6 +118,167 @@ const notesOf = (node: MeshDbNode): Promise<Record<string, unknown>[]> => queryA
 /** The kinds of `statuses`, each run of one kind collapsed to one. */
 const kindRuns = (statuses: readonly QueuedTransactionStatus[]): string[] =>
 	statuses.map(status => status.kind).filter((kind, index, kinds) => kind !== kinds[index - 1]);
+
+type CommittedStatus = Extract<QueuedTransactionStatus, { kind: 'committed' }>;
+
+interface Machine extends MeshDbNode {
+	/** Every status this node's plugin reported, in order. */
+	statuses: QueuedTransactionStatus[];
+	/** Let this node's queue reach its cohort. */
+	openGate(): void;
+}
+
+/** Both nodes registered with `offline`, each behind its own closed gate, with `creates` declared on both. */
+async function twoOfflineMachines(...creates: string[]): Promise<{ a: Machine; b: Machine }> {
+	const { transactorFor } = await startMockMesh(2);
+	const machine = (index: number): Machine => {
+		const node = createMeshDbNode(transactorFor(index), { offline: { recheck: { baseMs: 20, maxMs: 100 } } } as unknown as Record<string, SqlValue>);
+		let open = false;
+		node.plugin.collectionFactory.registerCohortReachability('shared:test', { reachable: () => Promise.resolve(open) });
+		const statuses: QueuedTransactionStatus[] = [];
+		node.plugin.offline.onStatus(status => { statuses.push(status); });
+		return { ...node, statuses, openGate: () => { open = true; } };
+	};
+	const a = machine(0);
+	const b = machine(1);
+	for (const sql of creates) {
+		await a.db.exec(sql);
+		await b.db.exec(sql);
+	}
+	return { a, b };
+}
+
+/** Run `sql` as one offline transaction on `machine` and answer the id its `queued` status carried. */
+async function queuedOn(machine: Machine, sql: string): Promise<string> {
+	const before = machine.statuses.length;
+	await machine.db.exec(sql);
+	const queued = machine.statuses.slice(before).find(status => status.kind === 'queued');
+	expect(queued, `a queued status was delivered before the commit resolved: ${sql}`).to.not.equal(undefined);
+	return queued!.transactionId;
+}
+
+/** Open `machine`'s gate and wait for everything it queued to settle. */
+async function drain(machine: Machine): Promise<void> {
+	machine.openGate();
+	await machine.plugin.offline.whenDrained();
+}
+
+const committedOn = (machine: Machine, transactionId: string): CommittedStatus | undefined =>
+	machine.statuses.find((status): status is CommittedStatus => status.kind === 'committed' && status.transactionId === transactionId);
+
+const failedOn = (machine: Machine, transactionId: string): FailedStatus | undefined =>
+	machine.statuses.find((status): status is FailedStatus => status.kind === 'failed' && status.transactionId === transactionId);
+
+const createTasks = `create table Tasks (id integer primary key, title text, done integer) using optimystic('tree://offline-two-machine/tasks')`;
+const createTasksByDone = `create index TasksByDone on Tasks (done)`;
+const createCounters = `create table Counters (name text primary key, n integer) using optimystic('tree://offline-two-machine/counters')`;
+const createUsers = `create table Users (name text primary key, bio text) using optimystic('tree://offline-two-machine/users')`;
+/** A blob store keyed by content hash: two machines storing the same content insert the same row. */
+const createBlobs = `create table Blobs (hash text primary key, body text) using optimystic('tree://offline-two-machine/blobs') with tags ("optimystic.content_key" = true)`;
+
+describe('Offline mode: two machines make the same change offline', function () {
+	this.timeout(60_000);
+
+	it('both mark the same task done: the second to drain commits already applied, and both read the task done, by index and by scan', async () => {
+		const { a, b } = await twoOfflineMachines(createTasks, createTasksByDone);
+		await a.db.exec(`insert into Tasks (id, title, done) values (1, 'write the tests', 0)`);
+		const tasksOf = (machine: Machine): Promise<Record<string, unknown>[]> => queryAll(machine.db, 'select id, title, done from Tasks order by id');
+		expect(await tasksOf(b), 'B holds the task before going offline').to.deep.equal([{ id: 1, title: 'write the tests', done: 0 }]);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		const onA = await queuedOn(a, `update Tasks set done = 1 where id = 1`);
+		const onB = await queuedOn(b, `update Tasks set done = 1 where id = 1`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, onA)?.effect).to.equal('applied');
+		expect(committedOn(b, onB)?.effect, 'B found A had already made its change').to.equal('already-applied');
+		for (const [name, machine] of [['A', a], ['B', b]] as const) {
+			expect(await tasksOf(machine), `${name}'s scan`).to.deep.equal([{ id: 1, title: 'write the tests', done: 1 }]);
+			expect(await queryAll(machine.db, 'select id from Tasks where done = 1'), `${name}'s index-driven read`).to.deep.equal([{ id: 1 }]);
+			expect(await queryAll(machine.db, 'select id from Tasks where done = 0'), `${name}'s old index entry is gone`).to.deep.equal([]);
+		}
+	});
+
+	it('both delete the same row: the second to drain commits already applied, and the row is gone on both', async () => {
+		const { a, b } = await twoOfflineMachines(createTasks);
+		await a.db.exec(`insert into Tasks (id, title, done) values (1, 'obsolete', 0)`);
+		expect(await queryAll(b.db, 'select id from Tasks'), 'B holds the task before going offline').to.deep.equal([{ id: 1 }]);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		const onA = await queuedOn(a, `delete from Tasks where id = 1`);
+		const onB = await queuedOn(b, `delete from Tasks where id = 1`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, onA)?.effect).to.equal('applied');
+		expect(committedOn(b, onB)?.effect).to.equal('already-applied');
+		expect(await queryAll(a.db, 'select id from Tasks')).to.deep.equal([]);
+		expect(await queryAll(b.db, 'select id from Tasks')).to.deep.equal([]);
+	});
+
+	it('both increment the same counter: the second to drain fails with concurrent-modification, and both read one increment', async () => {
+		const { a, b } = await twoOfflineMachines(createCounters);
+		await a.db.exec(`insert into Counters (name, n) values ('hits', 0)`);
+		expect(await queryAll(b.db, 'select n from Counters'), 'B holds the counter before going offline').to.deep.equal([{ n: 0 }]);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		const onA = await queuedOn(a, `update Counters set n = n + 1 where name = 'hits'`);
+		const onB = await queuedOn(b, `update Counters set n = n + 1 where name = 'hits'`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, onA)?.effect).to.equal('applied');
+		expect(failedOn(b, onB)?.reason, 'an increment is not self-independent: a rival\'s, then ours, is a different row').to.equal('concurrent-modification');
+		expect(await queryAll(a.db, 'select n from Counters')).to.deep.equal([{ n: 1 }]);
+		expect(await queryAll(b.db, 'select n from Counters'), 'B\'s increment left its view').to.deep.equal([{ n: 1 }]);
+	});
+
+	it('both insert the same row under a natural key: insert or ignore commits already applied on the second, a plain insert still fails with constraint', async () => {
+		const { a, b } = await twoOfflineMachines(createUsers);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		const ignoreOnA = await queuedOn(a, `insert or ignore into Users (name, bio) values ('ann', 'a')`);
+		const plainOnA = await queuedOn(a, `insert into Users (name, bio) values ('bob', 'b')`);
+		const ignoreOnB = await queuedOn(b, `insert or ignore into Users (name, bio) values ('ann', 'a')`);
+		const plainOnB = await queuedOn(b, `insert into Users (name, bio) values ('bob', 'b')`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, ignoreOnA)?.effect).to.equal('applied');
+		expect(committedOn(a, plainOnA)?.effect).to.equal('applied');
+		expect(committedOn(b, ignoreOnB)?.effect, 'the row it wanted exists, and the disposition says that is not an error').to.equal('already-applied');
+		expect(failedOn(b, plainOnB)?.reason, 'SQL says a duplicate is an error').to.equal('constraint');
+		const users = [{ name: 'ann', bio: 'a' }, { name: 'bob', bio: 'b' }];
+		expect(await queryAll(a.db, 'select name, bio from Users order by name')).to.deep.equal(users);
+		expect(await queryAll(b.db, 'select name, bio from Users order by name')).to.deep.equal(users);
+	});
+
+	it('both plainly insert the same row into a content-keyed table: the second commits already applied; the same key under other content still fails with constraint', async () => {
+		const { a, b } = await twoOfflineMachines(createBlobs);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		const sameOnA = await queuedOn(a, `insert into Blobs (hash, body) values ('h1', 'payload')`);
+		const otherOnA = await queuedOn(a, `insert into Blobs (hash, body) values ('h2', 'from-a')`);
+		const sameOnB = await queuedOn(b, `insert into Blobs (hash, body) values ('h1', 'payload')`);
+		const otherOnB = await queuedOn(b, `insert into Blobs (hash, body) values ('h2', 'from-b')`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, sameOnA)?.effect).to.equal('applied');
+		expect(committedOn(a, otherOnA)?.effect).to.equal('applied');
+		expect(committedOn(b, sameOnB)?.effect, 'the key is a function of the content, so the row the rival inserted IS this write').to.equal('already-applied');
+		expect(failedOn(b, otherOnB)?.reason, 'the variant compares the whole row').to.equal('constraint');
+		const blobs = [{ hash: 'h1', body: 'payload' }, { hash: 'h2', body: 'from-a' }];
+		expect(await queryAll(a.db, 'select hash, body from Blobs order by hash')).to.deep.equal(blobs);
+		expect(await queryAll(b.db, 'select hash, body from Blobs order by hash')).to.deep.equal(blobs);
+	});
+});
 
 describe('Offline mode: a two-machine group with one member away', function () {
 	this.timeout(60_000);

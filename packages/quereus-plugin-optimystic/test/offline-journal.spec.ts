@@ -242,6 +242,7 @@ describe('Offline mode: the journal over a key-value store', function () {
 			durability: transactionDurability(new Map([['c1' as CollectionId, full]])),
 			tables: new Map<string, WriteDurability | undefined>([['main.Notes', full], ['main.Other', undefined]]),
 			followed: true,
+			effect: 'already-applied' as const,
 		});
 		const constraint = Object.assign(new Error('UNIQUE constraint failed: Notes.id', { cause: new Error('key taken') }), { name: 'ConstraintError' });
 		const failed: TransactionOutcome = {
@@ -261,5 +262,10 @@ describe('Offline mode: the journal over a key-value store', function () {
 		const { error: _error, ...rest } = decodedFailed;
 		const { error: _original, ...expected } = failed;
 		expect(rest).to.deep.equal(expected);
+	});
+
+	it('a committed outcome record written before effect was journaled decodes as applied', () => {
+		const decoded = decodeOutcome({ kind: 'committed', transactionId: 't0', durability: { collections: [] }, tables: [] });
+		expect(decoded).to.include({ kind: 'committed', effect: 'applied' });
 	});
 });

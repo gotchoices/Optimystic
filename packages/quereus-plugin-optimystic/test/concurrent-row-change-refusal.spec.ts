@@ -251,21 +251,19 @@ describe('Concurrent same-ROW change refusal (two handles, one dir)', function (
 		}
 	});
 
-	it('DELETE vs a rival DELETE of the same row: the second deleter is refused; its retry affects zero rows', async () => {
-		// The guard treats an absent entry as changed, on deletes too: the loser's delete was
-		// computed from a row that is gone, so it is refused rather than replayed as a silent
-		// no-op — the ordinary optimistic-concurrency answer. The sequential retry then finds
-		// no row and does nothing, which is exactly what a second delete does sequentially.
+	it('DELETE vs a rival DELETE of the same row: the second deleter commits, its delete already applied; the index is clean', async () => {
+		// A delete's guard (`unchangedOrAbsent`) accepts the key already gone: a rival that deleted
+		// the row first made exactly this writer's change, so at replay the loser's main-table
+		// delete is skipped as already applied and its index delete finds nothing — the final
+		// state is the one both intended, and what a second delete leaves sequentially. A rival
+		// that CHANGED the row still refuses (the DELETE-vs-UPDATE case above).
 		const handles = await twoHandles('tree://row-race/delete-delete', PLAIN, SEED);
 		try {
-			const message = await stageThenRival(handles,
-				`delete from T where id = 1`,
-				`delete from T where id = 1`);
-			expect(message).to.match(concurrentModificationOf(1));
-			await expectStateOnBoth(handles, [[2, 'seed-2']], 'after the refused race');
-
+			await handles.a.exec('begin');
 			await handles.a.exec(`delete from T where id = 1`);
-			await expectStateOnBoth(handles, [[2, 'seed-2']], 'after the sequential retry');
+			await handles.b.exec(`delete from T where id = 1`);
+			await handles.a.exec('commit');
+			await expectStateOnBoth(handles, [[2, 'seed-2']], 'after both deletes committed');
 		} finally {
 			await handles.dispose();
 		}

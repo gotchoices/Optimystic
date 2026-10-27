@@ -245,6 +245,17 @@ function raceStatement(which: Which, op: RaceOp): string {
 /** Whether `op` reads row 100 and rewrites or removes it, rather than inserting a new row beside it. */
 const touchesOwnerRow = (op: RaceOp): boolean => op !== 'insert-shared';
 
+/**
+ * Whether a race over row 100 refuses its second committer: both sides rewrite or remove the row, and
+ * they do not both delete it. Two deletes are the one same-row race the second committer survives —
+ * a delete's guard accepts the key already gone (`unchangedOrAbsent`; docs/offline-sync.md §Guards
+ * that make idempotent writes assured), so the loser's main-table delete is skipped as already applied
+ * and its index delete finds nothing. The two updates write different tokens, so neither accepts the
+ * other's row as its own.
+ */
+const refusesSecond = (ops: Record<Which, RaceOp>): boolean =>
+	touchesOwnerRow(ops.A) && touchesOwnerRow(ops.B) && !(ops.A === 'delete' && ops.B === 'delete');
+
 const IGNORED_ID = 300;
 const WINNER_TOKEN = 'tok-winner';
 
@@ -391,9 +402,10 @@ async function settleInOrder(
  * THE racing oracle. The first committer always fulfils. The second is refused with the
  * concurrent-modification message when both sides read and rewrite row 100 — its main-table action
  * is guarded on the row image its index delta was computed from, and the first committer changed
- * that image — and fulfils when one side only inserted a new row beside it. Then, on both nodes:
- * the rows are the winner's outcome, and the index agrees with the table in both directions (no
- * entry no row implies, no row without its entry, every lookup equal to the scan).
+ * that image — and fulfils when one side only inserted a new row beside it, or when both deleted the
+ * row ({@link refusesSecond}). Then, on both nodes: the rows are the winner's outcome, and the index
+ * agrees with the table in both directions (no entry no row implies, no row without its entry, every
+ * lookup equal to the scan).
  */
 async function expectRaceOutcome(
 	nodes: Nodes,
@@ -403,11 +415,11 @@ async function expectRaceOutcome(
 ): Promise<void> {
 	const [first, second] = order;
 	expect(outcomes[first], `the first committer (${first}) fulfils`).to.equal('fulfilled');
-	if (touchesOwnerRow(ops.A) && touchesOwnerRow(ops.B)) {
+	if (refusesSecond(ops)) {
 		expect(outcomes[second], `the second committer (${second}) is refused: the row image it read changed under it`)
 			.to.match(CONCURRENT_MODIFICATION_OF_ROW_100);
 	} else {
-		expect(outcomes[second], `the second committer (${second}) fulfils: the two writers touch different rows`)
+		expect(outcomes[second], `the second committer (${second}) fulfils: the two writers touch different rows, or both deleted the same one`)
 			.to.equal('fulfilled');
 	}
 	await expectScans(nodes, expectedRaceRows(order, ops), 'must hold the winner\'s outcome');

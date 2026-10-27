@@ -11,7 +11,7 @@ import { announceExternalChange } from './optimystic-adapter/external-change.js'
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
-import { emptyWriteFacts, freshElementsOf } from './optimystic-adapter/write-description.js';
+import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow } from './optimystic-adapter/write-description.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -19,7 +19,7 @@ import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchem
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
-import type { Collection, CollectionId, ITransactor, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
+import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
@@ -227,6 +227,32 @@ interface PreWriteImage {
  */
 function unchanged(entry: StoredRowEntry): TreeUnchangedGuard<StoredRowEntry> {
   return { kind: 'unchanged', expected: entry };
+}
+
+/**
+ * {@link unchanged}, accepting also that the entry at the key already equals the element's own
+ * entry — a rival made exactly this write, which the replay then skips as already applied rather
+ * than refusing (`unchangedOrEqual` in `TreeAlreadyAppliedGuard`; docs/offline-sync.md §Guards
+ * that make idempotent writes assured). Sound only for a statement whose re-application to its
+ * own result changes nothing, which is what {@link OptimysticVirtualTable.rewriteGuard} checks
+ * before staging it. The rows the replay reports as changed were changed by the rival; the queue
+ * reports that as `effect: 'already-applied'` on the transaction's `committed` status.
+ */
+function unchangedOrEqual(entry: StoredRowEntry): Extract<TreeAlreadyAppliedGuard<StoredRowEntry>, { kind: 'unchangedOrEqual' }> {
+  return { kind: 'unchangedOrEqual', expected: entry };
+}
+
+/**
+ * {@link unchanged} for a delete, accepting also that the key is already absent — a rival deleted
+ * the row first, and the replay skips the delete as already applied rather than refusing it
+ * (`unchangedOrAbsent` in `TreeAlreadyAppliedGuard`). A delete's intent for the row is that it be
+ * gone, whatever selected it, so every main-table delete carries this: the statement's DELETE and
+ * each secondary-UNIQUE eviction's. A rival that CHANGED the row still refuses, as under
+ * {@link unchanged}, since the index deletes staged beside the main-table delete were computed
+ * from the image it read. The index deletes of an already-gone row find nothing and write nothing.
+ */
+function unchangedOrAbsent(entry: StoredRowEntry): Extract<TreeAlreadyAppliedGuard<StoredRowEntry>, { kind: 'unchangedOrAbsent' }> {
+  return { kind: 'unchangedOrAbsent', expected: entry };
 }
 
 /** One existing row a secondary UNIQUE constraint collides with, keyed by its
@@ -574,6 +600,12 @@ const FRESH_TAG = 'optimystic.fresh';
 
 /** The table tag that declares only one machine writes the table's rows (docs/offline-sync.md §Declared hints). */
 const SINGLE_WRITER_TAG = 'optimystic.single_writer';
+
+/** The table tag that declares the table's primary key a deterministic function of the row's other
+ * columns (a blob store keyed by content hash), so two machines inserting the same content insert the
+ * same row and a plain `insert` of an equal row is the same write made twice (docs/offline-sync.md
+ * §Declared hints). Read `=== true` at staging time, as {@link SINGLE_WRITER_TAG} is read. */
+const CONTENT_KEY_TAG = 'optimystic.content_key';
 
 /** Whether `column` is tagged fresh — read with `=== true`, as {@link wantsNetworkWatch} reads its tag. */
 function freshTagged(column: { readonly tags?: Readonly<Record<string, SqlValue>> } | undefined): boolean {
@@ -2395,18 +2427,57 @@ export class OptimysticVirtualTable extends VirtualTable {
     const collection = this.collection;
     const indexManager = this.indexManager;
     if (write === undefined || !collection || !indexManager) return;
-    const columnName = (index: number): string => this.tableSchema.columns[index]?.name ?? `col${index}`;
     const facts = freshElementsOf(write, arm, {
       mainCollectionId: collection.getCollection().id,
       key: rowKey,
-      keyColumns: this.tableSchema.primaryKeyDefinition.map(pk => columnName(pk.index)),
+      keyColumns: this.primaryKeyColumnNames(),
       uniqueEntries: this.guardedUniqueConstraints(values).map(({ constraint, enforcing }) => ({
         collectionId: enforcing.tree.getCollection().id,
         key: indexEntryKey(indexManager.createIndexKey(enforcing.descriptor, values), rowKey),
-        columns: constraint.columns.map(columnName),
+        columns: constraint.columns.map(index => this.columnName(index)),
       })),
     });
     if (facts.length > 0) this.txnBridge.noteWriteFacts(facts);
+  }
+
+  /**
+   * The guard an INSERT whose probe found the key clear carries: `absentOrEqual` when a rival's
+   * EQUAL row at the key is this write already made — the statement's disposition says a present
+   * row is not an error (`insertAcceptsEqualRow` in write-description.ts: `or ignore`, `or replace`,
+   * `on conflict do nothing` on the key), or the table is tagged {@link CONTENT_KEY_TAG}, its key
+   * being a function of the row's content — and `absent` otherwise. Either kind still refuses a
+   * rival's DIFFERENT row at the key, which the sequential retry then resolves under the
+   * disposition; `absentOrEqual` compares the whole row, so an equal key under other content
+   * refuses as a plain insert would. A plain `insert` keeps `absent`: SQL says a duplicate is an
+   * error, and an application may rely on that to learn that someone else got there first.
+   */
+  private insertGuard(write: TableWrite | undefined): TreeUpsertGuard<string, StoredRowEntry> {
+    const contentKeyed = this.tableSchema.tags?.[CONTENT_KEY_TAG] === true;
+    return contentKeyed || insertAcceptsEqualRow(write, this.primaryKeyColumnNames())
+      ? { kind: 'absentOrEqual' }
+      : { kind: 'absent' };
+  }
+
+  /**
+   * The guard a rewrite of an existing row carries — the same-key UPDATE (`arm` `'update'`) and the
+   * INSERT OR REPLACE over an occupied key (`arm` `'insert'`): {@link unchangedOrEqual} on `entry`
+   * when the statement's description says re-applying it to its own result changes nothing
+   * (`rewriteAcceptsEqualRow` in write-description.ts), so a rival that already wrote exactly this
+   * row is accepted as the write already made; {@link unchanged} otherwise — `set n = n + 1`, a
+   * value read from other rows, no description, or a description of another arm (the upsert `DO
+   * UPDATE` arm receives the INSERT's).
+   */
+  private rewriteGuard(write: TableWrite | undefined, arm: 'insert' | 'update', entry: StoredRowEntry): TreeUpsertGuard<string, StoredRowEntry> {
+    return rewriteAcceptsEqualRow(write, arm) ? unchangedOrEqual(entry) : unchanged(entry);
+  }
+
+  /** The primary-key column names, in key order, as the gates compare them against a description. */
+  private primaryKeyColumnNames(): string[] {
+    return this.tableSchema.primaryKeyDefinition.map(pk => this.columnName(pk.index));
+  }
+
+  private columnName(index: number): string {
+    return this.tableSchema.columns[index]?.name ?? `col${index}`;
   }
 
   /**
@@ -2915,10 +2986,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * maintenance, FK cascade, delete auto-events) for each before the new row's own
    * bookkeeping. The caller must {@link markDirtyTrees} first so a rollback
    * restores the evicted rows, and must stage its own write AFTER (evict-then-write
-   * journal order). Each eviction's main-table delete is guarded {@link unchanged} on
-   * the collision's stored entry: its index deletes were computed from that image, so a
+   * journal order). Each eviction's main-table delete is guarded {@link unchangedOrAbsent}
+   * on the collision's stored entry: its index deletes were computed from that image, so a
    * rival's concurrent change to the evicted row refuses this writer rather than
-   * leaving the rival's index entries orphaned.
+   * leaving the rival's index entries orphaned — while an evicted row a rival already
+   * removed is accepted as gone, which is the REPLACE's intent for it, and the
+   * replacement row then lands.
    */
   private async applyUniqueEvictions(
     collisions: readonly UniqueCollision[],
@@ -2929,7 +3002,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
     const evicted: Row[] = [];
     for (const { pk, row, entry } of collisions) {
-      await this.collection.stage([[pk, undefined, unchanged(entry)]]);
+      await this.collection.stage([[pk, undefined, unchangedOrAbsent(entry)]]);
       await this.indexManager.deleteIndexEntries(row, pk, transactor);
       evicted.push(row);
     }
@@ -3089,8 +3162,12 @@ export class OptimysticVirtualTable extends VirtualTable {
                 // computed from `existingRow`, so the replacement is guarded on that entry:
                 // a rival that changes or removes the row first refuses this writer instead
                 // of letting the replacement land beside an index delta for a row image the
-                // collection no longer holds.
-                await this.collection.stage([[insertKey, [insertKey, replacementEncoded], unchanged(existing)]]);
+                // collection no longer holds. Two machines running the same self-independent
+                // `insert or replace into Settings …` is the idempotent-upsert pattern: the
+                // guard then also accepts a rival that already wrote exactly this row (see
+                // rewriteGuard). The index deletes computed from the displaced image find
+                // nothing when the rival made the same replace, and the new entries are equal.
+                await this.collection.stage([[insertKey, [insertKey, replacementEncoded], this.rewriteGuard(args.writeScope, 'insert', existing)]]);
                 await this.indexManager.updateIndexEntries(
                   existingRow,
                   values,
@@ -3168,9 +3245,13 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - ON CONFLICT (pk) DO UPDATE whose probe found no row is covered too:
             //    under concurrency the statement REFUSES rather than performing the
             //    upsert the sequential path would have; the retry takes the update arm.
-            // Do not try to re-run SQL semantics inside the replay.
+            // Do not try to re-run SQL semantics inside the replay. One acceptance IS
+            // re-made there, because it needs no SQL: a rival's row EQUAL to this one, under
+            // a statement that said a present row is not an error (`or ignore`, `or
+            // replace`, `on conflict do nothing` on the key) or on a content-keyed table,
+            // is this write already made, and `absentOrEqual` skips it (see insertGuard).
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
-            await this.collection.stage([[insertKey, [insertKey, encodedRow], { kind: 'absent' }]]);
+            await this.collection.stage([[insertKey, [insertKey, encodedRow], this.insertGuard(args.writeScope)]]);
 
             // Stage into all indexes. UNIQUE-enforcing index trees whose value this row
             // occupies carry the concurrency guard so a rival that commits the same value
@@ -3257,7 +3338,14 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - the slot the row leaves (a same-key rewrite, or the delete half of a PK
             //    move) is guarded `unchanged` on the pre-write entry: a rival that changed
             //    or removed the row refuses this writer, rather than being overwritten
-            //    (or resurrected) with a stale index delta;
+            //    (or resurrected) with a stale index delta. A same-key rewrite whose
+            //    statement is self-independent carries `unchangedOrEqual` instead (see
+            //    rewriteGuard): two machines marking one task done both intended the row
+            //    they find, so the second is accepted as already applied. The delete half
+            //    of a PK move never is: if a rival deleted the old row, the sequential
+            //    statement affects zero rows, and accepting the absent delete half while
+            //    still inserting the new row would create a row the sequential execution
+            //    never would;
             //  - a PK move's insert half at a key the probe found CLEAR is guarded
             //    'absent' under every resolved conflict action, exactly as an INSERT is
             //    (see the INSERT arm). IGNORE is not 'keepExisting': skipping only the
@@ -3283,7 +3371,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // without refusing itself.
             await this.collection.stage(oldKey !== newKey
               ? [[oldKey, undefined, unchanged(oldEntry)], [newKey, [newKey, encodedRow], moveGuard]]
-              : [[newKey, [newKey, encodedRow], unchanged(oldEntry)]]);
+              : [[newKey, [newKey, encodedRow], this.rewriteGuard(args.writeScope, 'update', oldEntry)]]);
 
             // Index maintenance for a displacing move needs both stagings, in this
             // order: first remove the DISPLACED row's entries (tree keys
@@ -3340,10 +3428,13 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Stage the main-table delete (flushed at commit / restored on rollback),
             // guarded on the entry the index deletes below were computed from: a rival
             // that changed the row first refuses this writer (its index entries would
-            // otherwise be orphaned), and so does a rival that already deleted it — the
-            // second of two racing deletes reads a row that is gone, and its sequential
-            // retry then affects zero rows.
-            await this.collection.stage([[deleteKey, undefined, unchanged(oldEntry)]]);
+            // otherwise be orphaned). A rival that already deleted it is accepted — the
+            // delete's intent for the row is that it be gone, whatever selected it (a
+            // `global` selection's wider decision is reported as a `row-selection`
+            // unchecked decision) — and the replay skips the delete as already applied,
+            // its index deletes below finding nothing. No description is needed for that,
+            // so a cascade child delete carries it too (see unchangedOrAbsent).
+            await this.collection.stage([[deleteKey, undefined, unchangedOrAbsent(oldEntry)]]);
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
@@ -3366,6 +3457,10 @@ export class OptimysticVirtualTable extends VirtualTable {
       // rival's commit that the pre-stage probe's view had not (observed on a two-node
       // mesh, never on one node). Same message a commit-time refusal carries; the
       // statement-level savepoint discards whatever this statement staged before it.
+      // The already-applied guard kinds can meet their ACCEPTANCE at initial staging the
+      // same way: a DELETE whose row such a fetched commit already removed is skipped as
+      // already applied and the statement returns ok for a row the sequential execution
+      // would not have found. Acceptable, since the final state is the statement's intent.
       const refusal = this.txnBridge.mapCommitRefusal(error);
       if (refusal !== error && refusal instanceof Error) {
         this.setErrorMessage(refusal.message);

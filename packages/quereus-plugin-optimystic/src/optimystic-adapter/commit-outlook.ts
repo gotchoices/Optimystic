@@ -40,6 +40,12 @@ export type Exposure = {
 	readonly key: readonly SqlValue[] | undefined;
 	/** For `'unique'`: the constraint's columns. */
 	readonly columns?: readonly string[];
+	/** Present when the check accepts a rival that made exactly this transaction's change — the row
+	 * already deleted, or already equal to what this transaction writes — and refuses only a rival that
+	 * made a different one: one of the three already-applied guard kinds (docs/offline-sync.md §Guards
+	 * that make idempotent writes assured). `kind` stays `'exposed'` for such a check, since a rival can
+	 * still make a different change. */
+	readonly tolerates?: 'same-change';
 };
 
 export type OutlookDependency = {
@@ -63,7 +69,8 @@ export type UncheckedDecision = {
 
 // ── what a table says about its collections ──────────────────────────────────────────────────
 
-/** A table's main tree: keyed by the framed primary key, carrying `absent` and `unchanged` checks. */
+/** A table's main tree: keyed by the framed primary key, carrying `absent` and `unchanged` checks and
+ * their already-applied variants. */
 export type MainTreeDescription = {
 	readonly kind: 'main';
 	readonly table: string;
@@ -175,8 +182,9 @@ export type JudgedTransaction = { readonly writes: StagedWrites; readonly tables
 /** What is queued ahead of the transaction being judged, in queue order. */
 export type QueueAhead = { readonly earlier: readonly EarlierEntry[]; readonly deferred: readonly DeferredTransaction[] };
 
-/** What one check covers: the exact key for `absent` and `unchanged`, the range for `absentRange`,
- * everything the collection holds for a check the analysis cannot read. */
+/** What one check covers: the exact key for `absent` and `unchanged` and their already-applied
+ * variants, the range for `absentRange`, everything the collection holds for a check the analysis
+ * cannot read. */
 type GuardSpan =
 	| { readonly kind: 'key'; readonly key: string }
 	| { readonly kind: 'range'; readonly range: StringRange }
@@ -282,8 +290,18 @@ function withinRange(key: string, range: StringRange): boolean {
 
 // ── what earlier entries wrote ───────────────────────────────────────────────────────────────
 
-/** The keys one segment writes, and those it inserts under an `absent` check; `undefined` when
- * anything in it cannot be read, which counts as writing every key. */
+/** The guard kinds that check exactly one key: the main tree's two base kinds and the three
+ * already-applied variants (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`). */
+const EXACT_KEY_KINDS: ReadonlySet<unknown> = new Set(['absent', 'unchanged', 'absentOrEqual', 'unchangedOrEqual', 'unchangedOrAbsent']);
+/** The kinds that accept a rival's identical change ({@link Exposure}'s `tolerates`). */
+const SAME_CHANGE_KINDS: ReadonlySet<unknown> = new Set(['absentOrEqual', 'unchangedOrEqual', 'unchangedOrAbsent']);
+/** The kinds an INSERT at a key its probe found clear carries. */
+const INSERT_KINDS: ReadonlySet<unknown> = new Set(['absent', 'absentOrEqual']);
+
+/** The keys one segment writes, and those it inserts under an `absent` or `absentOrEqual` check;
+ * `undefined` when anything in it cannot be read, which counts as writing every key. An
+ * `absentOrEqual` insert counts: a rival change that refuses a later check at the key refuses this
+ * earlier one first, as under `absent`. */
 function writtenKeysIn(actions: readonly Action<unknown>[]): { written: Set<string>; insertedAbsent: Set<string> } | undefined {
 	const written = new Set<string>();
 	const insertedAbsent = new Set<string>();
@@ -292,7 +310,7 @@ function writtenKeysIn(actions: readonly Action<unknown>[]): { written: Set<stri
 		if (elements === undefined) return undefined;
 		for (const element of elements) {
 			written.add(element.key);
-			if (element.upsert && element.guard?.kind === 'absent') insertedAbsent.add(element.key);
+			if (element.upsert && INSERT_KINDS.has(element.guard?.kind)) insertedAbsent.add(element.key);
 		}
 	}
 	return { written, insertedAbsent };
@@ -306,8 +324,8 @@ type CollectionWrites = {
 	readonly writers: EarlierEntry[];
 	/** The entries whose segment here cannot be read, which count as writing every key. */
 	readonly unreadable: EarlierEntry[];
-	/** Keys an entry inserted under an `absent` check, from the segments that can be read, each with
-	 * whether the facts of an entry that inserted it say the key is fresh. */
+	/** Keys an entry inserted under an `absent` or `absentOrEqual` check, from the segments that can
+	 * be read, each with whether the facts of an entry that inserted it say the key is fresh. */
 	readonly insertedAbsent: Map<string, boolean>;
 };
 
@@ -352,8 +370,8 @@ class WriteIndex {
 		}
 	}
 
-	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` check AND under a
-	 * fresh key — the table's key is tagged fresh, or the facts of an entry that inserted it list the
+	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` or `absentOrEqual`
+	 * check AND under a fresh key — the table's key is tagged fresh, or the facts of an entry that inserted it list the
 	 * key — so that no other machine can know the row yet (docs/offline-sync.md §Judging each guard). */
 	insertedFresh(collectionId: CollectionId, key: string, description: MainTreeDescription): boolean {
 		const byFacts = this.collections.get(collectionId)?.insertedAbsent.get(key);
@@ -465,16 +483,21 @@ function withoutCollections(own: OwnJudgement, collections: ReadonlySet<Collecti
  * and what each covers, for {@link outlookFrom} to match against earlier transactions' writes.
  *
  * - A check at a key an earlier element of the same transaction already wrote, in the same
- *   collection, under an `absent` or `unchanged` check is not judged: any change of a rival's that
- *   refuses it refuses that earlier check first. So an insert followed by updates of the row is
- *   judged once, by the insert. An `absentRange` is never covered this way: a rival taking the value
- *   under another key refuses it without touching the earlier element's key.
+ *   collection, under an exact-key check — `absent` or `unchanged`, or one of their already-applied
+ *   variants — is not judged: any change of a rival's that refuses it refuses that earlier check
+ *   first. So an insert followed by updates of the row is judged once, by the insert. An
+ *   `absentRange` is never covered this way: a rival taking the value under another key refuses it
+ *   without touching the earlier element's key.
  * - `absent` is exposed unless the key is fresh: the table's primary key is tagged fresh, or the
  *   transaction's `facts` — what its statements' write descriptions said — list the element's key.
  *   `absentRange` likewise, unless the unique value is tagged fresh or the facts list the index entry's
  *   key. `unchanged` is exposed unless the table is tagged single-writer, or an earlier entry of the
  *   queue inserted the row under a fresh key, by tag or by that entry's facts (no other machine can
  *   know it yet).
+ * - The three already-applied variants are judged as their base kinds — `absentOrEqual` as `absent`,
+ *   `unchangedOrEqual` and `unchangedOrAbsent` as `unchanged` — since a rival can still make a
+ *   different change; an exposure they produce carries `tolerates: 'same-change'`, because a rival
+ *   that made exactly this transaction's change does not refuse them.
  * - `keepExisting`, and an element with no check, can never be refused.
  * - Anything the judgement cannot read is exposed, never silent (docs/offline-sync.md §Conservative
  *   by construction): an unknown check kind, an action that is not a tree `replace`, a check in a
@@ -539,7 +562,7 @@ function encodedKeys(rows: readonly PinnedRow[], table: MainTreeKeys): string[] 
 
 /** The judgement of one collection's segment: what it adds to the transaction's exposures and spans. */
 class CollectionJudge {
-	/** Keys an earlier element of this segment wrote under an `absent` or `unchanged` check. */
+	/** Keys an earlier element of this segment wrote under an exact-key check ({@link EXACT_KEY_KINDS}). */
 	private readonly covered = new Set<string>();
 
 	constructor(
@@ -569,7 +592,7 @@ class CollectionJudge {
 
 	private element({ key, guard }: ReadElement): void {
 		if (guard === undefined || guard.kind === 'keepExisting') return;
-		const exactKey = guard.kind === 'absent' || guard.kind === 'unchanged';
+		const exactKey = EXACT_KEY_KINDS.has(guard.kind);
 		if (exactKey && this.covered.has(key)) return;
 		this.judge(key, guard);
 		if (exactKey) this.covered.add(key);
@@ -577,17 +600,21 @@ class CollectionJudge {
 
 	private judge(key: string, guard: NonNullable<ReadElement['guard']>): void {
 		const description = this.description;
+		const tolerance = SAME_CHANGE_KINDS.has(guard.kind) ? { tolerates: 'same-change' as const } : {};
 		switch (guard.kind) {
 			case 'absent':
+			case 'absentOrEqual':
 				if (description.kind !== 'main') return this.unreadable();
 				this.cover({ kind: 'key', key });
-				if (!description.freshKey && !this.fresh(key)) this.exposeKey(description, 'primary-key', key);
+				if (!description.freshKey && !this.fresh(key)) this.exposeKey(description, 'primary-key', key, tolerance);
 				return;
 			case 'unchanged':
+			case 'unchangedOrEqual':
+			case 'unchangedOrAbsent':
 				if (description.kind !== 'main') return this.unreadable();
 				this.cover({ kind: 'key', key });
 				if (!description.singleWriter && !this.earlier.insertedFresh(this.collectionId, key, description)) {
-					this.exposeKey(description, 'row', key);
+					this.exposeKey(description, 'row', key, tolerance);
 				}
 				return;
 			case 'absentRange': {
@@ -612,9 +639,9 @@ class CollectionJudge {
 		return this.freshKeys?.has(key) ?? false;
 	}
 
-	private exposeKey(description: MainTreeDescription, rule: 'primary-key' | 'row', key: string): void {
+	private exposeKey(description: MainTreeDescription, rule: 'primary-key' | 'row', key: string, tolerance: Pick<Exposure, 'tolerates'>): void {
 		const values = description.decodeKey(key);
-		this.expose({ table: description.table, rule: values === undefined ? 'row' : rule, key: values });
+		this.expose({ table: description.table, rule: values === undefined ? 'row' : rule, key: values, ...tolerance });
 	}
 
 	// NOTE: one exposure per judged check, so a bulk offline write of N natural-key rows lists N on one
@@ -746,8 +773,8 @@ export function refusedCheck(refusal: TreeGuardRefusedError, description: Collec
 export function renderCommitOutlook(outlook: CommitOutlook): string {
 	const shape = {
 		kind: outlook.kind,
-		exposures: outlook.exposures.map(({ table, rule, key, columns }) => ({
-			table, rule, key: key ?? null, ...(columns === undefined ? {} : { columns }),
+		exposures: outlook.exposures.map(({ table, rule, key, columns, tolerates }) => ({
+			table, rule, key: key ?? null, ...(columns === undefined ? {} : { columns }), ...(tolerates === undefined ? {} : { tolerates }),
 		})),
 		dependsOn: outlook.dependsOn,
 		unchecked: outlook.unchecked,

@@ -12,7 +12,9 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlParameters, TableWrite } from '@quereus/quereus';
 import register from '../dist/plugin.js';
-import { foldWriteFacts, freshElementsOf, uncheckedOf, type StagedRowOf, type UncheckedRead } from '../src/optimystic-adapter/write-description.js';
+import {
+	foldWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow, uncheckedOf, type StagedRowOf, type UncheckedRead,
+} from '../src/optimystic-adapter/write-description.js';
 
 const MAIN = 'app/t';
 const EMAIL_INDEX = 'app/t/index/email';
@@ -98,6 +100,67 @@ describe('write-description: the fresh elements of a described write', () => {
 
 	it('no description (an FK cascade child write) records nothing fresh', () => {
 		expect(freshElementsOf(undefined, 'insert', row)).to.deep.equal([]);
+	});
+});
+
+describe('write-description: the guard variant a described statement admits', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		// Declared spellings differ from the lowercased names the description carries, on purpose.
+		await db.exec(`
+			create table t (Id text primary key, Email text unique, body text, n integer) using memory;
+			create table c (A text, B text, body text, primary key (A, B)) using memory;
+		`);
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	/** The one write site of `sql`, as the vtab receives it on `UpdateArgs.writeScope`. */
+	function describedWrite(sql: string): TableWrite {
+		const stmt = db.prepare(sql);
+		try {
+			const { writes } = stmt.getWriteScope();
+			expect(writes.length, 'one write site').to.equal(1);
+			return writes[0]!;
+		} finally {
+			void stmt.finalize();
+		}
+	}
+
+	const insertT = (suffix: string): string => `insert ${suffix.startsWith('or ') ? suffix : ''}into t (Id, Email, body, n) values ('k', 'a@x', 'a', 1)${suffix.startsWith('or ') ? '' : ` ${suffix}`}`;
+
+	it('an insert admits absentOrEqual when its disposition says a present row is not an error: or ignore, or replace, on conflict do nothing, and on conflict (the key) do nothing', () => {
+		for (const sql of [insertT('or ignore '), insertT('or replace '), insertT('on conflict do nothing'), insertT('on conflict (Id) do nothing')]) {
+			expect(insertAcceptsEqualRow(describedWrite(sql), ['Id']), sql).to.equal(true);
+		}
+	});
+
+	it('a do nothing clause on a composite key matches the key columns as a set, whatever their order and case', () => {
+		const write = describedWrite(`insert into c (A, B, body) values ('x', 'y', 'z') on conflict (b, a) do nothing`);
+		expect(insertAcceptsEqualRow(write, ['A', 'B'])).to.equal(true);
+	});
+
+	it('a plain insert, a do nothing clause on another unique column, and a do update clause keep absent; so does no description', () => {
+		for (const sql of [insertT(''), insertT('on conflict (Email) do nothing'), insertT(`on conflict (Id) do update set body = 'b'`)]) {
+			expect(insertAcceptsEqualRow(describedWrite(sql), ['Id']), sql).to.equal(false);
+		}
+		expect(insertAcceptsEqualRow(undefined, ['Id'])).to.equal(false);
+	});
+
+	it('a same-key update admits unchangedOrEqual when self-independent: a parameter or a literal, not a value read from the row', () => {
+		expect(rewriteAcceptsEqualRow(describedWrite(`update t set body = :p where Id = 'k'`), 'update')).to.equal(true);
+		expect(rewriteAcceptsEqualRow(describedWrite(`update t set n = 1 where Id = 'k'`), 'update')).to.equal(true);
+		expect(rewriteAcceptsEqualRow(describedWrite(`update t set n = n + 1 where Id = 'k'`), 'update')).to.equal(false);
+	});
+
+	it('an insert or replace is a self-independent rewrite on its insert arm; the DO UPDATE arm, handed the INSERT\'s description, and a cascade child write keep unchanged', () => {
+		expect(rewriteAcceptsEqualRow(describedWrite(insertT('or replace ')), 'insert')).to.equal(true);
+		const upsert = describedWrite(insertT(`on conflict (Id) do update set body = 'b'`));
+		expect(upsert.operation).to.equal('insert');
+		expect(rewriteAcceptsEqualRow(upsert, 'update')).to.equal(false);
+		expect(rewriteAcceptsEqualRow(undefined, 'update')).to.equal(false);
 	});
 });
 

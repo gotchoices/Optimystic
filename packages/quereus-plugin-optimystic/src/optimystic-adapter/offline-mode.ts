@@ -2,7 +2,7 @@ import type { Database, QualifiedName } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError, alwaysReachable } from '@optimystic/db-core';
 import type {
-	ActionRefusedError, BlockId, Collection, CollectionId, EntryId, EntryStatus, ICohortReachability, JournalSettledStatus,
+	ActionRefusedError, BlockId, Collection, CollectionId, CommittedEffect, EntryId, EntryStatus, ICohortReachability, JournalSettledStatus,
 	OfflineQueueOptions, OfflineQueueState, QueuedEntry, TransactionDurability,
 } from '@optimystic/db-core';
 import type { TransactionBridge } from './txn-bridge.js';
@@ -1068,7 +1068,7 @@ export class OfflineMode {
 	private translateOutcome(status: JournalSettledStatus): TransactionOutcome {
 		switch (status.kind) {
 			case 'committed':
-				return this.committed(status.entryId, status.durability);
+				return this.committed(status.entryId, status.durability, status.effect);
 			case 'failed':
 				return {
 					kind: 'failed',
@@ -1116,11 +1116,12 @@ export class OfflineMode {
 	 * A drained commit is reported exactly as an online commit is: the bridge builds the report,
 	 * follows the commit and calls every `onCommitDurability` listener before this status exists
 	 * (docs/offline-sync.md §Durability reports and the full-replication event). The report is always
-	 * demanded, listeners or not, because `outcomes()` retains it.
+	 * demanded, listeners or not, because `outcomes()` retains it. `effect` is the queue's, passed
+	 * through: the report says who holds the commit, the effect what it did to the rows.
 	 */
-	private committed(transactionId: string, durability: TransactionDurability): TransactionOutcome {
+	private committed(transactionId: string, durability: TransactionDurability, effect: CommittedEffect): TransactionOutcome {
 		const report = this.bridge.reportCommitDurability(transactionId, durability, true);
-		return Object.freeze({ kind: 'committed' as const, ...report });
+		return Object.freeze({ kind: 'committed' as const, effect, ...report });
 	}
 
 	private listed(entry: QueuedEntry): QueuedTransaction {

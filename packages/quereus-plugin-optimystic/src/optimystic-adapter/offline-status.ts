@@ -1,4 +1,4 @@
-import type { EntryWaitingFor, OfflineQueueState, QueuedFailureReason } from '@optimystic/db-core';
+import type { CommittedEffect, EntryWaitingFor, OfflineQueueState, QueuedFailureReason } from '@optimystic/db-core';
 import type { SqlCommitDurability } from './commit-durability.js';
 import type { CommitOutlook } from './commit-outlook.js';
 
@@ -7,10 +7,10 @@ import type { CommitOutlook } from './commit-outlook.js';
  * §Following transactions): the db-core queue's `EntryStatus` with tables (`schema.table`) in place
  * of collection ids and the transaction's `StampId()` in place of the entry id, `persisted`, the
  * `outlook`, and one waiting state of the plugin's own, `'restore'` (docs/offline-sync.md §Restore
- * after a restart). The `effect` a later stage adds is absent until it lands.
+ * after a restart).
  */
 
-export type { QueuedFailureReason } from '@optimystic/db-core';
+export type { CommittedEffect, QueuedFailureReason } from '@optimystic/db-core';
 
 export type QueuedTransactionStatus =
 	| {
@@ -54,8 +54,22 @@ export type QueuedTransactionStatus =
 	| { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }
 	| { kind: 'submitting'; transactionId: string; attempt: number }
 	/** The same report `onCommitDurability` listeners received for this commit, which they did, before
-	 * this status was delivered. */
-	| ({ kind: 'committed' } & SqlCommitDurability)
+	 * this status was delivered — plus what the commit did to the rows it wrote. */
+	| ({
+		kind: 'committed';
+		/** Whether the transaction's changes were already in place when it committed (docs/offline-sync.md
+		 * §Guards that make idempotent writes assured): `'already-applied'` when every element carrying one
+		 * of the already-applied guard kinds was skipped because another writer had made exactly its change
+		 * — the row already deleted, or already equal to what this transaction wrote — and at least one
+		 * was; `'applied'` otherwise. "All, not any": a transaction that marked two tasks done, one of
+		 * which another machine had already marked, did change a row and reads `'applied'`, as does a plain
+		 * insert beside an already-applied update, a transaction with no such element, and one of whose
+		 * collections' tallies the queue never heard (put back after a restart, or the committed half of a
+		 * partial commit before a restart). The db-core queue's `CommittedEffect`, passed through. Says
+		 * nothing about who holds the commit: `durability` and `tables` do, and an already-applied
+		 * transaction is held exactly as an applied one. */
+		effect: CommittedEffect;
+	} & SqlCommitDurability)
 	| {
 		kind: 'partially-committed';
 		transactionId: string;
@@ -83,7 +97,8 @@ export type QueuedTransactionStatus =
 /** A terminal status, as `plugin.offline.outcomes()` retains it. One read back from the journal's
  * outcome record (`decodeOutcome` in `offline-journal.ts`) has lost two things: a `committed` one has
  * `followed: false`, since nothing is followed across a restart, and a `failed` one's `error` is a
- * plain `Error` with the original's name and message and no `cause`. */
+ * plain `Error` with the original's name and message and no `cause`; a `committed` one read from a
+ * record written before `effect` was journaled reads `effect: 'applied'`. */
 export type TransactionOutcome = Extract<QueuedTransactionStatus, { kind: 'committed' | 'failed' }>;
 
 /** One queued transaction as `plugin.offline.entries()` lists it: its identity and its current status,

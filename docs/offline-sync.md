@@ -204,7 +204,7 @@ const off = plugin.offline.onStatus(status => {
 });
 ```
 
-Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts`; `outlook` and `outlook-changed` are stage 7's, `effect` stage 10's):
+Status shape (`QueuedTransactionStatus` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-status.ts`; `outlook` and `outlook-changed` are stage 7's):
 
 ```typescript
 type QueuedTransactionStatus =
@@ -236,6 +236,12 @@ type QueuedFailureReason =
   ones with the same code. One property of today's report does not carry over: an online report
   arrives during the `db.exec` that committed, and a drained one does not. The `transactionId` is
   the only attribution.
+- `effect` on `committed` says what the drain did to the rows: `'already-applied'` when every
+  element whose guard could accept a rival's identical change was skipped because another machine
+  had already made exactly that change, and at least one was; `'applied'` otherwise — a transaction
+  with no such element, and one of which only part was already made, since a host reading
+  `'already-applied'` as "none of my changes landed" must be right. See
+  [Guards that make idempotent writes assured](#guards-that-make-idempotent-writes-assured).
 - `queued` is delivered before `commit` resolves — inside the enqueue, once the journal holds the
   entry record when persistence is on — by the same rule `onCommitDurability` uses today, so a host
   wrapping `db.exec` can attribute it to the call — which is how an autocommit statement's caller
@@ -270,11 +276,13 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 `committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
 `failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
 what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
-plugin passes through. It carries no `outlook`: judging a guard needs the catalog's tags and the
-tables' key decoding, which only the plugin has, so the outlook is the plugin's own and `effect`
-arrives with stage 10; `followed`, the per-table `tables` map and `changedTables` landed with stage 4,
-`persisted` (on `queued`, and on each item `entries()` lists) and the `'restore'` waiting state with
-stage 5, and `outlook` on `queued` and the `outlook-changed` status with stage 7.
+plugin passes through, and `effect` on `committed` (`CommittedEffect` in
+`packages/db-core/src/offline/status.ts`), passed through too. It carries no `outlook`: judging a
+guard needs the catalog's tags and the tables' key decoding, which only the plugin has, so the
+outlook is the plugin's own. `followed`, the per-table `tables` map and `changedTables` landed with
+stage 4, `persisted` (on `queued`, and on each item `entries()` lists) and the `'restore'` waiting
+state with stage 5, `outlook` on `queued` and the `outlook-changed` status with stage 7, and `effect`
+with stage 10.
 
 Queue-wide state, for a status bar:
 
@@ -969,6 +977,7 @@ analysis can prove about where its values came from:
 | `absent` (INSERT) | inserting the same primary key. | every key value is **fresh**: see below. |
 | `absentRange` (secondary UNIQUE) | inserting a row with the same unique value. | the unique value is fresh. |
 | `unchanged` (UPDATE, DELETE, REPLACE over an existing row, eviction) | changing or deleting that row. | the row was inserted under a fresh key by an earlier entry of this queue that has not been committed — no other machine has seen the key — or the table is declared single-writer. |
+| `absentOrEqual`, `unchangedOrEqual`, `unchangedOrAbsent` (the already-applied variants, [Guards that make idempotent writes assured](#guards-that-make-idempotent-writes-assured)) | as the base kind — but not by making exactly this entry's change: inserting the same row, leaving the row equal to this entry's result, deleting the row this entry deletes. | as the base kind; the exposure carries `tolerates: 'same-change'`. |
 | none (index trees) | — | always; an index segment is never refused on its own. |
 
 A key or unique value is **fresh** when no other writer can produce it. The plugin learns this from
@@ -1045,7 +1054,10 @@ guard that can be refused:
   decoded primary key; `absentRange` reports `rule: 'unique'` with the constraint's columns and the
   unique value decoded from the range's lower bound (`decodeIndexKey` in
   `packages/quereus-plugin-optimystic/src/schema/index-manager.ts`); `unchanged` reports `rule:
-  'row'` with the decoded primary key.
+  'row'` with the decoded primary key. An exposure from one of the already-applied variants is the
+  base kind's with `tolerates: 'same-change'` beside it: `kind` stays `exposed`, since a rival can
+  still make a different change, and the field is what says a rival making the same one does not
+  refuse it.
 - **Anything the analysis cannot read is exposed** (see [Conservative by
   construction](#conservative-by-construction)): an unknown guard kind, an action that is not a tree
   `replace`, a guard in a collection no table describes, a guard of a kind its collection does not
@@ -1200,18 +1212,26 @@ key; the Quereus fix is tracked in blocked `quereus-labels-a-fresh-blob-written-
 
 ### Declared hints
 
-Two facts the analysis cannot see, which an application can declare with tags saved in the catalog
-record:
+Three facts the analysis cannot see, which an application can declare with tags saved in the
+catalog record:
 
 - **`"optimystic.fresh" = true` on a column**: values of this column are generated unique per write
   by the application (a UUID made in the app and passed as a parameter). Its values count as fresh.
 - **`"optimystic.single_writer" = true` on a table**: only one machine writes this table's rows (a
   device's own settings). Its `unchanged` guards count as not refusable by others.
+- **`"optimystic.content_key" = true` on a table**: the primary key is a deterministic function of
+  the row's other columns (a blob store keyed by content hash), so two machines inserting the same
+  content insert the same row, and a plain `insert` of an equal row is the same write made twice.
+  An INSERT into it is staged under `absentOrEqual` rather than `absent` ([Guards that make
+  idempotent writes assured](#guards-that-make-idempotent-writes-assured)). No provenance label
+  describes a content hash, so a tag is the only way the plugin can learn this.
 
-A hint changes the prediction and nothing else: every guard is still enforced at rebase. A false
-hint produces an assured entry that fails, which the plugin logs as `offline:assured-entry-failed`
-with the guard that refused and counts in `assuredFailures` (see [Conservative by
-construction](#conservative-by-construction)).
+The first two hints change the prediction and nothing else: every guard is still enforced at rebase.
+A false one produces an assured entry that fails, which the plugin logs as
+`offline:assured-entry-failed` with the guard that refused and counts in `assuredFailures` (see
+[Conservative by construction](#conservative-by-construction)). The third changes which guard the
+drain enforces and not the prediction; the variant still compares the whole row, so an equal key
+under different content refuses as a plain insert would.
 
 ### Conservative by construction
 
@@ -1238,29 +1258,55 @@ also adds one to `assuredFailures` on the queue-wide state, which, like the queu
 
 ### Guards that make idempotent writes assured
 
-The guards today refuse every case where the row is not as the statement found it, including cases
+The base guards refuse every case where the row is not as the statement found it, including cases
 where the rival made exactly the change this entry makes: two machines marking the same task done,
 two machines deleting the same row, two machines inserting the same content-addressed row. Each of
-those entries fails today although the final state is what both intended. With the write
-description, three guard variants can accept them as **already applied** and drop the action
-instead of refusing:
+those entries would fail although the final state is what both intended. Three guard kinds beside
+the base kinds of `TreeEntryGuard` (`TreeAlreadyAppliedGuard` in
+`packages/db-core/src/collections/tree/struct.ts`) accept them as **already applied** and skip the
+element instead of refusing. Which kind a statement's element carries is decided at staging, from
+the statement's write description (`insertAcceptsEqualRow` and `rewriteAcceptsEqualRow` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`, pure over the
+description and the arm) and the table's tags:
 
-| Variant | Accepts at rebase when… | Sound because… |
-|---|---|---|
-| DELETE by key | the row is already absent. | The final state is the one the statement intended. |
-| UPDATE `unchanged` | the row equals this entry's post-image, and every value the statement writes is independent of the row's own previous values (no `set n = n + 1`). | Applying the statement to its own result changes nothing, so "rival, then us" yields the same row. |
-| INSERT `absent` | the row equals the entry's row, and the statement is `insert or ignore`, `on conflict do nothing`, or `or replace`, or the table's key is a deterministic function of its content. | The row the statement wanted exists; the disposition says a present row is not an error. |
+| Element | Base kind | Variant | Carried when… | Sound because… |
+|---|---|---|---|---|
+| DELETE by key, and a secondary-UNIQUE eviction's delete | `unchanged` | `unchangedOrAbsent`: accepts the row already absent | always. | The final state is the one the statement intended. |
+| same-key UPDATE, and INSERT OR REPLACE over an occupied key | `unchanged` | `unchangedOrEqual`: accepts the row already equal to this entry's post-image | the description is of that arm and `selfIndependent` — every value the statement writes is independent of the row's own previous values and of other rows (no `set n = n + 1`). | Applying the statement to its own result changes nothing, so "rival, then us" yields the same row. |
+| INSERT whose probe found the key clear | `absent` | `absentOrEqual`: accepts the present row equal to this entry's row | the statement is `insert or ignore`, `insert or replace`, or `on conflict do nothing` with no target or targeting the primary key; or the table is tagged `optimystic.content_key` ([Declared hints](#declared-hints)). | The row the statement wanted exists; the disposition says a present row is not an error. |
 
 A plain `insert` of an existing equal row still refuses: SQL says a duplicate is an error, and an
-application may rely on that to learn that someone else got there first. The index segments of an
-already-applied entry replay as no-ops, because index entries are deterministic per row. The entry
-is reported `committed`, with `effect: 'already-applied'` on the status, since the rows it reports
-as changed were changed by someone else.
+application may rely on that to learn that someone else got there first. A primary-key move keeps
+the base kinds on both halves: accepting the absent delete half while still inserting the new row
+would create a row the sequential execution never would. The upsert `DO UPDATE` arm, which receives
+the INSERT's description, and an FK cascade child write, which has none, keep the base kinds — except
+the cascade's delete, which needs no description. Every variant still refuses a rival that made a
+DIFFERENT change, with the same error classes as its base kind, so nothing downstream of a refusal
+changes.
 
-These are new guard kinds beside the four in `TreeEntryGuard` (in
-`packages/db-core/src/collections/tree/struct.ts`). They are evaluated only by the writer's own
-replay, as every guard is, so a node on an older build never has to interpret one; and with them,
-the outlook counts such guards as not refusable by a rival making the same change.
+The index segments of an already-applied entry need nothing: an index entry carries no `unchanged`
+guard, and under such an entry they replay as no-ops of their own accord — the delete of the old
+index entry finds nothing, the insert of the new one finds an equal entry, and a UNIQUE index
+entry's `absentRange` excludes the entry's own key, which is where the rival's identical entry sits.
+The tree handler reports what each guard accepted as an `AlreadyAppliedTally`
+(`packages/db-core/src/collection/action.ts`), the queue sums the tallies over every collection the
+entry wrote, and the entry is reported `committed` with `effect: 'already-applied'` exactly when
+every counted element was already applied and at least one was (`CommittedEffect` in
+`packages/db-core/src/offline/status.ts`). An entry of which only part was already made — one row
+already done elsewhere, one not — reads `'applied'`, as does one with no such element, and one of
+whose collections' tallies the queue never heard (put back after a restart, or the committed half of
+a partial commit before one), since a host reading `'already-applied'` as "none of my changes
+landed" must be right.
+
+The variants are evaluated only by the writer's own replay, as every guard is, so a node on an older
+build never has to interpret one. Nor are they a property of offline mode: the same statements stage
+them online, where a racing identical write commits instead of refusing — an online transaction's
+`delete` of a row a rival deleted meanwhile commits, its delete skipped. The outlook judges each
+variant as its base kind, since a rival can still make a different change, and marks the exposure
+`tolerates: 'same-change'` ([Judging each guard](#judging-each-guard)). The acceptance can also be
+met at initial staging on a mesh, where the tracker the guard scans fetched a rival's commit the
+pre-stage probe's view had not: the statement then returns `ok` for a row the sequential execution
+would not have found, which is acceptable because the final state is the statement's intent.
 
 A further step, not proposed in the first stages: a blind partial update
 (`update t set status = 'done' where id = ?`, reading nothing but the key) is refused today when a
@@ -1587,11 +1633,12 @@ restart into.
 
 The record holds the outcome reduced to what JSON carries (`PersistedOutcome` in
 `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-journal.ts`): a `committed` one's
-`transactionId`, `durability` (per collection and `overall`) and per-table `tables`, without
-`followed`; a `failed` one's `transactionId`, `reason`, `causedBy`, `changedTables`,
+`transactionId`, `durability` (per collection and `overall`), per-table `tables` and `effect`,
+without `followed`; a `failed` one's `transactionId`, `reason`, `causedBy`, `changedTables`,
 `committedTables`, and `error` as its name and message. Read back (`decodeOutcome`, same file), a
-`committed` outcome says `followed: false`, since nothing is followed across a restart, and a
-`failed` one carries a plain `Error` with the original's name and message and no `cause`. Its
+`committed` outcome says `followed: false`, since nothing is followed across a restart — and
+`effect: 'applied'` from a record written before `effect` was journaled — and a `failed` one carries
+a plain `Error` with the original's name and message and no `cause`. Its
 record is written when the outcome is settled, before it is reported, and deleted, without a
 flush, when it is acknowledged or found past the retention window by `status` or `outcomes`; a
 delete a crash loses lists the outcome once more after the restart.
@@ -1849,9 +1896,11 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
 9. **The outlook from the write description** (implemented, in three tickets). Fresh-value
    detection from provenance, `unchecked` decisions, dependencies through unchecked reads, and the
    journaling of the facts the first two rest on, so a restored transaction is judged with them.
-10. **Guards that accept an already-applied write.** The three variants, gated on the write
-    description's self-independence and disposition facts, with the `already-applied` effect on
-    `committed`.
+10. **Guards that accept an already-applied write** (implemented, in two tickets). The three
+    variants in db-core with the per-segment tally and the queue's `effect`; in the plugin the
+    gates on the write description's self-independence and disposition facts, the
+    `optimystic.content_key` tag, the `already-applied` effect on `committed`, and the outlook's
+    `tolerates`.
 11. **Later, each separately:** the constraint re-check before submission; session-mode re-execution;
     submission as a long-lived pend; column-level actions for blind partial updates; the
     `optimystic_queue` virtual table (backlog `feat-offline-sync-queue-virtual-table`).
@@ -1976,7 +2025,13 @@ record carries its one fresh key, the foreign key and `complete: true`; after `h
 equals the one before the crash except the copy's, whose read is now matched by its table and so
 depends on both earlier conversations; and the same records without `outlook` restore the message
 exposed on its key with `unchecked: 'not-computed'`.
-Of the list below, what is left waits for its stage: stage 10.
+Stage 10's already-applied cases — two machines marking one task done, two deleting one row, two
+incrementing one counter, and two inserting one row under `insert or ignore` beside a plain `insert`
+— are pinned end to end in `packages/quereus-plugin-optimystic/test/offline-mode-two-machine.spec.ts`,
+the gates over prepared statements in
+`packages/quereus-plugin-optimystic/test/write-description.spec.ts`, and the outlook's reading of the
+variants in `packages/quereus-plugin-optimystic/test/commit-outlook.spec.ts`. Every case below is
+pinned.
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.

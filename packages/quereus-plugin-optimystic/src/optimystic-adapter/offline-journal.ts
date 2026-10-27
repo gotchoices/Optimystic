@@ -1,7 +1,7 @@
 import { OFFLINE_JOURNAL_KEY_PREFIX, type IKVStore } from '@optimystic/db-p2p';
 import type {
-	Action, ActionId, CollectionId, EntryId, InFlightAttempt, IOfflineJournal, JournalDriveState, JournalEntryRecord,
-	JournalSettledStatus, QueuedFailureReason, WriteDurability,
+	Action, ActionId, CollectionId, CommittedEffect, EntryId, InFlightAttempt, IOfflineJournal, JournalDriveState,
+	JournalEntryRecord, JournalSettledStatus, QueuedFailureReason, WriteDurability,
 } from '@optimystic/db-core';
 import type { QualifiedTableName } from '../schema/table-identity.js';
 import type { EntryFacts } from './commit-outlook.js';
@@ -96,6 +96,9 @@ export type PersistedOutcome =
 		readonly transactionId: string;
 		readonly durability: { readonly collections: readonly DurabilityPair<CollectionId>[]; readonly overall?: WriteDurability };
 		readonly tables: readonly DurabilityPair<string>[];
+		/** What the commit did to the rows (`QueuedTransactionStatus`'s `effect`). Absent in a record
+		 * written before the field existed, which {@link decodeOutcome} reads as `'applied'`. */
+		readonly effect?: CommittedEffect;
 	}
 	| {
 		readonly kind: 'failed';
@@ -401,6 +404,7 @@ export function encodeOutcome(outcome: TransactionOutcome): PersistedOutcome {
 				...(outcome.durability.overall === undefined ? {} : { overall: outcome.durability.overall }),
 			},
 			tables: durabilityPairs(outcome.tables),
+			effect: outcome.effect,
 		};
 	}
 	return {
@@ -417,7 +421,8 @@ export function encodeOutcome(outcome: TransactionOutcome): PersistedOutcome {
 /**
  * The outcome a record holds, as `plugin.offline` reports it — less what the record dropped: a
  * committed one has `followed: false`, and a failed one's `error` is a plain `Error` with the
- * original's name and message and no `cause`.
+ * original's name and message and no `cause`. A committed record with no `effect` (written before
+ * the field existed) reads `'applied'`, the answer for an entry whose tallies were never heard.
  */
 export function decodeOutcome(persisted: PersistedOutcome): TransactionOutcome {
 	if (persisted.kind === 'committed') {
@@ -430,6 +435,7 @@ export function decodeOutcome(persisted: PersistedOutcome): TransactionOutcome {
 			},
 			tables: durabilityMap(persisted.tables),
 			followed: false,
+			effect: persisted.effect ?? 'applied',
 		});
 	}
 	const error = new Error(persisted.error.message);

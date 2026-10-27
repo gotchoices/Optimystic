@@ -36,6 +36,8 @@ const createMemos = `create table Memos (id text primary key, body text) using o
 const createConversations = `create table Conversations (id text primary key, title text) using optimystic('tree://outlook/conversations')`;
 /** A message referencing its conversation: the foreign key is a decision made against the parent row. */
 const createMessages = `create table Messages (id text primary key, conversation text references Conversations(id), body text) using optimystic('tree://outlook/messages')`;
+/** A shared counter: whether an update of it tolerates a rival's identical change depends on how the statement writes it. */
+const createCounters = `create table Counters (name text primary key, n integer) using optimystic('tree://outlook/counters')`;
 
 interface Node extends MeshDbNode {
 	/** Every status the plugin reported, in order. */
@@ -58,7 +60,7 @@ async function oneNode(): Promise<Node> {
 	const { transactorFor } = await startMockMesh(1);
 	const node = followed(createMeshDbNode(transactorFor(0), offlineConfig));
 	node.plugin.collectionFactory.registerCohortReachability('shared:test', { reachable: () => Promise.resolve(false) });
-	for (const sql of [createNotes, createUsers, createAccounts, createMemos, createConversations, createMessages]) await node.db.exec(sql);
+	for (const sql of [createNotes, createUsers, createAccounts, createMemos, createConversations, createMessages, createCounters]) await node.db.exec(sql);
 	return node;
 }
 
@@ -179,9 +181,11 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		node.plugin.offline.enter();
 
 		const update = await queuedOutlook(node, `update Notes set body = 'b' where id = 'n3'`);
+		// A literal rewrite tolerates a rival making the same change (docs/offline-sync.md §Guards that
+		// make idempotent writes assured); it is still exposed, since a rival can make a different one.
 		expect(update.outlook).to.deep.equal({
 			kind: 'exposed',
-			exposures: [{ table: 'main.Notes', rule: 'row', key: ['n3'] }],
+			exposures: [{ table: 'main.Notes', rule: 'row', key: ['n3'], tolerates: 'same-change' }],
 			dependsOn: [],
 			unchecked: [],
 		});
@@ -234,7 +238,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		const both = await queuedOutlook(node, `begin; update Conversations set title = 'renamed' where id = 'c1'; insert into Messages (id, conversation, body) values (StampId(), 'c1', 'again'); commit`);
 		expect(both.outlook).to.deep.equal({
 			kind: 'exposed',
-			exposures: [{ table: 'main.Conversations', rule: 'row', key: ['c1'] }],
+			exposures: [{ table: 'main.Conversations', rule: 'row', key: ['c1'], tolerates: 'same-change' }],
 			dependsOn: [{ transactionId: conversation.transactionId, via: 'guard' }],
 			unchecked: [{ table: 'main.Conversations', kind: 'foreign-key', scope: 'global' }],
 		});
@@ -271,6 +275,23 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			dependsOn: [],
 			unchecked: [],
 		});
+	});
+
+	it('CommitOutlook() marks a self-independent update of a shared row as tolerating the same change by a rival, and an increment of it as not', async () => {
+		const node = await oneNode();
+		await node.db.exec(`insert into Counters (name, n) values ('hits', 0)`);
+		const exposuresOf = async (update: string): Promise<unknown> => {
+			await node.db.exec('begin');
+			await node.db.exec(update);
+			const answer = (await queryAll(node.db, 'select CommitOutlook() as outlook'))[0]?.outlook;
+			await node.db.exec('rollback');
+			return (JSON.parse(String(answer)) as { exposures: unknown }).exposures;
+		};
+
+		expect(await exposuresOf(`update Counters set n = 5 where name = 'hits'`), 'a literal: re-applying it changes nothing')
+			.to.deep.equal([{ table: 'main.Counters', rule: 'row', key: ['hits'], tolerates: 'same-change' }]);
+		expect(await exposuresOf(`update Counters set n = n + 1 where name = 'hits'`), 'an increment: a rival\'s identical one, then ours, is a different row')
+			.to.deep.equal([{ table: 'main.Counters', rule: 'row', key: ['hits'] }]);
 	});
 
 	it('a transaction exposed only through an earlier one it depends on is told it is assured once that one commits, before it is sent', async () => {

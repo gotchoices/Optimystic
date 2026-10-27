@@ -1,4 +1,4 @@
-import type { QualifiedName, ScopeValue, SqlValue, TableWatch, TableWrite, WatchScope } from '@quereus/quereus';
+import type { QualifiedName, ScopeValue, SqlValue, TableWatch, TableWrite, UpsertClause, WatchScope } from '@quereus/quereus';
 import type { CollectionId } from '@optimystic/db-core';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type { EntryFacts, UncheckedDecision } from './commit-outlook.js';
@@ -7,11 +7,12 @@ import type { EntryFacts, UncheckedDecision } from './commit-outlook.js';
  * Everything that reads a Quereus write description (`TableWrite`, the object `UpdateArgs.writeScope`
  * carries once a table sets `wantWriteScope`; the contract is
  * `@quereus/quereus/src/planner/analysis/write-scope.ts`, documented in the sibling checkout's
- * docs/write-scope.md) on the vtab's behalf, and the facts it turns the description into. Pure: no
+ * docs/write-scope.md) on the vtab's behalf: the facts it turns the description into, and which guard
+ * variant a statement admits ({@link insertAcceptsEqualRow}, {@link rewriteAcceptsEqualRow}). Pure: no
  * table, bridge or queue state, so the rules are unit-tested over prepared statements alone
  * (test/write-description.spec.ts). The plugin trusts the description's labels and does no provenance
  * reasoning of its own: a `fresh` column is fresh, anything else is not; a read is what the description
- * lists, with the scope it gives it.
+ * lists, with the scope it gives it; a statement is self-independent when it says so.
  */
 
 /** One row a `rows`-scoped read pinned: the unique key it was pinned by, lowercased as Quereus names
@@ -120,6 +121,59 @@ function freshColumnsOf(write: TableWrite): Set<string> {
 
 function anyFresh(fresh: ReadonlySet<string>, columns: readonly string[]): boolean {
 	return columns.some(column => fresh.has(column.toLowerCase()));
+}
+
+// ── the guard variant a described statement admits ───────────────────────────────────────────
+
+/**
+ * Whether an INSERT whose probe found the key clear may carry `absentOrEqual` in place of `absent`
+ * (docs/offline-sync.md §Guards that make idempotent writes assured): a rival's equal row at the key is
+ * then accepted as this write already made, where `absent` refuses it. True exactly when the statement
+ * said a present row is not an error — its disposition is `ignore` (`insert or ignore`), `replace`
+ * (`insert or replace`), or an upsert with a `do nothing` clause on the primary key: `on conflict do
+ * nothing`, which Quereus describes with the target `'primary-key'`, or `on conflict (<the key columns>)
+ * do nothing`, the columns compared lowercased as a set. A plain `insert` keeps `absent`: SQL says a
+ * duplicate is an error, and an application may rely on that to learn that someone else got there
+ * first. A clause on another unique column does not excuse a present row at the primary key, and a `do
+ * update` clause is not a `do nothing`. As for {@link freshElementsOf}, no description (a cascade child
+ * write) or one of another operation says nothing about the row.
+ */
+export function insertAcceptsEqualRow(write: TableWrite | undefined, keyColumns: readonly string[]): boolean {
+	if (write === undefined || write.operation !== 'insert') return false;
+	const disposition = write.disposition;
+	switch (disposition.kind) {
+		case 'ignore':
+		case 'replace':
+			return true;
+		case 'upsert':
+			return disposition.clauses.some(clause => clause.action === 'nothing' && targetsPrimaryKey(clause.target, keyColumns));
+		default:
+			return false;
+	}
+}
+
+/** Whether an upsert clause's conflict target is the primary key: named as such, or exactly its columns. */
+function targetsPrimaryKey(target: UpsertClause['target'], keyColumns: readonly string[]): boolean {
+	if (target === 'primary-key') return true;
+	const key = new Set(keyColumns.map(column => column.toLowerCase()));
+	const named = new Set(target.map(column => column.toLowerCase()));
+	return named.size === key.size && [...named].every(column => key.has(column));
+}
+
+/**
+ * Whether a rewrite of an existing row — a same-key UPDATE (`arm` `'update'`), or an INSERT OR REPLACE
+ * over an occupied key (`arm` `'insert'`) — may carry `unchangedOrEqual` in place of `unchanged`
+ * (docs/offline-sync.md §Guards that make idempotent writes assured): a rival that already wrote
+ * exactly this row is then accepted as this write already made, where `unchanged` refuses every
+ * change. Sound only for a self-independent statement (`TableWrite.selfIndependent`: no written value
+ * depends on the row's previous values or on other rows), since then applying the statement to its own
+ * result changes nothing and "rival, then us" is the row we hold; `set n = n + 1` keeps `unchanged`,
+ * because a rival's identical increment followed by ours would not. As for {@link freshElementsOf}, no
+ * description, or one of another operation than the arm (the upsert `DO UPDATE` arm receives the
+ * INSERT's), describes nothing about the row and keeps `unchanged`.
+ */
+export function rewriteAcceptsEqualRow(write: TableWrite | undefined, arm: 'insert' | 'update'): boolean {
+	return write !== undefined && write.operation === arm && write.selfIndependent;
 }
 
 // ── the decisions a statement made against other rows ────────────────────────────────────────
