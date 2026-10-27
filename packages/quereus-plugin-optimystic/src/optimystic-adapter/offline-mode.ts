@@ -12,7 +12,7 @@ import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { followOutlooks, judgeTransaction, outlookContradicted, refusedCheck, renderKey } from './commit-outlook.js';
 import type {
-	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, FollowedEntry, QueueAhead, QueuedJudgement, StagedWrites, TableOutlookSource,
+	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, EntryFacts, FollowedEntry, QueueAhead, QueuedJudgement, StagedWrites, TableOutlookSource,
 } from './commit-outlook.js';
 import { guardRefusalIn } from './guard-refusal.js';
 import { addListener, notifyListeners } from './listeners.js';
@@ -193,6 +193,11 @@ export class OfflineMode {
 	 * settles. Nothing of it is journaled: a restart judges a restored transaction again when the
 	 * restore puts it back. */
 	private readonly judgements = new Map<string, HeldJudgement>();
+	/** What each queued transaction's statements' write descriptions said about its elements, handed in
+	 * by {@link enqueue} ahead of the enqueue (the judgement runs inside it) and held, like its
+	 * judgement, until it settles. A transaction a restore put back has none until the facts are
+	 * journaled; the judgement then reads the tags alone. */
+	private readonly entryFacts = new Map<string, EntryFacts>();
 	/** Assured transactions that failed anyway ({@link reportAssuredFailure}), published on the state. */
 	private assuredFailures = 0;
 	/** The unsubscribe of each distinct gate a table published that has `onChange` ({@link subscribeToGate});
@@ -534,10 +539,19 @@ export class OfflineMode {
 	 * `queued` status before resolving (so the commit it is in can be attributed). `undefined` when no
 	 * collection had anything staged: nothing queued, nothing reported, as a commit that wrote nothing.
 	 * Rejects, with every segment unsealed again and nothing queued, when the queue's journal refuses
-	 * the entry record (docs/offline-sync.md §Write ordering).
+	 * the entry record (docs/offline-sync.md §Write ordering). `facts` is what the transaction's
+	 * statements' write descriptions said about its elements (`TransactionBridge.openWriteFacts`),
+	 * held for its judgement — which runs inside the enqueue, on the `queued` status — until it settles.
 	 */
-	async enqueue(collections: readonly Collection<any>[], transactionId: string): Promise<QueuedTransaction | undefined> {
-		const entry = await this.queue.enqueue(collections, { id: transactionId, timestamp: this.now() });
+	async enqueue(collections: readonly Collection<any>[], transactionId: string, facts: EntryFacts): Promise<QueuedTransaction | undefined> {
+		this.entryFacts.set(transactionId, facts);
+		let entry: QueuedEntry | undefined;
+		try {
+			entry = await this.queue.enqueue(collections, { id: transactionId, timestamp: this.now() });
+		} finally {
+			// Nothing queued — nothing staged, or the journal refused — leaves nothing to hold facts for.
+			if (entry === undefined) this.entryFacts.delete(transactionId);
+		}
 		return entry === undefined ? undefined : this.listed(entry);
 	}
 
@@ -709,7 +723,7 @@ export class OfflineMode {
 	openTransactionOutlook(): CommitOutlook {
 		const collections = this.bridge.stagedCollections().filter(collection => collection.openActions().length > 0);
 		const writes: StagedWrites = new Map(collections.map(collection => [collection.id, collection.openActions()]));
-		return this.judge(writes, collections.map(collection => collection.id), this.queueAhead(this.queue.entries(), Infinity)).outlook;
+		return this.judge(writes, collections.map(collection => collection.id), this.queueAhead(this.queue.entries(), Infinity), this.bridge.openWriteFacts()).outlook;
 	}
 
 	/** {@link judgeQueued}, isolated: it runs ahead of the status's translation and delivery, and a
@@ -742,22 +756,23 @@ export class OfflineMode {
 		}
 		const collections = this.heldCollections(entry);
 		const ahead = this.queueAhead(entries.slice(0, position), entry.seq);
-		const judgement = this.judge(this.sealedWrites(entryId, collections), collections, ahead);
+		const judgement = this.judge(this.sealedWrites(entryId, collections), collections, ahead, this.entryFacts.get(entryId));
 		this.judgements.set(entryId, { ...judgement, dependencyFailed: false });
 	}
 
-	private judge(writes: StagedWrites, collections: readonly CollectionId[], ahead: QueueAhead): QueuedJudgement {
-		return judgeTransaction({ writes, tables: this.tablesOf(collections) }, this.describeCollection, ahead);
+	private judge(writes: StagedWrites, collections: readonly CollectionId[], ahead: QueueAhead, facts: EntryFacts | undefined): QueuedJudgement {
+		return judgeTransaction({ writes, tables: this.tablesOf(collections), facts }, this.describeCollection, ahead);
 	}
 
-	/** `entries`, each with the segments it still holds and its outlook's kind, beside the deferred
-	 * journaled transactions numbered below `seq`. */
+	/** `entries`, each with the segments it still holds, its outlook's kind and its facts, beside the
+	 * deferred journaled transactions numbered below `seq`. */
 	private queueAhead(entries: readonly QueuedEntry[], seq: number): QueueAhead {
 		const earlier = entries.map((entry): EarlierEntry => ({
 			transactionId: entry.id,
 			seq: entry.seq,
 			writes: this.sealedWrites(entry.id, this.heldCollections(entry)),
 			assured: this.judgements.get(entry.id)?.outlook.kind === 'assured',
+			facts: this.entryFacts.get(entry.id),
 		}));
 		return { earlier, deferred: this.deferredBelow(seq) };
 	}
@@ -832,7 +847,7 @@ export class OfflineMode {
 	}
 
 	/** `entry` as {@link followOutlooks} reads it: the segments it still holds, read as for its
-	 * judgement, and whether a replay has refused one of them. */
+	 * judgement, its facts, and whether a replay has refused one of them. */
 	private followedEntry(entry: QueuedEntry): FollowedEntry {
 		const collections = this.heldCollections(entry);
 		const registry = this.bridge.getCollectionRegistry();
@@ -842,6 +857,7 @@ export class OfflineMode {
 			writes: this.sealedWrites(entry.id, collections),
 			tables: this.tablesOf(collections),
 			committedCollections: entry.committedCollections ?? [],
+			facts: this.entryFacts.get(entry.id),
 			judgement: this.judgements.get(entry.id),
 			refused: collections.some(id => registry.get(id)?.sealedRefusal(entry.id) !== undefined),
 		};
@@ -943,7 +959,10 @@ export class OfflineMode {
 		const translated = outcome?.status ?? this.translate(status);
 		if (status.kind === 'failed') this.weighFailure(status);
 		if (outcome !== undefined) {
+			// With the judgement, its facts: a later transaction that depended on them was judged while they
+			// were held, and its own judgement is frozen (docs/offline-sync.md §The outlook).
 			this.judgements.delete(status.entryId);
+			this.entryFacts.delete(status.entryId);
 			this.retain(outcome);
 		}
 		notifyListeners(this.statusListeners, translated,

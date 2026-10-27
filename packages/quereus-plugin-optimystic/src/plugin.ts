@@ -5,8 +5,8 @@
  * All metadata is in package.json - no manifest export needed.
  */
 
-import type { Database, SqlValue, FunctionFlags } from '@quereus/quereus';
-import { TEXT_TYPE } from '@quereus/quereus';
+import type { Database, SqlValue } from '@quereus/quereus';
+import { FunctionFlags, TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OfflineMode } from './optimystic-adapter/offline-mode.js';
@@ -85,7 +85,14 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 				schema: {
 					name: 'StampId',
 					numArgs: 0,
-					flags: 1 as FunctionFlags, // UTF8
+					// FRESH: a promise to Quereus's write-provenance analysis that no OTHER writer can produce the
+					// value (16 random bytes beside a hash of this peer's id), so an insert keyed by StampId() is
+					// judged assured offline (docs/offline-sync.md §Judging each guard). Quereus words the flag
+					// as "unique per call"; StampId() answers the same value for every call inside one
+					// transaction, which the outlook does not need to be otherwise — two rows inserted under it
+					// in one transaction collide with each other sequentially, and the pre-stage probe refuses
+					// the second before anything is queued (README § Offline mode).
+					flags: FunctionFlags.UTF8 | FunctionFlags.FRESH,
 					returnType: {
 						typeClass: 'scalar' as const,
 						logicalType: TEXT_TYPE,
@@ -99,7 +106,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 				schema: {
 					name: 'CommitOutlook',
 					numArgs: 0,
-					flags: 1 as FunctionFlags, // UTF8
+					flags: FunctionFlags.UTF8,
 					returnType: {
 						typeClass: 'scalar' as const,
 						logicalType: TEXT_TYPE,

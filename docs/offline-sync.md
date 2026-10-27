@@ -1,7 +1,7 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: stages 1 to 4 of [Implementation stages](#implementation-stages) are implemented; the
-rest is a proposal.** It describes an opt-in operating
+**Status: stages 1 to 8 of [Implementation stages](#implementation-stages) are implemented, stage 9
+is in progress; the rest is a proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
 transaction's progress to the application until it is committed or has failed.
@@ -966,16 +966,25 @@ analysis can prove about where its values came from:
 | `unchanged` (UPDATE, DELETE, REPLACE over an existing row, eviction) | changing or deleting that row. | the row was inserted under a fresh key by an earlier entry of this queue that has not been committed — no other machine has seen the key — or the table is declared single-writer. |
 | none (index trees) | — | always; an index segment is never refused on its own. |
 
-A key or unique value is **fresh** when the analysis can show that no other writer can produce it:
+A key or unique value is **fresh** when no other writer can produce it. The plugin learns this from
+two sources and reasons no further:
 
-- it is `StampId()`, or a deterministic function of it (`StampId()` is a hash of this peer's id
-  plus 16 random bytes, so it is unique per transaction);
-- it comes from a random source of at least 128 bits (`random_bytes(16)` or wider, a UUIDv4
-  function), or a deterministic function of one; `random()`'s 64 bits do not qualify by default;
-- it is supplied by a parameter or a context variable, and the column is declared fresh by a tag
-  (`"optimystic.fresh" = true`) because the application generates the value itself — see
-  [Declared hints](#declared-hints);
-- for a composite key, any one column is fresh.
+- **The write description's provenance** (see [What the analysis needs from
+  Quereus](#what-the-analysis-needs-from-quereus)): a column Quereus labels `fresh` is fresh. That is
+  `StampId()`, which the plugin registers with `FunctionFlags.FRESH` — a hash of this peer's id beside
+  16 random bytes, so no other machine can produce it, though every call inside one transaction
+  answers the same value — any function another plugin registers `fresh: true`, and the builtin
+  `randomblob(n)` with a literal `n ≥ 16`; each bare, or under one of the injective wrappers Quereus
+  recognises (`hex`, `lower`, `upper`, `cast`, `||` against a literal; only `hex` keeps a blob fresh),
+  so `hex(randomblob(16))` is the fresh spelling of a random text key. Anything else is not:
+  `substr(StampId(), 1, 8)`, `random()`'s 64 bits, and the crypto plugin's `random_bytes(bits,
+  encoding)`, whose width is an argument and so cannot be promised (backlog
+  `feat-crypto-plugin-offers-a-fresh-id-function`).
+- **A tag**: the value is supplied by a parameter or a context variable, and the column is declared
+  fresh by `"optimystic.fresh" = true` because the application generates it itself — see
+  [Declared hints](#declared-hints).
+- For a composite key, any one column fresh makes the key fresh; a unique value is fresh when any of
+  its constraint's columns is.
 
 Two refinements matter in practice:
 
@@ -1008,6 +1017,24 @@ guard that can be refused:
   constraint (with the constraint's columns, whether one of them is tagged fresh, and a value
   decoder), and which are other index trees. It reads the live schema at call time, so a tag change
   needs no re-publication. Tags are read `=== true`, the rule `optimystic.network_watch` is read by.
+- **The provenance knowledge comes from the statements, as they stage.** Each vtab opts into the
+  write description (`wantWriteScope`) and, after each `update()` arm's last stage, records which of
+  the elements it staged carry a fresh value (`freshElementsOf` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`): the main-tree
+  entry when a primary-key column is labelled fresh, and the entry in each UNIQUE-enforcing index
+  tree the row binds when one of the constraint's columns is, keyed exactly as the guarded entry is
+  staged. The bridge keeps the records with the transaction (`TransactionBridge.noteWriteFacts` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) and folds them at commit
+  into the entry's facts (`EntryFacts`, per collection the fresh elements' keys), which the judgement
+  reads beside the tags: an `absent` or `absentRange` whose element the facts list is not exposed,
+  and an `unchanged` on a row an earlier queued entry inserted under a key that entry's facts list is
+  not either. The records follow savepoints: the bridge notes how many there were when a savepoint
+  was created and truncates to that on a rollback to it, and Quereus wraps every DML statement in
+  one, so a failed statement leaves no record and a rolled-back statement's fresh key is never
+  credited to a later statement that supplies it as a literal. A cascade child write carries no
+  description and records nothing; the upsert `DO UPDATE` arm receives the INSERT's description and
+  records nothing. The facts are held in memory with the judgement: a transaction restored after a
+  restart has none until they are journaled, and is judged from the tags alone.
 - **Exposures name what a user can recognise.** `absent` reports `rule: 'primary-key'` with the
   decoded primary key; `absentRange` reports `rule: 'unique'` with the constraint's columns and the
   unique value decoded from the range's lower bound (`decodeIndexKey` in
@@ -1068,45 +1095,53 @@ every queued entry and every deferred record counts as earlier.
 
 ### What the analysis needs from Quereus
 
-Most of the machinery exists in Quereus today:
+Quereus 4.21.0 ships the statement-level description of a **write** this section used to propose
+(Quereus's [write-scope.md](https://github.com/gotchoices/quereus/blob/main/docs/write-scope.md); the
+contract is `@quereus/quereus/src/planner/analysis/write-scope.ts`, the provenance classifier
+`@quereus/quereus/src/planner/analysis/value-provenance.ts`). It is computed from the same planner as
+the read-side change scope and speaks its vocabulary — `QualifiedName`, `TableWatch`, `ScopeValue`,
+`NonDetSource` (Quereus's
+[change-scope.md](https://github.com/gotchoices/quereus/blob/main/docs/change-scope.md)) — so a host
+reading change scopes reads it without new shapes. What the plugin reads of it:
 
-- **Read scope with binding modes.** `Statement.getChangeScope()` reports, per table, which columns a
-  statement reads and whether each read is pinned to rows, groups, or the whole table, built on
-  `analyzeRowSpecific` and `extractBindings`
-  (`@quereus/quereus/src/planner/analysis/binding-extractor.ts`; see Quereus's
-  [change-scope.md](https://github.com/gotchoices/quereus/blob/main/docs/change-scope.md) and
-  [optimizer-assertions.md](https://github.com/gotchoices/quereus/blob/main/docs/optimizer-assertions.md)).
-- **Non-deterministic sources.** The same analysis reports `time`, `random`, volatile UDFs and
-  parameters as `nonDeterministicSources`, from `FunctionFlags.DETERMINISTIC`.
-- **Functional dependencies and keys** (Quereus's
-  [optimizer-fd.md](https://github.com/gotchoices/quereus/blob/main/docs/optimizer-fd.md)), which
-  decide whether a predicate pins a target to one row.
-- **Column lineage** for views (`@quereus/quereus/src/planner/analysis/update-lineage.ts`), which
-  traces an output column to a base column or a computed expression.
+- **`Statement.getWriteScope()`**, beside `getChangeScope()`: one `TableWrite` per write site in plan
+  order, with the statement's non-deterministic sources and unbound parameters.
+- **The module hook.** A virtual table that sets `wantWriteScope = true` receives
+  `UpdateArgs.writeScope`, the write site's `TableWrite`, on every `update()` of the statement's own
+  write: one object per execution, the same reference for every row, the execution's parameters
+  already bound into `selection` and `reads`. It is **absent** on the engine's FK cascade child
+  writes, and the upsert `DO UPDATE` arm receives the INSERT's object (whose `disposition.clauses`
+  describe the arm). Unset, the engine runs no analysis; set, a write site is analyzed once per plan
+  and its parameters bound once per execution.
+- **Per written column, a `ValueProvenance`** (`TableWrite.columns`: INSERT lists every table column
+  in schema order, UPDATE the assigned columns, DELETE none): `literal`; `input` (parameters and
+  context variables); `fresh` — a call to a function flagged `FunctionFlags.FRESH`, or `randomblob(n)`
+  with a literal `n ≥ 16`, or an injective wrapper over exactly one such call (`hex`, `lower`, `upper`,
+  `cast`, `||` against a literal; only `hex` keeps a blob fresh); `volatile`; `self` (the row's own
+  previous values, `set n = n + 1`); `other` (other rows, or anything the classifier cannot describe).
+  A function declares itself fresh with `fresh: true` in `createScalarFunction`'s options, or the flag
+  bit in a raw function schema; no builtin carries it. The rule is narrower than "a deterministic
+  function of a fresh value is fresh": `substr(StampId(), 1, 8)` is `other`.
+- **How the target rows were chosen** (`selection`): `none` for INSERT; `rows`, with the key and the
+  bound values, when the WHERE pins a unique key by equality; `global` otherwise — what the
+  `row-selection` decision reads.
+- **Everything else the write reads** (`reads`: `TableWatch`es, each with its binding mode `full`,
+  `rows`, `groups` or `rowsByGroup`) and **the constraints it is subject to** (`constraints`, each
+  classed `row` or `cross-row` and `immediate` or `deferred`, with the table a foreign key or an
+  assertion references): the inputs of the `unchecked` decisions.
+- **`selfIndependent`**: no written value depends on the row's previous values or on other rows, so
+  re-applying the write to its own result changes nothing — the property the [already-applied
+  guards](#guards-that-make-idempotent-writes-assured) read, distinct from Quereus's
+  `PhysicalProperties.idempotent` ("safe to evaluate twice in one transaction").
 
-What is missing is a statement-level description of a **write**, which is a proposal to Quereus:
-
-- `getChangeScope()` deliberately reports no watches for DML without `RETURNING`. The prediction
-  needs the opposite: the read scope of everything a DML statement reads to decide its effect — its
-  `WHERE`, `SET` and `VALUES` expressions, its source query, and the constraint checks its writes
-  trigger — with the target row's own key read separated from the rest.
-- Per written column, the **provenance** of the value: a literal, a parameter, a context variable, a
-  fresh source (`StampId()`, a wide random source, or a deterministic function of one), the row's
-  own previous values (`set n = n + 1`), or other rows.
-- How the target rows were chosen: by a key equality (`row`) or by a predicate (`global`).
-- The constraints the write is subject to, each classed as row-local or cross-row (foreign keys,
-  subquery CHECKs, assertions), which is the distinction the lens prover already draws for its own
-  constraint attachment.
-
-A host-facing `Statement.getWriteScope()` beside `getChangeScope()` would serve any application,
-and the vtab needs the same description for the statement that is calling its `update()`, through
-a module-facing hook (on `UpdateArgs`, or a per-statement callback on the connection). The vtab
-combines the static description with the facts only it has at staging time: the guard each action
-actually carries, and whether the target row was inserted by an unsettled entry of this queue.
-
-Note that Quereus's existing `PhysicalProperties.idempotent` flag means "safe to evaluate twice in
-one transaction", which is not the property the convergent guards below need (re-applying a write to
-its own result changes nothing). The write description has to state that one separately.
+The vtab combines the description with the facts only it has at staging time: the guard each action
+actually carries, and whether the target row was inserted by an unsettled entry of this queue. Two
+gaps it works around: a cascade child write and the upsert `DO UPDATE` arm are undescribed for the
+row's own values, and both count as not fresh. One imprecision it inherits, because the plugin
+trusts the label: on Quereus 4.21.0, `randomblob(16)` written bare to a `text` column is labelled
+`fresh` although the engine stores a lossy text decode of the bytes — the write conversion the label
+should fail on is not planned for a `text` column — so write `hex(randomblob(16))` for a random text
+key; the Quereus fix is tracked in blocked `quereus-labels-a-fresh-blob-written-to-text-as-fresh`.
 
 ### Declared hints
 
@@ -1736,12 +1771,14 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    (reported as not computed). Deliver it on `queued`, `outlook-changed` as dependencies settle, the
    `CommitOutlook()` function, and the `offline:assured-entry-failed` log. Useful on its own for
    applications that generate ids in the app.
-8. **The write description in Quereus** (Quereus ticket `statement-write-scope`, filed 2026-10-25): `Statement.getWriteScope()`
+8. **The write description in Quereus** (shipped in Quereus 4.21.0): `Statement.getWriteScope()`
    and the module hook that hands it to the vtab for the executing statement — the DML read scope
    with binding modes, per-column value provenance, target-row selection, and constraint
    classification.
-9. **The outlook from the write description.** Fresh-value detection from provenance, `unchecked`
-   decisions, and dependencies through unchecked reads.
+9. **The outlook from the write description** (in progress, three tickets: fresh-value detection
+   from provenance is implemented; the `unchecked` decisions with their dependencies, and the
+   journaling of the facts so a restored transaction is judged with them, follow). Fresh-value
+   detection from provenance, `unchecked` decisions, and dependencies through unchecked reads.
 10. **Guards that accept an already-applied write.** The three variants, gated on the write
     description's self-independence and disposition facts, with the `already-applied` effect on
     `committed`.
@@ -1832,8 +1869,20 @@ also checks its predictions against their outcomes (the last item below):
 `packages/quereus-plugin-optimystic/test/outlook-predictions.ts`
 tracks each plugin `createMeshDbNode` and the offline specs' own helpers register, and a root
 `afterEach` fails a test that leaves any tracked plugin's `assuredFailures` above zero, unless the
-test declared the count with `expectAssuredFailures`. Of the list below, what is left waits for its
-stage: the rest of the outlook (stages 8 to 10).
+test declared the count with `expectAssuredFailures`.
+
+Stage 9's first ticket pins fresh-value detection from the write description.
+`packages/quereus-plugin-optimystic/test/write-description.spec.ts`, over prepared statements on
+memory tables with the plugin's `StampId()` registered, one case per rule of `freshElementsOf`: a
+key from `StampId()` fresh; from `hex(randomblob(16))` fresh; a fresh blob under a lossy wrapper not
+fresh; a parameter key not fresh; a composite key fresh through one column; a unique entry fresh
+through one of its columns while the key is not; the upsert `DO UPDATE` arm, handed the INSERT's
+description, nothing fresh; no description nothing fresh. `offline-outlook.spec.ts`, on a table with
+no fresh tag: an insert under `StampId()` assured, and one under `hex(randomblob(16))`; the same id a
+rolled-back insert minted, inserted again as a literal after `rollback to` the savepoint, exposed on
+that key; and an update of a row an earlier queued entry inserted under `StampId()` assured with that
+entry in `dependsOn`. The suite-wide check above now also catches a false `fresh` label end to end.
+Of the list below, what is left waits for its stage: the rest of stage 9, and stage 10.
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.
@@ -1864,8 +1913,8 @@ stage: the rest of the outlook (stages 8 to 10).
 - DDL refused while an entry for the table is queued; allowed after it settles.
 - `discard` of a never-sent entry; refusal of `discard` for a sent one.
 - `expireAfterMs` reached while unreachable.
-- Outlook, one case per row of the guard table: an insert under `StampId()` or `random_bytes(16)` is
-  assured; an insert under a natural key is exposed with that key; an update of a row created offline
+- Outlook, one case per row of the guard table: an insert under `StampId()` or `hex(randomblob(16))`
+  is assured; an insert under a natural key is exposed with that key; an update of a row created offline
   under a fresh key is assured, and becomes exposed (in a test of the residual) only if a rival
   writes the row between the two drains; an update of an existing shared row is exposed.
 - A message inserted under a fresh key, referencing a conversation created by an earlier queued

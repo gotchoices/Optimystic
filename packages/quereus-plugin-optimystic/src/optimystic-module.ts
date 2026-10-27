@@ -11,11 +11,12 @@ import { announceExternalChange } from './optimystic-adapter/external-change.js'
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 import type { MainTreeDescription, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
-import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
+import { freshElementsOf } from './optimystic-adapter/write-description.js';
+import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
@@ -38,6 +39,19 @@ const log = createLogger('module');
 /** Shared empty guard set — returned by {@link OptimysticVirtualTable.guardedUniqueIndexes}
  *  for the common no-secondary-UNIQUE table so the staging paths allocate nothing. */
 const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
+
+/** A transaction state carrying nothing but `transactor`, for opening a collection on a transactor the
+ *  factory should reuse (`CollectionFactory.createOrGetCollection`) outside any SQL transaction. */
+function transactorOnlyState(transactor: ITransactor): TransactionState {
+  return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: { records: [], marks: new Map() } };
+}
+
+/** A UNIQUE constraint that binds a row, with the index tree enforcing it
+ *  ({@link OptimysticVirtualTable.guardedUniqueConstraints}). */
+type GuardedUniqueConstraint = {
+  readonly constraint: UniqueConstraintSchema;
+  readonly enforcing: { readonly descriptor: StoredIndexSchema; readonly tree: Tree<string, IndexEntry> };
+};
 
 /**
  * Every catch arm below that surfaces a caught error to the SQL layer funnels through
@@ -681,6 +695,13 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     // Enable statement capture for replication/transaction logging
     this.wantStatements = true;
+    // Every update() of the statement's own write carries its description (UpdateArgs.writeScope), from
+    // which the arms record which staged elements came from a fresh source (recordWriteFacts) for the
+    // offline outlook (docs/offline-sync.md §Judging each guard).
+    // NOTE: Quereus analyzes a write site once per plan and binds its parameters once per execution; a
+    // plan built by `db.exec` of a new string is analyzed each time. If the analysis ever shows in a
+    // profile, gate this on the offline controller having been entered, or on a plugin option.
+    this.wantWriteScope = true;
   }
 
   /**
@@ -2296,16 +2317,57 @@ export class OptimysticVirtualTable extends VirtualTable {
    * disposition (skip/evict the rival's MAIN row from an index-tree guard) ever exists.
    */
   private guardedUniqueIndexes(values: Row): ReadonlySet<string> {
+    const guarded = this.guardedUniqueConstraints(values);
+    return guarded.length === 0 ? EMPTY_INDEX_SET : new Set(guarded.map(({ enforcing }) => enforcing.descriptor.name));
+  }
+
+  /**
+   * The UNIQUE constraints that BIND the row carrying `values` — non-partial, every column present
+   * and non-null — each with the index tree enforcing it ({@link resolveEnforcingIndex}); a
+   * constraint whose tree cannot be resolved is left out. The one walk behind
+   * {@link guardedUniqueIndexes}, which guards these trees' entries, and {@link recordWriteFacts},
+   * which says which of those entries carry a fresh value, so the guarded element and the fact about
+   * it come from one list.
+   */
+  private guardedUniqueConstraints(values: Row): GuardedUniqueConstraint[] {
     const constraints = this.tableSchema.uniqueConstraints;
-    if (!constraints || constraints.length === 0) return EMPTY_INDEX_SET;
-    const guarded = new Set<string>();
+    if (!constraints || constraints.length === 0) return [];
+    const guarded: GuardedUniqueConstraint[] = [];
     for (const uc of constraints) {
       if (uc.predicate !== undefined || uc.columns.length === 0) continue;
       if (!uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined)) continue;
       const enforcing = this.resolveEnforcingIndex(uc);
-      if (enforcing) guarded.add(enforcing.descriptor.name);
+      if (enforcing) guarded.push({ constraint: uc, enforcing });
     }
-    return guarded.size === 0 ? EMPTY_INDEX_SET : guarded;
+    return guarded;
+  }
+
+  /**
+   * Tell the bridge which of the elements an arm has just staged for the row carrying `values` came
+   * from a fresh source, read from the executing statement's write description (`freshElementsOf` in
+   * write-description.ts): the main-tree entry at `rowKey`, and the entry in each UNIQUE-enforcing
+   * index tree {@link guardedUniqueIndexes} guarded — keyed exactly as `IndexManager.insertIndexEntries`
+   * and `updateIndexEntries` key the entry, so the fact names the guarded element by construction.
+   * Called after the arm's last stage. A write with no description (an FK cascade child write), or
+   * one describing another operation (the upsert `DO UPDATE` arm receives the INSERT's), records
+   * nothing; so does a DELETE, whose elements carry no check a fresh value could assure.
+   */
+  private recordWriteFacts(write: TableWrite | undefined, arm: 'insert' | 'update', rowKey: string, values: Row): void {
+    const collection = this.collection;
+    const indexManager = this.indexManager;
+    if (write === undefined || !collection || !indexManager) return;
+    const columnName = (index: number): string => this.tableSchema.columns[index]?.name ?? `col${index}`;
+    const facts = freshElementsOf(write, arm, {
+      mainCollectionId: collection.getCollection().id,
+      key: rowKey,
+      keyColumns: this.tableSchema.primaryKeyDefinition.map(pk => columnName(pk.index)),
+      uniqueEntries: this.guardedUniqueConstraints(values).map(({ constraint, enforcing }) => ({
+        collectionId: enforcing.tree.getCollection().id,
+        key: indexEntryKey(indexManager.createIndexKey(enforcing.descriptor, values), rowKey),
+        columns: constraint.columns.map(columnName),
+      })),
+    });
+    if (facts.length > 0) this.txnBridge.noteWriteFacts(facts);
   }
 
   /**
@@ -2993,6 +3055,7 @@ export class OptimysticVirtualTable extends VirtualTable {
                   txnState?.transactor,
                   this.guardedUniqueIndexes(values),
                 );
+                this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
                 // replacedRow (the same-PK slot) and evictedRows (rows at OTHER PKs)
                 // co-occur here; the executor runs each eviction's delete pipeline
                 // before modelling the replacement as an update of replacedRow.
@@ -3075,6 +3138,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               txnState?.transactor,
               this.guardedUniqueIndexes(values),
             );
+            this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
 
             return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
           }
@@ -3198,6 +3262,10 @@ export class OptimysticVirtualTable extends VirtualTable {
               // a value-preserving move never refuses itself (see updateIndexEntries).
               this.guardedUniqueIndexes(values),
             );
+            // Under newKey: its `absent` insert half is what a fresh key assures. A same-key update
+            // records a main-tree fact only when an assigned key column is fresh, which is then true
+            // of the key however it reached newKey (minted earlier in this transaction).
+            this.recordWriteFacts(args.writeScope, 'update', newKey, values);
 
             return {
               status: 'ok',
@@ -3931,7 +3999,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     };
     const tree = await this.collectionFactory.createOrGetCollection(
       indexOptions,
-      transactor ? { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network' } : undefined
+      transactor ? transactorOnlyState(transactor) : undefined
     );
     log(
       'index:tree-open table=%s index=%s uri=%s collection=%s node=%s',
@@ -4492,9 +4560,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         encoding: 'json',
         rawStorageFactory: tableOptions.rawStorageFactory,
       };
-      const txnState = transactor
-        ? { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network' as const }
-        : undefined;
+      const txnState = transactor ? transactorOnlyState(transactor) : undefined;
       // Write paths bring the catalog into existence; read paths must observe an
       // absent catalog as absent (undefined) rather than as a table-less database.
       return create

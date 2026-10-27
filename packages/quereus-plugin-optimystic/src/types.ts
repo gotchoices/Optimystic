@@ -1,6 +1,7 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
 import type { IRawStorage, NodeOptions } from '@optimystic/db-p2p';
+import type { WriteFact } from './optimystic-adapter/write-description.js';
 
 /**
  * Configuration for the optimystic virtual table
@@ -114,4 +115,12 @@ export interface TransactionState {
    * open changes nothing about it.
    */
   acknowledgement: 'local' | 'network';
+  /**
+   * What the statements' write descriptions said about the elements this transaction staged
+   * (`WriteFact`, recorded by the vtab through `TransactionBridge.noteWriteFacts`), in staging order,
+   * with the record count at each open savepoint's creation (`marks`, keyed by the depth Quereus
+   * broadcasts) so a rollback to it discards the records of the statements it discards. Folded into
+   * the queue entry's facts at commit and read live by `CommitOutlook()`.
+   */
+  writeFacts: { records: WriteFact[]; marks: Map<number, number> };
 }

@@ -30,6 +30,8 @@ const createUsers = `create table Users (name text primary key, bio text) using 
 const createAccounts = `create table Accounts (id text primary key with tags ("optimystic.fresh" = true), email text unique, badge integer unique) using optimystic('tree://outlook/accounts')`;
 /** Natural primary key, written by this machine alone. */
 const createPrefs = `create table Prefs (pref text primary key, choice text) using optimystic('tree://outlook/prefs') with tags ("optimystic.single_writer" = true)`;
+/** No tag: whether a key is fresh is read from where the statement's value came from (the write description). */
+const createMemos = `create table Memos (id text primary key, body text) using optimystic('tree://outlook/memos')`;
 
 interface Node extends MeshDbNode {
 	/** Every status the plugin reported, in order. */
@@ -52,8 +54,15 @@ async function oneNode(): Promise<Node> {
 	const { transactorFor } = await startMockMesh(1);
 	const node = followed(createMeshDbNode(transactorFor(0), offlineConfig));
 	node.plugin.collectionFactory.registerCohortReachability('shared:test', { reachable: () => Promise.resolve(false) });
-	for (const sql of [createNotes, createUsers, createAccounts]) await node.db.exec(sql);
+	for (const sql of [createNotes, createUsers, createAccounts, createMemos]) await node.db.exec(sql);
 	return node;
+}
+
+/** The open transaction's `StampId()`, which is what `StampId()` inside its statements writes. */
+async function stampIdOf(db: MeshDbNode['db']): Promise<string> {
+	const rows = await queryAll(db, 'select StampId() as id');
+	expect(rows[0]?.id, 'a transaction is open').to.be.a('string');
+	return rows[0]!.id as string;
 }
 
 /** Node A, whose gate stays closed until `openGate`, and node B, both with `creates` declared. */
@@ -115,6 +124,49 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		expect(update.outlook).to.deep.equal(assured([{ transactionId: insert.transactionId, via: 'guard' }]));
 		const listed = node.plugin.offline.entries().find(entry => entry.transactionId === update.transactionId);
 		expect(listed?.status.kind === 'queued' ? listed.status.outlook : undefined, 'entries() lists the same outlook').to.deep.equal(update.outlook);
+	});
+
+	it('an insert under StampId() into a table with no fresh tag is assured: the write description says the key is fresh', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		// Inside an explicit transaction: in an autocommit statement StampId() is evaluated before the
+		// write begins the bridge's transaction, and answers NULL.
+		const insert = await queuedOutlook(node, `begin; insert into Memos (id, body) values (StampId(), 'a'); commit`);
+		expect(insert.outlook).to.deep.equal(assured());
+	});
+
+	it('an insert under hex(randomblob(16)) into a table with no fresh tag is assured: a wide random source is fresh', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		const insert = await queuedOutlook(node, `insert into Memos (id, body) values (hex(randomblob(16)), 'a')`);
+		expect(insert.outlook).to.deep.equal(assured());
+	});
+
+	it('a savepoint rollback discards the facts of the statements it discards: the id a rolled-back insert minted, inserted again as a literal, is exposed', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		await node.db.exec('begin');
+		const id = await stampIdOf(node.db);
+		await node.db.exec(`savepoint s; insert into Memos (id, body) values (StampId(), 'a'); rollback to s`);
+		const literal = await queuedOutlook(node, `insert into Memos (id, body) values ('${id}', 'a'); commit`);
+		expect(literal.outlook).to.deep.equal({
+			kind: 'exposed',
+			exposures: [{ table: 'main.Memos', rule: 'primary-key', key: [id] }],
+			dependsOn: [],
+			unchecked: 'not-computed',
+		});
+	});
+
+	it('an update of a row an earlier queued transaction inserted under StampId(), with no fresh tag, depends on that transaction and is assured with it', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		await node.db.exec('begin');
+		const id = await stampIdOf(node.db);
+		const insert = await queuedOutlook(node, `insert into Memos (id, body) values (StampId(), 'a'); commit`);
+		expect(insert.outlook).to.deep.equal(assured());
+
+		const update = await queuedOutlook(node, `update Memos set body = 'b' where id = '${id}'`);
+		expect(update.outlook).to.deep.equal(assured([{ transactionId: insert.transactionId, via: 'guard' }]));
 	});
 
 	it('an update of a row committed before going offline is exposed with the row\'s key', async () => {

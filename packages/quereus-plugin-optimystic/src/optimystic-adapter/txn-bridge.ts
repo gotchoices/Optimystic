@@ -17,6 +17,8 @@ import { guardRefusalIn } from './guard-refusal.js';
 import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
 import type { TransactionOutcome } from './offline-status.js';
+import type { EntryFacts } from './commit-outlook.js';
+import { foldWriteFacts, type WriteFact } from './write-description.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
@@ -886,6 +888,7 @@ export class TransactionBridge {
       // it (docs/offline-sync.md §Entering and leaving the mode). Never 'local' in session mode,
       // which offline mode refuses to enter beside, and vice versa.
       acknowledgement: this.offline?.isEntered() === true ? 'local' : 'network',
+      writeFacts: { records: [], marks: new Map() },
     };
 
     return this.currentTransaction;
@@ -1133,7 +1136,7 @@ export class TransactionBridge {
         action: treeActionId(tree),
       })));
     }
-    return await this.offline!.enqueue(collections, transactionId) !== undefined;
+    return await this.offline!.enqueue(collections, transactionId, this.openWriteFacts()) !== undefined;
   }
 
   /**
@@ -1892,6 +1895,8 @@ export class TransactionBridge {
    * Legacy (staged-tracker) mode only — see {@link savepoints}.
    */
   createSavepoint(depth: number): void {
+    // Ahead of the session-mode return: facts are recorded in session mode too, for CommitOutlook().
+    this.markWriteFacts(depth);
     if (this.session) {
       return;
     }
@@ -1930,6 +1935,8 @@ export class TransactionBridge {
    * segment is sealed the restore is the verbatim arm, as it was when this was synchronous.
    */
   async rollbackToSavepoint(depth: number): Promise<void> {
+    // Ahead of the snapshot check, which returns early in session mode (no snapshots there).
+    this.truncateWriteFacts(depth);
     const snapshots = this.savepoints.get(depth);
     if (!snapshots) {
       return;
@@ -1958,10 +1965,68 @@ export class TransactionBridge {
    * staged (flushed at commit). Never flushes. Idempotent / no-op when absent.
    */
   releaseSavepoint(depth: number): void {
+    this.releaseWriteFactMarks(depth);
     for (const openDepth of this.savepoints.keys()) {
       if (openDepth >= depth) {
         this.savepoints.delete(openDepth);
       }
+    }
+  }
+
+  /**
+   * Record what the executing statement's write description said about the elements the vtab has just
+   * staged (`freshElementsOf` in write-description.ts): kept with the transaction in staging order,
+   * discarded by a savepoint rollback with the statements it discards ({@link rollbackToSavepoint}),
+   * folded for the queue entry at {@link sealIntoQueue} and read live by {@link openWriteFacts}. A
+   * no-op with no active transaction.
+   */
+  noteWriteFacts(facts: readonly WriteFact[]): void {
+    const transaction = this.currentTransaction;
+    if (!transaction?.isActive || facts.length === 0) return;
+    transaction.writeFacts.records.push(...facts);
+  }
+
+  /**
+   * The facts the open transaction's statements have recorded so far, folded as the queue entry's are
+   * (`foldWriteFacts`); empty with no transaction. Read by `OfflineMode.openTransactionOutlook` for
+   * `CommitOutlook()`, which therefore sees the facts of the arms that completed before it, as it sees
+   * their staged elements.
+   */
+  openWriteFacts(): EntryFacts {
+    return foldWriteFacts(this.currentTransaction?.writeFacts.records ?? []);
+  }
+
+  /** Remember how many facts were recorded when the savepoint at `depth` was created — once per depth,
+   * the dedup {@link createSavepoint}'s snapshots use — so a rollback to it can discard the rest. */
+  private markWriteFacts(depth: number): void {
+    const facts = this.currentTransaction?.writeFacts;
+    if (facts !== undefined && !facts.marks.has(depth)) {
+      facts.marks.set(depth, facts.records.length);
+    }
+  }
+
+  /**
+   * Discard the facts recorded since the savepoint at `depth` was created — those of the statements a
+   * rollback to it discards, so a key a rolled-back statement minted fresh is never credited to a later
+   * statement that supplies it as a literal — and the marks nested above it. The mark at `depth` stays,
+   * as the savepoint does. A no-op when `depth` has no mark (released, or never created here).
+   */
+  private truncateWriteFacts(depth: number): void {
+    const facts = this.currentTransaction?.writeFacts;
+    const mark = facts?.marks.get(depth);
+    if (facts === undefined || mark === undefined) return;
+    facts.records.length = mark;
+    for (const openDepth of facts.marks.keys()) {
+      if (openDepth > depth) facts.marks.delete(openDepth);
+    }
+  }
+
+  /** Drop the marks at and above `depth`: the facts recorded under a released savepoint stay, as its rows do. */
+  private releaseWriteFactMarks(depth: number): void {
+    const facts = this.currentTransaction?.writeFacts;
+    if (facts === undefined) return;
+    for (const openDepth of facts.marks.keys()) {
+      if (openDepth >= depth) facts.marks.delete(openDepth);
     }
   }
 

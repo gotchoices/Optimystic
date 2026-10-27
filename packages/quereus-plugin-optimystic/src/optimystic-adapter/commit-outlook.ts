@@ -95,6 +95,16 @@ export type CollectionDescription = TableCollectionDescription | { readonly kind
  * sealed; `undefined` for a collection whose segment could not be read. */
 export type StagedWrites = ReadonlyMap<CollectionId, readonly Action<unknown>[] | undefined>;
 
+/** What the write descriptions of a transaction's statements said about its staged elements
+ * (`freshElementsOf` in write-description.ts, recorded by the vtab as it stages and folded by
+ * `foldWriteFacts`). `undefined` where the judgement has none: a transaction restored after a restart,
+ * until the facts are journaled. */
+export type EntryFacts = {
+	/** Per collection, the keys of the elements whose value came from a fresh source: the primary key of
+	 * a main-tree entry, the tree key of a unique-index entry. */
+	readonly fresh: ReadonlyMap<CollectionId, ReadonlySet<string>>;
+};
+
 /** An unsettled queue entry ahead of the transaction being judged. */
 export type EarlierEntry = {
 	readonly transactionId: string;
@@ -103,6 +113,8 @@ export type EarlierEntry = {
 	readonly writes: StagedWrites;
 	/** Its own outlook's kind. */
 	readonly assured: boolean;
+	/** What its statements' write descriptions said about its elements. */
+	readonly facts: EntryFacts | undefined;
 };
 
 /** A journaled transaction the restore after a restart has not put back yet: its writes are not
@@ -113,8 +125,9 @@ export type DeferredTransaction = {
 	readonly tables: readonly string[];
 };
 
-/** The transaction being judged: its staged writes, and `schema.table` of every table it wrote. */
-export type JudgedTransaction = { readonly writes: StagedWrites; readonly tables: readonly string[] };
+/** The transaction being judged: its staged writes, `schema.table` of every table it wrote, and what
+ * its statements' write descriptions said about its elements. */
+export type JudgedTransaction = { readonly writes: StagedWrites; readonly tables: readonly string[]; readonly facts: EntryFacts | undefined };
 
 /** What is queued ahead of the transaction being judged, in queue order. */
 export type QueueAhead = { readonly earlier: readonly EarlierEntry[]; readonly deferred: readonly DeferredTransaction[] };
@@ -152,6 +165,8 @@ export type FollowedEntry = {
 	readonly tables: readonly string[];
 	/** The collections a partial commit has committed: their checks have passed and can no longer refuse. */
 	readonly committedCollections: readonly CollectionId[];
+	/** What its statements' write descriptions said about its elements, as held. */
+	readonly facts: EntryFacts | undefined;
 	/** Its judgement as held; `undefined` when it was never judged (its judgement threw, or a restore
 	 * has registered it and not yet admitted it), which counts as not assured. */
 	readonly judgement: QueuedJudgement | undefined;
@@ -232,8 +247,9 @@ type CollectionWrites = {
 	readonly writers: EarlierEntry[];
 	/** The entries whose segment here cannot be read, which count as writing every key. */
 	readonly unreadable: EarlierEntry[];
-	/** Keys an entry inserted under an `absent` check, from the segments that can be read. */
-	readonly insertedAbsent: Set<string>;
+	/** Keys an entry inserted under an `absent` check, from the segments that can be read, each with
+	 * whether the facts of an entry that inserted it say the key is fresh. */
+	readonly insertedAbsent: Map<string, boolean>;
 };
 
 /**
@@ -258,13 +274,19 @@ class WriteIndex {
 				if (writers === undefined) writes.byKey.set(key, [entry]);
 				else writers.push(entry);
 			}
-			for (const key of keys.insertedAbsent) writes.insertedAbsent.add(key);
+			const freshHere = entry.facts?.fresh.get(collectionId);
+			for (const key of keys.insertedAbsent) {
+				writes.insertedAbsent.set(key, (freshHere?.has(key) ?? false) || (writes.insertedAbsent.get(key) ?? false));
+			}
 		}
 	}
 
-	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` check. */
-	insertedAbsent(collectionId: CollectionId, key: string): boolean {
-		return this.collections.get(collectionId)?.insertedAbsent.has(key) ?? false;
+	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` check AND under a
+	 * fresh key — the table's key is tagged fresh, or the facts of an entry that inserted it list the
+	 * key — so that no other machine can know the row yet (docs/offline-sync.md §Judging each guard). */
+	insertedFresh(collectionId: CollectionId, key: string, description: MainTreeDescription): boolean {
+		const byFacts = this.collections.get(collectionId)?.insertedAbsent.get(key);
+		return byFacts !== undefined && (description.freshKey || byFacts);
 	}
 
 	/** Every indexed entry that writes inside `span` in `collectionId`, an entry possibly more than once.
@@ -291,7 +313,7 @@ class WriteIndex {
 	private writesIn(collectionId: CollectionId): CollectionWrites {
 		let writes = this.collections.get(collectionId);
 		if (writes === undefined) {
-			writes = { byKey: new Map(), writers: [], unreadable: [], insertedAbsent: new Set() };
+			writes = { byKey: new Map(), writers: [], unreadable: [], insertedAbsent: new Map() };
 			this.collections.set(collectionId, writes);
 		}
 		return writes;
@@ -316,7 +338,7 @@ export function judgeTransaction(
 ): QueuedJudgement {
 	const index = new WriteIndex();
 	for (const entry of ahead.earlier) index.add(entry);
-	const own = ownJudgement(transaction.writes, describe, index);
+	const own = ownJudgement(transaction.writes, transaction.facts, describe, index);
 	return { own, outlook: outlookFrom(own, transaction.tables, index, ahead.deferred) };
 }
 
@@ -342,7 +364,7 @@ export function followOutlooks(queue: readonly FollowedEntry[], deferred: readon
 			judgement = { own, outlook: outlookFrom(own, entry.tables, index, ahead) };
 			followed.set(entry.transactionId, judgement);
 		}
-		index.add({ transactionId: entry.transactionId, seq: entry.seq, writes: entry.writes, assured: judgement?.outlook.kind === 'assured' });
+		index.add({ transactionId: entry.transactionId, seq: entry.seq, writes: entry.writes, assured: judgement?.outlook.kind === 'assured', facts: entry.facts });
 	}
 	return followed;
 }
@@ -367,9 +389,12 @@ function withoutCollections(own: OwnJudgement, collections: ReadonlySet<Collecti
  *   refuses it refuses that earlier check first. So an insert followed by updates of the row is
  *   judged once, by the insert. An `absentRange` is never covered this way: a rival taking the value
  *   under another key refuses it without touching the earlier element's key.
- * - `absent` is exposed unless the table's primary key is tagged fresh; `absentRange` unless the
- *   unique value is; `unchanged` unless the table is tagged single-writer, or an earlier entry of the
- *   queue inserted the row under a fresh key (no other machine can know it yet).
+ * - `absent` is exposed unless the key is fresh: the table's primary key is tagged fresh, or the
+ *   transaction's `facts` — what its statements' write descriptions said — list the element's key.
+ *   `absentRange` likewise, unless the unique value is tagged fresh or the facts list the index entry's
+ *   key. `unchanged` is exposed unless the table is tagged single-writer, or an earlier entry of the
+ *   queue inserted the row under a fresh key, by tag or by that entry's facts (no other machine can
+ *   know it yet).
  * - `keepExisting`, and an element with no check, can never be refused.
  * - Anything the judgement cannot read is exposed, never silent (docs/offline-sync.md §Conservative
  *   by construction): an unknown check kind, an action that is not a tree `replace`, a check in a
@@ -378,13 +403,14 @@ function withoutCollections(own: OwnJudgement, collections: ReadonlySet<Collecti
  */
 function ownJudgement(
 	writes: StagedWrites,
+	facts: EntryFacts | undefined,
 	describe: (collectionId: CollectionId) => CollectionDescription,
 	earlier: WriteIndex,
 ): OwnJudgement {
 	const exposures: OwnJudgement['exposures'][number][] = [];
 	const guarded: OwnJudgement['guarded'][number][] = [];
 	for (const [collectionId, actions] of writes) {
-		const judge = new CollectionJudge(collectionId, describe(collectionId), earlier, exposures, guarded);
+		const judge = new CollectionJudge(collectionId, describe(collectionId), facts?.fresh.get(collectionId), earlier, exposures, guarded);
 		if (actions === undefined) {
 			judge.unreadable();
 			continue;
@@ -402,6 +428,8 @@ class CollectionJudge {
 	constructor(
 		private readonly collectionId: CollectionId,
 		private readonly description: CollectionDescription,
+		/** The keys of this collection's elements the transaction's facts say came from a fresh source. */
+		private readonly freshKeys: ReadonlySet<string> | undefined,
 		private readonly earlier: WriteIndex,
 		private readonly exposures: OwnJudgement['exposures'][number][],
 		private readonly guarded: OwnJudgement['guarded'][number][],
@@ -436,12 +464,12 @@ class CollectionJudge {
 			case 'absent':
 				if (description.kind !== 'main') return this.unreadable();
 				this.cover({ kind: 'key', key });
-				if (!description.freshKey) this.exposeKey(description, 'primary-key', key);
+				if (!description.freshKey && !this.fresh(key)) this.exposeKey(description, 'primary-key', key);
 				return;
 			case 'unchanged':
 				if (description.kind !== 'main') return this.unreadable();
 				this.cover({ kind: 'key', key });
-				if (!description.singleWriter && !(description.freshKey && this.earlier.insertedAbsent(this.collectionId, key))) {
+				if (!description.singleWriter && !this.earlier.insertedFresh(this.collectionId, key, description)) {
 					this.exposeKey(description, 'row', key);
 				}
 				return;
@@ -449,7 +477,8 @@ class CollectionJudge {
 				const range = readRange(guard['range']);
 				if (description.kind !== 'unique-index' || range === undefined) return this.unreadable();
 				this.cover({ kind: 'range', range });
-				if (description.freshValue) return;
+				// The element's key is the index entry's tree key, which is what the facts name for it.
+				if (description.freshValue || this.fresh(key)) return;
 				const value = range.first === undefined ? undefined : description.decodeValue(range.first.key);
 				this.expose(value === undefined
 					? { table: description.table, rule: 'row', key: undefined }
@@ -459,6 +488,11 @@ class CollectionJudge {
 			default:
 				return this.unreadable();
 		}
+	}
+
+	/** Whether the transaction's facts say the element at `key` came from a fresh source. */
+	private fresh(key: string): boolean {
+		return this.freshKeys?.has(key) ?? false;
 	}
 
 	private exposeKey(description: MainTreeDescription, rule: 'primary-key' | 'row', key: string): void {
