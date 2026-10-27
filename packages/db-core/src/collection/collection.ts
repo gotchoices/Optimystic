@@ -16,8 +16,8 @@ import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailA
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
 import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
-import type { ActionContext, ActionRev } from "./action.js";
-import { actionIdAt } from "./action.js";
+import type { ActionContext, ActionRev, AlreadyAppliedTally } from "./action.js";
+import { actionIdAt, addTallies, ZeroTally } from "./action.js";
 import { AttemptCycle, resumedAttempt, retainedAttempt, stageAttempt } from "./write-attempts.js";
 import type { AttemptTarget, Refresh, StagedAttempt, WriteIdentity } from "./write-attempts.js";
 import { driveHeadCommit } from "./head-commit.js";
@@ -96,7 +96,10 @@ type HeadTracker = {
 };
 
 export type CollectionInitOptions<TAction> = {
-	modules: Record<ActionType, ActionHandler<TAction>>;
+	/** One handler per action type. A handler may answer what the action accepted as already applied
+	 * ({@link AlreadyAppliedTally}); one that answers nothing counts as the zero tally, so a collection
+	 * type with no such notion returns nothing. */
+	modules: Record<ActionType, ActionHandler<TAction, AlreadyAppliedTally | void>>;
 	createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => IBlock;
 	/** Called for each local action that is potentially in conflict with a remote action.
 	 * @param action - The local action to check
@@ -254,12 +257,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * {@link beginInFlightAction} and cleared by its disposer. */
 	private inFlightCycle: InFlightCycle = {};
 
-	/** The sealed segment a head commit on this instance is committing ({@link openHeadCommit}), for
-	 * the whole cycle — set and cleared beside {@link inFlightActionId}. Read by
-	 * {@link consumeOwnEntry}: the entry a head commit's own refresh finds under the in-flight action
-	 * id records the HEAD segment's actions, not the open segment's, so consuming it removes that
-	 * segment. */
-	private headCommitEntry?: EntryId;
+	/** The head commit running on this instance ({@link openHeadCommit}), for the whole cycle — set and
+	 * cleared beside {@link inFlightActionId}: the sealed segment it is committing, and the hook told
+	 * what that segment accepted as already applied when it is dropped as committed
+	 * ({@link HeadCommitOptions.onCommittedHead}). Read by {@link consumeOwnEntry}: the entry a head
+	 * commit's own refresh finds under the in-flight action id records the HEAD segment's actions, not
+	 * the open segment's, so consuming it removes that segment — and reports it through the hook, as
+	 * the handle's `fold` does. */
+	private headCommit?: { readonly entryId: EntryId; readonly onCommitted?: (applied: AlreadyAppliedTally) => void };
 
 	/** Set only while a head commit has RELEASED the collection latch for its one network round trip
 	 * ({@link HeadCommitHandle.release}), and cleared the moment it is retaken, so anything that runs under the
@@ -281,7 +286,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	protected constructor(
 		public readonly id: CollectionId,
 		public readonly transactor: ITransactor,
-		private readonly handlers: Record<ActionType, ActionHandler<TAction>>,
+		private readonly handlers: Record<ActionType, ActionHandler<TAction, AlreadyAppliedTally | void>>,
 		private readonly source: TransactorSource<IBlock>,
 		/** Cache of unmodified blocks from the source */
 		private readonly sourceCache: CacheSource<IBlock>,
@@ -732,25 +737,33 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.segments.open.push(...actions);
 	}
 
-	private internalTransact(...actions: Action<TAction>[]): Promise<void> {
+	private internalTransact(...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
 		return this.stageInto(this.tracker, ...actions);
 	}
 
 	/** Run `actions` through their handlers over `tracker` as ONE atomic unit: a throw from any
 	 * handler leaves none of their writes staged. The live tracker's path ({@link internalTransact})
-	 * and a head commit's tracker ({@link buildHeadTracker}) share it. */
-	private async stageInto(tracker: Tracker<IBlock>, ...actions: Action<TAction>[]): Promise<void> {
+	 * and a head commit's tracker ({@link buildHeadTracker}) share it.
+	 *
+	 * @returns the sum of what the handlers accepted as already applied ({@link AlreadyAppliedTally});
+	 * a handler that answers nothing adds the zero tally. */
+	private async stageInto(tracker: Tracker<IBlock>, ...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
 		const atomic = new Atomic(tracker);
+		let applied = ZeroTally;
 
 		for (const action of actions) {
 			const handler = this.handlers[action.type];
 			if (!handler) {
 				throw new Error(`No handler for action type ${action.type}`);
 			}
-			await handler(action, atomic);
+			const tally = await handler(action, atomic);
+			if (tally !== undefined) {
+				applied = addTallies(applied, tally);
+			}
 		}
 
 		atomic.commit();
+		return applied;
 	}
 
 	/** Load external changes and update our context to the latest log revision - resolve any conflicts with our pending actions. */
@@ -1031,7 +1044,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * tail, so the slice stays right. No sealed segment can exist for such a write: every
 	 * whole-collection path refuses while one does ({@link SealedSegmentsError}).
 	 *
-	 * A head commit ({@link commitHead}, which marks {@link headCommitEntry} for its cycle) wrote the
+	 * A head commit ({@link commitHead}, which marks {@link headCommit} for its cycle) wrote the
 	 * HEAD sealed segment's actions, so its entry is consumed by removing that segment — the open
 	 * segment, which may have grown while the commit was on the network, is untouched. The sealed
 	 * segments behind the head are never touched by either arm.
@@ -1048,8 +1061,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * That reset is what turns `hasUnsyncedChanges()` false so the sync loop exits reporting the
 	 * success the writer is owed (the action IS durable). */
 	private consumeOwnEntry(entry: ActionEntry<Action<TAction>>): boolean {
-		if (this.headCommitEntry !== undefined) {
-			this.consumeHead(entry, this.headCommitEntry);
+		if (this.headCommit !== undefined) {
+			this.consumeHead(entry, this.headCommit.entryId);
 		} else {
 			this.segments.open = this.consumedFromOpen(entry);
 		}
@@ -1058,7 +1071,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Remove the head segment `entryId` because `entry`, its own committed log entry, made it
 	 * durable — the head arm of {@link consumeOwnEntry}. Bumps the segment version, so an outstanding
-	 * snapshot restores by replay rather than putting the committed segment back. */
+	 * snapshot restores by replay rather than putting the committed segment back, and reports the
+	 * dropped segment's tally through the cycle's hook ({@link reportCommittedHead}), as the handle's
+	 * `fold` does for an attempt that committed. */
 	private consumeHead(entry: ActionEntry<Action<TAction>>, entryId: EntryId): void {
 		const head = this.segments.head();
 		if (head === undefined || head.entryId !== entryId) {
@@ -1072,7 +1087,34 @@ export class Collection<TAction> implements ICollection<TAction> {
 				+ `${entry.actions.length} actions but head segment ${entryId} holds ${head.actions.length}; `
 				+ `consuming it would drop actions that were never committed`);
 		}
-		this.segments.drop(entryId);
+		this.reportCommittedHead(this.segments.drop(entryId));
+	}
+
+	/** Hand the tally recorded on `segment` — the head segment just made durable and dropped — to the
+	 * cycle's `onCommittedHead` hook ({@link HeadCommitOptions.onCommittedHead}), under the latch, from
+	 * the two places that drop a head segment as committed: the handle's `fold`, and
+	 * {@link consumeHead}. A segment with no recorded tally is a defect, answered with the zero tally
+	 * and logged rather than thrown: every sealed segment is staged by {@link buildHeadTracker} before
+	 * its first send and by a replay when put back ({@link restoreSealed}), and the resume path that
+	 * re-sends a recorded attempt verbatim runs after one of those. A throw out of the hook is logged,
+	 * never raised — the commit is already durable. */
+	private reportCommittedHead(segment: SealedSegment<TAction>): void {
+		let applied = segment.applied;
+		if (applied === undefined) {
+			log('collection:committed-head-tally-missing id=%s tag=%s entry=%s: the head segment was committed without a recorded staging',
+				this.id, this.instanceTag, segment.entryId);
+			applied = ZeroTally;
+		}
+		const hook = this.headCommit?.onCommitted;
+		if (hook === undefined) {
+			return;
+		}
+		try {
+			hook(applied);
+		} catch (err) {
+			log('collection:committed-head-callback-threw id=%s tag=%s entry=%s error=%s',
+				this.id, this.instanceTag, segment.entryId, err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	/** The open segment with the leading actions `entry` made durable dropped off it. */
@@ -2376,7 +2418,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
 		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, {
 			refuseSolo: options.refuseSoloCommit,
-			...(options.resume === undefined ? {} : { resume: options.resume })
+			...(options.resume === undefined ? {} : { resume: options.resume }),
+			...(options.onCommittedHead === undefined ? {} : { onCommittedHead: options.onCommittedHead }),
 		});
 		try {
 			return await driveHeadCommit(handle, options);
@@ -2392,7 +2435,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * holds until its `close()` except around the network round trip; checks the three
 	 * preconditions; marks the action in flight for the whole cycle ({@link beginInFlightAction}), as
 	 * a sync's is, so the refresh between attempts recognises the write's own entry; sets
-	 * {@link headCommitEntry}, which tells {@link consumeOwnEntry} that such an entry records the head
+	 * {@link headCommit}, which tells {@link consumeOwnEntry} that such an entry records the head
 	 * segment; and seeds the retained attempt with `options.resume` when one is given, so that the
 	 * opening refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) —
 	 * and `stage()` re-sends it verbatim while the next attempt would request its revision
@@ -2436,7 +2479,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * (`not-head`), carries a recorded refusal (`refused`), or a head commit is already in flight on
 	 * this instance (`in-flight`). */
 	async openHeadCommit(entryId: EntryId, identity: WriteIdentity, options: OpenHeadCommitOptions = {}): Promise<HeadCommitHandle> {
-		const { resume, ...cycle } = options;
+		const { resume, onCommittedHead, ...cycle } = options;
 		if (resume !== undefined && resume.actionId !== identity.actionId) {
 			throw new Error(`Collection ${this.id}: an attempt recorded under action ${resume.actionId} cannot resume `
 				+ `a head commit of ${entryId} under action ${identity.actionId}`);
@@ -2449,7 +2492,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			throw err;
 		}
 		const endInFlight = this.beginInFlightAction(identity.actionId, cycle);
-		this.headCommitEntry = entryId;
+		this.headCommit = { entryId, ...(onCommittedHead === undefined ? {} : { onCommitted: onCommittedHead }) };
 		if (resume !== undefined) {
 			this.retainInFlightAttempt(resume);
 		}
@@ -2522,8 +2565,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 			},
 			fold: (staged) => {
 				assertUsable('fold', true);
-				this.segments.drop(this.headSegment(entryId).entryId);
+				const dropped = this.segments.drop(this.headSegment(entryId).entryId);
 				this.foldOwnCommit(staged, identity.actionId);
+				this.reportCommittedHead(dropped);
 			},
 			replay: () => {
 				assertUsable('replay', true);
@@ -2542,7 +2586,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			close: () => {
 				if (closed) return;
 				closed = true;
-				this.headCommitEntry = undefined;
+				this.headCommit = undefined;
 				this.headInFlight = undefined;
 				endInFlight();
 				if (held) {
@@ -2621,7 +2665,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private async buildHeadTracker(segment: SealedSegment<TAction>): Promise<Tracker<IBlock>> {
 		const tracker = new Tracker<IBlock>(this.sourceCache, this.replayBaseline());
 		try {
-			await this.stageInto(tracker, ...segment.actions);
+			segment.applied = await this.stageInto(tracker, ...segment.actions);
 		} catch (err) {
 			if (err instanceof ActionRefusedError) {
 				// NOTE: the live tracker still holds this segment's effects from its last replay, which
@@ -2727,7 +2771,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * per-segment refusal). Any error that is not a refusal propagates from either.
 	 *
 	 * Each re-staged update pins its base through `Atomic.commit` → `Tracker.absorb`, the path
-	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on.
+	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on. Each
+	 * sealed segment that staged records what its actions accepted as already applied
+	 * (`SealedSegment.applied`), the tally the head commit reports when the segment is committed.
 	 *
 	 * @param unreported - a segment whose refusal is recorded but NOT reported through
 	 * `onSealedRefused`: the one {@link restoreSealed} is inserting, whose caller reads the recorded
@@ -2736,7 +2782,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.tracker.reset(this.replayBaseline());
 		for (const segment of this.segments.replayable()) {
 			try {
-				await this.internalTransact(...segment.actions);
+				segment.applied = await this.internalTransact(...segment.actions);
 			} catch (err) {
 				if (!(err instanceof ActionRefusedError)) {
 					throw err;

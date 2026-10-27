@@ -6,7 +6,10 @@
  * layer's pre-stage probe otherwise discards: `absent` (INSERT — the key must not
  * exist), `keepExisting` (INSERT OR IGNORE — skip silently if it does), `absentRange`
  * (secondary-UNIQUE — nothing foreign inside a key prefix range) and `unchanged` (the
- * lost-update check — the entry at the key must still be exactly the one this write read).
+ * lost-update check — the entry at the key must still be exactly the one this write read),
+ * plus the three already-applied variants (`absentOrEqual`, `unchangedOrEqual`,
+ * `unchangedOrAbsent`; ticket `offline-sync-already-applied-guards-in-db-core`), which accept
+ * a change a rival already made instead of refusing it.
  * The `replace` handler enforces the guard on EVERY run — initial staging and every
  * conflict replay — so a losing concurrent writer is REFUSED instead of silently
  * overwriting the winner's committed row when its pending action replays against the
@@ -28,6 +31,7 @@ import {
 	TreeGuardRefusedError,
 	TreeKeyTakenError,
 	TreeRangeTakenError,
+	TreeUpsertGuardKindError,
 	KeyRange,
 	TransactionCoordinator,
 	createTransactionStamp,
@@ -37,8 +41,9 @@ import {
 	type Transaction,
 	type BlockId,
 	type ITransactor,
-	type TreeEntryGuard,
+	type AlreadyAppliedTally,
 	type TreeReplaceAction,
+	type TreeUpsertGuard,
 } from '../src/index.js';
 import {
 	TestTransactor,
@@ -78,6 +83,7 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 				'c', 1, { first: { key: 0, inclusive: true }, isAscending: true }, 2);
 			const changed = new TreeEntryChangedError<number, Entry>('c', 1, { key: 1, name: 'x' }, undefined);
 			const malformed = new TreeDeleteGuardKindError<number>('c', 1, 'absent');
+			const malformedUpsert = new TreeUpsertGuardKindError<number>('c', 1, 'unchangedOrAbsent');
 
 			// Every concurrency refusal shares the base contract (discard the action, never retry).
 			for (const err of [taken, range, changed]) {
@@ -91,8 +97,10 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			expect(changed).to.not.be.instanceOf(TreeKeyTakenError);
 			expect(taken).to.not.be.instanceOf(TreeEntryChangedError);
 			// A malformed action is a caller bug, not a refusal anything should retry or map.
-			expect(malformed).to.not.be.instanceOf(TreeGuardRefusedError);
-			expect(malformed).to.be.instanceOf(Error);
+			for (const err of [malformed, malformedUpsert]) {
+				expect(err, `${err.name} is not a guard refusal`).to.not.be.instanceOf(TreeGuardRefusedError);
+				expect(err).to.be.instanceOf(Error);
+			}
 		});
 	});
 
@@ -441,8 +449,8 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 		it('compares a guard that round-tripped through JSON exactly like a live one', async () => {
 			// A guard rides in the log beside its action, so by the time a conflict replay reads it
 			// back it is plain deserialized data — a different object graph than the one staged.
-			const roundTrip = (guard: TreeEntryGuard<number, Entry>) =>
-				JSON.parse(JSON.stringify(guard)) as TreeEntryGuard<number, Entry>;
+			const roundTrip = (guard: TreeUpsertGuard<number, Entry>) =>
+				JSON.parse(JSON.stringify(guard)) as TreeUpsertGuard<number, Entry>;
 
 			const transactor = new TestTransactor();
 			await seedOriginal(transactor);
@@ -503,7 +511,7 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			expect(err).to.be.instanceOf(TreeDeleteGuardKindError);
 			expect(err, 'a malformed action is not a guard refusal').to.not.be.instanceOf(TreeGuardRefusedError);
 			expect((err as TreeDeleteGuardKindError<number>).guardKind).to.equal('absent');
-			expect((err as Error).message).to.match(/only 'unchanged' is meaningful on a delete/);
+			expect((err as Error).message).to.match(/only 'unchanged' and 'unchangedOrAbsent' are meaningful on a delete/);
 			expect(tree.hasUnsyncedChanges(), 'the rejected action left nothing staged').to.be.false;
 		});
 
@@ -548,6 +556,246 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			const fresh = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
 			expect(await fresh.get(1), 'the null entry slot still means delete').to.be.undefined;
 			expect(await fresh.get(2), 'the null guard slot still means unguarded upsert').to.deep.equal({ key: 2, name: 'updated' });
+		});
+	});
+
+	// The three already-applied variants (docs/offline-sync.md §Guards that make idempotent writes
+	// assured). Each has the outcome its base kind lacks: the element is SKIPPED because a rival already
+	// made exactly its change. Over a raw tree a skip and a write end in the same state, so which
+	// outcome an element met is observable only through the tally the handler returns — which reaches
+	// a head commit's `onCommittedHead` hook, the path the offline queue reads it on. So each accepting
+	// case stages, seals and commits the head segment and reads the tally off that hook; each refusing
+	// case syncs and reads the error.
+	describe('already-applied variants (absentOrEqual, unchangedOrEqual, unchangedOrAbsent)', () => {
+		const original: Entry = { key: 1, name: 'original' };
+		const done: Entry = { key: 1, name: 'done' };
+		const rivalRow: Entry = { key: 1, name: 'rival' };
+		const absentOrEqual = { kind: 'absentOrEqual' as const };
+		const unchangedOrEqual = (expected: Entry) => ({ kind: 'unchangedOrEqual' as const, expected });
+		const unchangedOrAbsent = (expected: Entry) => ({ kind: 'unchangedOrAbsent' as const, expected });
+		const APPLIED: AlreadyAppliedTally = { alreadyApplied: 0, applied: 1 };
+		const ALREADY_APPLIED: AlreadyAppliedTally = { alreadyApplied: 1, applied: 0 };
+
+		/** A writer handle opened over a collection that already holds key 0 and `seeded`, so a tree
+		 *  whose only data row is deleted still exists in storage. */
+		async function openWriter(transactor: ITransactor, seeded: TreeReplaceAction<number, Entry>): Promise<Tree<number, Entry>> {
+			const seeder = await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+			await seeder.replace([[0, { key: 0, name: 'seed' }], ...seeded]);
+			return Tree.createOrOpen<number, Entry>(transactor, 'users', byKey);
+		}
+
+		/** Seal what `tree` has staged as one head segment and commit it, answering the tally the
+		 *  collection reported for it through `onCommittedHead`. */
+		async function commitAsHead(tree: Tree<number, Entry>): Promise<AlreadyAppliedTally> {
+			const collection = tree.getCollection();
+			expect(collection.sealPending('E'), 'something was staged').to.equal(true);
+			const reported: AlreadyAppliedTally[] = [];
+			await collection.commitHead('E', { actionId: 'E-action', timestamp: Date.now(), onCommittedHead: applied => { reported.push(applied); } });
+			expect(reported, 'the head commit reported its tally exactly once').to.have.length(1);
+			return reported[0]!;
+		}
+
+		const rival = (transactor: ITransactor, entries: TreeReplaceAction<number, Entry>) =>
+			commitRivalTreeWrite<number, Entry>(transactor, 'users', byKey, entries);
+		const committedAt = async (transactor: ITransactor, key: number) =>
+			(await Tree.createOrOpen<number, Entry>(transactor, 'users', byKey)).get(key);
+
+		describe('absentOrEqual (upsert)', () => {
+			it('writes when the key is absent, counting the element applied', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, []);
+				await writer.stage([[1, original, absentOrEqual]]);
+				expect(await commitAsHead(writer)).to.deep.equal(APPLIED);
+				expect(await committedAt(transactor, 1)).to.deep.equal(original);
+			});
+
+			it('skips, as already applied, when a rival committed an equal entry first', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, []);
+				await writer.stage([[1, original, absentOrEqual]]);
+				await rival(transactor, [[1, { ...original }]]);
+				expect(await commitAsHead(writer)).to.deep.equal(ALREADY_APPLIED);
+				expect(await committedAt(transactor, 1)).to.deep.equal(original);
+			});
+
+			it('refuses a different entry at the key with TreeKeyTakenError, as absent does', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, []);
+				await writer.stage([[1, original, absentOrEqual]]);
+				await rival(transactor, [[1, rivalRow]]);
+				const err = await capture(() => writer.sync());
+				expect(err).to.be.instanceOf(TreeKeyTakenError);
+				expect(err, 'a uniqueness refusal, not a lost update').to.not.be.instanceOf(TreeEntryChangedError);
+				expect(await committedAt(transactor, 1), 'the rival\'s row is the durable one').to.deep.equal(rivalRow);
+			});
+		});
+
+		describe('unchangedOrEqual (upsert)', () => {
+			it('writes while the entry is still the one that was read, counting the element applied', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, done, unchangedOrEqual(original)]]);
+				expect(await commitAsHead(writer)).to.deep.equal(APPLIED);
+				expect(await committedAt(transactor, 1)).to.deep.equal(done);
+			});
+
+			it('skips, as already applied, when a rival already wrote this element\'s entry', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, done, unchangedOrEqual(original)]]);
+				await rival(transactor, [[1, { ...done }]]);
+				expect(await commitAsHead(writer)).to.deep.equal(ALREADY_APPLIED);
+				expect(await committedAt(transactor, 1)).to.deep.equal(done);
+			});
+
+			it('writes a no-op update whose expected equals its entry, counting it applied (expected is checked first)', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, { ...original }, unchangedOrEqual(original)]]);
+				expect(await commitAsHead(writer)).to.deep.equal(APPLIED);
+				expect(await committedAt(transactor, 1)).to.deep.equal(original);
+			});
+
+			it('refuses when a rival deleted the row: absent is still changed for every upsert kind', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, done, unchangedOrEqual(original)]]);
+				await rival(transactor, [[1, undefined]]);
+				const err = await capture(() => writer.sync());
+				expect(err).to.be.instanceOf(TreeEntryChangedError);
+				expect((err as TreeEntryChangedError<number, Entry>).actual).to.equal(undefined);
+				expect(await committedAt(transactor, 1), 'the deleted row stays deleted').to.equal(undefined);
+			});
+
+			it('refuses any other entry at the key', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, done, unchangedOrEqual(original)]]);
+				await rival(transactor, [[1, rivalRow]]);
+				const err = await capture(() => writer.sync());
+				expect(err).to.be.instanceOf(TreeEntryChangedError);
+				expect((err as TreeEntryChangedError<number, Entry>).actual).to.deep.equal(rivalRow);
+				expect(await committedAt(transactor, 1)).to.deep.equal(rivalRow);
+			});
+		});
+
+		describe('unchangedOrAbsent (delete)', () => {
+			it('deletes while the entry is still the one that was read, counting the element applied', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, undefined, unchangedOrAbsent(original)]]);
+				expect(await commitAsHead(writer)).to.deep.equal(APPLIED);
+				expect(await committedAt(transactor, 1)).to.equal(undefined);
+			});
+
+			it('skips, as already applied, when a rival already deleted the row', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, undefined, unchangedOrAbsent(original)]]);
+				await rival(transactor, [[1, undefined]]);
+				expect(await commitAsHead(writer)).to.deep.equal(ALREADY_APPLIED);
+				expect(await committedAt(transactor, 1)).to.equal(undefined);
+			});
+
+			it('refuses when a rival changed the row instead of deleting it', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([[1, undefined, unchangedOrAbsent(original)]]);
+				await rival(transactor, [[1, rivalRow]]);
+				const err = await capture(() => writer.sync());
+				expect(err).to.be.instanceOf(TreeEntryChangedError);
+				expect((err as TreeEntryChangedError<number, Entry>).actual).to.deep.equal(rivalRow);
+				expect(await committedAt(transactor, 1), 'the rival\'s change is not deleted out from under it').to.deep.equal(rivalRow);
+			});
+		});
+
+		describe('two writes of one key in one entry (insert absentOrEqual, then update unchangedOrEqual)', () => {
+			it('a rival inserted the equal row: the insert skips, the update finds its expected image and writes — tally {1, 1}', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, []);
+				await writer.stage([
+					[1, original, absentOrEqual],
+					[1, done, unchangedOrEqual(original)],
+				]);
+				await rival(transactor, [[1, { ...original }]]);
+				expect(await commitAsHead(writer)).to.deep.equal({ alreadyApplied: 1, applied: 1 });
+				expect(await committedAt(transactor, 1)).to.deep.equal(done);
+			});
+
+			it('a rival inserted the row AND made the same update: the insert meets the post-image, which absentOrEqual cannot accept, so the entry is refused', async () => {
+				// The ticket expected this entry to commit with tally {2, 0} (the insert skips, the update
+				// finds its own entry and skips). That is unreachable with the kinds as specified:
+				// `absentOrEqual` compares the present entry against the ELEMENT's own entry — the
+				// pre-update image — and the rival's final row is the post-image, which it refuses as a
+				// taken key. Pinned so the plugin ticket meets the gap here, not in a failed drain: an entry
+				// that inserts and then updates one key has to be staged as one element (the final image,
+				// guarded `absentOrEqual`) to be accepted as already applied.
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, []);
+				await writer.stage([
+					[1, original, absentOrEqual],
+					[1, done, unchangedOrEqual(original)],
+				]);
+				await rival(transactor, [[1, { ...done }]]);
+				const err = await capture(() => writer.sync());
+				expect(err).to.be.instanceOf(TreeKeyTakenError);
+				expect(await committedAt(transactor, 1)).to.deep.equal(done);
+			});
+		});
+
+		describe('a kind on the wrong element is a malformed action, not a refusal', () => {
+			it('a delete carrying an upsert-only kind throws TreeDeleteGuardKindError, for a live action and for the JSON-replayed [key, null, guard] shape alike', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+
+				// @ts-expect-error - 'absentOrEqual' is not a TreeDeleteGuard
+				const live: TreeReplaceAction<number, Entry> = [[1, undefined, absentOrEqual]];
+				const liveErr = await capture(() => writer.stage(live));
+				expect(liveErr).to.be.instanceOf(TreeDeleteGuardKindError);
+				expect((liveErr as TreeDeleteGuardKindError<number>).guardKind).to.equal('absentOrEqual');
+
+				// A replayed log entry arrives with `null` in the entry slot, and must reach the same check.
+				const replayed = JSON.parse(JSON.stringify([[1, undefined, unchangedOrEqual(original)]])) as TreeReplaceAction<number, Entry>;
+				expect(replayed[0]![1], 'JSON really does produce null in the entry slot').to.be.null;
+				const replayedErr = await capture(() => writer.stage(replayed));
+				expect(replayedErr).to.be.instanceOf(TreeDeleteGuardKindError);
+				expect((replayedErr as TreeDeleteGuardKindError<number>).guardKind).to.equal('unchangedOrEqual');
+				expect(replayedErr, 'a malformed action is not a guard refusal').to.not.be.instanceOf(TreeGuardRefusedError);
+				expect(writer.hasUnsyncedChanges(), 'the rejected actions left nothing staged').to.be.false;
+			});
+
+			it('an upsert carrying the delete-only kind throws TreeUpsertGuardKindError', async () => {
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				// @ts-expect-error - 'unchangedOrAbsent' is not a TreeUpsertGuard
+				const illTyped: TreeReplaceAction<number, Entry> = [[1, done, unchangedOrAbsent(original)]];
+				const err = await capture(() => writer.stage(illTyped));
+				expect(err).to.be.instanceOf(TreeUpsertGuardKindError);
+				expect(err, 'a malformed action is not a guard refusal').to.not.be.instanceOf(TreeGuardRefusedError);
+				expect((err as TreeUpsertGuardKindError<number>).guardKind).to.equal('unchangedOrAbsent');
+				expect((err as Error).message).to.match(/meaningful only on a delete/);
+				expect(writer.hasUnsyncedChanges(), 'the rejected action left nothing staged').to.be.false;
+				expect(await writer.get(1), 'and the row is untouched').to.deep.equal(original);
+			});
+		});
+
+		it('compares guards that round-tripped through JSON like live ones: the two kinds with an expected keep it, absentOrEqual has no payload', async () => {
+			const roundTripped = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
+			const two: Entry = { key: 2, name: 'two' };
+			const three: Entry = { key: 3, name: 'three' };
+			const transactor = new TestTransactor();
+			const writer = await openWriter(transactor, [[1, original], [2, two]]);
+			await writer.stage([
+				[1, done, roundTripped(unchangedOrEqual(original))],
+				[2, undefined, roundTripped(unchangedOrAbsent(two))],
+				[3, three, roundTripped(absentOrEqual)],
+			]);
+			// The rival makes every one of the three changes first.
+			await rival(transactor, [[1, { ...done }], [2, undefined], [3, { ...three }]]);
+			expect(await commitAsHead(writer), 'every element was already applied').to.deep.equal({ alreadyApplied: 3, applied: 0 });
+			expect(await committedAt(transactor, 1)).to.deep.equal(done);
+			expect(await committedAt(transactor, 2)).to.equal(undefined);
+			expect(await committedAt(transactor, 3)).to.deep.equal(three);
 		});
 	});
 

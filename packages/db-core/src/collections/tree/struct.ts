@@ -40,6 +40,9 @@ export const rootId$ = nameof<TreeCollectionHeaderBlock>("rootId");
  *   re-stage of a present key (a replay after a clean refresh) would refuse itself.
  * - `unchanged` — see {@link TreeUnchangedGuard}: the only kind that says something must
  *   still BE here, rather than that nothing may be.
+ * - `absentOrEqual`, `unchangedOrEqual`, `unchangedOrAbsent` — the three ALREADY-APPLIED variants
+ *   (see {@link TreeAlreadyAppliedGuard}): each accepts, and SKIPS the element, where a rival has
+ *   already made exactly the change this element makes, instead of refusing it.
  *
  * MIXED VERSIONS: a peer running a build that predates guards destructures `[key, entry]`
  * and ignores the third slot — its replays revert to today's silent overwrite. No version
@@ -49,7 +52,52 @@ export type TreeEntryGuard<TKey, TEntry = unknown> =
 	| { kind: 'absent' }
 	| { kind: 'keepExisting' }
 	| { kind: 'absentRange', range: KeyRange<TKey> }
-	| TreeUnchangedGuard<TEntry>;
+	| TreeUnchangedGuard<TEntry>
+	| TreeAlreadyAppliedGuard<TEntry>;
+
+/**
+ * The three guard kinds that accept a row another writer already changed the same way, for the
+ * offline-sync queue's rebase of a queued entry (docs/offline-sync.md §Guards that make idempotent
+ * writes assured). Every guard above refuses when the row is not as the staged write found it, which
+ * includes the rival that made exactly the change this write makes: two machines marking one task
+ * done, two machines deleting one row. Each variant below has three outcomes, where its base kind has
+ * two — it ACCEPTS AND WRITES as the base kind does, it ACCEPTS AS ALREADY APPLIED and skips the
+ * element (the final state is the one the write intended), or it REFUSES with the base kind's error:
+ *
+ * | Kind | Element | Writes when | Skips as already applied when | Refuses with |
+ * |---|---|---|---|---|
+ * | `absentOrEqual` | upsert | the key is absent | the present entry equals the element's own `entry` | {@link TreeKeyTakenError}, as `absent` does |
+ * | `unchangedOrEqual` | upsert | the present entry equals `expected` | the present entry equals the element's own `entry` (checked second, so a no-op update whose `expected` equals its `entry` writes) | {@link TreeEntryChangedError} on absent or any other entry |
+ * | `unchangedOrAbsent` | delete | the present entry equals `expected` | the key is absent | {@link TreeEntryChangedError} on any other entry |
+ *
+ * "Equals" is `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts`, the
+ * comparison `unchanged` uses, with the same JSON caveats {@link TreeUnchangedGuard} states. The
+ * post-image an upsert variant compares against is the element's own `entry`, not a second copy on
+ * the guard: the element already carries it, so the guard stays the size its base kind is.
+ *
+ * Kinds and elements: `unchangedOrAbsent` is meaningful only on a delete (on an upsert it would mean
+ * "resurrect the row"), and the two `…OrEqual` kinds only on an upsert (a delete has no `entry` to
+ * compare, and would be a no-op by construction). The handler narrows both ways at runtime: a delete
+ * carrying an upsert-only kind throws {@link TreeDeleteGuardKindError}, an upsert carrying the
+ * delete-only kind {@link TreeUpsertGuardKindError} — malformed actions, outside the refusal
+ * hierarchy, never ignored.
+ *
+ * Whether an element accepted as already applied changed anything is reported out of the handler
+ * as an `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`), which the offline queue
+ * folds into the `effect` of its `committed` status.
+ */
+export type TreeAlreadyAppliedGuard<TEntry = unknown> =
+	| { kind: 'absentOrEqual' }
+	| { kind: 'unchangedOrEqual', /** The entry image the staged write read, as stored. */ expected: TEntry }
+	| { kind: 'unchangedOrAbsent', /** The entry image the staged delete read, as stored. */ expected: TEntry };
+
+/** The kinds a {@link TreeUpsertElement} may carry: every kind but the delete-only
+ * `unchangedOrAbsent`. */
+export type TreeUpsertGuard<TKey, TEntry = unknown> = Exclude<TreeEntryGuard<TKey, TEntry>, { kind: 'unchangedOrAbsent' }>;
+
+/** The kinds a {@link TreeDeleteElement} may carry: the two that say something must still BE at the
+ * key — `unchanged`, and `unchangedOrAbsent`, which also accepts the key already gone. */
+export type TreeDeleteGuard<TEntry = unknown> = TreeUnchangedGuard<TEntry> | Extract<TreeAlreadyAppliedGuard<TEntry>, { kind: 'unchangedOrAbsent' }>;
 
 /**
  * "The entry I am replacing must still be exactly the one I read" — the optimistic-concurrency
@@ -62,8 +110,9 @@ export type TreeEntryGuard<TKey, TEntry = unknown> =
  * exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and
  * a delete would be the second of two racing deletes. Refusing both is the optimistic answer —
  * the writer read a row that is now gone, and an application-level retry then affects zero rows
- * sequentially. If tolerating absence on deletes is ever genuinely wanted, add a separate
- * `unchangedOrAbsent` kind rather than weakening this one's contract.
+ * sequentially. A delete that means "gone either way" carries `unchangedOrAbsent` instead, and an
+ * upsert that means "equal either way" carries `unchangedOrEqual` ({@link TreeAlreadyAppliedGuard});
+ * this kind's contract is not weakened for them.
  *
  * `expected` is the entry AS STORED, not a digest: a guard rides in the log beside its action
  * under the same encoding entries already use, so a full copy round-trips by construction and no
@@ -81,8 +130,8 @@ export type TreeUnchangedGuard<TEntry = unknown> = {
 	expected: TEntry,
 };
 
-/** An element that writes (inserts or replaces) an entry. Any {@link TreeEntryGuard} kind is
- *  meaningful here. */
+/** An element that writes (inserts or replaces) an entry. Every {@link TreeEntryGuard} kind but the
+ *  delete-only `unchangedOrAbsent` is meaningful here ({@link TreeUpsertGuard}). */
 export type TreeUpsertElement<TKey, TEntry> = [
 	// The key to write at
 	key: TKey,
@@ -91,20 +140,22 @@ export type TreeUpsertElement<TKey, TEntry> = [
 	// Optional intent, re-checked on every handler run (see TreeEntryGuard). Absent = plain
 	// upsert, so existing callers and previously committed log entries deserialize and replay
 	// unchanged.
-	guard?: TreeEntryGuard<TKey, TEntry>,
+	guard?: TreeUpsertGuard<TKey, TEntry>,
 ];
 
-/** An element that deletes the entry at a key. Only {@link TreeUnchangedGuard} says anything a
- *  delete can act on — the other kinds all assert that nothing is present, which would make the
- *  delete a no-op by construction. The handler rejects any other kind at runtime too, since a
- *  replayed log entry is deserialized data that this type never policed. */
+/** An element that deletes the entry at a key. Only the two kinds that say something must still BE
+ *  at the key say anything a delete can act on ({@link TreeDeleteGuard}) — the other kinds all assert
+ *  that nothing is present, which would make the delete a no-op by construction. The handler rejects
+ *  any other kind at runtime too, since a replayed log entry is deserialized data that this type
+ *  never policed. */
 export type TreeDeleteElement<TKey, TEntry> = [
 	// The key to delete
 	key: TKey,
 	// Always empty: the absent entry is what marks this element a delete
 	entry?: undefined,
 	// Optional lost-update guard: refuse the delete unless the entry is still the one that was read
-	guard?: TreeUnchangedGuard<TEntry>,
+	// (`unchanged`), or unless it is either that or already gone (`unchangedOrAbsent`)
+	guard?: TreeDeleteGuard<TEntry>,
 ];
 
 /** Represents a unit of change to a tree collection. */
@@ -232,7 +283,8 @@ export class TreeEntryChangedError<TKey = unknown, TEntry = unknown> extends Tre
  * present, which would make the delete a no-op by construction, so this is a malformed action —
  * a caller bug, or a log entry written by a build whose element types disagree with this one.
  * The handler raises it rather than ignoring the guard (the pre-guard behaviour) so a writer
- * never believes an unenforceable guard is being enforced.
+ * never believes an unenforceable guard is being enforced. {@link TreeUpsertGuardKindError} is the
+ * upsert side of the same check.
  */
 export class TreeDeleteGuardKindError<TKey = unknown> extends Error {
 	constructor(
@@ -240,12 +292,34 @@ export class TreeDeleteGuardKindError<TKey = unknown> extends Error {
 		public readonly collectionId: CollectionId,
 		/** The key the malformed delete named. */
 		public readonly key: TKey,
-		/** The `kind` that was carried; only `'unchanged'` is meaningful on a delete. */
+		/** The `kind` that was carried; only `'unchanged'` and `'unchangedOrAbsent'` are meaningful on
+		 * a delete. */
 		public readonly guardKind: string,
 	) {
 		super(`Tree collection ${collectionId}: the delete of key ${renderKey(key)} carries a `
-			+ `'${guardKind}' guard; only 'unchanged' is meaningful on a delete`);
+			+ `'${guardKind}' guard; only 'unchanged' and 'unchangedOrAbsent' are meaningful on a delete`);
 		this.name = 'TreeDeleteGuardKindError';
+	}
+}
+
+/**
+ * An UPSERT element carries the delete-only guard kind, `unchangedOrAbsent`: on an upsert it would
+ * mean "write the row whether or not a rival deleted it", which resurrects a row the staged write
+ * never meant to and so is a malformed action, not a concurrency refusal — the mirror of
+ * {@link TreeDeleteGuardKindError}, and like it deliberately not a {@link TreeGuardRefusedError}.
+ */
+export class TreeUpsertGuardKindError<TKey = unknown> extends Error {
+	constructor(
+		/** The collection whose tree rejected the element. */
+		public readonly collectionId: CollectionId,
+		/** The key the malformed upsert named. */
+		public readonly key: TKey,
+		/** The `kind` that was carried. */
+		public readonly guardKind: string,
+	) {
+		super(`Tree collection ${collectionId}: the upsert of key ${renderKey(key)} carries a `
+			+ `'${guardKind}' guard, which is meaningful only on a delete`);
+		this.name = 'TreeUpsertGuardKindError';
 	}
 }
 

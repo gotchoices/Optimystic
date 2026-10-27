@@ -6,7 +6,7 @@
  * of indexed column values.
  */
 
-import type { Tree, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Tree, TreeReadView, TreeUpsertGuard } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
@@ -228,7 +228,7 @@ export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
  * proves the value clear in this writer's own snapshot. The exact-key `absent` guard
  * cannot express this: the two rows sit at different tree keys inside one prefix.
  */
-export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey, IndexEntry> {
+export function uniquePrefixGuard(indexKey: IndexKey): TreeUpsertGuard<IndexKey, IndexEntry> {
 	return { kind: 'absentRange', range: indexValueRange(indexKey) };
 }
 
@@ -487,7 +487,7 @@ export class IndexManager {
 		index: StoredIndexSchema,
 		indexKey: IndexKey,
 		uniqueIndexes: ReadonlySet<string> | undefined,
-	): TreeEntryGuard<IndexKey, IndexEntry> | undefined {
+	): TreeUpsertGuard<IndexKey, IndexEntry> | undefined {
 		return uniqueIndexes?.has(index.name) ? uniquePrefixGuard(indexKey) : undefined;
 	}
 

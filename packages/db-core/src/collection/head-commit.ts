@@ -64,7 +64,8 @@ export interface HeadCommitHandle {
 	retake(): Promise<void>;
 	/** A committed attempt's local treatment, first half, synchronous: remove the head segment
 	 * (asserted still first), bump the segment version, fold the attempt's transforms into the
-	 * cache and adopt its revision (`Collection.foldOwnCommit`). */
+	 * cache and adopt its revision (`Collection.foldOwnCommit`), and hand the dropped segment's
+	 * recorded tally to the cycle's `onCommittedHead` hook (`HeadCommitOptions.onCommittedHead`). */
 	fold(staged: StagedAttempt): void;
 	/** Second half: replay the remaining sealed segments and the open segment over the committed
 	 * state that now holds the head. Always after {@link fold} — the order `Collection.updateInternal`

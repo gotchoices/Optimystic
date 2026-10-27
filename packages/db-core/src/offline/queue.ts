@@ -4,6 +4,7 @@ import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import { ActionRefusedError, SealedSegmentsError } from '../collection/struct.js';
 import type { CollectionId, InFlightAttempt, SyncOptions } from '../collection/struct.js';
+import type { AlreadyAppliedTally } from '../collection/action.js';
 import type { ITransactor } from '../transactor/transactor.js';
 import { TransactionCoordinator } from '../transaction/coordinator.js';
 import { classifyCommitFailure, refusalReason } from '../transaction/commit-failure-class.js';
@@ -23,7 +24,7 @@ import {
 } from './status.js';
 import type { EntryStatus, EntryWaitingFor, OfflineQueueState, QueuedEntry, QueuedFailureReason } from './status.js';
 import type { IOfflineJournal, JournalDriveState, JournalEntryRecord, JournalSettledStatus } from './journal.js';
-import { committedField, currentStatus, driveState, queuedStatus, queuedStatusChanged, snapshot } from './entry.js';
+import { committedField, currentStatus, driveState, effectOf, queuedStatus, queuedStatusChanged, snapshot } from './entry.js';
 import type { Entry } from './entry.js';
 import { DrainWaker } from './wake.js';
 
@@ -311,6 +312,7 @@ export class OfflineQueue {
 			inDoubt: false,
 			retained: new Map(),
 			committed: new Map(),
+			applied: new Map(),
 			phase: 'queued',
 			waitingFor: this.list.length > 0 ? 'earlier-entry' : undefined,
 			lastError: undefined,
@@ -717,10 +719,12 @@ export class OfflineQueue {
 	 * slice over several — built on the transactor the remaining collections share, since a queue
 	 * holds collections of whatever transactor each was opened on — each under the entry's action id
 	 * and local commit time, resuming from the attempts retained under that id, and — unless the queue
-	 * allows it — refusing to be committed by a lone node that knows it is not alone. */
+	 * allows it — refusing to be committed by a lone node that knows it is not alone. Each committed
+	 * head segment's tally reaches {@link recordApplied} through the `onCommittedHead` hook. */
 	private async send(entry: Entry, remaining: readonly Collection<any>[], signal: AbortSignal): Promise<TransactionDurability> {
 		const submit: SyncOptions = { ...this.submitOptions, signal, ...(this.refuseSoloCommit ? { refuseSoloCommit: true } : {}) };
 		const recordAttempt = (attempts: ReadonlyMap<CollectionId, InFlightAttempt>) => this.recordAttempts(entry, attempts);
+		const onCommittedHead = (collectionId: CollectionId, applied: AlreadyAppliedTally) => this.recordApplied(entry, collectionId, applied);
 		if (remaining.length === 1) {
 			const collection = remaining[0]!;
 			const resume = entry.retained.get(collection.id);
@@ -729,6 +733,7 @@ export class OfflineQueue {
 				actionId: entry.actionId,
 				timestamp: entry.queuedAt,
 				recordAttempt: attempt => recordAttempt(new Map([[collection.id, attempt]])),
+				onCommittedHead: applied => onCommittedHead(collection.id, applied),
 				...(resume === undefined ? {} : { resume }),
 			});
 			return transactionDurability(new Map([[collection.id, written]]));
@@ -742,8 +747,17 @@ export class OfflineQueue {
 			timestamp: entry.queuedAt,
 			collectionIds: remaining.map(collection => collection.id),
 			recordAttempt,
+			onCommittedHead,
 			...(resume.size === 0 ? {} : { resume }),
 		}, submit);
+	}
+
+	/** The `onCommittedHead` hook's closure: record what `collectionId`'s head segment accepted as
+	 * already applied, for the entry's `effect` (`effectOf`). Runs under the collection latch, so it
+	 * records and nothing else. One segment per collection per entry is dropped as committed exactly
+	 * once, so this is a set, not a sum. */
+	private recordApplied(entry: Entry, collectionId: CollectionId, applied: AlreadyAppliedTally): void {
+		entry.applied.set(collectionId, applied);
 	}
 
 	/** The queue's write-ahead wrapper: the one moment before a send the queue is told about. The
@@ -781,7 +795,12 @@ export class OfflineQueue {
 		this.pendingRefusals.delete(entry.id);
 		entry.retained.clear();
 		entry.inDoubt = false;
-		const status: JournalSettledStatus = { kind: 'committed', entryId: entry.id, durability: entryDurability(entry, written) };
+		const status: JournalSettledStatus = {
+			kind: 'committed',
+			entryId: entry.id,
+			durability: entryDurability(entry, written),
+			effect: effectOf(entry),
+		};
 		await this.journalSettled(status);
 		this.emit(status);
 		this.waker.resetBackoff();
@@ -1049,6 +1068,7 @@ export class OfflineQueue {
 			inDoubt: drive !== undefined && (drive.attempts.size > 0 || drive.committed.size > 0),
 			retained: new Map(drive?.attempts),
 			committed: new Map(drive?.committed),
+			applied: new Map(),
 			phase: 'queued',
 			waitingFor: undefined,
 			lastError: undefined,

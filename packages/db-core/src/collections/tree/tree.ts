@@ -4,28 +4,39 @@ import { BTree, type Path, type KeyRange } from "../../btree/index.js";
 import { CollectionTrunk } from "./collection-trunk.js";
 import { structuralEquals } from "../../utility/structural-equals.js";
 import { BLOCK_TARGET_BYTES } from "../../network/block-size.js";
+import { ZeroTally } from "../../collection/action.js";
+import type { AlreadyAppliedTally } from "../../collection/action.js";
 import {
 	TreeHeaderBlockType, TreeDeleteGuardKindError, TreeEntryChangedError, TreeKeyTakenError,
-	TreeRangeTakenError, type TreeEntryGuard, type TreeReplaceAction,
+	TreeRangeTakenError, TreeUpsertGuardKindError, type TreeEntryGuard, type TreeReplaceAction,
 } from "./struct.js";
+
+/** What a guard decided for its element: write it, skip it with no claim about equality
+ * (`keepExisting` found the key occupied), or skip it because a rival already made exactly this
+ * change — the already-applied acceptance a `TreeAlreadyAppliedGuard` kind makes, which is the one
+ * skip the handler counts (`alreadyApplied` on the {@link AlreadyAppliedTally}). */
+type GuardVerdict = 'proceed' | 'skip' | 'already-applied';
 
 /**
  * Enforce a guard carried by an UPSERT element against the CURRENT content of `actionTree` —
  * the same Atomic store the upsert writes to, so it sees what earlier elements of this same
  * replay already staged or deleted (an UPDATE's delete-old half runs before its guarded insert
- * half). Throws the guard's refusal, which discards the whole action's staged writes.
+ * half). Throws the guard's refusal, which discards the whole action's staged writes. `entry` is the
+ * element's own entry, the post-image the `…OrEqual` kinds compare against.
  *
  * @returns `'skip'` when the element must be left unwritten (`keepExisting` found the key
- * 	occupied — the INSERT OR IGNORE disposition), `'proceed'` otherwise.
+ * 	occupied — the INSERT OR IGNORE disposition), `'already-applied'` when an already-applied kind
+ * 	found the rival had made this change, `'proceed'` otherwise.
  */
 async function enforceUpsertGuard<TKey, TEntry>(
 	actionTree: BTree<TKey, TEntry>,
 	id: CollectionId,
 	key: TKey,
+	entry: TEntry,
 	guard: TreeEntryGuard<TKey, TEntry>,
 	keyFromEntry: (entry: TEntry) => TKey,
 	compare: (a: TKey, b: TKey) => number,
-): Promise<'proceed' | 'skip'> {
+): Promise<GuardVerdict> {
 	switch (guard.kind) {
 		case 'absentRange': {
 			// Secondary-UNIQUE: the claimed range (a unique index's framed value prefix) must hold
@@ -53,6 +64,79 @@ async function enforceUpsertGuard<TKey, TEntry>(
 			// keepExisting: leave the present (rival's) entry in place and skip this element.
 			return 'skip';
 		}
+		case 'absentOrEqual': {
+			const actual = actionTree.at(await actionTree.find(key));
+			if (actual === undefined) return 'proceed';
+			if (structuralEquals(actual, entry)) return 'already-applied';
+			throw new TreeKeyTakenError(id, key);
+		}
+		case 'unchangedOrEqual': {
+			const actual = actionTree.at(await actionTree.find(key));
+			// `expected` first: a no-op update (expected equals entry) writes and counts as applied.
+			if (actual !== undefined && structuralEquals(actual, guard.expected)) return 'proceed';
+			if (actual !== undefined && structuralEquals(actual, entry)) return 'already-applied';
+			throw new TreeEntryChangedError(id, key, guard.expected, actual);
+		}
+		case 'unchangedOrAbsent': {
+			throw new TreeUpsertGuardKindError(id, key, guard.kind);
+		}
+	}
+}
+
+/**
+ * Enforce a guard carried by a DELETE element against the entry found at its path. Throws the
+ * guard's refusal, or {@link TreeDeleteGuardKindError} for a kind no delete can act on — the element
+ * type already says so ({@link TreeDeleteElement}), but a replayed log entry is deserialized data
+ * that no type policed, so the handler re-checks rather than silently ignoring a guard the writer
+ * believed was being enforced.
+ *
+ * @returns `'already-applied'` when `unchangedOrAbsent` found the key already gone (nothing to
+ * 	delete), `'proceed'` otherwise.
+ */
+function enforceDeleteGuard<TKey, TEntry>(
+	id: CollectionId,
+	key: TKey,
+	guard: TreeEntryGuard<TKey, TEntry>,
+	actual: TEntry | undefined,
+): Exclude<GuardVerdict, 'skip'> {
+	switch (guard.kind) {
+		case 'unchanged': {
+			assertEntryUnchanged(id, key, guard.expected, actual);
+			return 'proceed';
+		}
+		case 'unchangedOrAbsent': {
+			if (actual === undefined) return 'already-applied';
+			assertEntryUnchanged(id, key, guard.expected, actual);
+			return 'proceed';
+		}
+		default: {
+			throw new TreeDeleteGuardKindError(id, key, guard.kind);
+		}
+	}
+}
+
+/** Whether `guard` is one of the three already-applied kinds, whose elements the handler's tally
+ * counts (see {@link AlreadyAppliedTally}). */
+function countsTowardTally<TKey, TEntry>(guard: TreeEntryGuard<TKey, TEntry>): boolean {
+	return guard.kind === 'absentOrEqual' || guard.kind === 'unchangedOrEqual' || guard.kind === 'unchangedOrAbsent';
+}
+
+/** A tally over one handler run, mutable while the run counts. */
+class TallyBuilder {
+	private alreadyApplied = 0;
+	private applied = 0;
+
+	/** Count `verdict` for an element carrying `guard`, when the guard is a counted kind. */
+	count<TKey, TEntry>(guard: TreeEntryGuard<TKey, TEntry>, verdict: GuardVerdict): void {
+		if (!countsTowardTally(guard)) return;
+		if (verdict === 'already-applied') this.alreadyApplied++;
+		else if (verdict === 'proceed') this.applied++;
+	}
+
+	result(): AlreadyAppliedTally {
+		return this.alreadyApplied === 0 && this.applied === 0
+			? ZeroTally
+			: { alreadyApplied: this.alreadyApplied, applied: this.applied };
 	}
 }
 
@@ -68,21 +152,6 @@ function assertEntryUnchanged<TKey, TEntry>(
 	if (actual === undefined || !structuralEquals(actual, expected)) {
 		throw new TreeEntryChangedError(id, key, expected, actual);
 	}
-}
-
-/** Narrow a DELETE element's guard to the only kind a delete can act on. The element type already
- *  says this ({@link TreeDeleteElement}), but a replayed log entry is deserialized data that no
- *  type policed, so the handler re-checks it and throws {@link TreeDeleteGuardKindError} rather
- *  than silently ignoring a guard the writer believed was being enforced. */
-function deleteGuardExpected<TKey, TEntry>(
-	id: CollectionId,
-	key: TKey,
-	guard: TreeEntryGuard<TKey, TEntry>,
-): TEntry {
-	if (guard.kind !== 'unchanged') {
-		throw new TreeDeleteGuardKindError(id, key, guard.kind);
-	}
-	return guard.expected;
 }
 
 /**
@@ -184,7 +253,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		return {
 			...options,
 			modules: {
-				"replace": async ({ data: actions }, trx) => {
+				"replace": async ({ data: actions }, trx): Promise<AlreadyAppliedTally> => {
 					// Write through the Atomic store the handler is handed (`trx`), NOT the captured
 					// read btree, so `internalTransact`'s all-or-nothing wrapper actually governs this
 					// action: if any entry throws, `atomic.commit()` is skipped and every staged node
@@ -199,6 +268,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 						nodeCapacity,	// keep the write btree's fan-out in lock-step with the read btree
 						BLOCK_TARGET_BYTES,	// and its node size rule: every node is a block that must stay copyable
 					);
+					const tally = new TallyBuilder();
 					for (const [key, entry, guard] of actions) {
 						// NOTE: an element is a DELETE when its entry slot is falsy, not when it is
 						// strictly `undefined`. That is deliberate and load-bearing: JSON encodes the
@@ -223,9 +293,10 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 							// slot above: an explicitly-passed `undefined` guard (the shape every unguarded
 							// index write stages) comes back from JSON as `null`, and reading `.kind` off it
 							// would throw a TypeError mid-replay instead of meaning "no guard".
-							if (guard
-								&& await enforceUpsertGuard(actionTree, id, key, guard, keyFromEntry, compare) === 'skip') {
-								continue;
+							if (guard) {
+								const verdict = await enforceUpsertGuard(actionTree, id, key, entry, guard, keyFromEntry, compare);
+								tally.count(guard, verdict);
+								if (verdict !== 'proceed') continue;
 							}
 							await actionTree.upsert(entry);
 						} else {
@@ -233,7 +304,9 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 							// consumes it, with no mutation in between to invalidate it.
 							const path = await actionTree.find(key);
 							if (guard) {
-								assertEntryUnchanged(id, key, deleteGuardExpected(id, key, guard), actionTree.at(path));
+								const verdict = enforceDeleteGuard(id, key, guard, actionTree.at(path));
+								tally.count(guard, verdict);
+								if (verdict === 'already-applied') continue;
 							}
 							await actionTree.deleteAt(path);
 						}
@@ -242,6 +315,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 					// Bump it to invalidate any Path a caller still holds — preserving the path-invalidation
 					// the previous in-place handler gave for free.
 					held.btree?.invalidatePaths();
+					return tally.result();
 				}
 			},
 			createHeaderBlock: (hid: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist

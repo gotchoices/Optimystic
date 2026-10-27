@@ -324,6 +324,7 @@ describe('OfflineQueue', function () {
 		const order = statuses.map(s => `${s.entryId}:${s.kind}`);
 		expect(order.indexOf('E1:committed'), 'E1 settles before E2 is sent').to.be.lessThan(order.indexOf('E2:submitting'));
 		expect([...committedOf(statuses, 'E1').durability.collections.keys()]).to.deep.equal([USERS]);
+		expect(committedOf(statuses, 'E1').effect, 'an entry with no already-applied element is applied').to.equal('applied');
 		const a1 = actionIdOf(recorded, 'E1', USERS);
 		const a2 = actionIdOf(recorded, 'E2', USERS);
 		expect(a1).to.not.equal(a2);
@@ -536,9 +537,13 @@ describe('OfflineQueue', function () {
 		await queue.dispose();
 	});
 
-	it('resolves an in-doubt entry without a crash: a torn first drive leaves it queued and in doubt, discard refuses it, a passed expiry is deferred, and the next drive resumes the recorded attempt and commits it once', async () => {
+	it('resolves an in-doubt entry without a crash: a torn first drive leaves it queued and in doubt, discard refuses it, a passed expiry is deferred, and the next drive resumes the recorded attempt and commits it once — reporting the tally the first drive recorded, so the effect is already-applied', async () => {
 		const inner = new TestTransactor();
 		await seed(inner, USERS);
+		// A rival has already made the change the entry's guarded element makes, so the element is
+		// accepted as already applied when the entry is staged; the plain insert beside it (not counted,
+		// carrying no guard) is what gives the attempt a block beyond the log tail for the tear to abandon.
+		await commitRivalTreeWrite<number, Entry>(inner, USERS, byKey, [[5, entry(5, 'done')]]);
 		const torn = new TailLandsButReportsStale(inner, 1);
 		const gate = new Gate(true);
 		let clock = T0;
@@ -552,7 +557,10 @@ describe('OfflineQueue', function () {
 			recheck: { baseMs: 60_000, maxMs: 60_000 },
 		});
 		const users = await openTree(torn, queue, USERS);
-		await queueEntry(queue, 'E1', [users, [[1, entry(1, 'one')]]]);
+		await queueEntry(queue, 'E1', [users, [
+			[1, entry(1, 'one')],
+			[5, entry(5, 'done'), { kind: 'unchangedOrEqual', expected: entry(5, 'seed') }],
+		]]);
 		await waitFor(() => statuses.some(s => s.kind === 'queued' && s.entryId === 'E1' && s.attempts === 1),
 			{ description: 'E1 reported queued again after its first attempt' });
 
@@ -583,12 +591,64 @@ describe('OfflineQueue', function () {
 		expect(kindsOf(statuses, 'E1').at(-1)).to.equal('committed');
 		expect(recorded, 'the next drive finished the recorded attempt rather than building a new one').to.have.length(1);
 		expect(torn.landedCommits, 'landed whole once, by the re-send of the recorded attempt').to.equal(1);
+		// The head was consumed by the refresh that found the entry's own log entry, not folded from a
+		// new attempt — and the hook still reported the tally the first drive's staging recorded.
+		expect(committedOf(statuses, 'E1').effect, 'reported through the refresh-consumed path').to.equal('already-applied');
 		const actionId = actionIdOf(recorded, 'E1', USERS);
 		expect(await entriesUnder(inner, USERS, actionId), 'the log holds the entry once').to.have.length(1);
-		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [5], [1, 5]]);
 		const fresh = await Tree.createOrOpen<number, Entry>(inner, USERS, byKey);
 		expect(await fresh.get(1), 'the data block landed, not only the tail').to.deep.equal(entry(1, 'one'));
+		expect(await fresh.get(5), 'the already-applied row is as the rival left it').to.deep.equal(entry(5, 'done'));
 		await queue.dispose();
+	});
+
+	/** Queue `E1` over USERS and ITEMS behind a closed gate — a guarded update of the seed row in USERS
+	 * (`unchangedOrEqual`) and a guarded delete of it in ITEMS (`unchangedOrAbsent`) — let `rivals`
+	 * commit, open the gate and drain. Answers E1's committed status and what the journal heard. */
+	async function drainGuardedPair(rivals: (inner: TestTransactor) => Promise<void>) {
+		const inner = new TestTransactor();
+		await seed(inner, USERS, ITEMS);
+		const gate = new Gate(false);
+		const { queue, statuses, journal } = openQueue({ reachability: gate });
+		const users = await openTree(inner, queue, USERS);
+		const items = await openTree(inner, queue, ITEMS);
+		const seeded = entry(5, 'seed');
+		await queueEntry(queue, 'E1',
+			[users, [[5, entry(5, 'done'), { kind: 'unchangedOrEqual', expected: seeded }]]],
+			[items, [[5, undefined, { kind: 'unchangedOrAbsent', expected: seeded }]]]);
+		await rivals(inner);
+		gate.open = true;
+		queue.wake();
+		await queue.whenDrained();
+		const status = committedOf(statuses, 'E1');
+		await queue.dispose();
+		return { inner, status, journal, users, items };
+	}
+
+	it('reports effect already-applied for an entry over two trees whose every guarded element a rival had already applied, and the journal hears the same status', async () => {
+		const { inner, status, journal, users, items } = await drainGuardedPair(async inner => {
+			await commitRivalTreeWrite<number, Entry>(inner, USERS, byKey, [[5, entry(5, 'done')]]);
+			await commitRivalTreeWrite<number, Entry>(inner, ITEMS, byKey, [[5, undefined]]);
+		});
+		expect(status.effect).to.equal('already-applied');
+		expect([...status.durability.collections.keys()].sort(), 'the entry committed over both collections').to.deep.equal([ITEMS, USERS]);
+		expect(journal.settledStatuses, 'the journal heard the status with its effect').to.deep.equal([status]);
+		expect(await users.get(5)).to.deep.equal(entry(5, 'done'));
+		expect(await items.get(5)).to.equal(undefined);
+		expect(await committedKeys(inner, USERS), 'the entry is in the log although it changed nothing').to.deep.equal([[5], [5], [5]]);
+		expect(await committedKeys(inner, ITEMS)).to.deep.equal([[5], [5], [5]]);
+	});
+
+	it('reports effect applied when one guarded element was already applied and the other still changed a row (all, not any)', async () => {
+		const { inner, status, users, items } = await drainGuardedPair(async inner => {
+			await commitRivalTreeWrite<number, Entry>(inner, USERS, byKey, [[5, entry(5, 'done')]]);
+		});
+		expect(status.effect).to.equal('applied');
+		expect(await users.get(5)).to.deep.equal(entry(5, 'done'));
+		expect(await items.get(5), 'the delete was this entry\'s own').to.equal(undefined);
+		const fresh = await Tree.createOrOpen<number, Entry>(inner, ITEMS, byKey);
+		expect(await fresh.get(5)).to.equal(undefined);
 	});
 
 	it('finishes an entry over two trees that partly committed: partially-committed with ITEMS committed and USERS pending — listed queued with its committed half, in doubt, not discardable — then committed with a durability naming both, the remainder sent alone under the same action id, each log holding the entry once', async () => {

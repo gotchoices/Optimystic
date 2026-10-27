@@ -1,4 +1,4 @@
-import type { ActionId, CollectionId } from "../index.js";
+import type { ActionId, AlreadyAppliedTally, CollectionId } from "../index.js";
 import type { ReadDependency, Transaction } from "./transaction.js";
 import { clampPriority } from "./transaction.js";
 import type { Collection, RefreshReport } from "../collection/collection.js";
@@ -68,6 +68,12 @@ export type EntryCommit = {
 	/** Write-ahead hook, awaited with every participant's attempt before any latch is released
 	 * (see `HeadCommitOptions.recordAttempt`). A throw aborts the cycle with nothing sent. */
 	readonly recordAttempt?: (attempts: ReadonlyMap<CollectionId, InFlightAttempt>) => Promise<void>;
+	/** Called once per participant, under that collection's latch, with what its head segment accepted
+	 * as already applied when the segment is dropped as committed — on the fold of a committed attempt,
+	 * the committed half of a partial landing included, and when the opening refresh finds the
+	 * entry's own log entry and consumes the head (see `HeadCommitOptions.onCommittedHead`, whose
+	 * contract this is, per collection). */
+	readonly onCommittedHead?: (collectionId: CollectionId, applied: AlreadyAppliedTally) => void;
 };
 
 /** One collection's part in a refresh round between attempts
@@ -125,12 +131,17 @@ export class EntryParticipants {
 			return { collectionId, collection };
 		});
 		const handles = new Map<CollectionId, HeadCommitHandle>();
+		const onCommittedHead = entry.onCommittedHead;
 		try {
 			for (const { collectionId, collection } of participants) {
 				const resume = entry.resume?.get(collectionId);
 				handles.set(collectionId, await collection.openHeadCommit(entry.entryId,
 					{ actionId: entry.actionId, timestamp: entry.timestamp },
-					{ ...cycle, ...(resume === undefined ? {} : { resume }) }));
+					{
+						...cycle,
+						...(resume === undefined ? {} : { resume }),
+						...(onCommittedHead === undefined ? {} : { onCommittedHead: (applied: AlreadyAppliedTally) => onCommittedHead(collectionId, applied) }),
+					}));
 			}
 		} catch (err) {
 			closeAll(handles);

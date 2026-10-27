@@ -1,4 +1,5 @@
 import type { Action } from "../index.js";
+import type { AlreadyAppliedTally } from "./action.js";
 import type { ActionRefusedError } from "./struct.js";
 
 /** A queue entry's id, opaque to the collection: the offline-sync queue (docs/offline-sync.md)
@@ -15,6 +16,15 @@ export type SealedSegment<TAction> = {
 	/** The refusal recorded for this segment, once a replay refused it. A refused segment is excluded
 	 * from every later replay until it is dropped. */
 	refused?: ActionRefusedError;
+	/** What the segment's actions accepted as already applied the last time they were staged over the
+	 * committed state — by a replay (`Collection.replayActions`) or by a head commit's tracker
+	 * (`Collection.buildHeadTracker`), both of which stage over the state the collection reads at, so
+	 * when the head commit folds this is the tally of a staging over the state the write committed
+	 * over. Set directly, with no version bump: it is not a change to the sealed list. Reported to the
+	 * head commit's `onCommittedHead` hook when the segment is dropped as committed. Absent only before
+	 * the segment's first staging — a refused staging leaves the previous value, which nothing reads,
+	 * since a refused segment is never committed. */
+	applied?: AlreadyAppliedTally;
 };
 
 /**

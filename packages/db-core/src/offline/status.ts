@@ -6,7 +6,7 @@ import type { TransactionDurability } from '../transaction/durability.js';
  * The status an offline-sync queue reports for each entry (docs/offline-sync.md §Following
  * transactions), in its db-core form: collections stand in for tables. The plugin's `followed`,
  * `persisted` and `outlook` are its own and never appear here — the outlook needs the catalog's tags
- * and key decoding, which only the plugin has — and `effect` is absent until its stage lands.
+ * and key decoding, which only the plugin has.
  */
 
 /** Why an entry failed. `constraint` and `concurrent-modification` are the two guard refusals
@@ -19,6 +19,17 @@ export type QueuedFailureReason = 'constraint' | 'concurrent-modification' | 're
  * first out), the cohort (the reachability gate said no, or the last attempt could not reach it),
  * or the backoff timer after a transient failure. `undefined` for a head about to be submitted. */
 export type EntryWaitingFor = 'earlier-entry' | 'cohort' | 'backoff';
+
+/** What a committed entry did to the rows it wrote (docs/offline-sync.md §Guards that make idempotent
+ * writes assured): `already-applied` when every element that carried one of the already-applied guard
+ * kinds (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`) was skipped
+ * because a rival had already made exactly its change, and at least one did — summed over every
+ * collection the entry wrote (`AlreadyAppliedTally`); `applied` otherwise, including for an entry with
+ * no such element and for one a restore found already committed, which records no tally. "All, not
+ * any": an entry of two guarded updates of which one was already done did change a row, and a host
+ * reading `already-applied` as "none of my guarded changes landed" must be right. Says nothing about
+ * elements carrying no guard or one of the base kinds, which are never counted. */
+export type CommittedEffect = 'applied' | 'already-applied';
 
 export type EntryStatus =
 	| {
@@ -48,6 +59,9 @@ export type EntryStatus =
 		/** Every collection the entry wrote, each with its class — across submissions, so a partly
 		 * committed entry's earlier half is listed beside the remainder's. */
 		durability: TransactionDurability;
+		/** Whether the entry's guarded changes were already in place when it committed
+		 * ({@link CommittedEffect}). */
+		effect: CommittedEffect;
 	}
 	| {
 		/** A submission committed part of the entry and not the rest (`CoordinatorPartialCommitError`).

@@ -2,6 +2,7 @@ import type { IBlock, BlockId, Action, ActionId, Transforms, WriteDurability } f
 import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
+import type { AlreadyAppliedTally } from "./action.js";
 import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
 
 export type CollectionId = BlockId;
@@ -143,6 +144,18 @@ export type HeadCommitOptions = SyncOptions & {
 	 * re-sends, verbatim, while the next attempt would request its revision (`resumedAttempt`), since
 	 * it may have landed on machines the refresh did not hear from. */
 	resume?: InFlightAttempt;
+	/** Called once, with what the head segment's actions accepted as already applied
+	 * ({@link AlreadyAppliedTally}, as recorded on the segment by its last staging over the committed
+	 * state), at the moment the segment is made durable and dropped: when the committed attempt is
+	 * folded (`HeadCommitHandle.fold`), or when the cycle's refresh finds the entry's own log entry and
+	 * consumes the head (`Collection.consumeHead`) — so a re-drive that finds its earlier attempt landed
+	 * reports it too. Runs synchronously under the collection latch, like `onSealedRefused`, so it must
+	 * not call a latched method of the collection; the queue's closure only records into a map. A throw
+	 * out of it is logged, never raised: the commit is already durable. A hook rather than a widened
+	 * return type because the partial-commit path reports the committed half through
+	 * `CoordinatorPartialCommitError` and the refresh-consumed path through `RefreshReport`; one hook
+	 * reaches all three. */
+	onCommittedHead?: (applied: AlreadyAppliedTally) => void;
 };
 
 export type CollectionHeaderBlock = IBlock & Partial<IChainHeader>;
@@ -229,10 +242,12 @@ export type InFlightCycle = {
 };
 
 /** What `Collection.openHeadCommit` opens a head commit with besides its identity: the cycle's
- * {@link InFlightCycle}, and the attempt an earlier cycle under the same action id recorded and did
- * not resolve ({@link HeadCommitOptions.resume}). */
+ * {@link InFlightCycle}, the attempt an earlier cycle under the same action id recorded and did not
+ * resolve ({@link HeadCommitOptions.resume}), and the committed-head hook
+ * ({@link HeadCommitOptions.onCommittedHead}). */
 export type OpenHeadCommitOptions = InFlightCycle & {
 	readonly resume?: InFlightAttempt;
+	readonly onCommittedHead?: (applied: AlreadyAppliedTally) => void;
 };
 
 /** Thrown by {@link ICollection.sync} / {@link ICollection.updateAndSync} when the retry budget

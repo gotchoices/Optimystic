@@ -19,7 +19,7 @@ import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchem
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
-import type { Collection, CollectionId, ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Collection, CollectionId, ITransactor, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
@@ -225,7 +225,7 @@ interface PreWriteImage {
  * implies, or a deleted row resurrected). See docs/internals.md, "Conflict replay
  * re-makes the uniqueness decision (entry guards)".
  */
-function unchanged(entry: StoredRowEntry): TreeEntryGuard<string, StoredRowEntry> {
+function unchanged(entry: StoredRowEntry): TreeUnchangedGuard<StoredRowEntry> {
   return { kind: 'unchanged', expected: entry };
 }
 
@@ -3269,7 +3269,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - a displacing move (REPLACE onto an OCCUPIED key) is guarded `unchanged`
             //    on the displaced entry: `deleteIndexEntries(pkMove.row, newKey)` below
             //    was computed from that image.
-            const moveGuard: TreeEntryGuard<string, StoredRowEntry> = pkMove.kind === 'displace'
+            const moveGuard: TreeUpsertGuard<string, StoredRowEntry> = pkMove.kind === 'displace'
               ? unchanged(pkMove.entry)
               : { kind: 'absent' };
 

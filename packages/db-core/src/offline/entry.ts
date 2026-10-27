@@ -1,9 +1,10 @@
-import type { ActionId } from '../collection/action.js';
+import type { ActionId, AlreadyAppliedTally } from '../collection/action.js';
+import { addTallies, ZeroTally } from '../collection/action.js';
 import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
-import type { EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
+import type { CommittedEffect, EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
 import type { JournalDriveState } from './journal.js';
 
 /** One queued entry, as `OfflineQueue` holds it, and the projections of it the queue reports. */
@@ -28,6 +29,14 @@ export type Entry = {
 	 * segments are consumed, so the next submission drives only the rest, and the terminal status
 	 * reports these beside it. */
 	readonly committed: Map<CollectionId, WriteDurability | undefined>;
+	/** What each collection's head segment accepted as already applied when it was committed, as the
+	 * `onCommittedHead` hooks reported it — across submissions, so a partial commit's committed half is
+	 * recorded before the error reaches the queue and a later submission's tallies accumulate beside
+	 * it. A collection a restore found already committed records nothing. Folded into the `committed`
+	 * status's `effect` ({@link effectOf}). In memory only: a restart between a partial commit and the
+	 * remainder's commit loses the committed half's tally, and the entry then reports `applied`, the
+	 * conservative answer. */
+	readonly applied: Map<CollectionId, AlreadyAppliedTally>;
 	phase: 'queued' | 'submitting';
 	waitingFor: EntryWaitingFor | undefined;
 	lastError: unknown;
@@ -87,6 +96,16 @@ export function queuedStatusChanged(previous: QueuedStatus | undefined, status: 
 		|| previous.lastError !== status.lastError
 		// The committed set only grows, so its size says whether it changed.
 		|| previous.committedCollections?.length !== status.committedCollections?.length;
+}
+
+/** The `effect` of a committed entry ({@link CommittedEffect}): `already-applied` exactly when the
+ * tallies recorded over every collection sum to `alreadyApplied > 0` and `applied === 0`. */
+export function effectOf(entry: Entry): CommittedEffect {
+	let total = ZeroTally;
+	for (const tally of entry.applied.values()) {
+		total = addTallies(total, tally);
+	}
+	return total.alreadyApplied > 0 && total.applied === 0 ? 'already-applied' : 'applied';
 }
 
 /** The entry's drive state as the journal records it (`IOfflineJournal.driving`): its action id,
