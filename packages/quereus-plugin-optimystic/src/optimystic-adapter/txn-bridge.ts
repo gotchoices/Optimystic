@@ -18,7 +18,7 @@ import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
-import { foldWriteFacts, type WriteFact } from './write-description.js';
+import { emptyWriteFacts, foldWriteFacts, type WriteFact } from './write-description.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
@@ -888,7 +888,7 @@ export class TransactionBridge {
       // it (docs/offline-sync.md §Entering and leaving the mode). Never 'local' in session mode,
       // which offline mode refuses to enter beside, and vice versa.
       acknowledgement: this.offline?.isEntered() === true ? 'local' : 'network',
-      writeFacts: { records: [], marks: new Map() },
+      writeFacts: emptyWriteFacts(),
     };
 
     return this.currentTransaction;

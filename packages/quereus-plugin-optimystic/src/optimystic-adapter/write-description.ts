@@ -16,6 +16,18 @@ import type { EntryFacts } from './commit-outlook.js';
  *  unique value of a unique-index entry (docs/offline-sync.md §Judging each guard). */
 export type WriteFact = { readonly kind: 'fresh'; readonly collectionId: CollectionId; readonly key: string };
 
+/**
+ * The facts a transaction has recorded so far, as `TransactionState.writeFacts` keeps them: the records
+ * in staging order, and at each open savepoint's creation the record count (`marks`, keyed by the
+ * depth Quereus broadcasts) so a rollback to it discards the records of the statements it discards.
+ */
+export type TransactionWriteFacts = { records: WriteFact[]; marks: Map<number, number> };
+
+/** The facts of a transaction that has recorded none: what every transaction state starts with. */
+export function emptyWriteFacts(): TransactionWriteFacts {
+	return { records: [], marks: new Map() };
+}
+
 /** One entry a row's write stages in a UNIQUE-enforcing index tree, as {@link freshElementsOf} needs it. */
 export type UniqueEntryOf = {
 	readonly collectionId: CollectionId;

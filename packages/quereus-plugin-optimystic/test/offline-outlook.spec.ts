@@ -196,6 +196,21 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		]);
 	});
 
+	it('a unique value from hex(randomblob(16)) is not exposed: the fact names the index entry the statement staged', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+
+		// The key is fresh by tag; email by the write description, keyed as the index tree stages its
+		// entry; badge by neither. A fact under any other key would leave email exposed beside badge.
+		const insert = await queuedOutlook(node, `insert into Accounts (id, email, badge) values ('a2', hex(randomblob(16)), 42)`);
+		expect(insert.outlook).to.deep.equal({
+			kind: 'exposed',
+			exposures: [{ table: 'main.Accounts', rule: 'unique', columns: ['badge'], key: [42] }],
+			dependsOn: [],
+			unchecked: 'not-computed',
+		});
+	});
+
 	it('CommitOutlook() answers the JSON outlook of what an open transaction has staged, and NULL outside one', async () => {
 		const node = await oneNode();
 		const outlookNow = async (): Promise<unknown> => (await queryAll(node.db, 'select CommitOutlook() as outlook'))[0]?.outlook;

@@ -274,6 +274,10 @@ class WriteIndex {
 				if (writers === undefined) writes.byKey.set(key, [entry]);
 				else writers.push(entry);
 			}
+			// OR across the entries that inserted the key: once a fresh inserter is queued the key counts fresh
+			// while a later literal re-inserter of it (insert, delete, insert again) is queued too. That
+			// changes no verdict: the re-inserter is exposed on its own `absent`, and every later writer of
+			// the key depends on it.
 			const freshHere = entry.facts?.fresh.get(collectionId);
 			for (const key of keys.insertedAbsent) {
 				writes.insertedAbsent.set(key, (freshHere?.has(key) ?? false) || (writes.insertedAbsent.get(key) ?? false));

@@ -11,7 +11,7 @@ import { announceExternalChange } from './optimystic-adapter/external-change.js'
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
 import type { MainTreeDescription, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
-import { freshElementsOf } from './optimystic-adapter/write-description.js';
+import { emptyWriteFacts, freshElementsOf } from './optimystic-adapter/write-description.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -43,7 +43,7 @@ const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
 /** A transaction state carrying nothing but `transactor`, for opening a collection on a transactor the
  *  factory should reuse (`CollectionFactory.createOrGetCollection`) outside any SQL transaction. */
 function transactorOnlyState(transactor: ITransactor): TransactionState {
-  return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: { records: [], marks: new Map() } };
+  return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: emptyWriteFacts() };
 }
 
 /** A UNIQUE constraint that binds a row, with the index tree enforcing it
@@ -3130,8 +3130,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
             // Stage into all indexes. UNIQUE-enforcing index trees whose value this row
             // occupies carry the concurrency guard so a rival that commits the same value
-            // under a different PK refuses the loser at replay (see guardedUniqueIndexes);
-            // a REPLACE-resolved constraint's tree is unguarded, its eviction already staged.
+            // under a different PK refuses the loser at replay (see guardedUniqueIndexes) —
+            // a REPLACE-resolved constraint's tree included, its eviction staged above so the
+            // range holds nothing this snapshot saw.
             await this.indexManager.insertIndexEntries(
               values,
               insertKey,
@@ -3257,7 +3258,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               oldKey,
               newKey,
               txnState?.transactor,
-              // Guard the NEW entry on every binding, ABORT-resolved UNIQUE constraint —
+              // Guard the NEW entry on every binding UNIQUE constraint (see guardedUniqueIndexes) —
               // the moving row's own OLD entry is deleted first in the same tree action, so
               // a value-preserving move never refuses itself (see updateIndexEntries).
               this.guardedUniqueIndexes(values),

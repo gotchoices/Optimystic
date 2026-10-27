@@ -14,6 +14,7 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import type { TransactionState } from '../dist/index.js';
+import { emptyWriteFacts } from '../src/optimystic-adapter/write-description.js';
 import { captureTrace, commitTraces } from './trace-helpers.js';
 import { Collection } from '@optimystic/db-core';
 import type { ActionHandler, BlockId, BlockStore, CollectionInitOptions, IBlock } from '@optimystic/db-core';
@@ -129,6 +130,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			collections: new Map(),
 			stampId: 'test-stamp',
 			acknowledgement: 'network',
+			writeFacts: emptyWriteFacts(),
 		};
 
 		const col1 = await factory.createOrGetCollection(options, txnState);
@@ -156,6 +158,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			collections: new Map(),
 			stampId: 'test-stamp',
 			acknowledgement: 'network',
+			writeFacts: emptyWriteFacts(),
 		};
 
 		await factory.createOrGetCollection(options, txnState);
