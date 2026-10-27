@@ -1,7 +1,8 @@
-import type { SqlValue } from '@quereus/quereus';
+import type { QualifiedName, SqlValue } from '@quereus/quereus';
 import { TreeRangeTakenError } from '@optimystic/db-core';
 import type { Action, CollectionId, QueuedFailureReason, TreeGuardRefusedError } from '@optimystic/db-core';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
+import type { PinnedRow, UncheckedRead } from './write-description.js';
 
 /**
  * Whether anything another writer does could make a queued transaction fail, and if so what
@@ -15,12 +16,16 @@ export type CommitOutlook = {
 	/** What another writer would have to do for one of the transaction's checks to refuse it, one per
 	 * check that can: collection by collection, in staging order within each. Empty when assured. */
 	readonly exposures: readonly Exposure[];
-	/** Earlier unsettled transactions whose failure would fail this one, each once, in queue order. */
+	/** Earlier unsettled transactions whose failure would fail this one, or leave one of its decisions
+	 * resting on rows that are gone — each once, in queue order. */
 	readonly dependsOn: readonly OutlookDependency[];
-	/** Decisions made against rows nothing re-checks when the transaction is submitted. Needs a
-	 * description of what each statement read, which this build does not have, so it is always
-	 * `'not-computed'` — a string rather than an absent field, so the JSON `CommitOutlook()` answers
-	 * says so too. */
+	/** Decisions made against rows nothing re-checks when the transaction is submitted
+	 * (docs/offline-sync.md §Unchecked decisions), read from the write description of each statement.
+	 * `'not-computed'` when a statement of the transaction was undescribed (an FK cascade child write),
+	 * or the transaction was restored after a restart without its facts — a string rather than an
+	 * absent field, so the JSON `CommitOutlook()` answers says so too. Independent of `kind`: a
+	 * decision does not make the transaction fail, it can make it commit as a fresh evaluation would
+	 * not. */
 	readonly unchecked: readonly UncheckedDecision[] | 'not-computed';
 };
 
@@ -40,13 +45,19 @@ export type Exposure = {
 export type OutlookDependency = {
 	readonly transactionId: string;
 	/** `'guard'`: one of this transaction's checks covers what the earlier one wrote, so it refuses
-	 * when the earlier one fails. `'unchecked'` arrives with the statement analysis. */
+	 * when the earlier one fails. `'unchecked'`: one of its decisions read what the earlier one wrote,
+	 * so it would commit anyway, resting on rows that are gone. A transaction listed for both reasons
+	 * is listed as `'guard'`. */
 	readonly via: 'guard' | 'unchecked';
 };
 
 export type UncheckedDecision = {
+	/** The table the decision read (for a cross-row CHECK, the table written): `schema.table` when a
+	 * table of this plugin, else the lowercased name Quereus gave it. */
 	readonly table: string;
 	readonly kind: 'foreign-key' | 'check' | 'assertion' | 'read' | 'row-selection';
+	/** Quereus's binding mode for the read: `'row'` pinned to rows by a unique key, `'group'` to groups,
+	 * `'global'` otherwise. */
 	readonly scope: 'row' | 'group' | 'global';
 };
 
@@ -78,16 +89,38 @@ export type UniqueIndexDescription = {
 /** What a table can say about one of its collections. */
 export type TableCollectionDescription = MainTreeDescription | UniqueIndexDescription | { readonly kind: 'index'; readonly table: string };
 
+/** A table's main tree as the dependency rule needs it: where its rows are, and how a row a read pinned
+ * is keyed there. */
+export type MainTreeKeys = {
+	readonly collectionId: CollectionId;
+	/** The main-tree key of the row a read pinned by `key` = `values` (the columns lowercased as Quereus
+	 * names them, the values in `key` order); `undefined` when `key` is not the table's primary key
+	 * (any order, case-insensitive) or a value cannot be encoded. */
+	rowKey(key: readonly string[], values: readonly SqlValue[]): string | undefined;
+};
+
 /** Published by each table to the offline-mode controller beside its offline policy, and asked when
  * a transaction is judged: read at call time, so a tag change or an index created since needs no
- * re-publication. `undefined` for a collection that is not one of the table's. */
+ * re-publication. */
 export interface TableOutlookSource {
+	/** `undefined` for a collection that is not one of the table's. */
 	describe(collectionId: CollectionId): TableCollectionDescription | undefined;
+	/** `undefined` before the table is initialized. */
+	mainTree(): MainTreeKeys | undefined;
 }
 
 /** What the judgement is told about a collection: a table's description, or — when no published
  * table describes it — at most the name of a table recorded for it. */
 export type CollectionDescription = TableCollectionDescription | { readonly kind: 'unknown'; readonly table: string | undefined };
+
+/** The judgement's view of the schema, implemented by the offline-mode controller over the tables
+ * that published a {@link TableOutlookSource}. */
+export interface OutlookSchema {
+	describe(collectionId: CollectionId): CollectionDescription;
+	/** The table Quereus names, when a vtab has published it and is initialized: its `schema.table`
+	 * rendering and its main tree's keys. */
+	table(name: QualifiedName): (MainTreeKeys & { readonly name: string }) | undefined;
+}
 
 // ── the judgement's inputs ───────────────────────────────────────────────────────────────────
 
@@ -95,14 +128,20 @@ export type CollectionDescription = TableCollectionDescription | { readonly kind
  * sealed; `undefined` for a collection whose segment could not be read. */
 export type StagedWrites = ReadonlyMap<CollectionId, readonly Action<unknown>[] | undefined>;
 
-/** What the write descriptions of a transaction's statements said about its staged elements
- * (`freshElementsOf` in write-description.ts, recorded by the vtab as it stages and folded by
- * `foldWriteFacts`). `undefined` where the judgement has none: a transaction restored after a restart,
- * until the facts are journaled. */
+/** What the write descriptions of a transaction's statements said about its staged elements and its
+ * decisions (`freshElementsOf` and `uncheckedOf` in write-description.ts, recorded by the vtab as it
+ * stages and folded by `foldWriteFacts`). `undefined` where the judgement has none: a transaction
+ * restored after a restart, until the facts are journaled. */
 export type EntryFacts = {
 	/** Per collection, the keys of the elements whose value came from a fresh source: the primary key of
 	 * a main-tree entry, the tree key of a unique-index entry. */
 	readonly fresh: ReadonlyMap<CollectionId, ReadonlySet<string>>;
+	/** The decisions the statements made against other rows, each (table, kind, scope) once, in
+	 * statement order. */
+	readonly unchecked: readonly UncheckedRead[];
+	/** Every write of the transaction was described: `false` once one went undescribed (an FK cascade
+	 * child write), after which `unchecked` is not the whole list. */
+	readonly complete: boolean;
 };
 
 /** An unsettled queue entry ahead of the transaction being judged. */
@@ -111,6 +150,8 @@ export type EarlierEntry = {
 	readonly seq: number;
 	/** The segments it still holds — not those a partial commit already committed. */
 	readonly writes: StagedWrites;
+	/** `schema.table` of every table behind those segments. */
+	readonly tables: readonly string[];
 	/** Its own outlook's kind. */
 	readonly assured: boolean;
 	/** What its statements' write descriptions said about its elements. */
@@ -142,13 +183,26 @@ type GuardSpan =
 type StringBound = { readonly key: string; readonly inclusive: boolean };
 type StringRange = { readonly first?: StringBound; readonly last?: StringBound };
 
+/** What one unchecked decision is matched against: the main-tree keys of the rows a `row` read
+ * pinned, or everything written to a table. */
+type ReadSpan =
+	| { readonly kind: 'keys'; readonly collectionId: CollectionId; readonly keys: readonly string[] }
+	| { readonly kind: 'table'; readonly table: string };
+
+/** One unchecked decision as judged: rendered for the outlook, with its span. */
+type JudgedRead = { readonly decision: UncheckedDecision; readonly span: ReadSpan };
+
 /** The part of an outlook that depends on nothing but the transaction and what was queued when it
- * was judged — its own exposures, with the collection each came from, and what each judged check
- * covers — against which its dependencies are matched. Fixed when the transaction is judged
- * (docs/offline-sync.md §The outlook); only a partial commit narrows it ({@link followOutlooks}). */
+ * was judged — its own exposures, with the collection each came from, what each judged check covers,
+ * and its unchecked decisions with what each read — against which its dependencies are matched. Fixed
+ * when the transaction is judged (docs/offline-sync.md §The outlook); only a partial commit narrows
+ * it ({@link followOutlooks}), and never the decisions, which are a statement's rather than a
+ * collection's. */
 export type OwnJudgement = {
 	readonly exposures: readonly { readonly collectionId: CollectionId; readonly exposure: Exposure }[];
 	readonly guarded: readonly { readonly collectionId: CollectionId; readonly span: GuardSpan }[];
+	/** `'not-computed'` when the transaction's facts are absent or incomplete. */
+	readonly unchecked: readonly JudgedRead[] | 'not-computed';
 };
 
 /** A queued transaction's outlook beside the own judgement it was computed from, which is what
@@ -259,8 +313,16 @@ type CollectionWrites = {
  */
 class WriteIndex {
 	private readonly collections = new Map<CollectionId, CollectionWrites>();
+	/** Every entry with a segment in any collection of a table, by its `schema.table`, in queue order:
+	 * what an unchecked decision matched by table depends on. */
+	private readonly tables = new Map<string, EarlierEntry[]>();
 
 	add(entry: EarlierEntry): void {
+		for (const table of entry.tables) {
+			const writers = this.tables.get(table);
+			if (writers === undefined) this.tables.set(table, [entry]);
+			else writers.push(entry);
+		}
 		for (const [collectionId, actions] of entry.writes) {
 			const writes = this.writesIn(collectionId);
 			writes.writers.push(entry);
@@ -314,6 +376,11 @@ class WriteIndex {
 		}
 	}
 
+	/** Every indexed entry with a segment in a collection of the table named `table`, each once. */
+	writersOfTable(table: string): Iterable<EarlierEntry> {
+		return this.tables.get(table) ?? [];
+	}
+
 	private writesIn(collectionId: CollectionId): CollectionWrites {
 		let writes = this.collections.get(collectionId);
 		if (writes === undefined) {
@@ -337,12 +404,12 @@ class WriteIndex {
  */
 export function judgeTransaction(
 	transaction: JudgedTransaction,
-	describe: (collectionId: CollectionId) => CollectionDescription,
+	schema: OutlookSchema,
 	ahead: QueueAhead,
 ): QueuedJudgement {
 	const index = new WriteIndex();
 	for (const entry of ahead.earlier) index.add(entry);
-	const own = ownJudgement(transaction.writes, transaction.facts, describe, index);
+	const own = ownJudgement(transaction.writes, transaction.facts, schema, index);
 	return { own, outlook: outlookFrom(own, transaction.tables, index, ahead.deferred) };
 }
 
@@ -368,17 +435,21 @@ export function followOutlooks(queue: readonly FollowedEntry[], deferred: readon
 			judgement = { own, outlook: outlookFrom(own, entry.tables, index, ahead) };
 			followed.set(entry.transactionId, judgement);
 		}
-		index.add({ transactionId: entry.transactionId, seq: entry.seq, writes: entry.writes, assured: judgement?.outlook.kind === 'assured', facts: entry.facts });
+		index.add({
+			transactionId: entry.transactionId, seq: entry.seq, writes: entry.writes, tables: entry.tables,
+			assured: judgement?.outlook.kind === 'assured', facts: entry.facts,
+		});
 	}
 	return followed;
 }
 
-/** `own` without what it judged in `collections`. */
+/** `own` without what it judged in `collections`; its decisions stay, being a statement's. */
 function withoutCollections(own: OwnJudgement, collections: ReadonlySet<CollectionId>): OwnJudgement {
 	if (collections.size === 0) return own;
 	return {
 		exposures: own.exposures.filter(({ collectionId }) => !collections.has(collectionId)),
 		guarded: own.guarded.filter(({ collectionId }) => !collections.has(collectionId)),
+		unchecked: own.unchecked,
 	};
 }
 
@@ -408,20 +479,54 @@ function withoutCollections(own: OwnJudgement, collections: ReadonlySet<Collecti
 function ownJudgement(
 	writes: StagedWrites,
 	facts: EntryFacts | undefined,
-	describe: (collectionId: CollectionId) => CollectionDescription,
+	schema: OutlookSchema,
 	earlier: WriteIndex,
 ): OwnJudgement {
 	const exposures: OwnJudgement['exposures'][number][] = [];
 	const guarded: OwnJudgement['guarded'][number][] = [];
 	for (const [collectionId, actions] of writes) {
-		const judge = new CollectionJudge(collectionId, describe(collectionId), facts?.fresh.get(collectionId), earlier, exposures, guarded);
+		const judge = new CollectionJudge(collectionId, schema.describe(collectionId), facts?.fresh.get(collectionId), earlier, exposures, guarded);
 		if (actions === undefined) {
 			judge.unreadable();
 			continue;
 		}
 		for (const action of actions) judge.action(action);
 	}
-	return { exposures, guarded };
+	return { exposures, guarded, unchecked: judgedReads(facts, schema) };
+}
+
+/**
+ * The transaction's unchecked decisions as the outlook lists them and the dependency rule matches them
+ * (docs/offline-sync.md §Dependencies between entries), resolved against the schema now and fixed with
+ * the judgement: a decision on a published table is named by the table's `schema.table`, one on any
+ * other table by Quereus's lowercased name. A `row` read on a published table whose every pinned row
+ * encodes to a main-tree key is matched by those keys; every other decision — a `group` or `global`
+ * one, a `row` read on an unpublished table, or one with a row pinned by a key other than the primary
+ * key — by its table. `'not-computed'` with no facts, or facts a cascade child write left incomplete.
+ */
+function judgedReads(facts: EntryFacts | undefined, schema: OutlookSchema): JudgedRead[] | 'not-computed' {
+	if (facts === undefined || !facts.complete) return 'not-computed';
+	return facts.unchecked.map(read => {
+		const table = schema.table(read.table);
+		const name = table?.name ?? `${read.table.schema}.${read.table.table}`;
+		const decision: UncheckedDecision = { table: name, kind: read.kind, scope: read.scope };
+		const keys = table !== undefined && read.scope === 'row' ? encodedKeys(read.rows, table) : undefined;
+		const span: ReadSpan = table !== undefined && keys !== undefined
+			? { kind: 'keys', collectionId: table.collectionId, keys }
+			: { kind: 'table', table: name };
+		return { decision, span };
+	});
+}
+
+/** Every pinned row's main-tree key, or `undefined` as soon as one does not encode. */
+function encodedKeys(rows: readonly PinnedRow[], table: MainTreeKeys): string[] | undefined {
+	const keys: string[] = [];
+	for (const { key, values } of rows) {
+		const encoded = table.rowKey(key, values);
+		if (encoded === undefined) return undefined;
+		keys.push(encoded);
+	}
+	return keys;
 }
 
 /** The judgement of one collection's segment: what it adds to the transaction's exposures and spans. */
@@ -519,11 +624,17 @@ class CollectionJudge {
 
 /**
  * The outlook of a transaction judged {@link ownJudgement}, given what is queued ahead of it
- * (docs/offline-sync.md §Dependencies between entries): it depends on every earlier entry whose
- * segment in a collection writes inside what one of its checks covers — an earlier failure reverts
- * that write, which can make the check refuse — and on every deferred transaction ahead of it that
- * wrote one of its `tables`, whose writes cannot be matched by key. It is assured exactly when it has
- * no exposure and every transaction it depends on is assured; a deferred one never is.
+ * (docs/offline-sync.md §Dependencies between entries). Through a guard (`via: 'guard'`) it depends on
+ * every earlier entry whose segment in a collection writes inside what one of its checks covers — an
+ * earlier failure reverts that write, which can make the check refuse — and on every deferred
+ * transaction ahead of it that wrote one of its `tables`, whose writes cannot be matched by key.
+ * Through an unchecked decision (`via: 'unchecked'`) it depends on every earlier entry that wrote one
+ * of the keys a `row` read pinned (unreadable segments included), or, for a decision matched by table,
+ * that holds a segment in any collection of the table, and on every deferred transaction that wrote
+ * the table. A transaction listed for both reasons is listed as `'guard'`. It is assured exactly when
+ * it has no exposure and every transaction it depends on through a guard is assured; a deferred one
+ * never is. The decisions do not bear on its kind: an earlier failure leaves them resting on rows that
+ * are gone, it does not refuse the transaction.
  */
 function outlookFrom(
 	own: OwnJudgement,
@@ -531,25 +642,38 @@ function outlookFrom(
 	earlier: WriteIndex,
 	deferred: readonly DeferredTransaction[],
 ): CommitOutlook {
-	const dependencies = new Map<string, { readonly seq: number; readonly assured: boolean }>();
+	const dependencies = new Map<string, { readonly seq: number; readonly assured: boolean; readonly via: OutlookDependency['via'] }>();
+	const depend = (transactionId: string, seq: number, assured: boolean, via: OutlookDependency['via']): void => {
+		if (!dependencies.has(transactionId)) dependencies.set(transactionId, { seq, assured, via });
+	};
 	for (const { collectionId, span } of own.guarded) {
-		for (const writer of earlier.writersWithin(collectionId, span)) {
-			dependencies.set(writer.transactionId, { seq: writer.seq, assured: writer.assured });
-		}
+		for (const writer of earlier.writersWithin(collectionId, span)) depend(writer.transactionId, writer.seq, writer.assured, 'guard');
 	}
 	const tables = new Set(ownTables);
 	for (const record of deferred) {
-		if (record.tables.some(table => tables.has(table))) {
-			dependencies.set(record.transactionId, { seq: record.seq, assured: false });
+		if (record.tables.some(table => tables.has(table))) depend(record.transactionId, record.seq, false, 'guard');
+	}
+	if (own.unchecked !== 'not-computed') {
+		for (const { span } of own.unchecked) {
+			if (span.kind === 'keys') {
+				for (const key of span.keys) {
+					for (const writer of earlier.writersWithin(span.collectionId, { kind: 'key', key })) depend(writer.transactionId, writer.seq, writer.assured, 'unchecked');
+				}
+				continue;
+			}
+			for (const writer of earlier.writersOfTable(span.table)) depend(writer.transactionId, writer.seq, writer.assured, 'unchecked');
+			for (const record of deferred) {
+				if (record.tables.includes(span.table)) depend(record.transactionId, record.seq, false, 'unchecked');
+			}
 		}
 	}
 	const ordered = [...dependencies].sort(([, a], [, b]) => a.seq - b.seq);
-	const assured = own.exposures.length === 0 && ordered.every(([, dependency]) => dependency.assured);
+	const assured = own.exposures.length === 0 && ordered.every(([, dependency]) => dependency.via === 'unchecked' || dependency.assured);
 	return {
 		kind: assured ? 'assured' : 'exposed',
 		exposures: own.exposures.map(({ exposure }) => exposure),
-		dependsOn: ordered.map(([transactionId]) => ({ transactionId, via: 'guard' as const })),
-		unchecked: 'not-computed',
+		dependsOn: ordered.map(([transactionId, { via }]) => ({ transactionId, via })),
+		unchecked: own.unchecked === 'not-computed' ? 'not-computed' : own.unchecked.map(({ decision }) => decision),
 	};
 }
 

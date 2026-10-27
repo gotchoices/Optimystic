@@ -885,14 +885,16 @@ type CommitOutlook = {
   kind: 'assured' | 'exposed';
   /** What another writer would have to do for a guard to refuse at rebase. Empty when assured. */
   exposures: readonly Exposure[];
-  /** Earlier unsettled entries whose failure would fail this one, or change what it means. */
+  /** Earlier unsettled entries whose failure would fail this one, or change what it means; an entry
+   *  depended on both ways is listed once, as 'guard'. */
   dependsOn: readonly { transactionId: string; via: 'guard' | 'unchecked' }[];
   /** Decisions made against rows nothing re-checks at rebase. Independent of `kind`: they do not
    *  make the entry fail, they can make it commit with a decision a fresh evaluation would refuse.
-   *  'not-computed' when the analysis had no description of what the statements read: always from
-   *  the guards alone (stage 7), and from the write description unless every statement of the entry
-   *  was described (stage 9). A string rather than an absent field, because `CommitOutlook()` renders
-   *  this as JSON, where an absent key would be ambiguous. */
+   *  'not-computed' when the analysis had no description of what a statement read: a statement of
+   *  the entry was undescribed (an FK cascade child write), or the entry was restored after a
+   *  restart before its facts were journaled (stage 9's third ticket removes the second). A string
+   *  rather than an absent field, because `CommitOutlook()` renders this as JSON, where an absent
+   *  key would be ambiguous. */
   unchecked: readonly UncheckedDecision[] | 'not-computed';
 };
 
@@ -904,7 +906,7 @@ type Exposure = {
 };
 
 type UncheckedDecision = {
-  table: string;                              // the table read, not the one written
+  table: string;                              // the table read (for a cross-row CHECK, the one written)
   kind: 'foreign-key' | 'check' | 'assertion' | 'read' | 'row-selection';
   scope: 'row' | 'group' | 'global';          // Quereus's binding mode for that read
 };
@@ -1049,20 +1051,57 @@ guard that can be refused:
 ### Unchecked decisions
 
 The rows a statement read to make its decision, other than the target row its guard protects, are
-what the analysis reports as `unchecked`, using Quereus's own classification of each read:
+what the analysis reports as `unchecked`. They are read from the statement's write description
+(`uncheckedOf` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`):
+its target selection, its constraints and its read watches, each decision kept with the table as
+Quereus names it and, for a read pinned to rows, the bound values. The vtab records them once per
+described statement — the engine hands one description object per execution, shared by every row's
+`update()`, so the object identifies the statement — ahead of every arm's staging, through
+`TransactionBridge.noteWriteDescription` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`, which keeps them beside the
+fresh-element facts under the same savepoint rule. A write the engine does not describe — an FK
+cascade child write — is recorded as undescribed, and the entry's `unchecked` is then
+`'not-computed'`: a partial list would read as a complete one.
 
-| Statement shape | `kind` |
+| From the description | Decision |
 |---|---|
-| A child row's FOREIGN KEY checked against its parent | `foreign-key` |
-| A CHECK with a subquery, or a deferred CHECK | `check` |
-| An assertion the transaction triggered | `assertion` |
-| Values taken from other rows: `insert … select`, `set x = (select …)`, a join in `update … from` | `read` |
-| An UPDATE or DELETE that chose its rows by a predicate other than a key equality (`where status = 'open'`) | `row-selection` |
+| An UPDATE or DELETE whose `selection` is `global`: rows chosen by anything but a unique-key equality (`where status = 'open'`) | `row-selection` on the target, `global` |
+| Each `foreign-key-child` constraint (an INSERT, or an UPDATE of a foreign-key column) | `foreign-key` on the parent it references, with the scope of the read watch on that table when one is listed — whole-table today, a known imprecision of Quereus's analysis — else `global`; that watch is consumed |
+| Each `foreign-key-parent` constraint (a DELETE, or an UPDATE of a referenced column) | `foreign-key` on the child it references, `global` |
+| Each `assertion` constraint | `assertion` on the table it references (the target when it names none), `global` |
+| Each `check` constraint of `cross-row` locality (a subquery, or a committed-state reference) | `check` on the **written** table, `global` |
+| Each remaining read watch | `read` on the watch's table, scoped by its binding mode |
+| `primary-key`, `unique`, `not-null`, a row-local `check` | nothing: the first two are guards, the rest are decided from the row alone |
 
 `row-selection` is the phantom case: a rival's new matching row will not be touched, because the
-action names the rows chosen locally. `scope` is the binding mode Quereus assigns that read — `row`
-when it is pinned to one row by a key equality, `group` when pinned to a group, `global` otherwise —
-which tells an application, and the dependency rule below, how wide the dependency is.
+action names the rows chosen locally. `scope` maps Quereus's four binding modes onto three: `full` is
+`global`; `rows`, a read pinned to rows by a unique-key equality, is `row`, and the decision keeps
+the key and the bound values; `groups` and `rowsByGroup` are both `group`. A pinned row still holding
+a parameter placeholder — an unbound description, which the module hook never hands the vtab — widens
+the read to `global`, as does a `rows` watch that pins no row. Decisions are deduped per statement by
+(table, kind, scope), merging the pinned rows, and the entry's list is the statements' lists
+concatenated in statement order and deduped the same way.
+
+Three things the description does not say, and how the analysis resolves each — in the direction of
+one decision too many rather than one too few:
+
+- **Reads are not labelled by what they served.** A foreign key's parent probe is a watch on the
+  parent table; a CHECK's subquery is a watch on whatever table it reads, indistinguishable from a
+  `SET` subquery. So a watch on a table a `foreign-key-child` constraint references is taken as that
+  constraint's read, and a cross-row CHECK is reported on the written table while its subquery's
+  watch is still reported as a `read`.
+- **The target row is not separated from the rest.** The description trims the target scan's watch to
+  the non-key columns the write read, but a subquery over the target table is a separate watch kept
+  whole. A watch on the target no wider than the selection is the target row itself and is dropped: a
+  `rows` watch pinned to the selection's rows under a `rows` selection (the `unchanged` guard covers
+  the row), and any watch under a `global` selection (the `row-selection` decision covers it). A
+  target watch wider than a `rows` selection (`set x = (select max(x) from t) where id = ?`), and
+  every target watch under an INSERT's `none` selection (`insert into t … select … from t`), is a
+  `read`.
+- **The table is named as Quereus names it**, lowercased. The outlook renders a decision on a table of
+  this plugin by the table's `schema.table` as the statuses name it (`main.Conversations`), resolved
+  through the controller's published tables when the entry is judged, and a decision on any other
+  table — one declared on another module — by Quereus's name.
 
 ### Dependencies between entries
 
@@ -1079,19 +1118,28 @@ An entry depends on an earlier unsettled entry in two ways:
 - **Through an unchecked read**: one of its unchecked decisions read rows the earlier entry wrote —
   a message whose conversation was created by the earlier entry. If the earlier entry fails, this
   one is kept (its guards still pass) but its decision rested on rows that are gone. Recorded with
-  `via: 'unchecked'`. It does not change `kind`, for the reason `unchecked` does not.
+  `via: 'unchecked'`. It does not change `kind`, for the reason `unchecked` does not. An entry
+  depended on both ways is listed once, as `'guard'`.
 
-Matching a read against an earlier entry's writes uses the read's scope: a `row`-scoped read matches
-when the earlier entry wrote that key, a `group` or `global` read matches when it wrote the table.
-The queue knows each entry's written keys from its actions. This is the change-scope lattice's
-intersection (`intersectScopes`), applied to a read scope and a write set.
+Matching a decision against an earlier entry's writes uses the decision's scope. A `row` read on a
+table of this plugin whose every pinned row encodes to a main-tree key — the read's key is the
+table's primary key, in any order, and every value encodes — matches an earlier entry whose segment
+in that main tree wrote one of those keys (an unreadable segment counts as writing every key), the
+lookup an `absent` guard makes. Every other decision — `group` or `global`, a `row` read pinned by a
+key other than the primary key, or one on a table no vtab of this plugin published — matches every
+earlier entry with a segment in any collection of the table, its main tree or an index tree. The
+encoding is the table's own (`TableOutlookSource.mainTree`, built as a point lookup builds its seek
+key), resolved when the entry is judged and fixed with its judgement. This is the change-scope
+lattice's intersection, applied to a read scope and a write set, with the key encoding standing in
+for `intersectScopes`.
 
 "Earlier" means before the entry in the queue's order. A journaled transaction the restore after a
 restart still defers (see [Restore after a restart](#restore-after-a-restart)) with a lower sequence
-number counts too, whenever it wrote one of the entry's tables: its writes are not staged, so they
-cannot be matched by key, and it is never assured. Each transaction is listed once, in queue order.
-`CommitOutlook()` judges the open transaction as an entry sealed behind everything queued now, so
-every queued entry and every deferred record counts as earlier.
+number counts too, whenever it wrote one of the entry's tables or a table one of its decisions is
+matched by: its writes are not staged, so they cannot be matched by key, and it is never assured.
+Each transaction is listed once, in queue order. `CommitOutlook()` judges the open transaction as an
+entry sealed behind everything queued now, so every queued entry and every deferred record counts as
+earlier.
 
 ### What the analysis needs from Quereus
 
@@ -1776,8 +1824,8 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    with binding modes, per-column value provenance, target-row selection, and constraint
    classification.
 9. **The outlook from the write description** (in progress, three tickets: fresh-value detection
-   from provenance is implemented; the `unchecked` decisions with their dependencies, and the
-   journaling of the facts so a restored transaction is judged with them, follow). Fresh-value
+   from provenance and the `unchecked` decisions with their dependencies are implemented; the
+   journaling of the facts so a restored transaction is judged with them follows). Fresh-value
    detection from provenance, `unchecked` decisions, and dependencies through unchecked reads.
 10. **Guards that accept an already-applied write.** The three variants, gated on the write
     description's self-independence and disposition facts, with the `already-applied` effect on
@@ -1882,6 +1930,22 @@ no fresh tag: an insert under `StampId()` assured, and one under `hex(randomblob
 rolled-back insert minted, inserted again as a literal after `rollback to` the savepoint, exposed on
 that key; and an update of a row an earlier queued entry inserted under `StampId()` assured with that
 entry in `dependsOn`. The suite-wide check above now also catches a false `fresh` label end to end.
+
+Stage 9's second ticket pins the unchecked decisions. `write-description.spec.ts`, one case per rule
+of `uncheckedOf` over prepared statements: an insert into a child table a `foreign-key` on the parent
+with the parent read consumed; a delete of a parent row a `foreign-key` on the child; an update by a
+non-key predicate one `row-selection` and nothing for its target read; an update by key reading its
+own column nothing; a subquery over the target under a key selection a `read`; an insert from a
+select a `read` with the source's scope, global and group; a read pinned by a key keeping the key and
+the bound values, widened to global while a value is unbound; a cross-row CHECK a `check` on the
+written table beside the subquery's `read`; and the fold concatenating the statements' lists,
+deduping with the pinned rows merged, and complete only while every write was described.
+`offline-outlook.spec.ts`: a message under `StampId()` referencing a conversation an earlier queued
+entry inserted under a natural key, assured with that entry in `dependsOn` `via: 'unchecked'` and the
+foreign key in `unchecked`, then a transaction that both updates the conversation and inserts a
+message listing the entry once, as `'guard'`; and a memo copied from one note by its key, depending
+on the entry that inserted that note and not on the entry that inserted another — which pins the key
+encoder and the key-span match together. Every `unchecked` the earlier cases assert is now `[]`.
 Of the list below, what is left waits for its stage: the rest of stage 9, and stage 10.
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →

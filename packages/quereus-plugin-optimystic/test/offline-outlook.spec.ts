@@ -32,6 +32,10 @@ const createAccounts = `create table Accounts (id text primary key with tags ("o
 const createPrefs = `create table Prefs (pref text primary key, choice text) using optimystic('tree://outlook/prefs') with tags ("optimystic.single_writer" = true)`;
 /** No tag: whether a key is fresh is read from where the statement's value came from (the write description). */
 const createMemos = `create table Memos (id text primary key, body text) using optimystic('tree://outlook/memos')`;
+/** Natural primary key: a conversation two machines could both create under one id. */
+const createConversations = `create table Conversations (id text primary key, title text) using optimystic('tree://outlook/conversations')`;
+/** A message referencing its conversation: the foreign key is a decision made against the parent row. */
+const createMessages = `create table Messages (id text primary key, conversation text references Conversations(id), body text) using optimystic('tree://outlook/messages')`;
 
 interface Node extends MeshDbNode {
 	/** Every status the plugin reported, in order. */
@@ -54,7 +58,7 @@ async function oneNode(): Promise<Node> {
 	const { transactorFor } = await startMockMesh(1);
 	const node = followed(createMeshDbNode(transactorFor(0), offlineConfig));
 	node.plugin.collectionFactory.registerCohortReachability('shared:test', { reachable: () => Promise.resolve(false) });
-	for (const sql of [createNotes, createUsers, createAccounts, createMemos]) await node.db.exec(sql);
+	for (const sql of [createNotes, createUsers, createAccounts, createMemos, createConversations, createMessages]) await node.db.exec(sql);
 	return node;
 }
 
@@ -93,7 +97,7 @@ async function queuedOutlook(node: Node, sql: string): Promise<{ transactionId: 
 }
 
 const assured = (dependsOn: CommitOutlook['dependsOn'] = []): CommitOutlook =>
-	({ kind: 'assured', exposures: [], dependsOn, unchecked: 'not-computed' });
+	({ kind: 'assured', exposures: [], dependsOn, unchecked: [] });
 
 describe('Offline mode: the outlook of a queued transaction', function () {
 	this.timeout(30_000);
@@ -110,7 +114,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [{ table: 'main.Users', rule: 'primary-key', key: ['ann'] }],
 			dependsOn: [],
-			unchecked: 'not-computed',
+			unchecked: [],
 		});
 	});
 
@@ -153,7 +157,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [{ table: 'main.Memos', rule: 'primary-key', key: [id] }],
 			dependsOn: [],
-			unchecked: 'not-computed',
+			unchecked: [],
 		});
 	});
 
@@ -179,7 +183,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [{ table: 'main.Notes', rule: 'row', key: ['n3'] }],
 			dependsOn: [],
-			unchecked: 'not-computed',
+			unchecked: [],
 		});
 	});
 
@@ -207,7 +211,48 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [{ table: 'main.Accounts', rule: 'unique', columns: ['badge'], key: [42] }],
 			dependsOn: [],
-			unchecked: 'not-computed',
+			unchecked: [],
+		});
+	});
+
+	it('a message under StampId() referencing a conversation an earlier queued transaction inserted under a natural key is assured, depends on it through the foreign key, and lists the decision', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		const conversation = await queuedOutlook(node, `insert into Conversations (id, title) values ('c1', 'hello')`);
+		expect(conversation.outlook?.kind, 'a natural key is exposed').to.equal('exposed');
+
+		// Quereus reads the parent whole for the foreign-key probe, so the dependency is by table.
+		const message = await queuedOutlook(node, `begin; insert into Messages (id, conversation, body) values (StampId(), 'c1', 'hi'); commit`);
+		expect(message.outlook).to.deep.equal({
+			kind: 'assured',
+			exposures: [],
+			dependsOn: [{ transactionId: conversation.transactionId, via: 'unchecked' }],
+			unchecked: [{ table: 'main.Conversations', kind: 'foreign-key', scope: 'global' }],
+		});
+
+		// A transaction that also guards what it read lists the entry once, as 'guard', and keeps the decision.
+		const both = await queuedOutlook(node, `begin; update Conversations set title = 'renamed' where id = 'c1'; insert into Messages (id, conversation, body) values (StampId(), 'c1', 'again'); commit`);
+		expect(both.outlook).to.deep.equal({
+			kind: 'exposed',
+			exposures: [{ table: 'main.Conversations', rule: 'row', key: ['c1'] }],
+			dependsOn: [{ transactionId: conversation.transactionId, via: 'guard' }],
+			unchecked: [{ table: 'main.Conversations', kind: 'foreign-key', scope: 'global' }],
+		});
+	});
+
+	it('a read pinned by a key depends on the earlier transactions that wrote that key alone, not on every writer of the table', async () => {
+		const node = await oneNode();
+		node.plugin.offline.enter();
+		const seven = await queuedOutlook(node, `insert into Notes (id, body) values ('n7', 'seven')`);
+		await queuedOutlook(node, `insert into Notes (id, body) values ('n8', 'eight')`);
+
+		// The key the read pinned is encoded as the note's insert keyed it; the copy's own key is a natural one.
+		const copy = await queuedOutlook(node, `insert into Memos (id, body) select id || '-copy', body from Notes where id = 'n7'`);
+		expect(copy.outlook).to.deep.equal({
+			kind: 'exposed',
+			exposures: [{ table: 'main.Memos', rule: 'primary-key', key: ['n7-copy'] }],
+			dependsOn: [{ transactionId: seven.transactionId, via: 'unchecked' }],
+			unchecked: [{ table: 'main.Notes', kind: 'read', scope: 'row' }],
 		});
 	});
 
@@ -224,7 +269,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [{ table: 'main.Users', rule: 'primary-key', key: ['bob'] }],
 			dependsOn: [],
-			unchecked: 'not-computed',
+			unchecked: [],
 		});
 	});
 
@@ -238,7 +283,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 			kind: 'exposed',
 			exposures: [],
 			dependsOn: [{ transactionId: insert.transactionId, via: 'guard' }],
-			unchecked: 'not-computed',
+			unchecked: [],
 		});
 
 		openGate();

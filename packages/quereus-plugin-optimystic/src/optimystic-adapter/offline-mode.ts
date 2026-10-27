@@ -1,4 +1,4 @@
-import type { Database } from '@quereus/quereus';
+import type { Database, QualifiedName } from '@quereus/quereus';
 import { QuereusError, StatusCode } from '@quereus/quereus';
 import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError, alwaysReachable } from '@optimystic/db-core';
 import type {
@@ -12,7 +12,7 @@ import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { followOutlooks, judgeTransaction, outlookContradicted, refusedCheck, renderKey } from './commit-outlook.js';
 import type {
-	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, EntryFacts, FollowedEntry, QueueAhead, QueuedJudgement, StagedWrites, TableOutlookSource,
+	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, EntryFacts, FollowedEntry, OutlookSchema, QueueAhead, QueuedJudgement, StagedWrites, TableOutlookSource,
 } from './commit-outlook.js';
 import { guardRefusalIn } from './guard-refusal.js';
 import { addListener, notifyListeners } from './listeners.js';
@@ -186,6 +186,9 @@ export class OfflineMode {
 	/** Each table's policy and reachability gate, keyed by its `schema.table` rendering, as its vtab
 	 * published them; a table absent here takes `'queue'` and is always reachable. */
 	private readonly tables = new Map<string, PublishedTable>();
+	/** The same renderings keyed lowercased, which is how Quereus names a table in a write description
+	 * (`QualifiedName`), for {@link schema}'s `table`. */
+	private readonly tablesByLowerName = new Map<string, string>();
 	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
 	/** Each queued transaction's judgement, made when the queue first reported it `queued`
@@ -328,14 +331,18 @@ export class OfflineMode {
 	 * it reads the table's live schema, so a tag change needs no new publication.
 	 */
 	setTablePolicy(table: QualifiedTableName, policy: OfflineTablePolicy, reachability: ICohortReachability, outlook: TableOutlookSource): void {
-		this.tables.set(qualifiedTableName(table), { policy, reachability, outlook });
+		const name = qualifiedTableName(table);
+		this.tables.set(name, { policy, reachability, outlook });
+		this.tablesByLowerName.set(name.toLowerCase(), name);
 		this.subscribeToGate(reachability);
 	}
 
 	/** Forget `table`'s policy, gate and outlook source: it was dropped, or its CREATE was refused. The
 	 * gate's wake subscription stays: a wake for a gate no table uses costs one gate check. */
 	withdrawTablePolicy(table: QualifiedTableName): void {
-		this.tables.delete(qualifiedTableName(table));
+		const name = qualifiedTableName(table);
+		this.tables.delete(name);
+		this.tablesByLowerName.delete(name.toLowerCase());
 	}
 
 	/** The policy of the table named `schema.table` ({@link qualifiedTableName}); `'queue'` for a table
@@ -761,19 +768,23 @@ export class OfflineMode {
 	}
 
 	private judge(writes: StagedWrites, collections: readonly CollectionId[], ahead: QueueAhead, facts: EntryFacts | undefined): QueuedJudgement {
-		return judgeTransaction({ writes, tables: this.tablesOf(collections), facts }, this.describeCollection, ahead);
+		return judgeTransaction({ writes, tables: this.tablesOf(collections), facts }, this.schema, ahead);
 	}
 
-	/** `entries`, each with the segments it still holds, its outlook's kind and its facts, beside the
-	 * deferred journaled transactions numbered below `seq`. */
+	/** `entries`, each with the segments it still holds and their tables, its outlook's kind and its
+	 * facts, beside the deferred journaled transactions numbered below `seq`. */
 	private queueAhead(entries: readonly QueuedEntry[], seq: number): QueueAhead {
-		const earlier = entries.map((entry): EarlierEntry => ({
-			transactionId: entry.id,
-			seq: entry.seq,
-			writes: this.sealedWrites(entry.id, this.heldCollections(entry)),
-			assured: this.judgements.get(entry.id)?.outlook.kind === 'assured',
-			facts: this.entryFacts.get(entry.id),
-		}));
+		const earlier = entries.map((entry): EarlierEntry => {
+			const collections = this.heldCollections(entry);
+			return {
+				transactionId: entry.id,
+				seq: entry.seq,
+				writes: this.sealedWrites(entry.id, collections),
+				tables: this.tablesOf(collections),
+				assured: this.judgements.get(entry.id)?.outlook.kind === 'assured',
+				facts: this.entryFacts.get(entry.id),
+			};
+		});
 		return { earlier, deferred: this.deferredBelow(seq) };
 	}
 
@@ -939,16 +950,30 @@ export class OfflineMode {
 		return new Map(collections.map(id => [id, registry.get(id)?.sealedActions(entryId)]));
 	}
 
+	/** The judgement's view of the schema, over the tables that published an outlook source. */
+	private readonly schema: OutlookSchema = {
+		describe: collectionId => this.describeCollection(collectionId),
+		table: name => this.publishedTable(name),
+	};
+
 	/** The first description a table behind `collectionId` publishes for it; else the name of the first
 	 * table the bridge recorded for it, when there is one. */
-	private readonly describeCollection = (collectionId: CollectionId): CollectionDescription => {
+	private describeCollection(collectionId: CollectionId): CollectionDescription {
 		const tables = this.bridge.tablesOf(collectionId);
 		for (const name of tables?.keys() ?? []) {
 			const description = this.tables.get(name)?.outlook.describe(collectionId);
 			if (description !== undefined) return description;
 		}
 		return { kind: 'unknown', table: tables === undefined ? undefined : [...tables.keys()][0] };
-	};
+	}
+
+	/** The published table Quereus names (lowercased), with its main tree's keys, when it is initialized. */
+	private publishedTable(name: QualifiedName): ReturnType<OutlookSchema['table']> {
+		const rendered = this.tablesByLowerName.get(`${name.schema}.${name.table}`.toLowerCase());
+		if (rendered === undefined) return undefined;
+		const tree = this.tables.get(rendered)?.outlook.mainTree();
+		return tree === undefined ? undefined : { name: rendered, collectionId: tree.collectionId, rowKey: tree.rowKey };
+	}
 
 	// ── translation ────────────────────────────────────────────────────────────────────────────
 

@@ -8,6 +8,7 @@ import {
   visitEveryThenThrow,
 } from '@optimystic/db-core';
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
+import type { TableWrite } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurability, type SqlCommitDurabilityListener } from './commit-durability.js';
@@ -18,7 +19,7 @@ import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
-import { emptyWriteFacts, foldWriteFacts, type WriteFact } from './write-description.js';
+import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
@@ -1984,6 +1985,29 @@ export class TransactionBridge {
     const transaction = this.currentTransaction;
     if (!transaction?.isActive || facts.length === 0) return;
     transaction.writeFacts.records.push(...facts);
+  }
+
+  /**
+   * Record what the executing statement's write description says it decided against other rows
+   * (`uncheckedOf` in write-description.ts), once per described statement: the engine hands one
+   * `TableWrite` object per execution, shared by every row's `update()`, so the first call for an
+   * object records the statement and later calls — the other rows, the upsert `DO UPDATE` arm handed
+   * the INSERT's object — add nothing. A write with no description (an FK cascade child write) records
+   * instead that a write of the transaction went undescribed, after which its decisions cannot be
+   * listed in full. Kept, discarded and folded as {@link noteWriteFacts}'s records are; a no-op with no
+   * active transaction.
+   */
+  noteWriteDescription(write: TableWrite | undefined): void {
+    const transaction = this.currentTransaction;
+    if (!transaction?.isActive) return;
+    const facts = transaction.writeFacts;
+    if (write === undefined) {
+      facts.records.push({ kind: 'undescribed' });
+      return;
+    }
+    if (facts.described.has(write)) return;
+    facts.described.add(write);
+    facts.records.push({ kind: 'statement', unchecked: uncheckedOf(write) });
   }
 
   /**

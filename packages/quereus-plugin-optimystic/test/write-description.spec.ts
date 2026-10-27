@@ -1,17 +1,18 @@
 /**
  * The rules by which a statement's write description (Quereus's `TableWrite`, docs/offline-sync.md
- * §Judging each guard) is turned into facts about the elements a row's write stages: which carry a
- * value no other writer can produce. Pure, over prepared statements alone: a plain `Database`, memory
- * tables, and the plugin's `StampId()` registered as it is in production (flagged fresh). Nothing is
- * executed and no network is touched; each case hands `Statement.getWriteScope()`'s one write site to
- * `freshElementsOf` with a hand-built description of the staged row.
+ * §Judging each guard and §Unchecked decisions) is turned into facts: which of the elements a row's
+ * write stages carry a value no other writer can produce (`freshElementsOf`), and which decisions the
+ * statement made against other rows (`uncheckedOf`). Pure, over prepared statements alone: a plain
+ * `Database`, memory tables, and the plugin's `StampId()` registered as it is in production (flagged
+ * fresh). Nothing is executed and no network is touched; each case hands `Statement.getWriteScope()`'s
+ * one write site to the rule under test.
  */
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
-import type { TableWrite } from '@quereus/quereus';
+import type { SqlParameters, TableWrite } from '@quereus/quereus';
 import register from '../dist/plugin.js';
-import { freshElementsOf, type StagedRowOf } from '../src/optimystic-adapter/write-description.js';
+import { foldWriteFacts, freshElementsOf, uncheckedOf, type StagedRowOf, type UncheckedRead } from '../src/optimystic-adapter/write-description.js';
 
 const MAIN = 'app/t';
 const EMAIL_INDEX = 'app/t/index/email';
@@ -97,5 +98,109 @@ describe('write-description: the fresh elements of a described write', () => {
 
 	it('no description (an FK cascade child write) records nothing fresh', () => {
 		expect(freshElementsOf(undefined, 'insert', row)).to.deep.equal([]);
+	});
+});
+
+/** A decision on `table` in `main`, with no pinned rows. */
+const on = (table: string, kind: UncheckedRead['kind'], scope: 'group' | 'global'): UncheckedRead =>
+	({ table: { schema: 'main', table }, kind, scope, rows: [] });
+
+describe('write-description: the decisions a described statement made against other rows', () => {
+	let db: Database;
+
+	beforeEach(async () => {
+		db = new Database();
+		// Foreign keys are enforced by default, so the child's constraint is listed with its parent read.
+		await db.exec(`
+			create table parent (id text primary key, name text) using memory;
+			create table child (id text primary key, parent_id text references parent(id), body text) using memory;
+			create table t (id text primary key, status text, n integer, x integer) using memory;
+			create table src (id text primary key, body text) using memory;
+			create table checked (id text primary key, amount integer, check (amount < (select max(n) from t))) using memory;
+		`);
+	});
+
+	afterEach(async () => { await db.close(); });
+
+	/** The one write site of `sql`, with `params` bound as the hook binds an execution's. */
+	function describedWrite(sql: string, params?: SqlParameters): TableWrite {
+		const stmt = db.prepare(sql);
+		try {
+			const { writes } = stmt.getWriteScope(params);
+			expect(writes.length, 'one write site').to.equal(1);
+			return writes[0]!;
+		} finally {
+			void stmt.finalize();
+		}
+	}
+
+	it('an insert into a child table is a foreign-key decision on the parent, global, and the parent read is consumed by it', () => {
+		const write = describedWrite(`insert into child (id, parent_id, body) values ('c', 'p', 'b')`);
+		expect(uncheckedOf(write)).to.deep.equal([on('parent', 'foreign-key', 'global')]);
+	});
+
+	it('a delete of a parent row is a foreign-key decision on the child, global; its key selection adds nothing', () => {
+		const write = describedWrite(`delete from parent where id = 'p'`);
+		expect(uncheckedOf(write)).to.deep.equal([on('child', 'foreign-key', 'global')]);
+	});
+
+	it('an update choosing its rows by a non-key predicate is one row-selection decision: the target read is covered by it', () => {
+		const write = describedWrite(`update t set status = 'done' where status = 'open'`);
+		expect(uncheckedOf(write)).to.deep.equal([on('t', 'row-selection', 'global')]);
+	});
+
+	it('an update of a row by its key, reading its own non-key column, decides nothing: the guard covers the row', () => {
+		const write = describedWrite(`update t set n = n + 1 where id = 'a'`);
+		expect(uncheckedOf(write)).to.deep.equal([]);
+	});
+
+	it('a target read wider than the key selection (a subquery over the table) is a read, global', () => {
+		const write = describedWrite(`update t set x = (select max(x) from t) where id = 'a'`);
+		expect(uncheckedOf(write)).to.deep.equal([on('t', 'read', 'global')]);
+	});
+
+	it('an insert from a select is a read with the source\'s scope: global over the whole source, group under a group by', () => {
+		expect(uncheckedOf(describedWrite(`insert into t (id, status, n, x) select id, body, 1, 2 from src`)))
+			.to.deep.equal([on('src', 'read', 'global')]);
+		expect(uncheckedOf(describedWrite(`insert into t (id, status, n, x) select id, body, count(*), 2 from src group by id, body`)))
+			.to.deep.equal([on('src', 'read', 'group')]);
+	});
+
+	it('a read pinned by a key keeps the key and the bound values, and is widened to global while a value is an unbound parameter', () => {
+		const sql = `insert into t (id, status, n, x) select id, body, 1, 2 from src where id = :source`;
+		expect(uncheckedOf(describedWrite(sql, { source: 'c1' }))).to.deep.equal([
+			{ table: { schema: 'main', table: 'src' }, kind: 'read', scope: 'row', rows: [{ key: ['id'], values: ['c1'] }] },
+		]);
+		expect(uncheckedOf(describedWrite(sql))).to.deep.equal([on('src', 'read', 'global')]);
+	});
+
+	it('a subquery pinned to a parent row keeps its own read beside the foreign key: the whole-table watch is the parent probe\'s', () => {
+		const write = describedWrite(`insert into child (id, parent_id, body) values ('c', 'p', (select name from parent where id = 'p'))`);
+		expect(uncheckedOf(write)).to.deep.equal([
+			on('parent', 'foreign-key', 'global'),
+			{ table: { schema: 'main', table: 'parent' }, kind: 'read', scope: 'row', rows: [{ key: ['id'], values: ['p'] }] },
+		]);
+	});
+
+	it('a cross-row CHECK is a check decision on the written table beside the read of the table its subquery reads', () => {
+		const write = describedWrite(`insert into checked (id, amount) values ('k', 1)`);
+		expect(uncheckedOf(write)).to.deep.equal([on('checked', 'check', 'global'), on('t', 'read', 'global')]);
+	});
+
+	it('folding a transaction\'s records concatenates the statements\' decisions in order, deduped with their rows merged, and is complete only while every write was described', () => {
+		const pinned = (value: string): UncheckedRead => ({ table: { schema: 'main', table: 'src' }, kind: 'read', scope: 'row', rows: [{ key: ['id'], values: [value] }] });
+		const described = [
+			{ kind: 'statement' as const, unchecked: [pinned('c1'), on('parent', 'foreign-key', 'global')] },
+			{ kind: 'fresh' as const, collectionId: MAIN, key: 'K' },
+			{ kind: 'statement' as const, unchecked: [pinned('c2'), pinned('c1')] },
+		];
+		const folded = foldWriteFacts(described);
+		expect(folded.unchecked).to.deep.equal([
+			{ table: { schema: 'main', table: 'src' }, kind: 'read', scope: 'row', rows: [{ key: ['id'], values: ['c1'] }, { key: ['id'], values: ['c2'] }] },
+			on('parent', 'foreign-key', 'global'),
+		]);
+		expect(folded.complete).to.equal(true);
+		expect([...folded.fresh.get(MAIN) ?? []]).to.deep.equal(['K']);
+		expect(foldWriteFacts([...described, { kind: 'undescribed' }]).complete).to.equal(false);
 	});
 });

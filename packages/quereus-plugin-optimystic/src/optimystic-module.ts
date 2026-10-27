@@ -10,7 +10,7 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
-import type { MainTreeDescription, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
+import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
 import { emptyWriteFacts, freshElementsOf } from './optimystic-adapter/write-description.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
@@ -663,6 +663,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
   private readonly outlookSource: TableOutlookSource = {
     describe: collectionId => this.describeCollection(collectionId),
+    mainTree: () => this.mainTreeKeys(),
   };
   /**
    * Live reads of this table are being served from this machine's own view because the cohort cannot
@@ -1408,6 +1409,44 @@ export class OptimysticVirtualTable extends VirtualTable {
       };
     }
     return undefined;
+  }
+
+  /** This table's main tree as a key encoder for the outlook's dependency rule
+   * (`TableOutlookSource.mainTree`); `undefined` before the table is initialized. Read from the live
+   * codec and schema at call time, as {@link describeCollection} is. */
+  private mainTreeKeys(): MainTreeKeys | undefined {
+    const collection = this.collection;
+    const rowCodec = this.rowCodec;
+    if (!collection || !rowCodec) return undefined;
+    return {
+      collectionId: collection.getCollection().id,
+      rowKey: (key, values) => this.rowKeyOf(rowCodec, key, values),
+    };
+  }
+
+  /**
+   * The main-tree key of the row a read pinned by `key` = `values`, built exactly as a point lookup
+   * builds its seek key ({@link executePointLookup}: the values reordered into primary-key order,
+   * then `createPrimaryKey` over `asPrimaryKeyTuple`), so it matches the key the row was staged
+   * under. `undefined` when `key` is not this table's primary key — compared lowercased, since Quereus
+   * lowercases the names it reads, in any order — or when the codec refuses a value.
+   */
+  private rowKeyOf(rowCodec: RowCodec, key: readonly string[], values: readonly SqlValue[]): string | undefined {
+    const primaryKey = this.tableSchema.primaryKeyDefinition;
+    if (key.length !== primaryKey.length || values.length !== key.length) return undefined;
+    const lowered = key.map(column => column.toLowerCase());
+    const ordered: SqlValue[] = [];
+    for (const column of primaryKey) {
+      const at = lowered.indexOf((this.tableSchema.columns[column.index]?.name ?? '').toLowerCase());
+      if (at < 0) return undefined;
+      ordered.push(values[at] ?? null);
+    }
+    try {
+      return rowCodec.createPrimaryKey(rowCodec.asPrimaryKeyTuple(ordered));
+    } catch (error) {
+      log('outlook:row-key-unencodable table=%s key=%o: %o', this.tableName, key, error);
+      return undefined;
+    }
   }
 
   /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */
@@ -2979,6 +3018,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
 
     const txnState = this.txnBridge.getCurrentTransaction();
+
+    // Ahead of every arm's staging, DELETE's included: the statement's decisions against other rows
+    // are recorded once per description (the bridge keys on the object), and a statement that then
+    // fails is discarded with its rows by the statement savepoint's rollback.
+    this.txnBridge.noteWriteDescription(args.writeScope);
 
     try {
       switch (operation) {
