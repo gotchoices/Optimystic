@@ -4,7 +4,9 @@ import type {
 	JournalSettledStatus, QueuedFailureReason, WriteDurability,
 } from '@optimystic/db-core';
 import type { QualifiedTableName } from '../schema/table-identity.js';
+import type { EntryFacts } from './commit-outlook.js';
 import type { TransactionOutcome } from './offline-status.js';
+import { encodeFacts, type JournaledFacts } from './write-description.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('offline-journal');
@@ -69,6 +71,10 @@ export type EntryRecordV1 = {
 	readonly queuedAt: number;
 	readonly expiresAt?: number;
 	readonly segments: readonly JournaledSegment[];
+	/** What the transaction's statements' write descriptions said about its elements and decisions, for
+	 * the restore to judge it with ({@link JournaledFacts}). Absent in a record written before the field
+	 * existed, which is restored without facts and judged from its checks and tags alone. */
+	readonly outlook?: JournaledFacts;
 };
 
 /** `null` stands for a collection saved with its holders unknown — JSON has no `undefined`. */
@@ -139,6 +145,9 @@ export interface OfflineJournalHooks {
 	 * committed transaction's durability as it translates, and keeps the translation for the status
 	 * the queue emits right after. */
 	outcomeOf(status: JournalSettledStatus): RetainedOutcome;
+	/** The facts the controller holds for the transaction being enqueued: handed in ahead of the enqueue
+	 * (`OfflineMode.enqueue`), so present when the entry record is written inside it. */
+	factsOf(transactionId: string): EntryFacts | undefined;
 }
 
 /** `seq` as a key segment: zero-padded to 12 digits, so string order is numeric order. */
@@ -303,6 +312,7 @@ export class OfflineJournal implements IOfflineJournal {
 		if (!JOURNAL_KEY_SEGMENT.test(record.id)) {
 			throw new Error(`offline journal: transaction id '${record.id}' cannot key its outcome record (letters, digits, '_' and '-' only)`);
 		}
+		const facts = this.hooks.factsOf(record.id);
 		return {
 			v: JOURNAL_RECORD_VERSION,
 			transactionId: record.id,
@@ -314,6 +324,7 @@ export class OfflineJournal implements IOfflineJournal {
 				table: this.tableOf(segment.collectionId),
 				actions: segment.actions,
 			})),
+			...(facts === undefined ? {} : { outlook: encodeFacts(facts) }),
 		};
 	}
 

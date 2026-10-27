@@ -20,8 +20,8 @@ import type { ICohortReachability, IRepo, ITransactor } from '@optimystic/db-cor
 import { waitFor } from '@optimystic/db-core/test';
 import { KvRawStorage, MemoryRawStorage, WriteGroupDriver, durabilityWindowMs, resolveDurabilityWindowPolicy, type IKVStore } from '@optimystic/db-p2p';
 import { MemoryBatchBackend, PowerLossKVStore, type Mesh } from '@optimystic/db-p2p/testing';
-import { EntryNotDiscardableError, OfflineJournalError, type QueuedTransactionStatus } from '../dist/index.js';
-import type { DriveRecordV1 } from '../src/optimystic-adapter/offline-journal.js';
+import { EntryNotDiscardableError, OfflineJournalError, type CommitOutlook, type QueuedTransactionStatus } from '../dist/index.js';
+import type { DriveRecordV1, EntryRecordV1 } from '../src/optimystic-adapter/offline-journal.js';
 import { Isolation, unavailableIn, withReads } from './isolation.js';
 import { keysOf, record } from './journal-records.js';
 import { countTreeEntries, createMeshDbNode, loggedUnder, startMockMesh, type MeshDbNode, type MockMeshOptions } from './mesh-node-harness.js';
@@ -37,6 +37,10 @@ const OTHER_URI = 'tree://offline-restore/other';
 const createNotes = `create table Notes (id integer primary key, body text) using optimystic('${NOTES_URI}')`;
 const createNotesIndex = 'create index NotesBody on Notes (body)';
 const createOther = `create table Other (id integer primary key) using optimystic('${OTHER_URI}')`;
+/** Natural primary key; a message references its conversation, a decision made against the parent row. */
+const createConversations = `create table Conversations (id text primary key, title text) using optimystic('tree://offline-restore/conversations')`;
+const MESSAGES_COLLECTION = 'offline-restore/messages';
+const createMessages = `create table Messages (id text primary key, conversation text references Conversations(id), body text) using optimystic('tree://${MESSAGES_COLLECTION}')`;
 const ENTRY_1 = 'optimystic-offline/default/entries/000000000001';
 const DRIVE_1 = 'optimystic-offline/default/drives/000000000001';
 
@@ -93,6 +97,24 @@ const notesOf = (db: Database): Promise<Record<string, unknown>[]> => queryAll(d
 
 const statusesOf = <K extends QueuedTransactionStatus['kind']>(statuses: readonly QueuedTransactionStatus[], kind: K, transactionId: string): Extract<QueuedTransactionStatus, { kind: K }>[] =>
 	statuses.filter((status): status is Extract<QueuedTransactionStatus, { kind: K }> => status.kind === kind && status.transactionId === transactionId);
+
+/** The outlook each queued transaction's status carries, in queue order. */
+const outlooksOf = (node: MeshDbNode): (CommitOutlook | undefined)[] =>
+	node.plugin.offline.entries().map(entry => entry.status.kind === 'queued' ? entry.status.outlook : undefined);
+
+/** A copy of `store` whose entry records carry no `outlook`, as a build before the field wrote them. */
+async function withoutOutlook(store: IKVStore): Promise<PowerLossKVStore> {
+	const durable = new Map<string, string>();
+	for (const key of await store.list('optimystic-offline/')) {
+		let value = (await store.get(key))!;
+		if (key.includes('/entries/')) {
+			const { outlook: _outlook, ...older } = JSON.parse(value) as EntryRecordV1;
+			value = JSON.stringify(older);
+		}
+		durable.set(key, value);
+	}
+	return new PowerLossKVStore(durable);
+}
 
 /** The crash: the journal loses power, and A's plugin is disposed as a dead process's drain is gone. */
 async function crashA(store: PowerLossKVStore, a: NodeA): Promise<PowerLossKVStore> {
@@ -260,6 +282,56 @@ describe('Offline mode: restoring the queue from its journal after a restart', f
 		gate.open = true;
 		await a2.plugin.offline.whenDrained();
 		expect(await notesOf(b.db)).to.deep.equal([{ id: 1, body: 'acknowledged' }]);
+	});
+
+	it('the outlooks queued transactions had survive a crash after the local acknowledgement: the write-description facts are journaled with each, a key-pinned read comes back matched by its table, and a record without the facts comes back judged by its checks alone', async () => {
+		const { transactorFor } = await startMockMesh(1);
+		const store = new PowerLossKVStore();
+		const gate = new Gate(false);
+		const a = openA(transactorFor(0), store, { gate });
+		await a.db.exec(createConversations);
+		await a.db.exec(createMessages);
+		a.plugin.offline.enter();
+		await a.db.exec(`insert into Conversations (id, title) values ('c1', 'hello')`);
+		await a.db.exec(`insert into Conversations (id, title) values ('c2', 'other')`);
+		await a.db.exec(`begin; insert into Messages (id, conversation, body) values (StampId(), 'c1', 'hi'); commit`);
+		// Reads c1's row alone, pinned by its key.
+		await a.db.exec(`insert into Conversations (id, title) select 'c3', title from Conversations where id = 'c1'`);
+		const [c1, c2, message, c3] = a.plugin.offline.entries().map(entry => entry.transactionId) as [string, string, string, string];
+		const before = outlooksOf(a);
+		expect(before[2], 'the message, before the crash').to.deep.equal({
+			kind: 'assured',
+			exposures: [],
+			dependsOn: [{ transactionId: c1, via: 'unchecked' }, { transactionId: c2, via: 'unchecked' }],
+			unchecked: [{ table: 'main.Conversations', kind: 'foreign-key', scope: 'global' }],
+		});
+		expect(before[3]!.dependsOn, 'the key-pinned read, before the crash').to.deep.equal([{ transactionId: c1, via: 'unchecked' }]);
+		const reopened = await crashA(store, a);
+		const messageRecord = await record<EntryRecordV1>(reopened, 'optimystic-offline/default/entries/000000000003');
+		expect(messageRecord.outlook?.fresh.map(([collectionId, keys]) => [collectionId, keys.length]), "the message's key is fresh").to.deep.equal([[MESSAGES_COLLECTION, 1]]);
+		expect(messageRecord.outlook).to.deep.include({
+			unchecked: [{ table: { schema: 'main', table: 'conversations' }, kind: 'foreign-key', scope: 'global' }],
+			complete: true,
+		});
+
+		const a2 = openA(transactorFor(0), reopened, { gate });
+		await a2.plugin.hydrate(a2.db);
+		expect(outlooksOf(a2), 'the same outlooks, but the key-pinned read now depends on every earlier writer of its table').to.deep.equal([
+			...before.slice(0, 3),
+			{ ...before[3]!, dependsOn: [{ transactionId: c1, via: 'unchecked' }, { transactionId: c2, via: 'unchecked' }] },
+		]);
+		await a2.plugin.dispose();
+
+		const a3 = openA(transactorFor(0), await withoutOutlook(reopened), { gate });
+		await a3.plugin.hydrate(a3.db);
+		const older = outlooksOf(a3);
+		expect(older[2], 'the message, from a record without the facts').to.deep.equal({
+			kind: 'exposed',
+			exposures: [{ table: 'main.Messages', rule: 'primary-key', key: [message] }],
+			dependsOn: [],
+			unchecked: 'not-computed',
+		});
+		expect(older[3]!.unchecked, `${c3}: nothing to judge its read by`).to.equal('not-computed');
 	});
 
 	it('a crash between writing the drive record and the send reaching the cohort: the restored entry is in doubt, discard refuses it, and it drains once under the recorded action id', async () => {

@@ -193,13 +193,14 @@ export class OfflineMode {
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
 	/** Each queued transaction's judgement, made when the queue first reported it `queued`
 	 * ({@link judgeQueued}), kept current as the queue changes ({@link followQueue}) and held until it
-	 * settles. Nothing of it is journaled: a restart judges a restored transaction again when the
-	 * restore puts it back. */
+	 * settles. The judgement is not journaled, its inputs are — the segments and {@link entryFacts} — so
+	 * a restart judges a restored transaction again, as it was judged, when the restore puts it back. */
 	private readonly judgements = new Map<string, HeldJudgement>();
 	/** What each queued transaction's statements' write descriptions said about its elements, handed in
-	 * by {@link enqueue} ahead of the enqueue (the judgement runs inside it) and held, like its
-	 * judgement, until it settles. A transaction a restore put back has none until the facts are
-	 * journaled; the judgement then reads the tags alone. */
+	 * ahead of the `queued` status that judges it — by {@link enqueue} ahead of the enqueue, where the
+	 * journal also writes them into the entry record, and by the restore ahead of `queue.restore`, read
+	 * back from that record — and held, like its judgement, until it settles. A transaction restored from
+	 * a record written before the facts were journaled has none; the judgement then reads the tags alone. */
 	private readonly entryFacts = new Map<string, EntryFacts>();
 	/** Assured transactions that failed anyway ({@link reportAssuredFailure}), published on the state. */
 	private assuredFailures = 0;
@@ -214,6 +215,7 @@ export class OfflineMode {
 		this.journal = config.journal === undefined ? undefined : new OfflineJournal(config.journal, config.journalLabel ?? DEFAULT_JOURNAL_LABEL, {
 			tablesOf: id => this.bridge.tablesOf(id),
 			outcomeOf: status => this.journalOutcome(status),
+			factsOf: transactionId => this.entryFacts.get(transactionId),
 		});
 		// The gates' wakes reach the queue through `onGateChange`, never as `wakeOn`: a wake must also
 		// start a restore pass, which nothing else asks for while the queue is empty.
@@ -233,6 +235,8 @@ export class OfflineMode {
 			collectionsOfTable: table => this.requireTableResolver().collectionsOfTable(this.db, table),
 			retainOutcome: outcome => this.retainRead(outcome),
 			emitSettled: status => this.onQueueStatus(status),
+			factsRestored: (transactionId, facts) => { this.entryFacts.set(transactionId, facts); },
+			restoreRolledBack: transactionId => this.forgetUnqueuedFacts(transactionId),
 		});
 		this.networkCommitTimeoutMs = config.networkCommitTimeoutMs ?? NetworkCommitBoundMs;
 		this.lastQueueState = this.queue.queueState();
@@ -560,6 +564,12 @@ export class OfflineMode {
 			if (entry === undefined) this.entryFacts.delete(transactionId);
 		}
 		return entry === undefined ? undefined : this.listed(entry);
+	}
+
+	/** Drop the facts handed in for a transaction a restore did not put back; kept if the queue lists it,
+	 * whose facts are dropped when it settles. */
+	private forgetUnqueuedFacts(transactionId: string): void {
+		if (this.queue.status(transactionId) === undefined) this.entryFacts.delete(transactionId);
 	}
 
 	/** Follow every queued transaction's statuses (docs/offline-sync.md §Following transactions).

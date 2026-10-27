@@ -28,7 +28,8 @@ export type UncheckedRead = {
 	readonly table: QualifiedName;
 	readonly kind: UncheckedDecision['kind'];
 	readonly scope: UncheckedDecision['scope'];
-	/** For scope `'row'`, the rows the read pinned; empty for the other scopes. */
+	/** For scope `'row'`, the rows the read pinned — none for a read restored from the journal
+	 * ({@link encodeFacts}), which the judgement then matches by its table; empty for the other scopes. */
 	readonly rows: readonly PinnedRow[];
 };
 
@@ -325,4 +326,47 @@ export function foldWriteFacts(records: readonly WriteFact[]): EntryFacts {
 		}
 	}
 	return { fresh, unchecked: dedupeReads(unchecked), complete };
+}
+
+// ── the facts across a restart ───────────────────────────────────────────────────────────────
+
+/**
+ * An entry's facts as its journal entry record carries them (`EntryRecordV1.outlook` in
+ * offline-journal.ts; docs/offline-sync.md §What is journaled): JSON-safe, so the restore after a
+ * restart hands the controller what the statements' write descriptions said, and the restored
+ * transaction is judged as it was before.
+ */
+export type JournaledFacts = {
+	/** `EntryFacts.fresh` as pairs: each collection with the keys of its fresh elements. */
+	readonly fresh: readonly (readonly [CollectionId, readonly string[]])[];
+	/** `EntryFacts.unchecked`, each read without its pinned rows ({@link encodeFacts}). */
+	readonly unchecked: readonly Omit<UncheckedRead, 'rows'>[];
+	readonly complete: boolean;
+};
+
+/**
+ * `facts` as the entry record journals them ({@link JournaledFacts}).
+ *
+ * NOTE: a `row` read's pinned rows are not journaled — a bound value can be a bigint or bytes, which
+ * the journal's `JSON.stringify` cannot carry — so a restored read is matched by its table, as a
+ * `group` read is, and keeps its reported scope: a restored outlook can list a dependency the original
+ * did not, never miss one, and only until that earlier entry settles. If restored outlooks ever list
+ * dependencies an application cannot act on, journal the encoded main-tree keys instead (the controller
+ * can encode them at enqueue, since every published table hands it its key codec).
+ */
+export function encodeFacts(facts: EntryFacts): JournaledFacts {
+	return {
+		fresh: [...facts.fresh].map(([collectionId, keys]) => [collectionId, [...keys]]),
+		unchecked: facts.unchecked.map(({ table, kind, scope }) => ({ table: { schema: table.schema, table: table.table }, kind, scope })),
+		complete: facts.complete,
+	};
+}
+
+/** The facts an entry record's `outlook` carries, each read with no pinned rows ({@link encodeFacts}). */
+export function decodeFacts(journaled: JournaledFacts): EntryFacts {
+	return {
+		fresh: new Map(journaled.fresh.map(([collectionId, keys]) => [collectionId, new Set(keys)])),
+		unchecked: journaled.unchecked.map(read => ({ ...read, rows: [] })),
+		complete: journaled.complete,
+	};
 }

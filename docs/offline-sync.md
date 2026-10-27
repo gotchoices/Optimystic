@@ -1,7 +1,7 @@
 # Offline Sync: Locally Acknowledged Transactions (Design)
 
-**Status: stages 1 to 8 of [Implementation stages](#implementation-stages) are implemented, stage 9
-is in progress; the rest is a proposal.** It describes an opt-in operating
+**Status: stages 1 to 9 of [Implementation stages](#implementation-stages) are implemented; the
+rest is a proposal.** It describes an opt-in operating
 mode for the Quereus plugin in which a SQL `commit` returns once the transaction is queued on this
 machine, and the plugin then commits it to the network in the background, reporting each
 transaction's progress to the application until it is committed or has failed.
@@ -891,10 +891,9 @@ type CommitOutlook = {
   /** Decisions made against rows nothing re-checks at rebase. Independent of `kind`: they do not
    *  make the entry fail, they can make it commit with a decision a fresh evaluation would refuse.
    *  'not-computed' when the analysis had no description of what a statement read: a statement of
-   *  the entry was undescribed (an FK cascade child write), or the entry was restored after a
-   *  restart before its facts were journaled (stage 9's third ticket removes the second). A string
-   *  rather than an absent field, because `CommitOutlook()` renders this as JSON, where an absent
-   *  key would be ambiguous. */
+   *  the entry was undescribed (an FK cascade child write). (An entry restored from a journal record
+   *  written before the facts were journaled has none either.) A string rather than an absent
+   *  field, because `CommitOutlook()` renders this as JSON, where an absent key would be ambiguous. */
   unchecked: readonly UncheckedDecision[] | 'not-computed';
 };
 
@@ -917,8 +916,12 @@ before `commit` resolves. More exactly, it is computed when the queue emits the 
 `queued` status — inside the enqueue, after sealing, or inside the restore after a restart that
 puts the entry back — from the sealed segments, and the controller holds it per transaction id until
 the entry settles. The entry's own judgement (its exposures, below, and what each of its guards
-covers) is fixed then and never recomputed: a tag changed later does not re-judge it. Nothing of it
-is journaled; a restart judges a restored entry again, against the entries restored before it.
+covers) is fixed then and never recomputed: a tag changed later does not re-judge it. The judgement
+itself is not journaled, but what it is made from is: the sealed segments, and the facts the
+statements' write descriptions recorded ([What is journaled](#what-is-journaled)). A restart judges a
+restored entry again from those, against the entries restored before it, and so gives it the outlook
+it had, with one widening: a `row` read comes back without the rows it pinned, and is matched by its
+table.
 
 The rest follows the queue. After every status that changes what is queued — an entry committed,
 partly committed or failed, or one a restore put back ahead of others — the controller walks the
@@ -1035,8 +1038,9 @@ guard that can be refused:
   one, so a failed statement leaves no record and a rolled-back statement's fresh key is never
   credited to a later statement that supplies it as a literal. A cascade child write carries no
   description and records nothing; the upsert `DO UPDATE` arm receives the INSERT's description and
-  records nothing. The facts are held in memory with the judgement: a transaction restored after a
-  restart has none until they are journaled, and is judged from the tags alone.
+  records nothing. The facts are held in memory with the judgement and journaled in the entry
+  record, so a transaction restored after a restart is judged with them ([What is
+  journaled](#what-is-journaled)).
 - **Exposures name what a user can recognise.** `absent` reports `rule: 'primary-key'` with the
   decoded primary key; `absentRange` reports `rule: 'unique'` with the constraint's columns and the
   unique value decoded from the range's lower bound (`decodeIndexKey` in
@@ -1126,9 +1130,9 @@ table of this plugin whose every pinned row encodes to a main-tree key — the r
 table's primary key, in any order, and every value encodes — matches an earlier entry whose segment
 in that main tree wrote one of those keys (an unreadable segment counts as writing every key), the
 lookup an `absent` guard makes. Every other decision — `group` or `global`, a `row` read pinned by a
-key other than the primary key, or one on a table no vtab of this plugin published or has not yet
-initialized — matches every earlier entry with a segment in any collection of the table, its main
-tree or an index tree. The encoding is the table's own (`TableOutlookSource.mainTree`, built as a
+key other than the primary key, one on a table no vtab of this plugin published or has not yet
+initialized, or one restored after a restart, whose pinned rows are not journaled — matches every
+earlier entry with a segment in any collection of the table, its main tree or an index tree. The encoding is the table's own (`TableOutlookSource.mainTree`, built as a
 point lookup builds its seek key), resolved when the entry is judged and fixed with its judgement; a
 published table is named by its `schema.table` rendering whether or not it is initialized, so a
 decision read before the table is first touched in this process (a restored entry's) still matches by
@@ -1393,7 +1397,7 @@ version, `v: 1`, which a reader that does not know it refuses rather than guesse
 
 | Key | Written | Value |
 |---|---|---|
-| `entries/<seq>` | once, at enqueue (`queued`) | `{ v, transactionId, seq, queuedAt, expiresAt?, segments: [{ collectionId, table, actions }] }` |
+| `entries/<seq>` | once, at enqueue (`queued`) | `{ v, transactionId, seq, queuedAt, expiresAt?, segments: [{ collectionId, table, actions }], outlook? }` |
 | `drives/<seq>` | before each send, after a partial commit, after an identity renewal (`driving`) | `{ v, transactionId, actionId, attempts: [[collectionId, InFlightAttempt]…], committed: [[collectionId, WriteDurability \| null]…] }` |
 | `outcomes/<transactionId>` | at a terminal outcome (`settled`), before the other two are deleted | `{ v, at, status }`, `status` the outcome as [Outcomes after a restart](#outcomes-after-a-restart) describes |
 
@@ -1403,6 +1407,22 @@ first the bridge recorded; a collection backing two tables is logged
 collection backing none fails the commit, since nothing could restore it. The transaction id keys
 the outcome record, which works because a `StampId()` is base64url. Maps are written as pairs, and a
 collection saved with its holders unknown as `null`.
+
+The entry record's `outlook` holds what only the original statements could see: the facts their
+write descriptions recorded ([Judging each guard](#judging-each-guard), [Unchecked
+decisions](#unchecked-decisions)), as `{ fresh: [[collectionId, [key…]]…], unchecked: [{ table: {
+schema, table }, kind, scope }…], complete }` (`JournaledFacts`, written by `encodeFacts` and read
+back by `decodeFacts` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`).
+The journal asks the controller for them as it writes the record (`OfflineJournalHooks.factsOf`); the
+controller holds them from before the enqueue. The restore hands them back ahead of
+`OfflineQueue.restore` (`RestoreHost.factsRestored`), so the `queued` status that judges the restored
+entry judges it with them, and withdraws them if the restore throws. A `row` read's pinned rows are
+left out: a bound value can be a bigint or bytes, which the journal's JSON cannot carry. A restored
+read is therefore matched by its table, as a `group` read is, and keeps its reported `scope`, so its
+`dependsOn` can be wider than before the restart, never narrower, and only until the extra earlier
+entry settles; the tripwire `NOTE:` at `encodeFacts` names the remedy. A record without the field,
+written by a build before it existed, is restored without facts and judged from its checks and tags
+alone, with `unchecked: 'not-computed'`; the record version stays 1.
 
 **Actions, not transforms.** Transforms are block operations relative to the base the actions were
 staged on. After a restart, or after a rival's commit, the base is different, and the actions have
@@ -1826,10 +1846,9 @@ stage 8 needs nothing here, and stages 9 and 10 need 7 and 8.
    and the module hook that hands it to the vtab for the executing statement — the DML read scope
    with binding modes, per-column value provenance, target-row selection, and constraint
    classification.
-9. **The outlook from the write description** (in progress, three tickets: fresh-value detection
-   from provenance and the `unchecked` decisions with their dependencies are implemented; the
-   journaling of the facts so a restored transaction is judged with them follows). Fresh-value
-   detection from provenance, `unchecked` decisions, and dependencies through unchecked reads.
+9. **The outlook from the write description** (implemented, in three tickets). Fresh-value
+   detection from provenance, `unchecked` decisions, dependencies through unchecked reads, and the
+   journaling of the facts the first two rest on, so a restored transaction is judged with them.
 10. **Guards that accept an already-applied write.** The three variants, gated on the write
     description's self-independence and disposition facts, with the `already-applied` effect on
     `committed`.
@@ -1949,7 +1968,15 @@ foreign key in `unchecked`, then a transaction that both updates the conversatio
 message listing the entry once, as `'guard'`; and a memo copied from one note by its key, depending
 on the entry that inserted that note and not on the entry that inserted another — which pins the key
 encoder and the key-span match together. Every `unchecked` the earlier cases assert is now `[]`.
-Of the list below, what is left waits for its stage: the rest of stage 9, and stage 10.
+
+Stage 9's third ticket pins the facts across a restart. `offline-restore.spec.ts`: two conversations
+under natural keys, a message under `StampId()` referencing the first, and a conversation copied from
+the first by its key, queued and then crashed after the local acknowledgement. The message's entry
+record carries its one fresh key, the foreign key and `complete: true`; after `hydrate` every outlook
+equals the one before the crash except the copy's, whose read is now matched by its table and so
+depends on both earlier conversations; and the same records without `outlook` restore the message
+exposed on its key with `unchecked: 'not-computed'`.
+Of the list below, what is left waits for its stage: stage 10.
 
 - Offline commit, read back, reconnect, drain: the row is on the other machine, and `queued` →
   `submitting` → `committed` is reported once each, with the same `transactionId`.

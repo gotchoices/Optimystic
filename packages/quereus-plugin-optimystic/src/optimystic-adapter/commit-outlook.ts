@@ -22,10 +22,10 @@ export type CommitOutlook = {
 	/** Decisions made against rows nothing re-checks when the transaction is submitted
 	 * (docs/offline-sync.md §Unchecked decisions), read from the write description of each statement.
 	 * `'not-computed'` when a statement of the transaction was undescribed (an FK cascade child write),
-	 * or the transaction was restored after a restart without its facts — a string rather than an
-	 * absent field, so the JSON `CommitOutlook()` answers says so too. Independent of `kind`: a
-	 * decision does not make the transaction fail, it can make it commit as a fresh evaluation would
-	 * not. */
+	 * or the transaction was restored from a journal record written before its facts were journaled —
+	 * a string rather than an absent field, so the JSON `CommitOutlook()` answers says so too.
+	 * Independent of `kind`: a decision does not make the transaction fail, it can make it commit as a
+	 * fresh evaluation would not. */
 	readonly unchecked: readonly UncheckedDecision[] | 'not-computed';
 };
 
@@ -132,8 +132,8 @@ export type StagedWrites = ReadonlyMap<CollectionId, readonly Action<unknown>[] 
 
 /** What the write descriptions of a transaction's statements said about its staged elements and its
  * decisions (`freshElementsOf` and `uncheckedOf` in write-description.ts, recorded by the vtab as it
- * stages and folded by `foldWriteFacts`). `undefined` where the judgement has none: a transaction
- * restored after a restart, until the facts are journaled. */
+ * stages and folded by `foldWriteFacts`; journaled with the entry by `encodeFacts`). `undefined` where
+ * the judgement has none: a transaction restored from a journal record written before the facts were. */
 export type EntryFacts = {
 	/** Per collection, the keys of the elements whose value came from a fresh source: the primary key of
 	 * a main-tree entry, the tree key of a unique-index entry. */
@@ -506,9 +506,9 @@ function ownJudgement(
  * the judgement: a decision on a published table is named by the table's `schema.table`, one on any
  * other table by Quereus's lowercased name. A `row` read on an initialized published table whose every
  * pinned row encodes to a main-tree key is matched by those keys; every other decision — a `group` or
- * `global` one, a `row` read on an unpublished or uninitialized table, or one with a row pinned by a
- * key other than the primary key — by its table alone. `'not-computed'` with no facts, or facts a
- * cascade child write left incomplete.
+ * `global` one, a `row` read on an unpublished or uninitialized table, one with a row pinned by a key
+ * other than the primary key, or one restored from the journal, which carries no rows — by its table
+ * alone. `'not-computed'` with no facts, or facts a cascade child write left incomplete.
  */
 function judgedReads(facts: EntryFacts | undefined, schema: OutlookSchema): JudgedRead[] | 'not-computed' {
 	if (facts === undefined || !facts.complete) return 'not-computed';
@@ -523,8 +523,11 @@ function judgedReads(facts: EntryFacts | undefined, schema: OutlookSchema): Judg
 	});
 }
 
-/** Every pinned row's main-tree key, or `undefined` as soon as one does not encode. */
+/** Every pinned row's main-tree key, or `undefined` as soon as one does not encode — or when there are
+ * none, as for a read restored from the journal (`encodeFacts` in write-description.ts): an empty key
+ * list would match no earlier writer, narrower than the read. */
 function encodedKeys(rows: readonly PinnedRow[], table: MainTreeKeys): string[] | undefined {
+	if (rows.length === 0) return undefined;
 	const keys: string[] = [];
 	for (const { key, values } of rows) {
 		const encoded = table.rowKey(key, values);

@@ -6,6 +6,8 @@ import {
 	decodeDriveRecord, decodeEntryRecord, decodeOutcome, decodeOutcomeRecord, seqKey,
 	type DriveRecordV1, type EntryRecordV1, type JournaledSegment, type OfflineJournal, type RetainedOutcome, type ScannedRecord,
 } from './offline-journal.js';
+import { decodeFacts } from './write-description.js';
+import type { EntryFacts } from './commit-outlook.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger } from '../logger.js';
 
@@ -55,6 +57,13 @@ export interface RestoreHost {
 	retainOutcome(outcome: RetainedOutcome): void;
 	/** A terminal status the restore settled itself (a deferred record discarded), to report as the queue's. */
 	emitSettled(status: JournalSettledStatus): void;
+	/** The facts a journaled transaction's entry record carries, handed in ahead of `queue.restore`,
+	 * whose `queued` status judges the transaction with them; held, like an enqueued transaction's,
+	 * until it settles. */
+	factsRestored(transactionId: string, facts: EntryFacts): void;
+	/** `queue.restore` threw, so the transaction is not queued and nothing will judge or settle it:
+	 * forget the facts {@link factsRestored} handed in. The next pass hands them in again. */
+	restoreRolledBack(transactionId: string): void;
 }
 
 type RestoreOutcome = { kind: 'restored' } | { kind: 'deferred'; reason: Exclude<DeferredReason, 'behind-deferred'>; table: string };
@@ -311,9 +320,11 @@ export class OfflineRestore {
 	}
 
 	/**
-	 * Resolve the record's collections and put the entry back through `OfflineQueue.restore`. A
-	 * `BlockUnavailableError` out of a table's initialization, or out of a segment's replay (the queue
-	 * then rolls the registration back), defers the record; any other error propagates.
+	 * Resolve the record's collections and put the entry back through `OfflineQueue.restore`, its
+	 * journaled facts handed to the controller first, so the `queued` status the restore emits judges
+	 * the transaction as it was judged before the restart. A `BlockUnavailableError` out of a table's
+	 * initialization, or out of a segment's replay (the queue then rolls the registration back), defers
+	 * the record; any other error propagates.
 	 */
 	private async restoreOne(entry: EntryRecordV1, drive: DriveRecordV1 | undefined): Promise<RestoreOutcome> {
 		const resolved = await this.resolveCollections(entry);
@@ -330,6 +341,7 @@ export class OfflineRestore {
 		// Before the queue can drive it: its first drive record, or the settlement of an entry whose every
 		// collection already holds its attempt, is keyed by this sequence number.
 		this.host.journal.adopt(entry.transactionId, entry.seq);
+		if (entry.outlook !== undefined) this.host.factsRestored(entry.transactionId, decodeFacts(entry.outlook));
 		let staging: JournaledSegment | undefined;
 		try {
 			await this.host.queue.restore(init, collection => {
@@ -337,6 +349,7 @@ export class OfflineRestore {
 				return this.stage(entry, drive, staging, collection);
 			});
 		} catch (error) {
+			this.host.restoreRolledBack(entry.transactionId);
 			if (unavailableIn(error) === undefined) throw error;
 			return { kind: 'deferred', reason: 'unreadable', table: qualifiedTableName((staging ?? entry.segments[0]!).table) };
 		}
