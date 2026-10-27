@@ -2026,8 +2026,9 @@ equals the one before the crash except the copy's, whose read is now matched by 
 depends on both earlier conversations; and the same records without `outlook` restore the message
 exposed on its key with `unchecked: 'not-computed'`.
 Stage 10's already-applied cases — two machines marking one task done, two deleting one row, two
-incrementing one counter, and two inserting one row under `insert or ignore` beside a plain `insert`
-— are pinned end to end in `packages/quereus-plugin-optimystic/test/offline-mode-two-machine.spec.ts`,
+replacing one row with `insert or replace`, two incrementing one counter, two inserting one row under
+`insert or ignore` beside a plain `insert`, and two inserting one row into a content-keyed table — are
+pinned end to end in `packages/quereus-plugin-optimystic/test/offline-mode-two-machine.spec.ts`,
 the gates over prepared statements in
 `packages/quereus-plugin-optimystic/test/write-description.spec.ts`, and the outlook's reading of the
 variants in `packages/quereus-plugin-optimystic/test/commit-outlook.spec.ts`. Every case below is

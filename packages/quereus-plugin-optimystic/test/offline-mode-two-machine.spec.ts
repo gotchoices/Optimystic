@@ -219,6 +219,29 @@ describe('Offline mode: two machines make the same change offline', function () 
 		expect(await queryAll(b.db, 'select id from Tasks')).to.deep.equal([]);
 	});
 
+	it('both insert or replace the same row over an existing one: the second to drain commits already applied, and the index holds the replacement once', async () => {
+		const { a, b } = await twoOfflineMachines(createTasks, createTasksByDone);
+		await a.db.exec(`insert into Tasks (id, title, done) values (1, 'draft', 0)`);
+		expect(await queryAll(b.db, 'select id from Tasks'), 'B holds the row before going offline').to.deep.equal([{ id: 1 }]);
+		a.plugin.offline.enter();
+		b.plugin.offline.enter();
+
+		// The probe finds the key occupied on both, so each stages the REPLACE arm's rewrite, guarded on
+		// the row it displaces; the second to drain finds the rival's replacement equal to its own.
+		const onA = await queuedOn(a, `insert or replace into Tasks (id, title, done) values (1, 'final', 1)`);
+		const onB = await queuedOn(b, `insert or replace into Tasks (id, title, done) values (1, 'final', 1)`);
+		await drain(a);
+		await drain(b);
+
+		expect(committedOn(a, onA)?.effect).to.equal('applied');
+		expect(committedOn(b, onB)?.effect, 'B found A had already made its replace').to.equal('already-applied');
+		for (const [name, machine] of [['A', a], ['B', b]] as const) {
+			expect(await queryAll(machine.db, 'select id, title, done from Tasks'), `${name}'s scan`).to.deep.equal([{ id: 1, title: 'final', done: 1 }]);
+			expect(await queryAll(machine.db, 'select id from Tasks where done = 1'), `${name}'s index-driven read`).to.deep.equal([{ id: 1 }]);
+			expect(await queryAll(machine.db, 'select id from Tasks where done = 0'), `${name}'s displaced index entry is gone`).to.deep.equal([]);
+		}
+	});
+
 	it('both increment the same counter: the second to drain fails with concurrent-modification, and both read one increment', async () => {
 		const { a, b } = await twoOfflineMachines(createCounters);
 		await a.db.exec(`insert into Counters (name, n) values ('hits', 0)`);
