@@ -22,10 +22,13 @@ export type ActionHandler<T, TResult = void> = (action: Action<T>, store: BlockS
  * (`SealedSegment.applied`). Today only the tree's `replace` handler counts anything: for each element
  * whose guard is one of the three already-applied kinds (`TreeAlreadyAppliedGuard` in
  * `packages/db-core/src/collections/tree/struct.ts`), `alreadyApplied` when the element was skipped
- * because a rival had made exactly its change, `applied` when it was written or deleted. Elements with
- * no guard or with one of the four base guard kinds are not counted — a `keepExisting` skip says
- * nothing about equality — so {@link ZeroTally} is the tally of an action with no such element, and of
- * a handler that returns nothing (`Diary`'s).
+ * because a rival had made exactly its change, `applied` when it was written or deleted; and `applied`
+ * for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever
+ * they do not refuse and that the SQL layer stages on every main-table element, so a plain insert
+ * beside an already-applied update keeps the entry `applied`. Elements with no guard, or with
+ * `keepExisting` (a skip that says nothing about equality) or `absentRange` — the shapes an index
+ * tree's entries take — are not counted, so {@link ZeroTally} is the tally of an action with no counted
+ * element, and of a handler that returns nothing (`Diary`'s).
  *
  * The offline queue sums an entry's tallies over every collection it wrote and reports
  * `effect: 'already-applied'` on its `committed` status exactly when `alreadyApplied > 0` and

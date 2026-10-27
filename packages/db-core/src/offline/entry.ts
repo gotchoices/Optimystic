@@ -33,9 +33,10 @@ export type Entry = {
 	 * `onCommittedHead` hooks reported it — across submissions, so a partial commit's committed half is
 	 * recorded before the error reaches the queue and a later submission's tallies accumulate beside
 	 * it. A collection a restore found already committed records nothing. Folded into the `committed`
-	 * status's `effect` ({@link effectOf}). In memory only: a restart between a partial commit and the
-	 * remainder's commit loses the committed half's tally, and the entry then reports `applied`, the
-	 * conservative answer. */
+	 * status's `effect` ({@link effectOf}, which answers `applied` while any collection the entry wrote
+	 * has no tally here). In memory only: a restart between a partial commit and the remainder's commit
+	 * loses the committed half's tally, and the entry then reports `applied`, the conservative answer,
+	 * whatever the remainder reports. */
 	readonly applied: Map<CollectionId, AlreadyAppliedTally>;
 	phase: 'queued' | 'submitting';
 	waitingFor: EntryWaitingFor | undefined;
@@ -98,11 +99,16 @@ export function queuedStatusChanged(previous: QueuedStatus | undefined, status: 
 		|| previous.committedCollections?.length !== status.committedCollections?.length;
 }
 
-/** The `effect` of a committed entry ({@link CommittedEffect}): `already-applied` exactly when the
- * tallies recorded over every collection sum to `alreadyApplied > 0` and `applied === 0`. */
+/** The `effect` of a committed entry ({@link CommittedEffect}): `already-applied` exactly when EVERY
+ * collection the entry wrote reported a tally and the tallies sum to `alreadyApplied > 0` and
+ * `applied === 0`. A collection whose tally was never heard — one committed before a restart, or one
+ * a restore found already committed — may have changed rows, so its absence answers `applied`: a
+ * remainder that was wholly already applied must not speak for a half that was not. */
 export function effectOf(entry: Entry): CommittedEffect {
 	let total = ZeroTally;
-	for (const tally of entry.applied.values()) {
+	for (const collection of entry.collections) {
+		const tally = entry.applied.get(collection.id);
+		if (tally === undefined) return 'applied';
 		total = addTallies(total, tally);
 	}
 	return total.alreadyApplied > 0 && total.applied === 0 ? 'already-applied' : 'applied';

@@ -969,14 +969,20 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		await queue.dispose();
 	});
 
-	it('restore of a partly committed entry: the committed collection answers already-committed and is recorded, the rest is staged, the entry is queued in doubt with its committed half, and the next submission drives only the rest under the recorded action id', async () => {
+	it('restore of a partly committed entry: the committed collection answers already-committed and is recorded, the rest is staged, the entry is queued in doubt with its committed half, and the next submission drives only the rest under the recorded action id — reporting effect applied, since the restart lost the committed half\'s tally', async () => {
 		const inner = new TestTransactor();
 		await seed(inner, USERS, ITEMS);
+		// The remainder (USERS) is wholly already applied — a rival made its one guarded change first —
+		// while the half that commits before the restart (ITEMS) inserts a row of its own. The restart
+		// loses the ITEMS tally, so the entry must not report `already-applied` on USERS' word alone.
+		await commitRivalTreeWrite<number, Entry>(inner, USERS, byKey, [[5, entry(5, 'done')]]);
 		const throwing = new ThrowsOnCommitOf(inner, await logTailOf(inner, USERS));
 		const first = openQueue({ recheck: { baseMs: 60_000, maxMs: 60_000 } });
 		const users = await openTree(throwing, first.queue, USERS);
 		const items = await openTree(throwing, first.queue, ITEMS);
-		await queueEntry(first.queue, 'E1', [users, [[1, entry(1, 'one')]]], [items, [[7, entry(7, 'seven')]]]);
+		await queueEntry(first.queue, 'E1',
+			[users, [[5, entry(5, 'done'), { kind: 'unchangedOrEqual', expected: entry(5, 'seed') }]]],
+			[items, [[7, entry(7, 'seven')]]]);
 		await partiallyCommitted(first.statuses, 'E1');
 		const drive = first.journal.drives.at(-1)!.state;
 		expect([...drive.committed.keys()], 'the drive record was rewritten after the partial commit').to.deep.equal([ITEMS]);
@@ -1010,9 +1016,10 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		expect(journal.drives.map(d => [d.entryId, d.state.actionId, [...d.state.attempts.keys()]]), 'the remainder alone, under the recorded id')
 			.to.deep.equal([['E1', drive.actionId, [USERS]]]);
 		expect([...committedOf(statuses, 'E1').durability.collections.keys()].sort(), 'every collection the entry wrote').to.deep.equal([ITEMS, USERS]);
+		expect(committedOf(statuses, 'E1').effect, 'the ITEMS half changed a row and its tally is lost, so applied, whatever USERS reported').to.equal('applied');
 		expect(await entriesUnder(inner, USERS, drive.actionId)).to.have.length(1);
 		expect(await entriesUnder(inner, ITEMS, drive.actionId)).to.have.length(1);
-		expect(await committedKeys(inner, USERS)).to.deep.equal([[5], [1]]);
+		expect(await committedKeys(inner, USERS), 'the entry is in the log although its one element was skipped').to.deep.equal([[5], [5], [5]]);
 		expect(await committedKeys(inner, ITEMS)).to.deep.equal([[5], [7]]);
 		await queue.dispose();
 	});

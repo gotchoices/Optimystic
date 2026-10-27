@@ -25,10 +25,12 @@ export type EntryWaitingFor = 'earlier-entry' | 'cohort' | 'backoff';
  * kinds (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`) was skipped
  * because a rival had already made exactly its change, and at least one did — summed over every
  * collection the entry wrote (`AlreadyAppliedTally`); `applied` otherwise, including for an entry with
- * no such element and for one a restore found already committed, which records no tally. "All, not
- * any": an entry of two guarded updates of which one was already done did change a row, and a host
- * reading `already-applied` as "none of my guarded changes landed" must be right. Says nothing about
- * elements carrying no guard or one of the base kinds, which are never counted. */
+ * no such element and for one of which any collection's tally was never heard — one a restore found
+ * already committed, or one committed before a restart lost the tally. "All, not any": an entry of two
+ * guarded updates of which one was already done did change a row, and a host reading
+ * `already-applied` as "none of my guarded changes landed" must be right — and a write under `absent`
+ * or `unchanged`, the main-table base kinds, counts as applied for the same reason. Says nothing about
+ * elements carrying no guard, `keepExisting` or `absentRange`, which are never counted. */
 export type CommittedEffect = 'applied' | 'already-applied';
 
 export type EntryStatus =

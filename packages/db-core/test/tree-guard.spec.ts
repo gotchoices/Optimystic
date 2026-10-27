@@ -797,6 +797,41 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			expect(await committedAt(transactor, 2)).to.equal(undefined);
 			expect(await committedAt(transactor, 3)).to.deep.equal(three);
 		});
+
+		describe('which other elements the tally counts', () => {
+			// A write under `absent` or `unchanged` — the exact-key kinds the SQL layer stages on every
+			// main-table element — counts as applied, so a plain insert beside an already-applied update
+			// cannot make the entry read as already applied (review of
+			// `offline-sync-already-applied-guards-in-db-core`).
+			it('a plain absent insert beside an already-applied update counts as applied: {1, 1}', async () => {
+				const two: Entry = { key: 2, name: 'two' };
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([
+					[1, done, unchangedOrEqual(original)],
+					[2, two, { kind: 'absent' }],
+				]);
+				await rival(transactor, [[1, { ...done }]]);
+				expect(await commitAsHead(writer)).to.deep.equal({ alreadyApplied: 1, applied: 1 });
+				expect(await committedAt(transactor, 2)).to.deep.equal(two);
+			});
+
+			// An unguarded element and an `absentRange` one are the shapes an index tree's entries take,
+			// and under an already-applied entry their writes only restate what the rival's row implies.
+			it('an unguarded upsert and an absentRange upsert beside an already-applied update are not counted: {1, 0}', async () => {
+				const two: Entry = { key: 2, name: 'two' };
+				const three: Entry = { key: 3, name: 'three' };
+				const transactor = new TestTransactor();
+				const writer = await openWriter(transactor, [[1, original]]);
+				await writer.stage([
+					[1, done, unchangedOrEqual(original)],
+					[2, two],
+					[3, three, { kind: 'absentRange', range: new KeyRange({ key: 3, inclusive: true }, { key: 3, inclusive: true }) }],
+				]);
+				await rival(transactor, [[1, { ...done }], [2, { ...two }], [3, { ...three }]]);
+				expect(await commitAsHead(writer)).to.deep.equal({ alreadyApplied: 1, applied: 0 });
+			});
+		});
 	});
 
 	describe('coordinator path (TransactionCoordinator.commit inter-attempt refresh)', () => {

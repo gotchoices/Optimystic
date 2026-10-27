@@ -115,10 +115,17 @@ function enforceDeleteGuard<TKey, TEntry>(
 	}
 }
 
-/** Whether `guard` is one of the three already-applied kinds, whose elements the handler's tally
- * counts (see {@link AlreadyAppliedTally}). */
-function countsTowardTally<TKey, TEntry>(guard: TreeEntryGuard<TKey, TEntry>): boolean {
-	return guard.kind === 'absentOrEqual' || guard.kind === 'unchangedOrEqual' || guard.kind === 'unchangedOrAbsent';
+/** Whether a write under `guard` counts as `applied` on the tally (see {@link AlreadyAppliedTally}):
+ * the three already-applied kinds, whose skips are the `alreadyApplied` side, and the two exact-key
+ * base kinds that write whenever they do not refuse — `absent` and `unchanged`, which the SQL layer
+ * stages on every main-table element and never on an index tree — so an entry with a plain insert
+ * beside an already-applied update reads `applied`, as a host taking `already-applied` for "none of
+ * my changes landed" needs. Not counted: `keepExisting` (its skip says nothing about equality),
+ * `absentRange` and an unguarded element, the shapes an index tree's entries take, whose writes
+ * under an already-applied entry are rewrites of what the rival's row already implies. */
+function countsWrite<TKey, TEntry>(guard: TreeEntryGuard<TKey, TEntry>): boolean {
+	return guard.kind === 'absent' || guard.kind === 'unchanged'
+		|| guard.kind === 'absentOrEqual' || guard.kind === 'unchangedOrEqual' || guard.kind === 'unchangedOrAbsent';
 }
 
 /** A tally over one handler run, mutable while the run counts. */
@@ -126,11 +133,11 @@ class TallyBuilder {
 	private alreadyApplied = 0;
 	private applied = 0;
 
-	/** Count `verdict` for an element carrying `guard`, when the guard is a counted kind. */
+	/** Count `verdict` for an element carrying `guard`. Only an already-applied kind answers
+	 * `'already-applied'`; a write counts when {@link countsWrite} says so. */
 	count<TKey, TEntry>(guard: TreeEntryGuard<TKey, TEntry>, verdict: GuardVerdict): void {
-		if (!countsTowardTally(guard)) return;
 		if (verdict === 'already-applied') this.alreadyApplied++;
-		else if (verdict === 'proceed') this.applied++;
+		else if (verdict === 'proceed' && countsWrite(guard)) this.applied++;
 	}
 
 	result(): AlreadyAppliedTally {
