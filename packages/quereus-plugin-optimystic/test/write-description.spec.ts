@@ -68,9 +68,11 @@ describe('write-description: the fresh elements of a described write', () => {
 		expect(freshElementsOf(write, 'insert', row)).to.deep.equal([freshMain]);
 	});
 
-	// Not pinned: `randomblob(16)` written bare to a text key. Quereus 4.21.0 labels it `fresh` on a
-	// table with no blob column although the engine stores a lossy text decode of the bytes, and the
-	// plugin trusts the label — blocked `quereus-labels-a-fresh-blob-written-to-text-as-fresh`.
+	it('a fresh blob written bare to a text key is not fresh: the engine stores a lossy text decode', () => {
+		const write = describedWrite(`insert into t (Id, Email, body) values (randomblob(16), 'a@x', 'a')`);
+		expect(freshElementsOf(write, 'insert', row)).to.deep.equal([]);
+	});
+
 	it('a fresh blob under a lossy wrapper (cast to text) is not fresh: the plugin trusts the label', () => {
 		const write = describedWrite(`insert into t (Id, Email, body) values (cast(randomblob(16) as text), 'a@x', 'a')`);
 		expect(freshElementsOf(write, 'insert', row)).to.deep.equal([]);

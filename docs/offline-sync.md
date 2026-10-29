@@ -1204,11 +1204,7 @@ reading change scopes reads it without new shapes. What the plugin reads of it:
 The vtab combines the description with the facts only it has at staging time: the guard each action
 actually carries, and whether the target row was inserted by an unsettled entry of this queue. Two
 gaps it works around: a cascade child write and the upsert `DO UPDATE` arm are undescribed for the
-row's own values, and both count as not fresh. One imprecision it inherits, because the plugin
-trusts the label: on Quereus 4.21.0, `randomblob(16)` written bare to a `text` column is labelled
-`fresh` although the engine stores a lossy text decode of the bytes — the write conversion the label
-should fail on is not planned for a `text` column — so write `hex(randomblob(16))` for a random text
-key; the Quereus fix is tracked in blocked `quereus-labels-a-fresh-blob-written-to-text-as-fresh`.
+row's own values, and both count as not fresh.
 
 ### Declared hints
 
