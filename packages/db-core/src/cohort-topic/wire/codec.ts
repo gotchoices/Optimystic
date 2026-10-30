@@ -20,6 +20,8 @@ import {
 	validatePromotionNoticeV1,
 	validateRegisterReplyV1,
 	validateRegisterV1,
+	validateRenewBatchReplyV1,
+	validateRenewBatchV1,
 	validateRenewReplyV1,
 	validateRenewV1,
 	validateSignRequestV1,
@@ -34,6 +36,8 @@ import type {
 	PromotionNoticeV1,
 	RegisterReplyV1,
 	RegisterV1,
+	RenewBatchReplyV1,
+	RenewBatchV1,
 	RenewReplyV1,
 	RenewV1,
 	SignRequestV1,
@@ -187,6 +191,14 @@ export function decodeRenewV1(bytes: Uint8Array, maxMessageBytes?: number): Rene
 
 export function decodeRenewReplyV1(bytes: Uint8Array, maxMessageBytes?: number): RenewReplyV1 {
 	return validateRenewReplyV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+export function decodeRenewBatchV1(bytes: Uint8Array, maxMessageBytes?: number): RenewBatchV1 {
+	return validateRenewBatchV1(decodeCohortMessage(bytes, maxMessageBytes));
+}
+
+export function decodeRenewBatchReplyV1(bytes: Uint8Array, maxMessageBytes?: number): RenewBatchReplyV1 {
+	return validateRenewBatchReplyV1(decodeCohortMessage(bytes, maxMessageBytes));
 }
 
 export function decodeChildLinkV1(bytes: Uint8Array, maxMessageBytes?: number, minSigs?: number): ChildLinkV1 {

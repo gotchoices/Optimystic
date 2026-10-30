@@ -3017,14 +3017,18 @@ The **FRET host** (`packages/db-p2p/src/cohort-topic/host.ts`) scopes the cohort
 
 ### Protocol IDs
 
-`db-p2p` registers four libp2p protocols on the FRET node, binding the db-core ports to FRET + libp2p:
+`db-p2p` registers six libp2p protocols on the FRET node, binding the db-core ports to FRET + libp2p (`cohortTopicProtocolList` in `packages/db-p2p/src/cohort-topic/protocols.ts`):
 
 ```
 /optimystic/cohort-topic/1.0.0/register       — Register, renew, re-attach
+/optimystic/cohort-topic/1.0.0/renew-batch    — several plain renewal pings to one member, answered entry by entry
 /optimystic/cohort-topic/1.0.0/cohort-gossip  — record replication, willingness, load barometers
 /optimystic/cohort-topic/1.0.0/promote        — threshold-signed promotion/demotion notices
 /optimystic/cohort-topic/1.0.0/membership     — membership certificates
+/optimystic/cohort-topic/1.0.0/sign           — per-member endorsement for k − x threshold-signature assembly
 ```
+
+A participant renewing many registrations sends the plain pings bound for one primary over `renew-batch` in one frame (`CohortTopicService.renewMany` in `packages/db-core/src/cohort-topic/service.ts`); re-attaches and withdraws stay single on `register`, and a primary on an older build that refuses `renew-batch` is sent single pings ([docs/cohort-topic.md §TTL and renewal](cohort-topic.md#ttl-and-renewal)).
 
 The package split is strict: **db-core never imports FRET or libp2p** (enforced by `packages/db-core/test/no-fret-import.spec.ts`); **db-p2p** (`packages/db-p2p/src/cohort-topic`) is the only place the ports are bound to FRET's `RouteAndMaybeAct`, two-sided cohort assembly, and size estimator.
 

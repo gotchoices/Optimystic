@@ -17,6 +17,7 @@
 import type { Connection, PeerId } from '@libp2p/interface';
 import type { Identify } from '@libp2p/identify';
 import { createLogger } from '../logger.js';
+import { isUnsupportedProtocolError } from './open-protocol-stream.js';
 
 const log = createLogger('identify-on-open');
 
@@ -41,9 +42,6 @@ export interface IdentifyOnOpenHost {
 	services: { identify: Pick<Identify, 'identify'> };
 }
 
-/** libp2p's multistream negotiation raises this, by name, when the far side handles none of the offered protocols. */
-const UNSUPPORTED_PROTOCOL_ERROR = 'UnsupportedProtocolError';
-
 async function identifyConnection(node: IdentifyOnOpenHost, connection: Connection, observer?: IdentifyObserver): Promise<void> {
 	const peerId = connection.remotePeer;
 	observer?.started(peerId);
@@ -54,7 +52,7 @@ async function identifyConnection(node: IdentifyOnOpenHost, connection: Connecti
 	} catch (err) {
 		// The built-in trigger swallows this silently; a line per failure is what makes a peer that
 		// never classifies explainable.
-		if ((err as Error | undefined)?.name === UNSUPPORTED_PROTOCOL_ERROR) outcome = 'foreign';
+		if (isUnsupportedProtocolError(err)) outcome = 'foreign';
 		log('identify:%s peer=%s - %o', outcome, peerId.toString().substring(0, 12), err);
 	} finally {
 		observer?.settled(peerId, outcome);

@@ -1,4 +1,8 @@
 import { expect } from 'chai';
+import { createLibp2p, type Libp2p } from 'libp2p';
+import { tcp } from '@libp2p/tcp';
+import { noise } from '@chainsafe/libp2p-noise';
+import { yamux } from '@chainsafe/libp2p-yamux';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { hashKey, parseRouteAndMaybeAct, type NearAnchorV1, type RouteAndMaybeActV1 } from 'p2p-fret';
@@ -10,6 +14,7 @@ import {
 	createWalkEngine,
 	decodeRegisterV1,
 	MAX_ROOT_KEY_BYTES,
+	RenewBatchUnsupportedError,
 	type RegisterMessageFactory,
 } from '@optimystic/db-core';
 import { MockNode } from '../../src/testing/cohort-topic-mesh-harness.js';
@@ -91,6 +96,40 @@ describe('cohort-topic: topic router direct dial', () => {
 		expect([...reply]).to.deep.equal([...replyBytes]);
 		expect(frames).to.deep.equal([[...activity]]);
 		expect(dials).to.equal(0);
+	});
+});
+
+/**
+ * A member on a build that predates `/renew-batch` refuses the stream at negotiation. The participant re-sends
+ * the batch's pings singly only when the router reports that refusal as `RenewBatchUnsupportedError`; reported as
+ * anything else, every ping in the batch counts as failed, and an older member's registrations fail over. The
+ * refusal is libp2p's, matched by error name, so this runs over real libp2p.
+ */
+describe('cohort-topic: topic router renew-batch dial to a member without the protocol', () => {
+	async function realNode(): Promise<Libp2p> {
+		return await createLibp2p({
+			addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
+			transports: [tcp()],
+			connectionEncrypters: [noise()],
+			streamMuxers: [yamux()],
+		});
+	}
+
+	it('rejects with RenewBatchUnsupportedError', async () => {
+		const [client, member] = await Promise.all([realNode(), realNode()]);
+		try {
+			await client.dial(member.getMultiaddrs()[0]!);
+			const router = new FretTopicRouter(client, {} as never, {});
+			let caught: unknown;
+			try {
+				await router.dialMemberRenewBatch({ id: peerIdToBytes(member.peerId) }, new Uint8Array([1, 2, 3]));
+			} catch (err) {
+				caught = err;
+			}
+			expect(caught).to.be.instanceOf(RenewBatchUnsupportedError);
+		} finally {
+			await Promise.all([client.stop(), member.stop()]);
+		}
 	});
 });
 

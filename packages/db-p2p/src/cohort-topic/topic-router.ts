@@ -1,12 +1,13 @@
 import type { ITopicRouter, PeerRef, TopicRouteKey } from "@optimystic/db-core";
-import { bytesToB64url, b64urlToBytes, encodeCohortMessage } from "@optimystic/db-core";
+import { bytesToB64url, b64urlToBytes, encodeCohortMessage, RenewBatchUnsupportedError } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { randomBytes } from "@libp2p/crypto";
 import type { FretService, RouteAndMaybeActV1, NearAnchorV1 } from "p2p-fret";
 import { bytesToPeerId } from "./peer-codec.js";
 import { requestResponse, requireReply, DEFAULT_STREAM_MAX_BYTES, type NoResultReplyError } from "./stream-util.js";
-import { PROTOCOL_COHORT_REGISTER } from "./protocols.js";
+import { PROTOCOL_COHORT_REGISTER, PROTOCOL_COHORT_RENEW_BATCH } from "./protocols.js";
+import { isUnsupportedProtocolError } from "../network/open-protocol-stream.js";
 import { createLogger } from "../logger.js";
 import type { StreamOpenDeadlines } from "../rpc-deadline.js";
 
@@ -20,6 +21,8 @@ function isCommit(res: NearAnchorV1 | { commitCertificate: string }): res is { c
 export interface FretTopicRouterOptions {
 	/** The `/register` protocol id (defaults to the canonical one). */
 	readonly registerProtocol?: string;
+	/** The `/renew-batch` protocol id (defaults to the canonical one). */
+	readonly renewBatchProtocol?: string;
 	/** RPC TTL hops for `RouteAndMaybeAct`. Default 16. */
 	readonly ttl?: number;
 	/** Per-frame ceiling. Default {@link DEFAULT_STREAM_MAX_BYTES}. */
@@ -46,6 +49,8 @@ export interface FretTopicRouterOptions {
 	readonly selfPeerId?: string;
 	/** The `/register` body this node runs for a frame addressed to itself (see {@link selfPeerId}). */
 	readonly handleLocally?: (activity: Uint8Array) => Promise<Uint8Array>;
+	/** The `/renew-batch` body this node runs for a batch addressed to itself (see {@link selfPeerId}). */
+	readonly handleRenewBatchLocally?: (frame: Uint8Array) => Promise<Uint8Array>;
 	/** The stream-open delays for the direct dials (`requestResponse` in `stream-util.ts`); the node's where the host has them. */
 	readonly streamOpen?: StreamOpenDeadlines;
 }
@@ -64,7 +69,8 @@ export interface FretTopicRouterOptions {
  *
  * `dialMember` is the post-registration direct path: a libp2p dial of the `/register` protocol to the
  * cached primary, used by the renewal ping (`docs/cohort-topic.md` §FRET integration). A primary that is this
- * node is answered in process (see {@link FretTopicRouterOptions.selfPeerId}).
+ * node is answered in process (see {@link FretTopicRouterOptions.selfPeerId}). `dialMemberRenewBatch` is the
+ * same path for several plain pings to one primary, over `/renew-batch`.
  *
  * `routeToRoot` — present only when the router was given {@link FretTopicRouterOptions.rootGroupMembers} —
  * is the tier-0 step of a root-placed topic (`docs/cohort-topic.md` §Root placement at a routing key). It
@@ -76,21 +82,25 @@ export interface FretTopicRouterOptions {
  */
 export class FretTopicRouter implements ITopicRouter {
 	private readonly registerProtocol: string;
+	private readonly renewBatchProtocol: string;
 	private readonly ttl: number;
 	private readonly maxBytes: number;
 	private readonly clock: () => number;
 	private readonly selfPeerId: string | undefined;
 	private readonly handleLocally: ((activity: Uint8Array) => Promise<Uint8Array>) | undefined;
+	private readonly handleRenewBatchLocally: ((frame: Uint8Array) => Promise<Uint8Array>) | undefined;
 	private readonly streamOpen: StreamOpenDeadlines | undefined;
 	readonly routeToRoot?: (rootKey: Uint8Array, activity: Uint8Array) => Promise<Uint8Array>;
 
 	constructor(private readonly node: Libp2p, private readonly fret: FretService, options: FretTopicRouterOptions = {}) {
 		this.registerProtocol = options.registerProtocol ?? PROTOCOL_COHORT_REGISTER;
+		this.renewBatchProtocol = options.renewBatchProtocol ?? PROTOCOL_COHORT_RENEW_BATCH;
 		this.ttl = options.ttl ?? 16;
 		this.maxBytes = options.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
 		this.clock = options.clock ?? ((): number => Date.now());
 		this.selfPeerId = options.selfPeerId;
 		this.handleLocally = options.handleLocally;
+		this.handleRenewBatchLocally = options.handleRenewBatchLocally;
 		this.streamOpen = options.streamOpen;
 		const rootGroupMembers = options.rootGroupMembers;
 		if (rootGroupMembers !== undefined) {
@@ -141,6 +151,38 @@ export class FretTopicRouter implements ITopicRouter {
 		}
 		const reply = await requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes, this.streamOpen);
 		return requireReply(reply, "cohort-topic register dial");
+	}
+
+	/**
+	 * Dial `member`'s `/renew-batch` with an encoded `RenewBatchV1` and return its encoded reply. A member that
+	 * refuses the protocol at negotiation (a build that predates it) rejects with `RenewBatchUnsupportedError`, so
+	 * the caller sends the same pings singly over `/register`; any other failure rejects as {@link dialMember}'s
+	 * does. A `member` that is this node is served in process through
+	 * {@link FretTopicRouterOptions.handleRenewBatchLocally}; a router given no such handler answers a self-addressed
+	 * batch as unsupported, so its pings go singly through {@link dialMember}'s own self path.
+	 */
+	async dialMemberRenewBatch(member: PeerRef, frame: Uint8Array): Promise<Uint8Array> {
+		const peer = bytesToPeerId(member.id);
+		if (peer.toString() === this.selfPeerId) {
+			if (this.handleRenewBatchLocally === undefined) {
+				throw new RenewBatchUnsupportedError(member.id);
+			}
+			return this.handleRenewBatchLocally(frame);
+		}
+		let reply: Uint8Array | undefined;
+		try {
+			reply = await requestResponse(this.node, peer, this.renewBatchProtocol, frame, this.maxBytes, this.streamOpen);
+		} catch (err) {
+			// NOTE: `openProtocolStream` treats a negotiation refusal like any failed path and tries a forced fresh dial
+			// before rejecting, so each refusal leaves one extra connection to the older member (measured: 1 → 2 on two
+			// local nodes). The participant asks an older member at most once per `RENEW_BATCH_UNSUPPORTED_RECHECK_MS`;
+			// if those connections ever show up, have the stream opener stop at a negotiation refusal.
+			if (isUnsupportedProtocolError(err)) {
+				throw new RenewBatchUnsupportedError(member.id, { cause: err });
+			}
+			throw err;
+		}
+		return requireReply(reply, "cohort-topic renew-batch dial");
 	}
 
 	/**

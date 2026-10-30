@@ -59,6 +59,7 @@ class HeldRegistrationService implements CohortTopicService {
 		});
 	}
 	async renew(): Promise<void> {}
+	async renewMany(): Promise<void> {}
 	async lookup(): Promise<never> {
 		throw new Error('lookup is not used by the watch service');
 	}

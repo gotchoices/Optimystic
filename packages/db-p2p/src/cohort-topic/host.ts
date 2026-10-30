@@ -70,7 +70,7 @@
  * (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so `followOn`
  * stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path. The
  * behavioral substrate is validated at mock-tier by `test/cohort-topic/service.spec.ts` and end-to-end
- * across a real multi-node cohort (real Ed25519 keys, mock transport routing the five protocols + FRET
+ * across a real multi-node cohort (real Ed25519 keys, mock transport routing the cohort-topic protocols + FRET
  * `routeAct`/`assembleCohort`) by `test/cohort-topic/live-tier.spec.ts`.
  */
 
@@ -116,6 +116,7 @@ import {
 	encodeCohortMessage,
 	decodeCohortMessage,
 	decodeCohortGossipV1,
+	decodeRenewBatchV1,
 	membershipCertSignable,
 	membershipCertSigningPayload,
 	toCohortTopicSummary,
@@ -163,6 +164,7 @@ import {
 	type RegisterReplyV1,
 	type RegisterV1,
 	type RegistrationRecord,
+	type RenewBatchReplyV1,
 	type RenewReplyV1,
 	type RenewV1,
 	type ReputationEvidenceV1,
@@ -1019,17 +1021,20 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	};
 
 	// --- ports (node-wide singletons, injected into every coord engine) ---
-	// Every direct dial addressed to this node — a renewal whose primary is this node, or a root-group member
-	// that is — runs through the local register handler, since libp2p refuses a self-dial. The router's
+	// Every direct dial addressed to this node — a renewal (or a batch of them) whose primary is this node, or a
+	// root-group member that is — runs through the local register or renew-batch handler, since libp2p refuses a
+	// self-dial. The router's
 	// `routeToRoot` exists only on a host that serves root placement; it resolves the group by the rule that
 	// chose it (never by ring routing, whose nearest peers can differ from the storage group on a shared ring —
 	// see the router).
 	const router = new FretTopicRouter(node, fret, {
 		registerProtocol: protocols.register,
+		renewBatchProtocol: protocols.renewBatch,
 		maxBytes,
 		streamOpen,
 		selfPeerId: selfPeerStr,
 		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
+		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => Promise.resolve(handleRenewBatchFrame(frame)),
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
 				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
@@ -1679,10 +1684,20 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return encodeCohortMessage(reply, maxBytes);
 	};
 
+	// --- the `/renew-batch` protocol body, shared by the inbound handler and the router's in-process self-dials ---
+	// Each entry gets exactly the answer the same RenewV1 gets on `/register`; the validator has already refused a
+	// frame carrying a re-attach or a withdraw, which stay per-record and single.
+	const handleRenewBatchFrame = (frame: Uint8Array): Uint8Array => {
+		const { renews } = decodeRenewBatchV1(frame, maxBytes);
+		const now = Date.now();
+		const reply: RenewBatchReplyV1 = { v: 1, replies: renews.map((renew) => resolveRenew(registry, renew, now)) };
+		return encodeCohortMessage(reply, maxBytes);
+	};
+
 	// --- protocol handlers + activity callback ---
-	// Await registration so the host is not returned (and dialed) before the five handlers are live —
+	// Await registration so the host is not returned (and dialed) before the six handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, signEndorse, verifier, promoteGate, handleGossipFrame, publishSink, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, handleRenewBatchFrame, signEndorse, verifier, promoteGate, handleGossipFrame, publishSink, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -3984,6 +3999,8 @@ async function registerCohortTopicProtocols(
 	registry: CoordRegistry,
 	/** The `/register` body: a RenewV1, a ChildLinkV1 or a RegisterV1 frame in, the encoded reply out. */
 	handleRegisterFrame: (frame: Uint8Array) => Promise<Uint8Array>,
+	/** The `/renew-batch` body: a RenewBatchV1 frame in, the encoded RenewBatchReplyV1 out. */
+	handleRenewBatchFrame: (frame: Uint8Array) => Uint8Array,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
 	promoteGate: PromoteGate,
@@ -3996,6 +4013,11 @@ async function registerCohortTopicProtocols(
 		// register: a direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this
 		// parent), or a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic).
 		registerProtocolHandler(node, protocols.register, makeRequestHandler((frame): Promise<Uint8Array> => handleRegisterFrame(frame), maxBytes)),
+
+		// renew-batch: several plain pings to this member in one frame, answered entry by entry as `/register`
+		// answers each. Like `/register` it is not behind `authorizeInboundStream`, which gates the database protocols.
+		registerProtocolHandler(node, protocols.renewBatch, makeRequestHandler((frame): Promise<Uint8Array> =>
+			Promise.resolve(handleRenewBatchFrame(frame)), maxBytes)),
 
 		// cohort-gossip: one-way. Each frame is decoded and signature-checked once, then handed only to the buses
 		// subscribed to the coord it names; a verified co-member frame for a coord with no engine first instantiates

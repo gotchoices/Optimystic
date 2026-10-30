@@ -33,12 +33,15 @@
  * read did not see wakes the watcher. The service cannot know what a caller has read, so the first committed
  * tail it reads for a collection wakes that collection's watchers once, whether or not anything changed.
  *
- * **Work on one subscription is serial.** The first attach, each tick's renewal and the applying of its read,
- * each escalation's re-read and each scheduled follow run one at a time per subscription, so two follows never
- * interleave. The tick's read itself runs outside that queue, beside every other subscription's, so its answer
- * can be overtaken by a read the queue issued later; such an answer is dropped (see
- * {@link ReactivityCollectionWatch.acceptedTail}). Delivery is not part of the queue either: a notification
- * reaches {@link CollectionWatchRequest.onChange} while a follow is in flight.
+ * **Work on one subscription is serial.** The first attach, the applying of each tick's read, each escalation's
+ * re-read and each scheduled follow run one at a time per subscription, so two follows never interleave. The
+ * tick's read itself runs outside that queue, beside every other subscription's, so its answer can be overtaken
+ * by a read the queue issued later; such an answer is dropped (see {@link ReactivityCollectionWatch.acceptedTail}).
+ * Delivery is not part of the queue either: a notification reaches {@link CollectionWatchRequest.onChange} while a
+ * follow is in flight. Nor is renewal: each tick renews every registration in one `CohortTopicService.renewMany`
+ * call, so the pings bound for one cohort member travel in one request. The service runs at most one renewal
+ * cycle per registration and leaves alone a registration a follow displaced while its ping was out, so a renewal
+ * beside a follow neither doubles up nor fails over the registration the follow replaced.
  */
 
 import {
@@ -177,7 +180,7 @@ interface Subscription {
 	lastTailId?: BlockId;
 	/** Stamp of the newest tail read applied; an answer stamped below it is older and is dropped. */
 	appliedReadStamp: number;
-	/** A tick's renewal and answer are queued here and the answer has not been applied; later ticks skip it until it has. */
+	/** A tick's answer is queued here and has not been applied; later ticks skip it (its renewal too) until it has. */
 	tickQueued: boolean;
 	closed: boolean;
 	/** Tail of the serial work queue. */
@@ -356,7 +359,8 @@ export class ReactivityCollectionWatch {
 	 * settle), the service has stopped, or nothing is watched.
 	 *
 	 * NOTE: a tick costs one {@link CollectionTailReader.readTails} per reader, naming every collection that reads
-	 * through it — one `transactor.get` while no tail moved — plus one renewal per collection. On a node that holds
+	 * through it — one `transactor.get` while no tail moved — plus one renewal request per distinct primary the
+	 * registrations ping (none for those whose primary is this node). On a node that holds
 	 * the collections that read is local, and starts one background consult request per cohort peer per 32 blocks
 	 * (`MAX_CONSULT_BATCH_BLOCKS` in `protocol-limits.ts`) at two blocks per collection, so past 16 watched
 	 * collections the tick's consult takes a second request per peer. If hosts watch hundreds of collections, read
@@ -388,28 +392,30 @@ export class ReactivityCollectionWatch {
 	 * Keep every registration alive, then check every collection's tail: one read per reader, each answer applied on
 	 * its subscription's queue — wake the listeners if the revision is above the last one they were woken for, and
 	 * follow the tail if the registration is not where its root is, which is also how a registration that failed is
-	 * retried. Settles when the reads have, not when the follows have, so one subscription's slow registration walk
-	 * does not hold back every other collection's next tick. A subscription still working through an earlier tick's
-	 * renewal and answer sits this tick out, so a queue slower than the tick interval does not grow by a tick's steps
-	 * each interval.
+	 * retried. Settles when the reads have, not when the follows or the renewals have, so one subscription's slow
+	 * registration walk does not hold back every other collection's next tick. A subscription whose earlier tick's
+	 * answer is still queued sits this tick out, so a queue slower than the tick interval does not grow by a tick's
+	 * steps each interval.
 	 */
 	private async tick(): Promise<void> {
 		const groups = this.byReader([...this.subscriptions.values()].filter((sub) => !sub.tickQueued));
-		for (const group of groups.values()) {
-			for (const sub of group) {
-				sub.tickQueued = true;
-				void this.enqueue(sub, () => this.renew(sub));
-			}
+		const ticked = [...groups.values()].flat();
+		for (const sub of ticked) {
+			sub.tickQueued = true;
 		}
+		this.renewAll(ticked);
 		await Promise.all([...groups].map(([reader, group]) => this.readGroup(reader, group)));
 	}
 
-	private async renew(sub: Subscription): Promise<void> {
-		try {
-			await sub.manager?.renew();
-		} catch (err) {
-			log("renewal failed for collection=%s: %o", sub.collectionId, err);
+	/** One renewal cycle for every registration `subs` hold, in one call, so pings to one cohort member share a request. Not awaited by the tick. */
+	private renewAll(subs: ReadonlyArray<Subscription>): void {
+		const handles = subs.flatMap((sub) => sub.manager?.registration ?? []);
+		if (handles.length === 0) {
+			return;
 		}
+		void this.options.service.renewMany(handles).catch((err: unknown) => {
+			log("a renewal cycle failed this tick (of %d registration(s) renewed; the next tick renews again): %o", handles.length, err);
+		});
 	}
 
 	/** `subs` grouped by the reader each reads through. */

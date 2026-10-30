@@ -139,6 +139,15 @@ export class NoOpenConnectionError extends Error {
 	}
 }
 
+/**
+ * True when `err` is libp2p's refusal of a stream at negotiation: the far side handles none of the protocols
+ * offered. Matched by name, as libp2p raises it; {@link openProtocolStream} rejects with the first path's own
+ * error, so the refusal of the preferred connection reaches its caller unwrapped.
+ */
+export function isUnsupportedProtocolError(err: unknown): boolean {
+	return (err as Error | undefined)?.name === "UnsupportedProtocolError";
+}
+
 /** The reason a fresh dial still in flight is cancelled with once another path has opened the stream. */
 class StreamOpenedElsewhereError extends Error {
 	constructor(peer: string, protocol: string) {

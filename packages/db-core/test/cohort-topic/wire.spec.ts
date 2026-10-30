@@ -8,6 +8,7 @@ import {
 	decodeRegisterReplyV1,
 	decodeRenewV1,
 	decodeRenewReplyV1,
+	decodeRenewBatchV1,
 	decodeChildLinkV1,
 	decodeChildLinkReplyV1,
 	decodePromotionNoticeV1,
@@ -848,6 +849,11 @@ describe('cohort-topic wire', () => {
 			expect(withdraw, 'withdraw signs a distinct image from a reattach').to.not.equal(reattach);
 			// An absent flag and an explicit-false flag normalize to the same image (no signature ambiguity).
 			expect(bytesToB64url(renewSigningPayload({ ...base, withdraw: false })), 'withdraw:false === absent').to.equal(plain);
+		});
+
+		it('refuses a RenewBatchV1 an entry of which is a withdraw, so a batch cannot carry one past the per-record freshness gate', () => {
+			const batch = { v: 1 as const, renews: [sampleRenew(), { ...sampleRenew(), withdraw: true }] };
+			expect(() => decodeRenewBatchV1(encodeCohortMessage(batch))).to.throw(CohortWireError, /plain ping/);
 		});
 	});
 

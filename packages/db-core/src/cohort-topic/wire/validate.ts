@@ -44,6 +44,8 @@ import type {
 	RegisterReplyV1,
 	RegisterResult,
 	RegisterV1,
+	RenewBatchReplyV1,
+	RenewBatchV1,
 	RenewReplyV1,
 	RenewV1,
 	SignKind,
@@ -225,6 +227,49 @@ export function validateRenewReplyV1(value: unknown): RenewReplyV1 {
 		out.cohortEpoch = b64urlFixedLen(cohortEpoch, "cohortEpoch", COORD_BYTES, what);
 	}
 	return out;
+}
+
+/**
+ * Most pings one {@link RenewBatchV1} carries. A `RenewV1` encodes to a few hundred bytes, so a full batch is
+ * far under the frame ceiling; it also bounds the member's work for one frame at that many record lookups. A
+ * sender with more pings for one member splits them over several frames.
+ */
+export const MAX_RENEW_BATCH_ENTRIES = 64;
+
+/** `value[field]` as an array of 1..{@link MAX_RENEW_BATCH_ENTRIES} entries. */
+function batchEntries(obj: Record<string, unknown>, field: string, what: string): unknown[] {
+	const entries = obj[field];
+	if (!Array.isArray(entries) || entries.length === 0 || entries.length > MAX_RENEW_BATCH_ENTRIES) {
+		fail(`${what}: field "${field}" must be an array of 1..${MAX_RENEW_BATCH_ENTRIES} entries`);
+	}
+	return entries;
+}
+
+/**
+ * Validate a {@link RenewBatchV1}: 1..{@link MAX_RENEW_BATCH_ENTRIES} entries, each a valid `RenewV1` carrying
+ * neither `reattach` nor `withdraw` (present at all, whatever its value). Those two are privileged and judged per
+ * record by the member's freshness gate, so a batch may not carry one past it.
+ */
+export function validateRenewBatchV1(value: unknown): RenewBatchV1 {
+	const what = "RenewBatchV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	const renews = batchEntries(obj, "renews", what).map((entry) => {
+		const renew = validateRenewV1(entry);
+		if (renew.reattach !== undefined || renew.withdraw !== undefined) {
+			fail(`${what}: an entry may be a plain ping only (no reattach, no withdraw)`);
+		}
+		return renew;
+	});
+	return { v: 1, renews };
+}
+
+/** Validate a {@link RenewBatchReplyV1}: 1..{@link MAX_RENEW_BATCH_ENTRIES} valid `RenewReplyV1`s. Matching the request's length is the sender's check. */
+export function validateRenewBatchReplyV1(value: unknown): RenewBatchReplyV1 {
+	const what = "RenewBatchReplyV1";
+	const obj = asObject(value, what);
+	requireV1(obj, what);
+	return { v: 1, replies: batchEntries(obj, "replies", what).map(validateRenewReplyV1) };
 }
 
 export function validatePromotionNoticeV1(value: unknown): PromotionNoticeV1 {

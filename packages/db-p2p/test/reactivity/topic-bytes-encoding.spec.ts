@@ -56,6 +56,7 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 		const service: CohortTopicService = {
 			register: (req) => { registered.push(req); return new Promise<RegistrationHandle>(() => { /* never answers: only the request is read */ }); },
 			renew: () => Promise.resolve(),
+			renewMany: () => Promise.resolve(),
 			withdraw: () => Promise.resolve(),
 			moveRoot: () => { throw new Error('moveRoot is not used here'); },
 			lookup: () => Promise.reject(new Error('lookup is not used here')),

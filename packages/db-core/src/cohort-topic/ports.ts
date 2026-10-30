@@ -57,6 +57,14 @@ export interface ITopicRouter {
 	/** Direct dial to a cached primary; falls back to {@link routeAndAct} on failure (caller decides). */
 	dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array>;
 	/**
+	 * Send an encoded `RenewBatchV1` — several plain renewal pings — to `member` and resolve its encoded
+	 * `RenewBatchReplyV1`. Rejects with {@link RenewBatchUnsupportedError} when the member does not speak the
+	 * batch protocol, so the caller can send the same pings singly through {@link dialMember}; any other failure
+	 * rejects as {@link dialMember}'s does. Optional: a router without it gets no batching, and every ping goes
+	 * through {@link dialMember}.
+	 */
+	dialMemberRenewBatch?(member: PeerRef, frame: Uint8Array): Promise<Uint8Array>;
+	/**
 	 * Deliver `activity` to the **root group** of a root-placed topic — the peers responsible for
 	 * `rootKey` — and return the encoded reply. Optional: the walk uses it for the tier-0 step of a
 	 * root-placed topic when the router has it, and otherwise falls back to ring routing on the root key,
@@ -67,6 +75,19 @@ export interface ITopicRouter {
 	 * the root group is chosen by the rule storage placement uses. db-p2p binds this to the key network.
 	 */
 	routeToRoot?(rootKey: Uint8Array, activity: Uint8Array): Promise<Uint8Array>;
+}
+
+/**
+ * What {@link ITopicRouter.dialMemberRenewBatch} rejects with when the member does not speak the batch protocol
+ * (a build that predates it). That is a definite answer about the member, unlike a link failure, so the pings
+ * are re-sent singly rather than counted as failed. A db-core class because db-core cannot see libp2p's errors;
+ * the router maps the transport's own refusal onto it.
+ */
+export class RenewBatchUnsupportedError extends Error {
+	constructor(readonly member: Uint8Array, options?: { cause?: unknown }) {
+		super("cohort-topic: the member does not speak the renew-batch protocol", options);
+		this.name = "RenewBatchUnsupportedError";
+	}
 }
 
 /**

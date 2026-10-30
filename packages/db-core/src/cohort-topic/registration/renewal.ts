@@ -26,6 +26,11 @@
  *   rate limit, and a one-off `unknown_registration` from replication lag clears on the next ping.
  * - Cohort-side: evict where `now − lastPing > ttl`; eviction is gossiped so members converge.
  *
+ * A participant's cycle has two halves — `preparePing` (sign this cycle's ping and name its primary) and
+ * `settlePing` (act on the answer) — so a caller renewing many registrations can send the pings that share a
+ * primary in one request (`CohortTopicService.renewMany`) and settle each with its own answer. `pingLoop` is the
+ * two halves around one transport send. Re-attaches and withdraws are never split this way: they go singly.
+ *
  * Both sides take their transport/gossip by injection so storage + sharding + TTL stay unit-testable
  * in isolation; db-core never imports FRET or libp2p here.
  */
@@ -40,10 +45,32 @@ import type { RegistrationRecord, RegistrationStore } from "./types.js";
 
 // --- participant side ---
 
+/** One cycle's plain ping, signed and addressed; {@link RenewalParticipant.settlePing} acts on its answer. */
+export interface PreparedPing {
+	/** The member the ping goes to: the participant's current primary. */
+	readonly target: Uint8Array;
+	readonly msg: RenewV1;
+}
+
 /** Participant-side TTL renewal: periodic ping with 3-fail backup promotion. */
 export interface RenewalParticipant {
-	/** Run one ping cycle: ping the current primary, count failures, promote/relookup as needed. */
+	/**
+	 * Run one ping cycle: ping the current primary, count failures, promote/relookup as needed. The same as
+	 * {@link preparePing}, sending the ping through the transport (a rejection is no answer), then {@link settlePing}.
+	 */
 	pingLoop(): Promise<void>;
+	/**
+	 * The first half of a cycle, for a caller that sends several participants' pings together: this cycle's
+	 * signed plain ping and the member it goes to. Rejects when the signer does; that is a failed ping, to be
+	 * settled with no answer.
+	 */
+	preparePing(): Promise<PreparedPing>;
+	/**
+	 * The second half: act on the prepared ping's answer — `undefined` for none — as {@link pingLoop} does. `ok`
+	 * resets the failure count, `primary_moved` adopts the named primary, backups and epoch, and anything else
+	 * is a strike; the third strike in a row fails over, re-attaching to the backups singly and then re-walking.
+	 */
+	settlePing(reply: RenewReplyV1 | undefined): Promise<void>;
 	/** Re-attach to `target` (a backup), carrying the existing record; resolves with the reply. */
 	reattach(target: Uint8Array): Promise<RenewReplyV1>;
 	/**
@@ -124,7 +151,14 @@ class TtlRenewalParticipant implements RenewalParticipant {
 	}
 
 	async pingLoop(): Promise<void> {
-		const reply = await this.trySend(this.current.primary);
+		await this.settlePing(await this.tryPing());
+	}
+
+	async preparePing(): Promise<PreparedPing> {
+		return { target: this.current.primary, msg: await this.buildRenew({}) };
+	}
+
+	async settlePing(reply: RenewReplyV1 | undefined): Promise<void> {
 		if (reply !== undefined && this.acceptPingReply(reply)) {
 			return;
 		}
@@ -146,10 +180,11 @@ class TtlRenewalParticipant implements RenewalParticipant {
 		}
 	}
 
-	/** Send a renew, mapping an RPC rejection to `undefined` (a counted failure). */
-	private async trySend(target: Uint8Array): Promise<RenewReplyV1 | undefined> {
+	/** Prepare and send this cycle's ping, mapping a signer or RPC rejection to `undefined` (a counted failure). */
+	private async tryPing(): Promise<RenewReplyV1 | undefined> {
 		try {
-			return await this.deps.transport.send(target, await this.buildRenew({}));
+			const { target, msg } = await this.preparePing();
+			return await this.deps.transport.send(target, msg);
 		} catch {
 			return undefined;
 		}

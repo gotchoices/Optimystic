@@ -547,6 +547,8 @@ The participant pings `primary` every `ttl / 3` (default 30s). A primary that is
 - All of `primary` and `backups` fail → participant re-runs the lookup from `d_max` and **adopts where it lands**: the accepted walk's primary, backups, `cohortEpoch` and tree tier, and the accepted register's correlation id, which later renews echo. A walk that is not accepted (a back-off) leaves the old assignment in place. Either way the failure count resets, so a registration that stays lost is re-walked at most once every three pings — about once per TTL. A restarted primary usually recovers at the first step, since a backup still holds the record and promotes itself; an expired or withdrawn record recovers at the re-walk, which registers again.
 - A participant holds one registration per topic: a second register for the same topic displaces the first, and **no withdraw tombstone is sent for the displaced record** — it expires by TTL at its cohort. That is deliberate. When a root-placed topic's root moves, a participant that re-registers at the new root leaves a record at the old one, and a member in both roots' groups then holds two records for one participant under one topic. A renew (and a re-attach or a withdraw tombstone) carries no tree tier, so the member resolves it by the record it holds, and of two it picks the **newer**: the later `attachedAt` (stamped by the accepting member at admission and carried unchanged through gossip), ties to the later `lastPing` (`findHolder` in `packages/db-p2p/src/cohort-topic/host.ts`). A tombstone for the displaced registration would resolve to the live one and evict it. The two stamps come from different members' clocks, so a skew larger than the time between the two registrations picks the wrong record; the live one then expires one TTL later and the participant's renewal failover registers again.
 
+**Pings to one member share a request.** A node holding many registrations sends each cycle's plain pings grouped by primary (`CohortTopicService.renewMany` in `packages/db-core/src/cohort-topic/service.ts`): the pings bound for one member go in one `RenewBatchV1` frame over `/renew-batch` (§Renew batch), up to 64 per frame, and each entry is answered and acted on exactly as the same ping sent alone. The slot is `H(participantId ‖ cohortEpoch) mod k` and the epoch is the hash of the cohort's member list, so every registration a node holds at cohorts with one member list has one primary; on a two-machine group that is every registration, which then costs no request when the primary is this node and one per tick when it is the other. A primary on a build that predates the protocol refuses the stream at negotiation; the pings are re-sent singly over `/register` in the same cycle, and that member is sent single pings for the next 10 minutes (`RENEW_BATCH_UNSUPPORTED_RECHECK_MS`) before a batch is tried again. Any other batch failure is no answer for every ping in it, as the same pings sent singly over that link would each have been. A lone ping to a member goes singly. Re-attaches and withdraw tombstones never travel in a batch: they are privileged, judged per record by the freshness gate, and rare, so they keep going singly over `/register`, and the member refuses a batch any entry of which carries either flag. Each entry is signed on its own, byte for byte the single ping, so the member's handling is one code path and any later renew replay guard can stay per entry. The service runs at most one cycle per registration at a time — a registration whose failover is still waiting on a re-walk is skipped by the next call — and does not act on the answer for a registration displaced (by a second register for its topic) or withdrawn while its ping was out, so a displaced registration never fails over.
+
 > **Why an `unknown_registration` waits for three strikes.** A lost registration is re-made about one TTL after the first `unknown_registration` (three pings; 90 s at the default TTL), not on the next ping. Failing over on the first such reply would recover two ping intervals sooner, but it has no back-off. One case answers `unknown_registration` honestly and briefly: with the minimum 10 s TTL the first ping goes out about 3.3 s after the register, before the 5 s gossip round has brought the record to a primary that did not admit it. That case, or a re-walk that is not accepted, would then re-run the register walk on every ping, which for short TTLs exceeds the per-peer register rate limit (§Anti-DoS, "Per-peer rate limits per cohort") and turns a harmless lag into rate-limit refusals. Counting strikes reuses the failover's back-off, at most one re-walk per three pings, and lets a one-off lag answer clear on the next ping. The cost is the one-TTL gap: a collection watch's periodic tail check wakes its watchers through it ([reactivity.md §The node's watch service](reactivity.md#the-nodes-watch-service)), and a matchmaking provider is absent from seeker results for it.
 
 > **Resolved.** Backup failover refreshes the participant's `cohortEpoch` hint **lazily** — on the *next* ping/renewal after failover (when a `primary_moved` reply carries the fresh epoch), not eagerly at failover time. Promoting `backups[0]` keeps the existing epoch hint; the new primary corrects it on the following round.
@@ -1422,6 +1424,7 @@ A participant verifying a threshold-signed message against an out-of-date `Membe
 
 ```
 /optimystic/cohort-topic/1.0.0/register       — Register, renew, re-attach
+/optimystic/cohort-topic/1.0.0/renew-batch    — Several plain renewal pings to one member, answered entry by entry
 /optimystic/cohort-topic/1.0.0/cohort-gossip  — Registration replication, willingness vectors, load barometers
 /optimystic/cohort-topic/1.0.0/promote        — Threshold-signed promotion / demotion notices
 /optimystic/cohort-topic/1.0.0/membership     — Membership certificates
@@ -1758,6 +1761,24 @@ interface RenewReplyV1 {
   cohortEpoch?:    string             // 32 bytes
 }
 ```
+
+### Renew batch
+
+Sent over `/renew-batch`, one frame each way, by a participant with several plain pings for one member (§TTL and renewal).
+
+```
+interface RenewBatchV1 {
+  v:               1
+  renews:          RenewV1[]          // 1..64 (MAX_RENEW_BATCH_ENTRIES), each a plain ping: no reattach, no withdraw
+}
+
+interface RenewBatchReplyV1 {
+  v:               1
+  replies:         RenewReplyV1[]     // same length and order as renews
+}
+```
+
+Each entry is a complete, individually signed `RenewV1`, byte for byte what the same ping sends alone, and the member answers it as it answers that ping on `/register` (`resolveRenew` in `packages/db-p2p/src/cohort-topic/host.ts`), with one clock reading for the whole frame. `validateRenewBatchV1` refuses an empty or oversized `renews`, and an entry carrying `reattach` or `withdraw` at all, whatever its value; those stay single so the per-record freshness gate judges each one. A reply of the wrong length, or one that does not validate, is no answer for every entry. It is a protocol of its own rather than another frame shape on `/register` because a member that predates it then refuses the stream at negotiation (libp2p's `UnsupportedProtocolError`, which the router maps to `RenewBatchUnsupportedError`), a definite "older build", where an unrecognised frame on `/register` would fail in a way the dialer cannot tell from a dead link. Like `/register`, it is not behind `authorizeInboundStream`, which gates the four database protocols.
 
 ### Child link
 

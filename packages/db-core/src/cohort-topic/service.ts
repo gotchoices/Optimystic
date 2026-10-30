@@ -12,8 +12,9 @@
  * a cohort member (`docs/cohort-topic.md` §FRET integration — all four protocols on one node).
  *
  * Composition wired here: {@link WalkEngine} (lookup / register), the `d_max` computer + tier
- * addressing, the participant-side {@link RenewalParticipant} (the `ttl/3` ping with crash-failover),
- * and the application integration hooks ({@link CohortGossipBus}, {@link MembershipVerifier}). The
+ * addressing, the participant-side {@link RenewalParticipant} (the `ttl/3` ping with crash-failover,
+ * whose pings {@link CohortTopicService.renewMany} sends one request per primary), and the application
+ * integration hooks ({@link CohortGossipBus}, {@link MembershipVerifier}). The
  * cohort-side modules (willingness, promotion, traffic, store, membership publisher, anti-DoS) are
  * assembled by the member engine the FRET host wires into the `RouteAndMaybeAct` activity callback.
  */
@@ -22,10 +23,11 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { createTierAddressing, type TierAddressing } from "./addressing.js";
 import { makeDMaxComputer, type DMaxComputer } from "./dmax.js";
 import { DEFAULT_FANOUT } from "./addressing.js";
-import type { ISizeEstimator, ITopicRouter, IRingHash } from "./ports.js";
+import { RenewBatchUnsupportedError, type ISizeEstimator, type ITopicRouter, type IRingHash, type PeerRef } from "./ports.js";
 import { createWalkEngine, type AcceptedWalkOutcome, type RegisterMessageFactory, type WalkEngine, type WalkOutcome } from "./walk.js";
 import {
 	createRenewalParticipant,
+	type PreparedPing,
 	type RenewalAssignment,
 	type RenewalParticipant,
 	type RenewalParticipantTransport,
@@ -33,14 +35,24 @@ import {
 } from "./registration/renewal.js";
 import type { RegistrationRecord } from "./registration/types.js";
 import { DEFAULT_TTL_MS } from "./registration/types.js";
-import { recordKey } from "./registration/bytes.js";
+import { bytesKey, recordKey } from "./registration/bytes.js";
 import type { CohortGossipBus } from "./gossip/bus.js";
 import type { MembershipVerifier } from "./membership/verifier.js";
 import type { Tier } from "./tiers.js";
-import { bytesToB64url, b64urlToBytes, decodeRenewReplyV1, encodeCohortMessage } from "./wire/codec.js";
-import { MAX_ROOT_KEY_BYTES } from "./wire/validate.js";
-import type { RegisterV1, RenewReplyV1, TopicTrafficV1 } from "./wire/types.js";
+import { bytesToB64url, b64urlToBytes, decodeRenewBatchReplyV1, decodeRenewReplyV1, encodeCohortMessage } from "./wire/codec.js";
+import { CohortWireError, MAX_RENEW_BATCH_ENTRIES, MAX_ROOT_KEY_BYTES } from "./wire/validate.js";
+import type { RegisterV1, RenewBatchV1, RenewReplyV1, RenewV1, TopicTrafficV1 } from "./wire/types.js";
 import type { CollectionChangeEvent, CommitCert } from "../transactor/change-notifier.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger("cohort-topic:service");
+
+/**
+ * How long a member that refused the renew-batch protocol (a build that predates it) is sent single pings before
+ * a batch is tried again: an older member then costs one refused negotiation per interval, and an upgraded one is
+ * batched to again within it.
+ */
+export const RENEW_BATCH_UNSUPPORTED_RECHECK_MS = 10 * 60 * 1000;
 
 /** A resolved cohort for a topic/tier — the return of {@link CohortTopicService.lookup}. */
 export interface CohortHint {
@@ -118,8 +130,18 @@ export interface RegisterRequest {
 export interface CohortTopicService {
 	/** Walk → register for `topicId` at `tier`; resolves a live {@link RegistrationHandle} or throws {@link CohortBackoffError}. */
 	register(req: RegisterRequest): Promise<RegistrationHandle>;
-	/** Run one `ttl/3` renewal cycle for `handle` (handles `primary_moved` + crash-failover). */
+	/** Run one `ttl/3` renewal cycle for `handle` (handles `primary_moved` + crash-failover): {@link renewMany} of one. */
 	renew(handle: RegistrationHandle): Promise<void>;
+	/**
+	 * Run one renewal cycle for each of `handles`, sending the plain pings bound for one member in one request
+	 * (§TTL and renewal) — singly to a member that does not speak the batch protocol. Each registration is answered
+	 * and acted on exactly as a single renewal would be. Skipped: a stale or withdrawn handle, and a registration
+	 * whose previous cycle is still running (usually a failover held up by a re-walk), so no two cycles of one
+	 * registration run side by side. A handle displaced or withdrawn while its ping was out is not acted on, so it
+	 * never fails over. Resolves once every cycle has; when some threw, rejects after all of them with that error,
+	 * or an `AggregateError` of them when several did.
+	 */
+	renewMany(handles: readonly RegistrationHandle[]): Promise<void>;
 	/**
 	 * Resolve the cohort for `topicId` at `tier` without keeping a live registration. `rootKey` names the
 	 * root of a root-placed topic (see {@link RegisterRequest.rootKey}).
@@ -235,6 +257,20 @@ interface LiveRenewal {
 	readonly renewal: RenewalParticipant;
 	readonly root: RootKeySlot;
 	readonly landing: WalkLanding;
+	/** The renewal cycle running for it, if one is; {@link CohortTopicService.renewMany} skips it until that cycle ends. */
+	cycle: RenewalCycle | undefined;
+}
+
+/** One registration {@link CohortTopicService.renewMany} is running a cycle for. */
+interface RenewalCycle {
+	readonly handle: RegistrationHandle;
+	readonly live: LiveRenewal;
+}
+
+/** The prepared pings bound for one member, by their position in the cycle list. */
+interface PingGroup {
+	readonly target: Uint8Array;
+	readonly positions: number[];
 }
 
 class WalkRegisterService implements CohortTopicService {
@@ -248,6 +284,13 @@ class WalkRegisterService implements CohortTopicService {
 	private readonly maxMessageBytes?: number;
 	/** Live renewals, keyed by `(topicId, participantId)` so renew/withdraw/moveRoot find their handle. */
 	private readonly renewals = new Map<string, LiveRenewal>();
+	/**
+	 * Members that refused the renew-batch protocol, by `bytesKey`, with the time after which a batch is tried again.
+	 * NOTE: bounded by the distinct primaries this node renews with, and an entry is dropped only when read after it
+	 * expires; if a node ever renews with very many distinct primaries, cap it.
+	 */
+	private readonly batchUnsupportedUntil = new Map<string, number>();
+	private readonly dialRenewBatch: ((member: PeerRef, frame: Uint8Array) => Promise<Uint8Array>) | undefined;
 	private readonly participantId: Uint8Array;
 
 	constructor(private readonly deps: CohortTopicServiceDeps) {
@@ -256,6 +299,7 @@ class WalkRegisterService implements CohortTopicService {
 		this.clock = deps.clock ?? ((): number => Date.now());
 		this.ttl = cfg.ttl ?? DEFAULT_TTL_MS;
 		this.maxMessageBytes = cfg.maxMessageBytes;
+		this.dialRenewBatch = deps.router.dialMemberRenewBatch?.bind(deps.router);
 		// The participant identity carried on the wire (`participantCoord` on register, `participantId`
 		// on renew) IS `self` — the dialable peer id db-p2p supplies via its peer-codec. It is the
 		// record key the cohort stores AND the signer id its peer-key signature verifies against, so it
@@ -294,16 +338,25 @@ class WalkRegisterService implements CohortTopicService {
 		return this.hintFromReply(topicId, tier, outcome, rootKey);
 	}
 
-	async renew(handle: RegistrationHandle): Promise<void> {
-		// Act only if this handle is still the live entry. A stale handle (superseded by a second
-		// register() for the same pair) must not drive the new registration's ping loop, and a
-		// withdrawn handle must not silently re-start it.
-		const live = this.liveRenewal(handle);
-		if (live === undefined) {
+	renew(handle: RegistrationHandle): Promise<void> {
+		return this.renewMany([handle]);
+	}
+
+	async renewMany(handles: readonly RegistrationHandle[]): Promise<void> {
+		const cycles = this.beginCycles(handles);
+		if (cycles.length === 0) {
 			return;
 		}
-		await handle.renewal.pingLoop();
-		this.syncHandle(handle, live.landing);
+		try {
+			const pings = await Promise.all(cycles.map((cycle) => this.preparePing(cycle)));
+			// Every send finishes before anything is settled, so one registration's failover (re-attaches, then a
+			// re-walk) never holds back another's ping.
+			const answers = await this.sendPings(pings);
+			throwFailures(await this.settleCycles(cycles, answers));
+		} finally {
+			// Each cycle has ended by now, its own settle having ended it; this covers a throw before settling.
+			cycles.forEach(endCycle);
+		}
 	}
 
 	moveRoot(handle: RegistrationHandle, rootKey: Uint8Array): void {
@@ -362,6 +415,142 @@ class WalkRegisterService implements CohortTopicService {
 		return live?.renewal === handle.renewal ? live : undefined;
 	}
 
+	/**
+	 * Mark and return the registrations among `handles` a cycle may run for: live (a stale handle must not drive the
+	 * registration that displaced it, nor a withdrawn one re-start its pings) and not already renewing. A handle
+	 * named twice is taken once.
+	 */
+	private beginCycles(handles: readonly RegistrationHandle[]): RenewalCycle[] {
+		const cycles: RenewalCycle[] = [];
+		for (const handle of handles) {
+			const live = this.liveRenewal(handle);
+			if (live === undefined || live.cycle !== undefined) {
+				continue;
+			}
+			const cycle: RenewalCycle = { handle, live };
+			live.cycle = cycle;
+			cycles.push(cycle);
+		}
+		return cycles;
+	}
+
+	/** The cycle's signed ping, or `undefined` when signing failed — a failed ping, as a single renewal counts it. */
+	private async preparePing({ handle, live }: RenewalCycle): Promise<PreparedPing | undefined> {
+		try {
+			return await live.renewal.preparePing();
+		} catch (err) {
+			log("renew ping for topic %s could not be signed (a failed ping): %o", bytesKey(handle.topicId), err);
+			return undefined;
+		}
+	}
+
+	/** Send every prepared ping and return each one's answer by position, `undefined` for none. Never rejects. */
+	private async sendPings(pings: ReadonlyArray<PreparedPing | undefined>): Promise<(RenewReplyV1 | undefined)[]> {
+		const answers = new Array<RenewReplyV1 | undefined>(pings.length).fill(undefined);
+		const sends = groupByTarget(pings).flatMap(({ target, positions }) =>
+			chunked(positions, MAX_RENEW_BATCH_ENTRIES).map(async (chunk) => {
+				const replies = await this.sendToMember(target, chunk.map((position) => pings[position]!.msg));
+				chunk.forEach((position, i) => {
+					answers[position] = replies[i];
+				});
+			}));
+		await Promise.all(sends);
+		return answers;
+	}
+
+	/**
+	 * Send `msgs` to `target` as one batch frame when that can work, else singly. A member that does not speak the
+	 * batch protocol is sent the same pings singly at once, and remembered. Any other batch failure — the link, or a
+	 * reply that is malformed or of the wrong length — is no answer for every ping in it, as the same pings sent
+	 * singly over that link would each have been. Never rejects.
+	 */
+	private async sendToMember(target: Uint8Array, msgs: readonly RenewV1[]): Promise<(RenewReplyV1 | undefined)[]> {
+		const dialBatch = this.dialRenewBatch;
+		if (msgs.length === 1 || dialBatch === undefined || this.refusedBatches(target)) {
+			return this.sendSingly(target, msgs);
+		}
+		try {
+			return await this.sendBatch(dialBatch, target, msgs);
+		} catch (err) {
+			if (err instanceof RenewBatchUnsupportedError) {
+				this.batchUnsupportedUntil.set(bytesKey(target), this.clock() + RENEW_BATCH_UNSUPPORTED_RECHECK_MS);
+				return this.sendSingly(target, msgs);
+			}
+			log("renew batch of %d pings to %s got no usable answer (each a failed ping): %o", msgs.length, bytesKey(target), err);
+			return msgs.map(() => undefined);
+		}
+	}
+
+	private async sendBatch(
+		dialBatch: (member: PeerRef, frame: Uint8Array) => Promise<Uint8Array>,
+		target: Uint8Array,
+		msgs: readonly RenewV1[],
+	): Promise<RenewReplyV1[]> {
+		const batch: RenewBatchV1 = { v: 1, renews: [...msgs] };
+		const raw = await dialBatch({ id: target }, encodeCohortMessage(batch, this.maxMessageBytes));
+		const { replies } = decodeRenewBatchReplyV1(raw, this.maxMessageBytes);
+		if (replies.length !== msgs.length) {
+			throw new CohortWireError(`RenewBatchReplyV1: ${replies.length} replies to a batch of ${msgs.length} pings`);
+		}
+		return replies;
+	}
+
+	private sendSingly(target: Uint8Array, msgs: readonly RenewV1[]): Promise<(RenewReplyV1 | undefined)[]> {
+		return Promise.all(msgs.map(async (msg) => {
+			try {
+				return await this.sendRenew(target, msg);
+			} catch (err) {
+				log("renew ping to %s got no answer (a failed ping): %o", bytesKey(target), err);
+				return undefined;
+			}
+		}));
+	}
+
+	/** One renew — ping, re-attach or withdraw — to `target` over the router's direct dial. */
+	private async sendRenew(target: Uint8Array, msg: RenewV1): Promise<RenewReplyV1> {
+		const raw = await this.deps.router.dialMember({ id: target }, encodeCohortMessage(msg, this.maxMessageBytes));
+		return decodeRenewReplyV1(raw, this.maxMessageBytes);
+	}
+
+	/** Whether `target` refused the batch protocol within the last {@link RENEW_BATCH_UNSUPPORTED_RECHECK_MS}; an expired entry is dropped. */
+	private refusedBatches(target: Uint8Array): boolean {
+		const key = bytesKey(target);
+		const until = this.batchUnsupportedUntil.get(key);
+		if (until === undefined) {
+			return false;
+		}
+		if (this.clock() < until) {
+			return true;
+		}
+		this.batchUnsupportedUntil.delete(key);
+		return false;
+	}
+
+	/** Settle every cycle with its answer, side by side; resolves, once all have, with what the ones that threw threw. */
+	private async settleCycles(cycles: readonly RenewalCycle[], answers: ReadonlyArray<RenewReplyV1 | undefined>): Promise<unknown[]> {
+		const outcomes = await Promise.allSettled(cycles.map((cycle, i) => this.settleCycle(cycle, answers[i])));
+		return outcomes.flatMap((outcome): unknown[] => (outcome.status === "rejected" ? [outcome.reason] : []));
+	}
+
+	/**
+	 * Act on one cycle's answer — unless a later register displaced the handle (a tail follow at the root) or it was
+	 * withdrawn while its ping was out. Settling a displaced registration's strikes would fail it over and re-walk
+	 * it; its record at the old cohort expires by TTL instead. The cycle ends when this does, not when the slowest
+	 * cycle of the same call does, so another registration's long failover does not keep this one out of the next call.
+	 */
+	private async settleCycle(cycle: RenewalCycle, answer: RenewReplyV1 | undefined): Promise<void> {
+		const { handle, live } = cycle;
+		try {
+			if (this.liveRenewal(handle) !== live) {
+				return;
+			}
+			await live.renewal.settlePing(answer);
+			this.syncHandle(handle, live.landing);
+		} finally {
+			endCycle(cycle);
+		}
+	}
+
 	private startRenewal(req: RegisterRequest, hint: CohortHint, correlationId: string): RenewalParticipant {
 		const ttl = req.ttl ?? this.ttl;
 		const initial: RegistrationRecord = {
@@ -398,7 +587,7 @@ class WalkRegisterService implements CohortTopicService {
 		// record still lives at the old one, and a machine in both roots' storage groups holds both; a
 		// tombstone resolves through the host's `findHolder`, which picks the newer record there, so it would
 		// evict the live registration. The displaced record expires by TTL at its cohort.
-		this.renewals.set(recordKey(req.topicId, this.participantId), { renewal, root, landing });
+		this.renewals.set(recordKey(req.topicId, this.participantId), { renewal, root, landing, cycle: undefined });
 		return renewal;
 	}
 
@@ -410,10 +599,7 @@ class WalkRegisterService implements CohortTopicService {
 	 */
 	private renewalTransport(req: RegisterRequest, root: RootKeySlot, landing: WalkLanding): RenewalParticipantTransport {
 		return {
-			send: async (target: Uint8Array, msg): Promise<RenewReplyV1> => {
-				const raw = await this.deps.router.dialMember({ id: target }, encodeCohortMessage(msg, this.maxMessageBytes));
-				return decodeRenewReplyV1(raw, this.maxMessageBytes);
-			},
+			send: (target: Uint8Array, msg): Promise<RenewReplyV1> => this.sendRenew(target, msg),
 			relookup: async (): Promise<RenewalAssignment | undefined> => {
 				// NOTE: re-sends the first registration's `appPayload` (for a collection watch, its `tailIdAtAttach`
 				// and `lastKnownRev`). No cohort reads those fields off a held record today; if one ever does, the
@@ -529,6 +715,50 @@ class WalkRegisterService implements CohortTopicService {
 function assertRootKey(rootKey: Uint8Array | undefined): void {
 	if (rootKey !== undefined && (rootKey.length === 0 || rootKey.length > MAX_ROOT_KEY_BYTES)) {
 		throw new RangeError(`cohort-topic: rootKey must be 1..${MAX_ROOT_KEY_BYTES} bytes, got ${rootKey.length}`);
+	}
+}
+
+/** The prepared pings grouped by the member each goes to, in first-seen order; an unprepared one is in no group. */
+function groupByTarget(pings: ReadonlyArray<PreparedPing | undefined>): PingGroup[] {
+	const groups = new Map<string, PingGroup>();
+	pings.forEach((ping, position) => {
+		if (ping === undefined) {
+			return;
+		}
+		const key = bytesKey(ping.target);
+		const group = groups.get(key);
+		if (group !== undefined) {
+			group.positions.push(position);
+		} else {
+			groups.set(key, { target: ping.target, positions: [position] });
+		}
+	});
+	return [...groups.values()];
+}
+
+/** `items` in consecutive runs of at most `size`. */
+function chunked<T>(items: readonly T[], size: number): T[][] {
+	const chunks: T[][] = [];
+	for (let i = 0; i < items.length; i += size) {
+		chunks.push(items.slice(i, i + size));
+	}
+	return chunks;
+}
+
+/** Release the registration `cycle` ran for — only if that cycle still holds it, never a later call's cycle. */
+function endCycle(cycle: RenewalCycle): void {
+	if (cycle.live.cycle === cycle) {
+		cycle.live.cycle = undefined;
+	}
+}
+
+/** Rethrow what the settled cycles threw: the one error itself, or an `AggregateError` when several threw. */
+function throwFailures(failures: readonly unknown[]): void {
+	if (failures.length === 1) {
+		throw failures[0];
+	}
+	if (failures.length > 1) {
+		throw new AggregateError(failures, `cohort-topic: ${failures.length} renewal cycles failed`);
 	}
 }
 
