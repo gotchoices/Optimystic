@@ -91,7 +91,11 @@ export interface PushStateGossipTruncation {
 export interface ReactivityPushStateGossipDriverDeps {
 	/** Reuse the node's cohort gossip transport (`broadcastOver`) — no new transport. */
 	readonly gossipTransport: Pick<FretCohortGossipTransport, "broadcastOver">;
-	/** The live forwarder collections to gossip each round, with the cohort coord to broadcast to. */
+	/**
+	 * The live forwarder collections to gossip each round, with the cohort coord to broadcast to. Each push state
+	 * at most once per round: what was last sent is remembered per push state, not per coord, so a second listing
+	 * under another coord in the same round would find its frame just sent and be skipped.
+	 */
 	readonly liveCollections: () => Iterable<ReactivityGossipCollection>;
 	/** Resolve the collection owning an inbound frame (by collectionId/topicId) → its {@link PushState}, or undefined. */
 	readonly pushStateForGossip: (g: PushStateGossipV1) => PushState | undefined;
