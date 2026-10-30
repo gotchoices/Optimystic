@@ -183,7 +183,17 @@ import {
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
-import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS, DEFAULT_WILLINGNESS_HEARTBEAT_MS, type GossipDeltas } from "./cohort-gossip-driver.js";
+import {
+	buildCohortGossip,
+	createPendingDeltas,
+	DEFAULT_GOSSIP_INTERVAL_MS,
+	DEFAULT_WILLINGNESS_HEARTBEAT_MS,
+	emptyGossipDeltas,
+	gossipMaterialKey,
+	isGossipRoundDue,
+	type GossipDeltas,
+	type SentGossip,
+} from "./cohort-gossip-driver.js";
 import { createColdQuorumWait, DEFAULT_COLD_QUORUM_WAIT_MS } from "./cold-quorum-wait.js";
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
@@ -231,13 +241,15 @@ export interface CohortTopicHostOptions {
 	 */
 	readonly gossipIntervalMs?: number;
 	/**
-	 * `T_willingness_heartbeat` (ms): how often a genuinely-**idle but willing** {@link CoordEngine}
-	 * re-broadcasts a willingness-only heartbeat so a cold cohort can bootstrap (siblings hear it, instantiate
-	 * their own engine, and reciprocate — §Cold-start instantiation). Default
-	 * {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS} (~30 s). The first idle round after an engine is created emits
-	 * immediately regardless of this interval; a record-carrying round resets the clock, so this only paces the
-	 * steady-state re-broadcast of an idle willing cohort. Independent of {@link gossipIntervalMs} (the tick
-	 * cadence): the tick can fire fast while heartbeats stay throttled.
+	 * `T_willingness_heartbeat` (ms): the longest a {@link CoordEngine} goes without sending a frame while it has
+	 * one to send. A round sends when it carries deltas or its frame differs materially from the last one sent,
+	 * and otherwise only once this long has passed since that one. For an idle but willing engine that is the
+	 * willingness heartbeat that lets a cold cohort bootstrap (siblings hear it, instantiate their own engine,
+	 * and reciprocate — §Cold-start instantiation); for an engine holding records it is how often its unchanged
+	 * frame refreshes the advisory traffic rates siblings hold. It also paces the child-set re-advertisement.
+	 * Default {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS} (~30 s). The first round after an engine is created sends
+	 * regardless of this interval. Independent of {@link gossipIntervalMs} (the tick cadence): the tick can fire
+	 * fast while unchanged frames stay throttled.
 	 */
 	readonly willingnessHeartbeatMs?: number;
 	/**
@@ -640,8 +652,10 @@ export interface CoordEngine {
 	 * This cohort's current gossip-derived traffic barometer for `topicId` (own last-published counts +
 	 * siblings' last-gossiped summaries + `directParticipants` from the store). The matchmaking `QueryV1`
 	 * reply attaches it and the seeker hang-out decision consumes it (`docs/matchmaking.md` §Hang-out vs.
-	 * continue). Non-mutating — a synchronous read over the same in-memory state a `gossipRound` mutates,
-	 * lagging at most one gossip round (it reflects the last frozen summaries, never raw mid-round counts).
+	 * continue). Non-mutating — a synchronous read over the same in-memory state a `gossipRound` mutates. It
+	 * reflects frozen summaries, never raw mid-round counts: this member's own as of its last round, and each
+	 * sibling's as of the last frame that sibling sent — up to `T_willingness_heartbeat` old for a sibling whose
+	 * frame has not otherwise changed.
 	 */
 	topicTraffic(topicId: Uint8Array): TopicTrafficV1;
 	/**
@@ -667,9 +681,11 @@ export interface CoordEngine {
 	pumpMembership(now: number): Promise<MembershipCertV1 | undefined>;
 	/**
 	 * One gossip round: TTL-sweep stale records (firing the `evicted` deltas), freeze the per-topic
-	 * traffic summaries, drain the accumulated record/eviction deltas, and broadcast a signed
-	 * {@link CohortGossipV1} (willingness/load/traffic + deltas) to the cohort. Returns the broadcast
-	 * frame, or `undefined` when the engine is idle (no resident topics and no deltas → nothing to send).
+	 * traffic summaries, and — when the round is due — drain the accumulated record/eviction deltas and
+	 * broadcast a signed {@link CohortGossipV1} (willingness/load/traffic + deltas) to the cohort. A round is
+	 * due when it carries deltas, when its frame differs materially from the last one this engine sent, or when
+	 * `T_willingness_heartbeat` has passed since that one. Returns the broadcast frame, or `undefined` for a
+	 * round that sent nothing (not due, or idle and willing for no tier); such a round leaves the deltas queued.
 	 */
 	gossipRound(now: number): Promise<CohortGossipV1 | undefined>;
 	/**
@@ -843,7 +859,7 @@ interface CoordEngineContext {
 	readonly wantK: number;
 	readonly minSigs: number;
 	readonly maxBytes: number;
-	/** `T_willingness_heartbeat` (ms): idle-but-willing heartbeat throttle (§Cold-start instantiation). */
+	/** `T_willingness_heartbeat` (ms): the slow refresh of an unchanged frame, and the idle-but-willing heartbeat (§Cold-start instantiation). */
 	readonly willingnessHeartbeatMs: number;
 	/** The gossip-round cadence (ms): an engine sends at most one out-of-band willingness advert per interval. */
 	readonly gossipIntervalMs: number;
@@ -2816,6 +2832,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		gossip: {
 			// Per-touch replication, batched to one gossip round: a served ping/re-attach queues the touched
 			// record; the next round drains it so cohort members converge on the active set + assignments.
+			// A touch is a delta, so it makes that round send even when nothing else changed.
+			// NOTE: if renewal-driven frames on engines holding many records ever show up in profiles, defer a
+			// touch that changes only `lastPing` by up to ttl/6 and batch it with others — weighed against a
+			// backup replica one ping older at failover, closer to its own TTL eviction before re-attach reaches it.
 			touch: (rec): void => pending.touch(rec),
 			// A TTL sweep eviction is gossiped so siblings drop the dead record (convergence on eviction).
 			evicted: (rec): void => pending.evicted(rec),
@@ -2829,27 +2849,26 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 
 	// --- frame emission: the round's frame and the out-of-band willingness advert (§Cold-start instantiation) ---
 
-	// Timestamp of the last frame this engine actually emitted (any frame carries willingness). Drives the
-	// idle-but-willing heartbeat throttle: an idle round heartbeats only if this engine has never emitted
-	// (first idle round → immediate) or `T_willingness_heartbeat` has elapsed. A record-carrying round emits
-	// every round and updates this clock, so the throttle governs only genuinely-idle engines; a willingness
-	// advert updates it too, so the round after one does not repeat it. `undefined` until the first emit.
-	// NOTE: re-broadcasts willingness for every idle-but-willing cohort every T_willingness_heartbeat; if a
-	// node ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
-	let lastGossipAt: number | undefined;
+	// The last frame this engine emitted — a round's or a willingness advert's — as its material key and time:
+	// what siblings last heard from it. A round sends only when it carries deltas, differs materially from this,
+	// or `T_willingness_heartbeat` has passed since it (`isGossipRoundDue`). Recorded when the frame is handed to
+	// signing, so a round racing a slow sign compares against it; a frame lost to a close while signing is
+	// recorded anyway, since the engine is gone either way. `undefined` until the first emit.
+	// NOTE: re-broadcasts an unchanged frame for every willing cohort every T_willingness_heartbeat; if a node
+	// ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
+	let lastSent: SentGossip | undefined;
 
 	// Timestamp of the last willingness advert: an engine sends at most one per gossip interval, however many
 	// registers and newly heard members ask for one.
 	let lastAdvertAt: number | undefined;
 
 	/** This engine's frame at `now` over `topicSummaries` and `deltas`, or `undefined` when it has nothing to say. */
-	const frameAt = (now: number, heartbeat: boolean, topicSummaries: CohortTopicSummary[], deltas: GossipDeltas): CohortGossipV1 | undefined =>
+	const frameAt = (now: number, topicSummaries: CohortTopicSummary[], deltas: GossipDeltas): CohortGossipV1 | undefined =>
 		buildCohortGossip({
 			fromMember: selfMember,
 			coord: bytesToB64url(servedCoord),
 			cohortEpoch: bytesToB64url(localEpoch()),
 			treeTier,
-			heartbeat,
 			profile: ctx.profile,
 			barometer: ctx.barometer,
 			windowSeconds: DEFAULT_TRAFFIC_WINDOW_SECONDS,
@@ -2871,25 +2890,27 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 
 	/**
 	 * Tell the cohort this member's willingness at `at`, outside the round cadence, and say whether a frame
-	 * went out. The advert is the frame an idle round's heartbeat sends — no summaries, no deltas, nothing
-	 * drained from `pending`, no sweep — so a round racing it neither double-sends a delta nor heartbeats again.
+	 * went out. The advert is the frame an idle round sends — no summaries, no deltas, nothing drained from
+	 * `pending`, no sweep — and is recorded as this engine's last frame, so a round racing it neither
+	 * double-sends a delta nor repeats it.
 	 *
 	 * Only an idle engine (no records, nothing queued) adverts. A member's contribution replaces its previous
 	 * one in a sibling's view as a whole, so a summary-less frame from an engine holding records would blank
-	 * its topic summaries there until its next round — and such an engine gossips every round anyway. Only a
-	 * live-signer host adverts: without a key there is no co-member gate on the frames it would be answering.
+	 * its topic summaries there until its next frame — and such an engine's frames already carry its
+	 * willingness, sent on its next round whenever it changes. Only a live-signer host adverts: without a key
+	 * there is no co-member gate on the frames it would be answering.
 	 */
 	const advertiseWillingness = (at: number): boolean => {
 		const askedRecently = lastAdvertAt !== undefined && at - lastAdvertAt < ctx.gossipIntervalMs;
 		if (closed || ctx.signGossip === undefined || askedRecently || store.listAll().length > 0 || !pending.isEmpty()) {
 			return false;
 		}
-		const advert = frameAt(at, true, [], { records: [], evicted: [], childLinks: [], childUnlinks: [] });
+		const advert = frameAt(at, [], emptyGossipDeltas());
 		if (advert === undefined) {
 			return false; // willing for no tier: nothing to advertise
 		}
 		lastAdvertAt = at;
-		lastGossipAt = at;
+		lastSent = { key: gossipMaterialKey(advert), at };
 		void signAndBroadcast(advert).catch((err: unknown) => {
 			log("cohort-topic: willingness advert failed at coord %s: %o", bytesToB64url(servedCoord), err);
 		});
@@ -2971,10 +2992,12 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	let lastChildReadvertAt: number | undefined;
 
 	// One gossip round: sweep stale records (firing the `evicted` deltas), freeze each resident topic's
-	// traffic summary, re-advertise the linked child set on its throttle, drain the touch/evicted/child deltas,
-	// then assemble + sign + broadcast the frame. An idle engine (no topics, no deltas) normally builds no
-	// frame — except a willingness heartbeat, where an idle but willing engine still emits a willingness/load-
-	// only frame so a cold cohort can bootstrap.
+	// traffic summary, re-advertise the linked child set on its throttle, then send a frame only if the round
+	// is due (`isGossipRoundDue`): it carries deltas, it differs materially from the last frame this engine
+	// sent, or `T_willingness_heartbeat` has passed since that one. An idle engine (no topics, no deltas) has a
+	// willingness/load-only frame while it is willing for some tier, which is what lets a cold cohort bootstrap,
+	// and nothing at all while it is willing for none. Answers the frame sent, or `undefined` for a round that
+	// sent nothing.
 	const gossipRound = async (now: number): Promise<CohortGossipV1 | undefined> => {
 		if (closed) {
 			return undefined;
@@ -2982,6 +3005,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		await refreshRootGroup();
 		engine.sweepStale(now);
 		const topicSummaries = residentTopics().map((topicId) =>
+			// Publishes even on a round that sends nothing, so this member's own replies can use counts newer than
+			// its siblings hold — both are advisory.
 			toCohortTopicSummary(topicId, traffic.publish(topicId, now), {
 				tier: tierOfTopic(store, topicId),
 				directParticipants: store.directParticipants(topicId),
@@ -3004,7 +3029,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// registry rather than the queue is what makes the unlink direction safe: an already-released child is
 		// simply absent from `linkedChildren()`, and nothing between here and `drain()` awaits, so a
 		// re-advertisement can never race a same-round unlink. Bounded to one extra frame per engine per
-		// heartbeat, and the round is deliberately non-idle — the frame is the carrier.
+		// heartbeat: the re-advertised links are deltas, so the round sends — the frame is the carrier.
 		// NOTE: this heals a missed *link*, never a missed *unlink* — absence is not advertised, so a member
 		// that dropped an unlink frame over-counts until it hears another delta for that child. Both consumers
 		// fail conservatively there (demotion stays blocked; a seeker sweeps a no-longer-promoted tier —
@@ -3020,15 +3045,19 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				lastChildReadvertAt = now;
 			}
 		}
-		const deltas = pending.drain();
-		const idle = topicSummaries.length === 0 && deltas.records.length === 0 && deltas.evicted.length === 0
-			&& deltas.childLinks.length === 0 && deltas.childUnlinks.length === 0;
-		const heartbeat = idle && (lastGossipAt === undefined || now - lastGossipAt >= ctx.willingnessHeartbeatMs);
-		const g = frameAt(now, heartbeat, topicSummaries, deltas);
+		// A round that sends nothing must keep what is queued. Only a round with something queued drains, and a
+		// queued delta makes the round due on its own, so the drain only ever feeds a frame that goes out. Nothing
+		// between the `isEmpty` check and the drain awaits, so no delta can slip in between.
+		const hasDeltas = !pending.isEmpty();
+		const g = frameAt(now, topicSummaries, hasDeltas ? pending.drain() : emptyGossipDeltas());
 		if (g === undefined) {
+			return undefined; // idle and willing for no tier
+		}
+		const key = gossipMaterialKey(g);
+		if (!isGossipRoundDue({ hasDeltas, key, lastSent, now, heartbeatMs: ctx.willingnessHeartbeatMs })) {
 			return undefined;
 		}
-		lastGossipAt = now;
+		lastSent = { key, at: now };
 		await signAndBroadcast(g);
 		return g;
 	};

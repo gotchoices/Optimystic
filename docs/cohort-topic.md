@@ -383,7 +383,7 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 - **Willing** → become `primary` for this registration; assign two backups by the cohort's deterministic hash (see [Primary and backup sharding](#primary-and-backup-sharding)); return `Accepted`.
 - **Unwilling personally, but enough siblings are willing to meet the quorum** → return `UnwillingMember(candidateMembers)`. Caller retries the same coord at a named alternative member.
 
-The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
+The cohort gossips a coarse "willingness vector" (one bit per tier per member, sent on the next gossip round whenever it changes and re-sent at least once per `T_willingness_heartbeat`) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
 Because the admission quorum is counted from gossip, a member whose gossip has not arrived yet is not the same as a member that gossiped unwilling, and the check tells them apart. It is given the cohort's current members, and when the quorum is short it also reports whether it would be met if every member not yet heard from turned out willing (`awaitingMembers` on `UnwillingCohortOutcome` in `packages/db-core/src/cohort-topic/willingness.ts`): `willing + unheard ≥ quorum`, where a member that has gossiped unwilling counts as heard. A cohort whose answers are in and short declines with `UnwillingCohort` at once. A cohort that is only waiting on answers does not decline at once: the routed member asks its members to gossip now and holds the request briefly for them (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*).
 
@@ -470,7 +470,7 @@ TopicTrafficV1 {
 
 `arrivalsPerMin` deliberately combines fresh registrations and renewals into a single scalar: the seeker uses renewals as a proxy for active matchable supply, and the consumer-side formulas in [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue) take the combined value. A separate split is not currently needed; if a future consumer wants fresh-only or renewal-only, the field can be split then.
 
-Each member counts only the arrivals/queries that land on it (FRET routes each registration to one member; renewals go to the primary), so a member's own count is roughly `1/k` of the cohort's flow. The rate is therefore **cohort-wide aggregated**: the responder sums its own most-recent gossiped per-topic counts with the last-gossiped counts of its siblings (exact integers; `directParticipants` comes from the replicated store, not the sum). The reply uses this gossip-derived view — never a recompute from raw counters at reply time — and so lags by at most one gossip round.
+Each member counts only the arrivals/queries that land on it (FRET routes each registration to one member; renewals go to the primary), so a member's own count is roughly `1/k` of the cohort's flow. The rate is therefore **cohort-wide aggregated**: the responder sums its own most-recent gossiped per-topic counts with the last-gossiped counts of its siblings (exact integers; `directParticipants` comes from the replicated store, not the sum). The reply uses this gossip-derived view — never a recompute from raw counters at reply time. A sibling's counts are those of the last frame it sent: a material change or a delta reaches siblings on the next round, but a change of rates alone is not a reason to send, so rates refresh at least once per `T_willingness_heartbeat` (§Cohort gossip, *Cadence*) and in steady state a sibling's rates can be up to about that old. The responder's own counts are frozen every round, sent or not, so its own share can be newer than what its siblings hold. Matchmaking's hang-out decision is the one reader that weighs the rates, and a topic that is actually getting new registrations sends every round anyway, because each admission is a delta.
 
 Wire-format note: traffic fields are sent as **exact integers**, not log-bucketed like the load barometer in §Capacity barometer. Cohort gossip is intra-cohort and tiny, and the consumer-side formulas are numeric — bucketing would buy nothing and complicate matchmaking math. The load barometer is bucketed because it is a coarse priority signal; the traffic counts feed real arithmetic.
 
@@ -486,8 +486,9 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > replies; it is absent on `no_state`, `unwilling_member`, and `unwilling_cohort` (matches the
 > `RegisterReplyV1.topicTraffic` wire comment). Implemented as `attachTopicTraffic` in
 > `packages/db-core/src/cohort-topic/traffic.ts`, with the windowed exact-integer counters,
-> combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
-> recompute), and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
+> combined fresh+renewal arrivals, gossip-derived snapshot (no reply-time recompute; a sibling's
+> rates are those of its last frame, up to about `T_willingness_heartbeat` old when only the rates moved),
+> and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
 > gossiped per-topic counts (cohort-wide flow, since arrivals shard ~`1/k` across members);
 > `directParticipants` is read from the replicated store rather than summed. `childCohortCount` is a
 > **converged union** of the child cohorts this parent parents — not a max-of-siblings. The child set is
@@ -948,11 +949,12 @@ frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-
 
 1. **Idle-but-willing willingness heartbeat.** An idle engine that is willing for at least one tier
    (`selfWillingnessBits ≠ 0`) still emits a *willingness/load-only* gossip frame (empty `topicSummaries`,
-   no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first idle
-   round after the engine is created** and thereafter at most once per `T_willingness_heartbeat`
-   (§Configuration). A record-carrying (non-idle) round already ships willingness every round and resets
-   that clock, so the throttle governs only genuinely-idle engines; an engine willing for *nothing* stays
-   silent (it has nothing to bootstrap). On its own this converges a cold cohort in about two gossip
+   no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first
+   round after the engine is created**, again on the next round whenever its willingness or load changes,
+   and otherwise once per `T_willingness_heartbeat` (§Configuration) — the rule every engine's rounds follow
+   (§Cohort gossip, *Cadence*). An engine willing for *nothing* stays silent (it has nothing to bootstrap),
+   so an idle engine that turns unwilling announces nothing and siblings keep the willing frame they last
+   heard, while a willingness they have not heard is announced on the next round. On its own this converges a cold cohort in about two gossip
    rounds; mechanisms 3 and 4 send the same frame without waiting for a round.
 
 2. **Cold-sibling engine instantiation.** When a node receives a `/cohort-gossip` frame (e.g. the heartbeat
@@ -975,7 +977,9 @@ frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-
    and the rest are declined at once. The advert is sent only by an **idle** engine (no records, nothing
    queued for the next round), because a member's contribution replaces its previous one in a sibling's
    view as a whole and a summary-less frame from an engine holding records would blank its topic summaries
-   there until its next round; a non-idle engine gossips every round anyway. An engine sends at most one
+   there until its next frame; a non-idle engine's own frames carry its willingness, sent on its next round
+   whenever it changes. The advert counts as the engine's last frame, so the round after it does not repeat
+   it (a round with topics differs from it and sends once). An engine sends at most one
    advert per gossip round interval, and when it may not send one no wait opens — which is what keeps a
    member that never answers from turning every register on the engine into a full-length hold. The wait
    is offered only where an answer can arrive: a tier-0 engine on a live-signer host, the conditions (2)
@@ -1906,9 +1910,9 @@ rotated-in member builds a fresh engine with an **empty** child registry — wou
 `T_willingness_heartbeat` (`willingnessHeartbeatMs`, default 30 s — the same knob as the idle willingness
 heartbeat; lengthening it lengthens child-set convergence equally). The re-advertisement is a no-op on a
 member that already holds the link, and cannot resurrect a released child: its `effectiveAt` is older than
-the unlink's, so the tombstone's high-water drops it. A re-advertising round is deliberately **not** idle —
-it builds and broadcasts a frame even for an engine that would otherwise emit nothing, since the frame is
-the carrier. Only *links* are re-advertised: an **unlink** that a member missed is never re-sent (absence is
+the unlink's, so the tombstone's high-water drops it. The re-advertised links are deltas, so a
+re-advertising round always sends — it builds and broadcasts a frame even for an engine that would otherwise
+emit nothing, since the frame is the carrier. Only *links* are re-advertised: an **unlink** that a member missed is never re-sent (absence is
 not advertised), so such a member over-counts until another delta for that child arrives — conservative in
 both consumers (the demotion gate stays shut; matchmaking sweeps a tier that is no longer promoted).
 
@@ -1922,15 +1926,41 @@ forged records cannot replicate.
 
 **Cadence (host driver).** The cohort-topic host owns one repeating timer (`gossipIntervalMs`, default
 5 s — there is no dedicated `gossip_round` constant; it is a derived sub-round of `ping_interval`). On
-each tick, for every live coord engine, it TTL-sweeps stale records (gossiping each eviction), drains
-the registration-record deltas the admission `onAdmit` and renewal `touch`/`evicted` hooks accumulated
-since the last round into one `records`/`evicted` batch, broadcasts the signed `CohortGossipV1`, refreshes
-the membership certificate (`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`,
-self-gated). Idle engines (no resident topics, no deltas) build no frame and skip the broadcast. A freshly
-*admitted* record is enqueued at admission time (the `onAdmit` hook), so it replicates on the next gossip
-round without waiting for the participant's first renewal touch — closing the durability window between
-`accept` and that first touch. The driver lives in the host
+each tick, for every live coord engine, it TTL-sweeps stale records (queueing each eviction as a delta),
+freezes each resident topic's traffic summary, refreshes the membership certificate
+(`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`, self-gated). The engine's
+signed `CohortGossipV1` goes out only when the round is **due**, which is when any one of these holds:
+
+- **It carries deltas** — the registration-record deltas the admission `onAdmit` and renewal
+  `touch`/`evicted` hooks queued since the last frame, drained into one `records`/`evicted` batch, or child
+  link/unlink deltas, the child-set re-advertisement included. So an admission, a renewal, a re-attach and
+  an eviction each go out on the next round.
+- **Its frame differs materially from the last frame this engine sent.** Material is everything in the frame
+  except `timestamp`, `signature` and each topic summary's `arrivalsPerMin` and `queriesPerMin` (the deltas
+  aside, covered above): `cohortEpoch`, `treeTier`, `willingnessBits`, `loadBuckets`, `windowSeconds`,
+  `rootPlaced`, and the set of topic summaries, compared by `topicId`. A first frame always differs.
+- **`T_willingness_heartbeat` has passed** since that last frame.
+
+Otherwise the round sends nothing and leaves the queue as it was. The rule is `isGossipRoundDue`, over the
+key `gossipMaterialKey` reduces a frame to, in
+`packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts`; the out-of-band willingness advert
+(§Cold-start instantiation) counts as a frame sent. An idle engine (no resident topics, no deltas) has a
+frame only while it is willing for some tier, so it sends on a change of willingness and on the heartbeat;
+an engine holding records sends on the rounds after the renewals it serves and on the heartbeat, rather than
+on every round. A freshly *admitted* record is enqueued at admission time (the `onAdmit` hook), so it
+replicates on the next gossip round without waiting for the participant's first renewal touch — closing the
+durability window between `accept` and that first touch. The driver lives in the host
 ([`packages/db-p2p/src/cohort-topic`](../packages/db-p2p/src/cohort-topic)); db-core has no timer port.
+
+Sending less often costs no liveness, because nothing judges a member by how recently its gossip arrived.
+A sibling's view keeps each member's newest contribution with no expiry (`CohortView` in
+`packages/db-core/src/cohort-topic/gossip/view.ts`), and the willingness and traffic layers read it with no
+age check. A member that has gone silent is noticed through FRET membership, which reshapes the cohort, and
+through renewal failover, which promotes a backup after three failed pings (§TTL and renewal); neither reads
+the gossip cadence. What does age is the advisory traffic rates (§Topic traffic signal). A renewal touch is
+sent at once rather than held to batch with others, since a sibling's replica is evicted at
+`lastPing + ttl` by its own sweep, and a touch not yet gossiped when the primary dies leaves the backup one
+ping closer to that eviction.
 
 ### Membership certificate
 
@@ -1970,7 +2000,7 @@ interface MembershipCertV1 {
 | `ttl` | 90 s | Default registration TTL |
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
-| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, shared by **two** periodic re-advertisements. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): first idle round emits immediately; a record-carrying round resets the clock. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster, but re-broadcasts more often — for every idle willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round re-advertises. |
+| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, with **three** uses. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): its first round emits immediately. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. (3) The steady-state refresh of any engine whose frame has not changed (§Cohort gossip, *Cadence*): a round sends on a delta or a material change, and otherwise only once this interval has passed since the engine's last frame, so it also bounds how old a sibling's advisory traffic rates get (§Topic traffic signal); (1) is this rule for an engine with no topics. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster and keeps siblings' rates fresher, but re-broadcasts more often — for every willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round sends. |
 | `T_cold_quorum_wait` | 2 s | How long a tier-0 cohort member holds a register whose willingness quorum is short only for want of members it has not heard from, while it asks them to gossip now (§Cold-start instantiation). Host option `coldQuorumWaitMs`; `0` disables the wait and such a register is declined at once. It must stay well under the 5 s a participant waits for the reply (p2p-fret's `RPC_TIMEOUT_MS`, on a FRET-routed register and on a direct root-group dial alike), with room for the hops in front of it. |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
 | `confidence_min` | 0.3 | Below this `n_est` confidence, cap `d_max` at ⌊d_max_cap/2⌋ (upper bound) |

@@ -37,18 +37,19 @@ import {
 export const DEFAULT_GOSSIP_INTERVAL_MS = 5_000;
 
 /**
- * Default `T_willingness_heartbeat` (ms): how often a genuinely-**idle** but **willing** engine re-broadcasts
- * a willingness-only heartbeat so a cold cohort can bootstrap (siblings hear it, instantiate, and reciprocate
- * their own willingness) without waiting on a first registration that can never be admitted while the view is
- * empty. See `docs/cohort-topic.md` §Cold-start instantiation / §Configuration.
+ * Default `T_willingness_heartbeat` (ms): the slow refresh of an engine whose frame has not changed. A round
+ * sends a frame only when it carries deltas, when the frame differs materially from the last one this engine
+ * sent, or when this long has passed since that one ({@link isGossipRoundDue}). For an idle but willing
+ * engine that is the willingness heartbeat that lets a cold cohort bootstrap (siblings hear it, instantiate,
+ * and reciprocate their own willingness) without waiting on a first registration that can never be admitted
+ * while the view is empty; for an engine holding records it is what refreshes its advisory traffic rates on
+ * siblings. See `docs/cohort-topic.md` §Cold-start instantiation / §Cohort gossip / §Configuration.
  *
- * On the order of the ping interval (~30 s, `ttl/3` Core) — a few gossip rounds at the 5 s cadence. A
- * record-carrying (non-idle) round already ships willingness every round and resets this clock, so the
- * throttle governs only engines with nothing else to say. The very first idle round after an engine is
- * created emits immediately (no wait); the throttle only paces the steady-state re-broadcast of an idle
- * willing cohort. A cold cohort does not wait on these rounds to converge: the member a first registration
- * lands on sends the same frame at once, out of band, and each member answers a member it hears for the
- * first time the same way (the host's willingness advert, §Cold-start instantiation).
+ * On the order of the ping interval (~30 s, `ttl/3` Core) — a few gossip rounds at the 5 s cadence. The very
+ * first round after an engine is created emits immediately (nothing has been sent to compare against). A cold
+ * cohort does not wait on these rounds to converge: the member a first registration lands on sends the same
+ * frame at once, out of band, and each member answers a member it hears for the first time the same way (the
+ * host's willingness advert, §Cold-start instantiation).
  */
 export const DEFAULT_WILLINGNESS_HEARTBEAT_MS = 30_000;
 
@@ -90,6 +91,11 @@ export interface GossipDeltas {
 interface PendingChildDelta {
 	ref: ChildLinkRefV1;
 	linked: boolean;
+}
+
+/** A round's deltas when nothing is queued. */
+export function emptyGossipDeltas(): GossipDeltas {
+	return { records: [], evicted: [], childLinks: [], childUnlinks: [] };
 }
 
 /** Build an empty {@link PendingDeltas} queue. */
@@ -167,14 +173,6 @@ export interface GossipFrameInputs {
 	readonly cohortEpoch: string;
 	/** This cohort's tree tier `d` — carried on the frame so a cold sibling instantiates at the right tier. */
 	readonly treeTier: number;
-	/**
-	 * True to emit a **willingness-only heartbeat** even when this engine is idle (no resident topics, no
-	 * pending deltas) — provided the node is actually willing for some tier. Lets an idle-but-willing engine
-	 * still tell siblings it will serve, so a cold cohort can bootstrap (§Cold-start instantiation). The caller
-	 * (the gossip round) sets this from the per-engine heartbeat clock; a non-idle round ignores it (it already
-	 * ships willingness).
-	 */
-	readonly heartbeat: boolean;
 	/** This node's tier profile (the `∧` half of the willingness vector). */
 	readonly profile: NodeProfile;
 	/** This member's load barometer (load buckets + the load-shed half of willingness). */
@@ -202,20 +200,20 @@ export interface GossipFrameInputs {
 }
 
 /**
- * Assemble one round's {@link CohortGossipV1}, or `undefined` when this engine has nothing to say. An engine
- * is **idle** when it holds no resident topics and no pending deltas. An idle engine normally builds no frame
- * (idle empty engines cost no gossip) — **except** on a willingness heartbeat ({@link GossipFrameInputs.heartbeat}),
- * where an idle engine that is willing for at least one tier (`selfWillingnessBits !== 0`) still emits a
- * willingness/load-only frame (empty `topicSummaries`, no `records`/`evicted`) so siblings can hear it and a
- * cold cohort can bootstrap (§Cold-start instantiation). An idle-and-unwilling engine stays silent even on a
- * heartbeat (nothing to bootstrap). `willingnessBits` is `profile ∧ load` ({@link selfWillingnessBits}); the
- * `signature` slot is left empty for the host's peer-key signer to fill before broadcast.
+ * Assemble this engine's {@link CohortGossipV1}, or `undefined` when it has nothing to say. An engine is
+ * **idle** when it holds no resident topics and no pending deltas. An idle engine that is willing for at least
+ * one tier (`selfWillingnessBits !== 0`) still has a willingness/load-only frame (empty `topicSummaries`, no
+ * deltas), so siblings can hear it will serve and a cold cohort can bootstrap (§Cold-start instantiation); an
+ * idle-and-unwilling engine has nothing to bootstrap and stays silent. Whether a round actually sends the frame
+ * is {@link isGossipRoundDue}'s decision, not this function's. `willingnessBits` is `profile ∧ load`
+ * ({@link selfWillingnessBits}); the `signature` slot is left empty for the host's peer-key signer to fill
+ * before broadcast.
  */
 export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefined {
 	const willingness = selfWillingnessBits(i.profile, i.barometer);
 	const idle = i.topicSummaries.length === 0 && i.records.length === 0 && i.evicted.length === 0
 		&& i.childLinks.length === 0 && i.childUnlinks.length === 0;
-	if (idle && !(i.heartbeat && willingness !== 0)) {
+	if (idle && willingness === 0) {
 		return undefined;
 	}
 	const g: CohortGossipV1 = {
@@ -247,4 +245,60 @@ export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefi
 		g.rootPlaced = true;
 	}
 	return g;
+}
+
+/**
+ * The part of `g` a sibling's view would change on, as a canonical string: two frames with equal keys tell a
+ * sibling the same thing. Material are `cohortEpoch`, `treeTier`, `willingnessBits`, `loadBuckets`,
+ * `windowSeconds`, `rootPlaced`, and the set of topic summaries, each reduced to `topicId`, `tier`,
+ * `directParticipants`, `promoted` and `childCohortCount` and ordered by `topicId` (the order resident topics
+ * are listed in is not a change).
+ *
+ * Not material:
+ * - `timestamp` and `signature`, which differ on every frame.
+ * - Each summary's `arrivalsPerMin` and `queriesPerMin`. They move on nearly every round of a topic with any
+ *   traffic, they are advisory (nothing in admission, routing or promotion reads them), and a topic that is
+ *   actually getting new registrations sends every round anyway, since each admission is a delta. Counting
+ *   them would make every such round material and undo the saving.
+ * - The deltas (`records`, `evicted`, `childLinks`, `childUnlinks`). A round carrying any is due on that alone,
+ *   and counting them would make the round after a delta round differ from it.
+ * - `v`, `fromMember` and `coord`, which are fixed for an engine.
+ */
+export function gossipMaterialKey(g: CohortGossipV1): string {
+	const topics = g.topicSummaries
+		.map((s) => [s.topicId, s.tier, s.directParticipants, s.promoted, s.childCohortCount] as const)
+		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return JSON.stringify([g.cohortEpoch, g.treeTier, g.willingnessBits, g.loadBuckets, g.windowSeconds, g.rootPlaced === true, topics]);
+}
+
+/** The last frame an engine emitted: its {@link gossipMaterialKey} and when it went out (unix ms). */
+export interface SentGossip {
+	readonly key: string;
+	readonly at: number;
+}
+
+/** Inputs to {@link isGossipRoundDue}. */
+export interface GossipDueInputs {
+	/** True when the round has queued deltas to carry. */
+	readonly hasDeltas: boolean;
+	/** {@link gossipMaterialKey} of the frame this round would send. */
+	readonly key: string;
+	/** The last frame this engine emitted, or `undefined` if it has emitted none. */
+	readonly lastSent: SentGossip | undefined;
+	/** The round's time, unix ms. */
+	readonly now: number;
+	/** `T_willingness_heartbeat` — the longest an engine goes without sending while it has something to say. */
+	readonly heartbeatMs: number;
+}
+
+/**
+ * Whether a gossip round sends its frame: when it carries deltas, when the frame differs materially from the
+ * last one this engine sent (a first frame always does), or when `heartbeatMs` has passed since that one.
+ * Otherwise the round would repeat what siblings last heard and sends nothing.
+ */
+export function isGossipRoundDue(i: GossipDueInputs): boolean {
+	return i.hasDeltas
+		|| i.lastSent === undefined
+		|| i.key !== i.lastSent.key
+		|| i.now - i.lastSent.at >= i.heartbeatMs;
 }

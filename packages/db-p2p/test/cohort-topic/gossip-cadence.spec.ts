@@ -22,6 +22,7 @@ import {
 	cohortGossipSigningPayload,
 	type ChildLinkRefV1,
 	type CohortGossipV1,
+	type CohortTopicSummary,
 	type RegisterV1,
 	type RenewV1,
 	type RegistrationRecord,
@@ -32,6 +33,8 @@ import { createCohortTopicHost } from '../../src/cohort-topic/host.js';
 import {
 	createPendingDeltas,
 	buildCohortGossip,
+	gossipMaterialKey,
+	isGossipRoundDue,
 	DEFAULT_GOSSIP_INTERVAL_MS,
 } from '../../src/cohort-topic/cohort-gossip-driver.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
@@ -273,7 +276,7 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 		const base = {
 			fromMember: 'self', coord: bytesToB64url(TOPIC), cohortEpoch: bytesToB64url(TOPIC2), treeTier: 0,
 			profile: coreProfile(), barometer, windowSeconds: 60, timestamp: 9_000,
-			heartbeat: false, topicSummaries: [], records: [], evicted: [],
+			topicSummaries: [], records: [], evicted: [],
 		};
 		const c1: ChildLinkRefV1 = { topicId: bytesToB64url(TOPIC), childCohortCoord: bytesToB64url(TOPIC2), effectiveAt: 1_000 };
 		const linked = buildCohortGossip({ ...base, childLinks: [c1], childUnlinks: [] });
@@ -285,7 +288,7 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 		expect(unlinked!.childLinks, 'no link field when empty').to.equal(undefined);
 	});
 
-	it('buildCohortGossip skips an idle non-heartbeat engine, emits a willingness-only heartbeat when idle+willing, and packs deltas otherwise', () => {
+	it('buildCohortGossip emits a willingness-only frame when idle+willing, nothing when idle+unwilling, and packs deltas otherwise', () => {
 		const barometer = createLoadBarometer();
 		const base = {
 			fromMember: 'self',
@@ -299,28 +302,60 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 			childUnlinks: [],
 			timestamp: 9_000,
 		};
-		expect(buildCohortGossip({ ...base, heartbeat: false, topicSummaries: [], records: [], evicted: [] }), 'idle, no heartbeat → no frame').to.equal(undefined);
-
-		// Idle + heartbeat + willing (coreProfile serves every tier) → a willingness-only frame: no summaries,
-		// no record/eviction deltas, but the willingness vector + tree tier are carried so a cold sibling can
+		// Idle + willing (coreProfile serves every tier) → a willingness-only frame: no summaries, no
+		// record/eviction deltas, but the willingness vector + tree tier are carried so a cold sibling can
 		// instantiate off it and reciprocate.
-		const hb = buildCohortGossip({ ...base, heartbeat: true, topicSummaries: [], records: [], evicted: [] });
-		expect(hb, 'idle + heartbeat + willing → a willingness-only frame').to.not.equal(undefined);
+		const hb = buildCohortGossip({ ...base, topicSummaries: [], records: [], evicted: [] });
+		expect(hb, 'idle + willing → a willingness-only frame').to.not.equal(undefined);
 		expect(hb!.treeTier, 'the heartbeat carries the tree tier for cold-sibling instantiation').to.equal(0);
 		expect(hb!.topicSummaries, 'no topic summaries on a heartbeat').to.deep.equal([]);
 		expect(hb!.records ?? [], 'no record delta on a heartbeat').to.deep.equal([]);
 		expect(hb!.willingnessBits).to.equal(willingnessBitsHex(selfWillingnessBits(coreProfile(), barometer)));
 
-		// An idle engine that is willing for NOTHING stays silent even on a heartbeat (nothing to bootstrap).
+		// An idle engine that is willing for NOTHING stays silent (nothing to bootstrap).
 		const noTiers = { ...coreProfile(), willingTiers: new Set<Tier>() };
-		expect(buildCohortGossip({ ...base, profile: noTiers, heartbeat: true, topicSummaries: [], records: [], evicted: [] }), 'idle + heartbeat but unwilling → no frame').to.equal(undefined);
+		expect(buildCohortGossip({ ...base, profile: noTiers, topicSummaries: [], records: [], evicted: [] }), 'idle but unwilling → no frame').to.equal(undefined);
 
-		const withDelta = buildCohortGossip({ ...base, heartbeat: false, topicSummaries: [], records: [toGossipRecord(record('p', 5_000))], evicted: [] });
+		const withDelta = buildCohortGossip({ ...base, topicSummaries: [], records: [toGossipRecord(record('p', 5_000))], evicted: [] });
 		expect(withDelta, 'a pending delta makes it non-idle').to.not.equal(undefined);
 		expect(withDelta!.willingnessBits).to.equal(willingnessBitsHex(selfWillingnessBits(coreProfile(), barometer)));
 		expect(withDelta!.loadBuckets).to.deep.equal([0, 0, 0, 0]);
 		expect(withDelta!.records?.length).to.equal(1);
 		expect(withDelta!.signature, 'signature slot left for the host signer').to.equal('');
+	});
+
+	describe('round due-ness', () => {
+		const summary = (topicId: string, arrivalsPerMin = 3): CohortTopicSummary => ({
+			topicId, tier: 0, directParticipants: 2, arrivalsPerMin, queriesPerMin: 1, promoted: false, childCohortCount: 0,
+		});
+		const frame = (opts: Partial<CohortGossipV1> = {}): CohortGossipV1 => ({
+			v: 1, fromMember: 'self', coord: 'coord', cohortEpoch: 'epoch', treeTier: 0, willingnessBits: 'f',
+			loadBuckets: [0, 0, 0, 0], windowSeconds: 60, topicSummaries: [summary('a'), summary('b')], timestamp: 1_000, signature: '',
+			...opts,
+		});
+		const sentAt1000 = { key: gossipMaterialKey(frame()), at: 1_000 };
+		const due = (g: CohortGossipV1, now: number, hasDeltas = false): boolean =>
+			isGossipRoundDue({ hasDeltas, key: gossipMaterialKey(g), lastSent: sentAt1000, now, heartbeatMs: 30_000 });
+
+		it('a round with deltas is due, and so is a first frame', () => {
+			expect(due(frame(), 2_000, true), 'deltas, nothing else changed').to.equal(true);
+			expect(isGossipRoundDue({ hasDeltas: false, key: gossipMaterialKey(frame()), lastSent: undefined, now: 2_000, heartbeatMs: 30_000 }), 'nothing sent yet').to.equal(true);
+		});
+
+		it('a material change is due inside the heartbeat; a change of rates, timestamp or signature alone is not', () => {
+			expect(due(frame({ topicSummaries: [{ ...summary('a'), promoted: true }, summary('b')] }), 2_000), 'promoted flipped').to.equal(true);
+			expect(due(frame({ willingnessBits: '7' }), 2_000), 'willingness changed').to.equal(true);
+			expect(due(frame({ topicSummaries: [summary('a', 9), summary('b')], timestamp: 2_000, signature: 'sig' }), 2_000), 'only arrivalsPerMin moved').to.equal(false);
+		});
+
+		it('an unchanged frame is due once the heartbeat has elapsed, not a millisecond sooner', () => {
+			expect(due(frame(), 31_000), 'exactly heartbeatMs since the last send').to.equal(true);
+			expect(due(frame(), 30_999), 'one ms short').to.equal(false);
+		});
+
+		it('the order topic summaries are listed in is not a change', () => {
+			expect(gossipMaterialKey(frame({ topicSummaries: [summary('b'), summary('a')] }))).to.equal(gossipMaterialKey(frame()));
+		});
 	});
 });
 
@@ -363,11 +398,36 @@ describe('cohort-topic: host gossip round', () => {
 			'the gossip signature verifies against the node key',
 		).to.equal(true);
 
-		// The next round has no fresh deltas but still advertises the resident topic's summary.
-		const g2 = await ce.gossipRound(8_000);
-		expect(g2, 'a resident topic keeps the round non-idle').to.not.equal(undefined);
-		expect(g2!.records ?? [], 'no record delta after the queue was drained').to.deep.equal([]);
-		expect(g2!.topicSummaries.length, 'the resident topic is summarized').to.equal(1);
+		await host.stop();
+	});
+
+	it('an engine holding a registration sends on a delta or once the heartbeat elapses, and nothing in between', async () => {
+		const self = await makeMember();
+		const host = await createCohortTopicHost(makeFakeNode(self.peerId) as never, makeFakeFret(() => []) as never, {
+			privateKey: self.key,
+			wantK: 1,
+			minSigs: 1,
+			gossipIntervalMs: 3_600_000, // park the timer; drive the rounds by hand
+			willingnessHeartbeatMs: 30_000,
+		});
+		const participant = await makeMember();
+		const ce = host.registry.forCoord(addressing.coord0(TOPIC), 0 as Tier, participant.bytes);
+		expect((await ce.engine.handleRegister(await signedRegister(participant, TOPIC), { followOn: false, treeTier: 0 }, 1_000)).result).to.equal('accepted');
+
+		const admitted = await ce.gossipRound(2_000);
+		expect(admitted?.records?.length, 'the first round carries the admission delta').to.equal(1);
+		expect(admitted!.topicSummaries.length, 'and summarizes the resident topic').to.equal(1);
+		expect(await ce.gossipRound(7_000), 'nothing changed inside the heartbeat → no frame').to.equal(undefined);
+
+		expect((ce.engine.handleRenew(await signedReattach(participant, TOPIC, 8_000), 8_000)).result).to.equal('ok');
+		const touched = await ce.gossipRound(9_000);
+		expect(touched?.records?.length, 'the round after a renewal touch carries it').to.equal(1);
+
+		expect(await ce.gossipRound(38_999), 'unchanged, one ms short of the heartbeat → no frame').to.equal(undefined);
+		const refreshed = await ce.gossipRound(39_000);
+		expect(refreshed, 'unchanged, but the heartbeat elapsed → the frame is refreshed').to.not.equal(undefined);
+		expect(refreshed!.records ?? [], 'the refresh carries no delta').to.deep.equal([]);
+		expect(refreshed!.topicSummaries.length, 'and still summarizes the resident topic').to.equal(1);
 
 		await host.stop();
 	});
@@ -864,8 +924,8 @@ describe('cohort-topic: two-node replication via a gossip round', () => {
 			}
 		}
 		// 1_000 drains the real delta (and the immediate first re-advertisement, collapsed); 31_001 is the next
-		// heartbeat boundary. The six rounds in between carry nothing — and note 31_001's frame exists ONLY
-		// because the re-advertisement makes an otherwise-idle round non-idle: the frame is the carrier.
+		// heartbeat boundary, where the re-advertisement queues the link again as a delta and the frame carries
+		// it. The six rounds in between carry nothing.
 		expect(carried, 'exactly one frame per heartbeat window carries child links').to.deep.equal([1_000, 31_001]);
 		expect(lastRefs?.length, 'the resync frame carried the one linked child').to.equal(1);
 		expect(lastRefs?.[0]?.topicId, 'a non-resident topic is still re-advertised').to.equal(bytesToB64url(TOPIC2));
@@ -923,11 +983,13 @@ describe('cohort-topic: gossip driver timer lifecycle', () => {
 		const coordKey = bytesToB64url(coord0);
 		const cohortFor = (coord: RingCoord): string[] => (bytesToB64url(coord) === coordKey ? [self.idStr, sibling.idStr] : []);
 		const node = makeFakeNode(self.peerId);
-		const host = await createCohortTopicHost(node as never, makeFakeFret(cohortFor) as never, { privateKey: self.key, wantK: 2, minSigs: 2, gossipIntervalMs: 25 });
+		// A 1 ms heartbeat makes every tick due with nothing changed, so each tick broadcasts — otherwise ticks
+		// after stop() would have nothing to send and the stop assertion below would hold vacuously.
+		const host = await createCohortTopicHost(node as never, makeFakeFret(cohortFor) as never, { privateKey: self.key, wantK: 2, minSigs: 2, gossipIntervalMs: 25, willingnessHeartbeatMs: 1 });
 
 		const participant = await makeMember();
 		const ce = host.registry.forCoord(coord0, 0 as Tier, participant.bytes);
-		// Seed willingness + admit a registration so the engine is non-idle and each tick broadcasts. Use a
+		// Seed willingness + admit a registration so the engine is non-idle. Use a
 		// real-clock `now` for the admission: the driver sweeps with `Date.now()`, so a synthetic timestamp
 		// would make the record instantly stale and the engine idle again.
 		deliverGossip(node, await signedGossip(sibling, coord0, ce.cohort().cohortEpoch, { willingnessBits: 'f' }), sibling.peerId);

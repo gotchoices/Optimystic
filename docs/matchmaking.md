@@ -328,7 +328,7 @@ From the reply:
 
 - `directParticipants` — providers known at this cohort right now.
 - `arrivalsPerMin` — provider registration and renewal rate; predicts how quickly new matchable providers appear here.
-- `queriesPerMin` — competing seeker activity over the same provider pool. Now fed live from the cohort's matchmaking `QueryV1` serve path (each served query bumps it; previously always 0), lagging ≤ one gossip round like `arrivalsPerMin`. Pushes do **not** inflate it — only a `QueryV1` counts (see the *Contention-signal interaction* note under §Push-on-arrival).
+- `queriesPerMin` — competing seeker activity over the same provider pool. Now fed live from the cohort's matchmaking `QueryV1` serve path (each served query bumps it; previously always 0), lagging like `arrivalsPerMin`: ≤ one gossip round for the answering member's own count, up to about `T_willingness_heartbeat` for a sibling's ([cohort-topic.md §Topic traffic signal](cohort-topic.md#topic-traffic-signal)). Pushes do **not** inflate it — only a `QueryV1` counts (see the *Contention-signal interaction* note under §Push-on-arrival).
 - `childCohortCount` — non-zero means this tier has promoted; descending would lead to live shards, ascending would lead to broader aggregation.
 
 From the seeker:
