@@ -334,23 +334,14 @@ describe('cohort-topic: gossip-cadence driver helpers', () => {
 			...opts,
 		});
 		const sentAt1000 = { key: gossipMaterialKey(frame()), at: 1_000 };
-		const due = (g: CohortGossipV1, now: number, hasDeltas = false): boolean =>
-			isGossipRoundDue({ hasDeltas, key: gossipMaterialKey(g), lastSent: sentAt1000, now, heartbeatMs: 30_000 });
-
-		it('a round with deltas is due, and so is a first frame', () => {
-			expect(due(frame(), 2_000, true), 'deltas, nothing else changed').to.equal(true);
-			expect(isGossipRoundDue({ hasDeltas: false, key: gossipMaterialKey(frame()), lastSent: undefined, now: 2_000, heartbeatMs: 30_000 }), 'nothing sent yet').to.equal(true);
-		});
+		// Deltas, a first frame and the heartbeat boundary are pinned end to end by the host-level cadence test.
+		const due = (g: CohortGossipV1, now: number): boolean =>
+			isGossipRoundDue({ hasDeltas: false, key: gossipMaterialKey(g), lastSent: sentAt1000, now, heartbeatMs: 30_000 });
 
 		it('a material change is due inside the heartbeat; a change of rates, timestamp or signature alone is not', () => {
 			expect(due(frame({ topicSummaries: [{ ...summary('a'), promoted: true }, summary('b')] }), 2_000), 'promoted flipped').to.equal(true);
 			expect(due(frame({ willingnessBits: '7' }), 2_000), 'willingness changed').to.equal(true);
 			expect(due(frame({ topicSummaries: [summary('a', 9), summary('b')], timestamp: 2_000, signature: 'sig' }), 2_000), 'only arrivalsPerMin moved').to.equal(false);
-		});
-
-		it('an unchanged frame is due once the heartbeat has elapsed, not a millisecond sooner', () => {
-			expect(due(frame(), 31_000), 'exactly heartbeatMs since the last send').to.equal(true);
-			expect(due(frame(), 30_999), 'one ms short').to.equal(false);
 		});
 
 		it('the order topic summaries are listed in is not a change', () => {

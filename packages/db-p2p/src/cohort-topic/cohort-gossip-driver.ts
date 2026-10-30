@@ -263,6 +263,12 @@ export function buildCohortGossip(i: GossipFrameInputs): CohortGossipV1 | undefi
  * - The deltas (`records`, `evicted`, `childLinks`, `childUnlinks`). A round carrying any is due on that alone,
  *   and counting them would make the round after a delta round differ from it.
  * - `v`, `fromMember` and `coord`, which are fixed for an engine.
+ *
+ * NOTE: a sibling's summary `directParticipants` moves on every member when an admitted or evicted record
+ * merges in, so each admission or eviction makes every member of the cohort send on the next round, not only
+ * the one that queued the delta. No sibling reads those fields today (the traffic snapshot takes
+ * `directParticipants` from its own store, and the child count from its own registry); if admission-driven
+ * frames show up in profiles, drop `directParticipants` from the key.
  */
 export function gossipMaterialKey(g: CohortGossipV1): string {
 	const topics = g.topicSummaries

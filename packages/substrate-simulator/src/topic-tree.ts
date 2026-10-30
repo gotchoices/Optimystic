@@ -42,6 +42,9 @@ export interface TopicCohortState {
 	willingness: number; // 4-bit vector, one bit per tier T0..T3
 	// The member's last-gossiped per-topic view — the reply surface (`trafficSignal`) reads this
 	// snapshot, never the live counters, so every field lags raw state by at most one gossip round.
+	// NOTE: the real host sends an unchanged frame only once per T_willingness_heartbeat, so a sibling's
+	// rates there can lag up to ~30 s (docs/cohort-topic.md §Topic traffic signal); if the simulator is
+	// used to judge traffic staleness, model that cadence instead of a frame every round.
 	traffic: { arrivalsPerMin: number; queriesPerMin: number; directParticipants: number; childCohortCount: number };
 	lastGrowthSamples: GrowthSample[]; // for slope-based pre-promotion
 	// --- lifecycle bookkeeping (not part of the wire model) ---
