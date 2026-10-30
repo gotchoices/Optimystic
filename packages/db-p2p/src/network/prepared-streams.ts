@@ -51,9 +51,8 @@
  * `Connection.newStream` and in `onIncomingStream` — and each merge takes the peer's write lock. This
  * pool moves the requester's open, and that merge, off the request's critical path, but it does not
  * reduce the count: still one stream, so one merge, per request on each end. Fewer merges needs a
- * stream that carries more than one request (a change to all four request/response protocols; backlog
- * `feat-a-stream-carries-more-than-one-request`) or libp2p skipping a merge whose protocol is already
- * recorded (upstream). An unchanged merge emits no `peer:update`, so it does not invalidate the key
+ * stream that carries more than one request (a change to all four request/response protocols) or libp2p skipping a merge whose protocol is already recorded
+ * (upstream); the blocked decision `feat-a-stream-carries-more-than-one-request` weighs the two. An unchanged merge emits no `peer:update`, so it does not invalidate the key
  * network's cached records (`peer-record-cache.ts`).
  *
  * Imports here are type-only or pure, like `open-protocol-stream.ts`: this module is reachable from
