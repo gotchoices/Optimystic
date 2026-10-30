@@ -1369,7 +1369,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			return;
 		}
 		// Subscribers are looked up only now, after the verify: an engine created while the frame verified receives
-		// it, and one closed or evicted meanwhile has unsubscribed, so its frame reaches nobody.
+		// it, and one closed or evicted meanwhile has unsubscribed, so its frame takes the cold-sibling path (which
+		// re-creates it for a tier-0 co-member frame) or reaches nobody.
+		// NOTE: delivery never touches the registry, so verified gossip does not refresh an engine's LRU recency (the
+		// pre-verify probe that used to bump it was an unauthenticated pin). A rank-0 engine kept alive only by gossip
+		// ages out under a coord spray and is re-created by its siblings' next heartbeat; if that churn ever shows up,
+		// bump recency here only after the bus's membership gate passed, never on a signature alone.
 		if (!gossipTransport.hasSubscriber(coord)) {
 			await maybeInstantiateColdSibling(g, coord);
 		}
