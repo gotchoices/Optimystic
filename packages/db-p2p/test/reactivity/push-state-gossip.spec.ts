@@ -90,6 +90,8 @@ interface DriverOpts {
 	isCohortMember?: (from: string, g: PushStateGossipV1) => boolean | Promise<boolean>;
 	maxBytes?: number;
 	intervalMs?: number;
+	reAdvertiseMs?: number;
+	clock?: () => number;
 	onTruncate?: (info: PushStateGossipTruncation) => void;
 }
 
@@ -101,6 +103,8 @@ function makeDriver(transport: FakeGossipTransport, opts: DriverOpts = {}): Reac
 		...(opts.isCohortMember === undefined ? {} : { isCohortMember: opts.isCohortMember }),
 		...(opts.maxBytes === undefined ? {} : { maxBytes: opts.maxBytes }),
 		...(opts.intervalMs === undefined ? {} : { intervalMs: opts.intervalMs }),
+		...(opts.reAdvertiseMs === undefined ? {} : { reAdvertiseMs: opts.reAdvertiseMs }),
+		...(opts.clock === undefined ? {} : { clock: opts.clock }),
 		...(opts.onTruncate === undefined ? {} : { onTruncate: opts.onTruncate }),
 	});
 }
@@ -114,8 +118,12 @@ describe('reactivity / push-state gossip driver', () => {
 		const originEntry = ingest(a, 7);
 
 		const transport = new FakeGossipTransport();
-		const driverA = makeDriver(transport, { live: [{ pushState: a, cohortCoord: COORD }] });
-		const driverB = makeDriver(new FakeGossipTransport(), { resolve: (g): PushState | undefined => (g.collectionId === COLLECTION && g.topicId === TOPIC ? b : undefined) });
+		const transportB = new FakeGossipTransport();
+		const driverA = makeDriver(transport, { live: [{ pushState: a, cohortCoord: COORD }], resolve: (): PushState => a });
+		const driverB = makeDriver(transportB, {
+			live: [{ pushState: b, cohortCoord: COORD }],
+			resolve: (g): PushState | undefined => (g.collectionId === COLLECTION && g.topicId === TOPIC ? b : undefined),
+		});
 
 		// A gossips one round; the frame rides the dedicated push-state-gossip protocol to A's cohort coord.
 		driverA.round();
@@ -129,6 +137,41 @@ describe('reactivity / push-state gossip driver', () => {
 		expect(served(b), 'B now serves the replicated origin entry').to.deep.equal([7]);
 		expect(b.replayBuffer.get(7)!.payload, 'the full signed notification crosses intact').to.deep.equal(originEntry);
 		expect(b.lastRevision).to.equal(7);
+
+		// B sends what it now holds once; merging it adds nothing to A, so A's frame is unchanged and the pair goes quiet.
+		driverB.round();
+		expect(transportB.broadcasts).to.have.length(1);
+		await driverA.deliver(MEMBER, transportB.broadcasts[0]!.frame);
+		driverA.round();
+		expect(transport.broadcasts, 'a merge that adds nothing leaves A nothing new to send').to.have.length(1);
+	});
+
+	it('sends a push state only when its frame changed or reAdvertiseMs has passed since its last send', () => {
+		const a = makePushState();
+		ingest(a, 1);
+		let now = NOW;
+		const transport = new FakeGossipTransport();
+		const driver = makeDriver(transport, { live: [{ pushState: a, cohortCoord: COORD }], reAdvertiseMs: 30_000, clock: () => now });
+
+		driver.round();
+		expect(transport.broadcasts, 'the first round sends').to.have.length(1);
+
+		now += 5_000;
+		driver.round();
+		expect(transport.broadcasts, 'an unchanged state inside reAdvertiseMs sends nothing').to.have.length(1);
+
+		ingest(a, 2);
+		driver.round();
+		expect(transport.broadcasts, 'a change goes out on the next round').to.have.length(2);
+
+		now += 29_999;
+		driver.round();
+		expect(transport.broadcasts, 'still inside reAdvertiseMs of the last send').to.have.length(2);
+
+		now += 1;
+		driver.round();
+		expect(transport.broadcasts, 'the refresh resends the unchanged state').to.have.length(3);
+		expect(transport.broadcasts[2]!.frame).to.deep.equal(transport.broadcasts[1]!.frame);
 	});
 
 	it('clips an oversized replay ring to stay within maxBytes and surfaces the truncation (no silent cap)', async () => {
@@ -250,7 +293,8 @@ describe('reactivity / push-state gossip driver', () => {
 		const a = makePushState();
 		ingest(a, 1);
 		const transport = new FakeGossipTransport();
-		const driver = makeDriver(transport, { live: [{ pushState: a, cohortCoord: COORD }], intervalMs: 5 });
+		// reAdvertiseMs = 0 makes every round send, so a round that fires after stop() would show as a broadcast.
+		const driver = makeDriver(transport, { live: [{ pushState: a, cohortCoord: COORD }], intervalMs: 5, reAdvertiseMs: 0 });
 
 		driver.start();
 		driver.start(); // idempotent — a second start must not schedule a second timer

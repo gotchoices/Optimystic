@@ -22,7 +22,12 @@
  * {@link DEFAULT_GOSSIP_INTERVAL_MS} and the host's re-entrancy / `stopped` / `unref` discipline verbatim.
  * Reactivity collections are not 1:1 with the host's per-`CoordEngine` tick and the forwarder host owns the
  * live {@link PushState} set, so a separate timer is the clean seam now; a future consolidation could fold
- * this into the host tick via a hook, but a separate unref'd timer cannot pin an idle process.
+ * this into the host tick via a hook, but a separate unref'd timer cannot pin an idle process. A round sends
+ * a push state's frame only when it differs from the last frame this driver sent for that push state, or when
+ * `reAdvertiseMs` (default {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS}, the cohort gossip's slow refresh) has
+ * passed since that send — the rule {@link isGossipRoundDue} states for cohort gossip. A change therefore goes
+ * out on the next round. The refresh is what lets a member that joined the root group after a change, or
+ * missed its one frame, catch up: `mergeGossip` is a union, so only a later frame can carry what it lacks.
  *
  * The **driver** touches neither the libp2p node assembly nor FRET cohort assembly — it depends only on the
  * `broadcastOver` seam + db-core codec, so it is unit-testable with a fake transport and real `PushState`s.
@@ -40,8 +45,10 @@ import {
 } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import type { Connection, Stream } from "@libp2p/interface";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex } from "@noble/hashes/utils.js";
 import type { FretCohortGossipTransport } from "../cohort-topic/cohort-gossip-transport.js";
-import { DEFAULT_GOSSIP_INTERVAL_MS } from "../cohort-topic/cohort-gossip-driver.js";
+import { DEFAULT_GOSSIP_INTERVAL_MS, DEFAULT_WILLINGNESS_HEARTBEAT_MS, isGossipRoundDue, type SentGossip } from "../cohort-topic/cohort-gossip-driver.js";
 import { DEFAULT_STREAM_MAX_BYTES, readFrame } from "../cohort-topic/stream-util.js";
 import { PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP } from "./protocols.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
@@ -57,6 +64,13 @@ const NO_FRAME_LIMIT = Number.MAX_SAFE_INTEGER;
 export interface ReactivityGossipCollection {
 	readonly pushState: PushState;
 	readonly cohortCoord: RingCoord;
+}
+
+/** One push state's broadcast frame, with how many replay entries it kept of how many the ring held. */
+interface BoundedFrame {
+	readonly frame: Uint8Array;
+	readonly kept: number;
+	readonly total: number;
 }
 
 /** A truncation event: a collection's serialized replay ring exceeded the frame bound and was clipped. */
@@ -90,7 +104,12 @@ export interface ReactivityPushStateGossipDriverDeps {
 	readonly intervalMs?: number;
 	/** Per-frame ceiling (frame, including the length prefix, stays within this). Default {@link DEFAULT_STREAM_MAX_BYTES}. */
 	readonly maxBytes?: number;
-	/** Reserved for parity with the cohort host's tick discipline; unused today (gossip carries its own `receivedAt`). */
+	/**
+	 * The longest a live push state goes unsent while its frame is unchanged (ms). Default
+	 * {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS}, the cohort gossip's slow refresh.
+	 */
+	readonly reAdvertiseMs?: number;
+	/** Unix-ms clock that times {@link reAdvertiseMs}. Default `Date.now`. */
 	readonly clock?: () => number;
 	/** Observe a clipped (over-bound) frame, in addition to the "no silent cap" log. Test/diagnostic seam. */
 	readonly onTruncate?: (info: PushStateGossipTruncation) => void;
@@ -109,7 +128,14 @@ export class ReactivityPushStateGossipDriver {
 	private readonly isCohortMember?: (fromPeerId: string, g: PushStateGossipV1) => boolean | Promise<boolean>;
 	private readonly intervalMs: number;
 	private readonly maxBytes: number;
+	private readonly reAdvertiseMs: number;
+	private readonly clock: () => number;
 	private readonly onTruncate?: (info: PushStateGossipTruncation) => void;
+	/**
+	 * The last frame sent per push state, as a digest of its bytes — never the bytes themselves, which run to
+	 * {@link maxBytes} per push state. Weakly keyed, so a push state the forwarder host drops leaves nothing here.
+	 */
+	private readonly sent = new WeakMap<PushState, SentGossip>();
 
 	private timer?: ReturnType<typeof setInterval>;
 	private stopped = false;
@@ -123,6 +149,8 @@ export class ReactivityPushStateGossipDriver {
 		this.isCohortMember = deps.isCohortMember;
 		this.intervalMs = deps.intervalMs ?? DEFAULT_GOSSIP_INTERVAL_MS;
 		this.maxBytes = deps.maxBytes ?? DEFAULT_STREAM_MAX_BYTES;
+		this.reAdvertiseMs = deps.reAdvertiseMs ?? DEFAULT_WILLINGNESS_HEARTBEAT_MS;
+		this.clock = deps.clock ?? Date.now;
 		this.onTruncate = deps.onTruncate;
 	}
 
@@ -141,8 +169,8 @@ export class ReactivityPushStateGossipDriver {
 
 	/**
 	 * One round: broadcast each live collection's serialized {@link PushState} to its cohort, clipped to the
-	 * frame bound. Per-collection isolated (one collection's fault never skips the rest) and `stopped`-gated
-	 * mid-loop, mirroring the host tick.
+	 * frame bound, when that frame is due (the module's **Cadence**). Per-collection isolated (one collection's
+	 * fault never skips the rest) and `stopped`-gated mid-loop, mirroring the host tick.
 	 */
 	round(): void {
 		if (this.stopped || this.rounding) {
@@ -216,18 +244,38 @@ export class ReactivityPushStateGossipDriver {
 		}
 	}
 
-	/** Serialize one collection, clip to the frame bound, and broadcast to its cohort. */
+	/**
+	 * Serialize one collection, clip to the frame bound, and broadcast to its cohort if that frame is due. A
+	 * broadcast that throws is not recorded, so the next round tries again; one that returns counts as sent even
+	 * when a peer missed it (`broadcastOver` swallows per-peer failures), which the refresh covers.
+	 */
 	private broadcastOne(pushState: PushState, cohortCoord: RingCoord): void {
 		const g = pushState.serializeGossip();
-		const { frame, kept, total } = this.boundedFrame(g);
-		if (kept < total) {
-			// "No silent caps" (AGENTS.md): a clipped ring is always surfaced. Convergence still completes —
-			// each entry replicates while it is within the most-recent window across successive rounds, and
-			// `mergeGossip` unions ring entries so a partial frame loses nothing already held by a peer.
-			log("push-state gossip frame clipped for collection=%s: kept %d/%d most-recent replay entries to fit maxBytes=%d", g.collectionId, kept, total, this.maxBytes);
-			this.onTruncate?.({ collectionId: g.collectionId, topicId: g.topicId, kept, total, frameBytes: frame.length, maxBytes: this.maxBytes });
+		const bounded = this.boundedFrame(g);
+		const now = this.clock();
+		// NOTE: serializes and hashes every live push state each round to learn that nothing changed. If that
+		// sender-side cost shows in profiles, give PushState a change counter (bumped by a replay append, a merge
+		// that changes something, and ring eviction) and skip the serialize while it has not moved.
+		const key = bytesToHex(sha256(bounded.frame));
+		if (!isGossipRoundDue({ hasDeltas: false, key, lastSent: this.sent.get(pushState), now, heartbeatMs: this.reAdvertiseMs })) {
+			return;
 		}
-		this.gossipTransport.broadcastOver(PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP, cohortCoord, frame);
+		this.reportClip(g, bounded);
+		this.gossipTransport.broadcastOver(PROTOCOL_REACTIVITY_PUSH_STATE_GOSSIP, cohortCoord, bounded.frame);
+		this.sent.set(pushState, { key, at: now });
+	}
+
+	/**
+	 * "No silent caps" (AGENTS.md): a clipped ring that is about to be sent is always surfaced. Convergence still
+	 * completes — each entry replicates while it is within the most-recent window across successive rounds, and
+	 * `mergeGossip` unions ring entries so a partial frame loses nothing already held by a peer.
+	 */
+	private reportClip(g: PushStateGossipV1, { frame, kept, total }: BoundedFrame): void {
+		if (kept >= total) {
+			return;
+		}
+		log("push-state gossip frame clipped for collection=%s: kept %d/%d most-recent replay entries to fit maxBytes=%d", g.collectionId, kept, total, this.maxBytes);
+		this.onTruncate?.({ collectionId: g.collectionId, topicId: g.topicId, kept, total, frameBytes: frame.length, maxBytes: this.maxBytes });
 	}
 
 	/**
@@ -239,7 +287,7 @@ export class ReactivityPushStateGossipDriver {
 	 * to the parent checkpoint anyway. Frame size is monotone in the entry count, so binary-search the
 	 * high-water N rather than re-encoding per entry.
 	 */
-	private boundedFrame(g: PushStateGossipV1): { frame: Uint8Array; kept: number; total: number } {
+	private boundedFrame(g: PushStateGossipV1): BoundedFrame {
 		const total = g.replayBuffer.entries.length;
 		const full = encodePushStateGossipV1(g, NO_FRAME_LIMIT);
 		if (full.length <= this.maxBytes) {

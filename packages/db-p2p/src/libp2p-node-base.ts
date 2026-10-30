@@ -2494,7 +2494,8 @@ export async function createLibp2pNodeBase(
 				// A frame for a root this node serves no push state for is let through: there is nothing to
 				// protect, and the resolve step drops it as unserved.
 				// NOTE: reads the key network's serving cohort per inbound frame (one per collection per member
-				// per gossip round). If it shows in profiles, memoize per tail with a TTL of one gossip interval.
+				// for each change to its push state, plus one per refresh, 30 s by default). If it shows in
+				// profiles, memoize per tail with a TTL of one gossip interval.
 				isCohortMember: async (fromPeerId: string, g: PushStateGossipV1): Promise<boolean> => {
 					const served = servedPushStateForGossip(g);
 					if (served === undefined) return true;
