@@ -1034,7 +1034,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		streamOpen,
 		selfPeerId: selfPeerStr,
 		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
-		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => Promise.resolve(handleRenewBatchFrame(frame)),
+		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => handleRenewBatchFrame(frame),
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
 				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
@@ -1687,7 +1687,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- the `/renew-batch` protocol body, shared by the inbound handler and the router's in-process self-dials ---
 	// Each entry gets exactly the answer the same RenewV1 gets on `/register`; the validator has already refused a
 	// frame carrying a re-attach or a withdraw, which stay per-record and single.
-	const handleRenewBatchFrame = (frame: Uint8Array): Uint8Array => {
+	// Async (with nothing to await) so a malformed frame rejects, as `handleRegisterFrame`'s does, rather than throws.
+	const handleRenewBatchFrame = async (frame: Uint8Array): Promise<Uint8Array> => {
 		const { renews } = decodeRenewBatchV1(frame, maxBytes);
 		const now = Date.now();
 		const reply: RenewBatchReplyV1 = { v: 1, replies: renews.map((renew) => resolveRenew(registry, renew, now)) };
@@ -4000,7 +4001,7 @@ async function registerCohortTopicProtocols(
 	/** The `/register` body: a RenewV1, a ChildLinkV1 or a RegisterV1 frame in, the encoded reply out. */
 	handleRegisterFrame: (frame: Uint8Array) => Promise<Uint8Array>,
 	/** The `/renew-batch` body: a RenewBatchV1 frame in, the encoded RenewBatchReplyV1 out. */
-	handleRenewBatchFrame: (frame: Uint8Array) => Uint8Array,
+	handleRenewBatchFrame: (frame: Uint8Array) => Promise<Uint8Array>,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
 	promoteGate: PromoteGate,
@@ -4016,8 +4017,7 @@ async function registerCohortTopicProtocols(
 
 		// renew-batch: several plain pings to this member in one frame, answered entry by entry as `/register`
 		// answers each. Like `/register` it is not behind `authorizeInboundStream`, which gates the database protocols.
-		registerProtocolHandler(node, protocols.renewBatch, makeRequestHandler((frame): Promise<Uint8Array> =>
-			Promise.resolve(handleRenewBatchFrame(frame)), maxBytes)),
+		registerProtocolHandler(node, protocols.renewBatch, makeRequestHandler((frame): Promise<Uint8Array> => handleRenewBatchFrame(frame), maxBytes)),
 
 		// cohort-gossip: one-way. Each frame is decoded and signature-checked once, then handed only to the buses
 		// subscribed to the coord it names; a verified co-member frame for a coord with no engine first instantiates
