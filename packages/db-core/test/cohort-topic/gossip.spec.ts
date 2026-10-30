@@ -4,8 +4,8 @@ import { createCohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import { toGossipRecord } from '../../src/cohort-topic/gossip/records.js';
 import { createRegistrationStore } from '../../src/cohort-topic/registration/store.js';
 import { createTopicBudget } from '../../src/cohort-topic/antidos/topic-budget.js';
-import { bytesToB64url, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
-import type { ICohortGossipTransport, PeerRef, RingCoord } from '../../src/cohort-topic/ports.js';
+import { bytesToB64url, decodeCohortGossipV1, encodeCohortMessage } from '../../src/cohort-topic/wire/codec.js';
+import type { ICohortGossipTransport, RingCoord } from '../../src/cohort-topic/ports.js';
 import type { RegistrationStore, RegistrationRecord } from '../../src/cohort-topic/registration/types.js';
 import { MAX_TTL_MS } from '../../src/cohort-topic/registration/types.js';
 import type { ChildLinkRefV1, CohortGossipV1, GossipRecordRefV1 } from '../../src/cohort-topic/wire/types.js';
@@ -18,17 +18,24 @@ const COORD: RingCoord = bytes('cohort-coord');
 const EPOCH = bytes('epoch-1');
 const EPOCH2 = bytes('epoch-2');
 
-/** A transport that fans every broadcast to all registered handlers (a shared in-memory cohort bus). */
+/**
+ * A shared in-memory cohort bus: every broadcast is decoded once and handed to the handlers subscribed under the
+ * coord the frame names, as the db-p2p transport routes an inbound frame.
+ */
 class FanoutTransport implements ICohortGossipTransport {
-	private readonly handlers = new Set<(from: PeerRef, msg: Uint8Array) => void>();
+	private readonly handlers = new Map<string, Set<(g: CohortGossipV1) => void>>();
 	broadcast(_coord: RingCoord, msg: Uint8Array): void {
-		for (const h of this.handlers) {
-			h({ id: new Uint8Array(0) }, msg);
+		const g = decodeCohortGossipV1(msg);
+		for (const h of this.handlers.get(g.coord) ?? []) {
+			h(g);
 		}
 	}
-	onMessage(handler: (from: PeerRef, msg: Uint8Array) => void): () => void {
-		this.handlers.add(handler);
-		return () => this.handlers.delete(handler);
+	onGossip(coord: RingCoord, handler: (g: CohortGossipV1) => void): () => void {
+		const key = bytesToB64url(coord);
+		const set = this.handlers.get(key) ?? new Set();
+		this.handlers.set(key, set);
+		set.add(handler);
+		return () => set.delete(handler);
 	}
 }
 
@@ -118,7 +125,7 @@ describe('cohort-topic / gossip bus', () => {
 		transport.broadcast(COORD, encodeCohortMessage(gossip('member-B', EPOCH, { records: [] })));
 		expect(captured.length, 'no child deltas → callback not fired').to.equal(2);
 
-		// A frame naming a DIFFERENT coord → dropped by the coord-routing check before any merge.
+		// A frame naming a DIFFERENT coord → routed to that coord's subscribers, so it never reaches this bus.
 		const foreign = gossip('member-B', EPOCH, { childLinks: [link] });
 		foreign.coord = bytesToB64url(bytes('other-coord'));
 		transport.broadcast(COORD, encodeCohortMessage(foreign));

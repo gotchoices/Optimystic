@@ -20,13 +20,15 @@
  * **Verify is synchronous** — `ICohortThresholdCrypto.verify` is called from the sync
  * `CohortSigner.verifyThreshold` on the participant path. {@link verifyCollectedMultisig} splits the
  * blob into `signers.length` 64-byte chunks and {@link verifyPeerSig}-checks each against the
- * corresponding signer's embedded Ed25519 key (noble, sync). Do not make it async.
+ * corresponding signer's embedded Ed25519 key (noble, sync). Do not make it async. Collection, by contrast,
+ * is already async, so it verifies each member's endorsement with the platform verifier
+ * ({@link verifyPeerSigAsync}); what it accepts is RFC 8032, which the noble check later accepts too.
  */
 
 import type { PrivateKey } from "@libp2p/interface";
 import type { ICohortThresholdCrypto, RingCoord, SignKind, SignReplyV1, SignRequestV1 } from "@optimystic/db-core";
 import { bytesToB64url, b64urlToBytes, compareBytes } from "@optimystic/db-core";
-import { signPeer, verifyPeerSig } from "./peer-sig.js";
+import { signPeer, verifyPeerSig, verifyPeerSigAsync } from "./peer-sig.js";
 import { bytesToPeerIdString } from "./peer-codec.js";
 
 /** Width of an Ed25519 signature in bytes — the fixed stride of the concatenated `thresholdSig`. */
@@ -187,7 +189,7 @@ export class FretCohortThresholdCrypto implements ICohortThresholdCrypto {
 				return; // a malformed chunk would desync the fixed-stride concatenation
 			}
 			// Verify before counting: a member must not be able to poison the blob with a bad signature.
-			if (!verifyPeerSig(signerBytes, payload, sigBytes)) {
+			if (!(await verifyPeerSigAsync(signerBytes, payload, sigBytes))) {
 				return;
 			}
 			const key = bytesToB64url(signerBytes);

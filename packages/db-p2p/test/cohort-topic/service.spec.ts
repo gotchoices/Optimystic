@@ -68,7 +68,7 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 	// Mock gossip transport (no peers): the bus's view/merge logic still works for a single member.
 	const gossipTransport: ICohortGossipTransport = {
 		broadcast: (): void => {},
-		onMessage: (): (() => void) => () => {},
+		onGossip: (): (() => void) => () => {},
 	};
 	const gossipBus = createCohortGossipBus({ transport: gossipTransport, store, coord: cohortEpoch, localEpoch: () => cohortEpoch });
 	const view = gossipBus.view();
@@ -155,7 +155,7 @@ function buildMockService(engine: CohortMemberEngine, member: Uint8Array, onDial
 	};
 	const sizeEstimator: ISizeEstimator = { estimate: (): { nEst: number; confidence: number } => ({ nEst: 50, confidence: 1 }) };
 	const gossipBus = createCohortGossipBus({
-		transport: { broadcast: (): void => {}, onMessage: (): (() => void) => () => {} },
+		transport: { broadcast: (): void => {}, onGossip: (): (() => void) => () => {} },
 		store: createRegistrationStore(),
 		coord: self,
 		localEpoch: () => self,

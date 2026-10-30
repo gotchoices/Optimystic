@@ -1,14 +1,15 @@
 import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
-import { signPeer, verifyPeerSig } from '../../src/cohort-topic/peer-sig.js';
+import { signPeer, verifyPeerSig, verifyPeerSigAsync } from '../../src/cohort-topic/peer-sig.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 
 /**
- * The shared Ed25519 sign/verify primitive: `signPeer` (async, libp2p key) and `verifyPeerSig`
- * (synchronous, noble — the db-core verify ports are sync). The cohort participant-signature seam and
- * the threshold-assembly ticket both build on these, so the cross-key round-trip and the total
- * (never-throw) verify contract are pinned here.
+ * The shared Ed25519 sign/verify primitive: `signPeer` (async, libp2p key), `verifyPeerSig`
+ * (synchronous, noble — the db-core verify ports are sync) and `verifyPeerSigAsync` (the platform
+ * verifier, for callers that can await). The cohort participant-signature seam and the threshold-assembly
+ * ticket both build on these, so the cross-key round-trip and the total (never-throw, never-reject)
+ * verify contract are pinned here.
  */
 describe('cohort-topic: peer-key sign/verify primitive', () => {
 	const payload = (s: string): Uint8Array => new TextEncoder().encode(s);
@@ -57,5 +58,34 @@ describe('cohort-topic: peer-key sign/verify primitive', () => {
 		const secpPeerId = peerIdFromPrivateKey(secpKey);
 		const secpSig = await signPeer(secpKey, msg);
 		expect(verifyPeerSig(secpPeerId.toString(), msg, secpSig), 'secp256k1 id is rejected').to.equal(false);
+	});
+
+	describe('verifyPeerSigAsync (the platform verifier)', () => {
+		it('verifies a signPeer signature against the signer peer id (string and bytes forms), and refuses a tampered payload', async () => {
+			const key = await generateKeyPair('Ed25519');
+			const peerId = peerIdFromPrivateKey(key);
+			const msg = payload('hello cohort');
+			const sig = await signPeer(key, msg);
+
+			expect(await verifyPeerSigAsync(peerId.toString(), msg, sig), 'string signer id').to.equal(true);
+			expect(await verifyPeerSigAsync(peerIdToBytes(peerId), msg, sig), 'peer-codec bytes signer id').to.equal(true);
+			expect(await verifyPeerSigAsync(peerId.toString(), payload('tampered'), sig), 'tampered payload').to.equal(false);
+		});
+
+		it('resolves false (never rejects) on garbage ids, non-Ed25519 ids, and malformed signatures', async () => {
+			const key = await generateKeyPair('Ed25519');
+			const peerId = peerIdFromPrivateKey(key);
+			const msg = payload('x');
+			const sig = await signPeer(key, msg);
+
+			expect(await verifyPeerSigAsync('not-a-peer-id', msg, sig), 'garbage string id').to.equal(false);
+			expect(await verifyPeerSigAsync(new Uint8Array([0xff, 0xfe]), msg, sig), 'non-utf8 bytes id').to.equal(false);
+			expect(await verifyPeerSigAsync(peerId.toString(), msg, new Uint8Array(0)), 'empty signature').to.equal(false);
+			expect(await verifyPeerSigAsync(peerId.toString(), msg, new Uint8Array(10)), 'short signature').to.equal(false);
+
+			const secpKey = await generateKeyPair('secp256k1');
+			const secpPeerId = peerIdFromPrivateKey(secpKey);
+			expect(await verifyPeerSigAsync(secpPeerId.toString(), msg, await signPeer(secpKey, msg)), 'secp256k1 id is rejected').to.equal(false);
+		});
 	});
 });

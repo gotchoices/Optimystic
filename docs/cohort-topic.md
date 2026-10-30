@@ -1009,8 +1009,9 @@ replicas and failover. If too few members answer inside `T_cold_quorum_wait` the
 > ([`cohort-gossip-driver.ts`](../packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts)), driven by a
 > per-`CoordEngine` heartbeat clock in `CoordEngine.gossipRound`
 > ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts)). Cold-sibling instantiation is
-> `maybeInstantiateColdSibling` in the host's `/cohort-gossip` handler, run **before** the frame is
-> delivered (so the freshly-subscribed bus merges the very frame that woke it) and **only in live-signer
+> `maybeInstantiateColdSibling`, which the host's `/cohort-gossip` handler runs for a frame no bus subscribes
+> to, after its signature verified and **before** the frame is delivered (so the freshly-subscribed bus merges
+> the very frame that woke it), and **only in live-signer
 > mode** (the co-member gate needs keys; key-less/interim mode keeps today's drop-gossip-for-an-unknown-coord
 > behaviour, since unauthenticated engine creation would be a DoS vector). The originating cohort's
 > `treeTier` rides `CohortGossipV1` — a coord is a hash and cannot be inverted to recover its tier, and every
@@ -1917,12 +1918,18 @@ not advertised), so such a member over-counts until another delta for that child
 both consumers (the demotion gate stays shut; matchmaking sweeps a tier that is no longer promoted).
 
 **Per-coord routing.** A node serves many cohorts at once (one per coord FRET routes to it — see
-§FRET integration), and a delivered `cohort-gossip` frame is fanned to every coord engine's bus on the
-node. Each bus merges only the gossip whose `coord` names its own cohort: `cohortEpoch` alone cannot
-isolate two cohorts because they can share a member set (and therefore an epoch). In the live-signing
-path the receiver also drops any frame whose `fromMember` peer-key signature does not verify, or whose
-`fromMember` is not a member of the cohort around that coord — so willingness/load cannot be spoofed and
-forged records cannot replicate.
+§FRET integration), and one inbound `cohort-gossip` frame belongs to only one of them, the cohort its
+`coord` names: `cohortEpoch` alone cannot isolate two cohorts because they can share a member set (and
+therefore an epoch). The host's handler decodes each frame once and hands it only to the buses subscribed
+under that coord — usually one coord engine's bus, plus the node-level participant bus when the coord is the
+node's own ring position. A frame for a coord no bus subscribes to is dropped before any signature work,
+unless it can instantiate a cold sibling (§Cold-start instantiation). In the live-signing path the frame's
+`fromMember` peer-key signature is checked once, before any bus sees it, with the platform's own verifier
+(`verifyPeerSigAsync` in `packages/db-p2p/src/cohort-topic/peer-sig.ts`: native in Node, WebCrypto Ed25519
+where the runtime provides it), and a frame whose signature does not verify is dropped. Each bus then drops a
+frame whose `fromMember` is not a member of its cohort — so willingness/load cannot be spoofed and forged
+records cannot replicate. Two frames can finish verifying in the opposite order to their arrival; every merge
+above is ordered by its own key (`lastPing`, `timestamp`, `effectiveAt`), so the order does not matter.
 
 **Cadence (host driver).** The cohort-topic host owns one repeating timer (`gossipIntervalMs`, default
 5 s — there is no dedicated `gossip_round` constant; it is a derived sub-round of `ping_interval`). On

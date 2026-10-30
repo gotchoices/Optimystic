@@ -13,7 +13,7 @@
  * `cohort-topic-package-layering` for the authoritative layering rule.
  */
 
-import type { MembershipCertV1 } from "./wire/types.js";
+import type { CohortGossipV1, MembershipCertV1 } from "./wire/types.js";
 
 /**
  * Ring coordinate — SHA-256 truncated to the ring width `B` (see {@link IRingHash}). db-core
@@ -101,12 +101,18 @@ export interface MembershipLookupOptions {
 	readonly rootPlaced?: true;
 }
 
-/** Intra-cohort gossip transport (FRET cohort gossip underneath). */
+/**
+ * Intra-cohort gossip transport (FRET cohort gossip underneath). Outbound frames are encoded by the caller;
+ * inbound frames are decoded once by the transport and handed only to the subscribers of the coord they name.
+ */
 export interface ICohortGossipTransport {
 	/** Fire-and-forget broadcast of `msg` to the cohort at `coord`. */
 	broadcast(coord: RingCoord, msg: Uint8Array): void;
-	/** Subscribe to inbound cohort gossip; returns an unsubscribe handle. */
-	onMessage(handler: (from: PeerRef, msg: Uint8Array) => void): () => void;
+	/**
+	 * Subscribe to inbound cohort gossip naming `coord`; returns an unsubscribe handle. A frame reaches a handler
+	 * decoded, and, when the transport authenticates frames, only after its signature verified.
+	 */
+	onGossip(coord: RingCoord, handler: (g: CohortGossipV1) => void): () => void;
 }
 
 /** Authoritative cohort membership snapshots (FRET `MembershipCertV1` / stabilization underneath). */
