@@ -13,6 +13,7 @@ Quereus plugin providing cryptographic functions for SQL queries with base64url 
 - **Verification Functions**: Signature verification for all supported curves
 - **Key Generation**: Generate and derive cryptographic keys
 - **Multiple Encodings**: Support for base64url, base64, hex, utf8, and raw bytes
+- **Native Crypto Backend**: Optionally route SHA-256, SHA-512 and Ed25519 to a native library, checked against the JavaScript results when set
 
 ## Installation
 
@@ -345,6 +346,76 @@ break signature validation, so it is intentionally not offered for this function
 single database genuinely needs two digest configurations, register the plugin twice
 (or expose named variants) rather than flipping mutable session state.
 
+## Native crypto backend
+
+By default every hash and signature runs in JavaScript (`@noble/hashes`, `@noble/curves`). On a
+phone that already has fast native crypto, that is the slow part: on a Galaxy S7, one SQL `verify`
+took 408 ms, 366 ms of it in JavaScript Ed25519, and every `digest` hashed with JavaScript SHA-256
+even after the app routed `crypto.subtle.digest` to native code (this plugin never calls
+`crypto.subtle`). `setCryptoBackend` routes SHA-256, SHA-512 and Ed25519 to a synchronous native
+implementation for the whole process:
+
+```ts
+import { setCryptoBackend } from '@optimystic/quereus-plugin-crypto';
+
+setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every member optional
+```
+
+- **What it speeds up.** `digest`, `cid`, `hash_mod`, `set_commit` and `set_verify` whenever they
+  hash with sha256 or sha512, and `sign` / `verify` with `'ed25519'`. BLAKE3, secp256k1 and P-256
+  stay on `@noble`, and so does any member the backend omits.
+- **Set it once, at startup, for the whole process.** One call reaches the JS API and every
+  `Database`'s SQL functions, including those loaded from `@optimystic/quereus-plugin-crypto/plugin`
+  and those registered *before* the call: each hash and signature reads the installed backend when
+  it runs. `setCryptoBackend(undefined)` restores the `@noble` defaults. It is not a plugin load
+  option because plugin config is plain SQL values, which cannot carry functions, and because the
+  JS API is used with no plugin registration at all.
+- **Checked when set.** Each member the backend supplies is run once against `@noble` on fixed
+  inputs: a hash must equal the `@noble/hashes` one; `ed25519Sign` must produce exactly the
+  `@noble/curves` signature for a fixed raw 32-byte seed (Ed25519 signing is deterministic);
+  `ed25519Verify` must accept that signature and reject it once one byte of the message is flipped.
+  The inputs are views at a non-zero offset into a larger buffer, so an adapter that hands the native
+  side `data.buffer` instead of the view fails too. On any failure `setCryptoBackend` throws, naming
+  the member, and the previously installed backend (or `@noble`) stays in place, so the mistake shows
+  at app start rather than as wrong signatures persisted and replicated.
+- **Byte-identical, by requirement.** `digest`, `cid` and `set_commit` are `replicable`: their
+  outputs are signed and persisted, and every peer must compute the same bytes. A backend must
+  therefore agree with `@noble` on every input, not only the self-check's. The check catches an
+  adapter built wrong (wrong key shape, wrong bytes); it cannot prove a native library correct.
+- **Errors.** A backend that throws inside `verify` makes it return `false`, exactly as a throw from
+  `@noble` does; in `sign`, `digest` and `cid` the throw propagates. A backend handed a malformed key
+  or signature must throw or return `false`, as `@noble` does.
+- **Ed25519 strictness differs on crafted input.** `@noble` verifies under the ZIP-215 rule, which
+  accepts some non-canonical point encodings and small-order components that an RFC 8032-strict
+  library such as OpenSSL rejects. Honest signatures verify identically either way. A deliberately
+  crafted signature could verify on a machine without a backend and fail on one with it; that matters
+  only where peers re-execute a statement whose outcome depends on `verify`, which no Optimystic
+  deployment does today.
+
+A working adapter for Node.js, on `node:crypto`. Raw Ed25519 keys are wrapped as DER (PKCS#8 for the
+32-byte seed, SPKI for the 32-byte public key) because that is the form the Node API takes:
+
+```ts
+import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
+import { setCryptoBackend } from '@optimystic/quereus-plugin-crypto';
+
+const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
+
+setCryptoBackend({
+  sha256: (data) => createHash('sha256').update(data).digest(),
+  sha512: (data) => createHash('sha512').update(data).digest(),
+  ed25519Sign: (message, secretKey) => sign(null, message,
+    createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_PREFIX, secretKey]), format: 'der', type: 'pkcs8' })),
+  ed25519Verify: (signature, message, publicKey) => verify(null, message,
+    createPublicKey({ key: Buffer.concat([SPKI_ED25519_PREFIX, publicKey]), format: 'der', type: 'spki' }), signature),
+});
+```
+
+`react-native-quick-crypto` mirrors this API, so the same shape is the starting point on a phone.
+Whether its synchronous Ed25519 accepts these keys unchanged has not been confirmed; if it does not,
+`setCryptoBackend` throws at startup rather than producing wrong signatures.
+
 ## Supported Algorithms
 
 ### Hash Algorithms
@@ -503,7 +574,7 @@ Derive the public key from a private key.
 
 ## Security Notes
 
-- All cryptographic operations use audited libraries (@noble/*)
+- All cryptographic operations use audited libraries (@noble/*), unless a [native crypto backend](#native-crypto-backend) is installed, in which case SHA-2 and Ed25519 run in that library
 - Private keys should be handled securely and never exposed
 - Random number generation uses platform CSPRNG (crypto.getRandomValues)
 - Signatures use deterministic k-generation (RFC 6979)
@@ -511,10 +582,13 @@ Derive the public key from a private key.
 
 ## React Native Compatibility
 
-These functions are fully compatible with React Native and don't require any native modules. They use:
+These functions run on React Native without any native module. By default they use:
 - `@noble/curves` for elliptic curve operations
 - `@noble/hashes` for hashing
 - `crypto.getRandomValues()` for secure randomness (polyfill required for React Native)
+
+An app that has native crypto can route SHA-256, SHA-512 and Ed25519 to it; see
+[Native crypto backend](#native-crypto-backend).
 
 ## License
 

@@ -13,6 +13,8 @@ All implementations delegate to audited libraries ([`@noble/curves`](https://git
 
 Both the SQL functions and the JavaScript API share the same implementation (`crypto.ts`), so they produce byte-identical results for matching encodings. Use the lowercase function exports (`digest`, `sign`, `verify`, etc.) in application code.
 
+SHA-256, SHA-512 and Ed25519 sign/verify go through a process-wide native backend when an application installs one (`setCryptoBackend` in `packages/quereus-plugin-crypto/src/crypto.ts`); every other algorithm, and any member the backend omits, stays on `@noble`. The backend is held on `globalThis` under a `Symbol.for` key, because the package root and the `/plugin` entry are built as separate bundles that each carry their own copy of `crypto.ts`. The hashers `resolveHasher` returns, and the Ed25519 branches of `sign` and `verify`, read it on every call, so a backend set after the plugin was registered still applies. `setCryptoBackend` runs a known-answer check of each supplied member against `@noble` and refuses a backend that disagrees, since `digest`, `cid` and `set_commit` are replicable and must be byte-identical on every peer. See the [README](../README.md#native-crypto-backend) for usage and the Ed25519 strictness caveat.
+
 ---
 
 ## Hash Algorithms

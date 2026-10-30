@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased — native crypto backend
+
+- New `setCryptoBackend(backend)` and `CryptoBackend` exports. An application can route SHA-256,
+  SHA-512 and Ed25519 sign/verify to a synchronous native implementation for the whole process;
+  every member is optional and an omitted one stays on `@noble`. The setting reaches the JS API and
+  the SQL functions from the `/plugin` entry, including a plugin registered before the call.
+- `setCryptoBackend` checks each supplied member against `@noble` on fixed inputs and throws, keeping
+  the previous backend, when one disagrees. `setCryptoBackend(undefined)` restores `@noble`.
+- No behaviour change without a backend. See the README's
+  [Native crypto backend](README.md#native-crypto-backend) section.
+
 ## 0.14.0 — BREAKING: `digest` API rework
 
 ### What changed

@@ -114,9 +114,11 @@ const NON_DETERMINISTIC_FLAGS = FunctionFlags.UTF8;
  */
 export default function register(_db: Database, config: Record<string, SqlValue> = {}) {
 	// Resolve the digest algorithm + output encoding ONCE, at registration, from
-	// load-time config — so the per-call path never branches on them, and so the
+	// load-time config — so the per-call path never selects between them, and so the
 	// digest is stable for the lifetime of the database (a precondition for
 	// `replicable`: every peer that loads the plugin with the same config agrees).
+	// The resolved hasher still reads the process-wide crypto backend per call, so a
+	// backend set after registration applies; it is byte-identical to @noble by contract.
 	const digestHasher = resolveHasher(configAlgorithm(config));
 	const digestEncoder = resolveOutputEncoder(configEncoding(config));
 

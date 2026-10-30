@@ -90,12 +90,190 @@ function fromBytes(bytes: Uint8Array, encoding: Encoding = 'base64url'): string 
 	}
 }
 
-// --- Algorithm / encoding resolution (done once, no per-call switching) --- //
+// --- Native crypto backend (process-wide, optional) --- //
 
-/** Hash algorithm → noble hasher. Keyed lookup so the digest hot path never branches. */
+/**
+ * Synchronous native implementations; any omitted member falls back to @noble.
+ *
+ * Every member must give byte-identical results to @noble for the same input:
+ * `digest`, `cid` and `set_commit` are `replicable`, and their outputs are signed
+ * and persisted. {@link setCryptoBackend} checks each supplied member against
+ * @noble before installing it. A member handed a malformed key or signature must
+ * throw or return false, as @noble does; that is not checked.
+ */
+export interface CryptoBackend {
+	sha256?(data: Uint8Array): Uint8Array;
+	sha512?(data: Uint8Array): Uint8Array;
+	/** Raw 64-byte signature, message, raw 32-byte public key. Returns false, or throws, for an invalid signature or key. */
+	ed25519Verify?(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean;
+	/** Message, raw 32-byte secret seed (the form noble and generatePrivateKey('ed25519') use). Returns the raw 64-byte signature. */
+	ed25519Sign?(message: Uint8Array, secretKey: Uint8Array): Uint8Array;
+}
+
+type BackendMember = keyof CryptoBackend;
+
+/**
+ * The installed backend lives on `globalThis` rather than in a module variable:
+ * `dist/index.js` and `dist/plugin.js` are built as separate entries, each with its
+ * own copy of this module, and a second installed copy of the package has its own
+ * too. A `Symbol.for` key is the one slot all of them share.
+ */
+const BACKEND_KEY: unique symbol = Symbol.for('@optimystic/quereus-plugin-crypto/backend');
+
+interface BackendSlot {
+	[BACKEND_KEY]?: CryptoBackend;
+}
+
+const backendSlot = globalThis as BackendSlot;
+
+function currentBackend(): CryptoBackend | undefined {
+	return backendSlot[BACKEND_KEY];
+}
+
+/**
+ * Install a backend for this process, or pass undefined to restore the @noble defaults.
+ * Throws, leaving the previous backend in place, if the backend fails its self-check.
+ *
+ * Set it once at startup. It takes effect on the next call everywhere, including in
+ * a plugin registered before it was set.
+ */
+export function setCryptoBackend(backend: CryptoBackend | undefined): void {
+	if (backend === undefined) {
+		delete backendSlot[BACKEND_KEY];
+		return;
+	}
+	const installed = snapshotBackend(backend);
+	selfCheckBackend(installed);
+	backendSlot[BACKEND_KEY] = installed;
+}
+
+/**
+ * Copy the supplied members, bound to their object, into a frozen record. What is
+ * installed is then exactly what the self-check ran: a member added to or replaced on
+ * the caller's object later is never reached, and neither is a member this copy of
+ * the package does not know how to check.
+ */
+function snapshotBackend(backend: CryptoBackend): CryptoBackend {
+	return Object.freeze({
+		sha256: backend.sha256?.bind(backend),
+		sha512: backend.sha512?.bind(backend),
+		ed25519Verify: backend.ed25519Verify?.bind(backend),
+		ed25519Sign: backend.ed25519Sign?.bind(backend),
+	});
+}
+
+const CHECK_MESSAGE = utf8ToBytes('@optimystic/quereus-plugin-crypto backend self-check');
+const CHECK_SEED = Uint8Array.from({ length: 32 }, (_, i) => i + 1);
+
+/** Known-answer check of every member the backend supplies, against @noble. */
+function selfCheckBackend(backend: CryptoBackend): void {
+	if (backend.sha256) checkHash('sha256', backend.sha256, sha256);
+	if (backend.sha512) checkHash('sha512', backend.sha512, sha512);
+	if (backend.ed25519Sign) checkEd25519Sign(backend.ed25519Sign);
+	if (backend.ed25519Verify) checkEd25519Verify(backend.ed25519Verify);
+}
+
+function checkHash(member: BackendMember, native: DigestHasher, noble: DigestHasher): void {
+	const actual = runCheck(member, () => native(offsetView(CHECK_MESSAGE)));
+	if (!sameBytes(actual, noble(CHECK_MESSAGE))) {
+		throw backendRefused(member, 'returned a different hash than @noble/hashes for the same input');
+	}
+}
+
+/** Ed25519 signing is deterministic (RFC 8032), so noble's signature is the known answer. */
+function checkEd25519Sign(native: NonNullable<CryptoBackend['ed25519Sign']>): void {
+	const actual = runCheck('ed25519Sign', () => native(offsetView(CHECK_MESSAGE), offsetView(CHECK_SEED)));
+	if (!sameBytes(actual, ed25519.sign(CHECK_MESSAGE, CHECK_SEED))) {
+		throw backendRefused('ed25519Sign', 'returned a different signature than @noble/curves for the same raw 32-byte seed and message');
+	}
+}
+
+function checkEd25519Verify(native: NonNullable<CryptoBackend['ed25519Verify']>): void {
+	const signature = ed25519.sign(CHECK_MESSAGE, CHECK_SEED);
+	const publicKey = ed25519.getPublicKey(CHECK_SEED);
+	const accepted = runCheck('ed25519Verify', () => native(offsetView(signature), offsetView(CHECK_MESSAGE), offsetView(publicKey)));
+	if (accepted !== true) {
+		throw backendRefused('ed25519Verify', 'did not accept a valid signature over a raw 32-byte public key');
+	}
+	const tampered = CHECK_MESSAGE.slice();
+	tampered[0]! ^= 0x01;
+	if (rejectsOrThrows(() => native(offsetView(signature), offsetView(tampered), offsetView(publicKey)))) {
+		return;
+	}
+	throw backendRefused('ed25519Verify', 'accepted a signature over a different message');
+}
+
+/** For the tampered vector a throw is a rejection, as the interface allows. */
+function rejectsOrThrows(attempt: () => boolean): boolean {
+	try {
+		return attempt() === false;
+	} catch {
+		return true;
+	}
+}
+
+function runCheck<T>(member: BackendMember, attempt: () => T): T {
+	try {
+		return attempt();
+	} catch (cause) {
+		throw new Error(`setCryptoBackend: ${member} threw during its self-check; the backend was not installed`, { cause });
+	}
+}
+
+function backendRefused(member: BackendMember, reason: string): Error {
+	return new Error(`setCryptoBackend: ${member} ${reason}; the backend was not installed`);
+}
+
+/**
+ * Compared through hex rather than a byte-equality import: the `/plugin` bundle drops the
+ * setter, and an import only it used would be left dangling there. Runs once per backend.
+ */
+function sameBytes(actual: unknown, expected: Uint8Array): boolean {
+	return actual instanceof Uint8Array && bytesToHex(actual) === bytesToHex(expected);
+}
+
+/**
+ * A copy of `bytes` at a non-zero offset inside a larger buffer. The plugin routinely
+ * hands a hasher a view into a larger buffer, so an adapter that passes the native side
+ * `data.buffer` instead of the view fails here rather than hashing the wrong bytes.
+ */
+function offsetView(bytes: Uint8Array): Uint8Array {
+	const buffer = new Uint8Array(bytes.length + 2);
+	buffer.set(bytes, 1);
+	return buffer.subarray(1, 1 + bytes.length);
+}
+
+/** A hasher that reads the installed backend on every call, so one set after registration still applies. */
+function dispatchHash(member: 'sha256' | 'sha512', noble: DigestHasher): DigestHasher {
+	return (input) => (currentBackend()?.[member] ?? noble)(input);
+}
+
+function ed25519Sign(message: Uint8Array, secretKey: Uint8Array): Uint8Array {
+	const native = currentBackend()?.ed25519Sign;
+	return native ? native(message, secretKey) : ed25519.sign(message, secretKey);
+}
+
+function ed25519Verify(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean {
+	const native = currentBackend()?.ed25519Verify;
+	// NOTE: @noble verifies under ZIP-215 (accepts some non-canonical encodings and small-order
+	// components) while an RFC 8032-strict native library such as OpenSSL rejects them. Honest
+	// signatures verify the same either way, and the self-check cannot test this without refusing
+	// every strict backend. Harmless while no peer re-executes a statement whose outcome depends on
+	// `verify` (no deployment validates transactions at pend today); once one does, a crafted
+	// signature could verify on a machine with a backend and not on one without. Switching noble to
+	// `zip215: false` was rejected: it changes existing results and still differs on small-order keys.
+	return native ? native(signature, message, publicKey) : ed25519.verify(signature, message, publicKey);
+}
+
+// --- Algorithm / encoding resolution (selection done once, no per-call switching) --- //
+
+/**
+ * Hash algorithm → hasher. Keyed lookup so the digest hot path never branches on the
+ * algorithm; sha256 and sha512 read the installed backend per call (one property read).
+ */
 const HASHERS: Record<HashAlgorithm, DigestHasher> = {
-	sha256,
-	sha512,
+	sha256: dispatchHash('sha256', sha256),
+	sha512: dispatchHash('sha512', sha512),
 	blake3,
 };
 
@@ -110,7 +288,8 @@ const OUTPUT_ENCODERS: Record<OutputEncoding, OutputEncoder> = {
 /**
  * Resolve a hash algorithm name to its hasher. Throws on unknown algorithm.
  * Call once (e.g. at plugin registration) and capture the result so the digest
- * hot path performs no per-call algorithm branching.
+ * hot path performs no per-call algorithm branching. The returned hasher still
+ * honours a backend installed later by {@link setCryptoBackend}.
  */
 export function resolveHasher(algorithm: HashAlgorithm): DigestHasher {
 	const hasher = HASHERS[algorithm];
@@ -283,8 +462,8 @@ export function encodeFields(fields: readonly DigestField[]): Uint8Array {
 
 /**
  * Low-level multi-field digest: canonically encode the fields, then hash and
- * encode with the supplied (pre-resolved) hasher/encoder. No per-call branching
- * on algorithm or encoding — resolve once via {@link resolveHasher} /
+ * encode with the supplied (pre-resolved) hasher/encoder. No per-call selection
+ * of algorithm or encoding — resolve once via {@link resolveHasher} /
  * {@link resolveOutputEncoder} and reuse.
  */
 export function digestFields(
@@ -417,7 +596,7 @@ export function sign(
 			sigBytes = p256.sign(dataBytes, keyBytes, { lowS: true });
 			break;
 		case 'ed25519':
-			sigBytes = ed25519.sign(dataBytes, keyBytes);
+			sigBytes = ed25519Sign(dataBytes, keyBytes);
 			break;
 		default:
 			throw new Error(`Unsupported curve: ${curve}`);
@@ -469,7 +648,7 @@ export function verify(
 				return p256.verify(sigBytes, dataBytes, keyBytes);
 			}
 			case 'ed25519': {
-				return ed25519.verify(sigBytes, dataBytes, keyBytes);
+				return ed25519Verify(sigBytes, dataBytes, keyBytes);
 			}
 			default:
 				throw new Error(`Unsupported curve: ${curve}`);
