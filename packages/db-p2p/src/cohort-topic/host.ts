@@ -1019,19 +1019,20 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	};
 
 	// --- ports (node-wide singletons, injected into every coord engine) ---
-	// The router's `routeToRoot` exists only on a host that serves root placement; it resolves the group by the
-	// rule that chose it (never by ring routing, whose nearest peers can differ from the storage group on a
-	// shared ring — see the router) and runs a frame addressed to this node through the local register
-	// handler, since libp2p refuses a self-dial.
+	// Every direct dial addressed to this node — a renewal whose primary is this node, or a root-group member
+	// that is — runs through the local register handler, since libp2p refuses a self-dial. The router's
+	// `routeToRoot` exists only on a host that serves root placement; it resolves the group by the rule that
+	// chose it (never by ring routing, whose nearest peers can differ from the storage group on a shared ring —
+	// see the router).
 	const router = new FretTopicRouter(node, fret, {
 		registerProtocol: protocols.register,
 		maxBytes,
 		streamOpen,
+		selfPeerId: selfPeerStr,
+		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
 				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
-			selfPeerId: selfPeerStr,
-			handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
 		}),
 	});
 	const sizeEstimator = new FretSizeEstimator(fret);

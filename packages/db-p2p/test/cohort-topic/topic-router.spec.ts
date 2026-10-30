@@ -68,6 +68,30 @@ describe('cohort-topic: topic router direct dial', () => {
 		expect(err).to.be.instanceOf(NoResultReplyError);
 		expect((err as Error).message).to.contain('cohort-topic register dial');
 	});
+
+	it('serves a dial addressed to this node in process, opening no stream', async () => {
+		const { client } = await makePair();
+		let dials = 0;
+		client.dialProtocol = () => {
+			dials++;
+			return Promise.reject(new Error('a self-addressed dial must not open a stream'));
+		};
+		const frames: number[][] = [];
+		const replyBytes = new Uint8Array([7, 7]);
+		const router = new FretTopicRouter(client as never, {} as never, {
+			selfPeerId: client.peerId.toString(),
+			handleLocally: frame => {
+				frames.push([...frame]);
+				return Promise.resolve(replyBytes);
+			},
+		});
+
+		const reply = await router.dialMember({ id: peerIdToBytes(client.peerId) }, activity);
+
+		expect([...reply]).to.deep.equal([...replyBytes]);
+		expect(frames).to.deep.equal([[...activity]]);
+		expect(dials).to.equal(0);
+	});
 });
 
 /**

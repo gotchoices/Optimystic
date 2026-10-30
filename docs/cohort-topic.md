@@ -538,7 +538,7 @@ The record is replicated across all `~k` cohort members via standard FRET cohort
 
 ### TTL and renewal
 
-The participant pings `primary` every `ttl / 3` (default 30s). What it does with each reply (`TtlRenewalParticipant` in `packages/db-core/src/cohort-topic/registration/renewal.ts`):
+The participant pings `primary` every `ttl / 3` (default 30s). A primary that is the participant's own node — which happens whenever the participant is a member of the cohort it registered at, as on a two-machine group — is answered in process by that node's own engine, with no network request (`FretTopicRouter.dialMember` in `packages/db-p2p/src/cohort-topic/topic-router.ts`); the answer is the one an inbound `/register` frame gets. What it does with each reply (`TtlRenewalParticipant` in `packages/db-core/src/cohort-topic/registration/renewal.ts`):
 
 - `ok` → the primary updated `lastPing` and gossips the touch to the cohort; the participant's failure count resets.
 - `primary_moved` → a rotation moved the participant's slot; the participant adopts the named primary, backups and `cohortEpoch`, and its failure count resets.

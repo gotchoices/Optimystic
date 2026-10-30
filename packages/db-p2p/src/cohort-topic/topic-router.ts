@@ -37,9 +37,11 @@ export interface FretTopicRouterOptions {
 	 */
 	readonly rootGroupMembers?: (rootKey: Uint8Array) => Promise<readonly string[]>;
 	/**
-	 * This node's own peer-id string. With {@link handleLocally}, a root-group member that is this node is
-	 * served in process rather than dialed: libp2p refuses a self-dial, and a `clusterSize: 1` deployment's
-	 * root group is this node alone, so without it such a node could never register at its own root.
+	 * This node's own peer-id string. With {@link handleLocally}, every direct dial addressed to this node — a
+	 * {@link FretTopicRouter.dialMember} to a primary that is this node, or a root-group member that is — is
+	 * served in process rather than dialed. libp2p refuses a self-dial, so without it a node that is the
+	 * primary of its own registration fails every renewal ping, and a `clusterSize: 1` deployment (whose root
+	 * group is this node alone) could never register at its own root.
 	 */
 	readonly selfPeerId?: string;
 	/** The `/register` body this node runs for a frame addressed to itself (see {@link selfPeerId}). */
@@ -61,7 +63,8 @@ export interface FretTopicRouterOptions {
  * `NearAnchorV1` (no in-cluster activity ran) is surfaced to the walk as `no_state`.
  *
  * `dialMember` is the post-registration direct path: a libp2p dial of the `/register` protocol to the
- * cached primary, used by the renewal ping (`docs/cohort-topic.md` §FRET integration L457-460).
+ * cached primary, used by the renewal ping (`docs/cohort-topic.md` §FRET integration). A primary that is this
+ * node is answered in process (see {@link FretTopicRouterOptions.selfPeerId}).
  *
  * `routeToRoot` — present only when the router was given {@link FretTopicRouterOptions.rootGroupMembers} —
  * is the tier-0 step of a root-placed topic (`docs/cohort-topic.md` §Root placement at a routing key). It
@@ -121,7 +124,9 @@ export class FretTopicRouter implements ITopicRouter {
 	}
 
 	/**
-	 * Dial `member`'s `/register` directly and return its encoded reply.
+	 * Dial `member`'s `/register` directly and return its encoded reply. A `member` that is this node is served
+	 * in process through {@link FretTopicRouterOptions.handleLocally} when the router was given it, exactly as
+	 * an inbound `/register` frame is; a throw there is a fault of the frame, not of a link, and propagates.
 	 *
 	 * The `/register` responder always writes a frame, so a no-result (zero-length) reply only comes from a
 	 * non-conforming peer; it rejects with {@link NoResultReplyError}, reaching the caller exactly as a dial
@@ -131,6 +136,9 @@ export class FretTopicRouter implements ITopicRouter {
 	 */
 	async dialMember(member: PeerRef, activity: Uint8Array): Promise<Uint8Array> {
 		const peer = bytesToPeerId(member.id);
+		if (this.handleLocally !== undefined && peer.toString() === this.selfPeerId) {
+			return this.handleLocally(activity);
+		}
 		const reply = await requestResponse(this.node, peer, this.registerProtocol, activity, this.maxBytes, this.streamOpen);
 		return requireReply(reply, "cohort-topic register dial");
 	}
