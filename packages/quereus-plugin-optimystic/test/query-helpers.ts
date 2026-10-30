@@ -184,6 +184,8 @@ function renderRow(row: Row): string {
 function describeOrphan(orphan: OrphanedIndexEntry): string {
 	const detail = orphan.reason === 'stale-value' && orphan.currentRow !== undefined
 		? `, row now ${renderRow(orphan.currentRow)}`
+		: orphan.reason === 'outside-predicate' && orphan.currentRow !== undefined
+			? `, row ${renderRow(orphan.currentRow)} is outside the index's predicate`
 		: orphan.reason === 'malformed'
 			? `, but stores primary key ${JSON.stringify(orphan.primaryKey)}`
 			: '';

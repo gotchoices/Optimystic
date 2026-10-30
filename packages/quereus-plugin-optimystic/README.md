@@ -678,6 +678,7 @@ statement re-reads the row and decides again. See
 
   Use a fresh collection URI when re-creating a table whose old rows should not come back
 - A machine that hydrated before another machine changed a table's record, and then touches the table before re-hydrating, writes its own older description of the table back over the record on that first touch (a query, an insert, `create index`, and the check of stored rows Quereus runs for `alter table … add constraint … check`). The `CHECK` and column `ALTER` arms themselves do not touch the table, but in an `apply schema` that re-adds a `CHECK` on such a machine and then fails, this removes the other machine's `CHECK` from the record. Re-applying the schema on any machine that has the newer declaration puts it back
+- A partial index (`create index … where …`) holds entries only for the rows its `where` clause is true for, and is never used to answer a query: the planner scans the table instead, as Quereus's own memory tables do, since a seek through it would miss matching rows outside the clause. Nor does it stand in for a full `unique` constraint over the same columns — such a constraint gets its own internal tree. A `where` clause the index maintenance cannot evaluate (a function call, a subquery) is refused at `CREATE INDEX`. Entries an older build wrote for rows outside the clause stay in the tree; `plugin.verifyIndexes` reports them as `outside-predicate`
 - Cross-collection transactions not yet supported
 
 ## Development

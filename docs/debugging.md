@@ -838,8 +838,8 @@ for (const report of reports) {
 ```
 
 - `kind` — `declared` for an index from `CREATE INDEX`; `unique-enforcement` for the internal tree a table keeps to enforce a `unique` column that has no declared index (named like `_uniq_5.email`).
-- `rowCount` / `entryCount` — rows in the table and entries in the index tree. They are equal on a clean index, except where a `unique-enforcement` tree has no entries for NULL-bearing rows (see below).
-- `missing` — rows the index holds no entry for. An index lookup for such a row's value silently misses the row.
+- `rowCount` / `entryCount` — rows in the table and entries in the index tree. They are equal on a clean index, except where a `unique-enforcement` tree has no entries for NULL-bearing rows (see below), and on a partial index (`create index … where …`), which holds entries only for the rows its `where` clause is true for.
+- `missing` — rows the index should hold an entry for and does not. An index lookup for such a row's value silently misses the row. A row outside a partial index's `where` clause is never missing.
 - `orphaned` — entries no row accounts for, each with a `reason`:
 
 | `reason` | Meaning |
@@ -847,6 +847,7 @@ for (const report of reports) {
 | `no-row` | No row has the entry's primary key. The row was deleted, or moved to another primary key, and its entry stayed. |
 | `stale-value` | A row has that primary key but a different value in the indexed columns; `currentRow` shows it. The row's value changed and its entry did not follow. |
 | `malformed` | The primary key stored in the entry is not the one its own position in the tree encodes. No write path produces this; suspect corruption or a key-format change. Sitting at a row's own position, it also hides that row from lookups; it is reported once, here, not also under `missing`. |
+| `outside-predicate` | The index is partial, and the entry belongs to a row its `where` clause is not true for (false or NULL); `currentRow` shows it. Builds before partial indexes were maintained by their `where` clause wrote an entry for every row, and these are left in the tree: nothing migrates them away, and deleting such a row leaves its entry behind, because the delete stages nothing for a row outside the clause. They are harmless — no query reads through a partial index, and no full `unique` constraint is enforced through one. An `outside-predicate` entry for a row written by the current build means index maintenance is over-populating the index again. |
 
 One cause of `no-row` orphans is worth naming, because it produced them on every node at once rather than on one: an index delete staged against a tree copy that had never fetched the entry used to write no block, and the commit then logged an action whose transforms did nothing. Readers materialize blocks rather than log entries, so the row went and its entry stayed, everywhere. `Collection.updateInternal` now replays pending actions whenever a refresh adopts a newer revision, not only when a block conflict is detected, which rules that shape out ([docs/internals.md §Conflict replay must read at the revision it is adopting, not the one it is leaving](internals.md#conflict-replay-must-read-at-the-revision-it-is-adopting-not-the-one-it-is-leaving)). An orphan that reappears with the same all-nodes signature points at that gate.
 
@@ -858,7 +859,6 @@ What it reads, and what it does not do:
 - Inside an open transaction it includes that transaction's uncommitted writes.
 - It **repairs nothing**.
 - In a `unique-enforcement` tree, an entry for a row with a NULL in the tree's columns is optional. Such rows are exempt from the constraint, and the tree's one-time fill for rows an older build wrote skips them, while ordinary writes add them. Neither state is reported. That fill runs the first time a write checks the constraint; until then, a tree over an older build's rows reports those rows missing.
-- A partial index (`create index … where …`) is checked as if it had no `where` clause, because index maintenance ignores the clause too.
 - It holds the table's rows and the index's entries in memory at once. It is a diagnostic; do not put it on a hot path over a large table.
 
 The comparison is `compareIndexToRows` in `packages/quereus-plugin-optimystic/src/schema/index-integrity.ts`. Every index test in the plugin runs it through `expectIndexAgreesWithScan` in `packages/quereus-plugin-optimystic/test/query-helpers.ts`.

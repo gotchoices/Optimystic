@@ -1573,6 +1573,11 @@ export class TransactionBridge {
     }
 
     for (const [index, tree] of trees.entries()) {
+      // A tree marked dirty that staged nothing — an index the statement's rows left alone, a
+      // partial index whose predicate admitted none of them — has nothing to commit, and its
+      // `sync()` would still pay a refresh. Skipped, it reverts like any unsynced tree on a
+      // later failure, which for a tree with nothing staged restores what it already holds.
+      if (!isStaged(tree)) continue;
       try {
         const durability = await tree.sync();
         synced.push(tree);

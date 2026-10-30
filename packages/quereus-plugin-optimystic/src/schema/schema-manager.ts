@@ -720,7 +720,7 @@ export function withoutCheckConstraint(stored: StoredTableSchema, name: string |
 }
 
 /**
- * A column as the catalog record stores it — the inverse of {@link SchemaManager.storedToColumnSchema},
+ * A column as the catalog record stores it — the inverse of {@link storedToColumnSchema},
  * and the one conversion, shared by every path that writes one.
  */
 export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
@@ -736,6 +736,34 @@ export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
 		collationExplicit: col.collationExplicit ? true : undefined,
 		generated: col.generated,
 		generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
+		generatedStored: col.generatedStored,
+		pkDirection: col.pkDirection,
+		defaultConflict: col.defaultConflict,
+		tags: copyTags(col.tags),
+	};
+}
+
+/**
+ * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The logical type
+ * is re-inferred from the declared spelling by the same rule CREATE TABLE uses (`inferType`),
+ * falling back to the stored canonical name for a column declared without a type. Also used by
+ * the vtab's own load arm (a `connect` whose caller supplied no columns) and by the index
+ * manager's partial-index predicates (`IndexPredicate`), so none of them rebuilds a column
+ * differently.
+ */
+export function storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
+	return {
+		name: col.name,
+		logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
+		declaredType: col.declaredType,
+		notNull: col.notNull,
+		primaryKey: col.primaryKey,
+		pkOrder: col.pkOrder,
+		defaultValue: (col.defaultValue as Expression | undefined) ?? null,
+		collation: col.collation,
+		collationExplicit: col.collationExplicit,
+		generated: col.generated,
+		generatedExpr: col.generatedExpr as Expression | undefined,
 		generatedStored: col.generatedStored,
 		pkDirection: col.pkDirection,
 		defaultConflict: col.defaultConflict,
@@ -1601,7 +1629,7 @@ export class SchemaManager {
 		vtabAuxData?: unknown,
 		sessionVtabArgs: Readonly<Record<string, SqlValue>> = {}
 	): TableSchema {
-		const columns = stored.columns.map(col => this.storedToColumnSchema(col));
+		const columns = stored.columns.map(storedToColumnSchema);
 		const primaryKeyDefinition = stored.primaryKeyDefinition.map(pk => ({
 			index: pk.index,
 			desc: pk.desc,
@@ -1636,33 +1664,6 @@ export class SchemaManager {
 				: undefined,
 			generatedColumnTopoOrder: stored.generatedColumnTopoOrder ? [...stored.generatedColumnTopoOrder] : undefined,
 			tags: copyTags(stored.tags),
-		};
-	}
-
-	/**
-	 * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The
-	 * logical type is re-inferred from the declared spelling by the same rule CREATE TABLE
-	 * uses (`inferType`), falling back to the stored canonical name for a column declared
-	 * without a type. Also used by the vtab's own load arm (a `connect` whose caller
-	 * supplied no columns), so the two never rebuild a column differently.
-	 */
-	storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
-		return {
-			name: col.name,
-			logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
-			declaredType: col.declaredType,
-			notNull: col.notNull,
-			primaryKey: col.primaryKey,
-			pkOrder: col.pkOrder,
-			defaultValue: (col.defaultValue as Expression | undefined) ?? null,
-			collation: col.collation,
-			collationExplicit: col.collationExplicit,
-			generated: col.generated,
-			generatedExpr: col.generatedExpr as Expression | undefined,
-			generatedStored: col.generatedStored,
-			pkDirection: col.pkDirection,
-			defaultConflict: col.defaultConflict,
-			tags: copyTags(col.tags),
 		};
 	}
 

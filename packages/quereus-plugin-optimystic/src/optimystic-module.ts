@@ -20,7 +20,7 @@ import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, 
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
-import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
+import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
@@ -29,6 +29,7 @@ import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } fro
 import { withTagsOf } from './schema/tag-overlay.js';
 import { PhysicalType } from '@quereus/quereus';
 import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { IndexPredicate } from './schema/index-predicate.js';
 import { splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
@@ -304,6 +305,15 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
     `it would silently return incomplete results. Re-declare the index on this connection ` +
     `(CREATE INDEX) to re-attach it — DROP INDEX it first if this connection still lists it.`
   );
+}
+
+/**
+ * Whether a declared index holds an entry for every row: true unless it is a partial index
+ * (`create index … where …`), which holds only the rows its predicate admits. Only an index that
+ * holds every row can enforce a full UNIQUE constraint over its columns.
+ */
+function holdsEveryRow(index: StoredIndexSchema): boolean {
+  return index.predicate === undefined;
 }
 
 /**
@@ -1011,7 +1021,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
-          ...this.schemaManager.storedToColumnSchema(col),
+          ...storedToColumnSchema(col),
           affinity: col.affinity as any,
           index,
         }));
@@ -2553,9 +2563,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   - it is partial (`predicate !== undefined`, from `CREATE UNIQUE INDEX … WHERE …`) —
    *     never point-enforced here, matching the probe's own filter;
    *   - its columns match the PRIMARY KEY as a set — already structural (the tree key);
-   *   - its columns match a declared index as a set — reuse that tree (covers a
-   *     `derivedFromIndex` UNIQUE index and any plain index over the same columns), so we
-   *     never build a second tree for the same key.
+   *   - its columns match a declared index with no predicate as a set — reuse that tree (covers
+   *     a `derivedFromIndex` UNIQUE index and any plain index over the same columns), so we
+   *     never build a second tree for the same key. A partial declared index does not count: it
+   *     holds only the rows its predicate admits, so a duplicate among the others would pass.
    * Everything else gets a descriptor with a reserved `_uniq_`-prefixed name (the prefix
    * is reserved for enforcement trees and must not collide with a user index) and the
    * constraint's columns in declared order. Two constraints over the same column set
@@ -2575,7 +2586,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     const pkKey = columnSetKey(storedSchema.primaryKeyDefinition.map(pk => pk.index));
     const declaredKeys = new Set(
-      storedSchema.indexes.map(idx => columnSetKey(idx.columns.map(c => c.index))),
+      storedSchema.indexes
+        .filter(holdsEveryRow)
+        .map(idx => columnSetKey(idx.columns.map(c => c.index))),
     );
 
     const synthesized: StoredIndexSchema[] = [];
@@ -2611,8 +2624,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Resolve the index tree that enforces `uc`, or undefined if none can be resolved. A
    * DECLARED index (in `schema.indexes`) is preferred over a synthesized `_uniq_` tree
    * covering the same columns, so a real `CREATE UNIQUE INDEX` wins if one lands on the
-   * same column set as an already-synthesized plain UNIQUE. `synthesized` flags whether
-   * the resolved tree may need one-time backfill (see {@link ensureUniquePopulated}).
+   * same column set as an already-synthesized plain UNIQUE. A partial declared index never
+   * enforces: it holds only the rows its predicate admits ({@link holdsEveryRow}).
+   * `synthesized` flags whether the resolved tree may need one-time backfill (see
+   * {@link ensureUniquePopulated}).
    *
    * NOTE: when both a declared index and a synthesized tree cover the same columns, both
    * are still maintained on every DML (double writes to redundant trees). This can only
@@ -2626,7 +2641,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.indexManager) return undefined;
     const setKey = columnSetKey(uc.columns);
 
-    for (const idx of this.indexManager.getDeclaredIndexes()) {
+    for (const idx of this.indexManager.getDeclaredIndexes().filter(holdsEveryRow)) {
       if (columnSetKey(idx.columns.map(c => c.index)) === setKey) {
         const tree = this.indexManager.getIndexTree(idx.name);
         if (tree) return { descriptor: idx, tree, synthesized: false };
@@ -3530,6 +3545,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       throw new Error('Schema not found');
     }
 
+    // A partial index whose predicate maintenance cannot evaluate is refused before anything is
+    // written or mirrored: the statement fails with compilePredicate's own error, and no record
+    // lists the index and no tree is attached for it.
+    if (indexSchema.predicate !== undefined) {
+      IndexPredicate.compile(indexSchema.predicate, storedSchema.columns, storedSchema.name);
+    }
+
     const txnState = this.txnBridge.getCurrentTransaction();
     const existing = storedSchema.indexes.find(idx => idx.name === indexSchema.name);
 
@@ -3862,7 +3884,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Stage an entry for EVERY committed row into each named index tree, then flush
+   * Stage an entry for every committed row each named index admits into its tree, then flush
    * only those trees. The single populate path: `addIndex` uses it to build a
    * brand-new index, and the already-persisted branch uses it to close the gap for
    * rows committed while this connection was detached from an index it has now
@@ -3872,9 +3894,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * that received entries is handed to the batch, which lands it at `endSchemaBatch` BEFORE
    * the catalog commit that lists its index — one commit for the whole apply rather than one
    * per index, and never a listed index whose entries are missing. A tree this instance
-   * INVENTED that received nothing (the table has no rows) is neither flushed nor deferred:
-   * it is left exactly as CREATE TABLE leaves an unwritten main tree (see the
-   * create-on-missing NOTE in doInitialize). A later open of the never-committed collection
+   * INVENTED that received nothing (the table has no rows, or none its predicate admits) is
+   * neither flushed nor deferred: it is left exactly as CREATE TABLE leaves an unwritten main
+   * tree (see the create-on-missing NOTE in doInitialize). A later open of the never-committed collection
    * invents the same empty tree, and the first real write rides the next DML commit because
    * {@link reconcileMaintainedIndexes} has already registered it with the transaction bridge.
    *
@@ -3903,9 +3925,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    * the same mid-DML) and is narrowed by it: only NEWLY ATTACHED trees are synced, and
    * the caller cannot have staged into those — they were attached microseconds ago.
    *
-   * NOTE: `predicate` (partial indexes) is not honoured here, matching
-   * insertIndexEntries on the live DML path. Backfill and live maintenance therefore
-   * agree; both over-populate a partial index. Fix them together or not at all.
+   * A partial index is given an entry only for the rows its predicate admits
+   * (`IndexManager.admits`, the rule the live DML paths stage by).
    *
    * NOTE: backfill only ADDS entries, never purges. An entry a detached writer left
    * behind (its UPDATE moved the row off that indexed value, or its DELETE removed the
@@ -3947,16 +3968,18 @@ export class OptimysticVirtualTable extends VirtualTable {
     // question is only ever "is there anything to copy at all". Outside a batch the
     // flush below still runs when the scan is skipped — a freshly INVENTED tree holds
     // uncommitted header/root blocks even though no row staged anything into it.
-    // `stagedAny` is per call for the same reason: every target receives every row.
-    let stagedAny = false;
+    // What each target received is per target: a partial index admits only some rows,
+    // so one target can receive nothing while another receives rows.
+    const staged = new Set<string>();
     if (!await this.hasNoRowsToBackfill()) {
       await collection.update();
       for await (const { row, primaryKey } of walkDecodedRows(collection, rowCodec)) {
-        for (const { descriptor, tree } of targets) {
+        for (const { name, descriptor, tree } of targets) {
+          if (!manager.admits(descriptor, row)) continue;
           const treeKey = indexEntryKey(manager.createIndexKey(descriptor, row), primaryKey);
           await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+          staged.add(name);
         }
-        stagedAny = true;
       }
     }
 
@@ -3965,7 +3988,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // Invented and given nothing: leave it unwritten, like an unwritten main tree (see
         // this method's doc). `committedRevision() === undefined` is the invented STATE,
         // which that accessor documents as safe to branch on for a freshly opened instance.
-        if (!stagedAny && tree.committedRevision() === undefined) continue;
+        if (!staged.has(name) && tree.committedRevision() === undefined) continue;
         if (!tree.hasUnsyncedChanges()) continue;
         deferFlush(name, tree);
       }
@@ -4077,6 +4100,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         rows,
         entries,
         indexKeyOf: row => manager.createIndexKey(index, row),
+        admits: row => manager.admits(index, row),
       }));
     }
     return reports;
@@ -5785,6 +5809,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // regardless of how close the two costs come.
     if (!fullPkEquality && tableInfo.indexes && tableInfo.indexes.length > 0) {
       for (const index of tableInfo.indexes) {
+        // A partial index holds only the rows its predicate admits, so a seek through it drops
+        // matching rows outside the predicate. Never planned through, as Quereus's memory module
+        // (`gatherAvailableIndexes` in `@quereus/quereus/src/vtab/memory/module.ts`) does; backlog
+        // `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
+        if (index.predicate !== undefined) continue;
         // Try to match constraints to this index
         const indexColumns = index.columns.map(col => col.index);
         const matchedFilterIndices: number[] = [];
@@ -5815,7 +5844,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         if (matchedFilterIndices.length > 0) {
           const seekColumns = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
           // A prefix of a unique index is not unique.
-          const uniqueSeek = matchedFilterIndices.length === indexColumns.length && this.enforcesUniqueness(index);
+          const uniqueSeek = matchedFilterIndices.length === indexColumns.length && (index.unique ?? false);
           const matchedRows = uniqueSeek ? 1 : tableRowCount * this.equalityTupleSelectivity(tableInfo, seekColumns);
           const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + matchedRows;
           const indexRows = Math.max(1, Math.floor(matchedRows));
@@ -5923,15 +5952,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       factors.push(1 / Math.max(colStats.distinctCount, 1));
     }
     return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
-  }
-
-  /**
-   * True when an equality on every column of `index` matches at most one row. A partial
-   * unique index (`create unique index … where …`) does not qualify: this module enforces no
-   * partial UNIQUE (see {@link OptimysticVirtualTable.resolveSecondaryUniqueDecision}).
-   */
-  private enforcesUniqueness(index: IndexSchema): boolean {
-    return (index.unique ?? false) && index.predicate === undefined;
   }
 
   /**

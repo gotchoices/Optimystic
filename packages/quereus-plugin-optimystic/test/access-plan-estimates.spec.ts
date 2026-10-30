@@ -83,14 +83,14 @@ describe('Access-plan row estimates (getBestAccessPlan)', () => {
 		expect(result.isSet).to.equal(true);
 	});
 
-	it('does NOT report a partial unique index\'s seek as one row: this module does not enforce it', () => {
+	it('never plans through a partial index, unique or not: it holds only the rows its predicate admits', () => {
 		const partial: TableIndexSchema = {
 			name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }], unique: true,
 			predicate: { type: 'literal', value: 1 } as TableIndexSchema['predicate'],
 		};
 		const result = plan(makeTable([partial], {}), [eq(CATEGORY), eq(NAME)]);
-		expect(result.indexName).to.equal('idx_cat_name');
-		expect(result.rows).to.be.greaterThan(1);
+		expect(result.indexName).to.equal(undefined);
+		expect(result.handledFilters).to.deep.equal([false, false]);
 		expect(result.isSet).to.equal(false);
 	});
 
