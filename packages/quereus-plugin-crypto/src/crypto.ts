@@ -99,7 +99,9 @@ function fromBytes(bytes: Uint8Array, encoding: Encoding = 'base64url'): string 
  * `digest`, `cid` and `set_commit` are `replicable`, and their outputs are signed
  * and persisted. {@link setCryptoBackend} checks each supplied member against
  * @noble before installing it. A member handed a malformed key or signature must
- * throw or return false, as @noble does; that is not checked.
+ * throw or return false, as @noble does; that is not checked. Each returned array
+ * must be freshly allocated: under the `bytes` encoding it reaches the caller
+ * uncopied, so a native library's reused output buffer would rewrite earlier results.
  */
 export interface CryptoBackend {
 	sha256?(data: Uint8Array): Uint8Array;

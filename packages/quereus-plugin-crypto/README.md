@@ -384,7 +384,9 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every membe
   adapter built wrong (wrong key shape, wrong bytes); it cannot prove a native library correct.
 - **Errors.** A backend that throws inside `verify` makes it return `false`, exactly as a throw from
   `@noble` does; in `sign`, `digest` and `cid` the throw propagates. A backend handed a malformed key
-  or signature must throw or return `false`, as `@noble` does.
+  or signature must throw or return `false`, as `@noble` does. Every array a member returns must be
+  newly allocated: a raw-bytes result reaches the caller uncopied, so a library that reuses one output
+  buffer would rewrite results already returned.
 - **Ed25519 strictness differs on crafted input.** `@noble` verifies under the ZIP-215 rule, which
   accepts some non-canonical point encodings and small-order components that an RFC 8032-strict
   library such as OpenSSL rejects. Honest signatures verify identically either way. A deliberately
