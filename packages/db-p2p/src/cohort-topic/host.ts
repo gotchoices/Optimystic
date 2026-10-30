@@ -1659,7 +1659,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		verifyChildLinkSig,
 	};
 
-	// --- the `/register` protocol body, shared by the inbound handler and the router's local root step ---
+	// --- the `/register` protocol body, shared by the inbound handler and the router's in-process self-dials ---
 	// A direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this parent), or
 	// a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic). The three shapes are
 	// disjoint, so try each in turn.
