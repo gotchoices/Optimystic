@@ -72,6 +72,20 @@ describe('partial index maintenance', () => {
 		expect((await flaggedReport()).entryCount, 'rows 1 and 3').to.equal(2);
 	});
 
+	it('keeps evaluating the predicate after a dropped column ahead of the one it reads', async () => {
+		// Flag moves from position 3 to 2. A predicate still reading position 3 would see NULL for
+		// every later row, exclude it, and leave its entry missing.
+		await db.exec(`create table T (Id integer primary key, X integer null, C text null, Flag integer null) using optimystic('tree://partial/T')`);
+		await createFlaggedIndex();
+		await db.exec(`insert into T (Id, X, C, Flag) values (1, 0, 'a', 1), (2, 0, 'b', 0)`);
+		await db.exec(`alter table T drop column X`);
+
+		await db.exec(`insert into T (Id, C, Flag) values (3, 'c', 1), (4, 'd', 0)`);
+		await db.exec(`update T set Flag = 0 where Id = 1`);
+		await db.exec(`update T set Flag = 1 where Id = 2`);
+		expect((await flaggedReport()).entryCount, 'rows 2 and 3').to.equal(2);
+	});
+
 	it('answers an equality on the indexed column with rows outside the predicate too', async () => {
 		await createTable();
 		await createFlaggedIndex();

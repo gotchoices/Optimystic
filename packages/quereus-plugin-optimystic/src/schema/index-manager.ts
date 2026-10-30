@@ -773,6 +773,11 @@ export class IndexManager {
  * an index left unmaintained, or maintained for every row, would be the worse outcome.
  * `OptimysticVirtualTable.addIndex` compiles a new index's predicate before its record is
  * written, so a predicate that reaches a record has compiled once already.
+ *
+ * NOTE: a record written by a build without that check (or a Quereus whose `compilePredicate`
+ * narrows) can still list one that does not compile, and then every initialization of the table
+ * throws — including the one `dropIndex` runs before it can remove the index. If that is ever met
+ * outside a development database, let `dropIndex` remove a partial index without compiling it.
  */
 function compileIndexPredicates(schema: StoredTableSchema): Map<string, IndexPredicate> {
 	const predicates = new Map<string, IndexPredicate>();
