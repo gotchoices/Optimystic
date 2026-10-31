@@ -1016,12 +1016,15 @@ function committedAt(blockState: BlockState, pin: number | undefined): { block: 
 	return block ? { block, rev: blockState.latestRev } : undefined;
 }
 
-/** Returns the materialized block at the highest revision ≤ the given revision, together with
- *  that revision — the caller reports it as {@link GetBlockResult.materialized}. */
+/** Returns the block as it stood at the highest revision ≤ the given revision that committed it,
+ *  together with that revision — the caller reports it as {@link GetBlockResult.materialized} — or
+ *  `undefined` when that revision deleted it, as storage answers a tombstone: a committed revision
+ *  with no materialized block is a delete, never a reason to serve the content before it. */
 function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: IBlock, rev: number } | undefined {
 	for (let rev = maxRev; rev >= 0; rev--) {
 		const block = blockState.materializedBlocks.get(rev);
 		if (block) return { block, rev };
+		if (blockState.revisionActions.has(rev)) return undefined;
 	}
 	return undefined;
 }
