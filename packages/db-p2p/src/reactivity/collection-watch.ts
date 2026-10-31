@@ -22,16 +22,31 @@
  * move with nobody told (a subscriber registered at the old root is not sent the new root's notifications),
  * and a commit may never be announced at all. So the service also runs a tick, at the renewal cadence, that
  * reads every watched collection's committed tail and compares each with what it last saw (see
- * {@link ReactivityCollectionWatch.tick}). Every failure above then costs at most one tick of delay.
+ * {@link ReactivityCollectionWatch.tick}). Every failure above then costs at most one tick of delay, when the
+ * machine answering the read holds the commit.
  *
  * **One tick, one read per reader.** The tick is one timer for the whole service, not one per collection, and
  * reads the tails of every collection that reads through one {@link CollectionTailReader} in one call, so a
  * host that shares one reader across its watches (the Quereus plugin shares one per transactor) pays one read
  * per tick while idle, however many collections it watches.
  *
+ * **Most ticks read only what the answering machine holds.** A tick's read asks the answering repo not to
+ * consult its cohort behind the read (`skipWindowConsult`), so on a node that stores the collections an idle
+ * tick sends no read request at all. One read in every {@link ReactivityCollectionWatchOptions.verifyEveryTicks}
+ * ticks per subscription is an ordinary one, whose consult is what repairs a copy that missed a commit nobody
+ * announced; the reads the service makes on events (the first, the re-reads after an unservable gap and after a
+ * registration lands) are ordinary reads too.
+ *
+ * **This node's own storage is heard directly.** Given {@link ReactivityCollectionWatchOptions.localChanges}, a
+ * subscription wakes its listeners whenever a change to its collection lands in this node's storage — including a
+ * revision a notification already woke them for, since on a node that stores the collection the notification
+ * routinely arrives before the local apply, and a watcher that re-read its local copy on the notification saw the
+ * old data. The feed only wakes; following the tail stays with the tick and the notifications.
+ *
  * **What a watcher is promised.** Open the watch before the read it is meant to keep fresh: a commit that
  * read did not see wakes the watcher. The service cannot know what a caller has read, so the first committed
- * tail it reads for a collection wakes that collection's watchers once, whether or not anything changed.
+ * tail it reads for a collection wakes that collection's watchers once, whether or not anything changed, unless a
+ * notification or a local landing has already woken them for that revision since the watch opened.
  *
  * **Work on one subscription is serial.** The first attach, the applying of each tick's read, each escalation's
  * re-read and each scheduled follow run one at a time per subscription, so two follows never interleave. The
@@ -52,6 +67,9 @@ import {
 	subscriberTtlForProfile,
 	type BlockId,
 	type CohortTopicService,
+	type CollectionChangeEvent,
+	type CommittedTailReadOptions,
+	type IBlockChangeNotifier,
 	type ITransactor,
 	type NodeProfile,
 	type NotificationV1,
@@ -66,6 +84,12 @@ import type { Libp2pReactivityRecoverTransport, RecoverRequestSigners } from "./
 import { createLogger } from "../logger.js";
 
 const log = createLogger("reactivity-collection-watch");
+
+/** Default {@link ReactivityCollectionWatchOptions.verifyEveryTicks}: one consulting tail read in ten ticks. */
+export const DEFAULT_VERIFY_EVERY_TICKS = 10;
+
+/** The options of a tick's read that is not due for verification. */
+const HELD_ONLY: CommittedTailReadOptions = { skipWindowConsult: true };
 
 /** What a watcher knows about a collection's committed log: the tail block and the latest revision. */
 export interface CollectionTail {
@@ -92,9 +116,13 @@ export type CollectionTailAnswer =
  * Answer every query, by its `collectionId`; a collection left out reads as "no news" for that read. A read
  * of one collection's tail failing should be that collection's `error`, not a rejection: a rejection is no
  * news for every collection the call named.
+ *
+ * `options.skipWindowConsult` asks the answering repos to answer from what they hold without starting the
+ * background cohort consult (`BlockGets.skipWindowConsult`); the service sets it on most ticks. A reader that
+ * ignores it stays correct, and keeps paying the consult.
  */
 export interface CollectionTailReader {
-	readTails(queries: ReadonlyArray<CollectionTailQuery>): Promise<ReadonlyMap<string, CollectionTailAnswer>>;
+	readTails(queries: ReadonlyArray<CollectionTailQuery>, options?: CommittedTailReadOptions): Promise<ReadonlyMap<string, CollectionTailAnswer>>;
 }
 
 /**
@@ -104,9 +132,9 @@ export interface CollectionTailReader {
  */
 export function committedTailReader(transactor: ITransactor): CollectionTailReader {
 	return {
-		readTails: async (queries) => {
+		readTails: async (queries, options) => {
 			const answers = await Collection.readCommittedTails(transactor,
-				queries.map(({ collectionId, knownTailId }) => ({ id: collectionId, knownTailId })));
+				queries.map(({ collectionId, knownTailId }) => ({ id: collectionId, knownTailId })), options);
 			return new Map([...answers].map(([id, answer]): [string, CollectionTailAnswer] =>
 				[id, "error" in answer ? answer : { tail: answer.tail && { tailId: answer.tail.tailId, revision: answer.tail.rev } }]));
 		},
@@ -160,6 +188,18 @@ export interface ReactivityCollectionWatchOptions {
 	readonly setTimer?: (fn: () => void, delayMs: number) => RotationTimerCancel;
 	/** Clock (Unix ms) handed to each manager. Defaults to `Date.now`. */
 	readonly now?: () => number;
+	/**
+	 * A tick's read of a subscription's tail consults the answering repo's cohort only when the subscription has
+	 * gone this many ticks since such a read of it was last applied; every other tick reads what the answering repo
+	 * holds. A positive integer; `1` consults on every tick. Defaults to {@link DEFAULT_VERIFY_EVERY_TICKS}.
+	 */
+	readonly verifyEveryTicks?: number;
+	/**
+	 * This node's own storage change feed (the node passes its `StorageRepo`). Each subscription listens for its
+	 * collection while open and wakes its listeners on every change that lands here. Absent ⇒ the tick and the
+	 * notifications alone wake them.
+	 */
+	readonly localChanges?: Pick<IBlockChangeNotifier, "onCollectionChange">;
 }
 
 /** One watcher of a collection: its change callback and its way to read the committed tail. */
@@ -182,6 +222,10 @@ interface Subscription {
 	appliedReadStamp: number;
 	/** A tick's answer is queued here and has not been applied; later ticks skip it (its renewal too) until it has. */
 	tickQueued: boolean;
+	/** Ticks that have read this subscription since a consulting read of it was last applied. */
+	ticksSinceVerified: number;
+	/** Stops listening to this node's storage for the collection; set while open when the node has a feed. */
+	unsubscribeLocal?: () => void;
 	closed: boolean;
 	/** Tail of the serial work queue. */
 	work: Promise<void>;
@@ -195,6 +239,7 @@ export class ReactivityCollectionWatch {
 	private readonly setTimer: (fn: () => void, delayMs: number) => RotationTimerCancel;
 	private readonly now: () => number;
 	private readonly tickIntervalMs: number;
+	private readonly verifyEveryTicks: number;
 
 	private readonly subscriptions = new Map<string, Subscription>();
 	/**
@@ -214,6 +259,10 @@ export class ReactivityCollectionWatch {
 		this.setTimer = options.setTimer ?? setUnrefTimer;
 		this.now = options.now ?? ((): number => Date.now());
 		this.tickIntervalMs = pingIntervalMs(subscriberTtlForProfile(options.profile));
+		this.verifyEveryTicks = options.verifyEveryTicks ?? DEFAULT_VERIFY_EVERY_TICKS;
+		if (!Number.isInteger(this.verifyEveryTicks) || this.verifyEveryTicks < 1) {
+			throw new RangeError(`verifyEveryTicks must be a positive integer, got ${this.verifyEveryTicks}`);
+		}
 	}
 
 	/** Collections with a live subscription. Diagnostic / test seam. */
@@ -296,10 +345,13 @@ export class ReactivityCollectionWatch {
 			lastSeenRevision: 0,
 			appliedReadStamp: 0,
 			tickQueued: false,
+			// The first read (`checkTail`) consults, so the count starts there.
+			ticksSinceVerified: 0,
 			closed: false,
 			work: Promise.resolve(),
 			reAnchorQueued: false,
 		};
+		sub.unsubscribeLocal = this.options.localChanges?.onCollectionChange(collectionId, (event) => this.onLocalChange(sub, event));
 		this.subscriptions.set(collectionId, sub);
 		return sub;
 	}
@@ -324,6 +376,8 @@ export class ReactivityCollectionWatch {
 			}
 		}
 		sub.listeners.clear();
+		sub.unsubscribeLocal?.();
+		sub.unsubscribeLocal = undefined;
 		sub.unregisterHandler?.();
 		sub.unregisterHandler = undefined;
 		if (sub.manager?.registration !== undefined) {
@@ -360,14 +414,14 @@ export class ReactivityCollectionWatch {
 	 *
 	 * NOTE: a tick costs one {@link CollectionTailReader.readTails} per reader, naming every collection that reads
 	 * through it — one `transactor.get` while no tail moved — plus one renewal request per distinct primary the
-	 * registrations ping (none for those whose primary is this node). On a node that holds
-	 * the collections that read is local, and starts one background consult request per cohort peer per 32 blocks
-	 * (`MAX_CONSULT_BATCH_BLOCKS` in `protocol-limits.ts`) at two blocks per collection, so past 16 watched
-	 * collections the tick's consult takes a second request per peer. If hosts watch hundreds of collections, read
-	 * only the tail blocks on the tick (a log that rolls over moves the old tail's revision and `nextId`, so the
-	 * header is not needed to notice) to halve the blocks. The next tick also waits for every read of this one, so a
-	 * reader whose read never settles stops the tick for every collection; the transactor's read deadlines bound
-	 * that today.
+	 * registrations ping (none for those whose primary is this node). On a node that holds the collections that read
+	 * is local and, on all but one tick in {@link verifyEveryTicks}, sends nothing; the verifying tick's read starts
+	 * one background consult request per cohort peer per 32 blocks (`MAX_CONSULT_BATCH_BLOCKS` in
+	 * `protocol-limits.ts`) at two blocks per collection, so past 16 watched collections that consult takes a second
+	 * request per peer. If hosts watch hundreds of collections, read only the tail blocks on the tick (a log that
+	 * rolls over moves the old tail's revision and `nextId`, so the header is not needed to notice) to halve the
+	 * blocks. The next tick also waits for every read of this one, so a reader whose read never settles stops the
+	 * tick for every collection; the transactor's read deadlines bound that today.
 	 */
 	private armTick(): void {
 		if (this.stopped || this.cancelTick !== undefined || this.tickRunning || this.subscriptions.size === 0) {
@@ -402,6 +456,7 @@ export class ReactivityCollectionWatch {
 		const ticked = [...groups.values()].flat();
 		for (const sub of ticked) {
 			sub.tickQueued = true;
+			sub.ticksSinceVerified++;
 		}
 		this.renewAll(ticked);
 		await Promise.all([...groups].map(([reader, group]) => this.readGroup(reader, group)));
@@ -436,12 +491,17 @@ export class ReactivityCollectionWatch {
 		return groups;
 	}
 
-	/** The tick's one read of every tail in `group`, through the reader they share. A rejected read is no news for the whole group. */
+	/**
+	 * The tick's one read of every tail in `group`, through the reader they share. A rejected read is no news for the
+	 * whole group. The read consults the answering repos' cohorts when any subscription in the group is due for
+	 * verification, and otherwise reads only what they hold.
+	 */
 	private async readGroup(reader: CollectionTailReader, group: ReadonlyArray<Subscription>): Promise<void> {
+		const verified = group.some((sub) => sub.ticksSinceVerified >= this.verifyEveryTicks);
 		const stamp = this.nextReadStamp();
 		let answers: ReadonlyMap<string, CollectionTailAnswer> | undefined;
 		try {
-			answers = await reader.readTails(group.map((sub) => this.queryFor(sub)));
+			answers = await reader.readTails(group.map((sub) => this.queryFor(sub)), verified ? undefined : HELD_ONLY);
 		} catch (err) {
 			log("tick tail read failed for %d collection(s) (no news this tick): %o", group.length, err);
 		}
@@ -449,7 +509,7 @@ export class ReactivityCollectionWatch {
 			void this.enqueue(sub, async () => {
 				sub.tickQueued = false;
 				if (answers !== undefined) {
-					await this.followAnswer(sub, stamp, answers.get(sub.collectionId));
+					await this.followAnswer(sub, stamp, answers.get(sub.collectionId), verified);
 				}
 			});
 		}
@@ -468,8 +528,8 @@ export class ReactivityCollectionWatch {
 	}
 
 	/** Apply the answer a read stamped `stamp` found, as {@link acceptedTail} decides. */
-	private async followAnswer(sub: Subscription, stamp: number, answer: CollectionTailAnswer | undefined): Promise<void> {
-		const tail = this.acceptedTail(sub, stamp, answer);
+	private async followAnswer(sub: Subscription, stamp: number, answer: CollectionTailAnswer | undefined, verified: boolean): Promise<void> {
+		const tail = this.acceptedTail(sub, stamp, answer, verified);
 		if (tail !== undefined) {
 			await this.follow(sub, tail);
 		}
@@ -497,7 +557,10 @@ export class ReactivityCollectionWatch {
 		await this.moveTo(sub, reactivityTailBytes(tail.tailId), tail.revision);
 	}
 
-	/** `sub`'s tail, read on its own through its reader and accepted as {@link acceptedTail} decides. */
+	/**
+	 * `sub`'s tail, read on its own through its reader and accepted as {@link acceptedTail} decides. A consulting
+	 * read: each of these follows a reason to doubt what the node holds, and they are rare.
+	 */
 	private async readTail(sub: Subscription): Promise<CollectionTail | undefined> {
 		const reader = this.readerOf(sub);
 		if (reader === undefined) {
@@ -508,7 +571,7 @@ export class ReactivityCollectionWatch {
 			(answers) => answers.get(sub.collectionId),
 			(error: unknown): CollectionTailAnswer => ({ error }),
 		);
-		return sub.closed ? undefined : this.acceptedTail(sub, stamp, answer);
+		return sub.closed ? undefined : this.acceptedTail(sub, stamp, answer, true);
 	}
 
 	/**
@@ -516,9 +579,10 @@ export class ReactivityCollectionWatch {
 	 * never committed, the read failed or left the collection out (logged), or a read issued after this one was
 	 * applied first. The tick's read runs outside the subscription's queue, so a re-anchor or a rotation follow's
 	 * re-read can overtake it, and applying the older answer then would follow a tail the log has already left.
-	 * Every read, batched or single, is applied through here.
+	 * Every read, batched or single, is applied through here. An applied consulting (`verified`) read restarts the
+	 * subscription's count toward its next one; one that failed leaves it due on the next tick.
 	 */
-	private acceptedTail(sub: Subscription, stamp: number, answer: CollectionTailAnswer | undefined): CollectionTail | undefined {
+	private acceptedTail(sub: Subscription, stamp: number, answer: CollectionTailAnswer | undefined, verified: boolean): CollectionTail | undefined {
 		if (stamp < sub.appliedReadStamp) {
 			log("tail read for collection=%s dropped: a read issued after it was applied first", sub.collectionId);
 			return undefined;
@@ -529,6 +593,9 @@ export class ReactivityCollectionWatch {
 		}
 		sub.appliedReadStamp = stamp;
 		sub.lastTailId = answer.tail?.tailId ?? sub.lastTailId;
+		if (verified) {
+			sub.ticksSinceVerified = 0;
+		}
 		return answer.tail;
 	}
 
@@ -640,8 +707,22 @@ export class ReactivityCollectionWatch {
 		return manager;
 	}
 
+	/** A notification wakes the listeners only for a revision nothing has woken them for yet, a local landing included. */
 	private onDelivered(sub: Subscription, n: NotificationV1): void {
-		sub.lastSeenRevision = Math.max(sub.lastSeenRevision, n.revision);
+		this.wakeIfNewer(sub, n.revision);
+	}
+
+	/**
+	 * A change to the collection landed in this node's storage: wake the listeners whatever its revision. One already
+	 * woken for still wakes, because a notification or a tail read answered elsewhere can announce a revision before
+	 * this node's copy shows it; a lower one still wakes, because the change is still new to this node's copy (a held
+	 * event released after a later commit's, or non-tail blocks of a commit landing after a later tail).
+	 */
+	private onLocalChange(sub: Subscription, event: CollectionChangeEvent): void {
+		if (sub.closed) {
+			return;
+		}
+		sub.lastSeenRevision = Math.max(sub.lastSeenRevision, event.rev);
 		this.notify(sub);
 	}
 

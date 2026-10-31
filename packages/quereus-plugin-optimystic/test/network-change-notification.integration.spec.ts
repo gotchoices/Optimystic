@@ -9,9 +9,11 @@
  * in which announcements verify today (blocked
  * `reactivity-notifications-need-the-tail-cohort-to-be-the-topic-cohort`). Each node drives its own
  * plugin over the node it was handed through `registerLibp2pNode`. The watching node's
- * `blockChangeNotifier` is replaced with an inert one before registration, so a wake there cannot
- * have come from its storage listener; and every tail read the watch service makes on the watcher
- * is counted, so a wake its fallback check produced is told apart from one a notification produced.
+ * `blockChangeNotifier` is replaced with an inert one before registration, so the table's own storage
+ * listener wakes nothing there. The watch service still hears the watcher's storage directly (it
+ * stores the table, being in every cohort), so the frames its subscriber registry receives for the
+ * table's topic are counted to show the notification arrived; and every tail read the watch service
+ * makes on the watcher is counted, so a wake its fallback check produced is told apart.
  *
  * Gated on OPTIMYSTIC_INTEGRATION=1:
  *   yarn workspace @optimystic/quereus-plugin-optimystic test:integration
@@ -19,7 +21,7 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import { multiaddr } from '@multiformats/multiaddr';
-import { Collection, reactivityCollectionTopicId, routingKeyForBlock, type IBlockChangeNotifier, type ITransactor } from '@optimystic/db-core';
+import { Collection, reactivityCollectionTopicId, routingKeyForBlock, type IBlockChangeNotifier, type ITransactor, type NotificationV1 } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import {
 	createLibp2pNode,
@@ -140,11 +142,11 @@ describe('Network change notification for a tagged table over real libp2p', func
 	function countTailReads(transactor: ITransactor): { reads: { started: number; finished: number }; restore: () => void } {
 		const reads = { started: 0, finished: 0 };
 		const original = Collection.readCommittedTails;
-		Collection.readCommittedTails = async (through, queries) => {
+		Collection.readCommittedTails = async (through, queries, options) => {
 			const counted = through === transactor;
 			if (counted) reads.started++;
 			try {
-				return await original.call(Collection, through, queries);
+				return await original.call(Collection, through, queries, options);
 			} finally {
 				if (counted) reads.finished++;
 			}
@@ -185,31 +187,36 @@ describe('Network change notification for a tagged table over real libp2p', func
 		const wakes = { watched: 0, untagged: 0 };
 		const watchedSub = watcher.db.watch(watcher.db.prepare('select * from Watched').getChangeScope(), () => { wakes.watched++; });
 		const untaggedSub = watcher.db.watch(watcher.db.prepare('select * from Untagged').getChangeScope(), () => { wakes.untagged++; });
+		let delivered = 0;
+		const watcherRegistry = (watcherNode as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
+		const offCount = watcherRegistry.register(topicId, () => { delivered++; });
 		const { reads, restore } = countTailReads(watcherTransactor);
 		try {
-			// A wake proves the notification path only if no tail read on the watcher can account for it, so
-			// an attempt during which the service read the tail is repeated. So is one with no wake at all:
-			// the announcing node verifies its notification against the topic cohort's membership
-			// certificate, which a newly formed cohort publishes on its next gossip round.
+			// An attempt counts only if the watch woke and a notification frame arrived with no tail read on the
+			// watcher in between, so an attempt during which the service read the tail is repeated. So is one with
+			// no frame at all: the announcing node verifies its notification against the topic cohort's
+			// membership certificate, which a newly formed cohort publishes on its next gossip round.
 			let wokeByNotification = false;
 			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
 				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
 				const readsBeforeCommit = reads.started;
 				const wakesBeforeCommit = wakes.watched;
+				const deliveredBeforeCommit = delivered;
 				await writer.db.exec(`insert into Watched (id, v) values (${attempt + 2}, 'after the watch attached')`);
 				try {
-					await waitFor(() => wakes.watched > wakesBeforeCommit, { timeoutMs: WAKE_BOUND_MS, intervalMs: 50, description: 'the watch woke' });
+					await waitFor(() => wakes.watched > wakesBeforeCommit && delivered > deliveredBeforeCommit, { timeoutMs: WAKE_BOUND_MS, intervalMs: 50, description: 'the watch woke and the notification arrived' });
 				} catch {
 					continue;
 				}
 				wokeByNotification = reads.started === readsBeforeCommit;
 			}
-			expect(wokeByNotification, "a commit on another machine woke the tagged table's watch with no tail read between the commit and the wake").to.equal(true);
+			expect(wokeByNotification, "a commit on another machine woke the tagged table's watch and reached it over the notify socket, with no tail read in between").to.equal(true);
 
 			await writer.db.exec(`insert into Untagged (id, v) values (2, 'after the watch attached')`);
 			await new Promise(resolve => setTimeout(resolve, WAKE_BOUND_MS));
 			expect(wakes.untagged, 'an untagged table has only the (inert) local listener, so nothing wakes it').to.equal(0);
 		} finally {
+			offCount();
 			restore();
 			watchedSub.unsubscribe();
 			untaggedSub.unsubscribe();

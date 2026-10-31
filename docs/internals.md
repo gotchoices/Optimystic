@@ -1350,9 +1350,12 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   peer/actionId and let the vtab skip events it just authored.
 - **Double wake from storage and network (accepted).** On a node that both stores
   a table tagged for network change notification (below) and watches it, another
-  machine's commit wakes watchers twice: once from the storage listener, once from
-  the network notification. Both are whole-table invalidations, so the cost is one
-  extra re-query; neither path suppresses the other.
+  machine's commit wakes watchers twice: once from the table's own storage listener,
+  once from the watch service, which hears the same storage landing — and a third
+  time when the network notification reaches the node before the local apply (the
+  service wakes on a notification only for a revision nothing has woken it for). All
+  are whole-table invalidations, so the cost is one or two extra re-queries; the
+  vtab's listener and the service do not suppress each other.
 - **A failed offline transaction is announced the same way.** Its rows leave this
   machine's view with no commit to announce them, so the offline-mode controller
   makes the same call for each table its removal changed, through the same
@@ -1508,7 +1511,13 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     reader identity, and `committedTailReader` in the same file — `Collection.readCommittedTails` in
     `packages/db-core/src/collection/collection.ts` over one transactor — answers a group whose logs
     stayed on their tail blocks in one request. It opens no collection handle, so it cannot replay a
-    table's staged actions. A host builds one reader per transactor and passes it to every watch; the
+    table's staged actions. All but one tick in `verifyEveryTicks` (default 10) mark that read
+    `skipWindowConsult`, so on a node that stores the collections an idle tick is answered from its own
+    copy and sends no request beyond the renewal; the verifying tick's consult is what repairs a copy that
+    missed a commit nobody announced. The node also hands the service its `StorageRepo` as
+    `localChanges`, and a change landing in this node's storage wakes the collection's watchers whatever
+    its revision, since a notification routinely reaches a node that stores the collection before the
+    local apply does; a notification now wakes only for a revision nothing has woken the watchers for. A host builds one reader per transactor and passes it to every watch; the
     Quereus plugin does (`CollectionFactory`'s `tailReaders`). The cost and the recovery bound are in
     [reactivity.md § The node's watch service](reactivity.md#the-nodes-watch-service). The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin

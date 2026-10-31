@@ -2586,13 +2586,16 @@ export async function createLibp2pNodeBase(
 			// 7. Collection watch service — the host-facing surface of everything above: one call per collection an
 			// application wants to be woken for. It builds one subscription manager per collection, registers it in
 			// `reactivitySubscribers` under the collection's topic, renews it, and has it follow the tail on a
-			// rotation (driving the scheduler above).
+			// rotation (driving the scheduler above). It also hears this node's own storage: the per-collection
+			// feed holds a table's event until the action's other collections pending here have landed, so the
+			// wake it gives a watcher is one whose local re-read sees the whole commit.
 			const scheduler = reactivityRotation;
 			reactivityWatch = new ReactivityCollectionWatch({
 				service: host.service,
 				profile: reactivityProfile,
 				quorumRatio: reactivityQuorumRatio,
 				subscribers: reactivitySubscribers,
+				localChanges: storageRepo,
 				scheduleRotation: (notice): void => scheduler.schedule(notice),
 				recover,
 				recoverSigners,

@@ -1174,10 +1174,10 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 function countedTailReader(transactor: ITransactor, reads: { started: number; finished: number }): CollectionTailReader {
 	const committed = committedTailReader(transactor);
 	return {
-		readTails: async (queries) => {
+		readTails: async (queries, options) => {
 			reads.started++;
 			try {
-				return await committed.readTails(queries);
+				return await committed.readTails(queries, options);
 			} finally {
 				reads.finished++;
 			}
@@ -1263,6 +1263,13 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 		const watcherTransactor = transactorFor(watcher, WATCH_NETWORK);
 		const reads = { started: 0, finished: 0 };
 		let wakes = 0;
+		// Count the frames the watcher's subscriber registry receives for the collection's topic. The watcher stores
+		// the collection, so the watch service's own storage feed also wakes it, usually before the notification
+		// lands; a delivered frame is what shows the notify socket carried the commit.
+		const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(COLLECTION));
+		let delivered = 0;
+		const watcherRegistry = (watcher as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
+		const offCount = watcherRegistry.register(topicId, () => { delivered++; });
 		const handle = watcher.reactivityWatch!.watch({
 			collectionId: COLLECTION,
 			tails: countedTailReader(watcherTransactor, reads),
@@ -1275,7 +1282,6 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 			// (see captureCommitCert in cluster-repo.ts), so only the writer announces. It fans an announcement out
 			// to the registrations its own cohort engine holds, and the watcher's reaches it over cohort gossip
 			// unless the writer happens to be the topic's primary.
-			const topicId = reactivityCollectionTopicId(reactivityCollectionIdBytes(COLLECTION));
 			const writerHost = (writer as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
 			await waitFor(() => {
 				const engine = writerHost.registry.findServing(topicId, 0);
@@ -1283,26 +1289,28 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing node" });
 			expect(wakes, 'only the first tail read has woken the watch: nothing has changed since it opened').to.equal(1);
 
-			// A wake proves the notification path only if no tail read can account for it, so an attempt during
-			// which the service read the tail (its fallback check, or an early registration retry) proves nothing
-			// and is repeated. So is an attempt with no wake at all: the announcing node verifies its own
-			// notification against the topic cohort's membership certificate, which a newly formed cohort
-			// publishes on its next gossip round.
+			// An attempt counts only if the watch woke and a notification frame arrived with no tail read in between,
+			// so an attempt during which the service read the tail (its fallback check, or an early registration
+			// retry) proves nothing and is repeated. So is an attempt with no frame at all: the announcing node
+			// verifies its own notification against the topic cohort's membership certificate, which a newly formed
+			// cohort publishes on its next gossip round.
 			let wokeByNotification = false;
 			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
 				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
 				const readsBeforeCommit = reads.started;
 				const wakesBeforeCommit = wakes;
+				const deliveredBeforeCommit = delivered;
 				await tree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
 				try {
-					await waitFor(() => wakes > wakesBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke' });
+					await waitFor(() => wakes > wakesBeforeCommit && delivered > deliveredBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke and the notification arrived' });
 				} catch {
 					continue;
 				}
 				wokeByNotification = reads.started === readsBeforeCommit;
 			}
-			expect(wokeByNotification, 'a commit on another node woke the watch with no tail read between the commit and the wake').to.equal(true);
+			expect(wokeByNotification, 'a commit on another node woke the watch and reached it over the notify socket, with no tail read in between').to.equal(true);
 		} finally {
+			offCount();
 			await handle.close();
 		}
 	});
