@@ -577,8 +577,9 @@ export type BlockGets = {
 	 *  (`ITransactor.getLineage`); an ordinary read never sets it. */
 	lineageOf?: ActionRev;
 	/** The asker does not want this read to start the read-repair consult that the lazy window alone
-	 *  would run BEHIND the read: a held block whose window has expired is answered from the answering
-	 *  repo's own copy and no cohort consult is started for it. An effort hint, never a correctness one —
+	 *  would run BEHIND the read: a held block whose window has expired (or that the lazy mode's
+	 *  `readRepairSampleRate` picked for a re-check) is answered from the answering repo's own copy and
+	 *  no cohort consult is started for it. An effort hint, never a correctness one —
 	 *  the doubt an earlier consult recorded still stamps `unconfirmedAheadRev`, and the window's
 	 *  freshness stamp is untouched, so the next read without the flag consults as before.
 	 *
