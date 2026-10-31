@@ -8,6 +8,9 @@ import type { TreeBlock } from "./tree-block.js";
 import { AtomicProxy, type AtomicScope } from "../transform/atomic-proxy.js";
 import { jsonEncodedBytes } from "../network/transaction-size.js";
 import { branchItemBytes, divideItems, emptyBranchBytes, emptyLeafBytes, leafItemBytes, runOf } from "./node-division.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('btree');
 
 export const NodeCapacity = 64;
 
@@ -98,15 +101,23 @@ export class BTree<TKey, TEntry> {
 		return await this.getPath(await this.trunk.get(), key, navigate);
 	}
 
-	/** Retrieves the entry for the given key.
-	 * Use find instead for a path to the key, the nearest match, or as a basis for navigation.
+	/** Retrieves the entry for the given key, as the tree stood at some moment during the call.
+	 * Never throws for a change that lands while it reads: a descent that a change tore is read
+	 * again ({@link readUnchanged}). Use find instead for a path to the key, the nearest match, or as
+	 * a basis for navigation.
+	 *
+	 * NOTE: "some moment" holds only for changes that move {@link _version}: this tree's own writes
+	 * and {@link invalidatePaths}, which `Tree` calls for every change its collection reports. A
+	 * BTree used on its own over a store that something else mutates gets only the first.
 	 * @returns the entry for the given key if found; undefined otherwise. */
 	async get(key: TKey): Promise<TEntry | undefined> {
 		// Value-of-key point lookup: the result depends ONLY on the terminal leaf's content, so the
 		// interior descent nodes are pure navigation and are dropped from the OCC conflict set. The
-		// returned Path is consumed by `at` and discarded — it never seeds a scan — so navigate=true
-		// is safe here (unlike the public `find`).
-		return this.at(await this.find(key, /* navigate */ true));
+		// returned Path is read here and discarded — it never seeds a scan — so navigate=true is safe
+		// here (unlike the public `find`). Not validated: the leaf it holds was read with nothing
+		// changing, and is that moment's entry however many hops ago the descent finished.
+		const path = await this.readUnchanged('get', () => this.find(key, /* navigate */ true));
+		return path.on ? this.getEntry(path) : undefined;
 	}
 
 	/** @returns the entry for the given path if on an entry; undefined otherwise. */
@@ -115,24 +126,25 @@ export class BTree<TKey, TEntry> {
 		return path.on ? this.getEntry(path) : undefined;
 	}
 
-	/** Iterates based on the given range
-	 * WARNING: mutation during iteration will result in an exception
+	/** Iterates based on the given range.
+	 * Finding where the scan starts and ends never throws for a change that lands meanwhile: it is
+	 * read again ({@link readUnchanged}), so a scan that has yielded nothing has not failed.
+	 * WARNING: mutation during iteration — once a path has been yielded — will result in an exception
 	*/
 	async *range(range: KeyRange<TKey>): AsyncIterableIterator<Path<TKey, TEntry>> {
-		const startPath = range.first
-			? await this.findFirst(range)
-			: (range.isAscending ? await this.first() : await this.last());
-		const endPath = range.last
-			? await this.findLast(range)
-			: (range.isAscending ? await this.last() : await this.first());
-		// If the tree is empty or endPath is not on an entry, return early
-		if (!endPath.on) {
+		let bounds: RangeBounds<TKey, TEntry> | undefined;
+		do {
+			bounds = await this.readUnchanged('range', () => this.rangeBounds(range));
+			// Read with nothing changing, but handed back a few microtask hops ago: checked again here,
+			// in the same synchronous step as the iteration's first validation of the start path below.
+		} while (bounds !== undefined && !this.isValid(bounds.start));
+		if (bounds === undefined) {
 			return;
 		}
-		const endKey = this.keyFromPath(endPath);
+		const { start, endKey } = bounds;
 		const iterable = range.isAscending
-			? this.internalAscending(startPath)
-			: this.internalDescending(startPath);
+			? this.internalAscending(start)
+			: this.internalDescending(start);
 		const iter = iterable[Symbol.asyncIterator]();
 		const ascendingFactor = range.isAscending ? 1 : -1;
 		for await (let path of iter) {
@@ -143,6 +155,65 @@ export class BTree<TKey, TEntry> {
 				break;
 			}
 			yield path;
+		}
+	}
+
+	/** Every entry in `range`, in the range's order, as the tree stood at some moment during the call.
+	 * A range read that hands back one value: like {@link get}, it never throws for a concurrent
+	 * change, but reads the whole range again ({@link readUnchanged}). For a range small enough to
+	 * hold in memory and to read again; a scan that must stream, or may be long, uses {@link range}. */
+	async entriesIn(range: KeyRange<TKey>): Promise<TEntry[]> {
+		return await this.readUnchanged('entriesIn', async () => {
+			const entries: TEntry[] = [];
+			for await (const path of this.range(range)) {
+				entries.push(this.getEntry(path));
+			}
+			return entries;
+		});
+	}
+
+	/** Where a scan of `range` starts and the key it ends at, or `undefined` when the tree is empty or
+	 * the range's end is not on an entry, so there is nothing to scan. */
+	private async rangeBounds(range: KeyRange<TKey>): Promise<RangeBounds<TKey, TEntry> | undefined> {
+		const start = range.first
+			? await this.findFirst(range)
+			: (range.isAscending ? await this.first() : await this.last());
+		const end = range.last
+			? await this.findLast(range)
+			: (range.isAscending ? await this.last() : await this.first());
+		return end.on ? { start, endKey: this.keyFromPath(end) } : undefined;
+	}
+
+	/** Run `read` — one descent or several — until it finishes with no change to the tree landing
+	 * while it ran ({@link _version} unmoved), and return what it read: every block it read is then
+	 * of one moment. Reads are not latched, so a change can land between any two of them — a replay
+	 * that rebuilds staged nodes under fresh ids, a refresh that adopts newer blocks — and a descent
+	 * across one can follow an id that no longer exists, or an old branch to a new leaf that no
+	 * longer holds the key.
+	 *
+	 * A throw while the version moved is retried too: it is that change's symptom (`Missing block`
+	 * for a removed id, an invalid path from a step that validates one), not a fault. With the
+	 * version unmoved it propagates unchanged. That is an exception used as control flow, on purpose,
+	 * and only behind a concurrent change detected independently of it.
+	 *
+	 * NOTE: unbounded. Each retry needs another change to land inside a descent of a few block reads,
+	 * and every source of change (a drain step, a refresh) is finite work. If a storm of
+	 * `btree:read-retried` lines is ever seen, bound the loop and report the contention instead. */
+	private async readUnchanged<T>(what: string, read: () => Promise<T>): Promise<T> {
+		for (;;) {
+			const version = this._version;
+			try {
+				const result = await read();
+				if (this._version === version) {
+					return result;
+				}
+				log('btree:read-retried what=%s reason=changed', what);
+			} catch (err) {
+				if (this._version === version) {
+					throw err;
+				}
+				log('btree:read-retried what=%s reason=%s', what, err instanceof Error ? err.message : String(err));
+			}
 		}
 	}
 
@@ -1032,6 +1103,9 @@ export class BTree<TKey, TEntry> {
 
 /** A node's bytes weighed against the tree's byte target, measured once per rebalance. */
 type NodeFill = { bytes: number; target: number };
+
+/** Where a range scan starts, and the key past which it stops. */
+type RangeBounds<TKey, TEntry> = { start: Path<TKey, TEntry>; endKey: TKey };
 
 /** What a node that divided hands its parent: the nodes now to its right, each under the lowest key
  *  beneath it, and which of the resulting nodes the path's entry is in — 0 for the node that divided,

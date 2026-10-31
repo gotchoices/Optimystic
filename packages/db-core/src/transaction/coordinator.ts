@@ -1458,6 +1458,12 @@ export class TransactionCoordinator {
 	 *
 	 * This clears pending transforms from all collections. Useful for
 	 * cleaning up after validation or when starting a new transaction.
+	 *
+	 * NOTE: resets each tracker directly, so the collection's `onViewChanged` is not called and a
+	 * reader part-way through a descent of one of these collections is not told to read again. Its
+	 * one caller is the Quereus validator, which no composition root wires today; if validation ever
+	 * runs beside live reads of the same collections, reset through a `Collection` method that
+	 * calls `viewChanged` instead.
 	 */
 	resetTransforms(): void {
 		for (const collection of this.collections.values()) {

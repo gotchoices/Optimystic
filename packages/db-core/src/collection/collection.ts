@@ -117,6 +117,16 @@ export type CollectionInitOptions<TAction> = {
 	 * deadlock. The queue schedules its reaction instead. A throw out of the callback is caught and
 	 * logged (`collection:refusal-callback-threw`), never allowed to abort the replay. */
 	onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void;
+	/** Called, synchronously, at every moment what this collection's reads see may have changed
+	 * beneath a reader already part-way through them: the tracker's transforms replaced (a replay,
+	 * a restore, a staged action landing) or the read cache changed (a refresh adopting the log, a
+	 * commit folded in). Called BEFORE the change, in the same synchronous step as it, so a reader
+	 * that compares a counter the callback bumps before and after its reads sees it move whenever
+	 * anything it read may be out of date (`Tree` bumps its read btree's version; see
+	 * docs/btree.md §Reads under a concurrent change). Runs under the collection latch on most paths
+	 * and inside await-free steps on all of them, so it must be synchronous and must not call into
+	 * this collection; a throw out of it is caught and logged (`collection:view-changed-callback-threw`). */
+	onViewChanged?: () => void;
 }
 
 /** Options for building a committed read view (see {@link Collection.createReadTracker}
@@ -299,6 +309,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
 		/** See {@link CollectionInitOptions.onSealedRefused}. */
 		private readonly onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void,
+		/** See {@link CollectionInitOptions.onViewChanged}. */
+		private readonly onViewChanged?: () => void,
 		/** Short random tag naming THIS instance (see {@link newInstanceTag}). Open paths generate
 		 * it BEFORE construction (so pre-construction diagnostics such as attachToLog can carry it);
 		 * the default covers direct construction in tests. */
@@ -349,7 +361,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return undefined;
 		}
 		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, init.onViewChanged, instanceTag);
 		collection.logTailId = ends.header.tailId;
 		return collection;
 	}
@@ -380,7 +392,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			inventedBaseline = copyTransforms(tracker.transforms);
 		}
 
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, init.onViewChanged, instanceTag);
 		collection.logTailId = ends?.header.tailId;
 		collection.inventedBaseline = inventedBaseline;
 		return collection;
@@ -743,7 +755,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** Run `actions` through their handlers over `tracker` as ONE atomic unit: a throw from any
 	 * handler leaves none of their writes staged. The live tracker's path ({@link internalTransact})
-	 * and a head commit's tracker ({@link buildHeadTracker}) share it.
+	 * and a head commit's tracker ({@link buildHeadTracker}) share it. Only the live tracker's
+	 * commit changes what this collection's reads see ({@link viewChanged}); a head commit's tracker
+	 * is private to the commit.
 	 *
 	 * @returns the sum of what the handlers accepted as already applied ({@link AlreadyAppliedTally});
 	 * a handler that answers nothing adds the zero tally. */
@@ -762,8 +776,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 
+		if (tracker === this.tracker) {
+			this.viewChanged();
+		}
 		atomic.commit();
 		return applied;
+	}
+
+	/** Tell {@link CollectionInitOptions.onViewChanged} that what this collection's reads see is
+	 * about to change. Every caller calls it in the same synchronous step as the change itself — no
+	 * `await` between them — which is what lets a reader trust "the counter did not move" as "nothing
+	 * I read changed". */
+	private viewChanged(): void {
+		try {
+			this.onViewChanged?.();
+		} catch (err) {
+			log('collection:view-changed-callback-threw id=%s tag=%s error=%s',
+				this.id, this.instanceTag, err instanceof Error ? err.message : String(err));
+		}
 	}
 
 	/** Load external changes and update our context to the latest log revision - resolve any conflicts with our pending actions. */
@@ -1331,7 +1361,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * and the adopting, a concurrent read either lands before both and is forgotten with the rest,
 	 * or lands after both and is judged at the adopted revision — against the floor
 	 * ({@link TransactorSource.tryGet} reads its context when the answer arrives, not when it was
-	 * asked for) and against the generation the clear moved (`CacheSource.stillWanted`).
+	 * asked for) and against the generation the clear moved (`CacheSource.stillWanted`). That keeps
+	 * each single read sound; a reader part-way through SEVERAL reads — a tree descent — can still hold
+	 * blocks of the revision being left while it reads the rest at the adopted one, so it is told
+	 * through {@link viewChanged}.
 	 *
 	 * The advance is monotonic (see {@link advanceContext}): an empty or unopenable log yields no
 	 * context at all, and a log read that lags what this handle already committed yields an older
@@ -1344,6 +1377,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		revertedBlockIds: BlockId[],
 		ends: LogEnds,
 	): void {
+		this.viewChanged();
 		for (const entry of latest?.entries ?? []) {
 			this.sourceCache.clear(entry.blockIds);
 			this.raiseFloors(entry, entryRevs.get(entry.actionId));
@@ -1731,6 +1765,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			await this.replayActions();
 			return;
 		}
+		this.viewChanged();
 		if (boundaryMoved && snapshot.pending.length === 0) {
 			this.tracker.reset();
 			this.segments.open = [];
@@ -2079,9 +2114,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * revision because {@link update} sees its rev is already current and refetches
 	 * nothing. Call BEFORE resetting the tracker (the transforms are read live).
 	 *
+	 * Tells {@link viewChanged} for the fold AND for the tracker reset that follows it, so the
+	 * caller must reset in the same synchronous step, with no `await` between the two — every
+	 * coordinator site does.
+	 *
 	 * @param revision - the committed revision these transforms land at (from
 	 * {@link recordCommitted}), so cached read-dependency revisions advance to it. */
 	applyCommittedToCache(transforms: Transforms, revision: number): void {
+		this.viewChanged();
 		this.sourceCache.transformCache(transforms, revision);
 	}
 
@@ -2382,6 +2422,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * still staged (see the note in {@link syncAttempts}). Takes the transforms out of the attempt's
 	 * tracker, which is finished with. */
 	private foldOwnCommit(staged: StagedAttempt, actionId: ActionId): void {
+		this.viewChanged();
 		this.sourceCache.transformCache(staged.tracker.reset(), staged.rev);
 		this.recordCommitted(actionId, staged.rev);
 	}
@@ -2737,6 +2778,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// The actions were staged into the OPEN segment (actAndSync refuses over sealed segments).
 		this.segments.open = this.segments.open.filter(staged => !actions.includes(staged));
 		if (this.source.actionContext?.rev === revBefore) {
+			this.viewChanged();
 			this.tracker.reset(stagedBefore);
 		} else {
 			await this.replayActions();
@@ -2775,10 +2817,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * sealed segment that staged records what its actions accepted as already applied
 	 * (`SealedSegment.applied`), the tally the head commit reports when the segment is committed.
 	 *
+	 * A replay changes the tree beneath unlatched readers twice over: the reset drops every block a
+	 * staged action inserted, and the re-staging inserts them again under fresh ids. Both are told
+	 * through {@link viewChanged} — the reset here, each re-staged unit in {@link stageInto} — so a
+	 * reader part-way through a descent knows to read again rather than follow an id that is gone.
+	 *
 	 * @param unreported - a segment whose refusal is recorded but NOT reported through
 	 * `onSealedRefused`: the one {@link restoreSealed} is inserting, whose caller reads the recorded
 	 * refusal off the segment itself. */
 	private async replayActions(unreported?: EntryId): Promise<void> {
+		this.viewChanged();
 		this.tracker.reset(this.replayBaseline());
 		for (const segment of this.segments.replayable()) {
 			try {

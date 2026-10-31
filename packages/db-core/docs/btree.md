@@ -62,6 +62,9 @@ for await (const path of tree.range(range)) {
   console.log(entry);
 }
 
+// Read a small range as one value: never throws for a concurrent change
+const entries = await tree.entriesIn(range);
+
 // Count entries in range
 const count = await tree.getCount({
   path: await tree.find(startKey),
@@ -256,7 +259,20 @@ Trees constructed directly via `new BTree()` do not get atomicity; this path is 
 
 ### Path Invalidation
 
-A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version.
+A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version. A `Tree` also moves the counter for every change made beneath its read btree rather than through it (next section).
+
+### Reads under a concurrent change
+
+Reads are not latched, so a `Tree`'s collection can refresh, replay and commit on the same instance while a reader is part-way through a descent; the offline queue's drain does all three. Each block a descent reads is sound on its own, but two of them can describe different moments: a branch read before a replay rebuilt the staged nodes under fresh ids names a child that is gone (`Missing block`), and a branch read before a refresh adopted a rival's split points at a leaf that no longer holds the key, so a present key reads as absent. The tree learns of every such change through `_version`: `Tree` wires its collection's `onViewChanged` (`CollectionInitOptions` in `packages/db-core/src/collection/collection.ts`) to `invalidatePaths`, and the collection calls it in the same synchronous step as each change — a staged action landing in the tracker, a replay or a restore resetting it, a refresh adopting the log, a commit folded into the read cache.
+
+What a read does about it depends on whether it has handed anything back yet:
+
+- **A point read (`get`) never throws for a concurrent change.** It notes the version, descends, and returns the leaf's entry when the version did not move; otherwise it descends again. A throw from a descent while the version moved — a torn descent's `Missing block` — is retried as the change's symptom; with the version unmoved it propagates unchanged. The answer is the entry as the tree stood at some moment during the call.
+- **A range scan's setup does the same.** Finding where `range` starts and ends is repeated until it completes with nothing changing, so a scan that has yielded nothing never fails for a concurrent change.
+- **A range read as one value does the same.** `entriesIn(range)` collects every entry of the range and reads the whole range again when a change lands meanwhile, so it too answers as of some moment and never throws for a concurrent change. It suits a range small enough to hold in memory and cheap to read again; the Quereus plugin's unique-constraint probe reads its hit range this way.
+- **A scan that has yielded keeps its contract**: every step after a yield validates its path, so a change landing between a yield and the next step throws `Path is invalid due to mutation of the tree`.
+
+The retry is unbounded, because each one needs another change to land inside a descent of a few block reads and every source of change is finite work; the `NOTE:` at `readUnchanged` in `packages/db-core/src/btree/btree.ts` says what to do if a retry storm is ever seen. The guarantee reaches as far as changes that move `_version`: a `BTree` used on its own, over a store that something else mutates, sees only its own writes. A pinned read view (`Tree.readView`) reads a private tracker that nothing changes, and needs none of this.
 
 ## Node size
 

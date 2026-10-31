@@ -628,25 +628,28 @@ export class IndexManager {
 	 * range scan over the framed-prefix `indexKey`: from `indexKey` (inclusive) to
 	 * `indexKey + KEY_PREFIX_END` (exclusive) to find all entries matching it.
 	 */
-	async* findByIndex(
+	async findByIndex(
 		indexName: string,
 		indexKey: IndexKey
-	): AsyncIterable<PrimaryKey> {
+	): Promise<PrimaryKey[]> {
 		const tree = this.indexTrees.get(indexName);
 		if (!tree) {
 			throw new Error(`Index tree not found: ${indexName}`);
 		}
 
-		// Update tree to get latest data, then scan the live tree.
+		// Update tree to get latest data, then read the live tree.
 		await tree.update();
-		yield* this.findByIndexIn(tree, indexKey);
+		return await this.findByIndexIn(tree, indexKey);
 	}
 
 	/**
-	 * Range-scan a supplied index read source for all primary keys whose entry matches
-	 * `indexKey` — a projection of {@link findEntriesIn}, for a caller that needs no more
-	 * than the primary key. One range definition serves both, so the two cannot drift apart.
-	 * The read source is assumed already current (this method never refreshes it).
+	 * Every primary key whose entry in a supplied index read source matches `indexKey`, from the
+	 * range {@link findEntriesIn} scans — one range definition ({@link indexValueRange}) serves
+	 * both, so the two cannot drift apart. Read as ONE value (`entriesIn`), not streamed: the
+	 * answer is the range as the tree stood at some moment, read again rather than failed when the
+	 * tree changes beneath it, where a streaming scan throws for a change once it has yielded. The
+	 * offline queue's drain changes a tree beneath this read (docs/internals.md §The offline
+	 * queue). The read source is assumed already current (this method never refreshes it).
 	 *
 	 * The query read path does NOT use this: it needs each entry's tree key to verify the
 	 * entry against its row, so it scans {@link findEntriesIn} directly. The one production
@@ -656,13 +659,12 @@ export class IndexManager {
 	 * `bug-stale-index-entry-causes-false-unique-refusal`. ({@link findByIndex} also wraps it,
 	 * and has no caller of its own.)
 	 */
-	async* findByIndexIn(
+	async findByIndexIn(
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
-	): AsyncIterable<PrimaryKey> {
-		for await (const entry of this.findEntriesIn(read, indexKey)) {
-			yield entry[1];
-		}
+	): Promise<PrimaryKey[]> {
+		const entries = await read.entriesIn(indexValueRange(indexKey));
+		return entries.map(entry => entry[1]);
 	}
 
 	/**

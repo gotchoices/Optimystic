@@ -173,13 +173,14 @@ export interface TreeReadView<TKey, TEntry> {
 	get(key: TKey): Promise<TEntry | undefined>;
 	at(path: Path<TKey, TEntry>): TEntry | undefined;
 	range(range: KeyRange<TKey>): AsyncIterableIterator<Path<TKey, TEntry>>;
+	entriesIn(range: KeyRange<TKey>): Promise<TEntry[]>;
 	ascending(path: Path<TKey, TEntry>): AsyncIterableIterator<Path<TKey, TEntry>>;
 	isValid(path: Path<TKey, TEntry>): boolean;
 }
 
 /** Carries the read {@link BTree} from wherever it gets built (the `createHeaderBlock`
- * callback on the create path, {@link Tree.attach} on the open path) to the `replace`
- * handler, which needs the live instance to invalidate outstanding paths. */
+ * callback on the create path, {@link Tree.attach} on the open path) to the collection's
+ * `onViewChanged` callback, which needs the live instance to invalidate outstanding paths. */
 interface BTreeHolder<TKey, TEntry> {
 	btree?: BTree<TKey, TEntry>;
 }
@@ -318,13 +319,16 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 							await actionTree.deleteAt(path);
 						}
 					}
-					// Mutations landed in `trx`, not the read btree, so its version counter never moved.
-					// Bump it to invalidate any Path a caller still holds — preserving the path-invalidation
-					// the previous in-place handler gave for free.
-					held.btree?.invalidatePaths();
 					return tally.result();
 				}
 			},
+			// Mutations land in `trx` and in the collection's cache, never through the read btree, so
+			// its version counter would never move on its own. The collection says when what its reads
+			// see changes — a staged action landing, a replay, a restore, a refresh, a commit folded in
+			// — and the bump invalidates every Path handed out before, and tells a point read or a
+			// range scan's setup part-way through a descent to read again (docs/btree.md §Reads under
+			// a concurrent change).
+			onViewChanged: () => held.btree?.invalidatePaths(),
 			createHeaderBlock: (hid: BlockId, store: BlockStore<IBlock>) => {	// Only called if the collection does not exist
 				// Tricky bootstrapping here:
 				// We need the root id to initialize the collection header, so we create the btree here.
@@ -344,7 +348,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 	/** Bind an opened collection to its read btree. On the create path `createHeaderBlock` already
 	 * built one (it needed the root id for the header); on the open path it never ran, so build it
 	 * over the collection's existing tracker. Either way the result is written back into `held` so
-	 * the `replace` handler's path-invalidation targets the very btree reads go through. */
+	 * the collection's path-invalidation (`onViewChanged`) targets the very btree reads go through. */
 	private static attach<TKey, TEntry>(
 		collection: Collection<TreeReplaceAction<TKey, TEntry>>,
 		held: BTreeHolder<TKey, TEntry>,
@@ -524,6 +528,10 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
 	range(range: KeyRange<TKey>): AsyncIterableIterator<Path<TKey, TEntry>> {
 		return this.btree.range(range);
+	}
+
+	async entriesIn(range: KeyRange<TKey>): Promise<TEntry[]> {
+		return await this.btree.entriesIn(range);
 	}
 
 	ascending(path: Path<TKey, TEntry>): AsyncIterableIterator<Path<TKey, TEntry>> {

@@ -189,15 +189,16 @@ type StoredRowEntry = [string, EncodedRow];
  * source holds no usable entry there. Shared by the two seek paths — the primary-key point
  * lookup and the secondary-index scan — so "fetch the row this key names" has one meaning
  * and one set of skip conditions on both. Never refreshes the source; the caller resolved it.
+ * A point read (`get`), which reads again rather than fail when the tree changes beneath it —
+ * a refresh or an offline drain step on the same collection — where a `find` whose path a change
+ * invalidated used to drop the row from the result without a word.
  */
 async function readRowAt(
   read: TreeReadView<string, RowData>,
   rowCodec: RowCodec,
   primaryKey: string,
 ): Promise<Row | undefined> {
-  const path = await read.find(primaryKey);
-  if (!read.isValid(path)) return undefined;
-  const entry = read.at(path) as StoredRowEntry | undefined;
+  const entry = await read.get(primaryKey) as StoredRowEntry | undefined;
   if (!entry || entry.length < 2) return undefined;
   return rowCodec.decodeRow(entry[1]);
 }
@@ -2806,8 +2807,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
     await this.refreshLive(tree);
     const probeKey = this.indexManager.createIndexKey(descriptor, values);
+    // The index range is read whole, as one value, before any row is: the offline drain changes
+    // both trees beneath this probe (docs/internals.md §The offline queue), and a scan held open
+    // across the row reads would throw for that change once it had yielded.
+    const hits = await this.indexManager.findByIndexIn(tree, probeKey);
     const collisions: UniqueCollision[] = [];
-    for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {
+    for (const pk of hits) {
       if (excludeKeys?.has(pk)) continue;
       const entry = await this.collection.get(pk) as StoredRowEntry | undefined;
       if (!entry || entry.length < 2) continue;
