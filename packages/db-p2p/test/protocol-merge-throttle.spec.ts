@@ -19,12 +19,14 @@ class CountingStore {
 describe('protocol merge throttle', () => {
 	let clock: number;
 	let store: CountingStore;
+	let self: PeerId;
 	let peer: PeerId;
 
 	beforeEach(async () => {
 		clock = 1_000_000;
 		store = new CountingStore();
-		throttleProtocolMerges(store, { now: () => clock });
+		self = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+		throttleProtocolMerges(store, self, { now: () => clock });
 		peer = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
 	});
 
@@ -48,6 +50,13 @@ describe('protocol merge throttle', () => {
 		await store.merge(peer, { protocols: ['/a/1.0.0'] });
 		await store.delete(peer);
 		await store.merge(peer, { protocols: ['/a/1.0.0'] });
+		expect(store.merged).to.have.length(2);
+	});
+
+	it('never holds back a merge into this node\'s own record, so a re-handled protocol is advertised again', async () => {
+		// libp2p's registrar merges each handled protocol into the self record in the per-stream shape.
+		await store.merge(self, { protocols: ['/a/1.0.0'] });
+		await store.merge(self, { protocols: ['/a/1.0.0'] });
 		expect(store.merged).to.have.length(2);
 	});
 });

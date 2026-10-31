@@ -1323,7 +1323,7 @@ export async function createLibp2pNodeBase(
 	// libp2p merges a stream's protocol into the remote peer's record on every stream, both ends, at a
 	// cost that showed up on phones (GitHub #40). Until libp2p/js-libp2p#3692 ships, cap that at once a
 	// minute per peer and protocol; the module says when to delete this.
-	throttleProtocolMerges(node.peerStore);
+	throttleProtocolMerges(node.peerStore, node.peerId);
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic

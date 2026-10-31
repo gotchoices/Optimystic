@@ -86,6 +86,11 @@ interface PeerMerges {
  * without touching the store, to the `Peer` the peer's most recent real merge returned; libp2p's
  * callers ignore the value. A merge that rejects records nothing, so the next stream retries.
  *
+ * Merges into this node's own record (`self`) always reach the store. libp2p's registrar adds a
+ * protocol there in the same one-protocol shape on every `handle()`, and `unhandle()` removes it with
+ * a `patch`, so holding back a re-`handle()` inside the interval would leave identify advertising the
+ * node without that protocol until the next `handle()` of it.
+ *
  * `peerStore.delete` is wrapped too, to forget the peer, so a deleted record is re-created by the
  * next stream. libp2p 3 dispatches no event for a deletion, and FRET deletes records. A record the
  * store evicts on read needs nothing: eviction needs `updated` over 6 h old, and the last real merge
@@ -95,7 +100,8 @@ interface PeerMerges {
  * `node.peerStore` is `components.peerStore` (`configureComponent` assigns and returns it). No timer,
  * so nothing to tear down.
  */
-export function throttleProtocolMerges(peerStore: ThrottledPeerStore, options: ProtocolMergeThrottleOptions = {}): void {
+export function throttleProtocolMerges(peerStore: ThrottledPeerStore, self: PeerId, options: ProtocolMergeThrottleOptions = {}): void {
+	const selfKey = self.toString();
 	const intervalMs = options.intervalMs ?? PROTOCOL_MERGE_INTERVAL_MS;
 	const now = options.now ?? Date.now;
 	const peers = new LruMap<string, PeerMerges>(options.maxPeers ?? PROTOCOL_MERGE_TRACKED_PEERS);
@@ -119,8 +125,8 @@ export function throttleProtocolMerges(peerStore: ThrottledPeerStore, options: P
 	};
 
 	peerStore.merge = async (id: PeerId, data: PeerData, abort?: AbortOptions): Promise<Peer> => {
-		if (!isProtocolOnlyMerge(data)) return await merge.call(peerStore, id, data, abort);
 		const key = id.toString();
+		if (key === selfKey || !isProtocolOnlyMerge(data)) return await merge.call(peerStore, id, data, abort);
 		const protocol = data.protocols[0];
 		const recent = recentMerge(key, protocol);
 		if (recent !== undefined) {
