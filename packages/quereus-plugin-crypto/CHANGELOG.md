@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — native crypto backend
+## 1.21.0 — native crypto backend
 
 - New `setCryptoBackend(backend)` and `CryptoBackend` exports. An application can route SHA-256,
   SHA-512 and Ed25519 sign/verify to a synchronous native implementation for the whole process;
