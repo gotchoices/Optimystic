@@ -50,10 +50,12 @@
  * stream, both ends — `peerStore.merge(remotePeer, { protocols: [protocol] })` in
  * `Connection.newStream` and in `onIncomingStream` — and each merge takes the peer's write lock. This
  * pool moves the requester's open, and that merge, off the request's critical path, but it does not
- * reduce the count: still one stream, so one merge, per request on each end. Fewer merges needs a
- * stream that carries more than one request (a change to all four request/response protocols) or libp2p skipping a merge whose protocol is already recorded
- * (upstream); the blocked decision `feat-a-stream-carries-more-than-one-request` weighs the two. An unchanged merge emits no `peer:update`, so it does not invalidate the key
- * network's cached records (`peer-record-cache.ts`).
+ * reduce the count: still one stream, so one merge, per request on each end. A stream carrying more
+ * than one request was considered and declined (GitHub #40); libp2p/js-libp2p#3692 fixes it upstream
+ * by merging each protocol once per connection, and until a libp2p release carries it
+ * `protocol-merge-throttle.ts` lets one such merge per peer and protocol reach the store per minute.
+ * An unchanged merge emits no `peer:update`, so it does not invalidate the key network's cached
+ * records (`peer-record-cache.ts`).
  *
  * Imports here are type-only or pure, like `open-protocol-stream.ts`: this module is reachable from
  * the react-native entry (`src/rn.ts`) through `libp2p-key-network.ts`.

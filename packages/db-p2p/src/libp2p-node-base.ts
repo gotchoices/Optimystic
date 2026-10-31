@@ -44,6 +44,7 @@ import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayLis
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
 import { combineIdentifyObservers, identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import { IdentifyProgress } from './network/identify-progress.js';
+import { throttleProtocolMerges } from './network/protocol-merge-throttle.js';
 import { KeyNetworkCohortReachability } from './network/cohort-reachability.js';
 import { holePunchingWanted } from './network/hole-punching.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
@@ -1319,6 +1320,10 @@ export async function createLibp2pNodeBase(
 	// while one is in flight may be about to widen, which the cohort reachability gate reads.
 	const identifyProgress = new IdentifyProgress();
 	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, combineIdentifyObservers(bootstrapContact, identifyProgress));
+	// libp2p merges a stream's protocol into the remote peer's record on every stream, both ends, at a
+	// cost that showed up on phones (GitHub #40). Until libp2p/js-libp2p#3692 ships, cap that at once a
+	// minute per peer and protocol; the module says when to delete this.
+	throttleProtocolMerges(node.peerStore);
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
