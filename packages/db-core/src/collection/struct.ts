@@ -172,6 +172,13 @@ export type CommittedTailQuery = {
 	readonly knownTailId?: BlockId;
 };
 
+/** How a batched committed-tail read (`Collection.readCommittedTails`) asks. */
+export type CommittedTailReadOptions = {
+	/** Ask every answering repo not to start the background read-repair consult its lazy window would
+	 * run behind the read (`BlockGets.skipWindowConsult`) — for a poll that only wants what is held. */
+	readonly skipWindowConsult?: boolean;
+};
+
 /** One collection's answer to a batched committed-tail read: its tail (`undefined` when it has
  * never committed), or why reading it failed — what the single-collection read would have thrown. */
 export type CommittedTailAnswer =

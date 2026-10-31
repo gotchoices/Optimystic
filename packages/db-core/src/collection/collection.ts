@@ -12,7 +12,7 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
-import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
+import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, CommittedTailReadOptions, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
 import { SegmentList } from "./segments.js";
 import type { EntryId, SealedSegment } from "./segments.js";
@@ -86,6 +86,8 @@ type LogEnds = {
  * reading the block failed. */
 type AttributedRead = { entry: GetBlockResult | undefined } | { error: unknown };
 type AttributedReads = Map<BlockId, AttributedRead>;
+/** The optional `BlockGets` fields a committed-tail read puts on every request it makes. */
+type TailReadFields = Pick<BlockGets, 'skipWindowConsult'>;
 
 /** The tracker a head commit's attempts are built from: the head segment's actions staged over the
  * committed state, and the revision the attempt built from it requests (see
@@ -431,11 +433,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * coordinator's answer leaves a block out — is not every collection's failure either:
 	 * {@link readAttributed} then reads each block alone and only the collections whose blocks failed
 	 * report an error. That fallback costs what reading each collection separately costs, and only
-	 * when a request fails. */
-	static async readCommittedTails(transactor: ITransactor, queries: ReadonlyArray<CommittedTailQuery>): Promise<Map<CollectionId, CommittedTailAnswer>> {
+	 * when a request fails.
+	 *
+	 * `options.skipWindowConsult` puts {@link BlockGets.skipWindowConsult} on every request this read
+	 * makes, the per-block fallback included. */
+	static async readCommittedTails(transactor: ITransactor, queries: ReadonlyArray<CommittedTailQuery>, options?: CommittedTailReadOptions): Promise<Map<CollectionId, CommittedTailAnswer>> {
+		const reads = Collection.tailReadFields(options);
 		const knownTails = new Map(queries.map(query => [query.id, query.knownTailId]));
 		const ends = await Collection.readAttributed(transactor,
-			[...knownTails].flatMap(([id, knownTailId]) => knownTailId === undefined ? [id] : [id, knownTailId]));
+			[...knownTails].flatMap(([id, knownTailId]) => knownTailId === undefined ? [id] : [id, knownTailId]), reads);
 		const answers = new Map<CollectionId, CommittedTailAnswer>();
 		/** Collections whose header names a tail other than the known one, with the tail it names. */
 		const moved = new Map<CollectionId, BlockId>();
@@ -452,7 +458,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 		if (moved.size > 0) {
-			const tails = await Collection.readAttributed(transactor, [...new Set(moved.values())]);
+			const tails = await Collection.readAttributed(transactor, [...new Set(moved.values())], reads);
 			for (const [id, tailId] of moved) {
 				try {
 					answers.set(id, { tail: Collection.judgedTail(tailId, tails) });
@@ -2979,28 +2985,33 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * NOTE: the fallback is unbounded — two gets per collection at once, only after a failed
 	 * request. Fine for the tens of tables a host watches; if callers ever name hundreds, read the
 	 * fallback in bounded batches. */
-	private static async readAttributed(transactor: ITransactor, blockIds: BlockId[]): Promise<AttributedReads> {
+	private static async readAttributed(transactor: ITransactor, blockIds: BlockId[], reads: TailReadFields): Promise<AttributedReads> {
 		if (blockIds.length === 0) {
 			return new Map();
 		}
 		try {
-			const results = await transactor.get({ blockIds });
+			const results = await transactor.get({ blockIds, ...reads });
 			return new Map(blockIds.map(id => [id, { entry: results?.[id] }]));
 		} catch (error) {
 			if (blockIds.length === 1) {
 				return new Map([[blockIds[0]!, { error }]]);
 			}
 			log('collection:tails-read-split blocks=%d error=%o', blockIds.length, error);
-			return new Map(await Promise.all(blockIds.map(async id => [id, await Collection.readAlone(transactor, id)] as const)));
+			return new Map(await Promise.all(blockIds.map(async id => [id, await Collection.readAlone(transactor, id, reads)] as const)));
 		}
 	}
 
-	private static async readAlone(transactor: ITransactor, id: BlockId): Promise<AttributedRead> {
+	private static async readAlone(transactor: ITransactor, id: BlockId, reads: TailReadFields): Promise<AttributedRead> {
 		try {
-			return { entry: (await transactor.get({ blockIds: [id] }))?.[id] };
+			return { entry: (await transactor.get({ blockIds: [id], ...reads }))?.[id] };
 		} catch (error) {
 			return { error };
 		}
+	}
+
+	/** The `BlockGets` fields every request of a {@link readCommittedTails} carries. */
+	private static tailReadFields(options: CommittedTailReadOptions | undefined): TailReadFields {
+		return options?.skipWindowConsult ? { skipWindowConsult: true } : {};
 	}
 
 	/** An unpinned read of the log tail block, checked as {@link checkedLogTail} describes, carrying

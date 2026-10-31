@@ -142,6 +142,47 @@ describe('CoordinatorRepo held-block background consult', () => {
 		expect(asked.filter(id => id === silentPeer.toString()), 'one consult per block, not one per read').to.have.length(1);
 	});
 
+	it('a read marked skipWindowConsult starts no consult for a held block, and leaves the window expired', async () => {
+		// Ticket a-read-can-skip-the-background-consult: the watch tick's read of what this node holds.
+		const localPeer = await makePeerId();
+		const peer = await makePeerId();
+		const storageRepo = makeStorageRepo(blockId, 1, false);
+		const asked: string[] = [];
+		const callback: ClusterLatestCallback = async (peerId) => {
+			if (peerId.equals(localPeer)) return selfFrom(storageRepo, blockId)();
+			asked.push(peerId.toString());
+			return { actionId: 'local-action', rev: 1 };
+		};
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, callback, { clusterSize: 2 });
+
+		const skipped = await repo.get({ blockIds: [blockId], skipWindowConsult: true });
+		await repo.settleHeldBlockConsults();
+		expect(skipped[blockId]?.state?.latest?.rev).to.equal(1);
+		expect(asked, 'no consult behind a skipWindowConsult read').to.have.length(0);
+
+		await repo.get({ blockIds: [blockId] });
+		await repo.settleHeldBlockConsults();
+		expect(asked, 'the next unmarked read consults: the window was left expired').to.have.length(1);
+	});
+
+	it('a read marked skipWindowConsult still consults for a block missing locally', async () => {
+		const localPeer = await makePeerId();
+		const peer = await makePeerId();
+		const storageRepo = makeStorageRepo('some-other-block', 1, false);
+		const asked: string[] = [];
+		const callback: ClusterLatestCallback = async (peerId) => {
+			if (peerId.equals(localPeer)) return undefined;
+			asked.push(peerId.toString());
+			return undefined;
+		};
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, callback, { clusterSize: 2 });
+
+		const result = await repo.get({ blockIds: [blockId], skipWindowConsult: true });
+		expect(asked, 'the absence verdict still asks the cohort').to.have.length(1);
+		expect(result[blockId]?.state?.latest).to.equal(undefined);
+		expect(result[blockId]?.unavailable, 'the whole cohort answered "holds nothing"').to.equal(undefined);
+	});
+
 	it('a repair the consult lands is served by the next read, and arms the window', async () => {
 		const localPeer = await makePeerId();
 		const peerA = await makePeerId();

@@ -576,6 +576,20 @@ export type BlockGets = {
 	 *  reads as `unknown`. Asked only by a writer deciding whether its own superseded write is saved
 	 *  (`ITransactor.getLineage`); an ordinary read never sets it. */
 	lineageOf?: ActionRev;
+	/** The asker does not want this read to start the read-repair consult that the lazy window alone
+	 *  would run BEHIND the read: a held block whose window has expired is answered from the answering
+	 *  repo's own copy and no cohort consult is started for it. An effort hint, never a correctness one —
+	 *  the doubt an earlier consult recorded still stamps `unconfirmedAheadRev`, and the window's
+	 *  freshness stamp is untouched, so the next read without the flag consults as before.
+	 *
+	 *  It never skips a consult whose answer the read depends on: a block missing locally (the absence
+	 *  verdict), a held block whose read carries a floor above it ({@link floors}), and every consult
+	 *  under `'paranoid'` read-repair still run and still block. Whole-read, so `NetworkTransactor.get`
+	 *  forwards it on every batch: a remote coordinator also skips its own background consult. A peer
+	 *  that predates the field ignores it and consults as before. Meant for the node's watch tick,
+	 *  through `Collection.readCommittedTails`, which reads every watched tail on a timer. Distinct from
+	 *  `skipClusterFetch`, the sync protocol's guard, which skips every consult and never flags. */
+	skipWindowConsult?: true;
 };
 
 /**

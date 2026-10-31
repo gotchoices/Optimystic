@@ -1019,7 +1019,14 @@ export class CoordinatorRepo implements IRepo {
 
 		// `shouldReadRepair` says true on every read under `'paranoid'`, so the mode is tested here
 		// rather than inferred from `windowDemands`.
-		const background = isStale && !floorDemands && this.readRepairMode === 'lazy' && !this.awaitWindowConsults;
+		const windowOnly = isStale && !floorDemands && this.readRepairMode === 'lazy';
+		if (windowOnly && blockGets.skipWindowConsult) {
+			// The asker opted out of exactly this consult (`BlockGets.skipWindowConsult`): served from the
+			// local copy with the memo's stamp, and the window left expired so the next read consults.
+			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			return;
+		}
+		const background = windowOnly && !this.awaitWindowConsults;
 		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
 		if (background) {
 			// The trigger line is logged only when a consult actually starts: a read that lands while the

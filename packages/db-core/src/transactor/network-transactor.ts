@@ -1837,6 +1837,7 @@ function downstreamGets(batchBlockIds: BlockId[], blockGets: BlockGets): BlockGe
 		blockIds: batchBlockIds,
 		context: blockGets.context,
 		...(isRecordEmpty(floors) ? {} : { floors }),
+		...(blockGets.skipWindowConsult ? { skipWindowConsult: true } : {}),
 	};
 }
 
