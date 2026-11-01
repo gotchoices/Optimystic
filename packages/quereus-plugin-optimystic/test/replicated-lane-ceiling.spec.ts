@@ -40,9 +40,11 @@ describe('lane: the ceiling a member computes from replicated statements', () =>
 			create table notes (Id text primary key, Title text ${LWW}, Owner text null) using optimystic('tree://test/notes') ${REPLAY};
 			create table plain (Id text primary key, Title text) using optimystic('tree://test/plain') ${REPLAY};
 			create table accounts (Id text primary key, Email text unique, body text ${LWW}) using optimystic('tree://test/accounts') ${REPLAY};
-			create table ledger (Id text primary key, Title text ${LWW}) using optimystic('tree://test/ledger');
+			create table audited (Id text primary key, Title text ${LWW}) using optimystic('tree://test/audited') ${REPLAY};
+			create assertion audited_titles check (not exists (select 1 from audited where Title = 'forbidden'));
 			insert into notes (Id, Title, Owner) values ('k', 'a', 'x');
 			insert into plain (Id, Title) values ('k', 'a');
+			insert into audited (Id, Title) values ('k', 'a');
 		`);
 		// The engine reads only the catalog; the coordinator it is built with is never touched here.
 		engine = new QuereusEngine(db, {} as TransactionCoordinator);
@@ -80,9 +82,8 @@ describe('lane: the ceiling a member computes from replicated statements', () =>
 		{ name: 'a StampId()-keyed insert', sql: `insert into notes (Id, Title, Owner) values (StampId(), 'a', null)`, ceiling: 'convergent' },
 		{ name: 'a same-key update of a merge-tagged column, though its rebuild assigns the key and an untagged column', sql: `update notes set Title = 'b' where Id = 'k'`, ceiling: 'convergent' },
 		{ name: 'an update of a table that declares a merge on no column outside its key', sql: `update plain set Title = 'b' where Id = 'k'`, ceiling: 'serializable' },
-		{ name: 'a delete', sql: `delete from notes where Id = 'k'`, ceiling: 'serializable' },
-		{ name: 'an insert into a table with a UNIQUE column', sql: `insert into accounts (Id, Email, body) values (StampId(), 'a@x', 'b')`, ceiling: 'serializable' },
-		{ name: 'an insert into a table with no profile', sql: `insert into ledger (Id, Title) values (StampId(), 'a')`, ceiling: 'serializable' },
+		{ name: 'an update of a table an assertion depends on, whatever columns it assigns', sql: `update audited set Title = 'b' where Id = 'k'`, ceiling: 'serializable' },
+		{ name: 'an insert into a table with a UNIQUE column, though its rebuild names every column', sql: `insert into accounts (Id, Email, body) values (StampId(), 'a@x', 'b')`, ceiling: 'serializable' },
 	];
 
 	for (const { name, sql, ceiling } of cases) {

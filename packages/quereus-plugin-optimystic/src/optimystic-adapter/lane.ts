@@ -150,13 +150,17 @@ export function laneCeilingOf(write: TableWrite, table: TableSchema): Lane {
  * - a DELETE is `serializable` either way;
  * - an UPDATE is rebuilt to assign EVERY column, the key included, keyed by the row's old key. Which
  *   columns the writer's statement assigned is gone: an untagged column, and the key column's
- *   `primary-key` constraint, appear whether or not the writer touched them. What survives is the
- *   table's profile, the selection, and the table's declarations: an UPDATE assigns at least one
- *   column, so on a table that declares a merge on no column outside its key, every UPDATE's ceiling
- *   is `serializable`.
+ *   `primary-key` constraint, appear whether or not the writer touched them, and so do the `unique`,
+ *   foreign-key and `check` constraints Quereus lists only for the columns a write assigns. What
+ *   survives is the table's profile, the selection, the table's declarations — an UPDATE assigns at
+ *   least one column, so on a table that declares a merge on no column outside its key, every
+ *   UPDATE's ceiling is `serializable` — and the `assertion` constraints, which Quereus lists for
+ *   every write to a table an assertion depends on, whatever it assigns (`assertionConstraints` in
+ *   `@quereus/quereus/src/planner/analysis/write-site-analysis.ts`).
  *
- * So a writer that claims `convergent` for an UPDATE of an untagged column, or for one that moves the
- * row's key, is not caught here; that is the same bound as provenance and reads, the replay stage's
+ * So a writer that claims `convergent` for an UPDATE of an untagged column, of a column a `unique`,
+ * foreign-key or cross-row `check` constraint covers, or for one that moves the row's key, is not
+ * caught here; that is the same bound as provenance and reads, the replay stage's
  * guards' business. NOTE: if the rebuilt UPDATE ever assigns only the columns the statement assigned,
  * the UPDATE arm can become {@link laneCeilingOf}.
  */
@@ -165,6 +169,7 @@ export function replicatedCeilingOf(write: TableWrite, table: TableSchema | unde
 	if (write.operation !== 'update') return laneCeilingOf(write, table);
 	if (profileOf(table) !== 'replay-permitted') return 'serializable';
 	if (!selectedByPrimaryKey(write.selection, table)) return 'serializable';
+	if (write.constraints.some(constraint => constraint.kind === 'assertion')) return 'serializable';
 	return declaresMergeOutsideKey(table) ? 'convergent' : 'serializable';
 }
 
