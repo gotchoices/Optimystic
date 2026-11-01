@@ -176,7 +176,7 @@ export function answerFromArchiveResponse(response: SyncResponse): SyncBlockAnsw
  * ordinary group-member read), leaving the second round for a reader that is behind or holds nothing.
  */
 export async function serveLineageAnswer(repo: IRepo, blockId: BlockId, target: ActionRev): Promise<BlockLineage> {
-	const result = await repo.get({ blockIds: [blockId], lineageOf: target }, { skipClusterFetch: true } as any);
+	const result = await repo.get({ blockIds: [blockId], lineageOf: target }, { skipClusterFetch: true });
 	return result[blockId]?.lineage ?? 'unknown';
 }
 
@@ -359,7 +359,7 @@ async function readServable(repo: ArchiveServingRepo, blockId: BlockId, rev?: nu
 	// uncommitted-but-known action, and omitting `actionId` is what keeps this off `StorageRepo`'s
 	// pending-overlay path, so the read is purely "the highest COMMITTED revision at or below `rev`".
 	const context: ActionContext | undefined = rev !== undefined ? { rev, committed: [] } : undefined;
-	const result = await repo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
+	const result = await repo.get({ blockIds: [blockId], context }, { skipClusterFetch: true });
 	const entry = result[blockId];
 	const latest = entry?.state?.latest;
 	if (!latest) return undefined;

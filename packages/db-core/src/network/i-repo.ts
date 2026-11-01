@@ -30,6 +30,12 @@ export type MessageOptions = {
 	 * call, where there is no asker to stand in for.
 	 */
 	asker?: string;
+	/**
+	 * Answer a read from this node's own storage alone: no cohort consult, and no consult-derived
+	 * flag. Set by every block-repair answer (an archive, a consult answer, a lineage answer), so a
+	 * peer reports what it holds itself, never what its cohort says. Never sent.
+	 */
+	skipClusterFetch?: boolean;
 }
 
 export type RepoCommitRequest = {

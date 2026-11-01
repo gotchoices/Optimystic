@@ -341,7 +341,7 @@ export interface Mesh {
  * mesh-tier test exercise a path real peers do not have.
  */
 const consultAnswerOf = async (target: MeshNode, blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined): Promise<SyncBlockAnswer> => {
-	const result = await target.storageRepo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
+	const result = await target.storageRepo.get({ blockIds: [blockId], context }, { skipClusterFetch: true });
 	if (!result[blockId]?.state?.latest) return {};
 	return await serveConsultAnswer(target.storageRepo, blockId, held);
 };

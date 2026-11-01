@@ -936,7 +936,7 @@ export class CoordinatorRepo implements IRepo {
 		// one whose failure the flag reports, and flagging would feed the recursion this
 		// bypass exists to prevent. (Storage-level 'unmaterializable' flags still pass
 		// through untouched; they report local state, not the consult.)
-		const skipClusterFetch = (options as any)?.skipClusterFetch;
+		const skipClusterFetch = options?.skipClusterFetch;
 		// NOTE: NetworkTransactor.get treats an authoritative "absent" ({ state: {} })
 		// as final and no longer retries it (ticket txn-perf-authoritative-notfound),
 		// relying on this cluster reconciliation to have already run — for THIS read: an
