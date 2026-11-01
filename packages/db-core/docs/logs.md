@@ -16,10 +16,13 @@ Logs extend chains specifically for transaction logging, adding:
 
 ```typescript
 type LogEntry<TAction> = {
-  timestamp: number;
+  timestamp: number;     // Wall time the writer read; informational
+  hlc: Hlc;              // The write's hybrid logical clock value; a stored entry from before
+                         // the field has none — read it through hlcOf (docs/crdt-sync.md §Migration Path)
   rev: number;           // Monotonically increasing revision
   action?: ActionEntry<TAction>;
   checkpoint?: CheckpointEntry;
+  invalidation?: InvalidationEntry;
 };
 
 type ActionEntry<TAction> = {
@@ -94,15 +97,18 @@ const { entry, tailPath } = await log.addActions(
   'transaction-id',             // Transaction ID
   123,                          // Revision number
   () => ['block1', 'block2'],   // Block IDs affected
-  ['collection1', 'collection2'], // Collections involved
-  Date.now()                    // Timestamp
+  {                             // AddActionsOptions: the write's EntryTimes plus the action-entry fields
+    hlc: clockOf(transactor).now(),  // the write's HLC, minted once per write (required)
+    timestamp: Date.now(),           // the write's wall time (defaults to now)
+    collectionIds: ['collection1', 'collection2'],
+  }
 );
 
 // Add checkpoint
 const { entry, tailPath } = await log.addCheckpoint(
   [{ actionId: 'tx1', rev: 120 }, { actionId: 'tx2', rev: 121 }],  // Pending transactions
   123,                          // Current revision
-  Date.now()                    // Timestamp
+  { hlc: clockOf(transactor).now() }  // EntryTimes; timestamp defaults to now
 );
 ```
 
