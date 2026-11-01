@@ -16,7 +16,7 @@
 
 import { expect } from 'chai';
 import { canonicalBlockHash } from '@optimystic/db-core';
-import type { ActionId, ActionRev, BlockHeader, BlockId, CommitRequest, IBlock } from '@optimystic/db-core';
+import type { ActionId, ActionRev, BlockHeader, BlockId, BlockLineage, CommitRequest, IBlock } from '@optimystic/db-core';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { singleRevisionArchive } from '../src/storage/block-archive.js';
 import { createReconcileBlock, type ReconcileBlockDeps } from '../src/cluster/reconcile-block.js';
@@ -739,6 +739,90 @@ describe('createReconcileBlock (commit-path block restoration)', () => {
 			expect(h.saved[0]!.proof, 'the losing proof is never persisted').to.equal(undefined);
 			expect(h.penalties, 'the displaced solo holder is a partition casualty, not a liar')
 				.to.deep.equal([]);
+		});
+
+		/**
+		 * Ticket: repair-asks-a-lone-ahead-claimant-for-its-lineage. One revision AHEAD the same solo
+		 * machine still wins on the claim data (one peer ahead of two is also a lagging cohort), so
+		 * the reconcile asks it, through the optional `askLineage` dep, whether its history contains
+		 * the group's pair, and keeps the group's pair when it does not. The content gate never sees
+		 * the lone machine's bytes then: its candidates are the supporters of the selected pair.
+		 */
+		describe('a lone ahead claimant is asked for its lineage', () => {
+			const GROUP: ActionRev = { actionId: 'cohort' as ActionId, rev: 5 };
+			const SOLO: ActionRev = { actionId: 'solo-fork' as ActionId, rev: 6 };
+
+			/** Three peers besides self: two serving the group's pair with the same bytes, one serving
+			 *  its own revision 6 under a one-peer proof that binds its bytes. */
+			const forkedCohort = async () => {
+				const soloBlock = makeBlock('solo-v6');
+				const { proof } = await makeSignedProof(1, await commitFor(6, 'solo-fork', soloBlock));
+				return {
+					archives: {
+						g1: archiveAt(5, 'cohort', makeBlock('group-v5')),
+						g2: archiveAt(5, 'cohort', makeBlock('group-v5')),
+						solo: archiveAt(6, 'solo-fork', soloBlock, proof)
+					},
+					proof
+				};
+			};
+
+			/** An `askLineage` answering the same thing to everyone, recording who was asked about what. */
+			const answering = (answer: BlockLineage) => {
+				const asked: { peerId: string; target: ActionRev }[] = [];
+				const askLineage: ReconcileBlockDeps['askLineage'] = async (peerId, _blockId, target) => {
+					asked.push({ peerId, target });
+					return answer;
+				};
+				return { askLineage, asked };
+			};
+
+			it('keeps the group pair when the claimant says its history EXCLUDES it, and logs reconcile:fork-declined', async () => {
+				const { archives } = await forkedCohort();
+				const { askLineage, asked } = answering('excludes');
+				const h = harness(archives, { repairCorroborationClusterSize: 4, askLineage });
+
+				const captured = await captureLog('reconcile-block', async () => {
+					await h.reconcile(BLOCK_ID, GROUP, ['g1', 'g2', 'solo']);
+				});
+
+				expect(asked, 'only the lone claimant is asked, about the group pair').to.deep.equal([{ peerId: 'solo', target: GROUP }]);
+				expect(h.saved.length).to.equal(1);
+				expect(h.saved[0]!.source, 'the group pair wins').to.deep.equal(GROUP);
+				expect(payloadOf(h.saved[0]!.block), 'the group bytes are persisted').to.equal('group-v5');
+				expect(h.saved[0]!.proof, 'the fork\'s proof certifies nothing the group holds').to.equal(undefined);
+				expect(h.penalties, 'an honest fork claimant is a partition casualty, not a liar').to.deep.equal([]);
+				expect([...h.holderReports[0]!.holders], 'only the group pair\'s supporters are reported as holders').to.have.members(['g1', 'g2']);
+				expect(hasTag(captured, 'reconcile:fork-declined')).to.equal(true);
+				expect(hasTag(captured, 'reconcile:restored')).to.equal(true);
+			});
+
+			it('adopts the lone pair when the claimant says its history CONTAINS it — the lagging-cohort repair, confirmed', async () => {
+				const { archives, proof } = await forkedCohort();
+				const { askLineage, asked } = answering('contains');
+				const h = harness(archives, { repairCorroborationClusterSize: 4, askLineage });
+
+				const captured = await captureLog('reconcile-block', async () => {
+					await h.reconcile(BLOCK_ID, GROUP, ['g1', 'g2', 'solo']);
+				});
+
+				expect(asked).to.deep.equal([{ peerId: 'solo', target: GROUP }]);
+				expect(h.saved.length).to.equal(1);
+				expect(h.saved[0]!.source, 'the higher revision wins as before').to.deep.equal(SOLO);
+				expect(payloadOf(h.saved[0]!.block)).to.equal('solo-v6');
+				expect(h.saved[0]!.proof, 'the certified bytes carry their proof onward').to.equal(proof);
+				expect(hasTag(captured, 'reconcile:solo-ahead')).to.equal(true);
+				expect(hasTag(captured, 'reconcile:fork-declined')).to.equal(false);
+			});
+
+			it('without askLineage the lone pair wins exactly as before', async () => {
+				const { archives } = await forkedCohort();
+				const h = harness(archives, { repairCorroborationClusterSize: 4 });
+
+				await h.reconcile(BLOCK_ID, GROUP, ['g1', 'g2', 'solo']);
+
+				expect(h.saved[0]!.source).to.deep.equal(SOLO);
+			});
 		});
 	});
 });

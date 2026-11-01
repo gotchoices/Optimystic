@@ -1137,12 +1137,25 @@ exactly what this branch mints — no longer out-ranks a corroborated claim at e
 more distinct peers agreeing on a different `(rev, actionId)` at that revision beat it, and so does
 any multi-signer proof there, so the briefly-alone machine's fork loses to the cohort that stayed
 together. It stays repairable where nothing contradicts it, which is the ordinary solo case this
-mint exists for. **The weighing reaches exactly as far as an equal revision**: a machine that
-committed twice while alone, against a cohort that committed once, still presents the higher
-revision and still wins, because a claim carries no lineage — one peer ahead of two looks identical
-whether it forked or the other two are simply lagging, and refusing it would break the ordinary
-lagging-cohort repair this mint exists for. Closing that needs evidence a claim does not carry today
-(`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`). See *The certified exception* below.
+mint exists for. **One revision ahead, the claim data alone cannot decide**: a machine that
+committed twice while alone, against a cohort that committed once, presents the higher revision,
+and one peer ahead of two looks identical whether it forked or the other two are simply lagging.
+Refusing it outright would break the ordinary lagging-cohort repair this mint exists for, so both
+repair paths ask instead. When the claim set has exactly that shape — a single-signer certified
+pair strictly above a pair backed by more than one machine (`soloAheadOfCohort` in
+`packages/db-p2p/src/cluster/quorum-restore.ts`) — each claimant of the lone pair is asked whether
+its own history contains the group's pair (`settleSoloAhead` in
+`packages/db-p2p/src/cluster/solo-ahead.ts`, the question `IBlockStorage.lineageOf` already answers
+for the torn-write path), and a claimant that answers `excludes` has its claim set aside
+(`RevClaim.forkedFromCohort`), so the group's pair wins exactly as it wins the equal-revision
+contest. A `contains` answer confirms the lagging-cohort repair and the lone pair wins as before; no
+usable answer leaves that outcome too. Each path logs the round whole — `reconcile:fork-declined`
+and `cluster-fetch:fork-declined` for a fork (a lone machine losing to the group it left, never an
+incident), `reconcile:solo-ahead` and `cluster-fetch:solo-ahead` for the other two verdicts. The
+question travels on a callback that is optional at both paths (`askLineage` on `ReconcileBlockDeps`,
+`blockLineageCallback` on the coordinator) and absent until implement
+`the-sync-consult-answers-a-lineage-question` supplies it over the sync protocol. See *The
+certified exception* below for what the rule leaves undecided.
 
 **Persistence and retention.** `ClusterMember.applyConsensusCommits` builds the proof once per
 consensus record (membership-v2 records only) and passes it into every commit operation's `StorageRepo.commit`, which
@@ -2344,10 +2357,27 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
     proofs disagreeing at one revision do not deadlock the selection — they both yield to whatever
     multi-peer agreement exists. A claim marked certified with no signer count recorded is weighed as
     single-signer, the conservative direction. This is what keeps a briefly-partitioned machine's
-    self-signed fork from overruling the cohort that stayed together *at the same revision* — and
-    only there: a fork that got a revision ahead while alone still wins, for want of any lineage in
-    the claim to tell it apart from a lagging cohort
-    (`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`).
+    self-signed fork from overruling the cohort that stayed together *at the same revision*. One
+    revision ahead the claim carries no lineage to tell a fork from a lagging cohort, so the claimant
+    is asked (*One-peer proofs* above): a single-signer certified pair strictly above a pair backed
+    by more than one machine — two or more distinct supporters meeting the quorum, or a multi-signer
+    proof — has each of its claimants asked whether its history contains that pair, and an
+    `excludes` answer sets the lone pair aside so the group's pair wins; `contains` or no answer
+    keeps the lone pair. Three shapes are deliberately left as they are, for the partition-healing
+    design (backlog `feat-replay-mode-collections-merge-divergent-histories`): a fork between two
+    single-signer machines has no group's side to prefer, so the higher revision wins; a fork between
+    two halves that each kept two or more members is multi-signer on both sides, so nothing is
+    asked; and a block the group never touched after the fork point looks, at the block level, like
+    a plain extension of the pair the group also holds, so repair adopts it — the collection-level
+    fork is still refused at the log tail, which every commit touches
+    (`collection:context-not-lowered`). What the group's writers then see is the cost the
+    equal-revision rule already accepted: in a cohort of three the lone machine's member refuses the
+    group's next write at the forked revision as stale, super-majority at three needs all three, and
+    the write ends in `SyncRevisionStalledError` until the lone machine writes (its write lands by
+    the behind-reconcile, and the fork resolves toward it) or leaves. Before the lineage question the
+    same scenario cost the group its agreed write silently, on every member, instead. Repair never
+    lowers anyone: the lone machine's own claim is excluded from its own consult, so it keeps its
+    fork and its handle keeps refusing the group's lineage.
   - **Ordinary corroboration still wins when it is higher.** A pair corroborated by peers at a
     *strictly higher* revision than the top certified one is selected over the proof, so a legacy
     uncertified tail written after the last proven revision stays readable. (A merely

@@ -10,14 +10,18 @@
  *  - a CORROBORATED strictly-higher rev beats certified (legacy uncertified tail stays readable);
  *  - equal-rev tie → certified (the proof outweighs votes);
  *  - two actions certified at the same top rev = equivocation → decline the whole selection;
- *  - no certified claims → byte-identical behavior to the uncertified rules.
+ *  - no certified claims → byte-identical behavior to the uncertified rules;
+ *  - a claim marked `forkedFromCohort` (ticket repair-asks-a-lone-ahead-claimant-for-its-lineage) is
+ *    set aside entirely, which is how a single-signer claim one revision AHEAD loses to the group's
+ *    pair once its claimant has said so; unmarked it still wins. `soloAheadOfCohort` names that
+ *    shape — the pure half of the lineage round `cluster/solo-ahead.ts` runs.
  */
 
 import { expect } from 'chai';
 import type { IBlock } from '@optimystic/db-core';
 import { canonicalBlockHash } from '@optimystic/db-core';
 import {
-	certifiedContentEquivocation, certifiedEquivocation, selectQuorumBlock, selectQuorumRev,
+	certifiedContentEquivocation, certifiedEquivocation, selectQuorumBlock, selectQuorumRev, soloAheadOfCohort,
 	type BlockHashCandidate, type RevClaim
 } from '../src/cluster/quorum-restore.js';
 
@@ -91,14 +95,12 @@ describe('certified claim selection (quorum-restore)', () => {
 			expect(sel).to.deep.equal({ rev: 5, actionId: 'cohort', supporters: ['h1', 'h2'] });
 		});
 
-		it('does NOT reach a solo fork one revision AHEAD of the cohort — a known residual', () => {
-			// Scope boundary, pinned so nobody reads the equal-rev rule as a general fork defence.
-			// The weighing only fires at an EQUAL revision, because at an unequal one the claim data
-			// cannot tell a forked solo machine apart from a cohort that is merely lagging — both
-			// look like "one peer ahead of two". A partitioned machine that commits twice while the
-			// cohort commits once therefore still wins, and that is the ordinary solo-repair rule
-			// doing its job on data that cannot distinguish the two cases. Closing it needs proofs
-			// to carry lineage: `feat-commit-proofs-carry-predecessor-action`.
+		it('a solo fork one revision AHEAD still wins UNMARKED — the lineage round\'s `unknown` default', () => {
+			// On the claim data alone one peer ahead of two is both a forked machine and a lagging
+			// cohort, and the selector keeps the higher revision, which is what keeps the ordinary
+			// lagging-cohort repair working. What settles a fork is the lineage round
+			// (`cluster/solo-ahead.ts`), whose `fork` verdict sets the mark the next case pins; a
+			// round that learns nothing leaves the claim unmarked and this outcome stands.
 			const claims = [
 				claim('h1', 5, 'cohort'),
 				claim('h2', 5, 'cohort'),
@@ -106,6 +108,17 @@ describe('certified claim selection (quorum-restore)', () => {
 			];
 			const sel = selectQuorumRev(claims, THRESHOLD, 9);
 			expect(sel).to.deep.equal({ rev: 6, actionId: 'solo-fork', supporters: ['solo'], certified: true });
+		});
+
+		it('a solo fork one revision AHEAD loses once marked forkedFromCohort — the group pair is selected', () => {
+			const forked = { ...claim('solo', 6, 'solo-fork', true, 1), forkedFromCohort: true };
+			const claims = [claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'), forked];
+			const sel = selectQuorumRev(claims, THRESHOLD, 9);
+			expect(sel).to.deep.equal({ rev: 5, actionId: 'cohort', supporters: ['h1', 'h2'] });
+			// Set aside entirely: a marked claim neither certifies nor contends, and a pair with no
+			// unmarked claim is never selected.
+			expect(certifiedEquivocation([forked, claim('other', 6, 'other-fork', true, 1)])).to.equal(undefined);
+			expect(selectQuorumRev([forked], THRESHOLD, 9)).to.equal(undefined);
 		});
 
 		it('a single-signer certified claim still wins where NOTHING multi-peer contests it', () => {
@@ -257,6 +270,87 @@ describe('certified claim selection (quorum-restore)', () => {
 				expect(sel!.rev).to.equal(2);
 				expect('certified' in sel!).to.equal(false);
 			});
+		});
+	});
+
+	/**
+	 * The pure half of the lineage round: which claim sets have the ONE shape selection cannot settle
+	 * alone — a single-signer certified pair strictly ahead of a pair backed by more than one machine —
+	 * and which pair the claimants are asked about. The cohort pair named is, by construction, what
+	 * the selector picks once the claimants are marked (the case above).
+	 */
+	describe('soloAheadOfCohort', () => {
+		it('names a single-signer certified pair ahead of a corroborated pair, with its claimants', () => {
+			const shape = soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'), claim('solo', 6, 'solo-fork', true, 1)
+			], THRESHOLD, 9);
+			expect(shape).to.deep.equal({
+				solo: { rev: 6, actionId: 'solo-fork', claimants: ['solo'] },
+				cohort: { rev: 5, actionId: 'cohort' }
+			});
+		});
+
+		it('names every distinct claimant of the lone pair, certified or not', () => {
+			// The lone machine pushed its revision to a peer: two holders of one single-signer commit.
+			const shape = soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'),
+				claim('solo', 6, 'solo-fork', true, 1), claim('pushed', 6, 'solo-fork')
+			], THRESHOLD, 9);
+			expect(shape!.solo.claimants.sort()).to.deep.equal(['pushed', 'solo']);
+			expect(shape!.cohort).to.deep.equal({ rev: 5, actionId: 'cohort' });
+		});
+
+		it('fires when the group pair is itself certified by a MULTI-SIGNER proof', () => {
+			const shape = soloAheadOfCohort([
+				claim('cohort-holder', 5, 'cohort', true, 3), claim('solo', 6, 'solo-fork', true, 1)
+			], THRESHOLD, 9);
+			expect(shape).to.deep.equal({
+				solo: { rev: 6, actionId: 'solo-fork', claimants: ['solo'] },
+				cohort: { rev: 5, actionId: 'cohort' }
+			});
+		});
+
+		it('is not a shape when a MULTI-SIGNER proof certifies the top pair', () => {
+			expect(soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'), claim('holder', 6, 'cohort-6', true, 3)
+			], THRESHOLD, 9)).to.equal(undefined);
+		});
+
+		it('is not a shape on a capacity-one cohort, where the pair below has one supporter', () => {
+			// A quorum-meeting group of ONE is one machine\'s word, not a group\'s side.
+			expect(soloAheadOfCohort([
+				claim('partner', 5, 'cohort'), claim('solo', 6, 'solo-fork', true, 1)
+			], THRESHOLD, 1)).to.equal(undefined);
+		});
+
+		it('is not a shape when a corroborated pair sits strictly above every certified claim', () => {
+			expect(soloAheadOfCohort([
+				claim('holder', 5, 'a', true, 1), claim('h1', 9, 'z'), claim('h2', 9, 'z')
+			], THRESHOLD, 9)).to.equal(undefined);
+		});
+
+		it('is not a shape at an EQUAL revision — the selector already settles that contest', () => {
+			expect(soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'), claim('solo', 5, 'solo-fork', true, 1)
+			], THRESHOLD, 9)).to.equal(undefined);
+		});
+
+		it('is not a shape between two lone machines — no group side to prefer', () => {
+			expect(soloAheadOfCohort([
+				claim('soloA', 5, 'a', true, 1), claim('soloB', 6, 'b', true, 1)
+			], THRESHOLD, 9)).to.equal(undefined);
+			// Two single-signer actions contending at the top decline in the selector before this.
+			expect(soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'),
+				claim('soloA', 6, 'a', true, 1), claim('soloB', 6, 'b', true, 1)
+			], THRESHOLD, 9)).to.equal(undefined);
+		});
+
+		it('is no longer a shape once the lone pair is marked', () => {
+			expect(soloAheadOfCohort([
+				claim('h1', 5, 'cohort'), claim('h2', 5, 'cohort'),
+				{ ...claim('solo', 6, 'solo-fork', true, 1), forkedFromCohort: true }
+			], THRESHOLD, 9)).to.equal(undefined);
 		});
 	});
 

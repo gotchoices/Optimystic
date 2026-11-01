@@ -21,8 +21,12 @@ import type { BlockCommitProof } from "./commit-proof.js";
  * routine since solo cohorts mint their own commit receipts — is one machine's
  * honest word about its own commit, so it wins only where nothing multi-peer
  * contests it, and never outranks several distinct peers agreeing at the same
- * revision. Verification itself never happens here: both selectors stay pure and
- * synchronous; verdicts arrive as booleans and counts.
+ * revision. One revision AHEAD it would still win — one peer ahead of two looks the same whether it
+ * forked or the two are lagging — so the caller asks that lone claimant whether its history contains
+ * the group's pair ({@link soloAheadOfCohort} names the shape, `cluster/solo-ahead.ts` asks) and
+ * marks a claim that provably forked (`forkedFromCohort`), which selection sets aside. Verification
+ * and asking never happen here: both selectors stay pure and synchronous; verdicts arrive as
+ * booleans, counts and marks.
  */
 
 /** A single peer's self-reported (rev, actionId) for a block. */
@@ -56,6 +60,15 @@ export interface RevClaim {
 	 * not toward trusting one signature.
 	 */
 	certifiedSignerCount?: number;
+	/**
+	 * Injected verdict: this claim's `(rev, actionId)` was committed on a history that EXCLUDES the
+	 * pair the rest of the cohort backs — the claimant itself said so when asked
+	 * (`settleSoloAhead` in `cluster/solo-ahead.ts`, over `IBlockStorage.lineageOf`). A marked claim
+	 * is set aside before anything is grouped: it neither certifies nor corroborates, and it is not
+	 * a responder, so a pair with no unmarked claim is never selected and the group's side wins by
+	 * the ordinary rules. Never set this from the claim data alone; only a lineage answer can.
+	 */
+	forkedFromCohort?: boolean;
 }
 
 /** The (rev, actionId) pair a quorum agreed on, plus the peers that corroborated it. */
@@ -174,9 +187,29 @@ export function corroboratorCapacity(cohortPeerCount: number, repairCorroboratio
  *    same keys provably signed two different actions into one revision — and the whole selection
  *    declines (`undefined`). Callers distinguish this decline from a plain no-quorum via
  *    {@link certifiedEquivocation}.
+ *  - A claim marked {@link RevClaim.forkedFromCohort} is set aside before any of the above: it is
+ *    not a responder, not a corroborator and not certified. That is how a single-signer certified
+ *    claim one revision AHEAD of the group's pair loses once its claimant has said its history
+ *    excludes that pair — the shape {@link soloAheadOfCohort} names and `cluster/solo-ahead.ts`
+ *    asks about. Unmarked, such a claim still wins (the `same-lineage` and `unknown` verdicts),
+ *    since one peer ahead of two is also what an ordinary lagging cohort looks like.
  */
 export function selectQuorumRev(
 	claims: RevClaim[],
+	simpleMajorityThreshold: number,
+	corroboratorCapacity?: number
+): QuorumRev | undefined {
+	return selectAmongWeighable(weighable(claims), simpleMajorityThreshold, corroboratorCapacity);
+}
+
+/** The claims selection may weigh: everything not set aside as {@link RevClaim.forkedFromCohort}. */
+function weighable(claims: readonly RevClaim[]): RevClaim[] {
+	return claims.filter(c => c.forkedFromCohort !== true);
+}
+
+/** {@link selectQuorumRev} over a claim set the fork mark has already been applied to. */
+function selectAmongWeighable(
+	claims: readonly RevClaim[],
 	simpleMajorityThreshold: number,
 	corroboratorCapacity?: number
 ): QuorumRev | undefined {
@@ -224,13 +257,10 @@ export function selectQuorumRev(
 	// A single-signer-only certified rev loses the equal-rev tie to genuinely multi-peer
 	// corroboration — unless the corroborated pair AGREES with the sole certified action, which is
 	// convergence rather than a contest and keeps the certified verdict (and its logging/penalty
-	// exemptions) intact.
-	// NOTE: the weighing reaches EQUAL revisions only. A solo fork that committed twice while its
-	// cohort committed once claims the higher rev and still wins above. That is not an oversight of
-	// this rule: a claim carries no lineage, so "one peer ahead of two" is identical whether it
-	// forked or the two are lagging, and refusing it would break ordinary lagging-cohort repair.
-	// Pinned by 'does NOT reach a solo fork one revision AHEAD' in quorum-restore-certified.spec.ts;
-	// closing it needs new evidence — debt-repair-cannot-tell-a-fork-from-a-lagging-cohort.
+	// exemptions) intact. The weighing reaches EQUAL revisions only, on purpose: a claim carries no
+	// lineage, so a single-signer claim one revision AHEAD looks the same whether it forked or the
+	// cohort is lagging. That shape is settled by asking the claimant (soloAheadOfCohort below, and
+	// `cluster/solo-ahead.ts`), whose `forkedFromCohort` mark this selector sets aside at the top.
 	if (!contenders.multiSigner && corroborated && corroborated.rev === certified.rev
 		&& corroborated.supporters.length >= CORROBORATION_FLOOR
 		&& !(certified.byAction.size === 1 && certified.byAction.has(corroborated.actionId))) {
@@ -252,7 +282,7 @@ interface CertifiedActionGroup {
 }
 
 /** Certified claims at the top certified rev, keyed by actionId → the claimants behind each. */
-function certifiedGroups(claims: RevClaim[]): { rev: number; byAction: Map<string, CertifiedActionGroup> } | undefined {
+function certifiedGroups(claims: readonly RevClaim[]): { rev: number; byAction: Map<string, CertifiedActionGroup> } | undefined {
 	let top: number | undefined;
 	for (const c of claims) {
 		if (c.certified === true && (top === undefined || c.rev > top)) top = c.rev;
@@ -308,11 +338,86 @@ function certifiedContenders(
  * declined, to say WHY it declined.
  */
 export function certifiedEquivocation(claims: RevClaim[]): { rev: number; actionIds: string[] } | undefined {
-	const groups = certifiedGroups(claims);
+	// The same set selection weighed: a claim set aside as forked cannot have contended.
+	const groups = certifiedGroups(weighable(claims));
 	if (!groups) return undefined;
 	const contenders = certifiedContenders(groups.byAction);
 	if (contenders.entries.length < 2) return undefined;
 	return { rev: groups.rev, actionIds: contenders.entries.map(([actionId]) => actionId) };
+}
+
+/**
+ * The shape {@link selectQuorumRev} cannot settle on the claim data alone: a lone machine's
+ * single-signer certified claim strictly AHEAD of a pair the rest of the cohort backs. One peer ahead
+ * of two looks the same whether that peer forked away from the cohort while alone or the two are
+ * merely lagging, and the selector resolves it toward the higher revision — right for a lagging
+ * cohort, and the outcome that drops the group's own agreed write on every member for a fork.
+ */
+export interface SoloAheadShape {
+	/** The pair selection currently picks: the top certified revision, certified only by single-signer
+	 *  proofs, and every distinct peer claiming it — the claimants a caller asks. */
+	solo: { rev: number; actionId: string; claimants: string[] };
+	/**
+	 * The group's side: the pair selection would pick with the solo pair's claims set aside, provided
+	 * it is backed by more than one machine — {@link CORROBORATION_FLOOR}-plus distinct supporters,
+	 * or a multi-signer proof. This is exactly what wins if the claimants are marked
+	 * {@link RevClaim.forkedFromCohort}, so asking "does your history contain THIS pair?" asks about
+	 * the pair that would replace theirs.
+	 */
+	cohort: { rev: number; actionId: string };
+}
+
+/**
+ * Name the {@link SoloAheadShape} in a claim set, or `undefined` when selection needs no help:
+ *
+ *  - selection picks nothing, a corroborated pair, or a multi-signer certified pair — a cohort's own
+ *    signatures are not one machine's word, and a corroborated pair strictly above every certified
+ *    claim already wins as it always did;
+ *  - with the solo pair set aside nothing is selected (an equivocation beneath it declines), or what
+ *    is selected is one machine's word too — a single-signer certified claim, or a quorum-meeting
+ *    group of ONE supporter, which only a capacity-one cohort produces. A fork between two lone
+ *    machines has no group's side to prefer, and is left as it is today.
+ *
+ * Pure: it asks nobody. The `solo.claimants` are every distinct peer claiming the pair, certified or
+ * not — a replica the lone machine pushed to a second peer is the same single commit, so every claim
+ * at the pair is asked and marked together.
+ *
+ * NOTE: two single-signer actions contending at the top (two machines that each forked ahead of the
+ * group) already decline in {@link selectQuorumRev} as equivocation, so they never reach here and the
+ * block stays unrepaired on that consult; if that decline ever shows beside a corroborated pair below
+ * it (`certified-equivocation` with a group's side in the same claim set), widen this detector to
+ * name every contending single-signer action and ask each one's claimants. Both halves come from the selector
+ * itself, so the cohort pair named here is by construction the one that wins after the mark; do not
+ * re-derive either half from the groups separately.
+ */
+export function soloAheadOfCohort(
+	claims: readonly RevClaim[],
+	simpleMajorityThreshold: number,
+	corroboratorCapacity?: number
+): SoloAheadShape | undefined {
+	const weighed = weighable(claims);
+	const selected = selectAmongWeighable(weighed, simpleMajorityThreshold, corroboratorCapacity);
+	if (!selected?.certified) return undefined;
+	const atSolo = weighed.filter(c => c.rev === selected.rev && c.actionId === selected.actionId);
+	if (atSolo.some(isMultiSignerCertified)) return undefined;
+	const rest = weighed.filter(c => !(c.rev === selected.rev && c.actionId === selected.actionId));
+	const cohort = selectAmongWeighable(rest, simpleMajorityThreshold, corroboratorCapacity);
+	// The cohort pair is below the solo by construction (a corroborated pair at or above it would
+	// have been selected first); the guard keeps the shape honest if the selector's precedence ever
+	// changes.
+	if (!cohort || cohort.rev >= selected.rev) return undefined;
+	const atCohort = rest.filter(c => c.rev === cohort.rev && c.actionId === cohort.actionId);
+	const backedByMoreThanOne = cohort.supporters.length >= CORROBORATION_FLOOR || atCohort.some(isMultiSignerCertified);
+	if (!backedByMoreThanOne) return undefined;
+	return {
+		solo: { rev: selected.rev, actionId: selected.actionId, claimants: [...new Set(atSolo.map(c => c.peerId))] },
+		cohort: { rev: cohort.rev, actionId: cohort.actionId }
+	};
+}
+
+/** A claim certified by a proof two or more distinct cohort members signed — the cohort's word, not one machine's. */
+function isMultiSignerCertified(c: RevClaim): boolean {
+	return c.certified === true && (c.certifiedSignerCount ?? 1) >= 2;
 }
 
 /** One block candidate paired with its serving peer and canonical hash

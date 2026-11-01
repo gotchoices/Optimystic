@@ -10,6 +10,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "../cluster/i-transaction-state-store.js";
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
+import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js";
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
@@ -116,12 +117,16 @@ interface ClusterLatestQuery {
 	 * | "holds nothing" (a resolved `undefined`)        | `undefined` |
 	 * | silent (rejected, or past the per-peer deadline)| `undefined` |
 	 * | a claim with no archive (the asker's stand-in, a test double) | absent |
+	 * | a claim set aside as forked from the cohort (`cluster-fetch:fork-declined`) | `undefined` |
 	 * | this node                                       | absent      |
 	 *
 	 * A silent peer is recorded as having served nothing rather than left to be asked again: the
 	 * consult reached its corroboration without it, and re-asking would make the acquisition wait out
 	 * one more per-peer deadline for an answer that rarely comes. The next consult hears it if it
-	 * recovers.
+	 * recovers. A forked claimant is recorded the same way: what it served is the fork's bytes, which
+	 * cannot be the group's pair the acquisition is after, and handing its archive on would make the
+	 * acquisition ask the lineage question a second time — or, on a reconcile wired without the ask,
+	 * adopt the very fork this consult set aside (see {@link CoordinatorRepo.settleSoloAheadClaims}).
 	 */
 	consulted: ConsultedArchives;
 	/**
@@ -473,6 +478,16 @@ interface CoordinatorRepoComponents {
 	 */
 	acquireBlockFromCohort?: AcquireBlockCallback;
 	/**
+	 * Optional callback that asks one cohort peer whether its own history contains a `(rev, actionId)`
+	 * pair (`IBlockStorage.lineageOf`, over the wire) — the second, narrow round the consult runs for
+	 * the one shape selection cannot settle on the claim data, a lone single-signer certified claim
+	 * strictly ahead of a pair the rest of the cohort backs (`settleSoloAhead` in
+	 * `cluster/solo-ahead.ts`). Each ask is deadlined like a consult question
+	 * (`cohortQueryTimeoutMs`). Absent → that shape resolves toward the higher revision, as it did
+	 * before the question existed.
+	 */
+	blockLineageCallback?: BlockLineageAsk;
+	/**
 	 * Optional layer-2 anchoring for the cohort commit proofs the latest-revision consult verifies
 	 * (`cluster/certified-claims.ts`): re-derive the block's cohort and LOG the overlap with the
 	 * proof's signers, plus surface proofs accepted without that comparison. Purely observational —
@@ -552,7 +567,8 @@ export function coordinatorRepo(
 		components.onBlockHolders,
 		components.onBlockDurabilityReached,
 		components.durabilityWindowFor,
-		components.clusterLatestBatchCallback
+		components.clusterLatestBatchCallback,
+		components.blockLineageCallback
 	);
 }
 
@@ -728,7 +744,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly onBlockHolders?: BlockHoldersSink,
 		private readonly onBlockDurabilityReached?: BlockDurabilitySink,
 		private readonly durabilityWindowFor?: DurabilityWindowFor,
-		private readonly clusterLatestBatchCallback?: ClusterLatestBatchCallback
+		private readonly clusterLatestBatchCallback?: ClusterLatestBatchCallback,
+		private readonly blockLineageCallback?: BlockLineageAsk
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2235,6 +2252,8 @@ export class CoordinatorRepo implements IRepo {
 		// `nonSelfCount - silent.length` is exactly `answered.length`.
 		const answered = peerIds.filter(id => id !== selfId && !silent.includes(id));
 		const capacity = corroboratorCapacity(nonSelfCount, this.repairCorroborationClusterSize);
+		// The second round, after the seat's first has settled: it never goes through the seat.
+		await this.settleSoloAheadClaims(claims, blockId, capacity, consulted);
 		const required = quorumSize(claims.length, this.simpleMajorityThreshold, capacity);
 		const selected = selectQuorumRev(claims, this.simpleMajorityThreshold, capacity);
 		if (!selected) {
@@ -2314,6 +2333,36 @@ export class CoordinatorRepo implements IRepo {
 			},
 			local, silent, answered, claims, consulted
 		};
+	}
+
+	/**
+	 * The second, narrow round for the one shape selection cannot settle alone (`cluster/solo-ahead.ts`):
+	 * ask the lone ahead claimants, each under the per-peer consult budget, whether their history
+	 * contains the group's pair, and mark them forked when it does not — in place on `claims`, which
+	 * {@link selectQuorumRev} then sets aside, so the group's pair wins by the existing rules exactly as
+	 * it wins the equal-revision contest. Nothing is acquired from a forked claimant: the acquisition
+	 * that may follow reads `consulted`, and a claimant set aside here is recorded there as having
+	 * served nothing (see {@link ClusterLatestQuery.consulted}).
+	 *
+	 * Logged whole: `cluster-fetch:fork-declined` names a lone machine's fork losing to the group it
+	 * left (informational, never an incident), `cluster-fetch:solo-ahead` the two verdicts that leave
+	 * selection as it was — `same-lineage`, the ordinary lagging-cohort repair confirmed, and `unknown`.
+	 */
+	private async settleSoloAheadClaims(
+		claims: RevClaim[], blockId: BlockId, capacity: number, consulted: Map<string, BlockArchive | undefined>
+	): Promise<void> {
+		const callback = this.blockLineageCallback;
+		const ask: BlockLineageAsk | undefined = callback && ((peerId, id, target) =>
+			withDeadline(callback(peerId, id, target), this.cohortQueryTimeoutMs, `lineage query to ${peerId}`));
+		const outcome = await settleSoloAhead(
+			claims, blockId, { simpleMajorityThreshold: this.simpleMajorityThreshold, corroboratorCapacity: capacity }, ask);
+		if (outcome.verdict === 'not-asked') return;
+		if (outcome.verdict !== 'fork') {
+			this.log('cluster-fetch:solo-ahead', { blockId, ...outcome });
+			return;
+		}
+		this.log('cluster-fetch:fork-declined', { blockId, ...outcome });
+		for (const peerId of outcome.claimants) consulted.set(peerId, undefined);
 	}
 
 	/**

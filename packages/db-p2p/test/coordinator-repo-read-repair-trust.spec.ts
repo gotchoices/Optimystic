@@ -40,7 +40,8 @@ import type {
 	MessageOptions, BlockId, ActionRev
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
-import { CoordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../src/repo/coordinator-repo.js';
+import { CoordinatorRepo, coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../src/repo/coordinator-repo.js';
+import type { BlockLineageAsk } from '../src/cluster/solo-ahead.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import type { IPeerReputation, PenaltyReason } from '../src/reputation/types.js';
 import { toString as u8ToString } from 'uint8arrays';
@@ -572,5 +573,58 @@ describe('CoordinatorRepo read-repair CERTIFIED claims (cohort commit proofs)', 
 		// Two actions cannot both be the commit at one revision — this contradiction is provable
 		// without any proof machinery, so the penalty survives the higher-rev branch's removal.
 		expect(reports.map(r => r.peerId)).to.deep.equal([conflicting.toString()]);
+	});
+});
+
+/**
+ * Ticket: repair-asks-a-lone-ahead-claimant-for-its-lineage. One revision AHEAD, the solo machine's
+ * self-signed claim wins on the claim data alone (the `does NOT reach a solo fork one revision AHEAD`
+ * residual the selector used to pin), so the consult runs a second, narrow round through the optional
+ * `blockLineageCallback`: the lone claimant is asked whether its history contains the group's pair.
+ * On `excludes` the group's pair is selected; a reader holding it is current, acquires nothing, and
+ * carries no doubt marker — the lone machine's higher claim is a successful selection's bystander,
+ * as an uncorroborated higher claim is today.
+ */
+describe('CoordinatorRepo read-repair asks a lone ahead claimant for its lineage', () => {
+	const blockId: BlockId = 'block-solo-ahead';
+
+	it('keeps the group pair the reader holds when the lone claimant says its history EXCLUDES it', async () => {
+		const localPeer = await makePeerId();
+		const soloHolder = await makePeerId();
+		const voterA = await makePeerId();
+		const voterB = await makePeerId();
+		const group: ActionRev = { actionId: 'cohort', rev: 5 };
+		const soloAnswer = await certifiedAnswer(blockId, 6, 'solo-fork', 1);
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId) =>
+			peerId.equals(soloHolder) ? soloAnswer
+				: (peerId.equals(voterA) || peerId.equals(voterB)) ? group : undefined;
+		const asked: { peerId: string; blockId: BlockId; target: ActionRev }[] = [];
+		const blockLineageCallback: BlockLineageAsk = async (peerId, id, target) => {
+			asked.push({ peerId, blockId: id, target });
+			return 'excludes';
+		};
+		const { repo: storageRepo, calls } = makePresentStorageRepo(blockId, 5, 'cohort');
+		const { rep, reports } = makeReputationStub();
+		const repo = coordinatorRepo(
+			makeKeyNetwork(makeClusterPeers([localPeer, soloHolder, voterA, voterB])),
+			makeClusterClient,
+			{ clusterSize: 4, readRepairMode: 'paranoid' },
+			undefined,
+			rep
+		)({ storageRepo, localPeerId: localPeer, clusterLatestCallback, blockLineageCallback });
+
+		let result: GetBlockResults = {};
+		const captured = await captureLog('coordinator-repo', async () => {
+			result = await repo.get({ blockIds: [blockId] });
+		});
+
+		expect(asked, 'only the lone claimant is asked, about the group pair')
+			.to.deep.equal([{ peerId: soloHolder.toString(), blockId, target: group }]);
+		expect(calls.find(c => c.context?.committed), 'nothing is acquired: the reader already holds the selected pair').to.equal(undefined);
+		expect(result[blockId]?.state?.latest, 'the reader keeps its copy').to.deep.equal(group);
+		expect(result[blockId]?.unconfirmedAheadRev, 'the set-aside claim stamps no doubt').to.equal(undefined);
+		expect(hasTag(captured, 'cluster-fetch:fork-declined'), 'the fork is named').to.equal(true);
+		expect(hasTag(captured, 'cluster-fetch:local-current'), 'the group pair is at the reader\'s revision').to.equal(true);
+		expect(reports, 'nobody is penalized on a lineage answer').to.deep.equal([]);
 	});
 });

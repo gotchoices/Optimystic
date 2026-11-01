@@ -13,6 +13,7 @@ import {
 import {
 	certifyClaim, certifyContent, isAttributableProofFailure, proofThresholds, type ProofAnchoring
 } from "./certified-claims.js";
+import { settleSoloAhead, type BlockLineageAsk } from "./solo-ahead.js";
 import type { BlockCommitProof } from "./commit-proof.js";
 import { createLogger } from '../logger.js';
 
@@ -96,6 +97,14 @@ export interface ReconcileBlockDeps {
 	repairCorroborationClusterSize: number;
 	/** Best-effort misbehavior reporting; a throwing implementation is swallowed. */
 	reputation?: Pick<IPeerReputation, 'reportPeer'>;
+	/**
+	 * Optional: ask one cohort peer whether its own history contains a `(rev, actionId)` pair
+	 * (`IBlockStorage.lineageOf`, over the wire). Consulted for exactly one shape, the one selection
+	 * cannot settle on the claim data — a lone single-signer certified claim strictly ahead of a pair
+	 * the rest of the cohort backs (`settleSoloAhead` in `./solo-ahead.ts`). Absent → that shape
+	 * resolves toward the higher revision, as it did before the question existed.
+	 */
+	askLineage?: BlockLineageAsk;
 	/**
 	 * Optional: told, after a successful restore, that the peers whose archives corroborated the
 	 * selected revision hold this block — and that this node now holds it too. The node's rebalance
@@ -371,6 +380,7 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 			...(revCertified ? { certified: true } : {}),
 			...(revCertified && certifiedSignerCount !== undefined ? { certifiedSignerCount } : {})
 		}));
+		await settleSoloAheadClaims(deps, blockId, revClaims, capacity);
 		const selected = selectQuorumRev(revClaims, deps.simpleMajorityThreshold, capacity);
 		if (!selected) {
 			// Asked ONLY on a decline: a certified-vs-certified conflict can coexist with a successful
@@ -452,6 +462,20 @@ export function createReconcileBlock(deps: ReconcileBlockDeps): ReconcileBlockCa
 		log('reconcile:restored', { blockId, rev: selected.rev, actionId: selected.actionId });
 		reportRestoredHolders(deps, blockId, selected.supporters);
 	};
+}
+
+/**
+ * The second, narrow round for the one shape selection cannot settle alone (`./solo-ahead.ts`): ask
+ * the lone ahead claimants whether their history contains the group's pair, and mark them forked when
+ * it does not — in place on `revClaims`, which {@link selectQuorumRev} then sets aside. Logged whole:
+ * `reconcile:fork-declined` names a lone machine's fork losing to the group it left (informational,
+ * never an incident), `reconcile:solo-ahead` the two verdicts that leave selection as it was.
+ */
+async function settleSoloAheadClaims(deps: ReconcileBlockDeps, blockId: BlockId, revClaims: RevClaim[], capacity: number): Promise<void> {
+	const outcome = await settleSoloAhead(
+		revClaims, blockId, { simpleMajorityThreshold: deps.simpleMajorityThreshold, corroboratorCapacity: capacity }, deps.askLineage);
+	if (outcome.verdict === 'not-asked') return;
+	log(outcome.verdict === 'fork' ? 'reconcile:fork-declined' : 'reconcile:solo-ahead', { blockId, ...outcome });
 }
 
 /**
