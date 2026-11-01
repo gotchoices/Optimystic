@@ -167,7 +167,7 @@ describe('Small deployment lifecycle over real libp2p (solo → backup → away 
 		await expectReadable(b, TREE_ID, acknowledged.values(), 'B after its restart');
 
 		// Observed, not asserted: whether a lone survivor of a two-machine group should accept writes is
-		// under design (tickets/backlog/more-design/6.5-partition-healing.md). This phase pins durability of
+		// under design (backlog `feat-replay-mode-collections-merge-divergent-histories`). This phase pins durability of
 		// what was acknowledged; the admission outcome — and, when refused, whether the refused row surfaces
 		// anyway — is reported so a change in either shows up in the run output. For a write made in offline
 		// mode the outcome is settled, and pinned deterministically on the in-process mesh in

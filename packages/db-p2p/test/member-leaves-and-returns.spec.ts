@@ -7,7 +7,7 @@
  * runs the whole episode at THREE machines on the in-process mesh, with the production-shaped configuration
  * (`util/node-count-mesh.ts`: default replication factor, machine count declared only as
  * `clusterPolicy.repairCorroborationClusterSize`). Three, not two, so it asserts a documented rule: the
- * two-machine lone-survivor rule is under design (backlog/more-design/6.5-partition-healing.md) and is not
+ * two-machine lone-survivor rule is under design (backlog `feat-replay-mode-collections-merge-divergent-histories`) and is not
  * asserted here.
  *
  * ## How anything commits while a member is away, at three machines

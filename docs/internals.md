@@ -554,7 +554,7 @@ the refresh runs (backlog `debt-multi-collection-retry-cannot-see-the-taken-revi
 `Collection.refreshInFlight` takes it as an optional argument for when it does. A tail floor helps a
 client that is merely *behind*; on a forked lineage the refused revision exists on the rival's
 history, and the refresh that reaches it reports `collection:lineage-divergence` (backlog
-`6.5-partition-healing`) — in one round now, instead of never.
+`feat-replay-mode-collections-merge-divergent-histories`) — in one round now, instead of never.
 
 What this deliberately does not do. When *every* reachable coordinator is below the floor the old
 content is still *returned* — the highest revision anyone served, unflagged. How long that lasts
@@ -2619,7 +2619,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   A write that asks not to be committed alone (`refuseSolo`, which only the offline queue sets) is
   refused instead ([offline-sync.md §When to submit: the reachability gate](offline-sync.md#when-to-submit-the-reachability-gate)).
   Whether other such writes should be admitted at all belongs to the partition-healing design (backlog
-  `6.5-partition-healing`).
+  `feat-replay-mode-collections-merge-divergent-histories`).
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each

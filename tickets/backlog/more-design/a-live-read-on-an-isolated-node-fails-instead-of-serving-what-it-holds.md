@@ -5,7 +5,7 @@ files:
   - packages/db-core/src/collection/collection.ts (`Collection.update` → `updateInternal`, and the `CollectionHeaderVanishedError` NOTE that says a loud failure here is intended)
   - packages/db-core/src/transactor/transactor-source.ts (`tryGet` — the `!block && unavailable` throw, and the accepted-tradeoff NOTE below it about loud failure over silent staleness)
   - packages/db-core/src/network/struct.ts (`BlockUnavailableError`, and the `cohort-unreachable` reason)
-  - backlog/more-design/6.5-partition-healing.md (the neighbouring design question; the maintainer's CRDT decision is recorded there)
+  - tickets/backlog/6.52-feat-replay-mode-collections-merge-divergent-histories.md (the neighbouring design question; the maintainer's CRDT decision is recorded there)
 difficulty: medium
 tradeoffs: The current behaviour is defensible and partly deliberate — `tryGet`'s NOTE argues at length that "I could not find out" must never be read as "absent", and a node that answers queries from an unrefreshed local view is answering from data it knows may be stale. A maintainer may reasonably say the application should ask for a committed read when it wants that, in which case this ticket resolves into documentation plus a better error, not a behaviour change.
 ----
@@ -69,7 +69,7 @@ Three candidate answers, none obviously right:
 
 # Boundaries
 
-- **This is not the two-machine lone-survivor question.** That is `6.5-partition-healing`, and the
+- **This is not the two-machine lone-survivor question.** That is backlog `feat-replay-mode-collections-merge-divergent-histories`, and the
   maintainer has decided the CRDT sync layer is its fix. This is three nodes, one isolated, on the
   read path, and it is about what a node may answer with rather than what it may accept.
 - **The CRDT layer probably does not settle it.** Even with both sides proceeding in step and merging

@@ -233,7 +233,7 @@ describe('Two phones over a relay (transact → replicate → one drops → both
 
 		// Observed, not asserted, for the same reason as the direct-TCP spec's "one away" phase: whether a lone
 		// survivor of a two-machine group should accept writes is under design
-		// (tickets/backlog/more-design/6.5-partition-healing.md). Durability of what was acknowledged is asserted above.
+		// (backlog `feat-replay-mode-collections-merge-divergent-histories`). Durability of what was acknowledged is asserted above.
 		console.log(`      phase 3 observed: A's write with B away was ${await describeWriteAttempt(attempt, whileAway, TREE_ID, [a, b])}`);
 	});
 

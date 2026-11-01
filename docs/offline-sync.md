@@ -8,7 +8,7 @@ transaction's progress to the application until it is committed or has failed.
 
 This document assumes [architecture.md](architecture.md), [transactions.md](transactions.md) and
 [internals.md](internals.md). The neighbouring designs are [crdt-sync.md](crdt-sync.md),
-[partition-healing.md](partition-healing.md) and the backlog tickets `6.5-partition-healing` and
+[partition-healing.md](partition-healing.md) and the backlog tickets `feat-replay-mode-collections-merge-divergent-histories` (the partition-healing program) and
 `feat-long-lived-pend-completes-as-members-appear`; how this design relates to each is stated in
 [Relation to the other designs](#relation-to-the-other-designs).
 
@@ -565,7 +565,7 @@ wake arriving after it is ignored. `wakeOn` remains for a queue used without the
 The gate is what keeps offline mode from creating forks. Without it, a drain that runs while this
 node's routing view has dropped its partners takes the solo commit path (`soloCohortDurability` in
 `packages/db-p2p/src/repo/coordinator-repo.ts`) and commits alone at `local` durability — the
-lone-survivor write that backlog `6.5-partition-healing` records as a source of forked collections.
+lone-survivor write that backlog `feat-replay-mode-collections-merge-divergent-histories` records as a source of forked collections.
 The gate is a heuristic, though: the view can change between the check and the commit. The hard form
 is a per-write option, `SyncOptions.refuseSoloCommit` in `packages/db-core/src/collection/struct.ts`,
 that makes the solo short-circuit **refuse** the write instead of committing it `local` with the
@@ -600,7 +600,7 @@ awaited bootstrap peer) is its whole cohort and still commits. An application th
 lone-write behaviour opts out with `offline.allowSoloCommit: true` (`OfflineQueueOptions.allowSoloCommit`
 in `packages/db-core/src/offline/queue.ts`; unless it is `true`, `OfflineQueue` sets
 `refuseSoloCommit` on every submission). This does not choose a lone-write
-rule for writes in general, which `6.5-partition-healing` records a decision against: writes outside
+rule for writes in general, which `feat-replay-mode-collections-merge-divergent-histories` records a decision against: writes outside
 offline mode keep today's solo short-circuit. A coordinator on a build that predates the field
 ignores it, so in a mixed-version group the gate is the only protection.
 
@@ -1729,7 +1729,7 @@ which touches no row) is allowed. A `create table` is refused only when it decla
 columns or another primary key, a collection a table with queued entries already backs; an identical
 declaration reads and writes the queued rows exactly as that table does. Table creation while
 offline otherwise keeps its current behaviour, including the catalog written alone at launch that
-backlog `6.5-partition-healing` records as fork-safe only while every machine writes identical
+backlog `feat-replay-mode-collections-merge-divergent-histories` records as fork-safe only while every machine writes identical
 catalog content.
 
 In the plugin the check is `OfflineMode.assertNoQueuedEntries`, which reads a table's collections
@@ -1747,7 +1747,7 @@ against every live table over the same collection.
 A table declared but never written has no committed header, and `Collection.createOrOpen` invents
 one in the tracker. A queued entry that writes such a table carries no action that names the header.
 If another machine created the collection while this one was offline, committing the invented header
-would put two collections under one id — the joiner fork recorded in `6.5-partition-healing`.
+would put two collections under one id — the joiner fork recorded in `feat-replay-mode-collections-merge-divergent-histories`.
 
 The probe that prevents it is the refresh every drain cycle opens with (`Collection.commitHead`, and
 `TransactionCoordinator.commitEntry` for an entry over several collections): `Collection.updateInternal`
@@ -1806,7 +1806,7 @@ session mode is configured, until a later stage designs those points.
 - **[partition-healing.md](partition-healing.md).** Its effect gating ("fire on stable") is what an
   application should do with external effects of a queued transaction: wait for `committed`, not
   for the local acknowledgement.
-- **`6.5-partition-healing`.** The forked collections that ticket records come from machines that
+- **`feat-replay-mode-collections-merge-divergent-histories`.** The forked collections that ticket records come from machines that
   committed alone. Offline mode is an alternative an application can choose instead: the change is
   queued on the machine, not committed into its storage, and the reachability gate and the solo-refusing option every drain sets by default keep the drain from
   committing it alone. It does not fix

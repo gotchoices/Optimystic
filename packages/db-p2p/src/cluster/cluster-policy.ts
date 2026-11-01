@@ -105,8 +105,8 @@ export interface ClusterPolicyOptions {
 		 * consensus (default true); `false` refuses it with "below configured minimum". It has no effect
 		 * on a cohort of at most one peer — this node alone, or a lookup that named nobody — which
 		 * always commits alone, answered as durability class `local` or `unrouted`
-		 * (`CoordinatorRepo`'s solo path). Whether a lone write should ever be refused is open in
-		 * backlog `partition-healing`.
+		 * (`CoordinatorRepo`'s solo path). Whether a lone write should ever be refused is owned by
+		 * backlog `feat-replay-mode-collections-merge-divergent-histories`, which decides it per lane.
 		 */
 		allowDownsize?: boolean;
 		/** Acceptable relative difference (e.g. 0.5 = +/-50%). */

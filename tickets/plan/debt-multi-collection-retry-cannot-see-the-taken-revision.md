@@ -75,8 +75,8 @@ number of commit attempts made — the shape of
 ## Explicitly not in scope
 
 Making the wedged write *succeed*. That is reconciliation, tracked under
-`backlog/more-design/6.5-partition-healing` (see its "sync now fails fast on a wedged revision view"
-section) and `a-refresh-after-a-refused-write-asks-for-the-confirmed-revision` (landed; see the arm
+backlog `feat-replay-mode-collections-merge-divergent-histories` (which carries the forked-lineage
+evidence the old partition-healing ticket recorded under "sync now fails fast on a wedged revision view") and `a-refresh-after-a-refused-write-asks-for-the-confirmed-revision` (landed; see the arm
 below). This ticket only brings the
 multi-collection path up to the single-collection path's standard of failing quickly and honestly.
 

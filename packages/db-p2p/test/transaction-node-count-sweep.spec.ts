@@ -337,7 +337,7 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					// so the cohort the write runs on is the full mesh. At two machines it is therefore a
 					// deterministic refusal, and says nothing about the lone-survivor question (a survivor whose
 					// routing view has dropped its partner), which is under design in
-					// backlog/more-design/6.5-partition-healing.md and deliberately not asserted anywhere.
+					// backlog `feat-replay-mode-collections-merge-divergent-histories` and deliberately not asserted anywhere.
 
 					const oneAwayAttempts: Attempt[] = [];
 					const tree = await Tree.createOrOpen<string, Row>(driven(writer, oneAwayAttempts), TREE_ID, keyOf);
