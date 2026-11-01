@@ -25,7 +25,9 @@ export function spyBatchWrites(db: LevelDBLike, options: SpyBatchWritesOptions =
 	const spied: LevelDBLike = {
 		canSync,
 		get: key => db.get(key),
+		getText: key => db.getText(key),
 		iterator: iteratorOptions => db.iterator(iteratorOptions),
+		textIterator: iteratorOptions => db.textIterator(iteratorOptions),
 		close: () => db.close(),
 		batch: () => {
 			const inner = db.batch();

@@ -121,7 +121,7 @@ async function main() {
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: true },
 			// KvRawStorage over a non-memory driver == "host-supplied persistent storage",
-			// so the node attaches its read cache - the same wrap RN's LevelDBRawStorage gets.
+			// so the node attaches its read cache - the cache RN's LevelDBRawStorage builds in.
 			storage: () => new KvRawStorage(driver),
 		});
 	}

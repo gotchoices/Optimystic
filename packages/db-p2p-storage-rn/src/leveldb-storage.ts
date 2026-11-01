@@ -1,5 +1,6 @@
 import type { ActionId, BlockId } from '@optimystic/db-core';
 import {
+	CachedStoreDriver,
 	JournalBatchBackend,
 	JournalRecordDecodeError,
 	KvRawStorage,
@@ -7,10 +8,12 @@ import {
 	decodeJournalRecord,
 	encodeJournalRecord,
 	identityForHandle,
+	textValueCodec,
 	type JournalBatchBackendOptions,
 	type JournalContents,
 	type JournalRecord,
 	type JournalStore,
+	type SharedCachePool,
 	type StoreDurability,
 	type StoreIdentity,
 	type StoreKey,
@@ -66,8 +69,12 @@ function keyBytes(key: StoreKey): Uint8Array {
  * driver before it read them, so data an earlier build wrote reads unchanged; and the journal under
  * its own tag byte, which `JournalBatchBackend` drives.
  *
- * `KvRawStorage` owns all JSON/UTF-8 serialization, so this store only ever reads/writes raw
- * `Uint8Array` values; a journal record is bytes too, through `encodeJournalRecord`. Everything
+ * `KvRawStorage` owns all JSON serialization, so this store only moves values: it writes the
+ * UTF-8 bytes the write group hands it, and reads each value back as the text those bytes decode
+ * to, decoded by LevelDB's binding in native code (`LevelDBLike.getText` and `textIterator`), so a
+ * read never reaches a JavaScript `TextDecoder` — on React Native a polyfill, measured as the
+ * largest single cost of an offline save on an older phone (GitHub #51). A journal record stays
+ * bytes, through `encodeJournalRecord`, and is read only by recovery at open. Everything
  * LevelDB-specific stays here: the tag-range scans (drained snapshot-first before yielding, so a
  * native iterator never straddles a consumer's `await`), and the one `WriteBatch` each journal
  * write is.
@@ -93,7 +100,7 @@ function keyBytes(key: StoreKey): Uint8Array {
  * The handle is shared with `LevelDBKVStore` and `loadOrCreateRNPeerKey`, so there is no `close`
  * here: the host closes the handle after `storage.close()` has resolved.
  */
-export class LevelDBJournalStore implements JournalStore {
+export class LevelDBJournalStore implements JournalStore<string> {
 	// NOTE: `'process-crash'` holds only while the handle cannot sync (flush contract rule 3 is then
 	// not kept across a power cut: LevelDB's recovery skips a damaged log record and keeps the ones
 	// after it, and no apply is synced). The synced path is built and tested over `classic-level`;
@@ -117,11 +124,11 @@ export class LevelDBJournalStore implements JournalStore {
 
 	// --- reads: the applied stores ---
 
-	async get(key: StoreKey): Promise<Uint8Array | undefined> {
-		return this.db.get(keyBytes(key));
+	async get(key: StoreKey): Promise<string | undefined> {
+		return this.db.getText(keyBytes(key));
 	}
 
-	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, Uint8Array][]> {
+	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, string][]> {
 		// Revs are encoded 8-byte big-endian (`revisionKey`), so byte order == numeric
 		// order and `revisionKey(blockId, hi)` is exactly the inclusive upper bound;
 		// LevelDB's upper bound is exclusive (`lt`), so use `lt = revisionKey(hi + 1)`.
@@ -129,7 +136,7 @@ export class LevelDBJournalStore implements JournalStore {
 		const lt = revisionKey(blockId, hi + 1);
 		// Drained before returning: a native LevelDB iterator must not stay open across the
 		// consumer's awaits (the kernel's drain-before-yield contract).
-		const entries = await drain(this.db.iterator({ gte, lt }));
+		const entries = await drain(this.db.textIterator({ gte, lt }));
 		return entries.map(([key, value]) => [revisionFromKey(key), value]);
 	}
 
@@ -262,31 +269,53 @@ function putEntries(batch: LevelDBWriteBatchLike, record: JournalRecord): void {
 	}
 }
 
-/** The write group's and the journal backend's options (`idleFlushMs`, `maxUnsyncedBytes`, the test-only `setTimer` and `now`). */
-export type LevelDBRawStorageOptions = WriteGroupOptions & JournalBatchBackendOptions;
+/**
+ * The write group's and the journal backend's options (`idleFlushMs`, `maxUnsyncedBytes`, the
+ * test-only `setTimer` and `now`), and the read cache's.
+ */
+export interface LevelDBRawStorageOptions extends WriteGroupOptions, JournalBatchBackendOptions {
+	/** The pool the storage's read cache shares its memory budget with; `defaultCachePool()` by default. */
+	readCachePool?: SharedCachePool;
+	/** Names the storage in the pool's statistics; `'leveldb'` by default. */
+	readCacheLabel?: string;
+}
 
 /**
- * LevelDB-backed {@link IRawStorage} for React Native peers: the shared {@link KvRawStorage}
- * kernel over a {@link WriteGroupDriver} over a {@link JournalBatchBackend} over a
- * {@link LevelDBJournalStore}. Every write resolves into the driver's in-memory overlay; `flush()`
- * hands the group to the backend as one LevelDB batch — applied before the flush resolves, or,
- * for a flush with a window on a handle that can sync, appended as one journal record and applied
- * by the deadline. The public name/constructor (`new LevelDBRawStorage(db)`) is unchanged so
- * existing imports keep resolving.
+ * LevelDB-backed {@link IRawStorage} for React Native peers, every layer holding text: the shared
+ * {@link KvRawStorage} kernel over a {@link CachedStoreDriver} (its read cache) over a
+ * {@link WriteGroupDriver} over a {@link JournalBatchBackend} over a {@link LevelDBJournalStore}.
+ * Every write resolves into the driver's in-memory overlay; `flush()` hands the group to the
+ * backend as one LevelDB batch — applied before the flush resolves, or, for a flush with a window on
+ * a handle that can sync, appended as one journal record and applied by the deadline. The public
+ * name/constructor (`new LevelDBRawStorage(db)`) is unchanged so existing imports keep resolving.
  *
- * `listBlockIds`/`getApproximateBytesUsed`/`getStoreIdentity`/`close` are re-declared here as
- * always-present (the store always implements the first three, so the backend, driver and kernel
- * always wire them, and the driver always has a `close`) — the base declares them optional, but
- * every RN consumer relies on them. `close()` applies what is still held and disarms the timers;
- * it does not close the shared handle, which the host closes afterwards.
+ * The read cache is built in, and there is no option to leave it out: the node's own cache
+ * (`withReadCache`) fronts a storage through `RawStorageDriverAdapter`, which carries bytes, so a
+ * cold read through it would decode the stored value, re-encode it to bytes and decode it again,
+ * twice in JavaScript. Because this storage reports `readCached`, the node and the Quereus plugin
+ * pass it through unwrapped. A cache hit is the cached string and one `JSON.parse`. The cache claims
+ * the handle in its pool (`SharedCachePool.registerStore`), so a second storage over the same handle
+ * while the first is open is refused: two write groups over one store would already break Invariant 1
+ * (every write funnels through one `IRawStorage`) in `packages/db-p2p/docs/storage.md`.
+ *
+ * `listBlockIds`/`getApproximateBytesUsed`/`getStoreIdentity`/`close`/`readCached` are re-declared
+ * here as always-present (the store always implements the first three, so every layer always wires
+ * them, the cache always has a `close` and always reports `readCached`) — the base declares them
+ * optional, but every RN consumer relies on them. `close()` drops the cache and releases its pool
+ * registration, then applies what the write group still holds and disarms the timers; it does not
+ * close the shared handle, which the host closes afterwards.
  */
-export class LevelDBRawStorage extends KvRawStorage {
+export class LevelDBRawStorage extends KvRawStorage<string> {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
 	declare getStoreIdentity: () => StoreIdentity;
 	declare close: () => Promise<void>;
+	// `declare`, not a field: a field would be redefined as `undefined` after `super()` (see the note
+	// on `CachedRawStorage.readCached`).
+	declare readonly readCached: true;
 
 	constructor(db: LevelDBLike, options: LevelDBRawStorageOptions = {}) {
-		super(new WriteGroupDriver(new JournalBatchBackend(new LevelDBJournalStore(db), options), options));
+		const writeGroup = new WriteGroupDriver(new JournalBatchBackend(new LevelDBJournalStore(db), options), options, textValueCodec);
+		super(new CachedStoreDriver(writeGroup, options.readCachePool, options.readCacheLabel ?? 'leveldb', textValueCodec), textValueCodec);
 	}
 }

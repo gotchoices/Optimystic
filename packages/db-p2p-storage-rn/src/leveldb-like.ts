@@ -36,10 +36,13 @@ export interface LevelDBIteratorOptions {
 	keys?: boolean;
 }
 
-/** Cursor over a `LevelDBLike` range scan. Caller must `close()` exactly once. */
-export interface LevelDBIteratorLike {
+/** Range options for a `LevelDBLike.textIterator` scan: an iterator's, less `keys`, since a text scan exists to read values. */
+export type LevelDBTextIteratorOptions = Omit<LevelDBIteratorOptions, 'keys'>;
+
+/** Cursor over a `LevelDBLike` range scan, each value a `V` (bytes, or text from `textIterator`). Caller must `close()` exactly once. */
+export interface LevelDBIteratorLike<V = Uint8Array> {
 	/** Return the next entry, or `undefined` when the range is exhausted. */
-	next(): Promise<[Uint8Array, Uint8Array] | undefined>;
+	next(): Promise<[Uint8Array, V] | undefined>;
 	/** Release any native resources held by the iterator. */
 	close(): Promise<void>;
 }
@@ -78,8 +81,19 @@ export interface LevelDBLike {
 	 */
 	readonly canSync: boolean;
 	get(key: Uint8Array): Promise<Uint8Array | undefined>;
+	/**
+	 * The value at `key` as the text its UTF-8 bytes decode to, decoded by the engine rather than by a
+	 * JavaScript `TextDecoder`, which Hermes provides only as a slow polyfill. Defined for a value that
+	 * is valid UTF-8, and undefined for any other: every block-storage and key-value value this package
+	 * stores is `TextEncoder` output, while a journal record, the journal's mark, the identity key and
+	 * every key are binary, so those are read with `get` and `iterator` alone. Unlike `TextDecoder`,
+	 * the engine keeps a leading byte-order mark.
+	 */
+	getText(key: Uint8Array): Promise<string | undefined>;
 	batch(): LevelDBWriteBatchLike;
 	iterator(options?: LevelDBIteratorOptions): LevelDBIteratorLike;
+	/** `iterator`, each value read as `getText` reads one. */
+	textIterator(options?: LevelDBTextIteratorOptions): LevelDBIteratorLike<string>;
 	/** Release the underlying database handle. */
 	close(): Promise<void>;
 }
@@ -89,8 +103,8 @@ export interface LevelDBLike {
  * iterator never stays open across consumer awaits — same rationale as the
  * IndexedDB and SQLite backends.
  */
-export async function drain(iter: LevelDBIteratorLike): Promise<Array<[Uint8Array, Uint8Array]>> {
-	const out: Array<[Uint8Array, Uint8Array]> = [];
+export async function drain<V>(iter: LevelDBIteratorLike<V>): Promise<Array<[Uint8Array, V]>> {
+	const out: Array<[Uint8Array, V]> = [];
 	try {
 		while (true) {
 			const entry = await iter.next();

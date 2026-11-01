@@ -1,4 +1,13 @@
-import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
+import {
+	WriteGroup,
+	asStoredText,
+	textValueCodec,
+	type CommittedBatch,
+	type FlushOptions,
+	type IKVStore,
+	type WriteGroupEntry,
+	type WriteGroupOptions,
+} from '@optimystic/db-p2p';
 import { drain, type LevelDBLike } from './leveldb-like.js';
 import { kvKey, kvKeyToString, kvPrefixRange } from './keys.js';
 
@@ -6,10 +15,6 @@ import { kvKey, kvKeyToString, kvPrefixRange } from './keys.js';
 export type LevelDBKVStoreOptions = WriteGroupOptions;
 
 const textEncoder = new TextEncoder();
-// Built on first use, not at module load: Hermes (React Native) has no native `TextDecoder`, so a
-// module-scope construction fails the import itself whenever it runs ahead of the host's polyfill.
-let textDecoderInstance: TextDecoder | undefined;
-const textDecoder = (): TextDecoder => textDecoderInstance ??= new TextDecoder();
 
 /**
  * LevelDB-backed `IKVStore` adapter for React Native peers.
@@ -29,32 +34,36 @@ const textDecoder = (): TextDecoder => textDecoderInstance ??= new TextDecoder()
  * treats every window, and each batch carries its own data. A failed batch latches the store, after
  * which every write and flush throws `StoreFailedError` (rule 5 of the flush contract on
  * `RawStoreDriver.flush`); reads keep serving the overlay.
+ *
+ * Values stay text until they reach LevelDB: the overlay holds the string, a batch encodes it with
+ * `TextEncoder` (native in Hermes), and a read from the store is decoded from UTF-8 by the engine
+ * (`LevelDBLike.getText`), so no read constructs a `TextDecoder`, which Hermes has only as a slow
+ * polyfill.
  */
 export class LevelDBKVStore implements IKVStore {
-	private readonly group: WriteGroup<string>;
+	private readonly group: WriteGroup<string, string>;
 
 	constructor(
 		private readonly db: LevelDBLike,
 		private readonly prefix: string = 'optimystic:txn:',
 		options: LevelDBKVStoreOptions = {},
 	) {
-		this.group = new WriteGroup<string>(key => key, {
+		this.group = new WriteGroup<string, string>(key => key, {
 			commit: entries => this.commit(entries),
 			// Every commit is as durable as this store can make it when it resolves, so nothing is ever owed a sync.
 			sync: () => Promise.resolve(),
-		}, options);
+		}, { ...options, storedBytes: textValueCodec.storedBytes });
 	}
 
 	async get(key: string): Promise<string | undefined> {
 		const held = this.group.lookup(key);
-		if (held !== undefined) return held === null ? undefined : textDecoder().decode(held);
-		const bytes = await this.db.get(kvKey(this.prefix + key));
-		if (!bytes) return undefined;
-		return textDecoder().decode(bytes);
+		if (held !== undefined) return held ?? undefined;
+		return this.db.getText(kvKey(this.prefix + key));
 	}
 
+	/** Held as the text it reads back as once stored, so an overlay hit and a read from the store agree on an ill-formed string. */
 	async set(key: string, value: string): Promise<void> {
-		this.group.put(key, textEncoder.encode(value));
+		this.group.put(key, asStoredText(value));
 	}
 
 	async delete(key: string): Promise<void> {
@@ -89,11 +98,11 @@ export class LevelDBKVStore implements IKVStore {
 		return this.group.close();
 	}
 
-	private async commit(entries: readonly WriteGroupEntry<string>[]): Promise<CommittedBatch> {
+	private async commit(entries: readonly WriteGroupEntry<string, string>[]): Promise<CommittedBatch> {
 		const batch = this.db.batch();
 		for (const { key, value } of entries) {
 			const encoded = kvKey(this.prefix + key);
-			if (value === undefined) batch.delete(encoded); else batch.put(encoded, value);
+			if (value === undefined) batch.delete(encoded); else batch.put(encoded, textEncoder.encode(value));
 		}
 		await batch.write({ sync: this.db.canSync });
 		return { durable: Promise.resolve() };

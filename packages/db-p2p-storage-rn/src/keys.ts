@@ -149,6 +149,10 @@ export function blockEnvelopeRange(tag: number, blockId: string): { gte: Uint8Ar
 }
 
 /** Decode the `actionId` suffix from a `pendingKey` / `transactionKey` / `materializedKey`. */
+// NOTE: listings decode key suffixes with `TextDecoder`, a JavaScript polyfill on React Native, where
+// stored values are decoded in native code; a key is binary (tag, length, id), so the engine's text
+// reads cannot decode it. Ids are short and mostly base64url ASCII. If this shows in a device
+// profile, decode an all-ASCII suffix with `String.fromCharCode` and fall back to `TextDecoder`.
 export function actionIdFromKey(key: Uint8Array, blockId: string): string {
 	const blockIdLen = textEncoder.encode(blockId).length;
 	const suffixOffset = 1 + 4 + blockIdLen;

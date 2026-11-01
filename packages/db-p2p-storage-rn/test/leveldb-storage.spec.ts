@@ -11,8 +11,13 @@ import {
 	journalMarkKey,
 	journalRange,
 	journalRecordKey,
+	materializedKey,
 	metadataKey,
+	pendingKey,
+	proofKey,
+	revisionKey,
 	seqFromJournalKey,
+	transactionKey,
 } from '../src/keys.js';
 import { makeProof, runRawStorageConformance, type ConformanceHarness } from '@optimystic/db-p2p/testing/conformance';
 import type { ActionId, BlockHeader, BlockId, IBlock, Transform } from '@optimystic/db-core';
@@ -150,7 +155,14 @@ describe('LevelDB store specifics', () => {
 		}
 
 		// On disk, read by a storage with an empty overlay: the pending row is still there and no
-		// transaction row was created.
+		// transaction row was created. The latched storage is closed first, as an app reopening the
+		// store would: its read cache claims the handle until then. Its closing flush is refused.
+		try {
+			await storage.close();
+			expect.fail('expected the latched storage to refuse its closing flush');
+		} catch (err) {
+			expect(err).to.be.instanceOf(StoreFailedError);
+		}
 		const reader = new LevelDBRawStorage(handle.db);
 		expect(await reader.getPendingTransaction(blockId, actionId)).to.deep.equal(makeTransform());
 		expect(await reader.getTransaction(blockId, actionId)).to.equal(undefined);
@@ -187,6 +199,99 @@ describe('LevelDB store specifics', () => {
 		const { appliedThrough, records } = await store.readJournal();
 		expect(appliedThrough).to.equal(0);
 		expect(records.map(r => r.seq)).to.deep.equal([1, 4]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Text reads. Every stored value is read back as the text its UTF-8 bytes
+// decode to, decoded by the binding in native code (`classic-level`'s `utf8`
+// encoding here, `rn-leveldb`'s `getStr` and `valueStr` on a phone), so data an
+// earlier build wrote reads unchanged and no read reaches a JavaScript
+// `TextDecoder`. Hermes's own decoder is not under test here; a device profile
+// covers it.
+// ---------------------------------------------------------------------------
+describe('LevelDB text reads', () => {
+	// BMP non-ASCII, and an astral character (a surrogate pair in a JavaScript string, 4 bytes in UTF-8).
+	const text = 'é 中 😀';
+	const committed = `committed ${text}` as ActionId;
+	const pended = `pended ${text}` as ActionId;
+	const block: IBlock = { header: { id: blockId, type: `type ${text}`, collectionId: 'collection-1' as BlockId } };
+	const meta: BlockMetadata = { ranges: [[1, 1]], latest: { rev: 1, actionId: committed } };
+	const pending: Transform = { insert: block };
+	const transaction: Transform = { updates: [['entries', 0, 0, [text]]] };
+	const proof = makeProof(text);
+
+	let handle: TestDbHandle;
+
+	beforeEach(async () => {
+		handle = await openTestDb();
+	});
+
+	afterEach(async () => {
+		await handle.cleanup();
+	});
+
+	/** Every value kind read back through `storage`, against what was stored. */
+	async function expectEveryKind(storage: LevelDBRawStorage): Promise<void> {
+		expect(await storage.getMetadata(blockId), 'metadata').to.deep.equal(meta);
+		expect(await storage.getRevision(blockId, 1), 'revision').to.equal(committed);
+		const listed = [];
+		for await (const entry of storage.listRevisions(blockId, 1, 1)) listed.push(entry);
+		expect(listed, 'listed revisions').to.deep.equal([{ rev: 1, actionId: committed }]);
+		expect(await storage.getPendingTransaction(blockId, pended), 'pending').to.deep.equal(pending);
+		expect(await storage.getTransaction(blockId, committed), 'transaction').to.deep.equal(transaction);
+		expect(await storage.getBlockProof(blockId, 1), 'proof').to.deep.equal(proof);
+		expect(await storage.getMaterializedBlock(blockId, committed), 'materialized').to.deep.equal(block);
+	}
+
+	it('values an earlier build wrote, non-ASCII included, read back unchanged', async () => {
+		// The bytes every earlier build stored: `TextEncoder` of the JSON, and of the action id.
+		const encoder = new TextEncoder();
+		const json = (value: unknown): Uint8Array => encoder.encode(JSON.stringify(value));
+		await handle.db.batch()
+			.put(metadataKey(blockId), json(meta))
+			.put(revisionKey(blockId, 1), encoder.encode(committed))
+			.put(pendingKey(blockId, pended), json(pending))
+			.put(transactionKey(blockId, committed), json(transaction))
+			.put(proofKey(blockId, 1), json(proof))
+			.put(materializedKey(blockId, committed), json(block))
+			.write();
+
+		const storage = new LevelDBRawStorage(handle.db);
+		try {
+			await expectEveryKind(storage);
+		} finally {
+			await storage.close();
+		}
+	});
+
+	it('no stored value read calls a TextDecoder, from LevelDB or from the read cache', async () => {
+		const writer = new LevelDBRawStorage(handle.db);
+		await writer.saveMetadata(blockId, meta);
+		await writer.saveRevision(blockId, 1, committed);
+		await writer.savePendingTransaction(blockId, pended, pending);
+		await writer.saveTransaction(blockId, committed, transaction);
+		await writer.saveBlockProof(blockId, 1, proof);
+		await writer.saveMaterializedBlock(blockId, committed, block);
+		// Applies the group and drops the cache, so the next storage's first reads come from LevelDB.
+		await writer.close();
+
+		const reader = new LevelDBRawStorage(handle.db);
+		// The prototype, not the global: the codec builds one decoder and keeps it.
+		const decode = TextDecoder.prototype.decode;
+		let calls = 0;
+		TextDecoder.prototype.decode = function (this: TextDecoder, ...args: Parameters<TextDecoder['decode']>): string {
+			calls++;
+			return decode.apply(this, args);
+		};
+		try {
+			await expectEveryKind(reader);
+			await expectEveryKind(reader);
+		} finally {
+			TextDecoder.prototype.decode = decode;
+			await reader.close();
+		}
+		expect(calls, 'TextDecoder.decode calls across a cold pass and a cached pass').to.equal(0);
 	});
 });
 

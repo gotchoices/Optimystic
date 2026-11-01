@@ -50,6 +50,8 @@ const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
+  storage: rawStorage,
+  kvStore,
 });
 ```
 
@@ -60,7 +62,7 @@ The same handle is shared by all three consumers. Close the storage and the
 key-value store before the handle, and the handle last:
 
 ```ts
-await rawStorage.close();   // applies what it still holds, disarms its timers
+await rawStorage.close();   // releases its read cache, applies what it still holds, disarms its timers
 await kvStore.close();      // commits what it still holds, disarms its timer
 await db.close();
 ```
@@ -69,17 +71,27 @@ Neither `close()` closes the shared handle. A write a store still holds when the
 handle is closed under it is lost, and a timer it still has armed would fire on
 a closed handle.
 
+Open **one** `LevelDBRawStorage` per handle. Its read cache claims the handle
+in its cache pool, so constructing a second one over the same handle while the
+first is open throws (`two caches over one backing store never converge`). That
+refusal is new, but the shape was already wrong: two storages over one store
+each hold writes the other cannot see, which is what
+[storage.md §1. Every write to a store goes through `IRawStorage`](../db-p2p/docs/storage.md#1-every-write-to-a-store-goes-through-irawstorage)
+rules out. Close the first before opening another.
+
 ## Persistence semantics
 
 Everything lives in one LevelDB database (`optimystic` by default), one
 ordered byte keyspace partitioned by a leading tag byte (`src/keys.ts`).
-`LevelDBRawStorage` is the shared `KvRawStorage` kernel over a
-`WriteGroupDriver` over a `JournalBatchBackend` over a `LevelDBJournalStore`:
-the kernel owns all JSON/UTF-8 serialization, so the six block-storage stores
-hold opaque kernel-encoded bytes. The keys and the logical types the kernel
-decodes them back into are unchanged from earlier builds, so data written by
-one reads unchanged, and a database an earlier build wrote has no journal, so
-the first open over it applies nothing.
+`LevelDBRawStorage` is the shared `KvRawStorage` kernel over a read cache
+(`CachedStoreDriver`) over a `WriteGroupDriver` over a `JournalBatchBackend`
+over a `LevelDBJournalStore`: the kernel owns all JSON serialization, so the six
+block-storage stores hold opaque kernel-encoded values, written as UTF-8 bytes
+and read back as text (see *Reads decode text in native code* below). The keys,
+the bytes, and the logical types the kernel decodes them back into are
+unchanged from earlier builds, so data written by one reads unchanged, and a
+database an earlier build wrote has no journal, so the first open over it
+applies nothing.
 
 | Tag | Store | Key suffix | Decoded (logical) type |
 |-----|-------|------------|------------------------|
@@ -98,6 +110,48 @@ drained before any result is yielded so a native iterator never stays open
 across a consumer's `await`. `promotePendingTransaction` records two entries of
 one write group — the committed row's put and the pending row's delete — applied
 in that group's batch, so the move is atomic across crashes.
+
+## Reads decode text in native code
+
+Every stored value is JSON text or an action id, written as `TextEncoder`
+output (native in Hermes). Every read — a block, a transform, metadata, a
+proof, a revision's action id, a key-value record — asks `rn-leveldb` for the
+value as a string (`getStr`, and `valueStr` on an iterator), which the binding
+decodes from UTF-8 in native code. No read reaches a JavaScript `TextDecoder`,
+which Hermes provides only as a polyfill and which a device profile of an
+offline save on an older phone measured as the largest single cost of the save
+(GitHub #51). Values are held as text all the way up: the read cache and the
+write group's in-memory overlay hold the string, so a cache hit is the string
+and one `JSON.parse`, and text becomes bytes only when a group is written to
+LevelDB.
+
+The read cache is part of the storage, not something to add: the node's own
+cache (`withReadCache`) would front the storage through an adapter that carries
+bytes, bringing back two JavaScript decodes per cold read. `LevelDBRawStorage`
+reports itself read-cached, so the node and the Quereus plugin use it as it is.
+It shares a memory budget with every other cache in the process
+(`defaultCachePool()`, 8 MB on React Native by default); pass `readCachePool`
+to use a pool of your own, and `readCacheLabel` to name the storage in the
+pool's statistics (`'leveldb'` by default):
+
+```ts
+const rawStorage = new LevelDBRawStorage(db, { readCachePool: pool, readCacheLabel: 'blocks' });
+```
+
+The binding's decoder and `TextDecoder` agree on every value this package
+stores, since `TextEncoder` output is always valid UTF-8, with one difference:
+`TextDecoder` drops a leading byte-order mark and the binding keeps it. JSON
+never starts with one; an action id can, since whoever originates a write
+chooses it, and it now reads back as written, as it already did from the cache
+and the overlay. Existing databases need no migration.
+
+**The `TextDecoder` polyfill is still required.** `multiformats` and `cborg`
+construct one when they load, and this package still decodes keys with it:
+block and action ids out of a key in a listing (`listPendingTransactions`,
+`listBlockIds`, the key-value store's `list`), since a key is binary and the
+binding's text reads are defined only for UTF-8. Once `rn-leveldb` can sync a
+batch, journal recovery at open will decode each journal record's keys with it
+too, at open only.
 
 ## Durability
 

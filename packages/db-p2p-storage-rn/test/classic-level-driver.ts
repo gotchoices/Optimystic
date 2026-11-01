@@ -1,4 +1,4 @@
-import { ClassicLevel } from 'classic-level';
+import { ClassicLevel, type Iterator as ClassicIterator } from 'classic-level';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +6,7 @@ import type {
 	LevelDBIteratorLike,
 	LevelDBIteratorOptions,
 	LevelDBLike,
+	LevelDBTextIteratorOptions,
 	LevelDBWriteBatchLike,
 	LevelDBWriteOptions,
 } from '../src/leveldb-like.js';
@@ -17,7 +18,9 @@ import type {
  * storage classes run under Mocha without the React Native native module.
  * Unlike `rn-leveldb` it can sync a batch (`WriteOptions.sync`), which is what
  * lets the suite exercise the synced apply path the phone binding cannot
- * take yet.
+ * take yet. Its text reads ask `classic-level` for the `utf8` value encoding,
+ * which it decodes in native code as `rn-leveldb`'s `getStr` does, so the text
+ * path runs over Node's native decoder and never a JavaScript `TextDecoder`.
  *
  * Each `openTestDb()` returns an isolated, file-backed database in a fresh
  * temp directory; the matching `cleanup()` closes the handle and removes the
@@ -32,6 +35,10 @@ class ClassicLevelAdapter implements LevelDBLike {
 	async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		const value = await this.db.get(key);
 		return value === undefined ? undefined : new Uint8Array(value);
+	}
+
+	getText(key: Uint8Array): Promise<string | undefined> {
+		return this.db.get<Uint8Array, string>(key, { valueEncoding: 'utf8' });
 	}
 
 	batch(): LevelDBWriteBatchLike {
@@ -52,40 +59,55 @@ class ClassicLevelAdapter implements LevelDBLike {
 	}
 
 	iterator(options: LevelDBIteratorOptions = {}): LevelDBIteratorLike {
-		// classic-level natively supports gte/gt/lte/lt/reverse/limit/keys/values
-		// — pass through, but request `view` encoding so we get back Uint8Array
-		// rather than Buffer/string.
-		const iter = this.db.iterator({
-			...(options.gte !== undefined && { gte: options.gte }),
-			...(options.gt !== undefined && { gt: options.gt }),
-			...(options.lte !== undefined && { lte: options.lte }),
-			...(options.lt !== undefined && { lt: options.lt }),
-			...(options.reverse && { reverse: true }),
-			...(options.limit !== undefined && { limit: options.limit }),
+		// `view` encoding gives back Uint8Array rather than Buffer or string.
+		const iter = this.db.iterator<Uint8Array, Uint8Array>({
+			...rangeOf(options),
 			keyEncoding: 'view',
 			valueEncoding: 'view',
 			...(options.keys && { values: false }),
 		});
-		let closed = false;
-		return {
-			async next() {
-				if (closed) return undefined;
-				const entry = await iter.next();
-				if (entry === undefined) return undefined;
-				const [k, v] = entry;
-				return [new Uint8Array(k), v ? new Uint8Array(v) : new Uint8Array(0)];
-			},
-			async close() {
-				if (closed) return;
-				closed = true;
-				await iter.close();
-			},
-		};
+		return adaptIterator(iter, value => value ? new Uint8Array(value) : new Uint8Array(0));
+	}
+
+	textIterator(options: LevelDBTextIteratorOptions = {}): LevelDBIteratorLike<string> {
+		const iter = this.db.iterator<Uint8Array, string>({ ...rangeOf(options), keyEncoding: 'view', valueEncoding: 'utf8' });
+		return adaptIterator(iter, value => value ?? '');
 	}
 
 	async close(): Promise<void> {
 		await this.db.close();
 	}
+}
+
+/** The range options `classic-level` takes natively (gte/gt/lte/lt/reverse/limit), passed through. */
+function rangeOf(options: LevelDBTextIteratorOptions) {
+	return {
+		...(options.gte !== undefined && { gte: options.gte }),
+		...(options.gt !== undefined && { gt: options.gt }),
+		...(options.lte !== undefined && { lte: options.lte }),
+		...(options.lt !== undefined && { lt: options.lt }),
+		...(options.reverse && { reverse: true }),
+		...(options.limit !== undefined && { limit: options.limit }),
+	};
+}
+
+/** A `classic-level` iterator as a `LevelDBIteratorLike`, its keys copied into plain Uint8Arrays and each value read by `toValue`. */
+function adaptIterator<V, Raw>(iter: ClassicIterator<ClassicLevel<Uint8Array, Uint8Array>, Uint8Array, Raw>, toValue: (value: Raw | undefined) => V): LevelDBIteratorLike<V> {
+	let closed = false;
+	return {
+		async next() {
+			if (closed) return undefined;
+			const entry = await iter.next();
+			if (entry === undefined) return undefined;
+			const [k, v] = entry;
+			return [new Uint8Array(k), toValue(v)];
+		},
+		async close() {
+			if (closed) return;
+			closed = true;
+			await iter.close();
+		},
+	};
 }
 
 export interface TestDbHandle {

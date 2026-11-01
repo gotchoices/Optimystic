@@ -732,7 +732,7 @@ before any other imports).
 | Timer `.ref()` / `.unref()` | undici | Wrap Hermes numeric timer IDs in objects with no-op `.ref()`/`.unref()` methods; patch `clearTimeout`/`clearInterval` to unwrap |
 | `Event`, `CustomEvent`, `EventTarget` | libp2p, @libp2p/interface | Custom shim or npm `event-target-polyfill` |
 | `Intl.PluralRules` | moat-maker | English-only ordinal/cardinal shim is sufficient |
-| `TextDecoder` | multiformats, cborg, @optimystic/db-core, @optimystic/db-p2p, @optimystic/db-p2p-storage-rn | **multiformats and cborg construct it at module load, so without it the app fails at startup.** Optimystic's own packages construct it only on first use (see below), which does not make it optional. Expo SDK 52+ provides it; bare React Native's Hermes does not. A UTF-8-only shim is sufficient |
+| `TextDecoder` | multiformats, cborg, @optimystic/db-core, @optimystic/db-p2p, @optimystic/db-p2p-storage-rn | **multiformats and cborg construct it at module load, so without it the app fails at startup.** Optimystic's own packages construct it only on first use (see below), which does not make it optional. Stored values on the LevelDB backend (`@optimystic/db-p2p-storage-rn`) are decoded in native code and never reach it, but that backend still uses it to decode keys in listings, and will for journal recovery at open once `rn-leveldb` can sync a batch. Expo SDK 52+ provides it; bare React Native's Hermes does not. A UTF-8-only shim is sufficient |
 | `WebSocket.prototype.bufferedAmount` | @libp2p/websockets | **RN declares the field but never assigns it, so it reads `undefined`.** See below — without this every WebSocket write hangs. |
 
 **`WebSocket.bufferedAmount` deserves its own note, because the symptom does not look like a

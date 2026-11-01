@@ -8,7 +8,10 @@
  * Plain JavaScript because the writer runs it inside a published build's scratch install, and the
  * reader imports the same file (typed by `classic-level.d.mts`) so the two cannot drift. It keeps
  * `put` and `delete` whatever the current `LevelDBLike` declares: the published builds that wrote
- * each write directly call them, and the writer runs those builds over this handle.
+ * each write directly call them, and the writer runs those builds over this handle. Its text reads
+ * (`getText`, `textIterator`) ask `classic-level` for the `utf8` value encoding, which it decodes in
+ * native code as `rn-leveldb` does, so the reader proves data each release wrote reads unchanged
+ * through the path a phone takes.
  */
 
 import { ClassicLevel } from 'classic-level';
@@ -23,6 +26,9 @@ export async function openClassicLevel(path) {
 		async get(key) {
 			const value = await db.get(key);
 			return value === undefined ? undefined : new Uint8Array(value);
+		},
+		getText(key) {
+			return db.get(key, { valueEncoding: 'utf8' });
 		},
 		async put(key, value) {
 			await db.put(key, value);
@@ -48,39 +54,55 @@ export async function openClassicLevel(path) {
 		},
 		iterator(options = {}) {
 			const iterator = db.iterator({
-				...(options.gte !== undefined && { gte: options.gte }),
-				...(options.gt !== undefined && { gt: options.gt }),
-				...(options.lte !== undefined && { lte: options.lte }),
-				...(options.lt !== undefined && { lt: options.lt }),
-				...(options.reverse && { reverse: true }),
-				...(options.limit !== undefined && { limit: options.limit }),
+				...rangeOf(options),
 				...(options.keys && { values: false }),
 				keyEncoding: 'view',
 				valueEncoding: 'view',
 			});
-			let closed = false;
-			return {
-				async next() {
-					if (closed) {
-						return undefined;
-					}
-					const entry = await iterator.next();
-					if (entry === undefined) {
-						return undefined;
-					}
-					const [key, value] = entry;
-					return [new Uint8Array(key), value ? new Uint8Array(value) : new Uint8Array(0)];
-				},
-				async close() {
-					if (!closed) {
-						closed = true;
-						await iterator.close();
-					}
-				},
-			};
+			return adaptIterator(iterator, value => value ? new Uint8Array(value) : new Uint8Array(0));
+		},
+		textIterator(options = {}) {
+			const iterator = db.iterator({ ...rangeOf(options), keyEncoding: 'view', valueEncoding: 'utf8' });
+			return adaptIterator(iterator, value => value ?? '');
 		},
 		async close() {
 			await db.close();
+		},
+	};
+}
+
+/** The range options `classic-level` takes natively, passed through. */
+function rangeOf(options) {
+	return {
+		...(options.gte !== undefined && { gte: options.gte }),
+		...(options.gt !== undefined && { gt: options.gt }),
+		...(options.lte !== undefined && { lte: options.lte }),
+		...(options.lt !== undefined && { lt: options.lt }),
+		...(options.reverse && { reverse: true }),
+		...(options.limit !== undefined && { limit: options.limit }),
+	};
+}
+
+/** A `classic-level` iterator in the package's iterator shape, each key copied into a plain Uint8Array and each value read by `toValue`. */
+function adaptIterator(iterator, toValue) {
+	let closed = false;
+	return {
+		async next() {
+			if (closed) {
+				return undefined;
+			}
+			const entry = await iterator.next();
+			if (entry === undefined) {
+				return undefined;
+			}
+			const [key, value] = entry;
+			return [new Uint8Array(key), toValue(value)];
+		},
+		async close() {
+			if (!closed) {
+				closed = true;
+				await iterator.close();
+			}
 		},
 	};
 }

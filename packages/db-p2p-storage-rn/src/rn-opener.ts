@@ -2,6 +2,7 @@ import type {
 	LevelDBIteratorLike,
 	LevelDBIteratorOptions,
 	LevelDBLike,
+	LevelDBTextIteratorOptions,
 	LevelDBWriteBatchLike,
 	LevelDBWriteOptions,
 } from './leveldb-like.js';
@@ -18,6 +19,8 @@ import type {
 export interface RNLevelDBNative {
 	put(key: ArrayBuffer | string, value: ArrayBuffer | string): void;
 	getBuf(key: ArrayBuffer | string): ArrayBuffer | null;
+	/** The value decoded from UTF-8 in native code (JSI's `String::createFromUtf8`), or `null` when absent. */
+	getStr(key: ArrayBuffer | string): string | null;
 	delete(key: ArrayBuffer | string): void;
 	close(): void;
 	newIterator(): RNLevelDBIteratorNative;
@@ -39,6 +42,8 @@ export interface RNLevelDBIteratorNative {
 	prev(): void;
 	keyBuf(): ArrayBuffer;
 	valueBuf(): ArrayBuffer;
+	/** The current value decoded from UTF-8 in native code, as `getStr` decodes one. */
+	valueStr(): string;
 	close(): void;
 }
 
@@ -111,12 +116,20 @@ class RNLevelDBAdapter implements LevelDBLike {
 		return result === null ? undefined : new Uint8Array(result);
 	}
 
+	async getText(key: Uint8Array): Promise<string | undefined> {
+		return this.native.getStr(toArrayBuffer(key)) ?? undefined;
+	}
+
 	batch(): LevelDBWriteBatchLike {
 		return new RNLevelDBWriteBatchAdapter(this.native, new this.WriteBatch());
 	}
 
 	iterator(options: LevelDBIteratorOptions = {}): LevelDBIteratorLike {
-		return new RNLevelDBIteratorAdapter(this.native.newIterator(), options);
+		return new RNLevelDBIteratorAdapter(this.native.newIterator(), options, options.keys ? noValue : bytesValue);
+	}
+
+	textIterator(options: LevelDBTextIteratorOptions = {}): LevelDBIteratorLike<string> {
+		return new RNLevelDBIteratorAdapter(this.native.newIterator(), options, textValue);
 	}
 
 	async close(): Promise<void> {
@@ -153,17 +166,27 @@ class RNLevelDBWriteBatchAdapter implements LevelDBWriteBatchLike {
 	}
 }
 
-class RNLevelDBIteratorAdapter implements LevelDBIteratorLike {
+/** How an iterator adapter reads the value at the native iterator's position. */
+type ReadValue<V> = (iter: RNLevelDBIteratorNative) => V;
+
+const bytesValue: ReadValue<Uint8Array> = iter => new Uint8Array(iter.valueBuf());
+const textValue: ReadValue<string> = iter => iter.valueStr();
+/** A `keys: true` scan wants only keys, so the `valueBuf` native call is skipped. */
+const noValue: ReadValue<Uint8Array> = () => new Uint8Array(0);
+
+/** One positioning and bounds walk for both value kinds; only {@link ReadValue} differs. */
+class RNLevelDBIteratorAdapter<V> implements LevelDBIteratorLike<V> {
 	private positioned = false;
 	private yielded = 0;
 	private done = false;
 
 	constructor(
 		private readonly iter: RNLevelDBIteratorNative,
-		private readonly opts: LevelDBIteratorOptions,
+		private readonly opts: LevelDBTextIteratorOptions,
+		private readonly readValue: ReadValue<V>,
 	) {}
 
-	async next(): Promise<[Uint8Array, Uint8Array] | undefined> {
+	async next(): Promise<[Uint8Array, V] | undefined> {
 		if (this.done) return undefined;
 		if (this.opts.limit !== undefined && this.yielded >= this.opts.limit) {
 			this.done = true;
@@ -207,8 +230,7 @@ class RNLevelDBIteratorAdapter implements LevelDBIteratorLike {
 			}
 		}
 
-		// `keys: true` means caller wants only keys; skip the `valueBuf` native call.
-		const value = this.opts.keys ? new Uint8Array(0) : new Uint8Array(this.iter.valueBuf());
+		const value = this.readValue(this.iter);
 		this.yielded++;
 		return [key, value];
 	}

@@ -20,7 +20,8 @@ KvRawStorage (shared kernel) → RawStoreDriver (per-backend bytes layer)
 routing through the kernel, and a test double (`CrashingRawStorage` in
 `db-p2p/test/mid-ddl-crash.spec.ts`) does exactly that — but every shipping
 backend today reuses the shared `KvRawStorage` kernel over a small
-`RawStoreDriver` that only speaks bytes: `MemoryRawStorage`, `FileRawStorage`,
+`RawStoreDriver` that only moves stored values (bytes, or on React Native the text
+they decode to, see *Shared KV Kernel* below): `MemoryRawStorage`, `FileRawStorage`,
 `IndexedDBRawStorage`, `LevelDBRawStorage`, and `SqliteRawStorage` all `extends
 KvRawStorage`, each supplying only a driver for its native mechanism — or, for the
 backends that take their writes a group at a time, a `BatchBackend` or a `JournalStore`
@@ -776,6 +777,21 @@ directly: `TextEncoder` normalises an ill-formed string (an action id can hold a
 U+FFFD, where an engine's own conversion may not, and `TextEncoder` is native in Hermes, so there is
 no measured saving to buy with that risk.
 
+**The React Native backend is the one text composition.** `LevelDBRawStorage`
+(`packages/db-p2p-storage-rn/src/leveldb-storage.ts`) is `KvRawStorage<string>` over
+`CachedStoreDriver<string>` over `WriteGroupDriver<string>` over `JournalBatchBackend<string>` over
+`LevelDBJournalStore`, whose two value reads, `get` and `rangeRevisions`, ask the binding for text
+decoded in native code (`getText` and `textIterator` on `LevelDBLike` in
+`packages/db-p2p-storage-rn/src/leveldb-like.ts`, over `rn-leveldb`'s `getStr` and `valueStr`). Before
+it, every block, transform, metadata, proof and revision read on a phone ran Hermes's JavaScript
+`TextDecoder` polyfill, measured as the largest single cost of an offline save on an older phone
+(GitHub #51). Keys stay bytes — a key is a tag byte, a binary length and an id, not valid UTF-8 — so
+the listings and the journal's recovery read still decode in JavaScript. Its read cache is built
+in rather than left to the node: a cache `withReadCache` adds fronts the storage through the
+bytes-only `RawStorageDriverAdapter`, so each cold read would decode, re-encode and decode again, in
+JavaScript both times. `LevelDBRawStorage` reports `readCached`, so the node and the Quereus plugin
+pass it through (*Wiring*, under *Write-through raw-storage cache* below).
+
 Because a get always decodes a fresh object (JSON-decode on read) and a save always stores an
 independent copy (JSON-encode on save; bytes are never written to after encoding, and a string is
 immutable), every read yields a fresh object *by construction*. The `structuredClone`-on-every-get/put
@@ -1107,6 +1123,12 @@ Semantics worth knowing:
   stays the recommended one whenever the driver is reachable; requiring the
   storage-level form at a seam would force exactly the hosts that *have* a driver
   into the strictly worse composition.
+- **A backend may build its cache in.** `LevelDBRawStorage` composes its own
+  `CachedStoreDriver<string>` (*The React Native backend is the one text
+  composition*, under *Shared KV Kernel* above), taking the pool and label as its `readCachePool` and
+  `readCacheLabel` options, so it reaches every seam already cached and passes
+  through with no lease; its `close()` releases the registration. The host
+  closes it, as it would any storage it built.
 - **Never wrap `MemoryRawStorage`/`MemoryStoreDriver`** in production wiring:
   the memory driver already holds the same byte references, so the cache is
   pure bookkeeping overhead (tests do wrap it, to prove semantics match).
