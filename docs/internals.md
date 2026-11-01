@@ -3355,17 +3355,20 @@ getMaterializedBlock(): return structuredClone(this.blocks.get(key));
 **Now structural for kernel-backed stores.** Every store built on the shared
 `KvRawStorage` kernel (`packages/db-p2p/src/storage/kv-raw-storage.ts`) over a
 `RawStoreDriver` no longer needs — and must not reintroduce — the `structuredClone`
-discipline. Values cross the driver boundary as `Uint8Array` produced by `JSON`-encode
-(`raw-store-codec.ts`) and consumed by `JSON`-decode, so every save stores an independent
-byte snapshot and every read decodes a fresh object *by construction*. The in-memory
+discipline. Values cross the driver boundary encoded — a `Uint8Array`, or for a text
+composition the string those bytes decode to (`ValueCodec` in
+`packages/db-p2p/src/storage/raw-store-codec.ts`) — produced by `JSON`-encode and consumed by
+`JSON`-decode, so every save stores an independent snapshot and every read decodes a fresh object
+*by construction*. A string is immutable, so the invariant holds for text with no rule at all, more
+strongly than for bytes, which a holder could write to in place (nothing does). The in-memory
 driver (`memory-store-driver.ts`) stores byte references directly with no cloning. The
 conformance suite (`src/testing/raw-storage-conformance.ts`) asserts clone-on-store /
-clone-on-read against any driver, so a backend that shortcuts the byte boundary is caught.
+clone-on-read against any driver, so a backend that shortcuts the encoded boundary is caught.
 The clone rule above still applies only to a store that keeps live object references (none
-do today). The optional write-through cache (`cached-store-driver.ts`) sits inside that byte
-boundary for the same reason: it caches the encoded `Uint8Array`, never a decoded object, so
-the kernel still decodes a fresh object per read and needs no cache-side cloning. The
-conformance suite runs against the cached compositions too.
+do today). The optional write-through cache (`cached-store-driver.ts`) and the write group's
+overlay sit inside that boundary for the same reason: each holds the encoded value, never a
+decoded object, so the kernel still decodes a fresh object per read and needs no cloning above
+it. The conformance suite runs against the cached compositions too, the text one included.
 
 ### 3. Independent Node Storage
 **Bug**: Each node has its own storage. Consensus doesn't automatically sync data.

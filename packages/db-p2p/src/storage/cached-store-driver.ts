@@ -2,6 +2,7 @@ import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
 import type { FlushOptions, StoreDurability } from "./store-durability.js";
+import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecArgument } from "./raw-store-codec.js";
 import {
 	defaultCachePool,
 	SharedCachePool,
@@ -12,13 +13,13 @@ import {
 } from "./shared-cache-pool.js";
 
 /**
- * A cached value at the byte layer. `null` records a PROVEN absence — a confirmed miss read
+ * A cached value, in the driver's representation. `null` records a PROVEN absence — a confirmed miss read
  * through this wrapper, or a delete that went through it. A plain map miss (`undefined`)
  * means "unknown": the wrapper has never observed this key, so the inner driver must be
  * consulted. The distinction is load-bearing for the absence/unavailability logic one layer
  * up: a cached `null` may only ever mean "provably absent", never "could not confirm".
  */
-type CachedBytes = Uint8Array | null;
+type CachedValue<V extends StoredValue> = V | null;
 
 /**
  * Inclusive integer interval `[lo, hi]`. Distinct from `RevisionRange` (inclusive-exclusive,
@@ -73,8 +74,8 @@ function addCovered(covered: CoveredInterval[], lo: number, hi: number): Covered
  * enumeration can detect that a write landed during its inner drain and decline to claim
  * coverage it can no longer prove.
  */
-interface RevMapState {
-	byRev: Map<number, Uint8Array>;
+interface RevMapState<V extends StoredValue> {
+	byRev: Map<number, V>;
 	covered: CoveredInterval[];
 	gen: number;
 }
@@ -101,20 +102,20 @@ interface PendListState {
  * name-derived, so two stores running the same schema collide), which is why the store id
  * leads the key.
  */
-interface BlockCacheState {
-	meta?: PoolEntry<CachedBytes>;
-	revs?: PoolEntry<RevMapState>;
+interface BlockCacheState<V extends StoredValue> {
+	meta?: PoolEntry<CachedValue<V>>;
+	revs?: PoolEntry<RevMapState<V>>;
 	pendList?: PoolEntry<PendListState>;
-	pending: Map<ActionId, PoolEntry<CachedBytes>>;
-	transactions: Map<ActionId, PoolEntry<CachedBytes>>;
-	materialized: Map<ActionId, PoolEntry<CachedBytes>>;
+	pending: Map<ActionId, PoolEntry<CachedValue<V>>>;
+	transactions: Map<ActionId, PoolEntry<CachedValue<V>>>;
+	materialized: Map<ActionId, PoolEntry<CachedValue<V>>>;
 }
 
 /** Approximate bytes for JS-object bookkeeping, charged so tiny/negative entries are not free. */
 const CHAR_BYTES = 2;
 /** Fixed cost of one pool entry: entry object + owner map slot + queue map slot (key string charged separately). */
 const ENTRY_BASE = 256;
-/** Per-revision cost inside a revision map: map slot + boxed rev + Uint8Array header. */
+/** Per-revision cost inside a revision map: map slot + boxed rev + the value's own header. */
 const REV_SLOT = 56;
 /** Per-interval cost of the coverage list. */
 const INTERVAL_SLOT = 56;
@@ -167,10 +168,13 @@ function idsContent(ids: Set<ActionId>): number {
  * including the one just written. The eviction callback ({@link onPoolEvict}) removes only
  * the wrapper's reference and never calls back into the pool.
  *
- * **Values are cached as bytes**, exactly the encoded value the kernel wrote or the driver
- * returned. The kernel decodes fresh objects from those bytes on every read, so the
- * clone-on-read/clone-on-write discipline stays structural (same argument as the codec
- * boundary itself), and an entry's byte size feeds the pool's budget directly.
+ * **Values are cached in the driver's representation** (`V`: bytes by default, text for a text
+ * composition), exactly the encoded value the kernel wrote or the driver returned. The kernel
+ * decodes fresh objects from them on every read, so the clone-on-read/clone-on-write discipline
+ * stays structural (same argument as the codec boundary itself: bytes are never written to after
+ * encoding, and a string is immutable), and each value's {@link ValueCodec.residentBytes} feeds the
+ * pool's budget. Like the kernel, the cache takes the composition's codec, which a bytes
+ * composition may leave out.
  * NOTE: every cache hit still pays one JSON.parse in the kernel; if decode ever shows up hot
  * on large materialized blocks, cache decoded objects plus an explicit clone instead.
  *
@@ -181,9 +185,10 @@ function idsContent(ids: Set<ActionId>): number {
  * references in maps; wrapping it duplicates every map entry (the bytes themselves are
  * shared, so no byte copy — but the bookkeeping is pure overhead with nothing to save).
  */
-export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
-	private readonly blocks = new Map<BlockId, BlockCacheState>();
+export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements RawStoreDriver<V>, PoolEntryOwner {
+	private readonly blocks = new Map<BlockId, BlockCacheState<V>>();
 	private readonly store: CacheStoreHandle;
+	private readonly codec: ValueCodec<V>;
 
 	/**
 	 * Optional passthroughs are wired only when the inner driver provides them, mirroring
@@ -213,9 +218,10 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	readonly durability: StoreDurability;
 
 	constructor(
-		private readonly inner: RawStoreDriver,
+		private readonly inner: RawStoreDriver<V>,
 		private readonly pool: SharedCachePool = defaultCachePool(),
 		label?: string,
+		...codec: ValueCodecArgument<V>
 	) {
 		// Stacked wrap — the inner driver already has a read cache at or below it, so this one
 		// would only ever read through that one. Caught HERE, and before `registerStore`, because
@@ -237,6 +243,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		// lets the pool refuse a second, permanently divergent view of it. Throws before anything else is
 		// wired; the half-built driver is never returned and holds nothing to clean up.
 		this.store = pool.registerStore(label, inner.storeIdentity?.());
+		this.codec = resolveValueCodec(codec);
 		this.durability = inner.durability;
 		if (inner.storeIdentity) {
 			this.storeIdentity = () => inner.storeIdentity!();
@@ -333,7 +340,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * reachable with an arbitrary block-id list) churns the probation queue instead of
 	 * growing this map without bound.
 	 */
-	private state(blockId: BlockId): BlockCacheState {
+	private state(blockId: BlockId): BlockCacheState<V> {
 		let s = this.blocks.get(blockId);
 		if (!s) {
 			s = { pending: new Map(), transactions: new Map(), materialized: new Map() };
@@ -343,7 +350,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	}
 
 	/** Reap a block state holding no entries, so evictions and declined fills leave nothing behind. */
-	private dropIfEmpty(blockId: BlockId, s: BlockCacheState): void {
+	private dropIfEmpty(blockId: BlockId, s: BlockCacheState<V>): void {
 		if (s.meta === undefined && s.revs === undefined && s.pendList === undefined
 			&& s.pending.size === 0 && s.transactions.size === 0 && s.materialized.size === 0
 			&& this.blocks.get(blockId) === s) {
@@ -355,7 +362,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * An inner read threw after {@link state} allocated: reap the (uncharged) empty state so
 	 * a stream of probes against a throwing backend cannot grow `blocks` for free.
 	 */
-	private reapOnThrow(blockId: BlockId, started: BlockCacheState): void {
+	private reapOnThrow(blockId: BlockId, started: BlockCacheState<V>): void {
 		if (this.blocks.get(blockId) === started) this.dropIfEmpty(blockId, started);
 	}
 
@@ -367,15 +374,15 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 */
 	private cachePoint(
 		blockId: BlockId,
-		s: BlockCacheState,
+		s: BlockCacheState<V>,
 		cls: CacheEntryClass,
 		actionId: ActionId | undefined,
-		bytes: CachedBytes,
-		existing: PoolEntry<CachedBytes> | undefined,
-		attach: (e: PoolEntry<CachedBytes>) => void,
+		value: CachedValue<V>,
+		existing: PoolEntry<CachedValue<V>> | undefined,
+		attach: (e: PoolEntry<CachedValue<V>>) => void,
 		detach: () => void,
 	): void {
-		const len = bytes === null ? 0 : bytes.length;
+		const len = value === null ? 0 : this.codec.residentBytes(value);
 		if (existing !== undefined) {
 			const charge = existing.base + len;
 			if (!this.pool.admits(charge)) {
@@ -384,7 +391,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 				this.dropIfEmpty(blockId, s);
 				return;
 			}
-			existing.value = bytes;
+			existing.value = value;
 			this.pool.updated(existing, charge);
 			return;
 		}
@@ -394,9 +401,9 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 			this.dropIfEmpty(blockId, s);
 			return;
 		}
-		const entry: PoolEntry<CachedBytes> = {
+		const entry: PoolEntry<CachedValue<V>> = {
 			key, store: this.store, owner: this, cls, blockId, actionId,
-			value: bytes, base, charge: base + len, where: 'none',
+			value, base, charge: base + len, where: 'none',
 		};
 		attach(entry);
 		this.pool.admit(entry);
@@ -417,31 +424,31 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 */
 	private fillMiss(
 		blockId: BlockId,
-		started: BlockCacheState,
-		map: Map<ActionId, PoolEntry<CachedBytes>>,
+		started: BlockCacheState<V>,
+		map: Map<ActionId, PoolEntry<CachedValue<V>>>,
 		cls: CacheEntryClass,
 		actionId: ActionId,
-		bytes: Uint8Array | undefined
+		value: V | undefined
 	): void {
 		// `blocks.get`, not `state()` — a declined fill must not resurrect the block entry.
 		if (this.blocks.get(blockId) !== started) return;
 		if (map.get(actionId) !== undefined) return;
-		this.cachePoint(blockId, started, cls, actionId, bytes ?? null, undefined,
+		this.cachePoint(blockId, started, cls, actionId, value ?? null, undefined,
 			e => map.set(actionId, e), () => map.delete(actionId));
 	}
 
 	// --- metadata ---
 
-	async getMetadata(blockId: BlockId): Promise<Uint8Array | undefined> {
+	async getMetadata(blockId: BlockId): Promise<V | undefined> {
 		const s = this.state(blockId);
 		const hit = s.meta;
 		if (hit !== undefined) {
 			this.pool.touch(hit);
 			return hit.value ?? undefined;
 		}
-		let bytes: Uint8Array | undefined;
+		let value: V | undefined;
 		try {
-			bytes = await this.inner.getMetadata(blockId);
+			value = await this.inner.getMetadata(blockId);
 		} catch (err) {
 			this.reapOnThrow(blockId, s);
 			throw err;
@@ -452,13 +459,13 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		// confirmed miss stays provably absent until a funnelled write overwrites it —
 		// repeated probes of not-yet-created blocks are a real cold-start pattern.
 		if (this.blocks.get(blockId) === s && s.meta === undefined) {
-			this.cachePoint(blockId, s, 'meta', undefined, bytes ?? null, undefined,
+			this.cachePoint(blockId, s, 'meta', undefined, value ?? null, undefined,
 				e => { s.meta = e; }, () => { s.meta = undefined; });
 		}
-		return bytes;
+		return value;
 	}
 
-	async putMetadata(blockId: BlockId, value: Uint8Array): Promise<void> {
+	async putMetadata(blockId: BlockId, value: V): Promise<void> {
 		try {
 			await this.inner.putMetadata(blockId, value);
 		} catch (err) {
@@ -480,6 +487,12 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 
 	// --- revisions ---
 
+	/** What setting a revision to `value` adds to its map's charge: a new slot, or the change from the value it replaces. */
+	private revisionCharge(value: V, replaced: V | undefined): number {
+		const size = this.codec.residentBytes(value);
+		return replaced !== undefined ? size - this.codec.residentBytes(replaced) : REV_SLOT + size;
+	}
+
 	/**
 	 * Get or eagerly admit the block's revision-map entry. Eager (before any inner await) so
 	 * the fill guards have a stable identity to check across the await; the empty container
@@ -487,7 +500,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	 * `undefined` when the pool bypasses even the base charge (absurdly small budget) — the
 	 * callers then pass straight through to the inner driver, uncached.
 	 */
-	private ensureRevs(blockId: BlockId): PoolEntry<RevMapState> | undefined {
+	private ensureRevs(blockId: BlockId): PoolEntry<RevMapState<V>> | undefined {
 		const s = this.state(blockId);
 		if (s.revs !== undefined) return s.revs;
 		const key = this.pool.keyFor(this.store, 'revs', blockId);
@@ -496,7 +509,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 			this.dropIfEmpty(blockId, s);
 			return undefined;
 		}
-		const entry: PoolEntry<RevMapState> = {
+		const entry: PoolEntry<RevMapState<V>> = {
 			key, store: this.store, owner: this, cls: 'revs', blockId, actionId: undefined,
 			value: { byRev: new Map(), covered: [], gen: 0 }, base, charge: base, where: 'none',
 		};
@@ -505,7 +518,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		return entry;
 	}
 
-	async getRevision(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+	async getRevision(blockId: BlockId, rev: number): Promise<V | undefined> {
 		const entry = this.ensureRevs(blockId);
 		if (entry === undefined) return this.inner.getRevision(blockId, rev);
 		const revs = entry.value;
@@ -513,23 +526,23 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 			this.pool.touch(entry);
 			return revs.byRev.get(rev);
 		}
-		const bytes = await this.inner.getRevision(blockId, rev);
+		const value = await this.inner.getRevision(blockId, rev);
 		const current = this.blocks.get(blockId)?.revs;
 		if (current === entry && !coversRange(revs.covered, rev, rev)) {
 			let charge = entry.charge;
-			if (bytes !== undefined) {
-				revs.byRev.set(rev, bytes);
-				charge += REV_SLOT + bytes.length;
+			if (value !== undefined) {
+				revs.byRev.set(rev, value);
+				charge += this.revisionCharge(value, undefined);
 			}
 			const before = revs.covered.length;
 			revs.covered = addCovered(revs.covered, rev, rev);
 			charge += (revs.covered.length - before) * INTERVAL_SLOT;
 			this.pool.updated(entry, charge);
 		}
-		return bytes;
+		return value;
 	}
 
-	async putRevision(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+	async putRevision(blockId: BlockId, rev: number, value: V): Promise<void> {
 		try {
 			await this.inner.putRevision(blockId, rev, value);
 		} catch (err) {
@@ -547,7 +560,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		const revs = entry.value;
 		const had = revs.byRev.get(rev);
 		revs.byRev.set(rev, value);
-		let charge = entry.charge + (had !== undefined ? value.length - had.length : REV_SLOT + value.length);
+		let charge = entry.charge + this.revisionCharge(value, had);
 		const before = revs.covered.length;
 		revs.covered = addCovered(revs.covered, rev, rev);
 		charge += (revs.covered.length - before) * INTERVAL_SLOT;
@@ -555,10 +568,10 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		this.pool.updated(entry, charge);
 	}
 
-	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, Uint8Array]> {
+	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, V]> {
 		const entry = this.ensureRevs(blockId);
 		if (entry === undefined) {
-			const drained: [number, Uint8Array][] = [];
+			const drained: [number, V][] = [];
 			for await (const item of this.inner.rangeRevisions(blockId, lo, hi, reverse)) {
 				drained.push(item);
 			}
@@ -574,23 +587,23 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 			// while revisions are dense (one per commit) and callers bound `hi` by a real
 			// `latest.rev`. If a sparse or very wide range ever appears here, iterate
 			// `byRev`'s keys sorted instead.
-			const out: [number, Uint8Array][] = [];
+			const out: [number, V][] = [];
 			if (reverse) {
 				for (let rev = hi; rev >= lo; rev--) {
-					const bytes = revs.byRev.get(rev);
-					if (bytes !== undefined) out.push([rev, bytes]);
+					const value = revs.byRev.get(rev);
+					if (value !== undefined) out.push([rev, value]);
 				}
 			} else {
 				for (let rev = lo; rev <= hi; rev++) {
-					const bytes = revs.byRev.get(rev);
-					if (bytes !== undefined) out.push([rev, bytes]);
+					const value = revs.byRev.get(rev);
+					if (value !== undefined) out.push([rev, value]);
 				}
 			}
 			yield* out;
 			return;
 		}
 		const gen = revs.gen;
-		const drained: [number, Uint8Array][] = [];
+		const drained: [number, V][] = [];
 		for await (const item of this.inner.rangeRevisions(blockId, lo, hi, reverse)) {
 			drained.push(item);
 		}
@@ -601,10 +614,10 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		const current = this.blocks.get(blockId)?.revs;
 		if (current === entry && revs.gen === gen) {
 			let charge = entry.charge;
-			for (const [rev, bytes] of drained) {
+			for (const [rev, value] of drained) {
 				const had = revs.byRev.get(rev);
-				revs.byRev.set(rev, bytes);
-				charge += had !== undefined ? bytes.length - had.length : REV_SLOT + bytes.length;
+				revs.byRev.set(rev, value);
+				charge += this.revisionCharge(value, had);
 			}
 			const before = revs.covered.length;
 			revs.covered = addCovered(revs.covered, lo, hi);
@@ -678,25 +691,25 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 		this.dropIfEmpty(blockId, s);
 	}
 
-	async getPending(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	async getPending(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		const s = this.state(blockId);
 		const cached = s.pending.get(actionId);
 		if (cached !== undefined) {
 			this.pool.touch(cached);
 			return cached.value ?? undefined;
 		}
-		let bytes: Uint8Array | undefined;
+		let value: V | undefined;
 		try {
-			bytes = await this.inner.getPending(blockId, actionId);
+			value = await this.inner.getPending(blockId, actionId);
 		} catch (err) {
 			this.reapOnThrow(blockId, s);
 			throw err;
 		}
-		this.fillMiss(blockId, s, s.pending, 'pending', actionId, bytes);
-		return bytes;
+		this.fillMiss(blockId, s, s.pending, 'pending', actionId, value);
+		return value;
 	}
 
-	async putPending(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putPending(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		try {
 			await this.inner.putPending(blockId, actionId, value);
 		} catch (err) {
@@ -760,25 +773,25 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 
 	// --- transactions ---
 
-	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		const s = this.state(blockId);
 		const cached = s.transactions.get(actionId);
 		if (cached !== undefined) {
 			this.pool.touch(cached);
 			return cached.value ?? undefined;
 		}
-		let bytes: Uint8Array | undefined;
+		let value: V | undefined;
 		try {
-			bytes = await this.inner.getTransaction(blockId, actionId);
+			value = await this.inner.getTransaction(blockId, actionId);
 		} catch (err) {
 			this.reapOnThrow(blockId, s);
 			throw err;
 		}
-		this.fillMiss(blockId, s, s.transactions, 'tx', actionId, bytes);
-		return bytes;
+		this.fillMiss(blockId, s, s.transactions, 'tx', actionId, value);
+		return value;
 	}
 
-	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putTransaction(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		try {
 			await this.inner.putTransaction(blockId, actionId, value);
 		} catch (err) {
@@ -800,35 +813,35 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	// NOTE: if proof reads ever show up as hot, give proofs their own cache namespace
 	// alongside `transactions` (point entries keyed by rev, same shape as `tx`).
 
-	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+	async getProof(blockId: BlockId, rev: number): Promise<V | undefined> {
 		return this.inner.getProof(blockId, rev);
 	}
 
-	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+	async putProof(blockId: BlockId, rev: number, value: V): Promise<void> {
 		await this.inner.putProof(blockId, rev, value);
 	}
 
 	// --- materialized ---
 
-	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		const s = this.state(blockId);
 		const cached = s.materialized.get(actionId);
 		if (cached !== undefined) {
 			this.pool.touch(cached);
 			return cached.value ?? undefined;
 		}
-		let bytes: Uint8Array | undefined;
+		let value: V | undefined;
 		try {
-			bytes = await this.inner.getMaterialized(blockId, actionId);
+			value = await this.inner.getMaterialized(blockId, actionId);
 		} catch (err) {
 			this.reapOnThrow(blockId, s);
 			throw err;
 		}
-		this.fillMiss(blockId, s, s.materialized, 'mat', actionId, bytes);
-		return bytes;
+		this.fillMiss(blockId, s, s.materialized, 'mat', actionId, value);
+		return value;
 	}
 
-	async putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putMaterialized(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		try {
 			await this.inner.putMaterialized(blockId, actionId, value);
 		} catch (err) {
@@ -913,15 +926,17 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 			throw err;
 		}
 		const s = this.state(blockId);
-		const pendingBytes = s.pending.get(actionId)?.value;
+		const pendingValue = s.pending.get(actionId)?.value;
 		this.cachePoint(blockId, s, 'pending', actionId, null, s.pending.get(actionId),
 			e => s.pending.set(actionId, e), () => s.pending.delete(actionId));
 		this.notePendListRemove(blockId, actionId);
-		if (pendingBytes instanceof Uint8Array) {
+		// Presence, not a type test: a cached value of either representation is carried over, while
+		// `undefined` (never observed, or evicted) and `null` (a cached negative) are not values.
+		if (pendingValue !== undefined && pendingValue !== null) {
 			// The block state may have been reaped by an eviction the mutations above caused;
 			// re-fetch (or re-create) it before installing the committed value.
 			const s2 = this.blocks.get(blockId) ?? this.state(blockId);
-			this.cachePoint(blockId, s2, 'tx', actionId, pendingBytes, s2.transactions.get(actionId),
+			this.cachePoint(blockId, s2, 'tx', actionId, pendingValue, s2.transactions.get(actionId),
 				e => s2.transactions.set(actionId, e), () => s2.transactions.delete(actionId));
 		} else {
 			// Unknown (never observed, or evicted) — or a cached negative that promote just
@@ -932,7 +947,7 @@ export class CachedStoreDriver implements RawStoreDriver, PoolEntryOwner {
 	}
 }
 
-function evictFromMap(map: Map<ActionId, PoolEntry<CachedBytes>>, entry: PoolEntry): void {
+function evictFromMap<V extends StoredValue>(map: Map<ActionId, PoolEntry<CachedValue<V>>>, entry: PoolEntry): void {
 	if (entry.actionId !== undefined && map.get(entry.actionId) === entry) {
 		map.delete(entry.actionId);
 	}

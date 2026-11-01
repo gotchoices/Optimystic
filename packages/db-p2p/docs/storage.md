@@ -746,14 +746,39 @@ is under *The file backend* there. See "Shared KV Kernel" below.
 
 `KvRawStorage` implements the full `IRawStorage` surface once, on top of a
 `RawStoreDriver`. The driver exposes each backend's six logical stores
-(metadata, revisions, pending, transactions, materialized, proofs) as bytes-valued maps
+(metadata, revisions, pending, transactions, materialized, proofs) as maps of stored values
 over its native mechanism; the kernel owns all value (de)serialization (JSON via
 `raw-store-codec.ts`) and call orchestration. Backends therefore never
-(de)serialize values — they only lay out keys and move bytes.
+(de)serialize values — they only lay out keys and move values.
 
-Because values cross the driver boundary as `Uint8Array` (JSON-encode on save,
-JSON-decode on read), every save stores an independent byte snapshot and every
-read yields a fresh object *by construction*. The `structuredClone`-on-every-get/put
+**How a value is held in memory is a type parameter.** Values cross the driver as `V`
+(`RawStoreDriver<V>`, `StoredValue` in `packages/db-p2p/src/storage/raw-store-codec.ts`):
+`Uint8Array` by default, or `string`, the text the stored UTF-8 bytes decode to — the same logical
+value, for a backend whose platform decodes text natively and so never needs a JavaScript
+`TextDecoder` (React Native's LevelDB binding; Hermes has no native one). Every existing driver is a
+`RawStoreDriver`, which is `RawStoreDriver<Uint8Array>`. The representation is chosen once per
+composition with a `ValueCodec` — `bytesValueCodec` or `textValueCodec` in the same file — which
+encodes and decodes the JSON and the action id and says what a value costs: `storedBytes` (on disk,
+pacing a write group's `maxUnsyncedBytes`), `residentBytes` (in memory, charged to the read cache's
+pool) and `toBytes`. A composition is homogeneous: a text kernel over a text cache over a text write
+group over a backend whose reads return text, and the type checker refuses any mix. Nothing branches
+on the representation at run time. A bytes composition may leave the codec out of every constructor
+(`new KvRawStorage(driver)` is unchanged); any other representation must name it, or the call does
+not compile (`ValueCodecArgument`, same file).
+
+**Text becomes bytes in one place.** `WriteGroupDriver<V>` holds `V` in its overlay and hands each
+sealed group to its `BatchBackend` with every value converted by `toBytes` (the identity for bytes).
+A `BatchBackend<R>`'s reads return `R`, but its writes — `commit` entries, and so a
+`JournalBatchBackend`'s journal records — are always bytes. So what lands on disk is the
+`TextEncoder` output a bytes composition writes, byte for byte, and a text composition reads data
+any earlier release wrote with no migration. Strings are deliberately not handed to the engine
+directly: `TextEncoder` normalises an ill-formed string (an action id can hold a lone surrogate) to
+U+FFFD, where an engine's own conversion may not, and `TextEncoder` is native in Hermes, so there is
+no measured saving to buy with that risk.
+
+Because a get always decodes a fresh object (JSON-decode on read) and a save always stores an
+independent copy (JSON-encode on save; bytes are never written to after encoding, and a string is
+immutable), every read yields a fresh object *by construction*. The `structuredClone`-on-every-get/put
 discipline the old in-memory backend needed is now structural, not a rule — see
 docs/internals.md "Storage Returns References". `promote` (pending → committed) is
 the only cross-key atomic operation the kernel requires; each backend satisfies it
@@ -803,7 +828,9 @@ the driver does is under Invariant 6, *Writes that wait in memory*.
 ### 6. Write-through raw-storage cache (`CachedStoreDriver` + `CachedRawStorage`)
 
 `CachedStoreDriver` wraps any `RawStoreDriver` with an in-memory, **write-through
-coherent** cache at the bytes layer. Every save stores its encoded value *into*
+coherent** cache of encoded values, held in the driver's representation (§5: bytes by default,
+text for a text composition) and charged to the pool at the codec's `residentBytes`. Every save
+stores its encoded value *into*
 the cache as it writes the inner driver — it never invalidates — so after one
 cold read per key the cache always holds the last durable value and reads stop
 touching the backend for the life of the process. This is what a plain
@@ -1263,7 +1290,7 @@ const blockStorage = new BlockStorage(
 ### 3. Memory Management
 
 - **Lazy Loading**: Loads data only when accessed
-- **Snapshot-on-Store/Read**: Callers never share mutable references with the store. A backend that keeps live object references must deep-clone on get and put; a kernel-backed backend gets this for free from the `Uint8Array` codec boundary (see the shared KV kernel above)
+- **Snapshot-on-Store/Read**: Callers never share mutable references with the store. A backend that keeps live object references must deep-clone on get and put; a kernel-backed backend gets this for free from the codec boundary, where values cross encoded (see the shared KV kernel above)
 - **Resource Cleanup**: Properly manages file handles and locks
 
 ## Error Handling

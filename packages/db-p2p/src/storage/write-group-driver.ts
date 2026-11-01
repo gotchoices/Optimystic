@@ -2,16 +2,22 @@ import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { RawStoreDriver } from './raw-store-driver.js';
 import type { FlushOptions, StoreDurability } from './store-durability.js';
 import type { StoreIdentity } from './store-identity.js';
-import { canonicalStoreKey, type BatchBackend, type StoreKey } from './batch-backend.js';
-import { WriteGroup, type OverlayValue, type WriteGroupOptions } from './write-group.js';
+import { canonicalStoreKey, type BatchBackend, type BatchEntry, type StoreKey } from './batch-backend.js';
+import { WriteGroup, type OverlayValue, type WriteGroupEntry, type WriteGroupOptions, type WriteGroupSink } from './write-group.js';
+import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecArgument } from './raw-store-codec.js';
 
 /** The backend's ascending rows with the overlay's puts laid over and its deletes removed, ascending again. */
-function mergeRevisions(backendRows: readonly [number, Uint8Array][], held: ReadonlyMap<number, OverlayValue>): [number, Uint8Array][] {
+function mergeRevisions<V extends StoredValue>(backendRows: readonly [number, V][], held: ReadonlyMap<number, OverlayValue<V>>): [number, V][] {
 	const rows = new Map(backendRows);
 	for (const [rev, value] of held) {
 		if (value === null) rows.delete(rev); else rows.set(rev, value);
 	}
 	return [...rows].sort(([a], [b]) => a - b);
+}
+
+/** One overlay write as the backend takes it: the same key, its value as bytes. */
+function toBatchEntry<V extends StoredValue>({ key, value }: WriteGroupEntry<StoreKey, V>, codec: ValueCodec<V>): BatchEntry {
+	return value === undefined ? { key } : { key, value: codec.toBytes(value) };
 }
 
 /**
@@ -31,6 +37,12 @@ function mergeRevisions(backendRows: readonly [number, Uint8Array][], held: Read
  * in between drops entries from the overlay that a backend listing taken before that would not
  * have had — or, for a backend that applies at its sync, would hold only from then on.
  *
+ * Values are `V`, bytes by default: the overlay holds them as written, the backend's reads return
+ * them, and the kernel above decodes them with the composition's codec. They become bytes in one
+ * place — when a sealed group goes to the backend, each value is converted with
+ * {@link ValueCodec.toBytes} (the identity for bytes) — so a backend persists bytes whatever this
+ * driver holds. A bytes composition may leave the codec out; any other must name it.
+ *
  * `promote` is two entries of one batch, which is what makes it atomic and durable on a backend
  * whose `commit` is.
  *
@@ -38,7 +50,7 @@ function mergeRevisions(backendRows: readonly [number, Uint8Array][], held: Read
  * the backend has them, never stubbed, so feature detection above sees the backend's true
  * capability; `close` is this driver's own (it flushes first) and is always present.
  */
-export class WriteGroupDriver implements RawStoreDriver {
+export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements RawStoreDriver<V> {
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
@@ -46,10 +58,14 @@ export class WriteGroupDriver implements RawStoreDriver {
 	/** The backend's: the overlay adds no durability, it only defers the backend's until the flush. */
 	readonly durability: StoreDurability;
 
-	private readonly group: WriteGroup<StoreKey>;
+	private readonly group: WriteGroup<StoreKey, V>;
 
-	constructor(private readonly backend: BatchBackend, options: WriteGroupOptions = {}) {
-		this.group = new WriteGroup<StoreKey>(canonicalStoreKey, backend, options);
+	constructor(private readonly backend: BatchBackend<V>, options: WriteGroupOptions = {}, ...codecArgument: ValueCodecArgument<V>) {
+		const codec = resolveValueCodec(codecArgument);
+		this.group = new WriteGroup<StoreKey, V>(canonicalStoreKey, toBytesSink(backend, codec), {
+			...options,
+			storedBytes: (value: V) => codec.storedBytes(value),
+		});
 		this.durability = backend.durability;
 		if (backend.storeIdentity) {
 			this.storeIdentity = () => backend.storeIdentity!();
@@ -64,25 +80,25 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	// --- metadata ---
 
-	getMetadata(blockId: BlockId): Promise<Uint8Array | undefined> {
+	getMetadata(blockId: BlockId): Promise<V | undefined> {
 		return this.read({ store: 'metadata', blockId });
 	}
 
-	async putMetadata(blockId: BlockId, value: Uint8Array): Promise<void> {
+	async putMetadata(blockId: BlockId, value: V): Promise<void> {
 		this.group.put({ store: 'metadata', blockId }, value);
 	}
 
 	// --- revisions ---
 
-	getRevision(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+	getRevision(blockId: BlockId, rev: number): Promise<V | undefined> {
 		return this.read({ store: 'revisions', blockId, rev });
 	}
 
-	async putRevision(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+	async putRevision(blockId: BlockId, rev: number, value: V): Promise<void> {
 		this.group.put({ store: 'revisions', blockId, rev }, value);
 	}
 
-	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, Uint8Array]> {
+	async *rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, V]> {
 		const held = this.heldRevisions(blockId, lo, hi);
 		const backendRows = await this.backend.rangeRevisions(blockId, lo, hi);
 		// The backend's rows are already ascending, so only a block the overlay holds revisions of
@@ -94,11 +110,11 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	// --- pending ---
 
-	getPending(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	getPending(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		return this.read({ store: 'pending', blockId, actionId });
 	}
 
-	async putPending(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putPending(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		this.group.put({ store: 'pending', blockId, actionId }, value);
 	}
 
@@ -117,31 +133,31 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	// --- transactions ---
 
-	getTransaction(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	getTransaction(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		return this.read({ store: 'transactions', blockId, actionId });
 	}
 
-	async putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putTransaction(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		this.group.put({ store: 'transactions', blockId, actionId }, value);
 	}
 
 	// --- proofs ---
 
-	getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
+	getProof(blockId: BlockId, rev: number): Promise<V | undefined> {
 		return this.read({ store: 'proofs', blockId, rev });
 	}
 
-	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
+	async putProof(blockId: BlockId, rev: number, value: V): Promise<void> {
 		this.group.put({ store: 'proofs', blockId, rev }, value);
 	}
 
 	// --- materialized ---
 
-	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
+	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {
 		return this.read({ store: 'materialized', blockId, actionId });
 	}
 
-	async putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void> {
+	async putMaterialized(blockId: BlockId, actionId: ActionId, value: V): Promise<void> {
 		this.group.put({ store: 'materialized', blockId, actionId }, value);
 	}
 
@@ -152,17 +168,18 @@ export class WriteGroupDriver implements RawStoreDriver {
 	// --- promote ---
 
 	/**
-	 * Reads the pending bytes (overlay, else backend) and records the move as two entries of the
-	 * open batch, with no await between them, so no flush can seal one without the other.
+	 * Reads the pending value (overlay, else backend) and records the move as two entries of the
+	 * open batch, with no await between them, so no flush can seal one without the other. The value
+	 * moves as it was read, unconverted.
 	 */
 	async promote(blockId: BlockId, actionId: ActionId): Promise<void> {
 		this.group.throwIfFailed();
 		const pending: StoreKey = { store: 'pending', blockId, actionId };
-		const bytes = await this.read(pending);
-		if (bytes === undefined) {
+		const value = await this.read(pending);
+		if (value === undefined) {
 			throw new Error(`Pending action ${actionId} not found for block ${blockId}`);
 		}
-		this.group.put({ store: 'transactions', blockId, actionId }, bytes);
+		this.group.put({ store: 'transactions', blockId, actionId }, value);
 		this.group.delete(pending);
 	}
 
@@ -187,15 +204,15 @@ export class WriteGroupDriver implements RawStoreDriver {
 
 	// --- reads ---
 
-	private async read(key: StoreKey): Promise<Uint8Array | undefined> {
+	private async read(key: StoreKey): Promise<V | undefined> {
 		const held = this.group.lookup(key);
 		if (held !== undefined) return held ?? undefined;
 		return this.backend.get(key);
 	}
 
 	/** The overlay's revision rows for the block inside `[lo, hi]`, snapshotted synchronously. */
-	private heldRevisions(blockId: BlockId, lo: number, hi: number): Map<number, OverlayValue> {
-		const held = new Map<number, OverlayValue>();
+	private heldRevisions(blockId: BlockId, lo: number, hi: number): Map<number, OverlayValue<V>> {
+		const held = new Map<number, OverlayValue<V>>();
 		for (const [key, value] of this.group.entries()) {
 			if (key.store === 'revisions' && key.blockId === blockId && key.rev >= lo && key.rev <= hi) {
 				held.set(key.rev, value);
@@ -205,8 +222,8 @@ export class WriteGroupDriver implements RawStoreDriver {
 	}
 
 	/** The overlay's pending puts and deletes for the block, snapshotted synchronously. */
-	private heldPendingIds(blockId: BlockId): Map<ActionId, OverlayValue> {
-		const held = new Map<ActionId, OverlayValue>();
+	private heldPendingIds(blockId: BlockId): Map<ActionId, OverlayValue<V>> {
+		const held = new Map<ActionId, OverlayValue<V>>();
 		for (const [key, value] of this.group.entries()) {
 			if (key.store === 'pending' && key.blockId === blockId) {
 				held.set(key.actionId, value);
@@ -236,4 +253,15 @@ export class WriteGroupDriver implements RawStoreDriver {
 			if (!seen.has(blockId)) yield blockId;
 		}
 	}
+}
+
+/**
+ * The write group's sink over `backend`: each sealed group's values converted to bytes on their way
+ * to `commit`, since a backend persists bytes whatever the driver holds.
+ */
+function toBytesSink<V extends StoredValue>(backend: BatchBackend<V>, codec: ValueCodec<V>): WriteGroupSink<StoreKey, V> {
+	return {
+		commit: (entries, options) => backend.commit(entries.map(entry => toBatchEntry(entry, codec)), options),
+		sync: () => backend.sync(),
+	};
 }

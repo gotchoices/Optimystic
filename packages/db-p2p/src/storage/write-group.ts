@@ -2,6 +2,7 @@ import { createLogger } from '../logger.js';
 import { armUnrefTimer } from '../unref-timer.js';
 import { deferred, type Deferred } from '../deferred.js';
 import type { FlushOptions } from './store-durability.js';
+import type { StoredValue } from './raw-store-codec.js';
 
 const log = createLogger('write-group');
 
@@ -28,10 +29,10 @@ export class StoreFailedError extends Error {
 	}
 }
 
-/** One write of a batch. `value` absent means delete. */
-export interface WriteGroupEntry<K> {
+/** One write of a batch, its value in the group's representation (bytes by default). `value` absent means delete. */
+export interface WriteGroupEntry<K, V extends StoredValue = Uint8Array> {
 	readonly key: K;
-	readonly value?: Uint8Array;
+	readonly value?: V;
 }
 
 /** What a resolved commit hands back. */
@@ -54,13 +55,13 @@ export interface SinkCommitOptions {
 }
 
 /** The store under a {@link WriteGroup}: one write, `commit`, and the hasten that makes committed batches durable. */
-export interface WriteGroupSink<K> {
+export interface WriteGroupSink<K, V extends StoredValue = Uint8Array> {
 	/**
 	 * Apply the sealed batch, in order, atomically, so that it survives a crash of this process where
 	 * `durability` names one, and resolve; then sync it within {@link SinkCommitOptions.syncWithinMs}.
 	 * A rejection latches the group failed.
 	 */
-	commit(entries: readonly WriteGroupEntry<K>[], options: SinkCommitOptions): Promise<CommittedBatch>;
+	commit(entries: readonly WriteGroupEntry<K, V>[], options: SinkCommitOptions): Promise<CommittedBatch>;
 	/**
 	 * Hasten: resolve once every batch whose commit had resolved when this was called survives every
 	 * crash `durability` names. A batch committed while it runs is not covered.
@@ -81,25 +82,45 @@ export interface WriteGroupOptions {
 	/**
 	 * The most value bytes the overlay may hold for writes not yet durable, the open batch included
 	 * (a delete counts 0, a replaced value's bytes are given back), before a seal is committed with
-	 * `syncWithinMs` 0 whatever its flushes asked. Default {@link DEFAULT_MAX_UNSYNCED_BYTES}.
+	 * `syncWithinMs` 0 whatever its flushes asked. Values are measured by
+	 * {@link WriteGroupValueOptions.storedBytes}. Default {@link DEFAULT_MAX_UNSYNCED_BYTES}.
 	 */
 	maxUnsyncedBytes?: number;
 	setTimer?: SetTimer;
 }
 
-/** What the overlay holds for a key: the bytes a write put, or `null` for a delete not yet durable. */
-export type OverlayValue = Uint8Array | null;
+/** {@link WriteGroupOptions}, plus how the group measures a value of its representation. */
+export interface WriteGroupValueOptions<V extends StoredValue = Uint8Array> extends WriteGroupOptions {
+	/**
+	 * The bytes a value takes in the store, or an estimate, counted against `maxUnsyncedBytes`.
+	 * Defaults to the byte length for a bytes group; required for any other representation (see
+	 * {@link WriteGroupOptionsArgument}).
+	 */
+	storedBytes?: (value: V) => number;
+}
 
-interface OverlayEntry<K> {
+/**
+ * The options argument of {@link WriteGroup}'s constructor: a bytes group may leave it out, or
+ * leave `storedBytes` out of it; a group of any other representation must name `storedBytes`, so
+ * one built without a measure does not compile.
+ */
+export type WriteGroupOptionsArgument<V extends StoredValue> = [V] extends [Uint8Array]
+	? [options?: WriteGroupValueOptions<V>]
+	: [options: WriteGroupValueOptions<V> & { storedBytes: (value: V) => number }];
+
+/** What the overlay holds for a key: the value a write put, or `null` for a delete not yet durable. */
+export type OverlayValue<V extends StoredValue = Uint8Array> = V | null;
+
+interface OverlayEntry<K, V extends StoredValue> {
 	readonly key: K;
-	readonly value: OverlayValue;
+	readonly value: OverlayValue<V>;
 	/** The sequence of the batch holding this write; the overlay entry is dropped when that batch is durable. */
 	readonly seq: number;
 }
 
-interface OpenEntry<K> {
+interface OpenEntry<K, V extends StoredValue> {
 	readonly canonical: string;
-	readonly entry: WriteGroupEntry<K>;
+	readonly entry: WriteGroupEntry<K, V>;
 }
 
 /** One `flush()` call: by when its writes must be durable, and whether it waits for that. */
@@ -145,14 +166,14 @@ export const DEFAULT_IDLE_FLUSH_MS = 1000;
 /** {@link WriteGroupOptions.maxUnsyncedBytes}'s default: 64 MiB. */
 export const DEFAULT_MAX_UNSYNCED_BYTES = 64 * 1024 * 1024;
 
-const byteLength = (value: OverlayValue | undefined): number => value ? value.byteLength : 0;
+const byteLength = (value: Uint8Array): number => value.byteLength;
 const noop = (): void => undefined;
 
 /**
  * The key-agnostic half of group commit: writes are recorded in memory and resolve at once, and
  * `flush()` hands everything recorded so far to one `commit` of the {@link WriteGroupSink}.
  * `WriteGroupDriver` layers the block-storage keys on it; `FileKVStore` uses it over plain string
- * keys.
+ * keys. Values are `V`, bytes by default; the sink receives them as the group holds them.
  *
  * Two structures. The **overlay** maps each written key to its newest write (or a delete), so a
  * read can be served from memory until the write is durable in the store. The **open batch** is
@@ -178,15 +199,15 @@ const noop = (): void => undefined;
  * snapshots from {@link entries} BEFORE awaiting the store, since a batch becoming durable in
  * between drops entries the store listing was taken without.
  */
-export class WriteGroup<K> {
+export class WriteGroup<K, V extends StoredValue = Uint8Array> {
 	// NOTE: the overlay holds every write not yet durable: the open batch, the batch in flight, and
 	// every committed batch whose sync the sink is still allowed to defer. It is bounded by
 	// `maxUnsyncedBytes` — a seal that would leave more than that unsynced commits with `syncWithinMs`
 	// 0 — so it holds at most that many value bytes plus the batch in flight. The listing merges in
 	// `WriteGroupDriver` scan the whole map, which is fine at that size and would not be at an
 	// unbounded one.
-	private readonly overlay = new Map<string, OverlayEntry<K>>();
-	private open: OpenEntry<K>[] = [];
+	private readonly overlay = new Map<string, OverlayEntry<K, V>>();
+	private open: OpenEntry<K, V>[] = [];
 	/** The sequence the open batch takes when it is sealed. */
 	private openSeq = 1;
 	/** Value bytes the overlay holds, which is what `maxUnsyncedBytes` bounds. */
@@ -205,13 +226,17 @@ export class WriteGroup<K> {
 	private cancelIdleFlush: (() => void) | undefined;
 	private readonly idleFlushMs: number;
 	private readonly maxUnsyncedBytes: number;
+	private readonly storedBytes: (value: V) => number;
 	private readonly setTimer: SetTimer;
 
 	constructor(
 		private readonly canonical: (key: K) => string,
-		private readonly sink: WriteGroupSink<K>,
-		options: WriteGroupOptions = {},
+		private readonly sink: WriteGroupSink<K, V>,
+		...optionsArgument: WriteGroupOptionsArgument<V>
 	) {
+		const options: WriteGroupValueOptions<V> = optionsArgument[0] ?? {};
+		// Only a bytes group can leave the measure out — the argument's type sees to that.
+		this.storedBytes = options.storedBytes ?? byteLength as unknown as (value: V) => number;
 		this.idleFlushMs = options.idleFlushMs ?? DEFAULT_IDLE_FLUSH_MS;
 		if (!(this.idleFlushMs >= 0) || !Number.isFinite(this.idleFlushMs)) {
 			throw new RangeError(`idleFlushMs must be a finite number of milliseconds, got ${this.idleFlushMs}`);
@@ -234,7 +259,7 @@ export class WriteGroup<K> {
 	}
 
 	/** Record a put. Resolves at once for the owner: the write is visible to every later read through {@link lookup}. */
-	put(key: K, value: Uint8Array): void {
+	put(key: K, value: V): void {
 		this.record(key, value);
 	}
 
@@ -244,10 +269,10 @@ export class WriteGroup<K> {
 	}
 
 	/**
-	 * What the overlay holds for the key: bytes, `null` for a delete not yet durable, or
+	 * What the overlay holds for the key: a value, `null` for a delete not yet durable, or
 	 * `undefined` when it holds nothing and the store is to be asked.
 	 */
-	lookup(key: K): OverlayValue | undefined {
+	lookup(key: K): OverlayValue<V> | undefined {
 		return this.overlay.get(this.canonical(key))?.value;
 	}
 
@@ -256,7 +281,7 @@ export class WriteGroup<K> {
 	 * merging a listing takes what it needs from this before awaiting the store, and never awaits
 	 * while iterating.
 	 */
-	*entries(): IterableIterator<readonly [K, OverlayValue]> {
+	*entries(): IterableIterator<readonly [K, OverlayValue<V>]> {
 		for (const held of this.overlay.values()) {
 			yield [held.key, held.value];
 		}
@@ -307,13 +332,18 @@ export class WriteGroup<K> {
 		this.disarmIdleFlush();
 	}
 
-	private record(key: K, value: OverlayValue): void {
+	private record(key: K, value: OverlayValue<V>): void {
 		this.throwIfFailed();
 		const canonical = this.canonical(key);
 		if (this.open.length === 0) this.armIdleFlush();
-		this.unsyncedBytes += byteLength(value) - byteLength(this.overlay.get(canonical)?.value);
+		this.unsyncedBytes += this.measure(value) - this.measure(this.overlay.get(canonical)?.value);
 		this.overlay.set(canonical, { key, value, seq: this.openSeq });
 		this.open.push({ canonical, entry: value === null ? { key } : { key, value } });
+	}
+
+	/** What a held write counts against `maxUnsyncedBytes`: its value's stored size, 0 for a delete or nothing. */
+	private measure(value: OverlayValue<V> | undefined): number {
+		return value === null || value === undefined ? 0 : this.storedBytes(value);
 	}
 
 	/** Route one flush by what is open and in flight; the doc on {@link flush} lists the cases. */
@@ -357,7 +387,7 @@ export class WriteGroup<K> {
 		return this.unsyncedBytes > this.maxUnsyncedBytes ? now : Math.min(...deadlines);
 	}
 
-	private async runCommit(entries: readonly OpenEntry<K>[], batch: Batch, syncWithinMs: number): Promise<void> {
+	private async runCommit(entries: readonly OpenEntry<K, V>[], batch: Batch, syncWithinMs: number): Promise<void> {
 		try {
 			const committed = await this.sink.commit(entries.map(open => open.entry), { syncWithinMs });
 			// A deferred sync that failed meanwhile has latched the group, and nothing resolves after a latch.
@@ -374,7 +404,7 @@ export class WriteGroup<K> {
 	}
 
 	/** Keep the batch readable from the overlay until the sink says it is durable; a rejection latches the group. */
-	private awaitDurable(entries: readonly OpenEntry<K>[], batch: Batch, durable: Promise<void>): void {
+	private awaitDurable(entries: readonly OpenEntry<K, V>[], batch: Batch, durable: Promise<void>): void {
 		this.notYetDurable.push(batch);
 		durable.then(
 			() => {
@@ -388,12 +418,12 @@ export class WriteGroup<K> {
 	}
 
 	/** Drop the overlay entries the durable batch holds, leaving any a later write replaced. */
-	private dropDurable(batch: readonly OpenEntry<K>[], seq: number): void {
+	private dropDurable(batch: readonly OpenEntry<K, V>[], seq: number): void {
 		for (const { canonical } of batch) {
 			const held = this.overlay.get(canonical);
 			if (held?.seq === seq) {
 				this.overlay.delete(canonical);
-				this.unsyncedBytes -= byteLength(held.value);
+				this.unsyncedBytes -= this.measure(held.value);
 			}
 		}
 	}

@@ -1,16 +1,26 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { StoreIdentity } from "./store-identity.js";
 import type { FlushOptions, StoreDurability } from "./store-durability.js";
+import type { StoredValue } from "./raw-store-codec.js";
 
 /**
- * Bytes-valued, per-logical-store driver surface. Each backend implements the
+ * Per-logical-store driver surface. Each backend implements the
  * six block-storage stores (metadata, revisions, pending, transactions,
  * materialized, proofs) over its native mechanism (LevelDB tag-ranges, six SQLite
  * tables, six IndexedDB object stores, six filesystem subdirectories, six
  * in-memory maps). `KvRawStorage` layers all JSON serialization and call
  * orchestration on top — drivers never (de)serialize values and never see the
  * `BlockMetadata`/`Transform`/`IBlock` types. Drivers speak only
- * `Uint8Array`/`BlockId`/`ActionId`/`number`.
+ * `V`/`BlockId`/`ActionId`/`number`.
+ *
+ * ### Value representation
+ *
+ * `V` is how the driver holds a stored value in memory: `Uint8Array` (the default, and every
+ * backend but one) or `string`, the text the stored UTF-8 bytes decode to — the same logical
+ * value in a different form, for a backend whose platform decodes text natively. Every value
+ * position (each `get*` result, each `put*` argument, `rangeRevisions` rows) is `V`. The kernel
+ * and every wrapper over the driver share its `V` and its `ValueCodec` (`raw-store-codec.ts`), and
+ * the type checker refuses a composition that mixes them.
  *
  * ### Iteration semantics (drain-before-yield)
  *
@@ -31,32 +41,32 @@ import type { FlushOptions, StoreDurability } from "./store-durability.js";
  * readwrite transaction, filesystem rename); the kernel never assumes an
  * atomicity a backend cannot deliver.
  */
-export interface RawStoreDriver {
+export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	// metadata store — keyed by blockId
-	getMetadata(blockId: BlockId): Promise<Uint8Array | undefined>;
-	putMetadata(blockId: BlockId, value: Uint8Array): Promise<void>;
+	getMetadata(blockId: BlockId): Promise<V | undefined>;
+	putMetadata(blockId: BlockId, value: V): Promise<void>;
 
 	// revisions store — keyed by (blockId, rev), ORDERED BY rev
-	getRevision(blockId: BlockId, rev: number): Promise<Uint8Array | undefined>;
-	putRevision(blockId: BlockId, rev: number, value: Uint8Array): Promise<void>;
+	getRevision(blockId: BlockId, rev: number): Promise<V | undefined>;
+	putRevision(blockId: BlockId, rev: number, value: V): Promise<void>;
 	/**
 	 * Yield `[rev, value]` for every present rev in `[lo, hi]` (both inclusive),
 	 * ascending when `reverse` is false, descending when `reverse` is true. The
 	 * driver MUST drain any native cursor into memory before yielding — see the
 	 * "drain-before-yield" contract above.
 	 */
-	rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, Uint8Array]>;
+	rangeRevisions(blockId: BlockId, lo: number, hi: number, reverse: boolean): AsyncIterable<[number, V]>;
 
 	// pending store — keyed by (blockId, actionId)
-	getPending(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined>;
-	putPending(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void>;
+	getPending(blockId: BlockId, actionId: ActionId): Promise<V | undefined>;
+	putPending(blockId: BlockId, actionId: ActionId, value: V): Promise<void>;
 	deletePending(blockId: BlockId, actionId: ActionId): Promise<void>;
 	/** Yield each present pending actionId for the block. MUST drain before yielding (see above). */
 	listPendingActionIds(blockId: BlockId): AsyncIterable<ActionId>;
 
 	// transactions store — keyed by (blockId, actionId)
-	getTransaction(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined>;
-	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void>;
+	getTransaction(blockId: BlockId, actionId: ActionId): Promise<V | undefined>;
+	putTransaction(blockId: BlockId, actionId: ActionId, value: V): Promise<void>;
 
 	/**
 	 * proofs store — keyed by (blockId, rev), the same key shape as the revisions
@@ -72,12 +82,12 @@ export interface RawStoreDriver {
 	 * revisions). Whatever ever deletes a revision record must delete its proof;
 	 * until such a site exists this is a contract note, not a wired path.
 	 */
-	getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined>;
-	putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void>;
+	getProof(blockId: BlockId, rev: number): Promise<V | undefined>;
+	putProof(blockId: BlockId, rev: number, value: V): Promise<void>;
 
 	// materialized store — keyed by (blockId, actionId)
-	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined>;
-	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array): Promise<void>;
+	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<V | undefined>;
+	putMaterialized(blockId: BlockId, actionId: ActionId, value: V): Promise<void>;
 	deleteMaterialized(blockId: BlockId, actionId: ActionId): Promise<void>;
 
 	/**

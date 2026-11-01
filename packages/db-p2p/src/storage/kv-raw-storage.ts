@@ -5,13 +5,18 @@ import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
 import type { FlushOptions, StoreDurability } from "./store-durability.js";
-import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
+import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecArgument } from "./raw-store-codec.js";
 
 /**
  * Shared ordered-KV storage kernel. Implements the full {@link IRawStorage}
  * surface over a {@link RawStoreDriver}, owning all value (de)serialization and
  * call orchestration so each backend only has to expose its six logical stores
- * as bytes-valued maps over its native mechanism.
+ * as maps of stored values over its native mechanism.
+ *
+ * A store's values are `V`, the driver's representation, and every encode and decode goes through
+ * the {@link ValueCodec} the store was built with. A bytes driver may leave the codec out (every
+ * existing `new KvRawStorage(driver)`); any other representation must name one, or the
+ * constructor call does not compile.
  *
  * The genuinely-shared logic lives ABOVE the storage primitive: the JSON/string
  * codec for the value types, `listRevisions`' lo/hi/reverse bound computation,
@@ -20,7 +25,7 @@ import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-st
  * share one — LevelDB is a single ordered byte keyspace, SQLite six relational
  * tables, IndexedDB six object stores, the filesystem a directory tree.
  */
-export class KvRawStorage implements IRawStorage {
+export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawStorage {
 	/**
 	 * Optional passthroughs are wired in the constructor ONLY when the driver
 	 * provides them, so a `StorageMonitor` / owned-block seed that feature-detects
@@ -42,7 +47,10 @@ export class KvRawStorage implements IRawStorage {
 	/** Copied from the driver once, at construction — a store's durability never changes over its life. */
 	readonly durability: StoreDurability;
 
-	constructor(private readonly driver: RawStoreDriver) {
+	private readonly codec: ValueCodec<V>;
+
+	constructor(private readonly driver: RawStoreDriver<V>, ...codec: ValueCodecArgument<V>) {
+		this.codec = resolveValueCodec(codec);
 		this.durability = driver.durability;
 		if (driver.storeIdentity) {
 			this.getStoreIdentity = () => driver.storeIdentity!();
@@ -64,8 +72,8 @@ export class KvRawStorage implements IRawStorage {
 	// --- Metadata ---
 
 	async getMetadata(blockId: BlockId): Promise<BlockMetadata | undefined> {
-		const bytes = await this.driver.getMetadata(blockId);
-		return bytes === undefined ? undefined : decodeJson<BlockMetadata>(bytes);
+		const value = await this.driver.getMetadata(blockId);
+		return value === undefined ? undefined : this.codec.decodeJson<BlockMetadata>(value);
 	}
 
 	// NOTE: every value write funnels through the driver put/delete calls in the
@@ -79,18 +87,18 @@ export class KvRawStorage implements IRawStorage {
 	// future option only if TTL staleness ever proves insufficient; do NOT
 	// implement it here — leave the write path a single seam.
 	async saveMetadata(blockId: BlockId, metadata: BlockMetadata): Promise<void> {
-		await this.driver.putMetadata(blockId, encodeJson(metadata));
+		await this.driver.putMetadata(blockId, this.codec.encodeJson(metadata));
 	}
 
 	// --- Revisions ---
 
 	async getRevision(blockId: BlockId, rev: number): Promise<ActionId | undefined> {
-		const bytes = await this.driver.getRevision(blockId, rev);
-		return bytes === undefined ? undefined : decodeActionId(bytes);
+		const value = await this.driver.getRevision(blockId, rev);
+		return value === undefined ? undefined : this.codec.decodeActionId(value);
 	}
 
 	async saveRevision(blockId: BlockId, rev: number, actionId: ActionId): Promise<void> {
-		await this.driver.putRevision(blockId, rev, encodeActionId(actionId));
+		await this.driver.putRevision(blockId, rev, this.codec.encodeActionId(actionId));
 	}
 
 	async *listRevisions(blockId: BlockId, startRev: number, endRev: number): AsyncIterable<ActionRev> {
@@ -100,20 +108,20 @@ export class KvRawStorage implements IRawStorage {
 		const ascending = startRev <= endRev;
 		const lo = ascending ? startRev : endRev;
 		const hi = ascending ? endRev : startRev;
-		for await (const [rev, bytes] of this.driver.rangeRevisions(blockId, lo, hi, !ascending)) {
-			yield { rev, actionId: decodeActionId(bytes) };
+		for await (const [rev, value] of this.driver.rangeRevisions(blockId, lo, hi, !ascending)) {
+			yield { rev, actionId: this.codec.decodeActionId(value) };
 		}
 	}
 
 	// --- Pending transactions ---
 
 	async getPendingTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		const bytes = await this.driver.getPending(blockId, actionId);
-		return bytes === undefined ? undefined : decodeJson<Transform>(bytes);
+		const value = await this.driver.getPending(blockId, actionId);
+		return value === undefined ? undefined : this.codec.decodeJson<Transform>(value);
 	}
 
 	async savePendingTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		await this.driver.putPending(blockId, actionId, encodeJson(transform));
+		await this.driver.putPending(blockId, actionId, this.codec.encodeJson(transform));
 	}
 
 	async deletePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
@@ -127,12 +135,12 @@ export class KvRawStorage implements IRawStorage {
 	// --- Committed transactions ---
 
 	async getTransaction(blockId: BlockId, actionId: ActionId): Promise<Transform | undefined> {
-		const bytes = await this.driver.getTransaction(blockId, actionId);
-		return bytes === undefined ? undefined : decodeJson<Transform>(bytes);
+		const value = await this.driver.getTransaction(blockId, actionId);
+		return value === undefined ? undefined : this.codec.decodeJson<Transform>(value);
 	}
 
 	async saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform): Promise<void> {
-		await this.driver.putTransaction(blockId, actionId, encodeJson(transform));
+		await this.driver.putTransaction(blockId, actionId, this.codec.encodeJson(transform));
 	}
 
 	// --- Commit proofs (their OWN (blockId, rev)-keyed store — see RawStoreDriver.getProof) ---
@@ -145,25 +153,25 @@ export class KvRawStorage implements IRawStorage {
 	// (or be overwritten by it). Separate stores make that collision unrepresentable.
 
 	async getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined> {
-		const bytes = await this.driver.getProof(blockId, rev);
-		return bytes === undefined ? undefined : decodeJson<BlockCommitProof>(bytes);
+		const value = await this.driver.getProof(blockId, rev);
+		return value === undefined ? undefined : this.codec.decodeJson<BlockCommitProof>(value);
 	}
 
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
-		await this.driver.putProof(blockId, rev, encodeJson(proof));
+		await this.driver.putProof(blockId, rev, this.codec.encodeJson(proof));
 	}
 
 	// --- Materialized blocks ---
 
 	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
-		const bytes = await this.driver.getMaterialized(blockId, actionId);
-		return bytes === undefined ? undefined : decodeJson<IBlock>(bytes);
+		const value = await this.driver.getMaterialized(blockId, actionId);
+		return value === undefined ? undefined : this.codec.decodeJson<IBlock>(value);
 	}
 
 	async saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void> {
 		// Present ⇒ put the materialized block; absent ⇒ delete (tombstone / truncation).
 		if (block) {
-			await this.driver.putMaterialized(blockId, actionId, encodeJson(block));
+			await this.driver.putMaterialized(blockId, actionId, this.codec.encodeJson(block));
 		} else {
 			await this.driver.deleteMaterialized(blockId, actionId);
 		}

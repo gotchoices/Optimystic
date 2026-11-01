@@ -2,7 +2,11 @@ import { expect } from 'chai';
 import type { ActionId, BlockId } from '@optimystic/db-core';
 import { runRawStorageConformance } from '../src/testing/raw-storage-conformance.js';
 import { MemoryJournalStore, type MemoryJournalApply } from '../src/testing/memory-journal-store.js';
+import { TextReadsJournalStore } from '../src/testing/text-reads-journal-store.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
+import { CachedStoreDriver } from '../src/storage/cached-store-driver.js';
+import { SharedCachePool } from '../src/storage/shared-cache-pool.js';
+import { textValueCodec } from '../src/storage/raw-store-codec.js';
 import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
 import { JournalBatchBackend, type JournalRecord } from '../src/storage/journal-batch-backend.js';
 import { decodeJournalRecord, encodeJournalRecord, JournalRecordDecodeError } from '../src/storage/journal-record-codec.js';
@@ -17,6 +21,29 @@ runRawStorageConformance('WriteGroupDriver over JournalBatchBackend over memory'
 	const opened: KvRawStorage[] = [];
 	const open = (): KvRawStorage => {
 		const storage = new KvRawStorage(new WriteGroupDriver(new JournalBatchBackend(store)));
+		opened.push(storage);
+		return storage;
+	};
+	return {
+		storage: open(),
+		reopen: async () => open(),
+		cleanup: async () => { for (const storage of opened) await storage.close?.(); }
+	};
+}, { persistent: true });
+
+// The same composition with every layer holding text: what a backend whose engine decodes UTF-8 in
+// native code builds. The kernel, the read cache and the write group's overlay hold strings, a cache
+// or overlay hit is the string itself, and a group's values become bytes only on their way to the
+// journal backend, so the store persists exactly what the bytes composition above persists. Every
+// flush the suite makes is strict, so a group is applied at its commit at any store durability;
+// that a relaxed group's journal record carries bytes is `BatchEntry`'s type, not a run-time path.
+runRawStorageConformance('text KvRawStorage over CachedStoreDriver over WriteGroupDriver over JournalBatchBackend over memory', async () => {
+	const store = new TextReadsJournalStore(new MemoryJournalStore());
+	const pool = new SharedCachePool();
+	const opened: KvRawStorage<string>[] = [];
+	const open = (): KvRawStorage<string> => {
+		const writeGroup = new WriteGroupDriver(new JournalBatchBackend(store), {}, textValueCodec);
+		const storage = new KvRawStorage(new CachedStoreDriver(writeGroup, pool, 'text-journal', textValueCodec), textValueCodec);
 		opened.push(storage);
 		return storage;
 	};

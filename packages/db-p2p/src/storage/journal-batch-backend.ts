@@ -2,6 +2,7 @@ import type { ActionId, BlockId } from '@optimystic/db-core';
 import { createLogger } from '../logger.js';
 import type { BatchBackend, BatchEntry, StoreKey } from './batch-backend.js';
 import type { StoreDurability } from './store-durability.js';
+import type { StoredValue } from './raw-store-codec.js';
 import type { StoreIdentity } from './store-identity.js';
 import { SyncDeadlines, type SyncCover } from './sync-deadlines.js';
 import { StoreFailedError, type CommittedBatch, type SetTimer, type SinkCommitOptions } from './write-group.js';
@@ -31,8 +32,12 @@ export interface JournalContents {
  * resolves: `'power-loss'` for an engine that syncs the apply; anything less, and the backend
  * applies every group at once and never journals, since applying already meets all the store can
  * promise.
+ *
+ * Its reads return `R`, as `BatchBackend<R>`'s do: bytes by default, or the text the stored bytes
+ * decode to for an engine that decodes it natively. What it writes — journal records and applies —
+ * is bytes either way.
  */
-export interface JournalStore extends Omit<BatchBackend, 'commit' | 'sync'> {
+export interface JournalStore<R extends StoredValue = Uint8Array> extends Omit<BatchBackend<R>, 'commit' | 'sync'> {
 	/**
 	 * One atomic write that survives a crash of this process: store `record` in the journal under
 	 * its `seq`, unsynced. Not applied: reads do not reflect it.
@@ -151,7 +156,7 @@ const noop = (): void => undefined;
  * held `durable`s reject, and every later commit and sync throws `StoreFailedError` carrying the
  * first cause, as a rejected commit latches the driver above (rule 5).
  */
-export class JournalBatchBackend implements BatchBackend {
+export class JournalBatchBackend<R extends StoredValue = Uint8Array> implements BatchBackend<R> {
 	readonly durability: StoreDurability;
 	storeIdentity?: () => StoreIdentity;
 	listBlockIds?: () => AsyncIterable<BlockId>;
@@ -161,10 +166,12 @@ export class JournalBatchBackend implements BatchBackend {
 	 * Records appended and not yet applied, in order, each with its `durable`, with the earliest
 	 * deadline among them and the timer armed for it; emptied by every apply and by the latch.
 	 */
-	// NOTE: a held record's `entries` are the arrays `WriteGroup` handed `commit`, whose values are
-	// the very `Uint8Array`s its overlay holds for the same writes, so holding them here costs the
-	// entry arrays and not a second copy of the bytes. Both are bounded by `maxUnsyncedBytes`: a seal
-	// that would exceed it commits strictly, and a strict commit applies everything held.
+	// NOTE: a held record's `entries` are the byte entries `WriteGroupDriver` handed `commit`. In a
+	// bytes composition their values are the very `Uint8Array`s its overlay holds for the same writes,
+	// so holding them here costs the entry arrays and not a second copy of the bytes; in a text
+	// composition they are the `TextEncoder` output the driver made at the hand-off, a second copy
+	// beside the overlay's strings. Both are bounded by `maxUnsyncedBytes`: a seal that would exceed it
+	// commits strictly, and a strict commit applies everything held.
 	private readonly held: SyncDeadlines<JournalRecord>;
 	/** Open, commits, applies and close run one at a time, in order, on this chain; it never rejects. */
 	private queue: Promise<unknown> = Promise.resolve();
@@ -177,7 +184,7 @@ export class JournalBatchBackend implements BatchBackend {
 	/** What the `window-overrun` line names: the store's identity when it has one. */
 	private readonly subject: string;
 
-	constructor(private readonly store: JournalStore, options: JournalBatchBackendOptions = {}) {
+	constructor(private readonly store: JournalStore<R>, options: JournalBatchBackendOptions = {}) {
 		this.durability = store.durability;
 		this.subject = store.storeIdentity?.() ?? 'the journal store';
 		this.held = new SyncDeadlines<JournalRecord>({
@@ -203,12 +210,12 @@ export class JournalBatchBackend implements BatchBackend {
 
 	// --- reads: the store's, once the journal has been recovered into it ---
 
-	async get(key: StoreKey): Promise<Uint8Array | undefined> {
+	async get(key: StoreKey): Promise<R | undefined> {
 		await this.open();
 		return this.store.get(key);
 	}
 
-	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, Uint8Array][]> {
+	async rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, R][]> {
 		await this.open();
 		return this.store.rangeRevisions(blockId, lo, hi);
 	}

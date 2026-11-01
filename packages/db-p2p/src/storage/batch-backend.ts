@@ -2,6 +2,7 @@ import type { BlockId, ActionId } from '@optimystic/db-core';
 import type { StoreDurability } from './store-durability.js';
 import type { StoreIdentity } from './store-identity.js';
 import type { WriteGroupEntry, WriteGroupSink } from './write-group.js';
+import type { StoredValue } from './raw-store-codec.js';
 
 /**
  * One record of the six logical block-storage stores, addressed the way `RawStoreDriver`
@@ -13,7 +14,7 @@ export type StoreKey =
 	| { store: 'revisions' | 'proofs'; blockId: BlockId; rev: number }
 	| { store: 'pending' | 'transactions' | 'materialized'; blockId: BlockId; actionId: ActionId };
 
-/** One write of a batch. `value` absent means delete. */
+/** One write of a batch, its value always bytes whatever the driver above holds. `value` absent means delete. */
 export type BatchEntry = WriteGroupEntry<StoreKey>;
 
 /**
@@ -28,17 +29,22 @@ export type BatchEntry = WriteGroupEntry<StoreKey>;
  * value as 0. Rejecting is a storage fault: the driver then refuses every later write and flush
  * (rule 5 of the flush contract on `RawStoreDriver.flush`).
  *
+ * Reads return `R`, the representation of the `WriteGroupDriver<R>` above: bytes by default, or
+ * the text the stored bytes decode to for an engine that hands values back as text. Writes are
+ * bytes whatever `R` is — the driver converts each value when it hands a group here — so what a
+ * backend persists, and a journal record's values, never depend on the representation above.
+ *
  * Reads here are consulted only after the driver's overlay missed. They must reflect every batch
  * whose `durable` has resolved, and MAY reflect a batch earlier: the overlay serves a batch until it
  * is durable, so the only keys that reach these reads are ones whose newest write is durable, and a
  * listing the driver merges may see a batch here and in the overlay at once.
  */
-export interface BatchBackend extends WriteGroupSink<StoreKey> {
+export interface BatchBackend<R extends StoredValue = Uint8Array> extends WriteGroupSink<StoreKey> {
 	/** What a committed batch survives (see `RawStoreDriver.durability`). */
 	readonly durability: StoreDurability;
-	get(key: StoreKey): Promise<Uint8Array | undefined>;
+	get(key: StoreKey): Promise<R | undefined>;
 	/** Ascending `[rev, value]` for every present rev in `[lo, hi]`, both inclusive, fully drained. */
-	rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, Uint8Array][]>;
+	rangeRevisions(blockId: BlockId, lo: number, hi: number): Promise<[number, R][]>;
 	/** Every present pending action id for the block, fully drained. */
 	listPendingActionIds(blockId: BlockId): Promise<ActionId[]>;
 	/** Optional, with the contract of `RawStoreDriver.storeIdentity`. Omit rather than stub. */
