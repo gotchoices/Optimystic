@@ -3,7 +3,7 @@ import { QuereusError, StatusCode } from '@quereus/quereus';
 import { EntryNotDiscardableError, OfflineQueue, QueueDisposedError, UnknownEntryError, alwaysReachable } from '@optimystic/db-core';
 import type {
 	ActionRefusedError, BlockId, Collection, CollectionId, CommittedEffect, EntryId, EntryStatus, ICohortReachability, JournalSettledStatus,
-	OfflineQueueOptions, OfflineQueueState, QueuedEntry, TransactionDurability,
+	Lane, OfflineQueueOptions, OfflineQueueState, QueuedEntry, TransactionDurability,
 } from '@optimystic/db-core';
 import type { TransactionBridge } from './txn-bridge.js';
 import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-config.js';
@@ -523,11 +523,27 @@ export class OfflineMode {
 	 * then any whose removal is still in progress).
 	 */
 	assertNoQueuedEntries(table: QualifiedTableName, operation: StorageShapeChange): void {
+		const blocking = this.queuedTransactionsOf(table);
+		if (blocking.length === 0) return;
+		const name = qualifiedTableName(table);
+		log('offline:schema-change-refused table=%s operation=%s transactions=%o', name, operation, blocking);
+		throw new QueuedEntriesBlockSchemaChangeError(name, operation, blocking);
+	}
+
+	/**
+	 * The transactions whose rows are still this machine's view of `table` without having reached the
+	 * network: queued ones that wrote one of the table's collections — its main tree or an index tree,
+	 * as the bridge recorded them (`TransactionBridge.collectionsOf`) — in queue order, then any
+	 * journaled one not yet put back, then any whose removal is still in progress. What
+	 * {@link assertNoQueuedEntries} refuses a storage-shape change over, and what the vtab names when a
+	 * lane-bearing tag changes under them (`OptimysticVirtualTable.followSchemaTags`).
+	 */
+	queuedTransactionsOf(table: QualifiedTableName): string[] {
 		const name = qualifiedTableName(table);
 		// A journaled transaction not yet put back carries rows an index built now would miss.
 		const deferred = this.restorer?.records().filter(record => record.tables.includes(name)).map(record => record.transactionId) ?? [];
 		const collections = new Set(this.bridge.collectionsOf(table));
-		if (collections.size === 0 && deferred.length === 0) return;
+		if (collections.size === 0 && deferred.length === 0) return [];
 		const listed = this.queue.entries()
 			.filter(entry => entry.collections.some(id => collections.has(id)))
 			.map(entry => entry.id);
@@ -539,10 +555,7 @@ export class OfflineMode {
 		// tables over one URI become a supported shape.
 		const registry = this.bridge.getCollectionRegistry();
 		const stillSealed = [...collections].flatMap(id => registry.get(id)?.sealedEntries() ?? []);
-		const blocking = [...new Set([...listed, ...deferred, ...stillSealed])];
-		if (blocking.length === 0) return;
-		log('offline:schema-change-refused table=%s operation=%s transactions=%o', name, operation, blocking);
-		throw new QueuedEntriesBlockSchemaChangeError(name, operation, blocking);
+		return [...new Set([...listed, ...deferred, ...stillSealed])];
 	}
 
 	/**
@@ -553,12 +566,15 @@ export class OfflineMode {
 	 * the entry record (docs/offline-sync.md §Write ordering). `facts` is what the transaction's
 	 * statements' write descriptions said about its elements (`TransactionBridge.openWriteFacts`),
 	 * held for its judgement — which runs inside the enqueue, on the `queued` status — until it settles.
+	 * `lane` is the transaction's (`TransactionBridge.openLane`), fixed on the entry for its life and
+	 * journaled with it: a declaration changed later never reclassifies an entry already queued
+	 * (docs/transactions.md §Which lane a transaction takes).
 	 */
-	async enqueue(collections: readonly Collection<any>[], transactionId: string, facts: EntryFacts): Promise<QueuedTransaction | undefined> {
+	async enqueue(collections: readonly Collection<any>[], transactionId: string, facts: EntryFacts, lane: Lane): Promise<QueuedTransaction | undefined> {
 		this.entryFacts.set(transactionId, facts);
 		let entry: QueuedEntry | undefined;
 		try {
-			entry = await this.queue.enqueue(collections, { id: transactionId, timestamp: this.now() });
+			entry = await this.queue.enqueue(collections, { id: transactionId, timestamp: this.now(), lane });
 		} finally {
 			// Nothing queued — nothing staged, or the journal refused — leaves nothing to hold facts for.
 			if (entry === undefined) this.entryFacts.delete(transactionId);

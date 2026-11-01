@@ -1208,8 +1208,8 @@ row's own values, and both count as not fresh.
 
 ### Declared hints
 
-Three facts the analysis cannot see, which an application can declare with tags saved in the
-catalog record:
+Five facts the analysis cannot see, which an application can declare with tags saved in the
+catalog record (`declared-tags.ts` in `packages/quereus-plugin-optimystic/src/schema/`):
 
 - **`"optimystic.fresh" = true` on a column**: values of this column are generated unique per write
   by the application (a UUID made in the app and passed as a parameter). Its values count as fresh.
@@ -1221,13 +1221,27 @@ catalog record:
   An INSERT into it is staged under `absentOrEqual` rather than `absent` ([Guards that make
   idempotent writes assured](#guards-that-make-idempotent-writes-assured)). No provenance label
   describes a content hash, so a tag is the only way the plugin can learn this.
+- **`"optimystic.profile" = 'replay-permitted'` on a table**: the table's writes may take the
+  convergent lane when the statement allows it. Absent, or `'strong'`, every write is serializable,
+  which is what every table got before the tag existed.
+- **`"optimystic.merge" = 'last-writer-wins'` on a column**: two machines' concurrent assignments of
+  the column merge by the later HLC winning. The only merge kind defined so far.
 
 The first two hints change the prediction and nothing else: every guard is still enforced at rebase.
 A false one produces an assured entry that fails, which the plugin logs as
 `offline:assured-entry-failed` with the guard that refused and counts in `assuredFailures` (see
 [Conservative by construction](#conservative-by-construction)). The third changes which guard the
 drain enforces and not the prediction; the variant still compares the whole row, so an equal key
-under different content refuses as a plain insert would.
+under different content refuses as a plain insert would. The last two answer a fourth question the
+write description is put to, beside the fresh elements, the guard variant and the unchecked
+decisions: the **lane** of each statement, `serializable` or `convergent`, recorded with the
+transaction and fixed on its queue entry at enqueue (`laneOf` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/lane.ts`; the rule is
+[transactions.md §Which lane a transaction takes](transactions.md#which-lane-a-transaction-takes)).
+Like the others they change only a classification today: a false `optimystic.fresh` tag gives a
+convergent lane to an insert that can collide, which the replay stage resolves by its guards, and a
+profile or merge tag changed while entries are queued reclassifies nothing already queued (logged as
+`offline:profile-changed-with-entries-queued`).
 
 ### Conservative by construction
 
@@ -1730,7 +1744,11 @@ not on the network yet. So a statement that changes a table's storage shape (cre
 index, adding or dropping a column, dropping the table) is refused with a typed error naming the
 queued entries while any entry that wrote that table is queued, and succeeds once they settle.
 DDL that changes no stored shape (a tag change, a CHECK added or removed by name, a column rename,
-which touches no row) is allowed. A `create table` is refused only when it declares, with other
+which touches no row) is allowed — a change to the `optimystic.profile` or `optimystic.merge` tags
+under queued entries included, which reclassifies none of them (each keeps the lane it was queued
+with) and is logged as `offline:profile-changed-with-entries-queued`, since Quereus applies a tag
+before the plugin hears of it ([transactions.md §Which lane a transaction
+takes](transactions.md#which-lane-a-transaction-takes)). A `create table` is refused only when it declares, with other
 columns or another primary key, a collection a table with queued entries already backs; an identical
 declaration reads and writes the queued rows exactly as that table does. Table creation while
 offline otherwise keeps its current behaviour, including the catalog written alone at launch that

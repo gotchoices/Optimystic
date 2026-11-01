@@ -1,5 +1,5 @@
 import type {
-  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Lane, Transaction, TransactionDurability,
+  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Lane, SyncOptions, Transaction, TransactionDurability,
   TreeGuardRefusedError, WriteDurability,
 } from '@optimystic/db-core';
 import {
@@ -8,7 +8,7 @@ import {
   visitEveryThenThrow,
 } from '@optimystic/db-core';
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
-import type { TableWrite } from '@quereus/quereus';
+import type { TableSchema, TableWrite } from '@quereus/quereus';
 import type { TransactionState, ParsedOptimysticOptions } from '../types.js';
 import { CollectionFactory } from './collection-factory.js';
 import { sqlCommitDurability, type CommitFullyHeldListener, type SqlCommitDurability, type SqlCommitDurabilityListener } from './commit-durability.js';
@@ -20,6 +20,7 @@ import type { OfflineMode } from './offline-mode.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
 import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
+import { laneOf, transactionLaneOf } from './lane.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
@@ -44,9 +45,10 @@ export interface DirtyTree {
    * Flush this tree's staged changes, resolving to who holds what the flush wrote — or
    * `undefined` when the tree had nothing staged (and so wrote nothing). The per-tree sweep
    * ({@link TransactionBridge.sweepDirtyTreesLegacy}) folds these into the commit's
-   * durability report; a test double may resolve nothing, which reads as "wrote nothing".
+   * durability report, and hands each flush the transaction's lane as `options.lane`; a test
+   * double may ignore the options and resolve nothing, which reads as "wrote nothing".
    */
-  sync(): Promise<WriteDurability | undefined>;
+  sync(options?: SyncOptions): Promise<WriteDurability | undefined>;
   snapshot(): unknown;
   /**
    * Restore the staged state `snapshot` captured. Resolves once the restore is complete: a
@@ -911,14 +913,17 @@ export class TransactionBridge {
     }
     const transactionId = this.currentTransaction.stampId;
     const route = this.session ? undefined : this.offlineRoute();
+    // One fold, read once here and handed to whichever route runs, so the four routes cannot disagree
+    // on the lane the write carries.
+    const lane = this.openLane();
 
     let durability: TransactionDurability | undefined;
     let queued = false;
     try {
       if (this.session) {
-        durability = await this.commitSession(this.session);
+        durability = await this.commitSession(this.session, lane);
       } else if (route !== undefined) {
-        queued = await this.sealIntoQueue(route.collections, transactionId);
+        queued = await this.sealIntoQueue(route.collections, transactionId, lane);
       } else {
         // Legacy mode: push every tree that staged DML this transaction. This
         // replaces the inline updateAndSync that Tree.replace() used to perform
@@ -936,7 +941,7 @@ export class TransactionBridge {
         // after every pend succeeded, surfaced as CoordinatorPartialCommitError
         // rather than papered over. See commitDirtyTreesLegacy and
         // docs/transactions.md (§ "Legacy (single-node) commit").
-        durability = await this.commitDirtyTreesLegacy();
+        durability = await this.commitDirtyTreesLegacy(lane);
       }
     } catch (error) {
       throw await this.afterFailedCommit(error);
@@ -1126,9 +1131,10 @@ export class TransactionBridge {
    * entry was queued: `false` when nothing was staged, which queues nothing and reports nothing, as a
    * commit that wrote nothing reports nothing. An enqueue the queue's journal refuses throws with
    * every segment unsealed again, and the commit then rolls the transaction back as for any failed
-   * commit ({@link afterFailedCommit}).
+   * commit ({@link afterFailedCommit}). `lane` is the transaction's ({@link openLane}), fixed on the
+   * entry at enqueue.
    */
-  private async sealIntoQueue(collections: readonly Collection<any>[], transactionId: string): Promise<boolean> {
+  private async sealIntoQueue(collections: readonly Collection<any>[], transactionId: string, lane: Lane): Promise<boolean> {
     if (log.enabled) {
       this.logCommitCollections('offline', [...this.dirtyTrees.keys()].map((tree, i) => ({
         id: treeLabel(tree, i),
@@ -1137,7 +1143,7 @@ export class TransactionBridge {
         action: treeActionId(tree),
       })));
     }
-    return await this.offline!.enqueue(collections, transactionId, this.openWriteFacts()) !== undefined;
+    return await this.offline!.enqueue(collections, transactionId, this.openWriteFacts(), lane) !== undefined;
   }
 
   /**
@@ -1172,10 +1178,11 @@ export class TransactionBridge {
 
   /**
    * Session-mode commit: hand the staged transforms to the session's coordinator for
-   * distributed consensus. Resolves to who holds what the commit wrote, or `undefined` when
+   * distributed consensus, under the transaction's lane ({@link openLane}), which the session folds
+   * into the transaction it signs. Resolves to who holds what the commit wrote, or `undefined` when
    * it wrote nothing.
    */
-  private async commitSession(session: TransactionSession): Promise<TransactionDurability | undefined> {
+  private async commitSession(session: TransactionSession, lane: Lane): Promise<TransactionDurability | undefined> {
     // The DML path STAGES into the collection trackers (no inline sync), and
     // the coordinator's commit() iterates its collection map and reads each
     // `tracker.transforms` directly. Because that map is the SAME live
@@ -1183,11 +1190,11 @@ export class TransactionBridge {
     // getCollectionRegistry), the staged transforms are exactly what
     // consensus pends/commits — so we deliberately do NOT tree.sync() here;
     // flushing would reset the trackers out from under consensus.
-    // NOTE: session.commit() with no options inherits the coordinator's default
+    // NOTE: session.commit() with only the lane set inherits the coordinator's default
     // bounded backoff+jitter retry of a clean stale loss (~10 attempts, up to a
     // few seconds under sustained contention) before surfacing an error. That is
     // the intended safe default; if the SQL layer ever needs faster failure here,
-    // thread a SyncOptions ({ maxAttempts, deadlineMs, signal }) through commit().
+    // add the retry knobs ({ maxAttempts, deadlineMs, signal }) beside the lane.
     //
     // Trace what the coordinator is about to carry BEFORE handing off: in session
     // mode the commit set is the whole live registry (the coordinator iterates its
@@ -1204,7 +1211,7 @@ export class TransactionBridge {
         action: collection.committedActionId() ?? 'none' as const,
       })));
     }
-    const result = await session.commit();
+    const result = await session.commit({ lane });
     if (!result.success) {
       throw new Error(result.error || 'Transaction commit failed');
     }
@@ -1351,8 +1358,9 @@ export class TransactionBridge {
    *   share one batch — see {@link legacyBatch} for the two cases.
    *
    * Resolves to who holds what the commit wrote, or `undefined` when no tree wrote anything.
+   * `lane` is the transaction's ({@link openLane}), carried by whichever mechanism pushes.
    */
-  private async commitDirtyTreesLegacy(): Promise<TransactionDurability | undefined> {
+  private async commitDirtyTreesLegacy(lane: Lane): Promise<TransactionDurability | undefined> {
     const trees = [...this.dirtyTrees.keys()];
 
     // Trace what this commit is about to carry. Legacy mode's commit set is the
@@ -1372,8 +1380,8 @@ export class TransactionBridge {
 
     const batch = this.legacyBatch(trees);
     return batch === undefined
-      ? await this.sweepDirtyTreesLegacy(trees)
-      : await this.commitBatchLegacy(batch);
+      ? await this.sweepDirtyTreesLegacy(trees, lane)
+      : await this.commitBatchLegacy(batch, lane);
   }
 
   /**
@@ -1449,7 +1457,7 @@ export class TransactionBridge {
    *
    * On success, resolves to the coordinator's answer: who holds each collection it wrote.
    */
-  private async commitBatchLegacy({ collections, transactor }: LegacyBatch): Promise<TransactionDurability | undefined> {
+  private async commitBatchLegacy({ collections, transactor }: LegacyBatch, lane: Lane): Promise<TransactionDurability | undefined> {
     // NOTE: the batch pends each tree at the revision this handle currently holds for it — the
     // coordinator does not refresh before its first attempt, where the sweep's `updateAndSync`
     // did. A tree a rival advanced since this handle last refreshed it therefore costs one
@@ -1464,7 +1472,7 @@ export class TransactionBridge {
       { pendValidation: 'none' },
     );
     try {
-      return await coordinator.commit(await this.legacyTransaction(transactor));
+      return await coordinator.commit(await this.legacyTransaction(transactor, lane));
     } catch (error) {
       if (error instanceof CoordinatorPartialCommitError) {
         await this.restoreUncommittedTrees(new Set(error.committedCollections));
@@ -1480,11 +1488,12 @@ export class TransactionBridge {
    * things only: the action id every participant's log entry carries (`id`), the expiry it
    * checks before each attempt (`stamp.expiration`), and its one-open-stamp check
    * (`stamp.id`); and it carries the HLC every participant's log entry is stamped with, minted
-   * here from the batch's transactor clock exactly as `TransactionSession.commit` mints one. No
-   * member ever sees it — the pend carries no validation payload — so its expiry
-   * ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
+   * here from the batch's transactor clock exactly as `TransactionSession.commit` mints one, and
+   * the transaction's lane ({@link openLane}), which the coordinator puts on every participant's
+   * entry, pend and commit. No member ever sees it — the pend carries no validation payload — so
+   * its expiry ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
    */
-  private async legacyTransaction(transactor: ITransactor, lane: Lane = 'serializable'): Promise<Transaction> {
+  private async legacyTransaction(transactor: ITransactor, lane: Lane): Promise<Transaction> {
     const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, NetworkCommitBoundMs);
     const hlc = clockOf(transactor).now();
     return { stamp, statements: [], reads: [], hlc, lane, id: await createTransactionId(stamp.id, [], [], hlc, lane) };
@@ -1547,9 +1556,10 @@ export class TransactionBridge {
    *
    * On success, resolves to who holds what the sweep wrote — each tree's `sync()` answer,
    * keyed by its collection id (two trees over one id merge, weakest first) — or `undefined`
-   * when no tree had anything to push.
+   * when no tree had anything to push. Every flush carries `lane`, the transaction's
+   * ({@link openLane}), so the trees of one commit agree on it as a batch's participants do.
    */
-  private async sweepDirtyTreesLegacy(trees: readonly DirtyTree[]): Promise<TransactionDurability | undefined> {
+  private async sweepDirtyTreesLegacy(trees: readonly DirtyTree[], lane: Lane): Promise<TransactionDurability | undefined> {
     const synced: DirtyTree[] = [];
     const written = new Map<CollectionId, WriteDurability | undefined>();
 
@@ -1582,7 +1592,7 @@ export class TransactionBridge {
       // later failure, which for a tree with nothing staged restores what it already holds.
       if (!isStaged(tree)) continue;
       try {
-        const durability = await tree.sync();
+        const durability = await tree.sync({ lane });
         synced.push(tree);
         if (durability !== undefined) {
           recordCollectionDurability(written, tree.getCollection?.()?.id ?? treeLabel(tree, index), durability);
@@ -1997,16 +2007,18 @@ export class TransactionBridge {
 
   /**
    * Record what the executing statement's write description says it decided against other rows
-   * (`uncheckedOf` in write-description.ts), once per described statement: the engine hands one
-   * `TableWrite` object per execution, shared by every row's `update()`, so the first call for an
-   * object records the statement and later calls — the other rows, the upsert `DO UPDATE` arm handed
-   * the INSERT's object — add nothing. A write with no description (an FK cascade child write) records
-   * instead that a write of the transaction went undescribed, after which its decisions cannot be
-   * listed in full — once per run of such writes, since a cascade hands one per child row and the fold
-   * reads the record as a flag. Kept, discarded and folded as {@link noteWriteFacts}'s records are; a
-   * no-op with no active transaction.
+   * (`uncheckedOf` in write-description.ts) and which lane the statement takes (`laneOf` in lane.ts,
+   * over the description and `table`, the vtab's own `TableSchema` with its tags kept current), once
+   * per described statement: the engine hands one `TableWrite` object per execution, shared by every
+   * row's `update()`, so the first call for an object records the statement and later calls — the
+   * other rows, the upsert `DO UPDATE` arm handed the INSERT's object — add nothing. A write with no
+   * description (an FK cascade child write) records instead that a write of the transaction went
+   * undescribed, after which its decisions cannot be listed in full and its lane is `serializable` —
+   * once per run of such writes, since a cascade hands one per child row and the folds read the record
+   * as a flag. Kept, discarded and folded as {@link noteWriteFacts}'s records are; a no-op with no
+   * active transaction.
    */
-  noteWriteDescription(write: TableWrite | undefined): void {
+  noteWriteDescription(write: TableWrite | undefined, table: TableSchema): void {
     const transaction = this.currentTransaction;
     if (!transaction?.isActive) return;
     const facts = transaction.writeFacts;
@@ -2016,7 +2028,19 @@ export class TransactionBridge {
     }
     if (facts.described.has(write)) return;
     facts.described.add(write);
-    facts.records.push({ kind: 'statement', unchecked: uncheckedOf(write) });
+    facts.records.push({ kind: 'statement', unchecked: uncheckedOf(write) }, { kind: 'lane', lane: laneOf(write, table) });
+  }
+
+  /**
+   * The lane the open transaction's commit carries (`transactionLaneOf` in lane.ts): the stricter
+   * over its described statements' lanes, `serializable` for a transaction with no described write
+   * or with an undescribed one. Read once by {@link commitTransaction} and handed to whichever
+   * commit route runs — the session's `commit`, the legacy batch's transaction, each flush of the
+   * per-tree sweep, and the offline queue's entry — so the four cannot disagree. `serializable` with
+   * no transaction.
+   */
+  openLane(): Lane {
+    return transactionLaneOf(this.currentTransaction?.writeFacts.records ?? []);
   }
 
   /**

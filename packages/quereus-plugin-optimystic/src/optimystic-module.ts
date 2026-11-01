@@ -27,6 +27,8 @@ import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './sch
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
 import { withTagsOf } from './schema/tag-overlay.js';
+import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged } from './schema/declared-tags.js';
+import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
 import { PhysicalType } from '@quereus/quereus';
 import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
 import { IndexPredicate } from './schema/index-predicate.js';
@@ -604,25 +606,6 @@ function offlinePolicyTag(tags: Readonly<Record<string, SqlValue>> | undefined):
   return { policy: 'queue', recognised: value === undefined || value === 'queue' };
 }
 
-/** The column tag that declares the column's values generated unique per write by the application,
- * so an offline transaction's check on them cannot be refused by another writer (docs/offline-sync.md
- * §Declared hints). */
-const FRESH_TAG = 'optimystic.fresh';
-
-/** The table tag that declares only one machine writes the table's rows (docs/offline-sync.md §Declared hints). */
-const SINGLE_WRITER_TAG = 'optimystic.single_writer';
-
-/** The table tag that declares the table's primary key a deterministic function of the row's other
- * columns (a blob store keyed by content hash), so two machines inserting the same content insert the
- * same row and a plain `insert` of an equal row is the same write made twice (docs/offline-sync.md
- * §Declared hints). Read `=== true` at staging time, as {@link SINGLE_WRITER_TAG} is read. */
-const CONTENT_KEY_TAG = 'optimystic.content_key';
-
-/** Whether `column` is tagged fresh — read with `=== true`, as {@link wantsNetworkWatch} reads its tag. */
-function freshTagged(column: { readonly tags?: Readonly<Record<string, SqlValue>> } | undefined): boolean {
-  return column?.tags?.[FRESH_TAG] === true;
-}
-
 /**
  * Production-grade virtual table for Optimystic tree collections
  */
@@ -702,6 +685,10 @@ export class OptimysticVirtualTable extends VirtualTable {
   private offlinePolicy: OfflineTablePolicy;
   /** A tag value that names no policy was logged; it is logged once per table. */
   private unknownOfflinePolicyLogged = false;
+  /** A profile tag value that names no profile was logged; once per table ({@link logUnrecognisedLaneTags}). */
+  private unknownProfileLogged = false;
+  /** The columns whose merge tag value named no merge were logged; once per column. */
+  private readonly unknownMergeLogged = new Set<string>();
   /** What the offline-mode controller asks to judge a transaction's checks on this table's trees,
    * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
   private readonly outlookSource: TableOutlookSource = {
@@ -732,6 +719,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.declaredColumns = tableSchema.columns.length > 0;
     this.networkWatchTagged = wantsNetworkWatch(tableSchema.tags);
     this.offlinePolicy = this.readOfflinePolicy(tableSchema.tags);
+    this.logUnrecognisedLaneTags(tableSchema);
     this.options = options;
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
@@ -1371,11 +1359,14 @@ export class OptimysticVirtualTable extends VirtualTable {
    * module's job, not this instance's: a hydrated table may have no instance at all.
    */
   followSchemaTags(schema: TableSchema): void {
+    const before = this.tableSchema;
     this.tableSchema = withTagsOf(this.tableSchema, schema);
     this.networkWatchTagged = wantsNetworkWatch(this.tableSchema.tags);
     this.reconcileNetworkWatch();
     this.offlinePolicy = this.readOfflinePolicy(this.tableSchema.tags);
     this.publishOfflinePolicy();
+    this.logUnrecognisedLaneTags(this.tableSchema);
+    this.reportLaneDeclarationChange(before);
   }
 
   /** The policy `tags` choose ({@link offlinePolicyTag}), logging once per table a value that names
@@ -1388,6 +1379,44 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.tableName, tags?.[OFFLINE_POLICY_TAG], OFFLINE_POLICY_TAG);
     }
     return policy;
+  }
+
+  /**
+   * Log, once per table for the profile and once per column for the merge, a lane-bearing tag value
+   * that names nothing (`profileTag`, `mergeTag` in optimystic-adapter/lane.ts). The value is read as
+   * absent, fail safe: the table stays `strong`, the column declares no merge. Never a throw, since
+   * Quereus has already applied the tag to its own catalog when the module hears of it.
+   */
+  private logUnrecognisedLaneTags(schema: TableSchema): void {
+    if (!profileTag(schema.tags).recognised && !this.unknownProfileLogged) {
+      this.unknownProfileLogged = true;
+      log('optimystic:profile-tag-ignored table=%s value=%o: %s takes \'strong\' or \'replay-permitted\'; read as \'strong\'',
+        this.tableName, schema.tags?.[PROFILE_TAG], PROFILE_TAG);
+    }
+    for (const column of schema.columns) {
+      if (mergeTag(column.tags).recognised || this.unknownMergeLogged.has(column.name)) continue;
+      this.unknownMergeLogged.add(column.name);
+      log('optimystic:merge-tag-ignored table=%s column=%s value=%o: %s takes \'last-writer-wins\'; read as no merge',
+        this.tableName, column.name, column.tags?.[MERGE_TAG], MERGE_TAG);
+    }
+  }
+
+  /**
+   * A tag change that moves the table's profile or a column's merge (`laneDeclarationChanged` in
+   * optimystic-adapter/lane.ts) while transactions queued for the table have not reached the network:
+   * each keeps the lane it was classified with, which was true of its statements when the application
+   * made them and is journaled with it (docs/transactions.md §Which lane a transaction takes), so this
+   * only names them. The change cannot be refused — Quereus applies a tag change to its own catalog
+   * before the module hears of it — and no hazard follows while nothing admits by lane: the replay
+   * stage reads an entry's lane under the table's profile at merge time, and a `strong` table never
+   * merges whatever an entry says. The next transaction is classified under the new declarations.
+   */
+  private reportLaneDeclarationChange(before: TableSchema): void {
+    if (!laneDeclarationChanged(before, this.tableSchema)) return;
+    const queued = this.txnBridge.getOfflineMode()?.queuedTransactionsOf(this.qualifiedTable) ?? [];
+    if (queued.length === 0) return;
+    log('offline:profile-changed-with-entries-queued table=%s transactions=%o: each keeps the lane it was classified with',
+      qualifiedTableName(this.qualifiedTable), queued);
   }
 
   /** Tell the offline-mode controller this table's policy, which decides the acknowledgement of a
@@ -1423,7 +1452,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       kind: 'main',
       table,
       freshKey: this.tableSchema.primaryKeyDefinition.some(pk => freshTagged(columns[pk.index])),
-      singleWriter: this.tableSchema.tags?.[SINGLE_WRITER_TAG] === true,
+      singleWriter: singleWriterTagged(this.tableSchema),
       decodeKey: key => {
         // decodePrimaryKey answers one value per key column whatever it is given; a key with another
         // number of framed elements is not one of this table's.
@@ -2455,7 +2484,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    * The guard an INSERT whose probe found the key clear carries: `absentOrEqual` when a rival's
    * EQUAL row at the key is this write already made — the statement's disposition says a present
    * row is not an error (`insertAcceptsEqualRow` in write-description.ts: `or ignore`, `or replace`,
-   * `on conflict do nothing` on the key), or the table is tagged {@link CONTENT_KEY_TAG}, its key
+   * `on conflict do nothing` on the key), or the table is tagged `optimystic.content_key`
+   * (`contentKeyed` in schema/declared-tags.ts), its key
    * being a function of the row's content — and `absent` otherwise. Either kind still refuses a
    * rival's DIFFERENT row at the key, which the sequential retry then resolves under the
    * disposition; `absentOrEqual` compares the whole row, so an equal key under other content
@@ -2463,8 +2493,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * error, and an application may rely on that to learn that someone else got there first.
    */
   private insertGuard(write: TableWrite | undefined): TreeUpsertGuard<string, StoredRowEntry> {
-    const contentKeyed = this.tableSchema.tags?.[CONTENT_KEY_TAG] === true;
-    return contentKeyed || insertAcceptsEqualRow(write, this.primaryKeyColumnNames())
+    return contentKeyed(this.tableSchema) || insertAcceptsEqualRow(write, this.primaryKeyColumnNames())
       ? { kind: 'absentOrEqual' }
       : { kind: 'absent' };
   }
@@ -3113,9 +3142,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     const txnState = this.txnBridge.getCurrentTransaction();
 
     // Ahead of every arm's staging, DELETE's included: the statement's decisions against other rows
-    // are recorded once per description (the bridge keys on the object), and a statement that then
-    // fails is discarded with its rows by the statement savepoint's rollback.
-    this.txnBridge.noteWriteDescription(args.writeScope);
+    // and its lane (classified over this table's schema, tags included) are recorded once per
+    // description (the bridge keys on the object), and a statement that then fails is discarded with
+    // its rows by the statement savepoint's rollback.
+    this.txnBridge.noteWriteDescription(args.writeScope, this.tableSchema);
 
     try {
       switch (operation) {

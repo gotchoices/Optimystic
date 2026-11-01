@@ -1,5 +1,5 @@
 import type { QualifiedName, ScopeValue, SqlValue, TableWatch, TableWrite, UpsertClause, WatchScope } from '@quereus/quereus';
-import type { CollectionId } from '@optimystic/db-core';
+import type { CollectionId, Lane } from '@optimystic/db-core';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type { EntryFacts, UncheckedDecision } from './commit-outlook.js';
 
@@ -42,12 +42,15 @@ export type UncheckedRead = {
  *   entry, the unique value of a unique-index entry (docs/offline-sync.md §Judging each guard);
  * - `statement`: one described statement's decisions against other rows ({@link uncheckedOf}),
  *   recorded once per statement;
+ * - `lane`: one described statement's lane (`laneOf` in lane.ts), recorded beside its `statement`
+ *   record, from which `transactionLaneOf` folds the lane the transaction's commit carries;
  * - `undescribed`: a write the engine handed no description for (an FK cascade child write), after
- *   which the transaction's decisions cannot be listed in full.
+ *   which the transaction's decisions cannot be listed in full, and its lane is `serializable`.
  */
 export type WriteFact =
 	| { readonly kind: 'fresh'; readonly collectionId: CollectionId; readonly key: string }
 	| { readonly kind: 'statement'; readonly unchecked: readonly UncheckedRead[] }
+	| { readonly kind: 'lane'; readonly lane: Lane }
 	| { readonly kind: 'undescribed' };
 
 /**
@@ -110,8 +113,9 @@ export function freshElementsOf(write: TableWrite | undefined, arm: 'insert' | '
 	return facts;
 }
 
-/** The lowercased names of the columns `write` labels `fresh`. */
-function freshColumnsOf(write: TableWrite): Set<string> {
+/** The lowercased names of the columns `write` labels `fresh`. Shared with the lane rule (lane.ts),
+ * which judges an INSERT's key by the same labels. */
+export function freshColumnsOf(write: TableWrite): Set<string> {
 	const fresh = new Set<string>();
 	for (const column of write.columns) {
 		if (column.provenance.kind === 'fresh') fresh.add(column.column.toLowerCase());
@@ -119,7 +123,8 @@ function freshColumnsOf(write: TableWrite): Set<string> {
 	return fresh;
 }
 
-function anyFresh(fresh: ReadonlySet<string>, columns: readonly string[]): boolean {
+/** Whether any of `columns` (declared spellings) is among `fresh` (lowercased): the composite rule. */
+export function anyFresh(fresh: ReadonlySet<string>, columns: readonly string[]): boolean {
 	return columns.some(column => fresh.has(column.toLowerCase()));
 }
 
@@ -373,6 +378,9 @@ export function foldWriteFacts(records: readonly WriteFact[]): EntryFacts {
 			}
 			case 'statement':
 				unchecked.push(...record.unchecked);
+				break;
+			case 'lane':
+				// The lane is folded on its own (`transactionLaneOf` in lane.ts); the entry's facts do not carry it.
 				break;
 			case 'undescribed':
 				complete = false;
