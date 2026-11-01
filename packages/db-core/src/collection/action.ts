@@ -87,10 +87,18 @@ export type ActionContext = {
  * a log reaches (`Log.getActionContext`, `Log.getFrom`); or the context was never built from a
  * log at all. A caller printing this must carry a placeholder rather than invent an id.
  *
- * NOTE: linear in `committed`, which grows one entry per commit between context reads; fine now —
- * every caller is a `debug`-gated diagnostic, so this does not run on a normal path at all. If a
- * non-diagnostic caller ever appears, index the lookup or search from the end (the entry at the
- * context's own `rev` is normally the last one). */
+ * Searches from the end: `Collection.judgeAdoption` asks for the entry at the held context's own
+ * `rev` on every refresh that walks the log, and that entry is normally the last one.
+ *
+ * NOTE: still linear in `committed` for a revision near the front, and the list grows one entry per
+ * commit and truncates only at a checkpoint — which nothing writes today
+ * (tickets/backlog/debt-the-collection-log-never-writes-a-checkpoint). If a caller ever looks up old
+ * revisions on a hot path, index the list by revision. */
 export function actionIdAt(context: ActionContext, rev: number): ActionId | undefined {
-	return context.committed.find(entry => entry.rev === rev)?.actionId;
+	for (let i = context.committed.length - 1; i >= 0; i--) {
+		if (context.committed[i]!.rev === rev) {
+			return context.committed[i]!.actionId;
+		}
+	}
+	return undefined;
 }

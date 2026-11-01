@@ -301,25 +301,23 @@ export class CacheSource<T extends IBlock> implements BlockSource<T> {
 		return this.source.createBlockHeader(type, newId);
 	}
 
+	/** Forget `blockIds` — or, with none given, every id this cache holds or describes, an LRU-evicted
+	 *  id's lingering {@link revisions} entry included. Each forgotten id's generation moves, so a read
+	 *  of it already in flight is not kept when it lands ({@link stillWanted}), and a base pin or a
+	 *  materialized memo built on what was forgotten is re-judged. */
 	clear(blockIds: BlockId[] | undefined = undefined) {
-		if (blockIds) {
-			for (const id of blockIds) {
-				this.cache.delete(id);
-				this.revisions.delete(id);
-				this.unkept.delete(id);
-				this.bump(id);
-			}
-		} else {
-			for (const [id] of this.cache) {
-				this.bump(id);
-			}
-			for (const id of this.unkept.keys()) {
-				this.bump(id);
-			}
-			this.cache.clear();
-			this.revisions.clear();
-			this.unkept.clear();
+		for (const id of blockIds ?? this.describedIds()) {
+			this.cache.delete(id);
+			this.revisions.delete(id);
+			this.unkept.delete(id);
+			this.bump(id);
 		}
+	}
+
+	/** Every id this cache can say anything about: cached, evicted with its revision kept, or handed
+	 *  through unkept. */
+	private describedIds(): Set<BlockId> {
+		return new Set([...[...this.cache].map(([id]) => id), ...this.revisions.keys(), ...this.unkept.keys()]);
 	}
 
 	/** A cloned copy of the current cache contents with each id's committed revision, in LRU

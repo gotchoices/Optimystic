@@ -476,7 +476,9 @@ removed the floor), then a too-old one judged against nothing — kept, and serv
 caught up (pinned in `packages/db-core/test/refresh-below-floor.spec.ts`). A standing floor is always
 true of a correct answer, costs one map lookup per fetched block, and bounds the map by the distinct
 blocks walked entries named — the bound `CacheSource`'s `generations` map already pays (`NOTE:` on
-`BlockFloors`).
+`BlockFloors`). The one exception is a refresh that adopts another lineage, which drops every floor
+with the read cache (`BlockFloors.clear`; see [The revision context is monotonic](#the-revision-context-is-monotonic)): a floor
+raised under a history the network does not hold is no bound on the one it does.
 
 **The forgetting and the adopting are one synchronous step.** Floors apply at or above their own
 revision, so they say nothing about a read made at the revision the handle is *leaving* — and reads
@@ -2973,8 +2975,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   one they disagree at — the point the lineages actually parted, which is usually below either
   side's current revision once a forked copy has kept writing. The line is
   `collection:lineage-divergence id=… tag=… site=… forkRev=… heldAction=… readAction=… heldRev=… readRev=…`.
-  Like the shortfall line it only logs — adoption proceeds unchanged, which makes it a
-  per-discovery report rather than a per-refresh one. Both adoption sites run it and `site=` says
+  Both adoption sites print it and `site=` says
   which: on `updateInternal` (`site=refresh`) it contrasts this node's copy with the stored log,
   while on `attachToLog` (`site=attach`) it contrasts the tail block's `state.latest` (adopted on
   trust by `bootstrapContext`) with a walk of that tail's own chain, so a line there indicts
@@ -2985,6 +2986,34 @@ saveMaterializedBlock(block): store(structuredClone(block));
   above): it compares the held context only against the entries in the log tail block, and walks
   when any of them disagree. A fork below the tail block, on a log that has not moved, is
   therefore reported by the next refresh that finds a new entry, not by an idle one.
+- **A refresh that adopts another lineage forgets what it learned under the old one.** The line
+  above is a diagnostic, gated on logging; the behaviour rests on a separate, unconditional verdict
+  (`Collection.judgeAdoption`): the read is adopted (its revision is at or above the held one) and
+  names a different action than the held context at the held revision. One comparison is enough
+  because an action id is unique per commit, so two lineages that parted at or below the held
+  revision disagree at every revision both have reached since. On that verdict `forgetAndAdopt`
+  drops the **whole** read cache and every floor, before its walk raises the new lineage's floors,
+  and `mustReplay` re-stages every staged action, sealed segments included. The whole cache,
+  because the walk covers only entries above the held revision: the blocks the old lineage built at
+  and below it are named by entries the handle will never walk, the cache has no expiry, and a
+  refresh of a log that has not moved stops after one request — so nothing else would ever clear
+  them, the trap of
+  [A block re-read after a refresh can be answered too old](#a-block-re-read-after-a-refresh-can-be-answered-too-old-and-is-never-remembered)
+  reached by another door. The floors, because a floor raised under the old lineage is no bound on
+  the new one, where the block may sit below it, and would make every read of it a below-floor
+  answer for the life of the handle. The replay, because the staged actions were computed against
+  the old content, and a fork at the *same* revision advances nothing, so no other replay reason
+  sees it. The step stays await-free (*The forgetting and the adopting are one synchronous step*,
+  above). Adopting overwrites the held lineage marker and the drop leaves the handle consistent
+  with the log, so the next refresh compares log to log: the line is a per-discovery report.
+  An open (`site=attach`) has no cache to drop and nothing staged, and only logs. A read the
+  handle **refuses** — held above the read on another lineage, reported beside
+  `collection:context-not-lowered` — drops nothing, keeps the held marker and so is reported on
+  every refresh: that handle has sealed a fork, and bringing it onto the network's lineage is
+  reconciliation (backlog `feat-replay-mode-collections-merge-divergent-histories`). A side that
+  names no action at the held revision (an invalidation or checkpoint took the slot, or it predates
+  the read side's most recent checkpoint) gives no verdict, so a fork visible only below such a slot
+  can be printed by the line without being acted on.
 - A header that reads *authoritatively absent* while the collection holds a committed revision is
   a contradiction, not an absence: the client has proof something was committed under this id.
   `updateInternal` throws `CollectionHeaderVanishedError` (naming the collection and the held

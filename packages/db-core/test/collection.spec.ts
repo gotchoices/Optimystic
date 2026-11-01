@@ -2213,12 +2213,16 @@ describe('Collection', () => {
      *
      *  `state: false` plus `entryRev: N` rewrites ONE log entry and leaves the tail metadata
      *  honest — a handle that opens through it forks at revision N only and agrees with storage
-     *  everywhere above it, which is what the earliest-divergent-revision scan has to find. */
+     *  everywhere above it, which is what the earliest-divergent-revision scan has to find.
+     *
+     *  `content` gives data blocks the other lineage's content: while armed, each named block is
+     *  served with these fields laid over what storage holds. */
     const rewrittenLineageTransactor = (
       inner: TestTransactor,
       tailId: string,
       fakeId: string,
-      { entries = true, state = true, entryRev }: { entries?: boolean, state?: boolean, entryRev?: number } = {},
+      { entries = true, state = true, entryRev, content = {} }:
+        { entries?: boolean, state?: boolean, entryRev?: number, content?: Record<string, object> } = {},
     ) => {
       let armed = false
       const rewrite = (entry: GetBlockResults[string]): GetBlockResults[string] => {
@@ -2247,6 +2251,12 @@ describe('Collection', () => {
           const entry = res[tailId]
           if (armed && entry) {
             res[tailId] = rewrite(entry)
+          }
+          for (const [blockId, fields] of Object.entries(content)) {
+            const served = res[blockId]
+            if (armed && served?.block) {
+              res[blockId] = { ...served, block: { ...served.block, ...fields } as IBlock }
+            }
           }
           return res
         },
@@ -2331,22 +2341,58 @@ describe('Collection', () => {
       expect(values, 'a diverged collection still serves reads after the report').to.deep.equal(['one'])
     })
 
-    it('reports once per discovery, not once per refresh — adoption heals the held context', async () => {
-      // advanceContext adopts the log's context after reporting (equal revisions adopt; see its
-      // doc comment), so the held lineage marker now matches the log and a second refresh
-      // compares log-to-log. The line marks the refresh that DISCOVERED the divergence. This is
-      // deliberately weaker than the shortfall line's per-call reporting: the context disagreement
-      // genuinely is resolved by adoption, even though block content materialized under the old
-      // lineage may still be cached.
-      const { diverged } = await openDivergedHandle('divergent-lineage-action-id')
+    // Ticket a-lineage-divergence-drops-the-read-cache. A handle that opened on another lineage has
+    // cached that lineage's blocks, and no walked entry will ever clear them: the walk covers only
+    // entries above the held revision, and a refresh of a log that has not moved stops after one
+    // request. So a refresh that adopts the log's lineage drops the whole read cache, and re-stages
+    // what was staged over it — which a fork at the SAME revision would otherwise never do, since
+    // nothing advanced. The discovering refresh runs with the namespace OFF: the drop is behaviour,
+    // not diagnosis. The line it would have printed is pinned by the test above; the refresh after
+    // must have nothing left to report.
+    it('an adopted divergence drops the read cache and re-stages, and is not reported again', async () => {
+      const sharedBlockId = 'lineage-shared-block'
+      const derivedBlockId = 'lineage-derived-block'
+      const options: CollectionInitOptions<TestAction> = {
+        ...initOptions,
+        modules: {
+          'write': async (action, store) => {
+            store.insert({ header: store.createBlockHeader('TEST', sharedBlockId), value: action.data.value } as IBlock & { value: string })
+          },
+          // An insert computed from the shared block's content: it says what it was computed against,
+          // and it pins no base — so only the divergence itself can make the refresh re-stage it.
+          'derive': async (action, store) => {
+            const shared = await store.tryGet(sharedBlockId) as ({ value?: string } | undefined)
+            store.insert({ header: store.createBlockHeader('TEST', derivedBlockId), value: `${shared?.value}+${action.data.value}` } as IBlock & { value: string })
+          },
+        },
+      }
+      const read = async (collection: Collection<TestAction>, blockId: string): Promise<string | undefined> =>
+        (await collection.tracker.tryGet(blockId) as { value?: string } | undefined)?.value
 
-      const lines = await captureCollectionLog(async () => {
+      const writer = await Collection.createOrOpen<TestAction>(transactor, collectionId, options)
+      await writer.act({ type: 'write', data: { value: 'stored', timestamp: 1 } })
+      await writer.updateAndSync()
+      const { tailId } = await syncedTail()
+
+      const rewritten = rewrittenLineageTransactor(transactor, tailId, 'divergent-lineage-action-id',
+        { content: { [sharedBlockId]: { value: 'forked' } } })
+      rewritten.arm()
+      const diverged = (await Collection.open<TestAction>(rewritten.transactor, collectionId, options))!
+      expect(await read(diverged, sharedBlockId), 'the handle reads, and caches, the lineage it opened on').to.equal('forked')
+      await diverged.act({ type: 'derive', data: { value: 'local', timestamp: 2 } })
+      rewritten.disarm()
+
+      const previousNamespaces = debug.disable()
+      try {
         await diverged.update()
-        await diverged.update()
-        await diverged.update()
-      })
-      expect(lines.filter(l => l.includes(divergenceTag)).length,
-        `only the discovering refresh reports, got: ${lines.join(' | ')}`).to.equal(1)
+      } finally {
+        if (previousNamespaces) debug.enable(previousNamespaces)
+      }
+      expect(await read(diverged, sharedBlockId), 'the stored content, not the forked content the cache held').to.equal('stored')
+      expect(await read(diverged, derivedBlockId), 'the staged action re-made over the stored content').to.equal('stored+local')
+
+      const lines = await captureCollectionLog(() => diverged.update())
+      expect(lines.filter(l => l.includes(divergenceTag)), 'the handle now holds the log\'s lineage').to.deep.equal([])
     })
 
     it('an OPEN whose tail state and log entries name different actions reports too', async () => {

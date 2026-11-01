@@ -52,6 +52,18 @@ type DivergenceSite = 'refresh' | 'attach';
  * as `forkRev=` / `heldAction=` / `readAction=`. */
 type LineageFork = { rev: number, heldAction: ActionId, readAction: ActionId };
 
+/** What adopting a freshly-read context does to the one a handle holds — {@link Collection.judgeAdoption}'s
+ * answer, decided before anything changes because an adopted divergence has to clear the read cache
+ * and the floors before the refresh's walk raises the new lineage's floors.
+ *
+ * - `refuse` — the read is not adopted: it learned nothing, or it is older than the held revision
+ *   (`collection:context-not-lowered`).
+ * - `adopt` — the read is adopted, and names the same action as the held context at the held
+ *   revision, or one side names none there.
+ * - `adopt-divergent` — the read is adopted, and names a different action at the held revision: the
+ *   handle has been reading another lineage than the one the network holds. */
+type Adoption = 'refuse' | 'adopt' | 'adopt-divergent';
+
 /** What one refresh ({@link Collection.refreshInFlight}, and the refresh inside a sync) found out
  * about the write in flight on the instance's behalf. The caller hands in an empty report and the
  * refresh fills it in AS IT GOES, rather than returning it at the end, so a refresh that throws
@@ -601,23 +613,20 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * tag, two handles' lines interleave into what reads like one handle contradicting itself.
 	 *
 	 * Logs, does not throw — same reasoning as {@link reportShortfall}: `update()` runs
-	 * blanket-style over every registered collection between commit retries, and aborting here
-	 * would promote a diagnosis to production behaviour before the line has ever been seen to
-	 * fire in the wild. Adoption then proceeds unchanged, which means the line is a PER-DISCOVERY
-	 * report, not a per-refresh one: adopting `next` overwrites the held lineage marker with the
-	 * log's, so the next refresh of this instance compares log-to-log and stays silent — even
-	 * though block content materialized under the old lineage may still be in caches. The line
-	 * marks the refresh that first observed the disagreement.
+	 * blanket-style over every registered collection between commit retries. Whether the read is
+	 * adopted, and whether it is another lineage, is {@link judgeAdoption}'s call, made before this
+	 * runs so a refresh can act on it first: a refresh that ADOPTS another lineage drops its whole
+	 * read cache and its floors and re-stages every staged action ({@link forgetAndAdopt},
+	 * {@link mustReplay}), since everything it cached and computed was computed against a history the
+	 * network does not hold; an open has no cache to drop and nothing staged. The line is therefore a
+	 * PER-DISCOVERY report: adopting `next` overwrites the held lineage marker with the log's, the
+	 * drop leaves the handle consistent with the log, and the next refresh compares log to log and
+	 * has nothing to report. A REFUSED read leaves the held marker in place, so a fork sealed by a
+	 * `collection:context-not-lowered` refusal is reported on every refresh, beside that line, with
+	 * nothing dropped — bringing such a handle onto the network's lineage is reconciliation, backlog
+	 * `feat-replay-mode-collections-merge-divergent-histories`.
 	 *
-	 * NOTE: adoption resolves the CONTEXT disagreement, not the content one — the read caches on
-	 * this instance still hold blocks materialized under the old lineage, and since the revision
-	 * did not change nothing re-reads them. Conditional today: no fork has been reproduced (see
-	 * the still-open upstream reproducer), so this instrument exists to find out whether one
-	 * happens at all. If the line is ever seen firing in the field, decide then whether a
-	 * divergence should also drop the read cache (and whether to keep re-reporting per refresh)
-	 * — that is a behaviour change, and this seam deliberately makes none.
-	 *
-	 * The comparison is {@link earliestFork}, not a single lookup at the current revision: the
+	 * The comparison printed is {@link earliestFork}, not a single lookup at the current revision: the
 	 * two `committed` lists overlap across several revisions, and the LOWEST one they disagree at
 	 * is where the lineages actually parted — a fork below the current revision was previously
 	 * silent. `forkRev=` names it, `heldAction=`/`readAction=` are the two ids AT it, and
@@ -634,19 +643,23 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * the NOTE in {@link bootstrapContext}), which is exactly the case {@link earliestFork} has no
 	 * shared revision to report on.
 	 *
-	 * Gated on `log.enabled`, like every {@link actionIdAt} caller: the comparison buys nothing
-	 * when the line has no sink, and the lists — one entry per commit between context reads,
-	 * truncated at each checkpoint — are only walked on a run that has the namespace turned on.
+	 * The two printed comparisons are gated on `log.enabled`: they buy nothing when the line has no
+	 * sink. Nothing the handle DOES is: the adoption and the lineage verdict behind it
+	 * ({@link judgeAdoption}) run whatever the logging.
 	 * Silence proves nothing either way, because a revision is only comparable when BOTH sides
 	 * name an action for it: an invented collection has no context at all, a revision slot the log
 	 * gave to a checkpoint or invalidation entry names none, and a revision older than the read
-	 * log's most recent checkpoint has already fallen off the read side's list. */
+	 * log's most recent checkpoint has already fallen off the read side's list.
+	 *
+	 * @param adoption what adopting `next` does, as {@link judgeAdoption} answers it for the context
+	 * `source` holds now — passed in by a caller that had to act on it before calling. */
 	private static advanceContext(
 		source: TransactorSource<IBlock>,
 		id: CollectionId,
 		instanceTag: string,
 		site: DivergenceSite,
 		next: ActionContext | undefined,
+		adoption: Adoption = Collection.judgeAdoption(source.actionContext, next),
 	): void {
 		const current = source.actionContext;
 		if (next === undefined) {
@@ -659,9 +672,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 					id, instanceTag, site, fork.rev, fork.heldAction, fork.readAction, current.rev, next.rev);
 			}
 		}
-		if (current !== undefined && next.rev < current.rev) {
+		if (adoption === 'refuse') {
 			// The refusal itself is unconditional; only the id lookups that explain it are gated.
-			if (log.enabled) {
+			if (current !== undefined && log.enabled) {
 				log('collection:context-not-lowered id=%s tag=%s site=%s heldRev=%d readRev=%d heldAction=%s readAction=%s',
 					id, instanceTag, site, current.rev, next.rev,
 					actionIdAt(current, next.rev) ?? 'none', actionIdAt(next, next.rev) ?? 'none');
@@ -669,6 +682,39 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return;
 		}
 		source.actionContext = next;
+	}
+
+	/** Whether a read context `next` is adopted over the `held` one, and whether it is another
+	 * lineage ({@link Adoption}). Runs whatever the logging, because the answer is behaviour.
+	 *
+	 * Another lineage means the two name different actions at the HELD revision. One comparison is
+	 * enough because an action id is unique per commit: two lineages that parted at or below the held
+	 * revision name different actions at every revision both have reached since, the held one
+	 * included. The exception, one action landing on both sides (a writer's torn retry), is the same
+	 * lineage at that revision, which is the right answer. A side naming no action there is missing
+	 * evidence, not disagreement, as in {@link earliestFork} — the held revision's slot went to an
+	 * invalidation or checkpoint entry, or it predates the read side's most recent checkpoint — so a
+	 * fork visible only below such a slot is not acted on (the line may still report it). A refused
+	 * read names no action at the held revision, being below it, so `adopt-divergent` never comes
+	 * with a refusal.
+	 *
+	 * NOTE: two {@link actionIdAt} scans per refresh that walks the log, never per read. Each searches
+	 * from the end: the held side's entry is normally its last, and the read side's is as far back as
+	 * the entries the walk found. Both lists truncate only at a checkpoint, which nothing writes yet
+	 * (tickets/backlog/debt-the-collection-log-never-writes-a-checkpoint); if they grow long enough
+	 * for that to show, index them by revision. */
+	private static judgeAdoption(held: ActionContext | undefined, next: ActionContext | undefined): Adoption {
+		if (next === undefined || (held !== undefined && next.rev < held.rev)) {
+			return 'refuse';
+		}
+		if (held === undefined) {
+			return 'adopt';
+		}
+		const heldAction = actionIdAt(held, held.rev);
+		const readAction = actionIdAt(next, held.rev);
+		return heldAction !== undefined && readAction !== undefined && heldAction !== readAction
+			? 'adopt-divergent'
+			: 'adopt';
 	}
 
 	/** The EARLIEST revision the two contexts provably disagree about: the lowest revision both
@@ -1334,13 +1380,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			anyConflicts = true;
 		}
 
-		this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends);
+		const adoption = this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends);
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
 		// Re-stage the staged actions against the adopted revision. The affected
-		// blocks were already dropped from sourceCache above (per log entry / per invalidation),
-		// so the replay's reads re-materialize from the transactor.
+		// blocks were already dropped from sourceCache above (per log entry / per invalidation, or
+		// all of them on an adopted divergence), so the replay's reads re-materialize from the transactor.
 		// NOTE: a throw out of replayActions — a refusal of the OPEN segment, or any non-refusal
 		// error — leaves the tracker holding only the transforms replayed so far while the open
 		// segment still lists all of its actions; the caller's error handling is expected to
@@ -1349,7 +1395,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// collection-half-restaged). A SEALED segment is not left half-replayed: it is staged
 		// atomically, and a refusal of one is recorded and skipped rather than thrown. If replay ever
 		// gains a routinely-throwing read path, rebuild into a scratch tracker and swap on success.
-		if (this.mustReplay(anyConflicts, actionContext)) {
+		if (this.mustReplay(anyConflicts, actionContext, adoption)) {
 			await this.replayActions();
 		}
 	}
@@ -1376,21 +1422,41 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * context at all, and a log read that lags what this handle already committed yields an older
 	 * one; neither is grounds for forgetting the revision held. It also has to precede
 	 * {@link replayActions}, which re-reads blocks through `this.source` at whatever revision the
-	 * context names — replaying first would refill the cache at the revision being left. */
+	 * context names — replaying first would refill the cache at the revision being left.
+	 *
+	 * **An adopted divergence forgets everything first** ({@link judgeAdoption}): the whole read cache
+	 * and every floor, ahead of the per-entry loop so this walk's floors — the new lineage's — are the
+	 * ones left standing. Not just the blocks the walked entries name: the walk covers only entries
+	 * above the held revision, so the blocks the old lineage built at and below it are named by
+	 * entries this handle will never walk, the cache has no expiry, and an idle refresh stops after
+	 * one request while the log does not move — nothing would ever clear them. And not the floors
+	 * kept: a floor raised under the old lineage is no bound on the new one, where the block may
+	 * legitimately sit below it, and would make every read of it a below-floor answer for the life of
+	 * the handle. The header and tail {@link keepLogEnds} offers came from the new lineage and may be
+	 * kept. The staged actions were computed against the old content, so the verdict is returned for
+	 * {@link mustReplay}.
+	 *
+	 * @returns what the adoption did, as {@link judgeAdoption} answered it before anything changed. */
 	private forgetAndAdopt(
 		latest: GetFromResult<Action<TAction>> | undefined,
 		entryRevs: ReadonlyMap<ActionId, number>,
 		revertedBlockIds: BlockId[],
 		ends: LogEnds,
-	): void {
+	): Adoption {
+		const adoption = Collection.judgeAdoption(this.source.actionContext, latest?.context);
 		this.viewChanged();
+		if (adoption === 'adopt-divergent') {
+			this.sourceCache.clear();
+			this.floors.clear();
+		}
 		for (const entry of latest?.entries ?? []) {
 			this.sourceCache.clear(entry.blockIds);
 			this.raiseFloors(entry, entryRevs.get(entry.actionId));
 		}
 		this.sourceCache.clear(revertedBlockIds);
-		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context);
+		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context, adoption);
 		Collection.keepLogEnds(this.sourceCache, this.floors, this.source.actionContext, ends);
+		return adoption;
 	}
 
 	/** Put the header and log tail block {@link readLogEnds} already fetched into a handle's own
@@ -1537,7 +1603,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *   claim (`collection:context-short-of-tail`, or `collection:context-not-lowered` for a handle
 	 *   pinned by an over-claiming tail), or an invalidation or checkpoint took the newest slot;
 	 * - any action entry in the tail block naming a different action than `held` names at the same
-	 *   revision (`collection:lineage-divergence`, and the walk's adoption of the log's list).
+	 *   revision (`collection:lineage-divergence`, and the walk's adoption of the log's list, which
+	 *   drops the read cache when it adopts another lineage — see {@link forgetAndAdopt}).
 	 *
 	 * NOTE: the lineage comparison sees only the entries the tail block holds. A fork below them, on
 	 * a log that has not moved, is not looked at again until a refresh finds something new — that
@@ -1601,14 +1668,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * (`index-backfill-cost.spec.ts`, `cold-apply-cost.spec.ts`), because the replay's reads are
 	 * served from `sourceCache`. If a long transaction's reads ever show up as slow, narrow the
 	 * replay to the actions whose reads the adopted entries actually invalidated — NOT back to
-	 * conflicts alone, which is the defect above. */
-	private mustReplay(anyConflicts: boolean, priorContext: ActionContext | undefined): boolean {
+	 * conflicts alone, which is the defect above.
+	 *
+	 * @param adoption what the refresh's adoption did ({@link forgetAndAdopt}). */
+	private mustReplay(anyConflicts: boolean, priorContext: ActionContext | undefined, adoption: Adoption): boolean {
 		if (anyConflicts) {
 			return true;
 		}
 		const adoptedRev = this.source.actionContext?.rev;
 		const replayable = this.segments.replayableCount();
 		if (adoptedRev !== undefined && adoptedRev !== priorContext?.rev && replayable > 0) {
+			return true;
+		}
+		// Fourth reason, ahead of the third: the refresh adopted another lineage, so every staged
+		// action was computed against content the network does not hold. A fork at the SAME revision
+		// advances nothing, so the reason above does not see it. The whole-cache clear behind it
+		// would usually make every pinned base read as moved too, but this keeps the rule readable,
+		// covers staged actions that pinned nothing, and spares a `restage-moved-base` line per pin.
+		if (adoption === 'adopt-divergent' && replayable > 0) {
 			return true;
 		}
 		// Third reason: a staged block's base has MOVED — the read cache no longer describes it at

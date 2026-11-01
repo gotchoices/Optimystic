@@ -582,11 +582,19 @@ optimystic:db-core:collection collection:lineage-divergence id=default/main/Usag
 
 Three things to know when reading it:
 
-- **It fires once per discovery, not once per refresh.** After reporting, the refresh adopts the
-  log's context as usual (`update()` returns normally; nothing throws), so the held lineage marker
-  now matches the log and later refreshes of that instance stay silent — even though content the
-  instance materialized under its old lineage may still be cached. Seeing the line once is the
-  finding; do not wait for it to repeat.
+- **It fires once per discovery, not once per refresh — and on `site=refresh` the handle acts on
+  it.** A refresh that adopts the log's context (`update()` returns normally; nothing throws) and
+  finds it names another action at the revision the handle held drops the handle's whole read cache
+  and its floors and re-stages whatever was staged, so from then on the handle reads the network's
+  lineage and the next refresh has nothing left to report. That happens whether or not this
+  namespace is enabled — only the line itself needs it. Seeing the line once is the finding; do not
+  wait for it to repeat. Two cases repeat, or do nothing, by design. A line with a
+  `collection:context-not-lowered` beside it on the same `tag=` is a refused read: the handle holds
+  a higher revision on the other lineage, keeps it, drops nothing, and reports both lines on every
+  refresh — it has sealed a fork that only reconciliation can resolve (see `docs/transactions.md`).
+  And a `forkRev=` below `heldRev=` where the two sides agree at `heldRev=` itself, or name no action
+  there, is reported without being acted on, since the handle decides by the held revision alone.
+  `site=attach` lines never drop anything: an opening handle has no cache yet.
 - **Silence is weaker evidence than for the shortfall line.** A revision is only comparable when
   *both* sides name an action for it, and three ordinary situations leave one side empty: an
   invented collection (no context at all); a revision whose log slot went to a checkpoint or
@@ -633,13 +641,15 @@ The same three events on today's build carry the answers in the lines themselves
 
 ```
 collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 heldAction=63cJ... readAction=vPYE... heldRev=1 readRev=1
-collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=k3Vq_A site=refresh forkRev=1 heldAction=63cJ... readAction=vPYE... heldRev=2 readRev=2
+collection:lineage-divergence id=default/FormationUsage/index/FormationUsageByToken tag=m8Tz_C site=refresh forkRev=1 heldAction=63cJ... readAction=vPYE... heldRev=2 readRev=2
 collection:context-not-lowered  id=default/FormationUsage/index/FormationUsageByToken tag=7pQ1_B site=refresh heldRev=4 readRev=3 heldAction=W0vd... readAction=NEJ5...
 ```
 
 Read straight off: both forks are `site=refresh`, so a **replica** forked and storage is not
-implicated. Both name `forkRev=1` with the same pair of ids, so it is **one** split at revision 1
-that the second line re-reports from revision 2 — not two independent forks. And the refusal comes
+implicated. Both name `forkRev=1` with the same pair of ids, so it is **one** split at revision 1,
+seen by a second handle that had travelled one commit further on the forked side — not two
+independent forks. (One handle cannot print both: the refresh that reports a fork adopts the log's
+lineage, so that handle has nothing left to report.) And the refusal comes
 from a **different** `tag=`, naming two different actions **at one revision** (revision 3, the
 read's) — so that handle is not merely lagging: it is a second, separately-lineaged copy in the
 same process, which is the finding.

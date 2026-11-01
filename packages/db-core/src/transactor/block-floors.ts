@@ -56,7 +56,8 @@ export interface BlockFloorCheck {
  *
  * Raised where log entries are consumed (`Collection.updateInternal`) and checked where answers
  * arrive (`TransactorSource.tryGet`). A floor, once raised, STANDS for the life of the handle: an
- * answer that meets it does not remove it.
+ * answer that meets it does not remove it. The one thing that does is the handle adopting another
+ * lineage ({@link clear}).
  *
  * Why a met floor is not dropped. The source that judges an answer cannot know whether any cache
  * went on to keep it, and "an answer met the floor" is not "the cache now holds that answer": the
@@ -91,6 +92,15 @@ export class BlockFloors implements BlockFloorCheck {
 				this.floors.set(blockId, floor);
 			}
 		}
+	}
+
+	/** Drop every floor. Only for a handle that has learned its floors describe a history the network
+	 * does not hold — a refresh adopting another lineage (`Collection.forgetAndAdopt`). A floor raised
+	 * under the old lineage says nothing about the new one, where the block may legitimately sit below
+	 * it, and a standing floor would then make every read of the block a below-floor answer for the
+	 * life of the handle. The exception to "a floor, once raised, stands". */
+	clear(): void {
+		this.floors.clear();
 	}
 
 	applicableTo(blockId: BlockId, context: ActionContext | undefined): BlockFloor | undefined {
