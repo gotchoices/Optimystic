@@ -58,8 +58,8 @@ export interface CidParts {
 const MULTICODEC_CODES: Record<Multicodec, number> = {
 	'raw': 0x55,
 	'dag-cbor': 0x71,
-	// Canonical DAG-JSON documents, e.g. Stroc's: a schema can then check a stored document
-	// against the CID it is filed under (`Cid = cid(Bytes, 'dag-json')`).
+	// DAG-JSON documents: a schema can check a stored document against the CID it is filed under
+	// (`Cid = cid(Bytes, 'dag-json')`). A label only; the bytes are not checked for canonical form.
 	'dag-json': 0x0129,
 };
 
