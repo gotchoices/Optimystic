@@ -3,9 +3,9 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
 import type {
-	ActionId, BlockHeader, BlockId, ClusterPeers, IBlock, IKeyNetwork, IPeerNetwork, Transforms, FindCoordinatorOptions
+	ActionId, BlockHeader, BlockId, ClusterPeers, IBlock, IKeyNetwork, IPeerNetwork, Lane, Transforms, FindCoordinatorOptions
 } from '@optimystic/db-core';
-import { canonicalBlockHash } from '@optimystic/db-core';
+import { canonicalBlockHash, laneField } from '@optimystic/db-core';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
@@ -120,7 +120,7 @@ const soloCohortLine = (harness: Harness): Record<string, unknown> => {
 };
 
 const pendAndCommit = async (
-	harness: Harness, blockId: BlockId, actionId: ActionId, block: IBlock
+	harness: Harness, blockId: BlockId, actionId: ActionId, block: IBlock, lane?: Lane
 ): Promise<void> => {
 	const transforms: Transforms = { inserts: { [blockId]: block }, updates: {}, deletes: [] };
 	// No `rev` on the pend: rev 1 is the block's first revision, so there is no base to name — the
@@ -131,7 +131,8 @@ const pendAndCommit = async (
 	const digest = await canonicalBlockHash(block);
 	const committed = await harness.coordinated.commit({
 		actionId, blockIds: [blockId], tailId: blockId, rev: 1,
-		blockDigests: { [blockId]: { digest } }
+		blockDigests: { [blockId]: { digest } },
+		...laneField(lane)
 	});
 	expect(committed.success, 'commit must land').to.equal(true);
 };
@@ -158,7 +159,7 @@ describe('solo-cohort commit proof', function () {
 		const harness = await track();
 
 		const block = makeBlock(BLOCK_ID, COLLECTION_ID, 'hello');
-		await pendAndCommit(harness, BLOCK_ID, ACTION, block);
+		await pendAndCommit(harness, BLOCK_ID, ACTION, block, 'convergent');
 
 		const proof = await harness.storageRepo.getBlockProof(BLOCK_ID, 1);
 		expect(proof, 'a solo commit must retain a proof').to.not.equal(undefined);
@@ -170,7 +171,7 @@ describe('solo-cohort commit proof', function () {
 		expect(verdict.ok, `proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
 
 		// The operator's discriminator for a REAL cohort of one.
-		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 1, soleIsSelf: true, quorum: 'local' });
+		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 1, soleIsSelf: true, quorum: 'local', lane: 'convergent' });
 	});
 
 	it('the retained solo proof passes the receiver-side certified-push gate', async () => {
@@ -220,6 +221,8 @@ describe('solo-cohort commit proof', function () {
 		expect(verdict.ok, `proof must verify: ${JSON.stringify(verdict)}`).to.equal(true);
 
 		expect(soloCohortLine(harness)).to.include({ blockId: BLOCK_ID, cohortSize: 0, soleIsSelf: false, quorum: 'unrouted' });
+		// The commit stated no lane, so the line states none rather than guessing one.
+		expect(soloCohortLine(harness)).to.not.have.property('lane');
 	});
 
 	it('is synced before it is acknowledged, even on a node whose durability window is non-zero', async () => {

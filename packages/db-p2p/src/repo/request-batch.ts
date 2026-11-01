@@ -3,8 +3,8 @@
  * consensus record — what `IRepo.pendMany` and `IRepo.commitMany` take. `CoordinatorRepo` runs a single
  * `pend` or `commit` as a batch of one, so both shapes take one code path.
  */
-import type { ActionId, BlockId, CommitRequest, IRepo, PendRequest, RepoOperation } from "@optimystic/db-core";
-import { blockIdsForTransforms } from "@optimystic/db-core";
+import type { ActionId, BlockId, CommitRequest, IRepo, Lane, PendRequest, RepoOperation } from "@optimystic/db-core";
+import { blockIdsForTransforms, stricterLane } from "@optimystic/db-core";
 import { batchShapeFault } from "../cluster/record-operations.js";
 
 export interface RequestBatch<TRequest> {
@@ -45,6 +45,15 @@ export function commitBatchOf(requests: readonly CommitRequest[]): CommitBatch {
  * written together or not at all. */
 export function refusesSolo(batch: RequestBatch<{ readonly refuseSolo?: true }>): boolean {
 	return batch.requests.some(request => request.refuseSolo === true);
+}
+
+/** The lane `batch`'s requests state (`PendRequest.lane`, `CommitRequest.lane`), for a log line to
+ * report: `undefined` when none states one (an older writer), never a lane guessed for it; otherwise
+ * the stricter of the stated lanes, which for a batch one writer built is the one lane every request
+ * carries. */
+export function statedLane(batch: RequestBatch<{ readonly lane?: Lane }>): Lane | undefined {
+	const stated = batch.requests.flatMap(request => request.lane === undefined ? [] : [request.lane]);
+	return stated.length === 0 ? undefined : stricterLane(stated);
 }
 
 /** The blocks one pend request writes. */

@@ -1119,6 +1119,7 @@ export class OfflineMode {
 					...(status.committedCollections === undefined ? {} : { committedTables: this.tablesOf(status.committedCollections) }),
 					persisted: this.journal !== undefined,
 					...(outlook === undefined ? {} : { outlook }),
+					lane: status.lane,
 				};
 			}
 			case 'submitting':
@@ -1175,6 +1176,7 @@ export class OfflineMode {
 			inDoubt: record.inDoubt,
 			waitingFor: 'restore',
 			persisted: true,
+			lane: record.lane,
 		};
 	}
 

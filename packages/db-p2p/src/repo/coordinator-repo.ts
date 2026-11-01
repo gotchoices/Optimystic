@@ -1,5 +1,5 @@
-import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason } from "@optimystic/db-core";
-import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits } from "@optimystic/db-core";
+import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits, laneField } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
@@ -25,7 +25,7 @@ import { RESPONSIBILITY_TTL_MS, ResponsibilityRefusalError } from "./responsibil
 import { StuckReservationTracker } from "./stuck-reservation.js";
 import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
-import { commitBatchOf, pendBatchOf, refusesSolo, type CommitBatch, type PendBatch } from "./request-batch.js";
+import { commitBatchOf, pendBatchOf, refusesSolo, statedLane, type CommitBatch, type PendBatch, type RequestBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
 import { HeldBlockConsults } from "./held-block-consults.js";
 import { withDeadline } from "../with-deadline.js";
@@ -2851,7 +2851,7 @@ export class CoordinatorRepo implements IRepo {
 	 */
 	private refuseSoloPend(batch: PendBatch, blockId: BlockId, reason: SoloRefusalReason, solo: SoloCohort, awaitingBootstrap: boolean): ShortfallFailure {
 		const absent = solo.kind === 'self' ? solo.absent : [];
-		this.log('pend:solo-refused', { actionId: batch.actionId, blockId, reason, ...soloLogFields(absent, awaitingBootstrap) });
+		this.log('pend:solo-refused', { actionId: batch.actionId, blockId, reason, ...soloLogFields(batch, absent, awaitingBootstrap) });
 		const peerCount = 1 + absent.length;
 		return new PromiseShortfallError({
 			approvals: 1,
@@ -3906,7 +3906,7 @@ export class CoordinatorRepo implements IRepo {
 			soleIsSelf: peerCount === 1 && this.localPeerId !== undefined
 				&& cohortPeerIds[0] === this.localPeerId.toString(),
 			quorum: soloDurability.quorum,
-			...soloLogFields(absent, awaitingBootstrap),
+			...soloLogFields(batch, absent, awaitingBootstrap),
 			...(cohort.resolved ? {} : { reason: cohort.reason })
 		});
 		// Same message shape the multi-peer path produces — executeClusterTransaction stamps
@@ -3951,7 +3951,7 @@ export class CoordinatorRepo implements IRepo {
 			actionId: batch.actionId,
 			blockId: batch.blockIds[0],
 			reason,
-			...soloLogFields(absent, awaitingBootstrap)
+			...soloLogFields(batch, absent, awaitingBootstrap)
 		});
 		return {
 			success: false,
@@ -4049,13 +4049,19 @@ function soloRefusalFor(solo: SoloCohort, awaitingBootstrap: boolean): SoloRefus
 	return awaitingBootstrap ? 'awaiting-bootstrap' : undefined;
 }
 
-/** The log fields every solo line carries: the members known absent (short ids) and whether a
- *  bootstrap peer is still awaited. */
-function soloLogFields(absent: readonly string[], awaitingBootstrap: boolean): { knownAbsent: number; absentPeers?: string[]; awaitingBootstrap: boolean } {
+/** The log fields every solo line carries: the members known absent (short ids), whether a
+ *  bootstrap peer is still awaited, and the lane the batch's requests state ({@link statedLane}) —
+ *  whether a later merge will handle the write (`convergent`) or it needs its cohort's agreement
+ *  (`serializable`). The lane is left off when no request states one, so its absence reads as "not
+ *  stated" rather than as a lane. */
+function soloLogFields(
+	batch: RequestBatch<{ readonly lane?: Lane }>, absent: readonly string[], awaitingBootstrap: boolean
+): { knownAbsent: number; absentPeers?: string[]; awaitingBootstrap: boolean; lane?: Lane } {
 	return {
 		knownAbsent: absent.length,
 		...(absent.length === 0 ? {} : { absentPeers: absent.map(peerId => peerId.substring(0, 12)) }),
-		awaitingBootstrap
+		awaitingBootstrap,
+		...laneField(statedLane(batch))
 	};
 }
 

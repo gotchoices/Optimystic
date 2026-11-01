@@ -262,10 +262,13 @@ The exercise tends to surface a useful finding: the *right* reconcile differs pe
 
 ## How Optimystic Surfaces This
 
-The current collection API already has a `filterConflict` hook (referenced in [architecture.md](architecture.md) and [internals.md](internals.md)) for merging concurrent updates. This is the natural surface for the reconcile primitive. The evolution:
+Every write already says which side of the [I-Confluence Classification](#i-confluence-classification) it is on, and the collection's merge declaration is the natural surface for the reconcile primitive. The evolution:
 
-* **Today.** `filterConflict(mine, theirs) → resolved`. Pairwise, ad-hoc, runs at client retry time. Lives in application code that every replica must have.
-* **Target.** Full `InvariantSpec` plus `ReconcileSpec` declarations on the collection handler. Evaluated during replay, not only on client retry. Part of the signed transaction (or of the collection schema, which is schema-hashed) so every replaying node applies the same rule.
+* **Today.** The classification is declared and carried; nothing admits, merges or reconciles by it yet.
+  * **The declaration.** A collection declares which of its actions merge with `CollectionInitOptions.merge`, a `ConvergentMerge` (`packages/db-core/src/collection/collection.ts`): `laneOf(action)` answers each action's lane, and the optional `filterConflict(mine, theirs) → resolved` hook (pairwise, run at client retry time, application code every replica must have) is offered only an action the declaration classifies convergent. A collection that declares nothing is strong. A SQL table declares with two tags, `"optimystic.profile" = 'replay-permitted'` on the table (the default, `'strong'`, keeps every write `serializable`) and `"optimystic.merge" = 'last-writer-wins'` on each column whose concurrent assignments merge by the later one winning; the Quereus plugin then classifies each statement from its write description ([transactions.md §Which lane a transaction takes](transactions.md#which-lane-a-transaction-takes)).
+  * **The lane on every write.** Each write carries its lane, `serializable` (the cohort must agree; the revision order decides every conflict) or `convergent` (the invariants it is responsible for survive a merge), on its log entry, inside its signed transaction and on each pend and commit ([internals.md §Every Write Carries a Lane](internals.md#every-write-carries-a-lane)). An offline queue entry reports it on its `queued` status and the coordinator's solo log lines report it ([offline-sync.md §Following transactions](offline-sync.md#following-transactions)).
+  * **The check.** A member that validates a pend refuses a `convergent` claim its own engine computes as `serializable`, with a signed reject marked as a validity judgement, and never reclassifies ([transactions.md §What a member verifies](transactions.md#what-a-member-verifies)).
+* **Target.** Full `InvariantSpec` plus `ReconcileSpec` declarations on the collection handler. Evaluated during replay, not only on client retry. Part of the signed transaction (or of the collection schema, which is schema-hashed) so every replaying node applies the same rule. This is the next step after the replay stage that consumes the lane (backlog `feat-declarative-invariants-and-reconcile`).
 
 Engine integration:
 

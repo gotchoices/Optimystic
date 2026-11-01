@@ -1,4 +1,4 @@
-import type { CommittedEffect, EntryWaitingFor, OfflineQueueState, QueuedFailureReason } from '@optimystic/db-core';
+import type { CommittedEffect, EntryWaitingFor, Lane, OfflineQueueState, QueuedFailureReason } from '@optimystic/db-core';
 import type { SqlCommitDurability } from './commit-durability.js';
 import type { CommitOutlook } from './commit-outlook.js';
 
@@ -46,6 +46,13 @@ export type QueuedTransactionStatus =
 		 * queue cannot be judged — its first `queued` status after it is put back carries one. Absent
 		 * too, as a logged defect, when the judgement threw (`offline:outlook-unjudged`). */
 		outlook?: CommitOutlook;
+		/** Whether a later merge will handle the transaction's changes (`'convergent'`) or the cohort must
+		 * agree to them (`'serializable'`) — the lane fixed when it was queued (docs/transactions.md
+		 * §Which lane a transaction takes), the db-core queue's, passed through. Unlike `outlook` it
+		 * needs no judgement, so it is present while `waitingFor` is `'restore'` too, read from the
+		 * journal record (`'serializable'` for a record written before the field). It never changes for
+		 * the transaction's life, so no status announces it on its own. */
+		lane: Lane;
 	}
 	/** A queued transaction's outlook changed `kind` — normally from `'exposed'` to `'assured'`, once
 	 * every transaction it was exposed through has committed. Delivered after the status of the

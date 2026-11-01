@@ -75,8 +75,10 @@ export type PendRequest = ActionTransforms & {
 	 * put here so a storage node reads it without parsing log blocks. Every writer of this build sets
 	 * it (`TransactorSource.transact`, `TransactionCoordinator.pendRequestFor`); optional on the wire
 	 * because an older writer sends none. A reader treats absence as "not stated", never as a lane.
-	 * Observational: nothing judges the pend by it yet (the member-side check is a later ticket).
-	 * Omitted rather than `undefined`, for the same preimage reason as {@link baseRevs}.
+	 * Observational: nothing judges the pend by it — a validating member checks the lane the
+	 * transaction inside {@link validation} claims (`TransactionValidator.validate`) — and the
+	 * coordinator's solo log lines report it. Omitted rather than `undefined`, for the same preimage
+	 * reason as {@link baseRevs}.
 	 */
 	lane?: Lane;
 	/**

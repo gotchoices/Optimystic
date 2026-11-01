@@ -211,7 +211,8 @@ type QueuedTransactionStatus =
   | { kind: 'queued'; transactionId: string; seq: number; tables: readonly string[]; queuedAt: number;
       attempts: number; inDoubt: boolean; lastError?: unknown; committedTables?: readonly string[];
       persisted: boolean; waitingFor: 'earlier-entry' | 'cohort' | 'backoff' | 'restore' | undefined;
-      outlook?: CommitOutlook }        // absent while waitingFor is 'restore' (and on a logged defect)
+      outlook?: CommitOutlook;         // absent while waitingFor is 'restore' (and on a logged defect)
+      lane: 'serializable' | 'convergent' }   // fixed at enqueue; present while waitingFor is 'restore' too
   | { kind: 'outlook-changed'; transactionId: string; outlook: CommitOutlook }   // its outlook's kind changed
   | { kind: 'submitting'; transactionId: string; attempt: number }
   | { kind: 'committed'; transactionId: string; durability: TransactionDurability;
@@ -261,6 +262,14 @@ type QueuedFailureReason =
   status is delivered without an outlook rather than withheld, and the entry's next `queued` status
   judges it again. Its `dependsOn` and `kind` are kept current as earlier entries settle, and what
   `status` and `entries` answer is the current outlook (see [The outlook](#the-outlook)).
+- `lane` on `queued` says whether a later merge will handle the transaction's changes
+  (`'convergent'`) or the cohort must agree to them (`'serializable'`): the lane the transaction was
+  classified with ([transactions.md §Which lane a transaction takes](transactions.md#which-lane-a-transaction-takes)),
+  fixed when it was queued and journaled with it. Unlike `outlook` it needs no judgement, so it is
+  present while `waitingFor` is `'restore'` too, read from the entry record, and a record written
+  before the field reads `'serializable'`, the lane every entry then took. It never changes for an
+  entry's life, so no status announces it on its own. Today it only reports: the drain admits and
+  refuses a convergent entry exactly as a serializable one.
 - `outlook-changed` is delivered when an entry's outlook changes `kind` — an entry exposed only
   through `dependsOn` becoming assured once those entries commit — after the status of the entry
   whose settling changed it, and never terminal. A `dependsOn` that only narrows is not announced.
@@ -276,13 +285,13 @@ same shapes with collection ids in place of tables and `entryId` in place of `tr
 `committedCollections` on `failed` (and on `queued` once part of the entry has committed), and on
 `failed` also `changedCollections`, the collections whose visible content the removal changed. It adds
 what the drain knows about the attempts (`attempts`, `inDoubt`, `lastError` on `queued`), which the
-plugin passes through, and `effect` on `committed` (`CommittedEffect` in
-`packages/db-core/src/offline/status.ts`), passed through too. It carries no `outlook`: judging a
+plugin passes through, `lane` on `queued`, passed through, and `effect` on `committed`
+(`CommittedEffect` in `packages/db-core/src/offline/status.ts`), passed through too. It carries no `outlook`: judging a
 guard needs the catalog's tags and the tables' key decoding, which only the plugin has, so the
 outlook is the plugin's own. `followed`, the per-table `tables` map and `changedTables` landed with
 stage 4, `persisted` (on `queued`, and on each item `entries()` lists) and the `'restore'` waiting
-state with stage 5, `outlook` on `queued` and the `outlook-changed` status with stage 7, and `effect`
-with stage 10.
+state with stage 5, `outlook` on `queued` and the `outlook-changed` status with stage 7, `effect`
+with stage 10, and `lane` with the lane work of [crdt-sync.md §Stage 5](crdt-sync.md#stage-5--tunable-per-collection).
 
 Queue-wide state, for a status bar:
 
@@ -591,7 +600,12 @@ minted or anything applied: that is reached when the pend ran on a real cohort a
 before the commit, and the writer then cancels and retries, and the retry's pend meets the shortfall. A
 refused entry stays in doubt, as after any shortfall once it has been sent (see
 [Identity across attempts](#identity-across-attempts)). The coordinator logs `pend:solo-refused` and
-`commit:solo-refused`, each with the reason, `knownAbsent`, `absentPeers` and `awaitingBootstrap`.
+`commit:solo-refused`, each with the reason, `knownAbsent`, `absentPeers`, `awaitingBootstrap` and the
+write's `lane` (read off the refused request, `PendRequest.lane` or `CommitRequest.lane`, and left off
+when the request states none, as an older writer's does). The lane tells an operator whether the
+refused write was one a later merge could have handled (`convergent`) or one that needed its cohort
+(`serializable`); today both are refused alike, and admitting a convergent write alone is the replay
+stage's decision (backlog `feat-replay-mode-collections-merge-divergent-histories`).
 
 **Decision (maintainer, 2026-10-25): every drain sets the option by default.** A queued entry is
 settled as `committed` only by a commit its cohort reached consensus on — never by a lone write made
@@ -1839,9 +1853,14 @@ session mode is configured, until a later stage designs those points.
   half. Its small-network regime — promises collected across pairwise contacts — would replace the
   drain's submission step for an entry whose cohort is never reachable all at once, and could do so
   without changing the queue, the journal, or the application interface. Its arm on classifying the
-  lane per statement asks Quereus the same question the outlook does — whether a write's outcome
-  depends on state other writers can change — and would reuse the same write description to choose a
-  lane rather than to inform the application.
+  lane per statement has landed: the plugin classifies each statement from the same write description
+  the outlook reads, asking it much the same question — whether the write's outcome depends on state
+  other writers can change — and records the answer inside the signed transaction, and a validating
+  member refuses a `convergent` claim its own catalog computes as `serializable`
+  ([transactions.md §Which lane a transaction takes](transactions.md#which-lane-a-transaction-takes)).
+  The queue reports each entry's lane on its `queued` status. What that arm still needs is a late
+  signer acting on the lane, merging a convergent write rather than re-checking its read set, which is
+  the replay stage's (backlog `feat-replay-mode-collections-merge-divergent-histories`).
 - **`a-live-read-on-an-isolated-node-fails-instead-of-serving-what-it-holds`.** Offline mode adopts
   that ticket's candidate answer 2 for opted-in tables only. The ticket's question for applications
   that do not opt in stays open.

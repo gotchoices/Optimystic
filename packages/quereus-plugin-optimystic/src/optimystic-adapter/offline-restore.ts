@@ -1,6 +1,6 @@
 import { BlockUnavailableError, EntryDiscardedError, EntryNotDiscardableError, QueueDisposedError, legacyHlc } from '@optimystic/db-core';
 import type {
-	Collection, CollectionId, InFlightAttempt, JournalDriveState, JournalSettledStatus, OfflineQueue, RestoreInit, RestoredSegment,
+	Collection, CollectionId, InFlightAttempt, JournalDriveState, JournalSettledStatus, Lane, OfflineQueue, RestoreInit, RestoredSegment,
 } from '@optimystic/db-core';
 import {
 	decodeDriveRecord, decodeEntryRecord, decodeOutcome, decodeOutcomeRecord, seqKey,
@@ -40,6 +40,8 @@ export interface DeferredRecord {
 	readonly inDoubt: boolean;
 	/** 1 when a drive record exists (a send was at least begun), else 0, as `OfflineQueue.restore` counts. */
 	readonly attempts: 0 | 1;
+	/** The lane the record journaled (`EntryRecordV1.lane`), as the restore will re-supply it. */
+	readonly lane: Lane;
 }
 
 /** What the restore asks of its owner, `OfflineMode`. */
@@ -337,7 +339,7 @@ export class OfflineRestore {
 			// A record from before either field restores with the legacy shape (see EntryRecordV1.hlc
 			// and EntryRecordV1.lane).
 			hlc: entry.hlc ?? legacyHlc(entry.queuedAt),
-			lane: entry.lane ?? 'serializable',
+			lane: journaledLane(entry),
 			...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
 			collections: resolved.collections,
 			...(drive === undefined ? {} : { drive: driveStateOf(drive) }),
@@ -454,7 +456,14 @@ function deferredRecord(entry: EntryRecordV1, drive: DriveRecordV1 | undefined, 
 		table,
 		inDoubt: drive !== undefined && (drive.attempts.length > 0 || drive.committed.length > 0),
 		attempts: drive === undefined ? 0 : 1,
+		lane: journaledLane(entry),
 	};
+}
+
+/** The lane `entry` journaled; `'serializable'`, the lane every entry then took, for a record written
+ * before the field (`EntryRecordV1.lane`). */
+function journaledLane(entry: EntryRecordV1): Lane {
+	return entry.lane ?? 'serializable';
 }
 
 function driveStateOf(drive: DriveRecordV1): JournalDriveState {
