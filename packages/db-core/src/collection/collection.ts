@@ -598,8 +598,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	/** Have `clock` observe the highest HLC among the opened log's tail block entries, which the open
 	 * has read but does not walk — the open's half of what a refresh's walk feeds the clock
 	 * ({@link forgetAndAdopt}), so a write through this handle never mints below a write it has seen.
-	 * Only the tail block, for the reason {@link floorTailEntries} gives: an older log block's entries
-	 * are older still, and the clock keeps only a maximum. */
+	 * Only the tail block, which the open read anyway; an older log block would cost a read for entries
+	 * committed earlier. Their HLCs are usually lower, but not always — an offline entry keeps the HLC
+	 * minted at enqueue and a retry its first attempt's (the `NOTE:` at `WriteIdentity.hlc`) — so
+	 * a write may mint below an entry in an older block, one this handle never read. */
 	private static observeTailEntries(clock: HlcClock, ends: LogEnds): void {
 		const tail = ends.tail?.block as LogBlock<unknown> | undefined;
 		let highWater: Hlc | undefined;
