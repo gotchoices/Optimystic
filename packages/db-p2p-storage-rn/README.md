@@ -77,7 +77,9 @@ first is open throws (`two caches over one backing store never converge`). That
 refusal is new, but the shape was already wrong: two storages over one store
 each hold writes the other cannot see, which is what
 [storage.md §1. Every write to a store goes through `IRawStorage`](../db-p2p/docs/storage.md#1-every-write-to-a-store-goes-through-irawstorage)
-rules out. Close the first before opening another.
+rules out. Close the first before opening another, including when a node over
+the handle stops and starts again in the same process: the node never closes a
+storage it was handed.
 
 ## Persistence semantics
 
@@ -129,6 +131,9 @@ The read cache is part of the storage, not something to add: the node's own
 cache (`withReadCache`) would front the storage through an adapter that carries
 bytes, bringing back two JavaScript decodes per cold read. `LevelDBRawStorage`
 reports itself read-cached, so the node and the Quereus plugin use it as it is.
+Do not wrap it in a cache of your own: `CachedRawStorage` over it throws
+(`redundant read cache`); a host that wraps every storage should pass one that
+reports `readCached` through unchanged, as `withReadCache` does.
 It shares a memory budget with every other cache in the process
 (`defaultCachePool()`, 8 MB on React Native by default); pass `readCachePool`
 to use a pool of your own, and `readCacheLabel` to name the storage in the
