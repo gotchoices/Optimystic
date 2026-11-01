@@ -16,7 +16,8 @@ import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { DurabilityWindowFor } from '../storage/durability-window.js';
 import type { BlockArchive } from '../storage/struct.js';
-import { claimFromConsultAnswer, fitConsultContent, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
+import { claimFromConsultAnswer, fitConsultContent, serveBlockArchive, serveConsultAnswer, serveLineageAnswer } from '../storage/block-archive.js';
+import type { BlockLineageAsk } from '../cluster/solo-ahead.js';
 import type { SyncBlockAnswer } from '../sync/protocol.js';
 import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES } from '../protocol-limits.js';
 import type { ClusterLatestBatchCallback } from '../repo/consult-round.js';
@@ -376,6 +377,21 @@ const makeFetchArchive = (nodes: MeshNode[], selfPeerId: string, failures: MeshF
 	};
 
 /**
+ * One cohort peer's answer to the lineage question, read straight from its `StorageRepo` by the SAME
+ * function a real peer's sync service answers with (`serveLineageAnswer`) — the mesh analogue of
+ * `libp2p-node-base`'s `blockLineageCallback`, which both repair paths take. A silent peer, or an
+ * asking instance a restart has stopped, rejects, which the round reads as a silent claimant.
+ */
+const makeAskLineage = (nodes: MeshNode[], failures: MeshFailureConfig, lifetime: NodeLifetime): BlockLineageAsk =>
+	async (peerIdStr, blockId, target) => {
+		const peer = lifetime.stopped || failures.silentPeers?.has(peerIdStr)
+			? undefined
+			: nodes.find(n => n.peerId.toString() === peerIdStr);
+		if (!peer) throw new Error(`lineage question to ${peerIdStr} went unanswered`);
+		return await serveLineageAnswer(peer.storageRepo, blockId, target);
+	};
+
+/**
  * Fold the mesh's operator-facing knobs into the numbers every node runs on, through the SAME
  * resolver a real node's composition root uses (`libp2p-node-base.ts`). Named and exported rather
  * than inlined in `createMesh` so the precedence rule below is assertable without building a mesh.
@@ -560,7 +576,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			superMajorityThreshold: policy.superMajorityThreshold,
 			repairCorroborationClusterSize: policy.repairCorroborationClusterSize,
 			// Production shape: a successful restore reports the corroborating peers as holders.
-			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders)),
+			askLineage: makeAskLineage(nodes, failures, lifetime)
 		});
 		reconcileByPeer.set(peerId.toString(), reconcileBlock);
 
@@ -723,6 +740,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
+			blockLineageCallback: makeAskLineage(nodes, failures, lifetime),
 			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders)),
 			durabilityWindowFor: options.durabilityWindowFor
 		});

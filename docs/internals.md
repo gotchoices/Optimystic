@@ -1153,9 +1153,9 @@ usable answer leaves that outcome too. Each path logs the round whole — `recon
 and `cluster-fetch:fork-declined` for a fork (a lone machine losing to the group it left, never an
 incident), `reconcile:solo-ahead` and `cluster-fetch:solo-ahead` for the other two verdicts. The
 question travels on a callback that is optional at both paths (`askLineage` on `ReconcileBlockDeps`,
-`blockLineageCallback` on the coordinator) and absent until implement
-`the-sync-consult-answers-a-lineage-question` supplies it over the sync protocol. See *The
-certified exception* below for what the rule leaves undecided.
+`blockLineageCallback` on the coordinator); a node built by `createLibp2pNodeBase` supplies both with
+one function that asks over the sync protocol (see *On the repair wires* below). See *The certified
+exception* below for what the rule leaves undecided.
 
 **Persistence and retention.** `ClusterMember.applyConsensusCommits` builds the proof once per
 consensus record (membership-v2 records only) and passes it into every commit operation's `StorageRepo.commit`, which
@@ -1208,6 +1208,17 @@ check a lone holder's claim with no second holder to corroborate against:
 - *The latest-query wire.* `latestClaimFromArchive` projects a `CertifiedActionRev` — the claim plus
   the proof, read off the same revision entry — and `CoordinatorRepo.queryClusterForLatest` carries
   it into `RevClaim.proof`.
+
+The sync protocol carries a third thing: the lineage question repair asks a lone claimant ahead of
+the group (*One-peer proofs* above). `SyncRequest.lineageOf` names, per block, the `(rev, actionId)`
+to judge, and the serving node answers in `SyncBlockAnswer.lineage` from its own records
+(`serveLineageAnswer` in `packages/db-p2p/src/storage/block-archive.ts`, the same cluster-skipping
+read the two answers above are built from, so a peer reports what it derived itself, never what its
+cohort says). A request carrying only the question gets no archive back. A peer on an older build
+ignores the field and the asker reads its answer as `unknown` (`lineageFromSyncResponse`, same file),
+which leaves repair adopting the higher revision as it did before the question existed. The answer
+carries no proof and needs none: only the lone pair's claimants are asked, so a lying `excludes` can
+only make the liar's own claim lose.
 
 Absence stays legitimate and every consumer must behave exactly as it did before proofs existed:
 a pre-proof revision, a member whose materialization diverged, and an un-upgraded peer all serve
@@ -2537,6 +2548,20 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
     digest that proof declared. Those bytes are dropped from the content quorum and that peer is
     penalized, while its (genuinely verified) revision claim still counts; repair continues on the
     other holders.
+
+  The lineage question (*One-peer proofs* above) adds two more on each path, both informational:
+
+  - **`reconcile:fork-declined`** / **`cluster-fetch:fork-declined`** — a lone machine's single-signer
+    claim above the group's pair was asked about that pair, a claimant answered `excludes`, and its
+    claim was set aside so the group's pair won. A lone machine's fork losing to the group it left,
+    not an incident: nobody is penalized, and the lone machine keeps its fork.
+  - **`reconcile:solo-ahead`** / **`cluster-fetch:solo-ahead`** — the same round when no claimant
+    excluded the pair, so the lone pair is selected as before the question existed; `verdict` says
+    whether a claimant confirmed its history contains the pair (`same-lineage`) or none could say
+    (`unknown`).
+
+  Both carry the two pairs (`solo`, `cohort`), the machines asked (`claimants`) and each one's answer
+  (`answers`, `silent` for a question that went unanswered); [debugging.md](debugging.md) reads them.
 - **The coordinator tolerates the same divergence, in both its shapes — on a durable majority.**
   When `CoordinatorRepo.commit` finds its own member did not execute during consensus, it falls
   back to a local commit — which can diverge for reasons the caller is not responsible for. A

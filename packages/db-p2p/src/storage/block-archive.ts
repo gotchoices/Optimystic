@@ -1,4 +1,4 @@
-import type { ActionContext, ActionRev, BlockId, IBlock, IRepo } from "@optimystic/db-core";
+import type { ActionContext, ActionRev, BlockId, BlockLineage, IBlock, IRepo } from "@optimystic/db-core";
 import type { BlockArchive } from "./struct.js";
 import type { SyncBlockAnswer, SyncContentOmitted, SyncResponse } from "../sync/protocol.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -158,6 +158,39 @@ export function answerFromArchiveResponse(response: SyncResponse): SyncBlockAnsw
 }
 
 /**
+ * This repo's answer to the lineage question (`SyncRequest.lineageOf`): was its CURRENT content for
+ * `blockId` built from `target`? Read from its own records with the cluster skipped, as every
+ * block-repair answer is — `StorageRepo.get` answers `BlockGets.lineageOf` from
+ * `IBlockStorage.lineageOf`, and a node's served repo (`createServedRepoProxy`) reaches it through
+ * the coordinator, whose `skipClusterFetch` branch reads local storage with the question carried
+ * through. One function for a peer answering over the sync protocol and a node answering about itself
+ * (`libp2p-node-base.ts`), so the two cannot weigh differently. A repo that predates the question
+ * leaves the answer out, which reads as `unknown`: it could not say.
+ *
+ * A throw propagates. The sync service reads it as no lineage, which the asker reads as `unknown`
+ * too, and logs it there.
+ *
+ * NOTE: the question is a second round to each lone claimant, after the consult that showed the
+ * shape. If that round ever shows in traces, send `lineageOf` equal to `held` on the first consult
+ * instead: it answers the question for free whenever the asker already holds the group's pair (the
+ * ordinary group-member read), leaving the second round for a reader that is behind or holds nothing.
+ */
+export async function serveLineageAnswer(repo: IRepo, blockId: BlockId, target: ActionRev): Promise<BlockLineage> {
+	const result = await repo.get({ blockIds: [blockId], lineageOf: target }, { skipClusterFetch: true } as any);
+	return result[blockId]?.lineage ?? 'unknown';
+}
+
+/**
+ * The lineage answer a sync response carries for `blockId`. A peer on a build that predates
+ * `SyncRequest.lineageOf` answers the single-archive form (no `answers`), or `answers` without
+ * `lineage` when the request also carried `held`; both read as `unknown`, the answer of a peer that
+ * could not say, which leaves block repair choosing as it did before the question existed.
+ */
+export function lineageFromSyncResponse(response: SyncResponse, blockId: BlockId): BlockLineage {
+	return response.answers?.[blockId]?.lineage ?? 'unknown';
+}
+
+/**
  * Fit a batched consult response's block bytes into `budgetBytes`, in request order: an answer
  * carrying bytes keeps them while the running total of the JSON-encoded size of the archives kept
  * with bytes stays within the budget — and the first one always keeps them, so a one-block consult
@@ -188,7 +221,8 @@ export function fitConsultContent(
 function withoutContent(blockId: BlockId, answer: SyncBlockAnswer, reason: SyncContentOmitted): SyncBlockAnswer {
 	const claim = answer.archive ? latestClaimFromArchive(answer.archive) : undefined;
 	if (!claim) return answer;
-	return { archive: singleRevisionArchive(blockId, claim, undefined, claim.proof), contentOmitted: reason };
+	// Spread first, so a lineage answer riding beside the archive survives the reduction.
+	return { ...answer, archive: singleRevisionArchive(blockId, claim, undefined, claim.proof), contentOmitted: reason };
 }
 
 /**

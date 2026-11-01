@@ -1,5 +1,5 @@
 import type { Connection, Startable } from '@libp2p/interface';
-import type { ActionRev, BlockId } from '@optimystic/db-core';
+import type { BlockId, BlockLineage } from '@optimystic/db-core';
 import { buildSyncProtocol, type SyncBlockAnswer, type SyncRequest, type SyncResponse } from './protocol.js';
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
@@ -7,7 +7,8 @@ import * as lp from 'it-length-prefixed';
 import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
-import { fitConsultContent, serveBlockArchive, serveConsultAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { fitConsultContent, serveBlockArchive, serveConsultAnswer, serveLineageAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { isActionRev } from '../repo/stated-holdings.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
 import { createLogger, type Logger } from '../logger.js';
@@ -102,7 +103,7 @@ export class SyncService implements Startable {
 							request.rev ?? 'latest'
 						);
 
-						const response = request.held !== undefined
+						const response = request.held !== undefined || request.lineageOf !== undefined
 							? await self.answerConsult(request, stream.id ?? stream.stream?.id)
 							: await self.answerArchive(request, stream.id ?? stream.stream?.id);
 
@@ -151,30 +152,51 @@ export class SyncService implements Startable {
 	}
 
 	/**
-	 * The answer to a latest-revision consult that said what the asker holds (`SyncRequest.held`):
-	 * always `success`, with each asked block's answer in `answers` — an answer without an archive is
-	 * this node holding nothing, and the bytes ride only when this node is ahead of the asker
-	 * (`serveConsultAnswer`) and fit the response's content budget (`fitConsultContent`). `rev` is
-	 * ignored: a consult is always unpinned.
+	 * The answer to a request that said what the asker holds (`SyncRequest.held`), asked the lineage
+	 * question (`SyncRequest.lineageOf`), or both: always `success`, with each asked block's answer in
+	 * `answers`. With `held`, an answer without an archive is this node holding nothing, and the bytes
+	 * ride only when this node is ahead of the asker (`serveConsultAnswer`) and fit the response's
+	 * content budget (`fitConsultContent`); without it no archive is served. A block the request asked
+	 * the lineage question about also carries this node's `lineage`. `rev` is ignored: a consult is
+	 * always unpinned.
 	 *
 	 * The blocks are served one after another. A consult names a handful at most, each a local read.
 	 */
 	private async answerConsult(request: SyncRequest, responderId: string | undefined): Promise<SyncResponse> {
 		const served: Array<[BlockId, SyncBlockAnswer]> = [];
 		for (const blockId of consultedBlockIds(request)) {
-			served.push([blockId, await this.buildConsultAnswer(blockId, request.held?.[blockId])]);
+			const claim = request.held !== undefined ? await this.buildConsultAnswer(blockId, request) : {};
+			const lineage = await this.buildLineageAnswer(blockId, request);
+			served.push([blockId, lineage === undefined ? claim : { ...claim, lineage }]);
 		}
 		const answers = Object.fromEntries(fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES));
 		return { success: true, answers, responderId };
 	}
 
 	/** One block's consult answer; a local serve fault reads as "holds nothing", as {@link buildArchive}'s does. */
-	private async buildConsultAnswer(blockId: BlockId, held: ActionRev | undefined): Promise<SyncBlockAnswer> {
+	private async buildConsultAnswer(blockId: BlockId, request: SyncRequest): Promise<SyncBlockAnswer> {
 		try {
-			return await serveConsultAnswer(this.repo, blockId, held);
+			return await serveConsultAnswer(this.repo, blockId, request.held?.[blockId]);
 		} catch (error) {
 			this.log.error('Error building consult answer for block %s:', blockId, error);
 			return {};
+		}
+	}
+
+	/**
+	 * This node's answer to the lineage question for one block, or `undefined` when the request did not
+	 * ask a usable one about it. A serve fault is logged and reads as no lineage, never as a lost claim:
+	 * the asker counts an absent answer as `unknown`, which is what happened.
+	 */
+	private async buildLineageAnswer(blockId: BlockId, request: SyncRequest): Promise<BlockLineage | undefined> {
+		const asked: unknown = request.lineageOf?.[blockId];
+		if (!isActionRev(asked)) return undefined;
+		try {
+			// Copied field by field, so nothing else the asker attached reaches storage.
+			return await serveLineageAnswer(this.repo, blockId, { rev: asked.rev, actionId: asked.actionId });
+		} catch (error) {
+			this.log.error('Error answering the lineage question for block %s:', blockId, error);
+			return undefined;
 		}
 	}
 

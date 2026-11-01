@@ -1,4 +1,4 @@
-import type { ActionRev, BlockId } from '@optimystic/db-core';
+import type { ActionRev, BlockId, BlockLineage } from '@optimystic/db-core';
 import type { BlockArchive } from '../storage/struct.js';
 
 /**
@@ -17,9 +17,10 @@ export interface SyncRequest {
 
 	/**
 	 * Every block a latest-revision consult asks about, in order, {@link blockId} first, at most
-	 * `MAX_CONSULT_BATCH_BLOCKS` (`protocol-limits.ts`). Requires {@link held} (possibly empty); the
-	 * server then answers each in {@link SyncResponse.answers}. A server on an older build ignores it
-	 * and answers `blockId` alone, which the asker tells apart by the missing `answers`.
+	 * `MAX_CONSULT_BATCH_BLOCKS` (`protocol-limits.ts`). Requires {@link held} (possibly empty) or
+	 * {@link lineageOf}; the server then answers each in {@link SyncResponse.answers}. A server on an
+	 * older build ignores it and answers `blockId` alone, which the asker tells apart by the missing
+	 * `answers`.
 	 */
 	blockIds?: BlockId[];
 
@@ -59,6 +60,20 @@ export interface SyncRequest {
 	 * both read to the asker as "nothing ahead".
 	 */
 	held?: Record<BlockId, ActionRev>;
+
+	/**
+	 * Per asked block, a committed `(rev, actionId)` the asker wants judged: was this peer's CURRENT
+	 * content for the block built from it? Answered from the peer's own records
+	 * (`IBlockStorage.lineageOf`) in {@link SyncBlockAnswer.lineage}. Present → the server answers in
+	 * {@link SyncResponse.answers}. Asked by block repair when a lone machine's claim sits one revision
+	 * ahead of the pair the rest of the cohort backs (`settleSoloAhead` in `cluster/solo-ahead.ts`).
+	 *
+	 * May ride with or without {@link held}. Without it the request asks only this question, and each
+	 * answer carries the lineage and no archive. A server on an older build ignores the field: with no
+	 * `held` either it answers the single-archive form, and with `held` it answers without `lineage`;
+	 * the asker reads both as `unknown`.
+	 */
+	lineageOf?: Record<BlockId, ActionRev>;
 }
 
 /**
@@ -70,15 +85,22 @@ export interface SyncRequest {
  */
 export type SyncContentOmitted = 'held' | 'size';
 
-/** One block's answer to a request that carried {@link SyncRequest.held}. */
+/** One block's answer to a request that carried {@link SyncRequest.held} or {@link SyncRequest.lineageOf}. */
 export interface SyncBlockAnswer {
 	/**
-	 * The archive served; absent → this peer holds nothing of the block. With `contentOmitted`, the
-	 * archive's revision entry carries no `block` and no `action.transform.insert`, but still carries
-	 * the commit proof for the revision served.
+	 * The archive served, to a request that carried {@link SyncRequest.held}; absent there → this peer
+	 * holds nothing of the block. With `contentOmitted`, the archive's revision entry carries no `block`
+	 * and no `action.transform.insert`, but still carries the commit proof for the revision served. A
+	 * request that asked only {@link SyncRequest.lineageOf} gets no archive, whatever this peer holds.
 	 */
 	archive?: BlockArchive;
 	contentOmitted?: SyncContentOmitted;
+	/**
+	 * This peer's answer to {@link SyncRequest.lineageOf} for the block, from its own records only.
+	 * Present when the request asked about this block, unless reading the answer failed; absent reads
+	 * as `unknown` on the asker.
+	 */
+	lineage?: BlockLineage;
 }
 
 /**
@@ -98,8 +120,9 @@ export interface SyncResponse {
 	responderId?: string;
 
 	/**
-	 * Present whenever the request carried {@link SyncRequest.held}: one answer per asked block — each
-	 * of {@link SyncRequest.blockIds} up to the batch cap, or `blockId` alone without it.
+	 * Present whenever the request carried {@link SyncRequest.held} or {@link SyncRequest.lineageOf}:
+	 * one answer per asked block — each of {@link SyncRequest.blockIds} up to the batch cap, or
+	 * `blockId` alone without it.
 	 */
 	answers?: Record<BlockId, SyncBlockAnswer>;
 }

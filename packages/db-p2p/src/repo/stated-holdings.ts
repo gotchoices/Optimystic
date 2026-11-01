@@ -99,7 +99,8 @@ export function askerStatementFor(
 	return { peerId: asker, held, standsIn: localLatest !== undefined && isAtOrBelow(held, localLatest) };
 }
 
-function isActionRev(value: unknown): value is ActionRev {
+/** Whether a value a peer sent is a usable `(rev, actionId)`: a non-negative integer revision and a string action id. */
+export function isActionRev(value: unknown): value is ActionRev {
 	if (typeof value !== 'object' || value === null) return false;
 	const { rev, actionId } = value as Partial<ActionRev>;
 	return Number.isSafeInteger(rev) && (rev as number) >= 0 && typeof actionId === 'string';

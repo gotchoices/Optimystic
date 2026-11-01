@@ -24,7 +24,8 @@ import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
-import { answerFromArchiveResponse, claimFromConsultAnswer, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
+import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
+import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
 import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type CohortCommitAppliedSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
@@ -1478,6 +1479,28 @@ export async function createLibp2pNodeBase(
 			}
 		};
 
+		// Ask one cohort peer whether ITS current content for a block was built from a given pair, over
+		// the sync protocol (`SyncRequest.lineageOf`), answered from that peer's own records with the
+		// cluster skipped. Both repair paths ask it, and only for the shape the claim data cannot settle:
+		// a lone machine's single-signer certified claim one revision ahead of the pair the rest of the
+		// cohort backs (`settleSoloAhead` in `cluster/solo-ahead.ts`). The commit-path reconcile takes it
+		// as `askLineage`, the read path as `blockLineageCallback`.
+		//
+		// A dial failure, a budget expiry or an unreadable reply rejects, and the round counts a rejection
+		// as a silent claimant, i.e. `unknown`. The budget is the consult's, and so is its limit: a
+		// claimant reachable only over a cold relayed connection nothing else has opened reads as silent
+		// (the `NOTE:` in `clusterLatestCallback` below). Neither path should ever ask this node itself,
+		// since its own claim is excluded from the claim set, but a self ask reads local storage through
+		// the same function the sync service answers with rather than dialing self.
+		const blockLineageCallback: BlockLineageAsk = async (peerIdStr, blockId, target) => {
+			const peerId = peerIdFromString(peerIdStr);
+			if (peerId.equals(node.peerId)) return await serveLineageAnswer(storageRepo, blockId, target);
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix, linkDeadlines);
+			const response = await withinRequestBudget(peerIdStr, syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
+				options => syncClient.requestBlock({ blockId, blockIds: [blockId], rev: undefined, lineageOf: { [blockId]: target } }, options));
+			return lineageFromSyncResponse(response, blockId);
+		};
+
 		// Active reconciliation for a block this member committed without a materializable base
 		// (cohort drift, or a refused `missing-base-revision` commit). See `reconcile-block.ts` for
 		// the corroboration rules — in particular why both quorums are capped by how many peers
@@ -1500,7 +1523,8 @@ export async function createLibp2pNodeBase(
 			reputation,
 			// A restored block is one this node now holds, and the peers that corroborated the revision
 			// hold it too. Reported only on a successful restore — a decline persists nothing.
-			onBlockHolders
+			onBlockHolders,
+			askLineage: blockLineageCallback
 			// `anchoring` (proof layer-2, `ProofAnchoring`) is intentionally NOT wired here yet — nor
 			// is the coordinator's `proofAnchoring` below: a real implementation re-derives the
 			// block's cohort from `keyNetwork.findCluster` (the same source `deriveExpectedCluster`
@@ -1699,6 +1723,7 @@ export async function createLibp2pNodeBase(
 			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
 			// genuinely absent block still costs no archive fetch.
 			acquireBlockFromCohort: reconcileBlock,
+			blockLineageCallback,
 			// Records who is still missing each block of a commit acknowledged below `full`; the
 			// under-replication drain below sends those copies.
 			underReplicationLedger,

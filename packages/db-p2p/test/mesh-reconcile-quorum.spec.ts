@@ -15,9 +15,11 @@
  */
 
 import { expect } from 'chai';
-import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import type { BlockId, BlockOperation, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import { canonicalBlockHash, withOperation } from '@optimystic/db-core';
 import { createMesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { captureLog } from './support/capture-log.js';
+import { makeSignedProof } from './support/commit-proof-fixtures.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -224,5 +226,83 @@ describe('mesh repair runs the production quorum rules', () => {
 		const healed = await reader.coordinatorRepo.get({ blockIds: [blockId] });
 		expect(healed[blockId]?.state?.latest?.rev, 'a later pass succeeds').to.equal(2);
 		expect((await localState(reader, blockId))?.state?.latest?.rev).to.equal(2);
+	});
+});
+
+const FORK_BLOCK = 'block-lone-fork' as BlockId;
+const forkBase = (): IBlock => ({ header: makeHeader(FORK_BLOCK), items: ['base'] } as unknown as IBlock);
+const FORK_OP: BlockOperation = ['items', 1, 0, ['fork']];
+
+/**
+ * Land one revision of {@link FORK_BLOCK} straight into each node's storage through the real pend and
+ * commit path: the base block as an insert, or with `base` the fork operation applied over that
+ * revision (an update, so the node's history spans `base` and it can answer the lineage question for
+ * it). With `signers` the commit declares the resulting block's digest and carries a proof that many
+ * fresh keys signed, which each node retains: a cohort's commit proof, or with one signer a lone
+ * machine's self-signed one.
+ */
+const landForkRevision = async (
+	nodes: MeshNode[],
+	{ rev, actionId, base, signers }: { rev: number; actionId: string; base?: number; signers?: number }
+): Promise<void> => {
+	const transforms: Transforms = base === undefined
+		? { inserts: { [FORK_BLOCK]: forkBase() }, updates: {}, deletes: [] }
+		: { inserts: {}, updates: { [FORK_BLOCK]: [FORK_OP] }, deletes: [] };
+	const landed = base === undefined ? forkBase() : withOperation(forkBase(), FORK_OP);
+	const commit = {
+		actionId, blockIds: [FORK_BLOCK], tailId: FORK_BLOCK, rev,
+		...(signers === undefined ? {} : {
+			blockDigests: { [FORK_BLOCK]: { digest: await canonicalBlockHash(landed), ...(base === undefined ? {} : { baseRev: base }) } }
+		})
+	};
+	const proof = signers === undefined ? undefined : (await makeSignedProof(signers, commit)).proof;
+	for (const node of nodes) {
+		const pended = await node.storageRepo.pend({
+			actionId, transforms, rev, policy: 'c', ...(base === undefined ? {} : { baseRevs: { [FORK_BLOCK]: base } })
+		});
+		expect(pended.success, `pend of ${actionId} lands`).to.equal(true);
+		expect((await node.storageRepo.commit(commit, undefined, proof && { proof })).success, `commit of ${actionId} lands`).to.equal(true);
+	}
+};
+
+/**
+ * Ticket: the-sync-consult-answers-a-lineage-question. A lone machine's self-signed revision one
+ * ahead of the pair the rest of the cohort holds looks the same whether it forked or the others lag;
+ * the read path asks the lone machine whether its history contains the group's pair, through the same
+ * storage read a peer's sync service answers with. The fork is seeded, not produced by a partition.
+ */
+describe('mesh repair asks a lone ahead machine for its lineage', () => {
+
+	const forkMesh = () => createMesh(3, { responsibilityK: 3, clusterSize: 3, coordinatorConfig: { readRepairMode: 'paranoid' } });
+
+	it("a group member keeps the group's pair when the lone machine's history excludes it", async () => {
+		const mesh = await forkMesh();
+		const [reader, group, lone] = mesh.nodes as [MeshNode, MeshNode, MeshNode];
+		await landForkRevision([reader, group], { rev: 5, actionId: 'cohort-5', signers: 3 });
+		await landForkRevision([lone], { rev: 5, actionId: 'solo-5' });
+		await landForkRevision([lone], { rev: 6, actionId: 'solo-fork', base: 5, signers: 1 });
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			await reader.coordinatorRepo.get({ blockIds: [FORK_BLOCK] });
+		});
+
+		expect(countTag(captured, 'cluster-fetch:fork-declined'), 'the fork is named').to.equal(1);
+		expect((await localState(reader, FORK_BLOCK))?.state?.latest).to.deep.equal({ rev: 5, actionId: 'cohort-5' });
+	});
+
+	it("a group member acquires the lone machine's revision when its history contains the group's pair", async () => {
+		const mesh = await forkMesh();
+		const [reader, group, lone] = mesh.nodes as [MeshNode, MeshNode, MeshNode];
+		await landForkRevision([reader, group, lone], { rev: 5, actionId: 'cohort-5', signers: 3 });
+		await landForkRevision([lone], { rev: 6, actionId: 'solo-fork', base: 5, signers: 1 });
+
+		const captured = await captureLog('coordinator-repo', async () => {
+			await reader.coordinatorRepo.get({ blockIds: [FORK_BLOCK] });
+		});
+
+		expect(payloadsOf(captured, 'cluster-fetch:solo-ahead').map(p => p['verdict'])).to.deep.equal(['same-lineage']);
+		const readerLocal = await localState(reader, FORK_BLOCK);
+		expect(readerLocal?.state?.latest).to.deep.equal({ rev: 6, actionId: 'solo-fork' });
+		expect(readerLocal?.block).to.deep.equal((await localState(lone, FORK_BLOCK))?.block);
 	});
 });
