@@ -8,13 +8,16 @@
  */
 
 import type { Tree } from '@optimystic/db-core';
+import { structuralEquals } from '@optimystic/db-core';
 import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution, ForeignKeyConstraintSchema, SqlValue } from '@quereus/quereus';
 import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
+import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
+import { copyTags, withTagsOf } from './tag-overlay.js';
 
 // IndexSchema type from TableSchema.indexes
 export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
@@ -476,6 +479,35 @@ function canonicalizeRecordOrder<T extends StoredTableSchema | PersistedTableSch
 	} as T;
 }
 
+/**
+ * `record` with its table-level `tags` key where a fresh write of the same declaration puts it,
+ * for the same reason {@link canonicalizeRecordOrder} exists: a record that gained tags through
+ * `alter table … set tags` must persist the bytes a machine that declared them persists. The keys
+ * pulled out below are every key a write puts AFTER `tags` — those
+ * {@link SchemaManager.tableSchemaToStored} emits after it (keep the two in step), then those a
+ * later write appends (`orphanedIndexes`, {@link mergePersistedSchemas}; a gravestone's
+ * `droppedAt`). Every other tag lives on a list element, where the converters put it last, which
+ * is where `withTagsOf` (`./tag-overlay.ts`) puts it.
+ */
+function withTableTagsPlaced(record: PersistedTableSchema): PersistedTableSchema {
+	if (record.tags === undefined) {
+		return record;
+	}
+	const {
+		tags, synthesizedPrimaryKey, generatedColumnDependencies, generatedColumnTopoOrder, orphanedIndexes, droppedAt,
+		...before
+	} = record;
+	return {
+		...before,
+		tags,
+		...(synthesizedPrimaryKey !== undefined && { synthesizedPrimaryKey }),
+		...(generatedColumnDependencies !== undefined && { generatedColumnDependencies }),
+		...(generatedColumnTopoOrder !== undefined && { generatedColumnTopoOrder }),
+		...(orphanedIndexes !== undefined && { orphanedIndexes }),
+		...(droppedAt !== undefined && { droppedAt }),
+	};
+}
+
 /** Column-name → position map over a record's own column list (names compare case-insensitively). */
 function columnPositions(columns: readonly StoredColumnSchema[]): Map<string, number> {
 	return new Map(columns.map((col, index) => [col.name.toLowerCase(), index]));
@@ -567,11 +599,6 @@ function nonEmpty<T>(items: readonly T[] | undefined): T[] | undefined {
 	return items && items.length > 0 ? [...items] : undefined;
 }
 
-/** A copy of `tags` when it has any, else undefined — so tag-free objects carry no key. */
-function copyTags(tags: Readonly<Record<string, SqlValue>> | undefined): Record<string, SqlValue> | undefined {
-	return tags && Object.keys(tags).length > 0 ? { ...tags } : undefined;
-}
-
 /**
  * De-resolve a runtime schema to its on-disk shape: index positions become the names
  * of the columns they address in `stored`'s OWN column list. A position outside that
@@ -654,6 +681,162 @@ export function withoutIndex(record: PersistedTableSchema, indexName: string): P
 		indexes: record.indexes.filter(idx => idx !== removed),
 		orphanedIndexes: mergeIndexLists([removed], record.orphanedIndexes ?? []),
 	});
+}
+
+/** A CHECK as the catalog record stores it — the one conversion, shared by every path that writes one. */
+export function checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
+	return {
+		name: check.name,
+		expr: persistExpression(check.expr),
+		operations: check.operations,
+		deferrable: check.deferrable,
+		initiallyDeferred: check.initiallyDeferred,
+		defaultConflict: check.defaultConflict,
+		tags: copyTags(check.tags),
+	};
+}
+
+/**
+ * `stored` with `check` added: the persisted half of `ALTER TABLE … ADD CONSTRAINT … CHECK`. A
+ * CHECK already carrying that name, compared case-insensitively as Quereus compares constraint
+ * names, is replaced rather than doubled — the engine refuses a name its own catalog holds, so
+ * such a CHECK came from a writer this session's declaration never saw, and local DDL wins here as
+ * it does on every other schema write. List order is left to the write
+ * ({@link canonicalizeRecordOrder}).
+ */
+export function withCheckConstraint(stored: StoredTableSchema, check: RowConstraintSchema): StoredTableSchema {
+	const kept = withoutCheckConstraint(stored, check.name).checkConstraints ?? [];
+	return { ...stored, checkConstraints: [...kept, checkConstraintToStored(check)] };
+}
+
+/**
+ * `stored` without the CHECK named `name` (case-insensitive, the same name rule as
+ * {@link withCheckConstraint}): the persisted half of `ALTER TABLE … DROP CONSTRAINT` of a CHECK.
+ * An unnamed CHECK is dropped by the name Quereus minted for it, which the record carries too. The
+ * key is omitted when nothing is left, as {@link SchemaManager.tableSchemaToStored} omits it.
+ */
+export function withoutCheckConstraint(stored: StoredTableSchema, name: string | undefined): StoredTableSchema {
+	return { ...stored, checkConstraints: nonEmpty(withoutNamed(stored.checkConstraints ?? [], name)) };
+}
+
+/**
+ * A column as the catalog record stores it — the inverse of {@link storedToColumnSchema},
+ * and the one conversion, shared by every path that writes one.
+ */
+export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
+	return {
+		name: col.name,
+		affinity: col.logicalType.name,
+		declaredType: col.declaredType,
+		notNull: col.notNull,
+		primaryKey: col.primaryKey,
+		pkOrder: col.pkOrder,
+		defaultValue: col.defaultValue ? persistExpression(col.defaultValue) : undefined,
+		collation: col.collation,
+		collationExplicit: col.collationExplicit ? true : undefined,
+		generated: col.generated,
+		generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
+		generatedStored: col.generatedStored,
+		pkDirection: col.pkDirection,
+		defaultConflict: col.defaultConflict,
+		tags: copyTags(col.tags),
+	};
+}
+
+/**
+ * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The logical type
+ * is re-inferred from the declared spelling by the same rule CREATE TABLE uses (`inferType`),
+ * falling back to the stored canonical name for a column declared without a type. Also used by
+ * the vtab's own load arm (a `connect` whose caller supplied no columns) and by the index
+ * manager's partial-index predicates (`IndexPredicate`), so none of them rebuilds a column
+ * differently.
+ */
+export function storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
+	return {
+		name: col.name,
+		logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
+		declaredType: col.declaredType,
+		notNull: col.notNull,
+		primaryKey: col.primaryKey,
+		pkOrder: col.pkOrder,
+		defaultValue: (col.defaultValue as Expression | undefined) ?? null,
+		collation: col.collation,
+		collationExplicit: col.collationExplicit,
+		generated: col.generated,
+		generatedExpr: col.generatedExpr as Expression | undefined,
+		generatedStored: col.generatedStored,
+		pkDirection: col.pkDirection,
+		defaultConflict: col.defaultConflict,
+		tags: copyTags(col.tags),
+	};
+}
+
+/**
+ * `stored` with `column` appended: the persisted half of a catalog-only `ALTER TABLE … ADD COLUMN`.
+ * Appending moves no other column, so no positional field changes. No row is rewritten: rows are
+ * stored keyed by column name, and a row written before the column existed reads it as NULL.
+ */
+export function withColumn(stored: StoredTableSchema, column: ColumnSchema): StoredTableSchema {
+	return { ...stored, columns: [...stored.columns, columnSchemaToStored(column)] };
+}
+
+/**
+ * Renumbers a column position past the removal of the column at `removed`. Throws for `removed`
+ * itself: whatever still addresses the removed column must be refused before the column is
+ * removed ({@link columnDropBlockers}), never carried to a neighbour's position.
+ */
+export function positionAfterRemoving(removed: number): (position: number) => number {
+	return position => {
+		if (position === removed) {
+			throw new Error(`Column position ${removed} is being removed while something still addresses it`);
+		}
+		return position > removed ? position - 1 : position;
+	};
+}
+
+/** `index` with each column position passed through `reposition`. */
+export function repositionIndexColumns<T extends { columns: readonly StoredIndexColumn[] }>(
+	index: T,
+	reposition: (position: number) => number
+): T {
+	return { ...index, columns: index.columns.map(col => ({ ...col, index: reposition(col.index) })) };
+}
+
+/**
+ * `stored` without the column named `name` (case-insensitive): the persisted half of a
+ * catalog-only `ALTER TABLE … DROP COLUMN`. Every positional field is renumbered over the removed
+ * slot — the primary key, the resolved index columns (which {@link toPersistedSchema} turns into
+ * names, so a stale position would persist the wrong column's name), the UNIQUE constraints and
+ * FOREIGN KEYs, and the generated-column bookkeeping. `assertPositionsInRange` cannot catch a
+ * position that is in range but one off, so this is where that must be right. Unchanged when the
+ * record has no such column.
+ *
+ * Throws when anything in `stored` keys on the column ({@link columnDropBlockers}): the caller
+ * refuses that case first. No row is rewritten — a stored row keeps the dropped column's field,
+ * which nothing reads.
+ */
+export function withoutColumn(stored: StoredTableSchema, name: string): StoredTableSchema {
+	const position = positionOfNamed(stored.columns, name);
+	if (position === undefined) {
+		return stored;
+	}
+	const blockers = columnDropBlockers(stored, position);
+	if (blockers.length > 0) {
+		throw new Error(`Cannot remove column '${name}' from the catalog record of table '${stored.name}': ${blockers.join('; ')}`);
+	}
+	const reposition = positionAfterRemoving(position);
+	return {
+		...stored,
+		columns: stored.columns.filter((_, index) => index !== position),
+		primaryKeyDefinition: stored.primaryKeyDefinition.map(pk => ({ ...pk, index: reposition(pk.index) })),
+		indexes: stored.indexes.map(idx => repositionIndexColumns(idx, reposition)),
+		uniqueConstraints: stored.uniqueConstraints?.map(uc => ({ ...uc, columns: uc.columns.map(reposition) })),
+		foreignKeys: stored.foreignKeys?.map(fk => ({ ...fk, columns: fk.columns.map(reposition) })),
+		generatedColumnDependencies: stored.generatedColumnDependencies?.map(
+			([generated, dependencies]): [number, number[]] => [reposition(generated), dependencies.map(reposition)]
+		),
+		generatedColumnTopoOrder: stored.generatedColumnTopoOrder?.map(reposition),
+	};
 }
 
 /**
@@ -1213,6 +1396,61 @@ export class SchemaManager {
 	}
 
 	/**
+	 * The tag-change write: the table's live record with every tag `source` can address replaced by
+	 * `source`'s ({@link withTagsOf}) — the save of an edit Quereus made to its own catalog alone
+	 * (`OptimysticModule`'s `table_modified` listener). Nothing but tags changes, so this neither
+	 * goes through the index union of {@link storeStoredSchema} nor needs it. Read and written the
+	 * way that method reads and writes (fresh from the catalog, or through the open batch's overlay,
+	 * staged there), and open-only on the catalog like {@link removeIndex}.
+	 *
+	 * `'unchanged'` when the record already carries those tags — the answer for every structural
+	 * `table_modified`, and for a second machine saving the same edit — and nothing is written.
+	 * `'no-record'` when the catalog holds no live record for the table (a gravestone, or a record
+	 * that never landed — `OptimysticVirtualTable.markSchemaUnpersisted`); nothing is written then
+	 * either, since a record's whole content cannot be made from tags.
+	 */
+	async persistTags(
+		schemaName: string,
+		tableName: string,
+		source: TableSchema,
+		transactor?: ITransactor
+	): Promise<'saved' | 'unchanged' | 'no-record'> {
+		const key = catalogKey(schemaName, tableName);
+		if (this.batch) {
+			const record = this.livePersistedEntry(await this.batch.readEntry(key, transactor));
+			const tagged = record && this.retagged(record, source);
+			if (tagged) {
+				this.batch.write(key, [key, tagged]);
+			}
+			return record ? (tagged ? 'saved' : 'unchanged') : 'no-record';
+		}
+		const tree = await this.getSchemaTree(transactor);
+		if (!tree) {
+			return 'no-record';
+		}
+		await tree.update();
+		const path = await tree.find(key);
+		const record = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
+		if (!record) {
+			return 'no-record';
+		}
+		const tagged = this.retagged(record, source);
+		if (!tagged) {
+			return 'unchanged';
+		}
+		await tree.replace([[key, [key, tagged]]]);
+		// Cached only once the write landed, as storeStoredSchema does.
+		this.schemaCache.set(key, toStoredSchema(tagged));
+		return 'saved';
+	}
+
+	/** `record` carrying `source`'s tags, or undefined when it already does. */
+	private retagged(record: PersistedTableSchema, source: TableSchema): PersistedTableSchema | undefined {
+		const tagged = withTableTagsPlaced(withTagsOf(record, source));
+		return structuralEquals(tagged, record) ? undefined : tagged;
+	}
+
+	/**
 	 * ONE pass over every catalog entry, in key order — the shared walk behind
 	 * {@link listTables} and {@link findRecordForUri}, so the two cannot drift.
 	 * Open-only: a fresh install has no catalog at all and yields nothing rather
@@ -1391,7 +1629,7 @@ export class SchemaManager {
 		vtabAuxData?: unknown,
 		sessionVtabArgs: Readonly<Record<string, SqlValue>> = {}
 	): TableSchema {
-		const columns = stored.columns.map(col => this.storedToColumnSchema(col));
+		const columns = stored.columns.map(storedToColumnSchema);
 		const primaryKeyDefinition = stored.primaryKeyDefinition.map(pk => ({
 			index: pk.index,
 			desc: pk.desc,
@@ -1426,33 +1664,6 @@ export class SchemaManager {
 				: undefined,
 			generatedColumnTopoOrder: stored.generatedColumnTopoOrder ? [...stored.generatedColumnTopoOrder] : undefined,
 			tags: copyTags(stored.tags),
-		};
-	}
-
-	/**
-	 * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The
-	 * logical type is re-inferred from the declared spelling by the same rule CREATE TABLE
-	 * uses (`inferType`), falling back to the stored canonical name for a column declared
-	 * without a type. Also used by the vtab's own load arm (a `connect` whose caller
-	 * supplied no columns), so the two never rebuild a column differently.
-	 */
-	storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
-		return {
-			name: col.name,
-			logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
-			declaredType: col.declaredType,
-			notNull: col.notNull,
-			primaryKey: col.primaryKey,
-			pkOrder: col.pkOrder,
-			defaultValue: (col.defaultValue as Expression | undefined) ?? null,
-			collation: col.collation,
-			collationExplicit: col.collationExplicit,
-			generated: col.generated,
-			generatedExpr: col.generatedExpr as Expression | undefined,
-			generatedStored: col.generatedStored,
-			pkDirection: col.pkDirection,
-			defaultConflict: col.defaultConflict,
-			tags: copyTags(col.tags),
 		};
 	}
 
@@ -1576,7 +1787,7 @@ export class SchemaManager {
 		return canonicalizeRecordOrder({
 			name: schema.name,
 			schemaName: schema.schemaName,
-			columns: schema.columns.map(col => this.columnSchemaToStored(col)),
+			columns: schema.columns.map(columnSchemaToStored),
 			primaryKeyDefinition: schema.primaryKeyDefinition.map(pk => ({
 				index: pk.index,
 				desc: pk.desc,
@@ -1592,67 +1803,19 @@ export class SchemaManager {
 			// Omitting it keeps this byte-identical with every schema persisted before quereus
 			// 4.19 moved the row count onto `statistics`, so the migration costs no rewrites.
 			uniqueConstraints: nonEmpty(uniqueConstraints),
-			checkConstraints: nonEmpty(schema.checkConstraints.map(check => this.checkConstraintToStored(check))),
+			checkConstraints: nonEmpty(schema.checkConstraints.map(checkConstraintToStored)),
 			foreignKeys: nonEmpty(schema.foreignKeys?.map(fk => this.foreignKeyToStored(fk))),
 			mutationContext: nonEmpty(schema.mutationContext?.map(variable => ({
 				name: variable.name,
 				type: variable.logicalType.name,
 				notNull: variable.notNull,
 			}))),
+			// Every key below this one is placed after `tags` by withTableTagsPlaced as well.
 			tags: copyTags(schema.tags),
 			synthesizedPrimaryKey: schema.synthesizedPrimaryKey,
 			generatedColumnDependencies: nonEmpty(generatedColumnDependencies),
 			generatedColumnTopoOrder: nonEmpty(schema.generatedColumnTopoOrder),
 		});
-	}
-
-	/**
-	 * Convert ColumnSchema to storable format — the inverse of {@link storedToColumnSchema}.
-	 */
-	private columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
-		return {
-			name: col.name,
-			affinity: col.logicalType.name,
-			declaredType: col.declaredType,
-			notNull: col.notNull,
-			primaryKey: col.primaryKey,
-			pkOrder: col.pkOrder,
-			defaultValue: col.defaultValue ? persistExpression(col.defaultValue) : undefined,
-			collation: col.collation,
-			collationExplicit: col.collationExplicit ? true : undefined,
-			generated: col.generated,
-			generatedExpr: col.generatedExpr ? persistExpression(col.generatedExpr) : undefined,
-			generatedStored: col.generatedStored,
-			pkDirection: col.pkDirection,
-			defaultConflict: col.defaultConflict,
-			tags: copyTags(col.tags),
-		};
-	}
-
-	/**
-	 * `stored` with `check` added: the persisted half of `ALTER TABLE … ADD CONSTRAINT … CHECK`
-	 * (see `OptimysticVirtualTable.addCheckConstraint`). A CHECK already carrying that name,
-	 * compared case-insensitively as Quereus compares constraint names, is replaced rather than
-	 * doubled — the engine refuses a name its own catalog holds, so such a CHECK came from a
-	 * writer this session's declaration never saw, and local DDL wins here as it does on every
-	 * other schema write. List order is left to the write ({@link canonicalizeRecordOrder}).
-	 */
-	withCheckConstraint(stored: StoredTableSchema, check: RowConstraintSchema): StoredTableSchema {
-		const name = check.name?.toLowerCase();
-		const kept = (stored.checkConstraints ?? []).filter(existing => name === undefined || existing.name?.toLowerCase() !== name);
-		return { ...stored, checkConstraints: [...kept, this.checkConstraintToStored(check)] };
-	}
-
-	private checkConstraintToStored(check: RowConstraintSchema): StoredCheckConstraint {
-		return {
-			name: check.name,
-			expr: persistExpression(check.expr),
-			operations: check.operations,
-			deferrable: check.deferrable,
-			initiallyDeferred: check.initiallyDeferred,
-			defaultConflict: check.defaultConflict,
-			tags: copyTags(check.tags),
-		};
 	}
 
 	private foreignKeyToStored(fk: ForeignKeyConstraintSchema): StoredForeignKey {

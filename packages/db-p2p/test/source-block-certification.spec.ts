@@ -44,7 +44,7 @@ const makeBlock = (marker = 'x'): IBlock => ({
 const makeRepo = (): StorageRepo => {
 	// One raw store shared across every BlockStorage, as a real node has.
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((id) => new BlockStorage(id, raw));
+	return new StorageRepo(raw);
 };
 
 /** The cohort proof a genuine holder retained for `(BLOCK, rev, actionId)` over exactly `block`. */

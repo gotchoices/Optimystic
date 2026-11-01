@@ -7,7 +7,9 @@ export const DEFAULT_PEER_KEY_NAME = 'peer-private-key';
 
 /**
  * Loads the persisted React Native peer's libp2p private key, or generates a
- * fresh Ed25519 key on first call and persists it.
+ * fresh Ed25519 key on first call and persists it in one batch, synced where
+ * the handle can sync, so a power cut right after first start cannot give the
+ * node a different peer id next time. An existing key is read as it is.
  *
  * The key is stored as raw protobuf bytes under a dedicated identity tag —
  * LevelDB stores arbitrary byte sequences natively, so there is no base64
@@ -28,6 +30,6 @@ export async function loadOrCreateRNPeerKey(
 	}
 	const key = await generateKeyPair('Ed25519');
 	const bytes = privateKeyToProtobuf(key);
-	await db.put(identityKey(keyName), bytes);
+	await db.batch().put(identityKey(keyName), bytes).write({ sync: db.canSync });
 	return key;
 }

@@ -171,3 +171,21 @@ The design of record is now synchronous block-then-escalate (`docs/right-is-righ
 - **Status reconciliation.** Rewrite the status notes on `docs/correctness.md` Theorems 1 (Case 3), 7, 8, 10 and §1.5, the implementation-status notice at the top of that file, `docs/right-is-right.md` §Current Implementation, and `docs/architecture.md` §Status & Evolution to describe what then ships.
 - **Validator reality check.** The mechanism is inert while no deployment supplies a transaction validator (`feat-no-deployment-validates-transactions-at-pend`): no validator, no validity rejections, no disputes. Turning disputes on does not need it, but the end-to-end claim in the docs must say which deployments actually validate.
 
+
+## Who may arbitrate? (added by the `network-membership-predicate-gates-block-pushes` review, 2026-10-11)
+
+A node can be given a network membership predicate (`NodeOptions.isNetworkMember`) saying which peers belong to its network. Every path that chooses peers to send block contents to obeys it — except the arbitrator draw: the `selectArbitrators` hook in `packages/db-p2p/src/libp2p-node-base.ts` takes candidates straight from FRET's `assembleCohort`, and a challenge carries the disputed `ClusterRecord`, transforms included. With `disputeEnabled` on today, a peer the predicate refuses can be drawn, sent that record, and cast an arbitrator vote — a stranger registering the dispute protocol on its own node is enough, since nothing on the arbitrator side needs this network's handler. `docs/internals.md` § Network Membership Predicate lists it under *What it does not gate*, and a `NOTE:` sits at the hook.
+
+It was not simply filtered, because the draw must be identical on every honest node (see the existing `exclude` determinism note above): a node-local predicate breaks that unless every honest node's predicate agrees. Settle, as part of going live:
+
+- **Recommended:** let `feat-fret-honours-the-network-membership-predicate` close it — once FRET's ring excludes refused peers, `assembleCohort` never yields one, and the draw is as deterministic as ring membership already is (both are per-node views). Activation then only has to confirm that ticket landed.
+- **Alternative:** filter in the hook and accept that nodes whose predicates differ draw different arbitrators; a verify-path recompute would then need the predicate's answers as part of what it reconstructs, which the anchoring work would have to carry.
+
+Expected behaviour: on a node with a membership predicate, a refused peer is never drawn as an arbitrator and never sent a challenge.
+
+
+## A dispute over a batch reverses only its first collection (added by `a-consensus-record-carries-several-collections-of-one-action`, 2026-10-20)
+
+A consensus record can now carry a batch: the commits of several collections written by one action, each its own commit operation with its own revision, log tail and blocks (`RepoMessage` in `packages/db-core/src/network/repo-protocol.ts`). Members accept such records; the sending side follows in `a-transaction-pends-and-commits-its-collections-together`. `DisputeService.extractInvalidationTarget` in `packages/db-p2p/src/dispute/dispute-service.ts` returns the FIRST commit operation it finds, so a `challenger-wins` ruling over a batch record originates one `InvalidateRequest` for the first collection only — its blocks, its revision, its log — and leaves the action's other collections committed. The same first-operation target is hashed into the challenge (`computeChallengeTargetHash`) and into the invalidation certificate (`computeTargetHash`), which is why this is not a one-line loop: one certificate target per record cannot verify several per-collection requests.
+
+Expected behaviour: a proven-invalid batch is reversed in every collection it wrote. Settle, before going live, how the certificate binds several targets — one target per commit operation signed into the vote, or one target naming every operation that the apply side splits per collection — and have `maybeInvalidate` originate one invalidation per collection. Dormant until disputes are enabled and a sender builds batches, so it belongs here rather than in its own ticket.

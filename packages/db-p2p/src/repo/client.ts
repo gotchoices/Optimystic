@@ -8,6 +8,8 @@ import { ProtocolClient } from "../protocol-client.js";
 import type { RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
 import { peerIdFromString } from "@libp2p/peer-id";
+import { commitBatchOf, pendBatchOf } from "./request-batch.js";
+import { narrowBlockGets, readGetReply, type RepoBlockGets, type RepoGetReply } from "./get-reply.js";
 
 export class RepoClient extends ProtocolClient implements IRepo {
 	private constructor(peerId: PeerId, peerNetwork: IPeerNetwork, readonly protocolPrefix?: string) {
@@ -19,11 +21,36 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		return new RepoClient(peerId, peerNetwork, protocolPrefix);
 	}
 
+	/**
+	 * A reply too large for one frame comes back with some blocks left out (`fitGetReply`), and those
+	 * are asked of the same peer again, under the same context, floors and statement of holdings cut
+	 * down to them, until every block is answered; the answers are returned as one. Each round answers
+	 * at least one more block, so this ends — and a peer whose round answers none is refused rather
+	 * than asked forever.
+	 *
+	 * A later round is a fresh read on the far side, with its own cohort consult and read-repair
+	 * window, so blocks answered in different rounds may come from different moments. That is no
+	 * weaker than one round: every block's answer is judged on its own (its floor, its doubt markers),
+	 * and nothing reads the blocks of one answer as one snapshot.
+	 *
+	 * NOTE: a later round goes to this client's peer. When the first was redirected, each later round
+	 * is redirected again, one extra hop apiece; fine while a left-out block is rare. If big multi-block
+	 * reads ever arrive through redirects routinely, continue on the client the redirect reached.
+	 */
 	async get(blockGets: BlockGets, options: MessageOptions): Promise<GetBlockResults> {
-		return this.processRepoMessage<GetBlockResults>(
-			[{ get: blockGets }],
-			options
-		);
+		const results: GetBlockResults = {};
+		let asking = blockGets;
+		for (;;) {
+			const request: RepoBlockGets = { ...asking, acceptsLeftOut: true };
+			const reply = await this.processRepoMessage<RepoGetReply>([{ get: request }], options);
+			const { answered, leftOut } = readGetReply(reply, asking.blockIds);
+			Object.assign(results, answered);
+			if (leftOut.length === 0) return results;
+			if (leftOut.length >= new Set(asking.blockIds).size) {
+				throw new Error(`Repo get from ${this.peerId.toString()} left out every block it was asked for`);
+			}
+			asking = narrowBlockGets(blockGets, leftOut);
+		}
 	}
 
 	async pend(request: PendRequest, options: MessageOptions): Promise<PendResult> {
@@ -45,6 +72,24 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			[{ commit: request }],
 			options
 		);
+	}
+
+	/**
+	 * Every request in one message, which the coordinator runs as one consensus record and answers
+	 * together (`IRepo.pendMany`). A list that is not a batch throws here, before anything is sent.
+	 *
+	 * NOTE: one message carries every collection's transforms, and in session mode each request's own
+	 * copy of the validation payload. Together they are held to the per-transaction limit
+	 * (`MAX_TRANSACTION_BYTES`, checked by the coordinator's `pendMany`), which sits below the repo
+	 * protocol's frame limit (`MAX_BLOCK_MESSAGE_BYTES`) by the envelope reserve.
+	 */
+	async pendMany(requests: readonly PendRequest[], options: MessageOptions): Promise<PendResult> {
+		return this.processRepoMessage<PendResult>(pendBatchOf(requests).operations, options);
+	}
+
+	/** {@link pendMany}'s commit twin (`IRepo.commitMany`); the same `NOTE:` applies. */
+	async commitMany(requests: readonly CommitRequest[], options: MessageOptions): Promise<CommitResult> {
+		return this.processRepoMessage<CommitResult>(commitBatchOf(requests).operations, options);
 	}
 
 	private extractCorrelationId(operations: RepoMessage['operations']): string | undefined {
@@ -113,8 +158,10 @@ export class RepoClient extends ProtocolClient implements IRepo {
 				signal: combinedSignal,
 				correlationId,
 				dialTimeoutMs: options?.dialTimeoutMs,
-				// A get response carries block data → block cap (not control).
+				// A get response carries block data, and a pend request a transaction's transforms; the
+				// server decodes requests under the same block cap.
 				maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
+				maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES,
 			})
 		} finally {
 			clearTimeout(timer)
@@ -137,6 +184,12 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (next.id === currentIdStr) {
 				throw new Error('Redirect loop detected in RepoClient (same peer)')
 			}
+			// NOTE: the redirect target is followed without consulting the network membership
+			// predicate (`NodeOptions.isNetworkMember`), here and in `ClusterClient`. The redirect
+			// comes from a cohort member that applies its own predicate, so it reaches a refused
+			// peer only through a member configured without one; the cached hint it records is
+			// re-checked on its next use (`Libp2pKeyPeerNetwork.getCachedCoordinator`). If members
+			// with differing predicates ever share a network, gate the target here.
 			// Learn the redirect target's addresses BEFORE dialing it: the redirect is the only
 			// notice we get that this peer matters, and if it is relay-only we have no address
 			// for it at all. Merging after the dial would help only some later hop.

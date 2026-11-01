@@ -608,6 +608,42 @@ describe('a refreshed collection re-reading a block its log entry names', () => 
 	})
 })
 
+// An open walks no entries, but it has read the log tail, and the tail's entries say which blocks
+// changed at which revision. Before an open floored them, a handle opened over a replica whose copy
+// of such a block was behind its own log tail — a node whose crash kept a commit's tail and lost its
+// other blocks — read the block as it was before the commit, with nothing to say otherwise: a table
+// row with no index entry, after a restart.
+describe('a newly opened collection reading a block its log tail names', () => {
+	/** A handle opened after `NEW` was written, while every pinned read of the row's block is still
+	 *  answered as of the revision before it (the log blocks are served current). */
+	async function openedBehindOneWrite(collectionId: string, net: LaggingDataTransactor) {
+		const writer = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+		await writer.replace([[1, OLD]])
+		net.lagAt = writer.committedRevision()!
+		await writer.replace([[1, NEW]])
+		const reader = await Tree.createOrOpen<number, Row>(net, collectionId, keyOf)
+		return { reader, floorRev: writer.committedRevision()! }
+	}
+
+	it('asks another machine, and returns the new row on its first read', async () => {
+		const machines = new TwoReplicaTransactor()
+		const { reader, floorRev } = await openedBehindOneWrite('opened-two-replicas', machines)
+
+		expect(reader.committedRevision(), 'the open adopted the revision of the write').to.equal(floorRev)
+		expect(await reader.get(1), 'the current replica answered').to.deep.equal(NEW)
+		expect(machines.reAsked, 'the lagging answer earned exactly one re-ask').to.have.length(1)
+	})
+
+	it('with nobody better to ask, hands the old row on without keeping it, and sees the new one once storage catches up', async () => {
+		const net = new LaggingDataTransactor()
+		const { reader } = await openedBehindOneWrite('opened-one-replica', net)
+
+		expect(await reader.get(1)).to.deep.equal(OLD)
+		net.lagAt = undefined
+		expect(await reader.get(1), 'seen on the very next read, with no refresh in between').to.deep.equal(NEW)
+	})
+})
+
 // A refused write names the revision it lost to (`staleAt`), and every commit touches the log tail
 // block, so that revision is a floor for the refresh's read of the tail. Before the refresh said so,
 // a machine behind the rival answered the tail at the revision the writer already held, the refresh

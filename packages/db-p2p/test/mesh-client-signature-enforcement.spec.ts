@@ -17,9 +17,13 @@
  * A member votes `reject` with a signed, free-form `rejectReason`. When rejections make the
  * super-majority unreachable, `ClusterCoordinator` throws `ValidatorRejectionError` reading
  * `Transaction rejected by validators (n/m rejected): <peerId>: <reason>; …`, carrying the per-peer
- * map on `.rejectReasons`. Assertions here match the SUBSTRING (`Missing client signature`), never a
- * whole message: the peer ids are random per run and two members can word the same verdict
- * differently.
+ * map on `.rejectReasons`. A signature refusal judges the transaction itself, so the member marks its
+ * vote `validity`, and when every rejecting member did, `CoordinatorRepo.pend` RETURNS the rejection
+ * as a `RejectedFailure` naming each refuser — the answer a writer stops on for good. A refusal the
+ * member could not judge (`pend-not-validatable`, `validator-fault`) is unmarked and stays the thrown
+ * `ValidatorRejectionError`. Assertions here match the reason a member signed (`Missing client
+ * signature`) or a SUBSTRING of the thrown message, never a whole message: the peer ids are random
+ * per run.
  *
  * ## The arithmetic every case turns on
  *
@@ -52,8 +56,8 @@
  */
 
 import { expect } from 'chai';
-import type { BlockId, IBlock, BlockHeader, Transforms, Transaction, ITransactionValidator, ValidationResult } from '@optimystic/db-core';
-import { DEFAULT_SUPER_MAJORITY_THRESHOLD } from '@optimystic/db-core';
+import type { BlockId, IBlock, BlockHeader, Transforms, Transaction, ITransactionValidator, ValidationResult, PendResult, ValidityRefusal } from '@optimystic/db-core';
+import { DEFAULT_SUPER_MAJORITY_THRESHOLD, isRejectedFailure } from '@optimystic/db-core';
 import type { PrivateKey } from '@libp2p/interface';
 import { createMesh, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 import { ValidatorRejectionError } from '../src/repo/cluster-coordinator.js';
@@ -122,6 +126,17 @@ const expectNowhereCommitted = async (mesh: Mesh, blockId: string): Promise<void
 /** Every reject reason the coordinator collected, across peers. */
 const reasonsOf = (error: Error | undefined): string[] =>
 	error instanceof ValidatorRejectionError ? Object.values(error.rejectReasons) : [];
+
+/** The validity refusals a pend was answered with; fails the test when it was answered any other way. */
+const validityRefusalsOf = (result: PendResult): ValidityRefusal[] => {
+	if (result.success || !isRejectedFailure(result)) {
+		expect.fail(`the pend must be refused as invalid, but was answered ${JSON.stringify(result)}`);
+	}
+	return result.rejected.refusals;
+};
+
+/** The reason each validity refusal gave. */
+const refusalReasons = (refusals: ValidityRefusal[]): (string | undefined)[] => refusals.map(refusal => refusal.reason);
 
 // ─── mesh construction ───
 
@@ -194,16 +209,14 @@ describe('mesh — client transaction signature enforcement at PEND', () => {
 			const mesh = await createEnforcingMesh(3);
 			const blockId = 'block-unsigned-refused';
 
-			const error = await captureFailure(
-				async () => pendTx(mesh.nodes[0]!, blockId, 'a-unsigned', await buildUnsignedTx(clientPeerId))
+			const refusals = validityRefusalsOf(
+				await pendTx(mesh.nodes[0]!, blockId, 'a-unsigned', await buildUnsignedTx(clientPeerId))
 			);
 
-			expect(error, 'the pend must fail').to.be.instanceOf(ValidatorRejectionError);
-			// Assert the REASON, not merely that it failed — a bare "it threw" would pass for an
-			// admission refusal, a stale revision, or an unreachable cohort.
-			expect(error!.message).to.include('Missing client signature');
-			expect(reasonsOf(error), 'every rejecting member named the same cause')
-				.to.satisfy((rs: string[]) => rs.length > 0 && rs.every(r => r === 'Missing client signature'));
+			// Assert the REASON, not merely that it failed — a bare refusal would pass for an admission
+			// refusal, a stale revision, or an unreachable cohort.
+			expect(refusalReasons(refusals), 'every rejecting member named the same cause')
+				.to.satisfy((rs: (string | undefined)[]) => rs.length > 0 && rs.every(r => r === 'Missing client signature'));
 			await expectNowhereCommitted(mesh, blockId);
 		});
 
@@ -213,12 +226,11 @@ describe('mesh — client transaction signature enforcement at PEND', () => {
 			const mesh = await createEnforcingMesh(3);
 			const blockId = 'block-impersonated-refused';
 
-			const error = await captureFailure(
-				async () => pendTx(mesh.nodes[0]!, blockId, 'a-impersonated', await buildSignedTx(clientPeerId, strangerKey))
+			const refusals = validityRefusalsOf(
+				await pendTx(mesh.nodes[0]!, blockId, 'a-impersonated', await buildSignedTx(clientPeerId, strangerKey))
 			);
 
-			expect(error, 'the pend must fail').to.be.instanceOf(ValidatorRejectionError);
-			expect(error!.message).to.include('Invalid client signature');
+			expect(refusalReasons(refusals)).to.include('Invalid client signature');
 			await expectNowhereCommitted(mesh, blockId);
 		});
 
@@ -231,21 +243,19 @@ describe('mesh — client transaction signature enforcement at PEND', () => {
 
 			const garbageSig = await buildUnsignedTx(clientPeerId);
 			garbageSig.signature = '!!!not base64url!!!';
-			const garbageError = await captureFailure(
-				async () => pendTx(mesh.nodes[0]!, 'block-garbage-sig', 'a-garbage', garbageSig)
+			const garbageRefusals = validityRefusalsOf(
+				await pendTx(mesh.nodes[0]!, 'block-garbage-sig', 'a-garbage', garbageSig)
 			);
-			expect(garbageError, 'a malformed signature is a verdict, not a crash')
-				.to.be.instanceOf(ValidatorRejectionError);
-			expect(reasonsOf(garbageError)).to.include('Invalid client signature');
+			expect(refusalReasons(garbageRefusals), 'a malformed signature is a verdict, not a crash')
+				.to.include('Invalid client signature');
 
 			// A well-formed signature over a stamp whose peerId is not a libp2p identity at all.
 			const fakeIdTx = await buildSignedTx('not-a-real-peer-id', clientKey);
-			const fakeIdError = await captureFailure(
-				async () => pendTx(mesh.nodes[0]!, 'block-fake-peer-id', 'a-fake-id', fakeIdTx)
+			const fakeIdRefusals = validityRefusalsOf(
+				await pendTx(mesh.nodes[0]!, 'block-fake-peer-id', 'a-fake-id', fakeIdTx)
 			);
-			expect(fakeIdError, 'an undecodable peer id is a verdict, not a crash')
-				.to.be.instanceOf(ValidatorRejectionError);
-			expect(reasonsOf(fakeIdError)).to.include('Invalid client signature');
+			expect(refusalReasons(fakeIdRefusals), 'an undecodable peer id is a verdict, not a crash')
+				.to.include('Invalid client signature');
 		});
 	});
 
@@ -304,14 +314,13 @@ describe('mesh — client transaction signature enforcement at PEND', () => {
 			const mesh = await createEnforcingMesh(4, [0, 1]);
 			const blockId = 'block-two-enforcers';
 
-			const error = await captureFailure(
-				async () => pendTx(mesh.nodes[2]!, blockId, 'a-two-enforcers', await buildUnsignedTx(clientPeerId))
+			const refusals = validityRefusalsOf(
+				await pendTx(mesh.nodes[2]!, blockId, 'a-two-enforcers', await buildUnsignedTx(clientPeerId))
 			);
 
-			expect(error, 'two rejections must kill the pend').to.be.instanceOf(ValidatorRejectionError);
-			expect(error!.message).to.include('Missing client signature');
-			expect(Object.keys((error as ValidatorRejectionError).rejectReasons),
-				'exactly the two enforcing members rejected').to.have.lengthOf(2);
+			expect(refusals.map(refusal => refusal.peerId), 'exactly the two enforcing members rejected')
+				.to.have.members([mesh.nodes[0]!.peerId.toString(), mesh.nodes[1]!.peerId.toString()]);
+			expect(refusalReasons(refusals)).to.deep.equal(['Missing client signature', 'Missing client signature']);
 			await expectNowhereCommitted(mesh, blockId);
 		});
 	});

@@ -1,0 +1,14 @@
+description: The class that runs a write's voting rounds across a group of machines has grown to nearly two thousand lines, and the part that tracks messages still owed to a machine — and now holds some back on purpose — has passed the size its own comment said should trigger moving it into a file of its own.
+files: packages/db-p2p/src/repo/cluster-coordinator.ts (`carryCapablePeers`, `takeOwedRecords`, `returnCarried`, `settleCarriedDelivery`, `noteCarryCapability`, `forgetCarryCapability`, `mayDeferPendDelivery`, `deferPendDelivery`, `scheduleCommitRetry`, `armRetry`, `retryCommits`, `runRetry`, `finishRetry`, `clearRetry`, the `CommitRetryState` type and `ClusterTransactionState.carrying` / `owedSince`), packages/db-p2p/src/repo/late-pend-refusals.ts (the precedent: a piece already moved out)
+difficulty: medium
+tradeoffs: The code is correct and covered by mesh tests, and the owed-delivery bookkeeping reads and writes the same per-transaction state the voting rounds do, so the split needs a real interface rather than a cut-and-paste — a maintainer could reasonably wait for the next functional change to this path and restructure then.
+----
+# Measured
+
+`wc -l packages/db-p2p/src/repo/cluster-coordinator.ts` → 1953 lines (2026-10-13, after ticket `a-single-collection-write-defers-a-two-member-pends-delivery`, which added about 170 of them). The `NOTE:` on `carryCapablePeers` says: "this file is past 1700 lines; if owed-delivery bookkeeping (this map, `takeOwedRecords`, `returnCarried`, `settleCarriedDelivery`) grows further, move it into its own module." It has grown: that ticket added `forgetCarryCapability`, `mayDeferPendDelivery`, `deferPendDelivery`, the `deferred` mark on `CommitRetryState`, and `armRetry`, all of which belong to "which member is owed which decided record, and when it gets it".
+
+# What is wanted
+
+One module that owns everything about a decided record still owed to a member: who can be carried to, what each member is owed and in what order, what is riding on a request right now, the retry timer and its attempt budget, and the deliberate hold-back of a single-collection write's pend decision. `ClusterCoordinator` keeps the voting rounds (promise collection, the pre-vote and pre-sign, the commit round, the consensus broadcast) and asks that module "what rides on this request to this member?", "this member took it", and "owe these members this record (now, or after a delay)".
+
+Behaviour must not change. The safety net is `test/commit-round-carries-coordinator-commit-vote.spec.ts`, `test/cluster-coordinator.spec.ts` (the retry and carried-delivery cases), `test/commit-durability-quorum.spec.ts`, and the plugin's `test/two-node-write-request-count.spec.ts`, which counts the requests a write costs and so fails on any change to when a record is sent. The `NOTE:` comments at `takeOwedRecords`, `runRetry` and `deferPendDelivery` move with the code they describe.

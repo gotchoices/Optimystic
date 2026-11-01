@@ -3,7 +3,7 @@ import type { IPeerNetwork } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
-import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
+import { MAX_BLOCK_MESSAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 
 /**
  * Client for sending sync requests to remote peers.
@@ -38,7 +38,11 @@ export class SyncClient extends ProtocolClient {
 		// Asymmetry: the *request* the server reads is a tiny SyncRequest (control cap
 		// on the server side), but the *response* read here is a BlockArchive carrying
 		// block data → block cap.
-		return await this.processMessage<SyncResponse>(request, this.protocol, { ...withRpcDeadlineDefaults(options, this.rpcDeadlines), maxDataLength: MAX_BLOCK_MESSAGE_BYTES });
+		return await this.processMessage<SyncResponse>(request, this.protocol, {
+			...withRpcDeadlineDefaults(options, this.rpcDeadlines),
+			maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
+			maxRequestBytes: MAX_CONTROL_MESSAGE_BYTES,
+		});
 	}
 
 	/**

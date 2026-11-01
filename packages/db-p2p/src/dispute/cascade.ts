@@ -40,6 +40,8 @@ export type CollectionEnv = {
 	readonly collectionId: CollectionId;
 	readonly log: Log<unknown>;
 	readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
+	/** Flush of the store `createBlockStorage` writes to; see `InvalidationContext.flush`. */
+	readonly flush: () => Promise<void>;
 };
 
 // ─── Invalidated (blockId, revision) pairs ───
@@ -362,7 +364,7 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 
 			const env = cand.env;
 			const result = await applyInvalidation(
-				{ log: env.log, createBlockStorage: env.createBlockStorage },
+				{ log: env.log, createBlockStorage: env.createBlockStorage, flush: env.flush },
 				{
 					invalidatedActionId: cand.actionId,
 					invalidatedRev: cand.rev,

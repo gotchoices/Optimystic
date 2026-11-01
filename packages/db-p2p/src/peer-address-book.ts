@@ -18,10 +18,12 @@ export const MAX_MERGED_ADDRS_PER_PEER = 8
  * A record's peer map is NOT self-limiting: `ClusterService.processOperation` learns from it
  * before `checkRedirect` and before `cluster.update` validates a single signature, and inbound
  * stream authorization is opt-in (`authorizeInboundStream` is undefined by default), so the map
- * is attacker-authored at that point. One 1 MiB control message (`MAX_CONTROL_MESSAGE_BYTES`)
- * holds on the order of a thousand fabricated `{ id, multiaddrs, publicKey }` entries, each of
- * which would otherwise become a persisted peerStore record. Real cohorts are `clusterSize`
- * peers — single digits — so this is generous margin, not a functional limit.
+ * is attacker-authored at that point. One cluster frame (`MAX_BLOCK_MESSAGE_BYTES`, 8 MiB, since a
+ * pend record carries a transaction's transforms) holds on the order of ten thousand fabricated
+ * `{ id, multiaddrs, publicKey }` entries — eight times the thousand or so the 1 MiB control cap it
+ * was once decoded under held — each of which would otherwise become a persisted peerStore record.
+ * Real cohorts are `clusterSize` peers — single digits — so this is generous margin, not a
+ * functional limit.
  */
 export const MAX_LEARNED_PEERS_PER_RECORD = 64
 
@@ -44,7 +46,7 @@ export type AddressLog = (fmt: string, ...args: unknown[]) => void
  * `Libp2pKeyPeerNetwork.parseMultiaddrs` delegates here so there is one definition of
  * "an address string we are willing to carry".
  */
-export function validMultiaddrStrings(addrs: string[], log: AddressLog): string[] {
+export function validMultiaddrStrings(addrs: readonly string[], log: AddressLog): string[] {
 	return addrs.filter(a => isCarriableMultiaddrString(a, log))
 }
 
@@ -136,7 +138,7 @@ export function publishableConnectionAddr(conn: DirectionalConnection, log: Addr
  * peerStore for other reasons (`findCluster`'s membership-scoped path reads protocols and addresses
  * in a single `store.get` per member) and must not pay a second read to reuse the rule.
  */
-export function unionPublishableAddrs(connectionAddrs: string[], advertisedAddrs: string[], log: AddressLog): string[] {
+export function unionPublishableAddrs(connectionAddrs: readonly string[], advertisedAddrs: readonly string[], log: AddressLog): string[] {
 	return Array.from(new Set([...connectionAddrs, ...validMultiaddrStrings(advertisedAddrs, log)]))
 }
 
@@ -268,7 +270,7 @@ function isRelayComponent(component: Component | undefined, relayPeerId: string)
  * instead. Nothing can repair it from our side: once the client's connection drops only the client
  * can re-initiate, so the useful response is to fail fast and let the caller move on.
  */
-export function classifySelfDialability(addrs: string[], selfPeerId: string, log: AddressLog): SelfDialability {
+export function classifySelfDialability(addrs: readonly string[], selfPeerId: string, log: AddressLog): SelfDialability {
 	if (addrs.length === 0) return 'none'
 	return addrs.some(addr => !routesThroughRelay(addr, selfPeerId, log)) ? 'dialable' : 'self-relay-only'
 }

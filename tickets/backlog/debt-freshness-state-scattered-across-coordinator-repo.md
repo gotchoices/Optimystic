@@ -361,3 +361,15 @@ Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **3186 lines
 - The trigger log line `cluster-tx:read-repair-triggered` gained `reason` and `floor`. It is the one place the two predicates' verdicts meet, assembled inline in `get`.
 
 Nothing was added to `unsettledAheadClaims` or `stuckReservations`: the floor never touches doubt, and `coordinator-repo-small-cohort-arming.spec.ts` still passes unchanged. Still four `LruMap(1000)` fields (`grep -c "new LruMap"` → 4).
+
+## Seventeenth measurement (implement of `silent-read-repair-consults-back-off`, 2026-10-17)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **3761 lines**, up from 3684 at HEAD immediately before that ticket (+77, mostly comment). It added one more per-block fact the "consult or not" decision reads, and kept it out of the class as this ticket asks: `SilentConsultHolds` in `packages/db-p2p/src/repo/silent-consult-holds.ts`, two `LruMap(1000)`s of its own (per block: a hold placed after a consult a silent peer left unarmed; per peer: when it last answered). Its sites in the repo, for the extraction to absorb:
+
+- `shouldReadRepair`'s `'lazy'` arm reads `holds(blockId)` first, so the consult decision now has three inputs in two places (the window and the hold there, the floor in `floorDemandsConsult`).
+- `fetchBlockFromCluster` returns a third field, `heldBySilence`, at the one exit that leaves the window unarmed because of silence; both consult paths hand it to `noteConsultOutcome`. Same shape as the sixteenth measurement's complaint: the arming decision (`markBlocksSeen`) is still a call each exit makes, while the hold is now part of the returned verdict — the direction that note recommends.
+- `noteAnswered` is fed from three places: every consult's `answered` list, and the voters of the record `executeClusterTransaction` returns on the pend and commit paths (`noteVotersAnswered`). The write path now feeds a read-path fact, which a freshness collaborator would have to accept as an input rather than own.
+
+## Eighteenth measurement (implement of `a-member-that-applied-a-commit-counts-its-copy-checked`, 2026-10-20)
+
+Re-measured (`wc -l packages/db-p2p/src/repo/coordinator-repo.ts`): **4028 lines**, up from 3997 at HEAD immediately before that ticket (+31, almost all comment). The window's stamp now has its first writer from outside the class: `ClusterMember` reports each consensus commit it durably applied through its `onCohortCommitApplied` component, which a node binds late to `CoordinatorRepo.noteCohortCommitApplied` (`libp2p-node-base.ts`, and the mesh harness the same way). That method stamps through `markBlocksSeen` under the same `commitQuorumRulesOutRivals` bar the commit paths use. The extraction's collaborator must therefore own this as an entry point: the stamp is no longer written only by the consult exits and the commit paths inside `CoordinatorRepo`, but also by the cluster member's apply of a commit another node coordinated. It needs no clearing by local writers (a stamp only ever describes a copy a later write makes newer); the reasoning is on the method.

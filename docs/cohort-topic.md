@@ -383,7 +383,7 @@ When a registration arrives at a cohort, FRET's `RouteAndMaybeAct` lands it on o
 - **Willing** → become `primary` for this registration; assign two backups by the cohort's deterministic hash (see [Primary and backup sharding](#primary-and-backup-sharding)); return `Accepted`.
 - **Unwilling personally, but enough siblings are willing to meet the quorum** → return `UnwillingMember(candidateMembers)`. Caller retries the same coord at a named alternative member.
 
-The cohort gossips a coarse "willingness vector" (one bit per tier per member, refreshed every gossip round) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
+The cohort gossips a coarse "willingness vector" (one bit per tier per member, sent on the next gossip round whenever it changes and re-sent at least once per `T_willingness_heartbeat`) so any member can answer `UnwillingMember` vs `UnwillingCohort` without polling siblings. Stale gossip is acceptable; over-reporting unwillingness costs a temporal retry, not a flood.
 
 Because the admission quorum is counted from gossip, a member whose gossip has not arrived yet is not the same as a member that gossiped unwilling, and the check tells them apart. It is given the cohort's current members, and when the quorum is short it also reports whether it would be met if every member not yet heard from turned out willing (`awaitingMembers` on `UnwillingCohortOutcome` in `packages/db-core/src/cohort-topic/willingness.ts`): `willing + unheard ≥ quorum`, where a member that has gossiped unwilling counts as heard. A cohort whose answers are in and short declines with `UnwillingCohort` at once. A cohort that is only waiting on answers does not decline at once: the routed member asks its members to gossip now and holds the request briefly for them (§Cold-start instantiation → *Bootstrapping a cold multi-node cohort*).
 
@@ -470,7 +470,7 @@ TopicTrafficV1 {
 
 `arrivalsPerMin` deliberately combines fresh registrations and renewals into a single scalar: the seeker uses renewals as a proxy for active matchable supply, and the consumer-side formulas in [matchmaking.md §Hang-out vs. continue](matchmaking.md#hang-out-vs-continue) take the combined value. A separate split is not currently needed; if a future consumer wants fresh-only or renewal-only, the field can be split then.
 
-Each member counts only the arrivals/queries that land on it (FRET routes each registration to one member; renewals go to the primary), so a member's own count is roughly `1/k` of the cohort's flow. The rate is therefore **cohort-wide aggregated**: the responder sums its own most-recent gossiped per-topic counts with the last-gossiped counts of its siblings (exact integers; `directParticipants` comes from the replicated store, not the sum). The reply uses this gossip-derived view — never a recompute from raw counters at reply time — and so lags by at most one gossip round.
+Each member counts only the arrivals/queries that land on it (FRET routes each registration to one member; renewals go to the primary), so a member's own count is roughly `1/k` of the cohort's flow. The rate is therefore **cohort-wide aggregated**: the responder sums its own most-recent gossiped per-topic counts with the last-gossiped counts of its siblings (exact integers; `directParticipants` comes from the replicated store, not the sum). The reply uses this gossip-derived view — never a recompute from raw counters at reply time. A sibling's counts are those of the last frame it sent: a material change or a delta reaches siblings on the next round, but a change of rates alone is not a reason to send, so rates refresh at least once per `T_willingness_heartbeat` (§Cohort gossip, *Cadence*) and in steady state a sibling's rates can be up to about that old. The responder's own counts are frozen every round, sent or not, so its own share can be newer than what its siblings hold. Matchmaking's hang-out decision is the one reader that weighs the rates, and a topic that is actually getting new registrations sends every round anyway, because each admission is a delta.
 
 Wire-format note: traffic fields are sent as **exact integers**, not log-bucketed like the load barometer in §Capacity barometer. Cohort gossip is intra-cohort and tiny, and the consumer-side formulas are numeric — bucketing would buy nothing and complicate matchmaking math. The load barometer is bucketed because it is a coarse priority signal; the traffic counts feed real arithmetic.
 
@@ -486,8 +486,9 @@ A participant that receives `NoState` at tier `d` gets no traffic signal from th
 > replies; it is absent on `no_state`, `unwilling_member`, and `unwilling_cohort` (matches the
 > `RegisterReplyV1.topicTraffic` wire comment). Implemented as `attachTopicTraffic` in
 > `packages/db-core/src/cohort-topic/traffic.ts`, with the windowed exact-integer counters,
-> combined fresh+renewal arrivals, gossip-derived snapshot (lags ≤ one round, no reply-time
-> recompute), and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
+> combined fresh+renewal arrivals, gossip-derived snapshot (no reply-time recompute; a sibling's
+> rates are those of its last frame, up to about `T_willingness_heartbeat` old when only the rates moved),
+> and `cohortEpoch`-change reset alongside it. The snapshot **sums own + sibling**
 > gossiped per-topic counts (cohort-wide flow, since arrivals shard ~`1/k` across members);
 > `directParticipants` is read from the replicated store rather than summed. `childCohortCount` is a
 > **converged union** of the child cohorts this parent parents — not a max-of-siblings. The child set is
@@ -537,7 +538,7 @@ The record is replicated across all `~k` cohort members via standard FRET cohort
 
 ### TTL and renewal
 
-The participant pings `primary` every `ttl / 3` (default 30s). What it does with each reply (`TtlRenewalParticipant` in `packages/db-core/src/cohort-topic/registration/renewal.ts`):
+The participant pings `primary` every `ttl / 3` (default 30s). A primary that is the participant's own node — which happens whenever the participant is a member of the cohort it registered at, as on a two-machine group — is answered in process by that node's own engine, with no network request (`FretTopicRouter.dialMember` in `packages/db-p2p/src/cohort-topic/topic-router.ts`); the answer is the one an inbound `/register` frame gets. What it does with each reply (`TtlRenewalParticipant` in `packages/db-core/src/cohort-topic/registration/renewal.ts`):
 
 - `ok` → the primary updated `lastPing` and gossips the touch to the cohort; the participant's failure count resets.
 - `primary_moved` → a rotation moved the participant's slot; the participant adopts the named primary, backups and `cohortEpoch`, and its failure count resets.
@@ -545,6 +546,8 @@ The participant pings `primary` every `ttl / 3` (default 30s). What it does with
 - Three consecutive failures → participant promotes `backups[0]` to primary by sending a re-attach RPC. This is a renew carrying a **signed `reattach` flag** (`reattach: true`, part of the signed body so a member can trust the attestation and a stray/MITM'd ping can never silently usurp a live primary). The backup accepts when it both holds the record in its local replica *and* is a computed backup for it under the current epoch: it re-stamps `primary` to itself, gossips the new assignment, and replies `ok`. A plain ping (no `reattach`) on a backup that holds the record is never a promotion — it replies `primary_moved`.
 - All of `primary` and `backups` fail → participant re-runs the lookup from `d_max` and **adopts where it lands**: the accepted walk's primary, backups, `cohortEpoch` and tree tier, and the accepted register's correlation id, which later renews echo. A walk that is not accepted (a back-off) leaves the old assignment in place. Either way the failure count resets, so a registration that stays lost is re-walked at most once every three pings — about once per TTL. A restarted primary usually recovers at the first step, since a backup still holds the record and promotes itself; an expired or withdrawn record recovers at the re-walk, which registers again.
 - A participant holds one registration per topic: a second register for the same topic displaces the first, and **no withdraw tombstone is sent for the displaced record** — it expires by TTL at its cohort. That is deliberate. When a root-placed topic's root moves, a participant that re-registers at the new root leaves a record at the old one, and a member in both roots' groups then holds two records for one participant under one topic. A renew (and a re-attach or a withdraw tombstone) carries no tree tier, so the member resolves it by the record it holds, and of two it picks the **newer**: the later `attachedAt` (stamped by the accepting member at admission and carried unchanged through gossip), ties to the later `lastPing` (`findHolder` in `packages/db-p2p/src/cohort-topic/host.ts`). A tombstone for the displaced registration would resolve to the live one and evict it. The two stamps come from different members' clocks, so a skew larger than the time between the two registrations picks the wrong record; the live one then expires one TTL later and the participant's renewal failover registers again.
+
+**Pings to one member share a request.** A node holding many registrations sends each cycle's plain pings grouped by primary (`CohortTopicService.renewMany` in `packages/db-core/src/cohort-topic/service.ts`): the pings bound for one member go in one `RenewBatchV1` frame over `/renew-batch` (§Renew batch), up to 64 per frame, and each entry is answered and acted on exactly as the same ping sent alone. The slot is `H(participantId ‖ cohortEpoch) mod k` and the epoch is the hash of the cohort's member list, so every registration a node holds at cohorts with one member list has one primary; on a two-machine group that is every registration, which then costs no request when the primary is this node and one per tick when it is the other. A primary on a build that predates the protocol refuses the stream at negotiation; the pings are re-sent singly over `/register` in the same cycle, and that member is sent single pings for the next 10 minutes (`RENEW_BATCH_UNSUPPORTED_RECHECK_MS`) before a batch is tried again. Any other batch failure is no answer for every ping in it, as the same pings sent singly over that link would each have been. A lone ping to a member goes singly. Re-attaches and withdraw tombstones never travel in a batch: they are privileged, judged per record by the freshness gate, and rare, so they keep going singly over `/register`, and the member refuses a batch any entry of which carries either flag. Each entry is signed on its own, byte for byte the single ping, so the member's handling is one code path and any later renew replay guard can stay per entry. The service runs at most one cycle per registration at a time — a registration whose failover is still waiting on a re-walk is skipped by the next call — and does not act on the answer for a registration displaced (by a second register for its topic) or withdrawn while its ping was out, so a displaced registration never fails over.
 
 > **Why an `unknown_registration` waits for three strikes.** A lost registration is re-made about one TTL after the first `unknown_registration` (three pings; 90 s at the default TTL), not on the next ping. Failing over on the first such reply would recover two ping intervals sooner, but it has no back-off. One case answers `unknown_registration` honestly and briefly: with the minimum 10 s TTL the first ping goes out about 3.3 s after the register, before the 5 s gossip round has brought the record to a primary that did not admit it. That case, or a re-walk that is not accepted, would then re-run the register walk on every ping, which for short TTLs exceeds the per-peer register rate limit (§Anti-DoS, "Per-peer rate limits per cohort") and turns a harmless lag into rate-limit refusals. Counting strikes reuses the failover's back-off, at most one re-walk per three pings, and lets a one-off lag answer clear on the next ping. The cost is the one-TTL gap: a collection watch's periodic tail check wakes its watchers through it ([reactivity.md §The node's watch service](reactivity.md#the-nodes-watch-service)), and a matchmaking provider is absent from seeker results for it.
 
@@ -626,7 +629,7 @@ Cohort memberships are anchored in the transaction log ([transactions.md](transa
 > the FRET membership cache (`FretMembershipSource.has`) genuinely answers existence for **T2/T3**, while
 > **T0/T1** existence needs a committed-state backing distinct from the FRET cache (committed-tier
 > integrity). No coord-keyed committed-membership index exists yet (the tx-log commit certificate is
-> keyed by action, not by `coord_0`), so T0/T1 parent-ref existence fails closed today; the dedicated
+> keyed by action and collection tail, not by `coord_0`), so T0/T1 parent-ref existence fails closed today; the dedicated
 > committed backing — and the stronger "the parent's committed record names *this* child" check — is the
 > follow-on `cohort-topic-parent-ref-tx-log-content`.
 
@@ -948,11 +951,12 @@ frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-
 
 1. **Idle-but-willing willingness heartbeat.** An idle engine that is willing for at least one tier
    (`selfWillingnessBits ≠ 0`) still emits a *willingness/load-only* gossip frame (empty `topicSummaries`,
-   no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first idle
-   round after the engine is created** and thereafter at most once per `T_willingness_heartbeat`
-   (§Configuration). A record-carrying (non-idle) round already ships willingness every round and resets
-   that clock, so the throttle governs only genuinely-idle engines; an engine willing for *nothing* stays
-   silent (it has nothing to bootstrap). On its own this converges a cold cohort in about two gossip
+   no record/eviction deltas) so siblings hear that it will serve. It emits **immediately on the first
+   round after the engine is created**, again on the next round whenever its willingness or load changes,
+   and otherwise once per `T_willingness_heartbeat` (§Configuration) — the rule every engine's rounds follow
+   (§Cohort gossip, *Cadence*). An engine willing for *nothing* stays silent (it has nothing to bootstrap),
+   so an idle engine that turns unwilling announces nothing and siblings keep the willing frame they last
+   heard, while a willingness they have not heard is announced on the next round. On its own this converges a cold cohort in about two gossip
    rounds; mechanisms 3 and 4 send the same frame without waiting for a round.
 
 2. **Cold-sibling engine instantiation.** When a node receives a `/cohort-gossip` frame (e.g. the heartbeat
@@ -975,7 +979,9 @@ frame lacks and is deferred to the parent-child link work (`cohort-topic-parent-
    and the rest are declined at once. The advert is sent only by an **idle** engine (no records, nothing
    queued for the next round), because a member's contribution replaces its previous one in a sibling's
    view as a whole and a summary-less frame from an engine holding records would blank its topic summaries
-   there until its next round; a non-idle engine gossips every round anyway. An engine sends at most one
+   there until its next frame; a non-idle engine's own frames carry its willingness, sent on its next round
+   whenever it changes. The advert counts as the engine's last frame, so the round after it does not repeat
+   it (a round with topics differs from it and sends once). An engine sends at most one
    advert per gossip round interval, and when it may not send one no wait opens — which is what keeps a
    member that never answers from turning every register on the engine into a full-length hold. The wait
    is offered only where an answer can arrive: a tier-0 engine on a live-signer host, the conditions (2)
@@ -1005,8 +1011,9 @@ replicas and failover. If too few members answer inside `T_cold_quorum_wait` the
 > ([`cohort-gossip-driver.ts`](../packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts)), driven by a
 > per-`CoordEngine` heartbeat clock in `CoordEngine.gossipRound`
 > ([`host.ts`](../packages/db-p2p/src/cohort-topic/host.ts)). Cold-sibling instantiation is
-> `maybeInstantiateColdSibling` in the host's `/cohort-gossip` handler, run **before** the frame is
-> delivered (so the freshly-subscribed bus merges the very frame that woke it) and **only in live-signer
+> `maybeInstantiateColdSibling`, which the host's `/cohort-gossip` handler runs for a frame no bus subscribes
+> to, after its signature verified and **before** the frame is delivered (so the freshly-subscribed bus merges
+> the very frame that woke it), and **only in live-signer
 > mode** (the co-member gate needs keys; key-less/interim mode keeps today's drop-gossip-for-an-unknown-coord
 > behaviour, since unauthenticated engine creation would be a DoS vector). The originating cohort's
 > `treeTier` rides `CohortGossipV1` — a coord is a hash and cannot be inverted to recover its tier, and every
@@ -1303,8 +1310,8 @@ The layer does not attempt to defend against unbounded Sybil attacks at the regi
 >   — a cached `MembershipCertV1` means a cohort genuinely serves the parent); **T0/T1** consult the
 >   committed backing and the verifier **fails closed without one** (a FRET-cached cert must not vouch for
 >   committed-tier existence — committed-tier integrity). **Limitation (interim):** no coord-keyed
->   committed-membership index exists yet (the tx-log commit certificate is keyed by action, not by
->   `coord_0`), so a node wires no committed reader today and the T0/T1 existence check would fail closed for
+>   committed-membership index exists yet (the tx-log commit certificate is keyed by action and
+>   collection tail, not by `coord_0`), so a node wires no committed reader today and the T0/T1 existence check would fail closed for
 >   *every* parent. Because a brand-new root has no parent to reference, routing T0/T1 through that
 >   fail-closed verifier would make cold-root **origination** impossible
 >   (`cohort-topic-bootstrap-coldstart-origination-regression`). The host policy therefore keeps T0/T1
@@ -1417,6 +1424,7 @@ A participant verifying a threshold-signed message against an out-of-date `Membe
 
 ```
 /optimystic/cohort-topic/1.0.0/register       — Register, renew, re-attach
+/optimystic/cohort-topic/1.0.0/renew-batch    — Several plain renewal pings to one member, answered entry by entry
 /optimystic/cohort-topic/1.0.0/cohort-gossip  — Registration replication, willingness vectors, load barometers
 /optimystic/cohort-topic/1.0.0/promote        — Threshold-signed promotion / demotion notices
 /optimystic/cohort-topic/1.0.0/membership     — Membership certificates
@@ -1754,6 +1762,24 @@ interface RenewReplyV1 {
 }
 ```
 
+### Renew batch
+
+Sent over `/renew-batch`, one frame each way, by a participant with several plain pings for one member (§TTL and renewal).
+
+```
+interface RenewBatchV1 {
+  v:               1
+  renews:          RenewV1[]          // 1..64 (MAX_RENEW_BATCH_ENTRIES), each a plain ping: no reattach, no withdraw
+}
+
+interface RenewBatchReplyV1 {
+  v:               1
+  replies:         RenewReplyV1[]     // same length and order as renews
+}
+```
+
+Each entry is a complete, individually signed `RenewV1`, byte for byte what the same ping sends alone, and the member answers it as it answers that ping on `/register` (`resolveRenew` in `packages/db-p2p/src/cohort-topic/host.ts`), with one clock reading for the whole frame. `validateRenewBatchV1` refuses an empty or oversized `renews`, and an entry carrying `reattach` or `withdraw` at all, whatever its value; those stay single so the per-record freshness gate judges each one. A reply of the wrong length, or one that does not validate, is no answer for every entry. It is a protocol of its own rather than another frame shape on `/register` because a member that predates it then refuses the stream at negotiation (libp2p's `UnsupportedProtocolError`, which the router maps to `RenewBatchUnsupportedError`), a definite "older build", where an unrecognised frame on `/register` would fail in a way the dialer cannot tell from a dead link. Like `/register`, it is not behind `authorizeInboundStream`, which gates the four database protocols.
+
 ### Child link
 
 Sent by a freshly cold-started tier-`d` (`d ≥ 1`) forwarder to its tier-`(d−1)` parent cohort, routed the
@@ -1906,31 +1932,63 @@ rotated-in member builds a fresh engine with an **empty** child registry — wou
 `T_willingness_heartbeat` (`willingnessHeartbeatMs`, default 30 s — the same knob as the idle willingness
 heartbeat; lengthening it lengthens child-set convergence equally). The re-advertisement is a no-op on a
 member that already holds the link, and cannot resurrect a released child: its `effectiveAt` is older than
-the unlink's, so the tombstone's high-water drops it. A re-advertising round is deliberately **not** idle —
-it builds and broadcasts a frame even for an engine that would otherwise emit nothing, since the frame is
-the carrier. Only *links* are re-advertised: an **unlink** that a member missed is never re-sent (absence is
+the unlink's, so the tombstone's high-water drops it. The re-advertised links are deltas, so a
+re-advertising round always sends — it builds and broadcasts a frame even for an engine that would otherwise
+emit nothing, since the frame is the carrier. Only *links* are re-advertised: an **unlink** that a member missed is never re-sent (absence is
 not advertised), so such a member over-counts until another delta for that child arrives — conservative in
 both consumers (the demotion gate stays shut; matchmaking sweeps a tier that is no longer promoted).
 
 **Per-coord routing.** A node serves many cohorts at once (one per coord FRET routes to it — see
-§FRET integration), and a delivered `cohort-gossip` frame is fanned to every coord engine's bus on the
-node. Each bus merges only the gossip whose `coord` names its own cohort: `cohortEpoch` alone cannot
-isolate two cohorts because they can share a member set (and therefore an epoch). In the live-signing
-path the receiver also drops any frame whose `fromMember` peer-key signature does not verify, or whose
-`fromMember` is not a member of the cohort around that coord — so willingness/load cannot be spoofed and
-forged records cannot replicate.
+§FRET integration), and one inbound `cohort-gossip` frame belongs to only one of them, the cohort its
+`coord` names: `cohortEpoch` alone cannot isolate two cohorts because they can share a member set (and
+therefore an epoch). The host's handler decodes each frame once and hands it only to the buses subscribed
+under that coord — usually one coord engine's bus, plus the node-level participant bus when the coord is the
+node's own ring position. A frame for a coord no bus subscribes to is dropped before any signature work,
+unless it can instantiate a cold sibling (§Cold-start instantiation). In the live-signing path the frame's
+`fromMember` peer-key signature is checked once, before any bus sees it, with the platform's own verifier
+(`verifyPeerSigAsync` in `packages/db-p2p/src/cohort-topic/peer-sig.ts`: native in Node, WebCrypto Ed25519
+where the runtime provides it), and a frame whose signature does not verify is dropped. Each bus then drops a
+frame whose `fromMember` is not a member of its cohort — so willingness/load cannot be spoofed and forged
+records cannot replicate. Two frames can finish verifying in the opposite order to their arrival; every merge
+above is ordered by its own key (`lastPing`, `timestamp`, `effectiveAt`), so the order does not matter.
 
 **Cadence (host driver).** The cohort-topic host owns one repeating timer (`gossipIntervalMs`, default
 5 s — there is no dedicated `gossip_round` constant; it is a derived sub-round of `ping_interval`). On
-each tick, for every live coord engine, it TTL-sweeps stale records (gossiping each eviction), drains
-the registration-record deltas the admission `onAdmit` and renewal `touch`/`evicted` hooks accumulated
-since the last round into one `records`/`evicted` batch, broadcasts the signed `CohortGossipV1`, refreshes
-the membership certificate (`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`,
-self-gated). Idle engines (no resident topics, no deltas) build no frame and skip the broadcast. A freshly
-*admitted* record is enqueued at admission time (the `onAdmit` hook), so it replicates on the next gossip
-round without waiting for the participant's first renewal touch — closing the durability window between
-`accept` and that first touch. The driver lives in the host
+each tick, for every live coord engine, it TTL-sweeps stale records (queueing each eviction as a delta),
+freezes each resident topic's traffic summary, refreshes the membership certificate
+(`T_membership_refresh`, self-gated), and runs the demotion check (`T_demote`, self-gated). The engine's
+signed `CohortGossipV1` goes out only when the round is **due**, which is when any one of these holds:
+
+- **It carries deltas** — the registration-record deltas the admission `onAdmit` and renewal
+  `touch`/`evicted` hooks queued since the last frame, drained into one `records`/`evicted` batch, or child
+  link/unlink deltas, the child-set re-advertisement included. So an admission, a renewal, a re-attach and
+  an eviction each go out on the next round.
+- **Its frame differs materially from the last frame this engine sent.** Material is everything in the frame
+  except `timestamp`, `signature` and each topic summary's `arrivalsPerMin` and `queriesPerMin` (the deltas
+  aside, covered above): `cohortEpoch`, `treeTier`, `willingnessBits`, `loadBuckets`, `windowSeconds`,
+  `rootPlaced`, and the set of topic summaries, compared by `topicId`. A first frame always differs.
+- **`T_willingness_heartbeat` has passed** since that last frame.
+
+Otherwise the round sends nothing and leaves the queue as it was. The rule is `isGossipRoundDue`, over the
+key `gossipMaterialKey` reduces a frame to, in
+`packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts`; the out-of-band willingness advert
+(§Cold-start instantiation) counts as a frame sent. An idle engine (no resident topics, no deltas) has a
+frame only while it is willing for some tier, so it sends on a change of willingness and on the heartbeat;
+an engine holding records sends on the rounds after the renewals it serves and on the heartbeat, rather than
+on every round. A freshly *admitted* record is enqueued at admission time (the `onAdmit` hook), so it
+replicates on the next gossip round without waiting for the participant's first renewal touch — closing the
+durability window between `accept` and that first touch. The driver lives in the host
 ([`packages/db-p2p/src/cohort-topic`](../packages/db-p2p/src/cohort-topic)); db-core has no timer port.
+
+Sending less often costs no liveness, because nothing judges a member by how recently its gossip arrived.
+A sibling's view keeps each member's newest contribution with no expiry (`CohortView` in
+`packages/db-core/src/cohort-topic/gossip/view.ts`), and the willingness and traffic layers read it with no
+age check. A member that has gone silent is noticed through FRET membership, which reshapes the cohort, and
+through renewal failover, which promotes a backup after three failed pings (§TTL and renewal); neither reads
+the gossip cadence. What does age is the advisory traffic rates (§Topic traffic signal). A renewal touch is
+sent at once rather than held to batch with others, since a sibling's replica is evicted at
+`lastPing + ttl` by its own sweep, and a touch not yet gossiped when the primary dies leaves the backup one
+ping closer to that eviction.
 
 ### Membership certificate
 
@@ -1970,7 +2028,7 @@ interface MembershipCertV1 {
 | `ttl` | 90 s | Default registration TTL |
 | `ping_interval` | 30 s | Participant ping cadence (`ttl / 3`) |
 | `T_membership_refresh` | 5 min | Default refresh interval for membership certs |
-| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, shared by **two** periodic re-advertisements. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): first idle round emits immediately; a record-carrying round resets the clock. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster, but re-broadcasts more often — for every idle willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round re-advertises. |
+| `T_willingness_heartbeat` | 30 s | Slow re-broadcast interval, with **three** uses. (1) An idle-but-willing engine's willingness heartbeat (§Cold-start instantiation): its first round emits immediately. (2) A parent engine's child-set resync (§Cohort gossip): the linked child set is re-advertised at most once per interval, which bounds how long a rotated-in parent member reads `childCohortCount == 0`. (3) The steady-state refresh of any engine whose frame has not changed (§Cohort gossip, *Cadence*): a round sends on a delta or a material change, and otherwise only once this interval has passed since the engine's last frame, so it also bounds how old a sibling's advisory traffic rates get (§Topic traffic signal); (1) is this rule for an engine with no topics. Cost/latency tradeoff: shorter converges a cold cohort *and* a rotated-in parent faster and keeps siblings' rates fresher, but re-broadcasts more often — for every willing cohort and for every parent with children. Setting it longer than `gossip_round` is required for the throttle to bite at all; shorter than a round and every round sends. |
 | `T_cold_quorum_wait` | 2 s | How long a tier-0 cohort member holds a register whose willingness quorum is short only for want of members it has not heard from, while it asks them to gossip now (§Cold-start instantiation). Host option `coldQuorumWaitMs`; `0` disables the wait and such a register is declined at once. It must stay well under the 5 s a participant waits for the reply (p2p-fret's `RPC_TIMEOUT_MS`, on a FRET-routed register and on a direct root-group dial alike), with room for the hops in front of it. |
 | `d_max_cap` | 60 | Hard cap on walk-toward-root start tier |
 | `confidence_min` | 0.3 | Below this `n_est` confidence, cap `d_max` at ⌊d_max_cap/2⌋ (upper bound) |

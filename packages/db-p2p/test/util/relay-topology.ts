@@ -258,6 +258,8 @@ export interface SpawnCircuitOnlyPeerOpts {
 	clusterSize?: number;
 	/** Passed through as `NodeOptions.announceAddrs`; a relay-only node rejects it at start (see `assertRelayAddrsAdvertisable`). */
 	announceAddrs?: string[];
+	/** Passed through as `NodeOptions.holePunching`. Unset leaves this relay-only node without hole punching. */
+	holePunching?: boolean;
 }
 
 /**
@@ -282,6 +284,7 @@ export async function spawnCircuitOnlyPeer(
 		transports,
 		listenAddrs: [`${relayAddr.toString()}/p2p-circuit`],
 		...(opts.announceAddrs !== undefined ? { announceAddrs: opts.announceAddrs } : {}),
+		...(opts.holePunching !== undefined ? { holePunching: opts.holePunching } : {}),
 		...clusterScaffold(opts.clusterSize)
 	});
 }

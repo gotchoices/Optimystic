@@ -7,21 +7,30 @@
 
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
+import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
-import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData } from './types.js';
+import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
+import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow } from './optimystic-adapter/write-description.js';
+import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
-import { KeyRange } from '@optimystic/db-core';
-import type { ITransactor, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
-import { SchemaManager, columnSetKey, mergeIndexLists, uniqueConstraintKey, uniqueEnforcementTreeName } from './schema/schema-manager.js';
+import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
+import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
+import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
+import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
-import { defaultCollectionUri, type QualifiedTableName } from './schema/table-identity.js';
+import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
+import { withTagsOf } from './schema/tag-overlay.js';
 import { PhysicalType } from '@quereus/quereus';
-import { IndexManager, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { IndexPredicate } from './schema/index-predicate.js';
+import { splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger, revisionToken } from './logger.js';
@@ -31,6 +40,19 @@ const log = createLogger('module');
 /** Shared empty guard set — returned by {@link OptimysticVirtualTable.guardedUniqueIndexes}
  *  for the common no-secondary-UNIQUE table so the staging paths allocate nothing. */
 const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
+
+/** A transaction state carrying nothing but `transactor`, for opening a collection on a transactor the
+ *  factory should reuse (`CollectionFactory.createOrGetCollection`) outside any SQL transaction. */
+function transactorOnlyState(transactor: ITransactor): TransactionState {
+  return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: emptyWriteFacts() };
+}
+
+/** A UNIQUE constraint that binds a row, with the index tree enforcing it
+ *  ({@link OptimysticVirtualTable.guardedUniqueConstraints}). */
+type GuardedUniqueConstraint = {
+  readonly constraint: UniqueConstraintSchema;
+  readonly enforcing: { readonly descriptor: StoredIndexSchema; readonly tree: Tree<string, IndexEntry> };
+};
 
 /**
  * Every catch arm below that surfaces a caught error to the SQL layer funnels through
@@ -167,15 +189,16 @@ type StoredRowEntry = [string, EncodedRow];
  * source holds no usable entry there. Shared by the two seek paths — the primary-key point
  * lookup and the secondary-index scan — so "fetch the row this key names" has one meaning
  * and one set of skip conditions on both. Never refreshes the source; the caller resolved it.
+ * A point read (`get`), which reads again rather than fail when the tree changes beneath it —
+ * a refresh or an offline drain step on the same collection — where a `find` whose path a change
+ * invalidated used to drop the row from the result without a word.
  */
 async function readRowAt(
   read: TreeReadView<string, RowData>,
   rowCodec: RowCodec,
   primaryKey: string,
 ): Promise<Row | undefined> {
-  const path = await read.find(primaryKey);
-  if (!read.isValid(path)) return undefined;
-  const entry = read.at(path) as StoredRowEntry | undefined;
+  const entry = await read.get(primaryKey) as StoredRowEntry | undefined;
   if (!entry || entry.length < 2) return undefined;
   return rowCodec.decodeRow(entry[1]);
 }
@@ -204,8 +227,34 @@ interface PreWriteImage {
  * implies, or a deleted row resurrected). See docs/internals.md, "Conflict replay
  * re-makes the uniqueness decision (entry guards)".
  */
-function unchanged(entry: StoredRowEntry): TreeEntryGuard<string, StoredRowEntry> {
+function unchanged(entry: StoredRowEntry): TreeUnchangedGuard<StoredRowEntry> {
   return { kind: 'unchanged', expected: entry };
+}
+
+/**
+ * {@link unchanged}, accepting also that the entry at the key already equals the element's own
+ * entry — a rival made exactly this write, which the replay then skips as already applied rather
+ * than refusing (`unchangedOrEqual` in `TreeAlreadyAppliedGuard`; docs/offline-sync.md §Guards
+ * that make idempotent writes assured). Sound only for a statement whose re-application to its
+ * own result changes nothing, which is what {@link OptimysticVirtualTable.rewriteGuard} checks
+ * before staging it. The rows the replay reports as changed were changed by the rival; the queue
+ * reports that as `effect: 'already-applied'` on the transaction's `committed` status.
+ */
+function unchangedOrEqual(entry: StoredRowEntry): Extract<TreeAlreadyAppliedGuard<StoredRowEntry>, { kind: 'unchangedOrEqual' }> {
+  return { kind: 'unchangedOrEqual', expected: entry };
+}
+
+/**
+ * {@link unchanged} for a delete, accepting also that the key is already absent — a rival deleted
+ * the row first, and the replay skips the delete as already applied rather than refusing it
+ * (`unchangedOrAbsent` in `TreeAlreadyAppliedGuard`). A delete's intent for the row is that it be
+ * gone, whatever selected it, so every main-table delete carries this: the statement's DELETE and
+ * each secondary-UNIQUE eviction's. A rival that CHANGED the row still refuses, as under
+ * {@link unchanged}, since the index deletes staged beside the main-table delete were computed
+ * from the image it read. The index deletes of an already-gone row find nothing and write nothing.
+ */
+function unchangedOrAbsent(entry: StoredRowEntry): Extract<TreeAlreadyAppliedGuard<StoredRowEntry>, { kind: 'unchangedOrAbsent' }> {
+  return { kind: 'unchangedOrAbsent', expected: entry };
 }
 
 /** One existing row a secondary UNIQUE constraint collides with, keyed by its
@@ -260,6 +309,15 @@ function unmaintainedIndexMessage(tableName: string, indexName: string, detail: 
 }
 
 /**
+ * Whether a declared index holds an entry for every row: true unless it is a partial index
+ * (`create index … where …`), which holds only the rows its predicate admits. Only an index that
+ * holds every row can enforce a full UNIQUE constraint over its columns.
+ */
+function holdsEveryRow(index: StoredIndexSchema): boolean {
+  return index.predicate === undefined;
+}
+
+/**
  * Hands one populated index tree to the open `APPLY SCHEMA` batch instead of flushing it
  * on the spot; the batch lands it at `endSchemaBatch`, before the catalog commit that lists
  * its index. Supplied by `OptimysticModule.createIndex` only while a batch is open — its
@@ -270,6 +328,88 @@ type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => vo
 /** Quereus's CHECK shape and its ADD CONSTRAINT AST node, reached through exported types (neither is exported by name). */
 type RowConstraintSchema = TableSchema['checkConstraints'][number];
 type AddedConstraint = Extract<SchemaChangeInfo, { type: 'addConstraint' }>['constraint'];
+type AddColumnChange = Extract<SchemaChangeInfo, { type: 'addColumn' }>;
+type ColumnSchema = TableSchema['columns'][number];
+
+/**
+ * How a catalog-only ALTER moves the table's columns: one appended, or the one at `position`
+ * removed. A table instance rebuilds what it derived from its column list after either
+ * ({@link OptimysticVirtualTable.applyCatalogOnlyEdit}).
+ */
+type ColumnLayoutChange = { readonly kind: 'append' } | { readonly kind: 'remove'; readonly position: number };
+
+/**
+ * The column constraints a catalog-only ADD COLUMN accepts — none that would need a value written
+ * into the rows already stored (NOT NULL, DEFAULT, GENERATED), a key (PRIMARY KEY, UNIQUE), or the
+ * stored rows checked (CHECK, FOREIGN KEY). An inline CHECK, UNIQUE or FOREIGN KEY would also be
+ * installed by Quereus through a separate `addConstraint` call after the column, so refusing one
+ * here is what keeps a later failure from leaving the column half-installed.
+ */
+const CATALOG_ONLY_COLUMN_CONSTRAINTS: ReadonlySet<string> = new Set(['null', 'notNull', 'collate']);
+
+/**
+ * One catalog-only ALTER as `OptimysticModule.alterCatalogOnly` carries it out: the record object
+ * it changes (`kind` and `name`, which key the open batch's adopted changes), that object as this
+ * machine's engine holds it before and after the change (undefined: absent; record form), how the
+ * record is judged, and the edit — made to the record when the change is this machine's to write,
+ * and to the engine's catalog entry and the table instance's own schema whatever the record held.
+ */
+interface CatalogOnlyAlter {
+  /** What the statement does, for the missing-record error: `add CHECK constraint`. */
+  readonly operation: string;
+  readonly kind: CatalogObjectKind;
+  readonly name: string;
+  readonly before: CatalogObject | undefined;
+  readonly after: CatalogObject | undefined;
+  classify(record: StoredTableSchema): CatalogOnlyVerdict;
+  editRecord(record: StoredTableSchema): StoredTableSchema;
+  editSchema(schema: TableSchema): TableSchema;
+  /** How the change moves the table's columns; absent when it moves none. */
+  readonly layout?: ColumnLayoutChange;
+}
+
+/** `schema` without the CHECK named `name`, compared case-insensitively as Quereus compares constraint names. */
+function withoutCheck(schema: TableSchema, name: string | undefined): TableSchema {
+  return { ...schema, checkConstraints: Object.freeze(withoutNamed(schema.checkConstraints, name)) };
+}
+
+/** `schema` with `check` added, replacing a CHECK of that name — the rule {@link withCheckConstraint} applies to the record. */
+function withCheck(schema: TableSchema, check: RowConstraintSchema): TableSchema {
+  return { ...schema, checkConstraints: Object.freeze([...withoutCheck(schema, check.name).checkConstraints, check]) };
+}
+
+/** `schema` with `column` appended — the rule {@link withColumn} applies to the record. */
+function withColumnAppended(schema: TableSchema, column: ColumnSchema): TableSchema {
+  const columns = Object.freeze([...schema.columns, column]);
+  return { ...schema, columns, columnIndexMap: buildColumnIndexMap(columns) };
+}
+
+/**
+ * `schema` without the column at `position`, every positional field renumbered over the slot —
+ * the rule {@link withoutColumn} applies to the record. Quereus's own `shiftSchemaIndicesForDrop`
+ * renumbers the key, indexes, UNIQUE constraints and FOREIGN KEYs; nothing it would remove can be
+ * present, since a column any of them covers is refused first. The generated-column bookkeeping is
+ * renumbered here as well: Quereus recomputes it for the engine's catalog entry after the module
+ * returns, but a table instance keeps the schema this produces.
+ */
+function withoutColumnAt(schema: TableSchema, position: number): TableSchema {
+  const shifted = shiftSchemaIndicesForDrop(schema, position);
+  const reposition = positionAfterRemoving(position);
+  return {
+    ...schema,
+    columns: shifted.columns,
+    columnIndexMap: buildColumnIndexMap(shifted.columns),
+    primaryKeyDefinition: shifted.primaryKeyDefinition,
+    indexes: schema.indexes === undefined ? undefined : shifted.indexes,
+    uniqueConstraints: shifted.uniqueConstraints,
+    foreignKeys: shifted.foreignKeys,
+    generatedColumnDependencies: schema.generatedColumnDependencies
+      ? new Map([...schema.generatedColumnDependencies].map(([generated, dependencies]) =>
+        [reposition(generated), dependencies.map(reposition)]))
+      : undefined,
+    generatedColumnTopoOrder: schema.generatedColumnTopoOrder?.map(reposition),
+  };
+}
 
 /**
  * Quereus's schema-only RENAME COLUMN, reproduced unchanged — the fallback its ALTER TABLE
@@ -425,6 +565,17 @@ function describePrimaryKey(schema: Pick<StoredTableSchema, 'columns' | 'primary
   return `(${parts.join(', ')})`;
 }
 
+/**
+ * What the stored rows of a table declared by `schema` are encoded and keyed by: its column names and
+ * types in order, and its primary key ({@link describePrimaryKey}). Two declarations with the same
+ * shape read and write the same rows; tags, constraints and indexes are not part of it.
+ */
+function storedRowShape(schema: TableSchema): string {
+  const columns = schema.columns.map(columnSchemaToStored);
+  const columnList = columns.map(col => `${col.name.toLowerCase()} ${col.affinity}`).join(', ');
+  return `(${columnList}) keyed ${describePrimaryKey({ columns, primaryKeyDefinition: [...schema.primaryKeyDefinition] }).toLowerCase()}`;
+}
+
 /** The table tag that opts a table into network change notification (README § Reactive Watching). */
 const NETWORK_WATCH_TAG = 'optimystic.network_watch';
 
@@ -435,6 +586,41 @@ const NETWORK_WATCH_TAG = 'optimystic.network_watch';
  */
 function wantsNetworkWatch(tags: Readonly<Record<string, SqlValue>> | undefined): boolean {
   return tags?.[NETWORK_WATCH_TAG] === true;
+}
+
+/** The table tag that chooses which acknowledgement a transaction writing the table may get in
+ * offline mode (docs/offline-sync.md §Per-table policy): `'queue'`, the default, or `'network'`. */
+const OFFLINE_POLICY_TAG = 'optimystic.offline';
+
+/**
+ * The offline policy a table's tags choose, and whether the tag's value named one. An absent tag is
+ * `'queue'`; so is any value other than `'queue'` and `'network'`, which cannot be refused because
+ * Quereus applies a tag to its own catalog before the module hears of it, and which the vtab logs
+ * instead ({@link OptimysticVirtualTable.followSchemaTags}).
+ */
+function offlinePolicyTag(tags: Readonly<Record<string, SqlValue>> | undefined): { policy: OfflineTablePolicy; recognised: boolean } {
+  const value = tags?.[OFFLINE_POLICY_TAG];
+  if (value === 'network') return { policy: 'network', recognised: true };
+  return { policy: 'queue', recognised: value === undefined || value === 'queue' };
+}
+
+/** The column tag that declares the column's values generated unique per write by the application,
+ * so an offline transaction's check on them cannot be refused by another writer (docs/offline-sync.md
+ * §Declared hints). */
+const FRESH_TAG = 'optimystic.fresh';
+
+/** The table tag that declares only one machine writes the table's rows (docs/offline-sync.md §Declared hints). */
+const SINGLE_WRITER_TAG = 'optimystic.single_writer';
+
+/** The table tag that declares the table's primary key a deterministic function of the row's other
+ * columns (a blob store keyed by content hash), so two machines inserting the same content insert the
+ * same row and a plain `insert` of an equal row is the same write made twice (docs/offline-sync.md
+ * §Declared hints). Read `=== true` at staging time, as {@link SINGLE_WRITER_TAG} is read. */
+const CONTENT_KEY_TAG = 'optimystic.content_key';
+
+/** Whether `column` is tagged fresh — read with `=== true`, as {@link wantsNetworkWatch} reads its tag. */
+function freshTagged(column: { readonly tags?: Readonly<Record<string, SqlValue>> } | undefined): boolean {
+  return column?.tags?.[FRESH_TAG] === true;
 }
 
 /**
@@ -489,7 +675,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   private changeSubscribed = false;
   /**
    * Whether the table's tags opt it into network change notification. Taken from the declaration,
-   * then kept current by the module on every `table_modified` of this table ({@link followTags}).
+   * then kept current by the module on every `table_modified` of this table ({@link followSchemaTags}).
    */
   private networkWatchTagged: boolean;
   /** Whether the table is in the span it watches over: from full initialization until DROP TABLE. */
@@ -508,6 +694,26 @@ export class OptimysticVirtualTable extends VirtualTable {
   private networkWatchSteps: Promise<void> = Promise.resolve();
   /** The "tagged, but no watch service" warning was logged; it is logged once per table. */
   private networkWatchUnavailableLogged = false;
+  /**
+   * The table's `optimystic.offline` policy, taken from the declaration and kept current on every
+   * `table_modified` ({@link followSchemaTags}), and published to the offline-mode controller
+   * ({@link publishOfflinePolicy}), which the bridge asks at commit.
+   */
+  private offlinePolicy: OfflineTablePolicy;
+  /** A tag value that names no policy was logged; it is logged once per table. */
+  private unknownOfflinePolicyLogged = false;
+  /** What the offline-mode controller asks to judge a transaction's checks on this table's trees,
+   * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
+  private readonly outlookSource: TableOutlookSource = {
+    describe: collectionId => this.describeCollection(collectionId),
+    mainTree: () => this.mainTreeKeys(),
+  };
+  /**
+   * Live reads of this table are being served from this machine's own view because the cohort cannot
+   * be reached ({@link refreshLive}): set by the first such read, which logs it, and cleared by the
+   * next refresh that reaches the cohort, so each episode is logged once.
+   */
+  private readsServedLocally = false;
   public tableSchema: TableSchema; // Changed from private to public to match base class
 
   constructor(
@@ -525,6 +731,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.tableSchema = tableSchema;
     this.declaredColumns = tableSchema.columns.length > 0;
     this.networkWatchTagged = wantsNetworkWatch(tableSchema.tags);
+    this.offlinePolicy = this.readOfflinePolicy(tableSchema.tags);
     this.options = options;
     this.collectionFactory = collectionFactory;
     this.txnBridge = txnBridge;
@@ -532,6 +739,13 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     // Enable statement capture for replication/transaction logging
     this.wantStatements = true;
+    // Every update() of the statement's own write carries its description (UpdateArgs.writeScope), from
+    // which the arms record which staged elements came from a fresh source (recordWriteFacts) for the
+    // offline outlook (docs/offline-sync.md §Judging each guard).
+    // NOTE: Quereus analyzes a write site once per plan and binds its parameters once per execution; a
+    // plan built by `db.exec` of a new string is analyzed each time. If the analysis ever shows in a
+    // profile, gate this on the offline controller having been entered, or on a plugin option.
+    this.wantWriteScope = true;
   }
 
   /**
@@ -672,6 +886,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       // OptimysticModule), but it should not outlive the open it describes.
       this.setErrorMessage(undefined);
       const txnState = readOnly ? null : this.txnBridge.getCurrentTransaction();
+      // Published before the first network read, since neither the policy nor the gate depends on
+      // one: a table whose initialization fails because its cohort cannot be reached — one a
+      // journaled offline transaction is deferred on — still has its gate's wakes reach the
+      // controller, which retries the restore from them.
+      if (!readOnly) this.publishOfflinePolicy();
       // NOTE: create-on-missing is intentional here, and stays. A table registered in the
       // schema catalog but never written to has NO committed header block — the header is
       // only committed on the first write — so "absent header" and "empty table" are
@@ -681,10 +900,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       //
       // Built as a LOCAL, and published with the codec and index manager below only
       // once every await has succeeded — see the note at that publish point.
-      const collection = await this.collectionFactory.createOrGetCollection(
-        this.options,
-        txnState || undefined
-      );
+      //
+      // Opened together with the catalog read: neither reads the other's result, and each
+      // waits on its own network round trips.
+      const [collection, persistedSchema] = await Promise.all([
+        this.collectionFactory.createOrGetCollection(this.options, txnState || undefined),
+        this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor),
+      ]);
 
       // Resolve which schema to honour as the table's effective shape:
       //   - xCreate (DDL provided columns): keep the local DDL schema and
@@ -700,7 +922,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       // `this.tableSchema.columns.length` — the load arm below populates that list, so
       // reading it here would send a re-run (a retry after a failed attempt, or the
       // provisional→full upgrade) down the DDL-wins arm instead.
-      const persistedSchema = await this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor);
       let storedSchema: StoredTableSchema;
 
       if (this.declaredColumns) {
@@ -801,7 +1022,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
-          ...this.schemaManager.storedToColumnSchema(col),
+          ...storedToColumnSchema(col),
           affinity: col.affinity as any,
           index,
         }));
@@ -836,18 +1057,13 @@ export class OptimysticVirtualTable extends VirtualTable {
         (indexName, transactor) => this.openIndexTree(indexName, transactor)
       );
 
-      await indexManager.initialize(txnState?.transactor);
-
       // Give every point-enforceable secondary UNIQUE constraint a backing index tree
       // so probeUniqueConstraint can probe it instead of full-scanning the table per
-      // DML row (an O(N) scan per row -> O(log n) point probe). Must run BEFORE
-      // registerCollections so the synthesized trees are present in getIndexTrees()
-      // when the bridge snapshots this table's collections.
+      // DML row (an O(N) scan per row -> O(log n) point probe). Opened with the declared
+      // index trees, BEFORE registerCollections, so the synthesized trees are present in
+      // getIndexTrees() when the bridge snapshots this table's collections.
       const uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
-      await indexManager.setUniqueEnforcementIndexes(
-        uniqueEnforcementIndexes,
-        txnState?.transactor,
-      );
+      await indexManager.initialize(txnState?.transactor, uniqueEnforcementIndexes);
 
       // Publish the rebuilt state in ONE synchronous step, after the last await.
       // doInitialize runs more than once for a table — the upgrade after a
@@ -878,17 +1094,19 @@ export class OptimysticVirtualTable extends VirtualTable {
       // registerCollections). Must happen before any DML so the coordinator
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
+      // A journaled offline transaction deferred because this table could not be reached is put back
+      // now that it can (docs/offline-sync.md §Restore after a restart); scheduled, never awaited here.
+      this.txnBridge.getOfflineMode()?.tableReadable(this.qualifiedTable);
 
-      // NOTE: this is one of two paths on which doInitialize runs TWICE for a table —
-      // the upgrade after a provisional pass, and a retry after a failed attempt (see
+      // This is one of two paths on which doInitialize runs TWICE for a table — the
+      // upgrade after a provisional pass, and a retry after a failed attempt (see
       // initialize()) — so it replaces `rowCodec`/`indexManager` while a committed scan
-      // started off the provisional state may still be iterating (scans re-read both
-      // fields per row). A rerun that FAILS can no longer be seen half-applied (the
-      // publish above is one synchronous step), but a rerun that SUCCEEDS still swaps
-      // the fields under such a scan. Harmless while both passes resolve the same
-      // schema, which they do unless DDL changed the table in between; if concurrent
-      // DDL ever becomes real here, a scan must capture its codec and index manager as
-      // locals alongside its pinned views.
+      // started off the provisional state may still be iterating. A rerun that FAILS
+      // cannot be seen half-applied (the publish above is one synchronous step), and one
+      // that SUCCEEDS swaps the fields without reaching a running scan: every scan takes
+      // its codec and index manager once, at its start (runQuery), alongside its pinned
+      // views — which a catalog-only ADD or DROP COLUMN needs too, since it replaces both
+      // under a committed read the same way (republishColumnLayout).
       this.isProvisionallyInitialized = false;
       this.isInitialized = true;
 
@@ -1047,7 +1265,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Scope decisions:
    *   - Only the MAIN-table collection is watched. Index sub-collections
    *     (`<uri>/index/<name>`) mutate under the same actionId but carry their
-   *     own collection id; whole-table invalidation re-queries them anyway.
+   *     own collection id; whole-table invalidation re-queries them anyway. The
+   *     re-query reads the indexes too, so the storage layer holds the table's
+   *     event on a node until every other collection of the same action that is
+   *     pending there has landed (`StorageRepo.emitCollectionChanges`); a wake
+   *     therefore sees the table and its indexes together, possibly later than the
+   *     table's own commit applied.
    *   - The plugin-global schema tree (`tree://optimystic/schema`) is skipped —
    *     schema writes are not data-watch events.
    *
@@ -1097,22 +1320,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * notifyExternalChange).
    */
   private handleCollectionChange(): void {
-    try {
-      const result = this.db.notifyExternalChange(this.tableName, this.schemaName);
-      if (result && typeof (result as Promise<void>).catch === 'function') {
-        (result as Promise<void>).catch((error: unknown) => {
-          log(
-            `WARN: notifyExternalChange failed for '${this.tableName}': ` +
-            `${error instanceof Error ? error.message : String(error)}`
-          );
-        });
-      }
-    } catch (error) {
+    announceExternalChange(this.db, this.qualifiedTable, (error: unknown) => {
       log(
-        `WARN: notifyExternalChange threw for '${this.tableName}': ` +
+        `WARN: notifyExternalChange failed for '${this.tableName}': ` +
         `${error instanceof Error ? error.message : String(error)}`
       );
-    }
+    });
   }
 
   /**
@@ -1144,15 +1357,144 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * The module's hook for a `table_modified` of this table. Quereus applies a tag
-   * change (`alter table … set tags`, and the same statement `apply schema` emits
-   * for a tag-only change) to its own catalog without calling the module, so this
-   * is how the table learns of it: start or stop the network watch to match the
-   * new tags. Idempotent. A table not yet initialized only records the tags; its
-   * initialization opens the watch.
+   * change (`alter … set|add|drop tags` on the table, a column, a named constraint or
+   * an index, and the same statements `apply schema` emits for a tag-only change) to
+   * its own catalog without calling the module, so this is how the table learns of it.
+   * The new schema's tags are copied onto this instance's own `tableSchema` — only the
+   * tags, since `tableSchema` differs from the engine's object on purpose (UNIQUE
+   * constraints folded in from the record, indexes withheld after a failed batch
+   * commit) — so a re-initialize that rewrites the record from `tableSchema` writes the
+   * new tags rather than the old ones. Then the network watch is started or stopped to
+   * match, and the offline policy is published again — a transaction already queued keeps the
+   * acknowledgement it got. Idempotent. A table not yet initialized only records the tags; its
+   * initialization opens the watch. Saving the tags to the catalog record is the
+   * module's job, not this instance's: a hydrated table may have no instance at all.
    */
-  followTags(tags: Readonly<Record<string, SqlValue>> | undefined): void {
-    this.networkWatchTagged = wantsNetworkWatch(tags);
+  followSchemaTags(schema: TableSchema): void {
+    this.tableSchema = withTagsOf(this.tableSchema, schema);
+    this.networkWatchTagged = wantsNetworkWatch(this.tableSchema.tags);
     this.reconcileNetworkWatch();
+    this.offlinePolicy = this.readOfflinePolicy(this.tableSchema.tags);
+    this.publishOfflinePolicy();
+  }
+
+  /** The policy `tags` choose ({@link offlinePolicyTag}), logging once per table a value that names
+   * none. */
+  private readOfflinePolicy(tags: Readonly<Record<string, SqlValue>> | undefined): OfflineTablePolicy {
+    const { policy, recognised } = offlinePolicyTag(tags);
+    if (!recognised && !this.unknownOfflinePolicyLogged) {
+      this.unknownOfflinePolicyLogged = true;
+      log('offline:unknown-policy-tag table=%s value=%o: %s takes \'queue\' or \'network\'; read as \'queue\'',
+        this.tableName, tags?.[OFFLINE_POLICY_TAG], OFFLINE_POLICY_TAG);
+    }
+    return policy;
+  }
+
+  /** Tell the offline-mode controller this table's policy, which decides the acknowledgement of a
+   * transaction that writes it and whether a live read may be served locally, and the reachability
+   * gate of its transactor, which the queue and those reads ask; a bridge built bare has no
+   * controller to tell. */
+  private publishOfflinePolicy(): void {
+    this.txnBridge.getOfflineMode()?.setTablePolicy(
+      this.qualifiedTable, this.offlinePolicy, this.collectionFactory.getCohortReachability(this.options), this.outlookSource);
+  }
+
+  /**
+   * Which of this table's trees `collectionId` is (docs/offline-sync.md §Judging each guard): the main
+   * tree, an index tree that enforces a UNIQUE constraint, or another index tree; `undefined` for none
+   * of them, or before the table is initialized. Read from the live schema, codec and indexes, so a
+   * tag changed, or an index created or dropped, since the table published this needs no
+   * re-publication.
+   */
+  private describeCollection(collectionId: CollectionId): TableCollectionDescription | undefined {
+    const rowCodec = this.rowCodec;
+    if (!this.collection || !rowCodec) return undefined;
+    const table = qualifiedTableName(this.qualifiedTable);
+    if (this.collection.getCollection().id === collectionId) return this.describeMainTree(table, rowCodec);
+    const unique = this.describeUniqueIndex(collectionId, table, rowCodec);
+    if (unique) return unique;
+    const indexed = this.indexManager?.getIndexTrees().some(tree => tree.getCollection().id === collectionId) ?? false;
+    return indexed ? { kind: 'index', table } : undefined;
+  }
+
+  private describeMainTree(table: string, rowCodec: RowCodec): MainTreeDescription {
+    const columns = this.tableSchema.columns;
+    return {
+      kind: 'main',
+      table,
+      freshKey: this.tableSchema.primaryKeyDefinition.some(pk => freshTagged(columns[pk.index])),
+      singleWriter: this.tableSchema.tags?.[SINGLE_WRITER_TAG] === true,
+      decodeKey: key => {
+        // decodePrimaryKey answers one value per key column whatever it is given; a key with another
+        // number of framed elements is not one of this table's.
+        const values = rowCodec.decodePrimaryKey(key);
+        return splitKeyTuple(key).length === values.length ? values : undefined;
+      },
+    };
+  }
+
+  /** The UNIQUE constraint whose enforcing index tree ({@link resolveEnforcingIndex}) is
+   * `collectionId` — the trees {@link guardedUniqueIndexes} guards — described for the outlook. */
+  private describeUniqueIndex(collectionId: CollectionId, table: string, rowCodec: RowCodec): UniqueIndexDescription | undefined {
+    for (const uc of this.tableSchema.uniqueConstraints ?? []) {
+      if (uc.predicate !== undefined || uc.columns.length === 0) continue;
+      if (this.resolveEnforcingIndex(uc)?.tree.getCollection().id !== collectionId) continue;
+      const affinities = uc.columns.map(ci => rowCodec.getSchema().columns[ci]?.affinity);
+      return {
+        kind: 'unique-index',
+        table,
+        columns: uc.columns.map(ci => this.tableSchema.columns[ci]?.name ?? `col${ci}`),
+        freshValue: uc.columns.some(ci => freshTagged(this.tableSchema.columns[ci])),
+        decodeValue: indexKey => {
+          const values = decodeIndexKey(indexKey, affinities);
+          return values.length === uc.columns.length ? values : undefined;
+        },
+      };
+    }
+    return undefined;
+  }
+
+  /** This table's main tree as a key encoder for the outlook's dependency rule
+   * (`TableOutlookSource.mainTree`); `undefined` before the table is initialized. Read from the live
+   * codec and schema at call time, as {@link describeCollection} is. */
+  private mainTreeKeys(): MainTreeKeys | undefined {
+    const collection = this.collection;
+    const rowCodec = this.rowCodec;
+    if (!collection || !rowCodec) return undefined;
+    return {
+      collectionId: collection.getCollection().id,
+      rowKey: (key, values) => this.rowKeyOf(rowCodec, key, values),
+    };
+  }
+
+  /**
+   * The main-tree key of the row a read pinned by `key` = `values`, built exactly as a point lookup
+   * builds its seek key ({@link executePointLookup}: the values reordered into primary-key order,
+   * then `createPrimaryKey` over `asPrimaryKeyTuple`), so it matches the key the row was staged
+   * under. `undefined` when `key` is not this table's primary key — compared lowercased, since Quereus
+   * lowercases the names it reads, in any order — or when the codec refuses a value.
+   */
+  private rowKeyOf(rowCodec: RowCodec, key: readonly string[], values: readonly SqlValue[]): string | undefined {
+    const primaryKey = this.tableSchema.primaryKeyDefinition;
+    if (key.length !== primaryKey.length || values.length !== key.length) return undefined;
+    const lowered = key.map(column => column.toLowerCase());
+    const ordered: SqlValue[] = [];
+    for (const column of primaryKey) {
+      const at = lowered.indexOf((this.tableSchema.columns[column.index]?.name ?? '').toLowerCase());
+      if (at < 0) return undefined;
+      ordered.push(values[at] ?? null);
+    }
+    try {
+      return rowCodec.createPrimaryKey(rowCodec.asPrimaryKeyTuple(ordered));
+    } catch (error) {
+      log('outlook:row-key-unencodable table=%s key=%o: %o', this.tableName, key, error);
+      return undefined;
+    }
+  }
+
+  /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */
+  withdrawOfflinePolicy(): void {
+    this.txnBridge.getOfflineMode()?.withdrawTablePolicy(this.qualifiedTable);
   }
 
   /** Queue one step bringing the network watch in line with the tags and the table's lifetime. */
@@ -1324,6 +1666,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.collection || !this.rowCodec || !this.indexManager) {
       throw new Error('Table not initialized');
     }
+    // The codec and index descriptors this scan decodes and seeks with, taken once: a catalog-only
+    // ADD or DROP COLUMN replaces both on the instance (republishColumnLayout), and a committed
+    // read runs outside the engine's exec lock, so one can land while this scan is iterating.
+    const rowCodec = this.rowCodec;
+    const indexManager = this.indexManager;
 
     try {
       // Parse the access strategy FIRST (all synchronous), so the committed arm
@@ -1356,7 +1703,7 @@ export class OptimysticVirtualTable extends VirtualTable {
 
       const mainTree = this.collection as unknown as Tree<string, RowData>;
       const indexTarget = scanIndexName !== undefined
-        ? this.resolveIndexTarget(scanIndexName)
+        ? this.resolveIndexTarget(indexManager, scanIndexName)
         : undefined;
 
       let mainRead: TreeReadView<string, RowData>;
@@ -1372,10 +1719,10 @@ export class OptimysticVirtualTable extends VirtualTable {
           : undefined;
       } else {
         // Live reads refresh each tree from the network first.
-        await mainTree.update();
+        await this.refreshLive(mainTree);
         mainRead = mainTree;
         if (indexTarget !== undefined) {
-          await indexTarget.tree.update();
+          await this.refreshLive(indexTarget.tree);
           indexScan = { ...indexTarget, read: indexTarget.tree };
         }
       }
@@ -1391,7 +1738,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // still reports what the seek had produced by then.
         const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0 } : undefined;
         try {
-          yield* this.executeIndexScan(mainRead, indexScan, filterInfo.args, seek);
+          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, filterInfo.args, seek);
         } finally {
           if (seek !== undefined) {
             this.logIndexSeek(indexScan, mainTree, committed, seek);
@@ -1399,19 +1746,19 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
-        yield* this.executePointLookup(mainRead, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
       } else if (planType === 3) {
         // Range query on primary key (plan=3)
-        yield* this.executeRangeQuery(mainRead, filterInfo);
+        yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
       } else if (filterInfo.idxNum === 1) {
         // Legacy: Point lookup on primary key
-        yield* this.executePointLookup(mainRead, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
-        yield* this.executeRangeQuery(mainRead, filterInfo);
+        yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
       } else {
         // Full table scan
-        yield* this.executeTableScan(mainRead);
+        yield* this.executeTableScan(mainRead, rowCodec);
       }
     } catch (error) {
       // NOTE: a live read inside a doomed transaction can surface a concurrency
@@ -1434,19 +1781,72 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Refresh `tree` from the network before a live read, or a write's uniqueness probe, reads it. Every
+   * such refresh in this class goes through here; a committed read never refreshes.
+   *
+   * Outside offline mode, and for a table tagged `'network'`, it is `tree.update()`, failing as it
+   * always has. In offline mode, for a `'queue'` table, a cohort that cannot be reached leaves the read
+   * to this machine's own view — the committed blocks it holds plus every queued transaction
+   * (docs/offline-sync.md §Reads in offline mode): the refresh is skipped while the gate the queue asks
+   * says the cohort is unreachable, so a read does not pay the dial timeouts, and a refresh that fails
+   * for unreachability (`isCohortUnreachableRead`, the rule the drain sorts its failures by) is
+   * absorbed. Every other failure propagates, and a block this machine does not hold still fails the
+   * read that reaches it. Each outcome is reported to the controller, which keeps `readsServedLocally`.
+   */
+  private async refreshLive<TEntry>(tree: Tree<string, TEntry>): Promise<void> {
+    const offline = this.txnBridge.getOfflineMode();
+    const table = qualifiedTableName(this.qualifiedTable);
+    if (offline === undefined || !offline.degradesLiveReads(table)) {
+      await tree.update();
+      this.reachedCohort(offline);
+      return;
+    }
+    if (!await offline.cohortReachable(table, gateBlockIds(tree.getCollection()))) {
+      this.servedLocally(offline, 'gate-closed');
+      return;
+    }
+    try {
+      await tree.update();
+    } catch (error) {
+      // A block whose every request failed in transport is typed by the transactor itself
+      // (`NetworkTransactor.get` flags it `peers-unreachable`), so this predicate covers it.
+      if (!isCohortUnreachableRead(error)) throw error;
+      this.servedLocally(offline, error.reason);
+      return;
+    }
+    this.reachedCohort(offline);
+  }
+
+  /** A live refresh of this table reached the cohort: its episode of locally served reads, if any, is
+   * over, and a journaled offline transaction deferred because the table could not be reached can be
+   * put back (`OfflineMode.tableReadable`). */
+  private reachedCohort(offline: OfflineMode | undefined): void {
+    this.readsServedLocally = false;
+    offline?.noteLiveRefresh(false);
+    offline?.tableReadable(this.qualifiedTable);
+  }
+
+  /** A live read of this table is served from this machine's own view; the first of an episode is logged. */
+  private servedLocally(offline: OfflineMode, because: string): void {
+    if (!this.readsServedLocally) {
+      this.readsServedLocally = true;
+      log('offline:read-served-locally table=%s because=%s: live reads serve this machine\'s own view until a refresh reaches the cohort',
+        qualifiedTableName(this.qualifiedTable), because);
+    }
+    offline.noteLiveRefresh(true);
+  }
+
+  /**
    * Resolve the schema and tree behind a named secondary index, throwing when either
    * is unknown. Synchronous, so {@link runQuery}'s committed arm can resolve it inside
    * the single view-building block.
    */
-  private resolveIndexTarget(indexName: string): IndexScanTarget {
-    if (!this.indexManager) {
-      throw new Error('Table not initialized');
-    }
+  private resolveIndexTarget(indexManager: IndexManager, indexName: string): IndexScanTarget {
     // Scan-time backstop of the maintained-index invariant (the plan-time guard is
     // OptimysticModule.assertIndexMaintained): a scan routed through an index this
     // table does not maintain must fail loudly, naming table and index, instead of
     // descending a stale tree and honestly returning too few rows.
-    const schema = this.indexManager.getIndexSchema(indexName);
+    const schema = indexManager.getIndexSchema(indexName);
     if (!schema) {
       throw new QuereusError(
         unmaintainedIndexMessage(
@@ -1457,7 +1857,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         StatusCode.ERROR,
       );
     }
-    const tree = this.indexManager.getIndexTree(indexName);
+    const tree = indexManager.getIndexTree(indexName);
     if (!tree) {
       throw new QuereusError(
         unmaintainedIndexMessage(
@@ -1635,10 +2035,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executePointLookup(
     read: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
     args: readonly unknown[],
   ): AsyncIterable<Row> {
-    if (!this.rowCodec) return;
-
     // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no
     // row matches — even though key EQUALITY is NULL-self-equal and a NULL-keyed row
     // really is stored under the NULL tag (key-encoding.ts). Without this guard the
@@ -1665,11 +2064,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     // Using only args[0] silently drops every PK column past the first, so a
     // composite-PK point lookup builds a key that can never match a stored row.
     // Seek args are the key-ordered tuple shape, not a row — see schema/key-tuples.ts.
-    const key = this.rowCodec.createPrimaryKey(
-      this.rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
+    const key = rowCodec.createPrimaryKey(
+      rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
     );
 
-    const row = await readRowAt(read, this.rowCodec, key);
+    const row = await readRowAt(read, rowCodec, key);
     if (row !== undefined) {
       yield row;
     }
@@ -1680,11 +2079,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executeRangeQuery(
     read: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
     _filterInfo: FilterInfo,
   ): AsyncIterable<Row> {
     // For now, fall back to full scan
     // TODO: Implement proper range queries based on filter args
-    yield* this.executeTableScan(read);
+    yield* this.executeTableScan(read, rowCodec);
   }
 
   /**
@@ -1695,14 +2095,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
+    indexManager: IndexManager,
     index: IndexScanSource,
     args: readonly unknown[],
     seek?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    const rowCodec = this.rowCodec;
-    const indexManager = this.indexManager;
-    if (!rowCodec || !indexManager) return;
-
     // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no row
     // matches — the same guard, for the same reason, that executePointLookup carries; read
     // its comment for why the engine leaves a dynamic NULL to the module (it folds only a
@@ -1809,9 +2207,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * simply never exercised for it (harmless). The read source is already
    * network-refreshed (live) or a snapshot (committed); this method never refreshes it.
    */
-  private async* executeTableScan(read: TreeReadView<string, RowData>): AsyncIterable<Row> {
-    if (!this.rowCodec) return;
-
+  private async* executeTableScan(read: TreeReadView<string, RowData>, rowCodec: RowCodec): AsyncIterable<Row> {
     const maxRetries = 5;
     let retryCount = 0;
     let lastKey: string | undefined;
@@ -1841,7 +2237,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             }
 
             const encodedRow = entry[1];
-            const row = this.rowCodec.decodeRow(encodedRow);
+            const row = rowCodec.decodeRow(encodedRow);
             yieldedKeys.add(key);
             lastKey = key;
             yield row;
@@ -1903,7 +2299,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private registerCollections(): void {
     if (this.collection) {
-      this.txnBridge.registerCollection(this.collection.getCollection());
+      this.registerTree(this.collection);
       // Teach the bridge how to render a concurrency-refused duplicate key for THIS
       // table (a TreeKeyTakenError surfacing at commit from the main collection's
       // conflict replay). Registered here — after doInitialize resolved the schema,
@@ -1923,10 +2319,30 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
     if (this.indexManager) {
       for (const tree of this.indexManager.getIndexTrees()) {
-        this.txnBridge.registerCollection(tree.getCollection());
+        this.registerTree(tree);
       }
     }
     this.registerUniqueKeyTakenMessages();
+  }
+
+  /**
+   * Register one of this table's trees with the bridge (see
+   * {@link TransactionBridge.registerCollection}), under this table's qualified name — the key a
+   * commit's durability report groups the tree's collection under.
+   */
+  private registerTree(tree: Tree<any, any>): void {
+    this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedTable);
+  }
+
+  /** Stop the bridge naming this table in commit reports; on DROP and on a refused CREATE. */
+  forgetInCommitReports(): void {
+    this.txnBridge.forgetTable(this.qualifiedTable);
+  }
+
+  /** This table as the bridge records it: a commit's durability report groups the table's
+   * collections under its `schema.table` rendering. */
+  private get qualifiedTable(): QualifiedTableName {
+    return { schemaName: this.schemaName, tableName: this.tableName };
   }
 
   /**
@@ -1983,16 +2399,96 @@ export class OptimysticVirtualTable extends VirtualTable {
    * disposition (skip/evict the rival's MAIN row from an index-tree guard) ever exists.
    */
   private guardedUniqueIndexes(values: Row): ReadonlySet<string> {
+    const guarded = this.guardedUniqueConstraints(values);
+    return guarded.length === 0 ? EMPTY_INDEX_SET : new Set(guarded.map(({ enforcing }) => enforcing.descriptor.name));
+  }
+
+  /**
+   * The UNIQUE constraints that BIND the row carrying `values` — non-partial, every column present
+   * and non-null — each with the index tree enforcing it ({@link resolveEnforcingIndex}); a
+   * constraint whose tree cannot be resolved is left out. The one walk behind
+   * {@link guardedUniqueIndexes}, which guards these trees' entries, and {@link recordWriteFacts},
+   * which says which of those entries carry a fresh value, so the guarded element and the fact about
+   * it come from one list.
+   */
+  private guardedUniqueConstraints(values: Row): GuardedUniqueConstraint[] {
     const constraints = this.tableSchema.uniqueConstraints;
-    if (!constraints || constraints.length === 0) return EMPTY_INDEX_SET;
-    const guarded = new Set<string>();
+    if (!constraints || constraints.length === 0) return [];
+    const guarded: GuardedUniqueConstraint[] = [];
     for (const uc of constraints) {
       if (uc.predicate !== undefined || uc.columns.length === 0) continue;
       if (!uc.columns.every(ci => values[ci] !== null && values[ci] !== undefined)) continue;
       const enforcing = this.resolveEnforcingIndex(uc);
-      if (enforcing) guarded.add(enforcing.descriptor.name);
+      if (enforcing) guarded.push({ constraint: uc, enforcing });
     }
-    return guarded.size === 0 ? EMPTY_INDEX_SET : guarded;
+    return guarded;
+  }
+
+  /**
+   * Tell the bridge which of the elements an arm has just staged for the row carrying `values` came
+   * from a fresh source, read from the executing statement's write description (`freshElementsOf` in
+   * write-description.ts): the main-tree entry at `rowKey`, and the entry in each UNIQUE-enforcing
+   * index tree {@link guardedUniqueIndexes} guarded — keyed exactly as `IndexManager.insertIndexEntries`
+   * and `updateIndexEntries` key the entry, so the fact names the guarded element by construction.
+   * Called after the arm's last stage. A write with no description (an FK cascade child write), or
+   * one describing another operation (the upsert `DO UPDATE` arm receives the INSERT's), records
+   * nothing; so does a DELETE, whose elements carry no check a fresh value could assure.
+   */
+  private recordWriteFacts(write: TableWrite | undefined, arm: 'insert' | 'update', rowKey: string, values: Row): void {
+    const collection = this.collection;
+    const indexManager = this.indexManager;
+    if (write === undefined || !collection || !indexManager) return;
+    const facts = freshElementsOf(write, arm, {
+      mainCollectionId: collection.getCollection().id,
+      key: rowKey,
+      keyColumns: this.primaryKeyColumnNames(),
+      uniqueEntries: this.guardedUniqueConstraints(values).map(({ constraint, enforcing }) => ({
+        collectionId: enforcing.tree.getCollection().id,
+        key: indexEntryKey(indexManager.createIndexKey(enforcing.descriptor, values), rowKey),
+        columns: constraint.columns.map(index => this.columnName(index)),
+      })),
+    });
+    if (facts.length > 0) this.txnBridge.noteWriteFacts(facts);
+  }
+
+  /**
+   * The guard an INSERT whose probe found the key clear carries: `absentOrEqual` when a rival's
+   * EQUAL row at the key is this write already made — the statement's disposition says a present
+   * row is not an error (`insertAcceptsEqualRow` in write-description.ts: `or ignore`, `or replace`,
+   * `on conflict do nothing` on the key), or the table is tagged {@link CONTENT_KEY_TAG}, its key
+   * being a function of the row's content — and `absent` otherwise. Either kind still refuses a
+   * rival's DIFFERENT row at the key, which the sequential retry then resolves under the
+   * disposition; `absentOrEqual` compares the whole row, so an equal key under other content
+   * refuses as a plain insert would. A plain `insert` keeps `absent`: SQL says a duplicate is an
+   * error, and an application may rely on that to learn that someone else got there first.
+   */
+  private insertGuard(write: TableWrite | undefined): TreeUpsertGuard<string, StoredRowEntry> {
+    const contentKeyed = this.tableSchema.tags?.[CONTENT_KEY_TAG] === true;
+    return contentKeyed || insertAcceptsEqualRow(write, this.primaryKeyColumnNames())
+      ? { kind: 'absentOrEqual' }
+      : { kind: 'absent' };
+  }
+
+  /**
+   * The guard a rewrite of an existing row carries — the same-key UPDATE (`arm` `'update'`) and the
+   * INSERT OR REPLACE over an occupied key (`arm` `'insert'`): {@link unchangedOrEqual} on `entry`
+   * when the statement's description says re-applying it to its own result changes nothing
+   * (`rewriteAcceptsEqualRow` in write-description.ts), so a rival that already wrote exactly this
+   * row is accepted as the write already made; {@link unchanged} otherwise — `set n = n + 1`, a
+   * value read from other rows, no description, or a description of another arm (the upsert `DO
+   * UPDATE` arm receives the INSERT's).
+   */
+  private rewriteGuard(write: TableWrite | undefined, arm: 'insert' | 'update', entry: StoredRowEntry): TreeUpsertGuard<string, StoredRowEntry> {
+    return rewriteAcceptsEqualRow(write, arm) ? unchangedOrEqual(entry) : unchanged(entry);
+  }
+
+  /** The primary-key column names, in key order, as the gates compare them against a description. */
+  private primaryKeyColumnNames(): string[] {
+    return this.tableSchema.primaryKeyDefinition.map(pk => this.columnName(pk.index));
+  }
+
+  private columnName(index: number): string {
+    return this.tableSchema.columns[index]?.name ?? `col${index}`;
   }
 
   /**
@@ -2068,9 +2564,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   - it is partial (`predicate !== undefined`, from `CREATE UNIQUE INDEX … WHERE …`) —
    *     never point-enforced here, matching the probe's own filter;
    *   - its columns match the PRIMARY KEY as a set — already structural (the tree key);
-   *   - its columns match a declared index as a set — reuse that tree (covers a
-   *     `derivedFromIndex` UNIQUE index and any plain index over the same columns), so we
-   *     never build a second tree for the same key.
+   *   - its columns match a declared index with no predicate as a set — reuse that tree (covers
+   *     a `derivedFromIndex` UNIQUE index and any plain index over the same columns), so we
+   *     never build a second tree for the same key. A partial declared index does not count: it
+   *     holds only the rows its predicate admits, so a duplicate among the others would pass.
    * Everything else gets a descriptor with a reserved `_uniq_`-prefixed name (the prefix
    * is reserved for enforcement trees and must not collide with a user index) and the
    * constraint's columns in declared order. Two constraints over the same column set
@@ -2090,7 +2587,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     const pkKey = columnSetKey(storedSchema.primaryKeyDefinition.map(pk => pk.index));
     const declaredKeys = new Set(
-      storedSchema.indexes.map(idx => columnSetKey(idx.columns.map(c => c.index))),
+      storedSchema.indexes
+        .filter(holdsEveryRow)
+        .map(idx => columnSetKey(idx.columns.map(c => c.index))),
     );
 
     const synthesized: StoredIndexSchema[] = [];
@@ -2126,8 +2625,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Resolve the index tree that enforces `uc`, or undefined if none can be resolved. A
    * DECLARED index (in `schema.indexes`) is preferred over a synthesized `_uniq_` tree
    * covering the same columns, so a real `CREATE UNIQUE INDEX` wins if one lands on the
-   * same column set as an already-synthesized plain UNIQUE. `synthesized` flags whether
-   * the resolved tree may need one-time backfill (see {@link ensureUniquePopulated}).
+   * same column set as an already-synthesized plain UNIQUE. A partial declared index never
+   * enforces: it holds only the rows its predicate admits ({@link holdsEveryRow}).
+   * `synthesized` flags whether the resolved tree may need one-time backfill (see
+   * {@link ensureUniquePopulated}).
    *
    * NOTE: when both a declared index and a synthesized tree cover the same columns, both
    * are still maintained on every DML (double writes to redundant trees). This can only
@@ -2141,7 +2642,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (!this.indexManager) return undefined;
     const setKey = columnSetKey(uc.columns);
 
-    for (const idx of this.indexManager.getDeclaredIndexes()) {
+    for (const idx of this.indexManager.getDeclaredIndexes().filter(holdsEveryRow)) {
       if (columnSetKey(idx.columns.map(c => c.index)) === setKey) {
         const tree = this.indexManager.getIndexTree(idx.name);
         if (tree) return { descriptor: idx, tree, synthesized: false };
@@ -2202,7 +2703,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // ever shows up in a profile, memoize the emptiness answer until the first stage.
     if (await this.hasNoRowsToBackfill()) return;
 
-    await tree.update();
+    await this.refreshLive(tree);
     // Emptiness is "the first path is not ON an entry" — isValid() only reports whether
     // a path survived a concurrent mutation (its version), NOT whether it points at a
     // row, so at()===undefined is the on-entry signal (an empty tree's first() is
@@ -2222,7 +2723,11 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private async populateUniqueTree(descriptor: StoredIndexSchema, tree: Tree<string, IndexEntry>): Promise<void> {
     if (!this.collection || !this.rowCodec || !this.indexManager) return;
-    await this.collection.update();
+    // NOTE: the refresh degrades in offline mode but the `tree.sync()` below still needs the cohort, so
+    // the first write probing a synthesized tree an older build left empty fails while the cohort is
+    // unreachable (and succeeds once it is reachable). Only tables an older build wrote reach this; if
+    // offline writes to such tables matter, stage the populate into the caller's transaction instead.
+    await this.refreshLive(this.collection);
     for await (const { row, primaryKey } of walkDecodedRows(this.collection, this.rowCodec)) {
       if (hasNullIndexValue(descriptor, row)) {
         continue;
@@ -2300,10 +2805,14 @@ export class OptimysticVirtualTable extends VirtualTable {
     if (synthesized) {
       await this.ensureUniquePopulated(descriptor, tree);
     }
-    await tree.update();
+    await this.refreshLive(tree);
     const probeKey = this.indexManager.createIndexKey(descriptor, values);
+    // The index range is read whole, as one value, before any row is: the offline drain changes
+    // both trees beneath this probe (docs/internals.md §The offline queue), and a scan held open
+    // across the row reads would throw for that change once it had yielded.
+    const hits = await this.indexManager.findByIndexIn(tree, probeKey);
     const collisions: UniqueCollision[] = [];
-    for await (const pk of this.indexManager.findByIndexIn(tree, probeKey)) {
+    for (const pk of hits) {
       if (excludeKeys?.has(pk)) continue;
       const entry = await this.collection.get(pk) as StoredRowEntry | undefined;
       if (!entry || entry.length < 2) continue;
@@ -2497,10 +3006,12 @@ export class OptimysticVirtualTable extends VirtualTable {
    * maintenance, FK cascade, delete auto-events) for each before the new row's own
    * bookkeeping. The caller must {@link markDirtyTrees} first so a rollback
    * restores the evicted rows, and must stage its own write AFTER (evict-then-write
-   * journal order). Each eviction's main-table delete is guarded {@link unchanged} on
-   * the collision's stored entry: its index deletes were computed from that image, so a
+   * journal order). Each eviction's main-table delete is guarded {@link unchangedOrAbsent}
+   * on the collision's stored entry: its index deletes were computed from that image, so a
    * rival's concurrent change to the evicted row refuses this writer rather than
-   * leaving the rival's index entries orphaned.
+   * leaving the rival's index entries orphaned — while an evicted row a rival already
+   * removed is accepted as gone, which is the REPLACE's intent for it, and the
+   * replacement row then lands.
    */
   private async applyUniqueEvictions(
     collisions: readonly UniqueCollision[],
@@ -2511,7 +3022,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
     const evicted: Row[] = [];
     for (const { pk, row, entry } of collisions) {
-      await this.collection.stage([[pk, undefined, unchanged(entry)]]);
+      await this.collection.stage([[pk, undefined, unchangedOrAbsent(entry)]]);
       await this.indexManager.deleteIndexEntries(row, pk, transactor);
       evicted.push(row);
     }
@@ -2601,6 +3112,11 @@ export class OptimysticVirtualTable extends VirtualTable {
 
     const txnState = this.txnBridge.getCurrentTransaction();
 
+    // Ahead of every arm's staging, DELETE's included: the statement's decisions against other rows
+    // are recorded once per description (the bridge keys on the object), and a statement that then
+    // fails is discarded with its rows by the statement savepoint's rollback.
+    this.txnBridge.noteWriteDescription(args.writeScope);
+
     try {
       switch (operation) {
         case 'insert':
@@ -2666,8 +3182,12 @@ export class OptimysticVirtualTable extends VirtualTable {
                 // computed from `existingRow`, so the replacement is guarded on that entry:
                 // a rival that changes or removes the row first refuses this writer instead
                 // of letting the replacement land beside an index delta for a row image the
-                // collection no longer holds.
-                await this.collection.stage([[insertKey, [insertKey, replacementEncoded], unchanged(existing)]]);
+                // collection no longer holds. Two machines running the same self-independent
+                // `insert or replace into Settings …` is the idempotent-upsert pattern: the
+                // guard then also accepts a rival that already wrote exactly this row (see
+                // rewriteGuard). The index deletes computed from the displaced image find
+                // nothing when the rival made the same replace, and the new entries are equal.
+                await this.collection.stage([[insertKey, [insertKey, replacementEncoded], this.rewriteGuard(args.writeScope, 'insert', existing)]]);
                 await this.indexManager.updateIndexEntries(
                   existingRow,
                   values,
@@ -2676,6 +3196,7 @@ export class OptimysticVirtualTable extends VirtualTable {
                   txnState?.transactor,
                   this.guardedUniqueIndexes(values),
                 );
+                this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
                 // replacedRow (the same-PK slot) and evictedRows (rows at OTHER PKs)
                 // co-occur here; the executor runs each eviction's delete pipeline
                 // before modelling the replacement as an update of replacedRow.
@@ -2744,20 +3265,26 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - ON CONFLICT (pk) DO UPDATE whose probe found no row is covered too:
             //    under concurrency the statement REFUSES rather than performing the
             //    upsert the sequential path would have; the retry takes the update arm.
-            // Do not try to re-run SQL semantics inside the replay.
+            // Do not try to re-run SQL semantics inside the replay. One acceptance IS
+            // re-made there, because it needs no SQL: a rival's row EQUAL to this one, under
+            // a statement that said a present row is not an error (`or ignore`, `or
+            // replace`, `on conflict do nothing` on the key) or on a content-keyed table,
+            // is this write already made, and `absentOrEqual` skips it (see insertGuard).
             // Stage the row in the main table. Entry format: [primaryKey, encodedRow]
-            await this.collection.stage([[insertKey, [insertKey, encodedRow], { kind: 'absent' }]]);
+            await this.collection.stage([[insertKey, [insertKey, encodedRow], this.insertGuard(args.writeScope)]]);
 
             // Stage into all indexes. UNIQUE-enforcing index trees whose value this row
             // occupies carry the concurrency guard so a rival that commits the same value
-            // under a different PK refuses the loser at replay (see guardedUniqueIndexes);
-            // a REPLACE-resolved constraint's tree is unguarded, its eviction already staged.
+            // under a different PK refuses the loser at replay (see guardedUniqueIndexes) —
+            // a REPLACE-resolved constraint's tree included, its eviction staged above so the
+            // range holds nothing this snapshot saw.
             await this.indexManager.insertIndexEntries(
               values,
               insertKey,
               txnState?.transactor,
               this.guardedUniqueIndexes(values),
             );
+            this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
 
             return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
           }
@@ -2831,7 +3358,14 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - the slot the row leaves (a same-key rewrite, or the delete half of a PK
             //    move) is guarded `unchanged` on the pre-write entry: a rival that changed
             //    or removed the row refuses this writer, rather than being overwritten
-            //    (or resurrected) with a stale index delta;
+            //    (or resurrected) with a stale index delta. A same-key rewrite whose
+            //    statement is self-independent carries `unchangedOrEqual` instead (see
+            //    rewriteGuard): two machines marking one task done both intended the row
+            //    they find, so the second is accepted as already applied. The delete half
+            //    of a PK move never is: if a rival deleted the old row, the sequential
+            //    statement affects zero rows, and accepting the absent delete half while
+            //    still inserting the new row would create a row the sequential execution
+            //    never would;
             //  - a PK move's insert half at a key the probe found CLEAR is guarded
             //    'absent' under every resolved conflict action, exactly as an INSERT is
             //    (see the INSERT arm). IGNORE is not 'keepExisting': skipping only the
@@ -2843,7 +3377,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             //  - a displacing move (REPLACE onto an OCCUPIED key) is guarded `unchanged`
             //    on the displaced entry: `deleteIndexEntries(pkMove.row, newKey)` below
             //    was computed from that image.
-            const moveGuard: TreeEntryGuard<string, StoredRowEntry> = pkMove.kind === 'displace'
+            const moveGuard: TreeUpsertGuard<string, StoredRowEntry> = pkMove.kind === 'displace'
               ? unchanged(pkMove.entry)
               : { kind: 'absent' };
 
@@ -2857,7 +3391,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // without refusing itself.
             await this.collection.stage(oldKey !== newKey
               ? [[oldKey, undefined, unchanged(oldEntry)], [newKey, [newKey, encodedRow], moveGuard]]
-              : [[newKey, [newKey, encodedRow], unchanged(oldEntry)]]);
+              : [[newKey, [newKey, encodedRow], this.rewriteGuard(args.writeScope, 'update', oldEntry)]]);
 
             // Index maintenance for a displacing move needs both stagings, in this
             // order: first remove the DISPLACED row's entries (tree keys
@@ -2876,11 +3410,15 @@ export class OptimysticVirtualTable extends VirtualTable {
               oldKey,
               newKey,
               txnState?.transactor,
-              // Guard the NEW entry on every binding, ABORT-resolved UNIQUE constraint —
+              // Guard the NEW entry on every binding UNIQUE constraint (see guardedUniqueIndexes) —
               // the moving row's own OLD entry is deleted first in the same tree action, so
               // a value-preserving move never refuses itself (see updateIndexEntries).
               this.guardedUniqueIndexes(values),
             );
+            // Under newKey: its `absent` insert half is what a fresh key assures. A same-key update
+            // records a main-tree fact only when an assigned key column is fresh, which is then true
+            // of the key however it reached newKey (minted earlier in this transaction).
+            this.recordWriteFacts(args.writeScope, 'update', newKey, values);
 
             return {
               status: 'ok',
@@ -2910,10 +3448,13 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Stage the main-table delete (flushed at commit / restored on rollback),
             // guarded on the entry the index deletes below were computed from: a rival
             // that changed the row first refuses this writer (its index entries would
-            // otherwise be orphaned), and so does a rival that already deleted it — the
-            // second of two racing deletes reads a row that is gone, and its sequential
-            // retry then affects zero rows.
-            await this.collection.stage([[deleteKey, undefined, unchanged(oldEntry)]]);
+            // otherwise be orphaned). A rival that already deleted it is accepted — the
+            // delete's intent for the row is that it be gone, whatever selected it (a
+            // `global` selection's wider decision is reported as a `row-selection`
+            // unchecked decision) — and the replay skips the delete as already applied,
+            // its index deletes below finding nothing. No description is needed for that,
+            // so a cascade child delete carries it too (see unchangedOrAbsent).
+            await this.collection.stage([[deleteKey, undefined, unchangedOrAbsent(oldEntry)]]);
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
@@ -2936,6 +3477,10 @@ export class OptimysticVirtualTable extends VirtualTable {
       // rival's commit that the pre-stage probe's view had not (observed on a two-node
       // mesh, never on one node). Same message a commit-time refusal carries; the
       // statement-level savepoint discards whatever this statement staged before it.
+      // The already-applied guard kinds can meet their ACCEPTANCE at initial staging the
+      // same way: a DELETE whose row such a fetched commit already removed is skipped as
+      // already applied and the statement returns ok for a row the sequential execution
+      // would not have found. Acceptable, since the final state is the statement's intent.
       const refusal = this.txnBridge.mapCommitRefusal(error);
       if (refusal !== error && refusal instanceof Error) {
         this.setErrorMessage(refusal.message);
@@ -3003,6 +3548,13 @@ export class OptimysticVirtualTable extends VirtualTable {
     const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName);
     if (!storedSchema) {
       throw new Error('Schema not found');
+    }
+
+    // A partial index whose predicate maintenance cannot evaluate is refused before anything is
+    // written or mirrored: the statement fails with compilePredicate's own error, and no record
+    // lists the index and no tree is attached for it.
+    if (indexSchema.predicate !== undefined) {
+      IndexPredicate.compile(indexSchema.predicate, storedSchema.columns, storedSchema.name);
     }
 
     const txnState = this.txnBridge.getCurrentTransaction();
@@ -3218,7 +3770,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       if (!tree) {
         throw new Error(`Index tree not found: ${descriptor.name}`);
       }
-      this.txnBridge.registerCollection(tree.getCollection());
+      this.registerTree(tree);
       await this.populateUniqueTree(descriptor, tree);
       this.populatedUniqueTrees.add(descriptor.name);
       this.uniqueEnforcementIndexes = [...this.uniqueEnforcementIndexes, descriptor];
@@ -3227,47 +3779,63 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Persist a CHECK that `ALTER TABLE … ADD CONSTRAINT` added, and carry it on this instance's
-   * own schema ({@link OptimysticModule.alterTable} builds `check` exactly as the engine
-   * registers it).
-   *
-   * Both halves are needed. The catalog record is all a restarted machine hydrates, so without
-   * the write it stops enforcing the CHECK. And this instance compares its own `tableSchema`
-   * against the record whenever it (re-)initializes, rewriting the record from `tableSchema` on
-   * a mismatch — so an instance that never learned of the CHECK would write it back out on its
-   * next re-open (after a failed `APPLY SCHEMA` batch commit, say).
-   *
-   * Schema-only, like the engine's own CHECK arm and Quereus's memory tables: existing rows are
-   * not validated against the new CHECK.
+   * Carry a catalog-only ALTER on this instance's own schema ({@link OptimysticModule.alterTable}
+   * hands over the same edit it makes to the engine's catalog entry). Needed even though the
+   * statement changed no row: this instance compares its own `tableSchema` against the record
+   * whenever it (re-)initializes and rewrites the record from it on a mismatch, so an instance
+   * that never learned of the change would undo it in the record on its next re-open (after a
+   * failed `APPLY SCHEMA` batch commit, say). A change that moves the columns (`layout`) also
+   * rebuilds what the instance derived from them ({@link republishColumnLayout}).
    */
-  async addCheckConstraint(check: RowConstraintSchema): Promise<void> {
-    // Initialized first so there is a record to extend: an instance whose record never landed
-    // (see markSchemaUnpersisted) re-persists it here, through the storage-adoption guard.
-    if (!this.isInitialized) {
-      await this.initialize();
+  applyCatalogOnlyEdit(edit: (schema: TableSchema) => TableSchema, layout?: ColumnLayoutChange): void {
+    const tableSchema = edit(this.tableSchema);
+    if (layout !== undefined) {
+      this.republishColumnLayout(tableSchema, layout);
     }
+    this.tableSchema = tableSchema;
+  }
 
-    const txnState = this.txnBridge.getCurrentTransaction();
-    // MUTATING path: read the catalog fresh, for the reason addIndex does.
-    const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName, txnState?.transactor);
-    if (!storedSchema) {
-      throw new Error(`Schema not found for Optimystic table '${this.schemaName}.${this.tableName}'. Cannot add CHECK constraint.`);
+  /**
+   * What an initialized instance derived from its column list, rebuilt for `tableSchema` after a
+   * catalog-only ADD or DROP COLUMN ({@link applyCatalogOnlyEdit}), in one synchronous step as
+   * {@link doInitialize}'s publish does. The row codec follows the new column list. After a DROP,
+   * every maintained index — declared and unique-enforcement alike — is renumbered over the removed
+   * slot; none covers it ({@link columnDropBlockers}), so the maintained set, the trees and their
+   * registration with the transaction bridge are all unchanged (tree names come from index and
+   * column names). A running scan keeps the codec and index descriptors it started with.
+   *
+   * Built from this instance's own schema, not from the catalog record: rows reach this instance
+   * positioned by this machine's engine, whose column list the instance mirrors, and the record can
+   * hold columns this engine has not seen (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
+   * An uninitialized instance has nothing derived yet; its first initialize builds from `tableSchema`.
+   */
+  private republishColumnLayout(tableSchema: TableSchema, layout: ColumnLayoutChange): void {
+    if (!this.rowCodec || !this.indexManager) {
+      return;
     }
-    await this.schemaManager.storeStoredSchema(
-      this.schemaManager.withCheckConstraint(storedSchema, check),
-      txnState?.transactor,
-    );
+    const rowCodec = new RowCodec(this.schemaManager.tableSchemaToStored(tableSchema), this.options.encoding);
+    if (layout.kind === 'remove') {
+      const reposition = positionAfterRemoving(layout.position);
+      const uniqueEnforcementIndexes = this.uniqueEnforcementIndexes.map(idx => repositionIndexColumns(idx, reposition));
+      this.indexManager.repositionColumns(reposition);
+      this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
+    }
+    this.rowCodec = rowCodec;
+  }
 
-    // Only once the write is staged, so a refused write leaves this instance as it was. Same
-    // name rule as the record's (withCheckConstraint), so the two lists stay alike.
-    const name = check.name?.toLowerCase();
-    this.tableSchema = {
-      ...this.tableSchema,
-      checkConstraints: [
-        ...this.tableSchema.checkConstraints.filter(existing => name === undefined || existing.name?.toLowerCase() !== name),
-        check,
-      ],
-    };
+  /**
+   * Why this instance cannot drop the column at `position` without rewriting stored data, as
+   * {@link columnDropBlockers} phrases it: what its own schema keys on the column, else any index
+   * tree it maintains over it. Mirrors the engine's catalog entry in the normal case; asked anyway,
+   * since {@link republishColumnLayout} cannot renumber a maintained tree that covers the column.
+   */
+  columnDropBlockers(position: number): string[] {
+    const own = columnDropBlockers(this.tableSchema, position);
+    if (own.length > 0 || !this.indexManager) {
+      return own;
+    }
+    const maintained = this.indexManager.getAllMaintainedIndexes();
+    return columnDropBlockers({ columns: this.tableSchema.columns, primaryKeyDefinition: [], indexes: maintained }, position);
   }
 
   /**
@@ -3321,7 +3889,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Stage an entry for EVERY committed row into each named index tree, then flush
+   * Stage an entry for every committed row each named index admits into its tree, then flush
    * only those trees. The single populate path: `addIndex` uses it to build a
    * brand-new index, and the already-persisted branch uses it to close the gap for
    * rows committed while this connection was detached from an index it has now
@@ -3331,9 +3899,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * that received entries is handed to the batch, which lands it at `endSchemaBatch` BEFORE
    * the catalog commit that lists its index — one commit for the whole apply rather than one
    * per index, and never a listed index whose entries are missing. A tree this instance
-   * INVENTED that received nothing (the table has no rows) is neither flushed nor deferred:
-   * it is left exactly as CREATE TABLE leaves an unwritten main tree (see the
-   * create-on-missing NOTE in doInitialize). A later open of the never-committed collection
+   * INVENTED that received nothing (the table has no rows, or none its predicate admits) is
+   * neither flushed nor deferred: it is left exactly as CREATE TABLE leaves an unwritten main
+   * tree (see the create-on-missing NOTE in doInitialize). A later open of the never-committed collection
    * invents the same empty tree, and the first real write rides the next DML commit because
    * {@link reconcileMaintainedIndexes} has already registered it with the transaction bridge.
    *
@@ -3362,9 +3930,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    * the same mid-DML) and is narrowed by it: only NEWLY ATTACHED trees are synced, and
    * the caller cannot have staged into those — they were attached microseconds ago.
    *
-   * NOTE: `predicate` (partial indexes) is not honoured here, matching
-   * insertIndexEntries on the live DML path. Backfill and live maintenance therefore
-   * agree; both over-populate a partial index. Fix them together or not at all.
+   * A partial index is given an entry only for the rows its predicate admits
+   * (`IndexManager.admits`, the rule the live DML paths stage by).
    *
    * NOTE: backfill only ADDS entries, never purges. An entry a detached writer left
    * behind (its UPDATE moved the row off that indexed value, or its DELETE removed the
@@ -3406,16 +3973,18 @@ export class OptimysticVirtualTable extends VirtualTable {
     // question is only ever "is there anything to copy at all". Outside a batch the
     // flush below still runs when the scan is skipped — a freshly INVENTED tree holds
     // uncommitted header/root blocks even though no row staged anything into it.
-    // `stagedAny` is per call for the same reason: every target receives every row.
-    let stagedAny = false;
+    // What each target received is per target: a partial index admits only some rows,
+    // so one target can receive nothing while another receives rows.
+    const staged = new Set<string>();
     if (!await this.hasNoRowsToBackfill()) {
       await collection.update();
       for await (const { row, primaryKey } of walkDecodedRows(collection, rowCodec)) {
-        for (const { descriptor, tree } of targets) {
+        for (const { name, descriptor, tree } of targets) {
+          if (!manager.admits(descriptor, row)) continue;
           const treeKey = indexEntryKey(manager.createIndexKey(descriptor, row), primaryKey);
           await tree.stage([[treeKey, [treeKey, primaryKey]]]);
+          staged.add(name);
         }
-        stagedAny = true;
       }
     }
 
@@ -3424,7 +3993,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         // Invented and given nothing: leave it unwritten, like an unwritten main tree (see
         // this method's doc). `committedRevision() === undefined` is the invented STATE,
         // which that accessor documents as safe to branch on for a freshly opened instance.
-        if (!stagedAny && tree.committedRevision() === undefined) continue;
+        if (!staged.has(name) && tree.committedRevision() === undefined) continue;
         if (!tree.hasUnsyncedChanges()) continue;
         deferFlush(name, tree);
       }
@@ -3536,6 +4105,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         rows,
         entries,
         indexKeyOf: row => manager.createIndexKey(index, row),
+        admits: row => manager.admits(index, row),
       }));
     }
     return reports;
@@ -3598,7 +4168,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     };
     const tree = await this.collectionFactory.createOrGetCollection(
       indexOptions,
-      transactor ? { transactor, isActive: true, collections: new Map(), stampId: '' } : undefined
+      transactor ? transactorOnlyState(transactor) : undefined
     );
     log(
       'index:tree-open table=%s index=%s uri=%s collection=%s node=%s',
@@ -3671,7 +4241,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         manager.registerIndexTree(idx.name, tree);
       }
       // Idempotent (keyed by collection id) — see TransactionBridge.registerCollection.
-      this.txnBridge.registerCollection(tree.getCollection());
+      this.registerTree(tree);
     }
     return attached;
   }
@@ -3761,6 +4331,11 @@ export class OptimysticVirtualTable extends VirtualTable {
     return this.schemaManager;
   }
 
+  /** Whether the full initialization ({@link initialize}) has completed. */
+  get initialized(): boolean {
+    return this.isInitialized;
+  }
+
   /**
    * Forget that this table's schema is persisted. Called by the module when the end-of-batch
    * catalog commit of an `APPLY SCHEMA` failed after this table was created or gained an
@@ -3774,7 +4349,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * The index list is refreshed from what the IndexManager maintains first: `tableSchema`
    * is the object CREATE TABLE handed over, and Quereus's CREATE INDEX REPLACES the engine's
    * TableSchema (`appendIndexToTableSchema` returns a new object) rather than mutating this
-   * one — so without the refresh the re-persist would drop every index added since.
+   * one — so without the refresh the re-persist would drop every index added since. The
+   * IndexManager's descriptors carry the tags each index was CREATED with, so the engine's
+   * current tags are copied back on afterwards; without that, the re-persist would undo an
+   * `alter index … set tags` the failed commit was carrying.
    *
    * `withheldIndexes` names indexes whose tree the batch deferred and then failed to land.
    * They are left out of the refresh, along with any UNIQUE constraint derived from them
@@ -3801,6 +4379,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             uc => uc.derivedFromIndex === undefined || !withheldIndexes.has(uc.derivedFromIndex),
           ),
         };
+      }
+      const current = this.db.schemaManager.findTable(this.tableName, this.schemaName);
+      if (current) {
+        this.tableSchema = withTagsOf(this.tableSchema, current);
       }
     }
     this.isInitialized = false;
@@ -3871,6 +4453,12 @@ class OptimysticCommittedTable extends VirtualTable {
     // it. The per-scan read tracker is created and dropped inside query().
   }
 }
+
+/** Rows assumed for a table nobody has analyzed — Quereus's memory and store modules' default. */
+const UNKNOWN_TABLE_ROWS = 1000;
+
+/** Fraction of a table one equality tuple is assumed to match when `analyze` statistics cannot say. */
+const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
 
 /**
  * Optimystic Virtual Table Module
@@ -3951,30 +4539,54 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * whose DROP staged a gravestone — nothing can re-persist those, so the failure log names
    * them; `deferred` the populated index trees of each manager's tables whose flush was
    * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
-   * it was deferred), with the table and index each belongs to.
+   * it was deferred), with the table and index each belongs to; `adopted` the catalog-only
+   * changes the apply found already in a record, so their undo stays off it (see
+   * {@link alterCatalogOnly}).
    */
   private schemaBatch?: {
     managers: Set<SchemaManager>;
     written: Map<SchemaManager, Set<string>>;
     dropped: Map<SchemaManager, Set<string>>;
     deferred: Map<SchemaManager, Map<Tree<string, IndexEntry>, { tableKey: string; indexName: string }>>;
+    adopted: AdoptedChanges;
   };
 
   /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
   private readonly followedDatabases = new WeakSet<Database>();
+
+  /**
+   * The tag saves {@link followTagChanges} has queued, one after another, so two tag statements
+   * in one exec land in order. Never rejects: each step catches and logs its own failure.
+   *
+   * Every hook that writes the catalog ({@link create}, {@link createIndex}, {@link dropIndex},
+   * {@link alterTable}, {@link destroy}) drains it ({@link whenCatalogPersisted}) at entry. Those
+   * writes read the record and write it back whole, so a read made before a queued save landed
+   * would put the old tags back; and inside `apply schema` the drain comes before the statement's
+   * batch checkpoint ({@link underBatchCheckpoint}), so a later statement that fails cannot
+   * withdraw an earlier one's save. Quereus runs statements one at a time and the listener fires
+   * during the statement that made the change, so draining at the next hook is enough. The lazy
+   * first-touch initialize does not drain: its record is built from the instance's `tableSchema`,
+   * which already carries the new tags, so whichever of the two writes lands second writes them.
+   * `beginSchemaBatch` and `endSchemaBatch` drain too.
+   */
+  private catalogTagWrites: Promise<void> = Promise.resolve();
 
   constructor(
     private collectionFactory: CollectionFactory,
     private txnBridge: TransactionBridge
   ) {}
 
+  /** Quereus registered this module on `db`: listen for its tag changes from the first statement. */
+  onRegister(db: Database): void {
+    this.followTagChanges(db);
+  }
+
   /**
-   * Listen, once per `Database`, for `table_modified` and hand a table this module holds
-   * its new tags ({@link OptimysticVirtualTable.followTags}). A tag change never reaches
-   * the module otherwise: Quereus swaps its own catalog entry and announces the swap.
-   * Tables of other modules miss the lookup. (A rename, the one `table_modified` that
-   * changes the name, is refused for this module's tables, so the event's name is the
-   * name the table is held under.)
+   * Listen, once per `Database`, for `table_modified` of this module's tables, and save the new
+   * tags. A tag change never reaches the module otherwise: Quereus swaps its own catalog entry
+   * and announces the swap (`commitTagUpdate` in `@quereus/quereus/src/schema/manager.ts`).
+   * Subscribed from {@link onRegister}, so a session that has only hydrated — no table
+   * instantiated yet — hears its first `alter table … set tags` too.
    */
   private followTagChanges(db: Database): void {
     if (this.followedDatabases.has(db)) {
@@ -3982,10 +4594,114 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     this.followedDatabases.add(db);
     db.schemaManager.getChangeNotifier().addListener(event => {
-      if (event.type === 'table_modified') {
-        this.tables.get(`${event.schemaName}.${event.objectName}`.toLowerCase())?.followTags(event.newObject.tags);
+      if (event.type === 'table_modified' && this.ownsTable(db, event.newObject)) {
+        this.followTableTags(event.newObject);
       }
     });
+  }
+
+  /** Whether `schema` is a table of this module, judged as the engine resolves its module. */
+  private ownsTable(db: Database, schema: TableSchema): boolean {
+    return (schema.vtabModule ?? db.schemaManager.getModule(schema.vtabModuleName)?.module) === this;
+  }
+
+  /**
+   * One `table_modified` of this module's table: the instance (when one exists) takes the new
+   * tags, and a save of them onto the table's catalog record joins {@link catalogTagWrites}.
+   * Synchronous, as Quereus's listeners are: nothing is awaited here. A table no statement has
+   * touched since hydrate has no instance and is saved through the manager it would be built
+   * with. Every structural `table_modified` (a renamed column, the engine's follow-up after
+   * CREATE INDEX or ADD CONSTRAINT) arrives here too, and its save finds the tags already
+   * saved and writes nothing. (A table rename, the one `table_modified` that changes the
+   * name, is refused for this module's tables, so the schema's name is the key the table is
+   * held under.)
+   *
+   * NOTE: each such structural event still costs one catalog read outside a batch (`ANALYZE`
+   * fires one per table). If that ever shows up, skip the save when the event's `oldObject`
+   * carries the same tags as `newObject` — giving up the re-save, on the next DDL, of tags an
+   * earlier failed save left out of the record.
+   */
+  private followTableTags(schema: TableSchema): void {
+    const tableKey = `${schema.schemaName}.${schema.name}`.toLowerCase();
+    try {
+      const table = this.tables.get(tableKey);
+      table?.followSchemaTags(schema);
+      const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(schema));
+      // Inside `apply schema` the save stages into the batch, so a failed batch commit must
+      // mark the table unpersisted like any other table the batch altered.
+      this.recordBatchEffect(manager, 'written', tableKey);
+      const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
+      this.catalogTagWrites = this.catalogTagWrites.then(() => this.saveTableTags(manager, tableKey, schema, transactor));
+    } catch (error) {
+      log(`WARN: tag change on '${tableKey}' not saved: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /** One step of {@link catalogTagWrites}: save `schema`'s tags onto the table's catalog record. */
+  private async saveTableTags(
+    manager: SchemaManager,
+    tableKey: string,
+    schema: TableSchema,
+    transactor: ITransactor | undefined
+  ): Promise<void> {
+    try {
+      const outcome = await manager.persistTags(schema.schemaName, schema.name, schema, transactor);
+      if (outcome === 'no-record') {
+        // An instance whose record never landed re-persists it, tags included, from its own
+        // `tableSchema` on its next touch (see markSchemaUnpersisted).
+        log(`tag change on '${tableKey}' not saved: the catalog holds no live record for the table`);
+      }
+    } catch (error) {
+      // NOTE: accepted tradeoff — a failed tag save is logged, not reported: Quereus has no channel back from a schema-change listener, the same as the store module; revisit if Quereus gives listeners an async or error-reporting seam.
+      log(`WARN: failed to save tag change on '${tableKey}': ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  /**
+   * Resolves once every tag change heard so far is saved to its table's catalog record (or its
+   * save has failed and been logged). An imperative `alter … set|add|drop tags` returns before
+   * its save lands, because Quereus does not await its schema-change listeners; a tag change an
+   * `apply schema` makes lands before the apply returns. A host that closes a `Database` and
+   * reopens the same storage in this process waits on this (or `plugin.dispose()`) in between.
+   */
+  async whenCatalogPersisted(): Promise<void> {
+    let drained: Promise<void>;
+    do {
+      drained = this.catalogTagWrites;
+      await drained;
+    } while (drained !== this.catalogTagWrites);
+  }
+
+  /**
+   * Refuse `operation` on `schemaName.tableName` while offline transactions that wrote the table are
+   * queued (`OfflineMode.assertNoQueuedEntries`, docs/offline-sync.md §Schema changes). Each hook that
+   * changes how a table's rows are stored calls it after its {@link whenCatalogPersisted} drain and
+   * before it writes anything, so inside `apply schema` the refused step stages nothing into the
+   * batch and the engine unwinds the apply as for any failed step. A bridge built bare has no queue.
+   */
+  private assertNoQueuedEntries(schemaName: string, tableName: string, operation: StorageShapeChange): void {
+    this.txnBridge.getOfflineMode()?.assertNoQueuedEntries({ schemaName, tableName }, operation);
+  }
+
+  /**
+   * {@link create}'s arm of the gate: a declaration over a collection that a live table already backs
+   * is refused while that table has queued transactions, unless it declares the same columns and
+   * primary key ({@link storedRowShape}) — such a re-declare reads and writes the queued rows exactly
+   * as the live table does. Every live table over the collection is judged, since two tables declared
+   * over one URI share its collections.
+   */
+  private assertRedeclarationKeepsShape(tableSchema: TableSchema): void {
+    const collectionId = this.collectionFactory.getCollectionId(this.parseTableSchema(tableSchema));
+    const shape = storedRowShape(tableSchema);
+    for (const live of this.txnBridge.tablesOf(collectionId)?.values() ?? []) {
+      const declared = this.tables.get(`${live.schemaName}.${live.tableName}`.toLowerCase())?.tableSchema;
+      // NOTE: a table the bridge records with no instance here cannot be compared, and is treated as
+      // differing. Unreachable while every queued transaction was staged through a live instance in
+      // this process; revisit when queued transactions outlive a restart (offline-sync-journal).
+      if (declared === undefined || storedRowShape(declared) !== shape) {
+        this.assertNoQueuedEntries(live.schemaName, live.tableName, 'create table');
+      }
+    }
   }
 
   /**
@@ -4013,9 +4729,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         encoding: 'json',
         rawStorageFactory: tableOptions.rawStorageFactory,
       };
-      const txnState = transactor
-        ? { transactor, isActive: true, collections: new Map(), stampId: '' }
-        : undefined;
+      const txnState = transactor ? transactorOnlyState(transactor) : undefined;
       // Write paths bring the catalog into existence; read paths must observe an
       // absent catalog as absent (undefined) rather than as a table-less database.
       return create
@@ -4046,6 +4760,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * makes an overlapping apply impossible, so a second begin is a wiring bug and throws.
    */
   async beginSchemaBatch(_db: Database, _schemaName: string): Promise<void> {
+    // A tag save already running reads and writes the catalog directly; let it land first, so
+    // the batch reads the record it wrote rather than putting the old tags back at commit.
+    await this.whenCatalogPersisted();
     if (this.schemaBatch) {
       throw new Error('Optimystic schema batch already open: beginSchemaBatch without a matching endSchemaBatch');
     }
@@ -4054,7 +4771,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       manager.beginBatch();
       managers.add(manager);
     }
-    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map() };
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted: new AdoptedChanges() };
   }
 
   /**
@@ -4098,9 +4815,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * gravestone is lost with the commit, the catalog keeps its live record past the DROP (the next
    * hydrate resurrects it, and a later CREATE over the same URI is not checked against it — the
    * same failure direction as the unbatched, best-effort {@link destroy}), so the log names those
-   * tables too.
+   * tables too. A tag change on a hydrated table no statement has touched is listed with the
+   * re-persisting tables but has no instance to mark: the first statement that touches the table
+   * builds one from the engine's catalog entry, which carries the new tags, and its initialization
+   * writes them. A restart before that loses the change; the next `apply schema` then re-emits it.
    */
   async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
+    // The apply's tag changes stage into the batch, so they commit in its one catalog commit.
+    await this.whenCatalogPersisted();
     const batch = this.schemaBatch;
     if (!batch) {
       throw new Error('Optimystic schema batch is not open: endSchemaBatch without a matching beginSchemaBatch');
@@ -4172,27 +4894,25 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * checkpoint: a throw withdraws every catalog write the statement staged — and only those
    * — so a refused CREATE (the storage-adoption guard, or a failure later in doInitialize
    * after the schema already reached the overlay) leaves no record for the end-of-batch
-   * commit to persist. On success `tableKey` is recorded under `effect` for the table's
-   * manager (the `written` / `dropped` fields of `schemaBatch`). Outside a batch this is a
-   * plain call.
+   * commit to persist. On success — when `staged` says the work's result may have staged a write —
+   * `tableKey` is recorded under `effect` for `manager`, the table's catalog manager
+   * ({@link recordBatchEffect}) — taken rather than read off an instance, since a catalog-only
+   * ALTER on a hydrated table no statement has touched has none. Outside a batch this is a plain
+   * call.
    */
   private async underBatchCheckpoint<T>(
-    table: OptimysticVirtualTable,
+    manager: SchemaManager,
     effect: 'written' | 'dropped',
     tableKey: string,
-    work: () => Promise<T>
+    work: () => Promise<T>,
+    staged: (result: T) => boolean = () => true
   ): Promise<T> {
-    const batch = this.schemaBatch;
-    if (!batch) {
-      return work();
-    }
-    const manager = table.catalogManager;
     const checkpoint = manager.checkpointBatch();
     try {
       const result = await work();
-      const affected = batch[effect].get(manager) ?? new Set<string>();
-      affected.add(tableKey);
-      batch[effect].set(manager, affected);
+      if (staged(result)) {
+        this.recordBatchEffect(manager, effect, tableKey);
+      }
       return result;
     } catch (error) {
       if (checkpoint) {
@@ -4200,6 +4920,20 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
       throw error;
     }
+  }
+
+  /**
+   * Inside an open `APPLY SCHEMA` batch, record that `tableKey` (whose catalog record `manager`
+   * holds) was `written` or `dropped` by it — the lists {@link endSchemaBatch} recovers from when
+   * that manager's commit fails. Nothing outside a batch.
+   */
+  private recordBatchEffect(manager: SchemaManager, effect: 'written' | 'dropped', tableKey: string): void {
+    const batch = this.schemaBatch;
+    if (!batch) {
+      return;
+    }
+    const affected = batch[effect].get(manager) ?? new Set<string>();
+    batch[effect].set(manager, affected.add(tableKey));
   }
 
   /**
@@ -4243,7 +4977,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       return existing;
     }
 
-    this.followTagChanges(db);
     const tableOptions = options ?? this.parseTableSchema(tableSchema);
     const schemaManager = this.createSchemaManager(tableOptions);
     const table = new OptimysticVirtualTable(
@@ -4269,19 +5002,21 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     db: Database,
     tableSchema: TableSchema
   ): Promise<OptimysticVirtualTable> {
+    await this.whenCatalogPersisted();
     const tableKey = `${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase();
 
     // Check if table already exists
     if (this.tables.has(tableKey)) {
       throw new Error(`Optimystic table '${tableSchema.name}' already exists in schema '${tableSchema.schemaName}'.`);
     }
+    this.assertRedeclarationKeepsShape(tableSchema);
 
     const table = await this.instantiateTable(db, tableSchema);
 
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
     try {
-      await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+      await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
         await table.initialize();
         await table.ensureConnectionRegistered();
       });
@@ -4293,6 +5028,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // instance stayed cached. Nothing was registered with Quereus yet.
       this.tables.delete(tableKey);
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
+      table.withdrawOfflinePolicy();
       throw error;
     }
 
@@ -4349,8 +5086,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   async verifyIndexes(db: Database, tableName: string, schemaName = 'main'): Promise<IndexIntegrityReport[]> {
     const catalogEntry = db.schemaManager.findTable(tableName, schemaName);
     if (catalogEntry) {
-      const owner = catalogEntry.vtabModule ?? db.schemaManager.getModule(catalogEntry.vtabModuleName)?.module;
-      if (owner !== this) {
+      if (!this.ownsTable(db, catalogEntry)) {
         throw new Error(
           `Cannot verify indexes of '${schemaName}.${tableName}': it is not an Optimystic table ` +
           `(module '${catalogEntry.vtabModuleName}').`,
@@ -4370,15 +5106,16 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * join an in-flight writer transaction) and never registers a connection.
    *
    * NOTE: a connect is not run under the open `APPLY SCHEMA` batch's per-statement
-   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, alterTable's CHECK arm
-   * and destroy — and the first-touch initialize of createIndex and that arm runs inside it —
-   * but not plain connects). A first touch of a hydrated table mid-apply whose persisted record
-   * differs from the hydrated shape re-persists it from here, and that write stays in the
-   * overlay if the statement then throws. One statement does reach this today: an ADD COLUMN
-   * of a NOT NULL column with no default makes Quereus read a row before alterTable refuses
-   * the arm. Fine while that stays rare — before the batch that write was committed before the
-   * throw anyway. If a mid-apply statement that commonly fails after its connect appears, wrap
-   * it too.
+   * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, dropIndex, alterTable's
+   * catalog-only arms and destroy — and the first-touch initialize of createIndex and dropIndex
+   * runs inside it — but not plain connects). A first touch of a hydrated table mid-apply whose
+   * persisted record differs from the hydrated shape re-persists it from here, and that write
+   * stays in the overlay if the statement then throws. Two statements reach this today, both
+   * reading rows before alterTable runs: an ADD COLUMN of a NOT NULL column with no default
+   * (refused after the read), and ADD CONSTRAINT … CHECK, whose stored rows Quereus checks
+   * against the new CHECK (see the NOTE on `addCheckConstraint`). Fine while a failure after
+   * the connect stays rare — before the batch that write was committed before the throw anyway.
+   * If a mid-apply statement that commonly fails after its connect appears, wrap it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -4490,6 +5227,28 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
+   * The collections `table` backs — its main tree and its index trees, the instances every statement
+   * reads and stages through — after initializing the table as a statement's first touch would
+   * ({@link resolveConnectedTable}'s live path: instantiated from the engine's catalog if no statement
+   * has used it yet, initialized, its connection registered). `undefined` when the engine's catalog
+   * does not know the table. For the offline mode's restore after a restart
+   * (`OfflineMode.restore`), which re-stages a journaled transaction's segments into these instances
+   * (docs/offline-sync.md §Restore after a restart). Whatever initialization throws propagates: the
+   * restore reads a `BlockUnavailableError` along the cause chain as "defer", anything else as a fault.
+   */
+  async collectionsOfTable(db: Database, table: QualifiedTableName): Promise<readonly Collection<any>[] | undefined> {
+    const resolved = await this.lookupOrInstantiate(db, table.schemaName, table.tableName);
+    if (!resolved) return undefined;
+    await resolved.table.initialize();
+    if (resolved.fresh) await resolved.table.ensureConnectionRegistered();
+    const registry = this.txnBridge.getCollectionRegistry();
+    return this.txnBridge.collectionsOf(table).flatMap(id => {
+      const collection = registry.get(id);
+      return collection === undefined ? [] : [collection];
+    });
+  }
+
+  /**
    * The session's `default_vtab_args` when THIS module is the session's default module —
    * the arguments a `create table` without a `using` clause would run with — else nothing.
    * A different default module's arguments say nothing about how optimystic tables bind.
@@ -4535,12 +5294,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     indexSchema: IndexSchema
   ): Promise<void> {
+    await this.whenCatalogPersisted();
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
 
     if (!resolved) {
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot create index.`);
     }
+    this.assertNoQueuedEntries(schemaName, tableName, 'create index');
     const { table, fresh } = resolved;
 
     // Inside an `APPLY SCHEMA` batch the index trees this statement populates land at
@@ -4564,7 +5325,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // its connection the way connect's live path does (addIndex would initialize on its own,
     // but not register); if that initialize throws, the instance stays cached uninitialized
     // and the next touch retries, exactly as after a failed connect.
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+    await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
       if (fresh) {
         await table.initialize();
         await table.ensureConnectionRegistered();
@@ -4595,15 +5356,17 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     indexName: string
   ): Promise<void> {
+    await this.whenCatalogPersisted();
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
 
     if (!resolved) {
       throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot drop index.`);
     }
+    this.assertNoQueuedEntries(schemaName, tableName, 'drop index');
     const { table, fresh } = resolved;
 
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
+    await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
       if (fresh) {
         await table.initialize();
         await table.ensureConnectionRegistered();
@@ -4623,24 +5386,28 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * ALTER TABLE on an Optimystic table. The hook exists for ONE arm: a CHECK added by
-   * `ADD CONSTRAINT` — what `apply schema` emits when a later schema version declares a new
-   * named table-level CHECK — which must reach the table's catalog record
-   * ({@link OptimysticVirtualTable.addCheckConstraint}). Without the hook Quereus keeps such a
-   * CHECK in its in-memory catalog only, and a restarted machine that only hydrates stops
-   * enforcing it.
+   * ALTER TABLE on an Optimystic table. The hook exists for the arms that change nothing but the
+   * table's catalog record ({@link alterCatalogOnly}): a CHECK added by `ADD CONSTRAINT` and one
+   * removed by `DROP CONSTRAINT`, a nullable column added by `ADD COLUMN` ({@link addColumn}) and
+   * a column no key, index or constraint uses removed by `DROP COLUMN` ({@link dropColumn}) — what
+   * `apply schema` emits when a later schema version changes a table that way. Each must reach the
+   * record: without the hook Quereus keeps such a change in its in-memory catalog only, and a
+   * restarted machine that only hydrates gets the old table back.
    *
    * Having the hook takes every other arm off Quereus's path for modules without one, so each
    * answers here as it did there: RENAME COLUMN renames schema-only
-   * ({@link renameColumnSchemaOnly}); the rest are refused as UNSUPPORTED in Quereus's own
-   * words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes UNSUPPORTED from here
-   * as "fall back to a rebuild", which it then refuses because this module has no `renameTable`.
+   * ({@link renameColumnSchemaOnly}); the rest — DROP CONSTRAINT of a UNIQUE or FOREIGN KEY, and
+   * the column shapes the two column arms do not accept, included — are refused as UNSUPPORTED in
+   * Quereus's own words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes
+   * UNSUPPORTED from here as "fall back to a rebuild", which it then refuses because this module
+   * has no `renameTable`.
    *
    * NOTE: what does change is precedence. Quereus runs an arm's pre-dispatch checks only for a
    * module that has the hook, and those now come before these refusals — ADD COLUMN of a
    * NOT NULL column with no default over a table with rows reports the missing default (after
-   * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed. Both are
-   * still refused and change nothing; only the message differs.
+   * reading one row), a malformed ADD UNIQUE / FOREIGN KEY reports what is malformed, and DROP
+   * COLUMN of a column a CHECK or a generated column names reports that. All are still refused
+   * and change nothing; only the message differs.
    *
    * NOTE: Quereus's materialized-view reshape paths also call this hook, but only for a module
    * with `getBackingHost`, which this one lacks. If it ever gains it, those reshapes get these
@@ -4656,6 +5423,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableName: string,
     change: SchemaChangeInfo
   ): Promise<TableSchema> {
+    await this.whenCatalogPersisted();
     const tableSchema = db.schemaManager.findTable(tableName, schemaName);
     if (!tableSchema) {
       throw new QuereusError(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot alter.`, StatusCode.ERROR);
@@ -4667,16 +5435,21 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     switch (change.type) {
       case 'addConstraint':
         return change.constraint.type === 'check'
-          ? await this.addCheckConstraint(db, tableSchema, change.constraint)
+          ? await this.addCheckConstraint(tableSchema, change.constraint)
           : refuse('ADD CONSTRAINT');
       case 'renameColumn':
         return renameColumnSchemaOnly(tableSchema, change.oldName, change.newName);
       case 'addColumn':
-        return refuse('ALTER TABLE ADD COLUMN');
+        return await this.addColumn(db, tableSchema, change, refuse);
       case 'dropColumn':
-        return refuse('ALTER TABLE DROP COLUMN');
-      case 'dropConstraint':
-        return refuse('ALTER TABLE DROP CONSTRAINT');
+        return await this.dropColumn(tableSchema, change.columnName);
+      case 'dropConstraint': {
+        // Quereus has resolved the name to one constraint class (NOTFOUND / ambiguity raised) before calling.
+        const check = findNamed(tableSchema.checkConstraints, change.constraintName);
+        return check
+          ? await this.dropCheckConstraint(tableSchema, check, change.constraintName)
+          : refuse('ALTER TABLE DROP CONSTRAINT');
+      }
       case 'renameConstraint':
         return refuse('ALTER TABLE RENAME CONSTRAINT');
       case 'alterColumn':
@@ -4687,44 +5460,250 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * The CHECK arm of {@link alterTable}. The constraint is built by Quereus's own builder over
-   * the engine's catalog entry, exactly as its CHECK arm for a module without `alterTable` did,
-   * so an unnamed CHECK gets the same minted name. The table is resolved as {@link createIndex}
-   * resolves it — a hydrated table no statement has touched yet is instantiated and, inside the
-   * statement's batch checkpoint, initialized and registered — so the persisted write lands in
-   * an open `APPLY SCHEMA` batch and commits with the rest of the apply.
+   * The ADD CONSTRAINT … CHECK arm of {@link alterTable}, through {@link alterCatalogOnly}. The
+   * constraint is built by Quereus's own builder over the engine's catalog entry, exactly as its
+   * CHECK arm for a module without `alterTable` did, so an unnamed CHECK gets the same minted
+   * name. Enforced from the next statement; Quereus has already checked the stored rows against
+   * it before calling, and nothing here reads or rewrites a row.
+   *
+   * NOTE: accepted tradeoff — a record holding a CHECK of this name with another body is
+   * overwritten (local DDL wins, {@link withCheckConstraint}), so a machine applying an OLDER body
+   * over a newer one another machine committed puts the older one back, and if a later step of
+   * that apply fails, the undo of this owned write removes the CHECK from the record altogether.
+   * Reaching it takes two different upgrades of one table racing; revisit if hosts ever apply
+   * schema versions out of order.
+   *
+   * NOTE: Quereus's check of the stored rows is a `select` over the table, so on a hydrated table
+   * no statement has touched it builds the table instance before this arm runs — the first touch
+   * {@link alterCatalogOnly} itself avoids — and that instance's first initialize writes this
+   * machine's description of the table over a record another machine upgraded since this one
+   * hydrated (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
    */
-  private async addCheckConstraint(
-    db: Database,
-    tableSchema: TableSchema,
-    constraint: AddedConstraint
-  ): Promise<TableSchema> {
+  private addCheckConstraint(tableSchema: TableSchema, constraint: AddedConstraint): Promise<TableSchema> {
     const check = buildCheckConstraintSchema(
       constraint,
       tableSchema.checkConstraints.length,
       collectTableConstraintNames(tableSchema),
     );
+    const after = checkConstraintToStored(check);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'add CHECK constraint',
+      kind: 'check',
+      // buildCheckConstraintSchema always names the CHECK: it mints `check_<n>` for an unnamed one.
+      name: check.name!,
+      before: undefined,
+      after,
+      classify: record => classifyCheckChange(record, { op: 'add', after }),
+      editRecord: record => withCheckConstraint(record, check),
+      editSchema: schema => withCheck(schema, check),
+    });
+  }
 
+  /**
+   * The DROP CONSTRAINT arm of {@link alterTable} for a CHECK, through {@link alterCatalogOnly}:
+   * `check` is the engine's, matched by `name` case-insensitively. An unnamed CHECK is dropped by
+   * the name Quereus minted for it, which the record carries too.
+   */
+  private dropCheckConstraint(tableSchema: TableSchema, check: RowConstraintSchema, name: string): Promise<TableSchema> {
+    const before = checkConstraintToStored(check);
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'drop CHECK constraint',
+      kind: 'check',
+      name,
+      before,
+      after: undefined,
+      classify: record => classifyCheckChange(record, { op: 'drop', before }),
+      editRecord: record => withoutCheckConstraint(record, name),
+      editSchema: schema => withoutCheck(schema, name),
+    });
+  }
+
+  /**
+   * The ADD COLUMN arm of {@link alterTable}, through {@link alterCatalogOnly}, for a column that
+   * needs nothing written into the rows already stored: one that is nullable, has no DEFAULT, is
+   * not GENERATED and declares no inline CHECK, UNIQUE, FOREIGN KEY or key, appended at the end.
+   * Rows are stored keyed by column name ({@link RowCodec}), so a row written before the column
+   * existed reads it as NULL and no row is rewritten. An explicit COLLATE and column tags are
+   * accepted. Any other column is refused in Quereus's words for a module without the hook.
+   *
+   * The column is resolved exactly as Quereus's memory module resolves it — `columnDefToSchema`
+   * under the session's `default_column_nullability` and `default_collation` — so the column this
+   * machine saves is the one every machine running the same statement saves, and a second machine
+   * finds its own column already in the record ({@link classifyColumnChange}).
+   */
+  private addColumn(
+    db: Database,
+    tableSchema: TableSchema,
+    change: AddColumnChange,
+    refuse: (operation: string) => never
+  ): Promise<TableSchema> {
+    const column = columnDefToSchema(
+      change.columnDef,
+      db.options.getStringOption('default_column_nullability') === 'not_null',
+      db.options.getStringOption('default_collation'),
+      name => db.isCollationRegistered(name),
+    );
+    const appends = change.insertAtIndex === undefined || change.insertAtIndex === tableSchema.columns.length;
+    const needsNoRowWritten = !column.notNull && column.defaultValue === null && !column.generated && !column.primaryKey
+      && change.columnDef.constraints.every(constraint => CATALOG_ONLY_COLUMN_CONSTRAINTS.has(constraint.type));
+    if (!appends || !needsNoRowWritten) {
+      refuse('ALTER TABLE ADD COLUMN');
+    }
+    if (change.backfillEvaluator !== undefined) {
+      // Quereus builds one only from a DEFAULT or a generated expression, both refused above.
+      throw new QuereusError(
+        `ALTER TABLE ADD COLUMN '${column.name}' on Optimystic table '${tableSchema.name}' carried a per-row backfill for a column with no value source`,
+        StatusCode.INTERNAL,
+      );
+    }
+    const after = columnSchemaToStored(column);
+    this.assertNoQueuedEntries(tableSchema.schemaName, tableSchema.name, 'add column');
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'add column',
+      kind: 'column',
+      name: column.name,
+      before: undefined,
+      after,
+      classify: record => classifyColumnChange(record, { op: 'add', after }),
+      editRecord: record => withColumn(record, column),
+      editSchema: schema => withColumnAppended(schema, column),
+      layout: { kind: 'append' },
+    });
+  }
+
+  /**
+   * The DROP COLUMN arm of {@link alterTable}, through {@link alterCatalogOnly}, for a column
+   * nothing keys stored data on: not in the primary key, any index (declared, or a tree enforcing
+   * a UNIQUE constraint), any UNIQUE constraint or this table's own FOREIGN KEY, and not GENERATED
+   * ({@link columnDropBlockers}). Rows keep the dropped column's field until they are rewritten;
+   * nothing reads it. Quereus has already refused a column a CHECK, a DEFAULT, a generated
+   * expression, a partial index's predicate, another table's FOREIGN KEY or an assertion names.
+   *
+   * Judged here against this machine's catalog entry and table instance, and again against the
+   * fresh record ({@link classifyColumnChange}), which can hold an index another machine added that
+   * this machine has not hydrated.
+   *
+   * Quereus marks DROP COLUMN irreversible: a failed `apply schema` never re-adds the column. It
+   * runs here as an undo only as the undo of an ADD COLUMN, which {@link alterCatalogOnly} keeps off
+   * the record when that ADD was adopted.
+   *
+   * NOTE: accepted tradeoff — a later ADD COLUMN of a dropped name reads the values rows still
+   * carry under it, as they were stored (the row codec does not convert them to the new column's
+   * type), since no row is rewritten on the drop. Refusing the name would need a permanent list of
+   * dropped names in the record, and rewriting every row on the drop defeats catalog-only; a table
+   * re-declared with a different column list reads stale fields the same way. Revisit if a host
+   * needs to reuse a dropped column name.
+   */
+  private dropColumn(tableSchema: TableSchema, columnName: string): Promise<TableSchema> {
+    const position = tableSchema.columnIndexMap.get(columnName.toLowerCase());
+    if (position === undefined) {
+      // Quereus resolves the column before calling; kept as its own words in case it ever does not.
+      throw new QuereusError(`Column '${columnName}' not found in table '${tableSchema.name}'`, StatusCode.ERROR);
+    }
+    const column = tableSchema.columns[position]!;
+    const table = this.tables.get(`${tableSchema.schemaName}.${tableSchema.name}`.toLowerCase());
+    const blockers = new Set([...columnDropBlockers(tableSchema, position), ...(table?.columnDropBlockers(position) ?? [])]);
+    if (blockers.size > 0) {
+      throw new QuereusError(dropColumnRefusal(tableSchema.name, column.name, [...blockers], 'engine'), StatusCode.UNSUPPORTED);
+    }
+    const before = columnSchemaToStored(column);
+    this.assertNoQueuedEntries(tableSchema.schemaName, tableSchema.name, 'drop column');
+    return this.alterCatalogOnly(tableSchema, {
+      operation: 'drop column',
+      kind: 'column',
+      name: column.name,
+      before,
+      after: undefined,
+      classify: record => classifyColumnChange(record, { op: 'drop', before }),
+      editRecord: record => withoutColumn(record, column.name),
+      editSchema: schema => withoutColumnAt(schema, position),
+      layout: { kind: 'remove', position },
+    });
+  }
+
+  /**
+   * Carry out one catalog-only ALTER ({@link CatalogOnlyAlter}): the change reaches the table's
+   * catalog record — or is found there already — and this machine's engine catalog and table
+   * instance. No row is read or written.
+   *
+   * The table's catalog manager is its instance's when one exists, else the one it would be built
+   * with, as {@link followTableTags} resolves it. A table with no instance is NOT instantiated: an
+   * instance built from this machine's catalog entry compares that entry with the record on its
+   * first initialize and rewrites the record on any difference, so on a machine that hydrated
+   * before another machine upgraded the table it would put the old description back
+   * (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record). An
+   * instance that exists but is not initialized is initialized first, inside the statement's batch
+   * checkpoint, so a record that never landed (`markSchemaUnpersisted`) is re-persisted before it
+   * is extended.
+   *
+   * The record is read fresh and judged ({@link CatalogOnlyAlter.classify}). An owned change is
+   * written under the batch checkpoint, so a throw withdraws it and a failed batch commit marks
+   * the table unpersisted; an adopted one writes nothing. Either way the instance and the engine's
+   * entry take the edit. The returned schema is built from the engine's entry, never the
+   * instance's, which differs from it on purpose (see {@link OptimysticVirtualTable.followSchemaTags}).
+   *
+   * Inside `apply schema` a change the record already held is recorded as adopted, and a later
+   * change that undoes it ({@link AdoptedChanges}) — Quereus unwinding the apply after a later step
+   * failed — changes this machine's engine catalog and instance only: the record holds what another
+   * machine committed, and undoing a change this machine did not make would remove it. Outside a
+   * batch no undo follows, so nothing is recorded.
+   */
+  private async alterCatalogOnly(tableSchema: TableSchema, change: CatalogOnlyAlter): Promise<TableSchema> {
     const { schemaName, name: tableName } = tableSchema;
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
-    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName, tableSchema);
-    if (!resolved) {
-      throw new Error(`Optimystic table '${tableName}' not found in schema '${schemaName}'. Cannot add CHECK constraint.`);
-    }
-    const { table, fresh } = resolved;
+    const table = this.tables.get(tableKey);
+    const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(tableSchema));
+    const adopted = this.schemaBatch?.adopted;
+    const adoptedKey = adoptedChangeKey(tableKey, change.kind, change.name);
+    const undoesAdopted = adopted?.undoes(adoptedKey, change.after) ?? false;
 
-    await this.underBatchCheckpoint(table, 'written', tableKey, async () => {
-      if (fresh) {
-        await table.initialize();
-        await table.ensureConnectionRegistered();
+    // An adopted or undone change stages nothing, so it must not mark the table `written`: a failed
+    // batch commit would then re-persist this machine's description, which after an undo kept off
+    // the record is older than the record. The first-touch initialize can stage a write of its own.
+    const initializesHere = table !== undefined && !table.initialized;
+    const outcome = await this.underBatchCheckpoint(manager, 'written', tableKey, async () => {
+      await table?.initialize();
+      if (undoesAdopted) {
+        log('%s %s on %s: undoes a change this apply found already saved; this machine\'s catalog only', change.operation, change.name, tableKey);
+        return 'undone';
       }
-      await table.addCheckConstraint(check);
-    });
+      return await this.saveCatalogOnly(manager, tableSchema, change);
+    }, outcome => outcome === 'owned' || initializesHere);
+    table?.applyCatalogOnlyEdit(change.editSchema, change.layout);
+    if (adopted) {
+      if (outcome === 'undone') {
+        adopted.release(adoptedKey);
+      } else if (outcome === 'adopted') {
+        adopted.adopt(adoptedKey, change.before);
+      }
+    }
+    return change.editSchema(tableSchema);
+  }
 
-    return {
-      ...tableSchema,
-      checkConstraints: Object.freeze([...tableSchema.checkConstraints, check]),
-    };
+  /** The record half of {@link alterCatalogOnly}: read the record fresh, judge it, and write an owned change. */
+  private async saveCatalogOnly(
+    manager: SchemaManager,
+    tableSchema: TableSchema,
+    change: CatalogOnlyAlter
+  ): Promise<'owned' | 'adopted'> {
+    const { schemaName, name: tableName } = tableSchema;
+    const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
+    const record = await manager.getSchemaFresh(schemaName, tableName, transactor);
+    if (!record) {
+      throw new Error(`Schema not found for Optimystic table '${schemaName}.${tableName}'. Cannot ${change.operation}.`);
+    }
+    const verdict = change.classify(record);
+    switch (verdict.kind) {
+      case 'refused':
+        throw new QuereusError(verdict.message, verdict.code);
+      case 'owned':
+        await manager.storeStoredSchema(change.editRecord(record), transactor);
+        break;
+      case 'adopted':
+        log('%s %s on %s.%s: the catalog record already holds it; nothing written', change.operation, change.name, schemaName, tableName);
+        break;
+    }
+    return verdict.kind;
   }
 
   /**
@@ -4735,29 +5714,29 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     tableInfo: TableSchema,
     request: BestAccessPlanRequest
   ): BestAccessPlanResult {
-    // Quereus 4.19 retired the flat `TableSchema.estimatedRows` this used to read. The row
-    // count now reaches a module through the REQUEST — `rule-select-access-path` passes the
-    // catalog's number down as `request.estimatedRows`, `undefined` when the table has never
-    // been ANALYZEd — which is also the field a module that can size itself would substitute
-    // its own count into. Reading the request rather than `tableInfo.statistics` directly is
-    // what keeps this module's answer consistent with the plan costed around it.
+    // The row count reaches a module through the REQUEST: `rule-select-access-path` passes the
+    // catalog's `analyze` figure down as `request.estimatedRows`, `undefined` when nobody has
+    // analyzed the table. `??`, not `||`: a measured 0 is an empty table and is priced as one.
     //
-    // `||` rather than `??`, matching the shipped memory module's `request.estimatedRows || 1000`:
-    // it collapses an ANALYZEd-empty table (a real 0) into the default. Quereus documents that
-    // collapse at its own `|| default` sites and calls it harmless — any plan over 0 rows is
-    // cheap either way — so this stays deliberately identical to the reference implementation
-    // rather than quietly diverging from it.
+    // An unknown size must be the SAME number for every access to this table. Quereus takes an
+    // index seek's row count from this answer but a sequential scan's from the catalog, which
+    // for an un-analyzed table is unknown and becomes the join rule's own default. A fallback
+    // larger than the engine's put the two sides of a join on different scales: a filtered seek
+    // reported 1000× the rows of the unfiltered scan of a table of equal unknown size, and the
+    // join planned as a nested loop issuing one seek per outer row (GitHub #44). 1000 is the
+    // last-resort default Quereus's memory and store modules both use.
     //
-    // NOTE: the default is 1,000,000 where the memory module uses 1,000. Unchanged here on
-    // purpose: it predates this migration, it biases an unanalyzed table toward index seeks
-    // (the right instinct for a distributed store where a full scan is a network cost), and
-    // retuning it is a costing decision that wants its own measurement, not a drive-by.
-    const tableRowCount = request.estimatedRows || 1000000;
+    // NOTE: if full scans of a network-backed table should look costlier than local ones, say so
+    // through a per-read cost (`expectedLatencyMs`, whose absence is explained at the
+    // `concurrencyMode` doc on this class) or by sizing the table (backlog
+    // `feat-optimystic-persisted-planner-statistics`) — never by inflating this row count, which
+    // every join and aggregate above the access reads as cardinality.
+    const tableRowCount = request.estimatedRows ?? UNKNOWN_TABLE_ROWS;
     const tableScanCost = Math.max(1000, tableRowCount);
 
     // Track best plan found
     let bestCost = tableScanCost;
-    let bestRows = tableRowCount;
+    let bestRows = Math.max(1, tableRowCount);
     let bestHandledFilters: boolean[] = request.filters.map(() => false);
     let bestOrdering: OrderingSpec[] | undefined = undefined;
     let bestIsSet = false;
@@ -4818,7 +5797,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // optimystic-tree-comparator-lexicographic-missort).
         const selectivity = 0.25;
         const rangeCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
-        const rangeRows = Math.floor(tableRowCount * selectivity);
+        const rangeRows = Math.max(1, Math.floor(tableRowCount * selectivity));
 
         if (rangeCost < bestCost) {
           bestCost = rangeCost;
@@ -4830,13 +5809,19 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
     }
 
-    // Check secondary indexes if we haven't found a PK equality match
-    if (bestCost > 10 && tableInfo.indexes && tableInfo.indexes.length > 0) {
+    // Secondary indexes only when no full primary-key equality made this a point seek. A fully
+    // matched unique index prices within a fraction of that seek, and the primary key must win
+    // regardless of how close the two costs come.
+    if (!fullPkEquality && tableInfo.indexes && tableInfo.indexes.length > 0) {
       for (const index of tableInfo.indexes) {
+        // A partial index holds only the rows its predicate admits, so a seek through it drops
+        // matching rows outside the predicate. Never planned through, as Quereus's memory module
+        // (`gatherAvailableIndexes` in `@quereus/quereus/src/vtab/memory/module.ts`) does; backlog
+        // `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
+        if (index.predicate !== undefined) continue;
         // Try to match constraints to this index
         const indexColumns = index.columns.map(col => col.index);
-        let selectivity = 1.0;
-        let matchedFilterIndices: number[] = [];
+        const matchedFilterIndices: number[] = [];
 
         // Check if we have equality constraints on the index columns
         for (let colIdx = 0; colIdx < indexColumns.length; colIdx++) {
@@ -4850,9 +5835,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
             if (filter.columnIndex === indexCol && filter.op === '=') {
               matchedFilterIndices.push(i);
               foundEq = true;
-              // Each equality constraint reduces selectivity
-              const colSelectivity = 0.1; // Heuristic selectivity estimate
-              selectivity *= colSelectivity;
               break;
             }
           }
@@ -4865,25 +5847,31 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
         // Calculate cost and rows for this index
         if (matchedFilterIndices.length > 0) {
-          const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
-          const indexRows = Math.max(1, Math.floor(tableRowCount * selectivity));
+          const seekColumns = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
+          // A prefix of a unique index is not unique.
+          const uniqueSeek = matchedFilterIndices.length === indexColumns.length && (index.unique ?? false);
+          const matchedRows = uniqueSeek ? 1 : tableRowCount * this.equalityTupleSelectivity(tableInfo, seekColumns);
+          const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + matchedRows;
+          const indexRows = Math.max(1, Math.floor(matchedRows));
 
-          // If this index is better than what we have, use it
-          if (indexCost < bestCost) {
+          // On a cost tie the longer match wins: without statistics every equality tuple
+          // estimates the same rows, but the longer seek reads fewer and leaves less residual.
+          const longerMatch = matchedFilterIndices.length > (bestSeekColumnIndexes?.length ?? 0);
+          if (indexCost < bestCost || (indexCost === bestCost && longerMatch)) {
             bestCost = indexCost;
             bestRows = indexRows;
             bestHandledFilters = request.filters.map((_, idx) => matchedFilterIndices.includes(idx));
-            // Note: IndexSchema doesn't have unique property in quereus 0.4.8, so we can't determine uniqueness
-            bestIsSet = false;
+            bestIsSet = uniqueSeek;
             bestIndexName = index.name;
-            bestSeekColumnIndexes = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
-            bestExplains = `Index seek on ${index.name} ` +
-              `(selectivity: ${selectivity.toFixed(4)}, cost: ${indexCost.toFixed(2)})`;
+            bestSeekColumnIndexes = seekColumns;
+            bestExplains = `${uniqueSeek ? 'Unique index' : 'Index'} seek on ${index.name} ` +
+              `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`;
 
-            // Check if ORDER BY matches index order
-            if (request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)) {
-              bestOrdering = [...request.requiredOrdering];
-            }
+            // Cleared when this index cannot deliver it, so an ordering an earlier,
+            // costlier index could deliver is never promised for this one.
+            bestOrdering = request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)
+              ? [...request.requiredOrdering]
+              : undefined;
           }
         }
       }
@@ -4943,6 +5931,32 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         StatusCode.ERROR,
       );
     }
+  }
+
+  /**
+   * The fraction of the table one equality tuple over `eqColumns` is expected to match, by the
+   * rule Quereus's memory and store modules use, so the backends agree and a seek's `rows`
+   * matches what the engine would estimate for the same predicate: `1 / max(distinctCount, 1)`
+   * per column, combined by the engine's own `combineConjunctive`.
+   *
+   * Without `analyze` statistics for every column the whole tuple takes
+   * {@link EQ_SELECTIVITY_WITHOUT_STATS} — never a measured factor mixed with the constant. A
+   * snapshot with `rowCount` 0 (taken while the table was empty) counts as none: its
+   * `distinctCount`s of 0 would read as "every row matches". `columnStats` is keyed by the
+   * lowercase current column name, so a column added since the snapshot simply has no entry.
+   */
+  private equalityTupleSelectivity(tableInfo: TableSchema, eqColumns: readonly number[]): number {
+    const stats = tableInfo.statistics;
+    if (!stats || stats.rowCount <= 0) return EQ_SELECTIVITY_WITHOUT_STATS;
+
+    const factors: number[] = [];
+    for (const colIdx of eqColumns) {
+      const name = tableInfo.columns[colIdx]?.name;
+      const colStats = name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
+      if (!colStats) return EQ_SELECTIVITY_WITHOUT_STATS;
+      factors.push(1 / Math.max(colStats.distinctCount, 1));
+    }
+    return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
   }
 
   /**
@@ -5045,6 +6059,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     schemaName: string,
     tableName: string
   ): Promise<void> {
+    await this.whenCatalogPersisted();
+    this.assertNoQueuedEntries(schemaName, tableName, 'drop table');
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
     const table = this.tables.get(tableKey)
       ?? await this.instantiateForTeardown(db, schemaName, tableName);
@@ -5052,8 +6068,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // Release the collection-change → watch bridge before forgetting the table
       // so the storage listener doesn't leak past the table's lifetime.
       table.teardownChangeSubscription();
+      table.forgetInCommitReports();
+      table.withdrawOfflinePolicy();
       try {
-        await this.underBatchCheckpoint(table, 'dropped', tableKey, () => table.deleteOwnSchema());
+        await this.underBatchCheckpoint(table.catalogManager, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {
         // Best-effort: a schema-tree write failure shouldn't stop teardown. But it
         // does leave the record LIVE past its own DROP, which blinds the

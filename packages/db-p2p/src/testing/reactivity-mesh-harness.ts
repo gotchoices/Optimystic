@@ -94,7 +94,6 @@ import {
 	type Transforms,
 } from "@optimystic/db-core";
 import { StorageRepo } from "../storage/storage-repo.js";
-import { BlockStorage } from "../storage/block-storage.js";
 import { MemoryRawStorage } from "../storage/memory-storage.js";
 import { makeCohortTopicChangeNotifier } from "../cohort-topic/change-bridge.js";
 import { buildCommitCert } from "../cluster/commit-cert.js";
@@ -256,6 +255,9 @@ interface CollectionState {
 	rotatedFromTailB64?: string;
 	readonly subscribers: SubscriptionHandle[];
 	/** Certs cached for actionId so the synchronous bridge extractor can resolve a pre-signed real cert. */
+	// NOTE: keyed by action alone, unlike production's `CommitCertStore` (keyed by action and tail); sound only
+	// because every harness commit has its own action id and one collection. If the harness ever commits one
+	// action across several collections, switch to `createCommitCertStore` + `makeClusterCommitCertExtractor`.
 	readonly certByAction: Map<string, CommitCert>;
 }
 
@@ -432,7 +434,7 @@ export class ReactivityMesh {
 		const queueMax = opts.queueMax ?? 32;
 
 		const rawStorage = new MemoryRawStorage();
-		const repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		const repo = new StorageRepo(rawStorage);
 
 		// Origination is the root group's responsibility — installed on the node nearest the tail's root
 		// coordinate (the group's routed primary), one of the nodes a commit on the tail lands on in production.

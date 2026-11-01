@@ -35,13 +35,13 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { queryAll, expectIndexAgreesWithScan } from './query-helpers.js';
 
 function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
+	const repo = new StorageRepo(storage);
 	return {
 		async get(blockGets) { return await repo.get(blockGets); },
 		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },

@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import type { BlockHeader, BlockId, IBlock, Transforms } from '@optimystic/db-core';
+import { isShortfallFailure, type BlockHeader, type BlockId, type IBlock, type Transforms } from '@optimystic/db-core';
 import { createMesh, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 /**
@@ -53,13 +53,9 @@ describe('mesh harness: onClusterDelivery', () => {
 
 		// The leaver's very first delivery is its promise request, so its promise never arrives and a
 		// three-member cohort cannot reach its all-three promise bar.
-		let refusal: unknown;
-		try {
-			await coordinator.coordinatorRepo.pend({ actionId: 'hook-first-delivery', transforms: makeTransforms('hook-first-delivery-block'), policy: 'c' });
-		} catch (err) {
-			refusal = err;
-		}
-		expect(String((refusal as Error)?.message ?? refusal)).to.match(/Failed to get super-majority: 2\/3 approvals/);
+		const result = await coordinator.coordinatorRepo.pend({ actionId: 'hook-first-delivery', transforms: makeTransforms('hook-first-delivery-block'), policy: 'c' });
+		expect(!result.success && isShortfallFailure(result) ? result.shortfall : result, 'the leaver is the one silent member')
+			.to.deep.include({ approvals: 2, peerCount: 3, silentPeers: [leaverId] });
 	});
 });
 
@@ -92,14 +88,11 @@ describe('mesh harness: restart', () => {
 
 		const deliveries: string[] = [];
 		mesh.failures.onClusterDelivery = (target) => { deliveries.push(target); };
-		let refusal: unknown;
-		try {
-			await oldCoordinator.pend({ actionId: 'from-a-stopped-instance', transforms: makeTransforms('stopped-instance-block'), policy: 'c' });
-		} catch (err) {
-			refusal = err;
-		}
+		const result = await oldCoordinator.pend({ actionId: 'from-a-stopped-instance', transforms: makeTransforms('stopped-instance-block'), policy: 'c' });
 
-		expect(refusal, 'a stopped instance cannot assemble a cohort').to.be.instanceOf(Error);
+		const others = mesh.nodes.filter(node => node !== restarted).map(node => node.peerId.toString()).sort();
+		expect(!result.success && isShortfallFailure(result) ? [...result.shortfall.silentPeers].sort() : result, 'a stopped instance cannot assemble a cohort: every other member is silent to it')
+			.to.deep.equal(others);
 		expect(deliveries, 'no delivery left the stopped instance').to.deep.equal([]);
 		for (const node of mesh.nodes) {
 			const pendings = (await node.storageRepo.get({ blockIds: ['stopped-instance-block' as BlockId] }))['stopped-instance-block']?.state?.pendings ?? [];

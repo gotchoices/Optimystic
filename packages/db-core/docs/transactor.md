@@ -261,18 +261,35 @@ policy). The commit side does not read it: a returned commit failure other than 
 re-driven whatever it says —
 see [internals.md](../../../docs/internals.md).
 
-#### The one refusal that is never retryable (`ExpiredFailure`)
+#### Refusals that are never retryable (`ExpiredFailure`, `ShortfallFailure`, `RejectedFailure`)
+
+Three refusals come back as siblings of `StaleFailure`, each with its own predicate in
+`src/network/stale-failure.ts`, and `isConflictFailure` is false for all of them. When
+`NetworkTransactor` rebuilds one answer from several per-batch refusals, the first validity rejection
+is the whole answer, then the first expiry, then the first shortfall.
 
 A pend or commit the cohort refused because, by its members' clocks, the transaction had already
-expired comes back as a sibling of `StaleFailure` rather than as one:
-`ExpiredFailure` (`src/network/struct.ts`), `{ success: false, conflict: false, reason?, expired }`,
+expired comes back as `ExpiredFailure` (`src/network/struct.ts`), `{ success: false, conflict: false, reason?, expired }`,
 where `expired` (`TransactionExpiry`) carries the transaction's `expiration`, each refusing member's
 signed clock reading and the coordinator's clock. Test for it with `isExpiryFailure`, never by reading
-`reason`; `isConflictFailure` is false for it. When `NetworkTransactor` rebuilds one answer from
-several per-batch refusals, an expiry in any batch is returned as the whole answer. Both write paths
+`reason`. Both write paths
 stop on it with `TransactionExpiredError` (`src/network/transaction-expired-error.ts`) instead of
 retrying, since a retry's expiration comes from the same clock — see
 [correctness.md §7.4](../../../docs/correctness.md#74-clock-assumptions).
+
+A pend whose promise round fell short because too few cohort members answered comes back as
+`ShortfallFailure`, carrying the counts and the silent members (`PromiseShortfall`); test for it
+with `isShortfallFailure`. Both write paths stop on it with `PromiseShortfallError`
+(`src/network/promise-shortfall-error.ts`), since every coordinator of the cohort meets the same
+silent members.
+
+A pend the members that sank it judged invalid — a failed re-execution, an operations-hash mismatch,
+a bad stamp or client signature, each signed as a validity vote — comes back as `RejectedFailure`,
+carrying one `ValidityRefusal` per refusing member (`TransactionInvalidity`); test for it with
+`isRejectedFailure`. Both write paths stop on it with `ValidityRejectedError`
+(`src/network/validity-rejected-error.ts`), since a retry sends the same content to the same checks.
+When it is returned, and when a validity vote is left unclassified instead, is in
+[internals.md §Consensus Execution](../../../docs/internals.md#consensus-execution).
 
 #### The lost-to revision (`staleAt`)
 

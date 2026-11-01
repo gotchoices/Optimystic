@@ -136,8 +136,8 @@ describe('a block only one machine holds', function () {
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 
-		const aRepo = new StorageRepo(id => new BlockStorage(id, aStorage));
-		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage));
+		const aRepo = new StorageRepo(aStorage);
+		const bRepo = new StorageRepo(bStorage);
 
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
 

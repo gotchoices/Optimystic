@@ -56,6 +56,7 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 		const service: CohortTopicService = {
 			register: (req) => { registered.push(req); return new Promise<RegistrationHandle>(() => { /* never answers: only the request is read */ }); },
 			renew: () => Promise.resolve(),
+			renewMany: () => Promise.resolve(),
 			withdraw: () => Promise.resolve(),
 			moveRoot: () => { throw new Error('moveRoot is not used here'); },
 			lookup: () => Promise.reject(new Error('lookup is not used here')),
@@ -85,7 +86,11 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 			scheduleRotation: () => {},
 			setTimer: () => () => {},
 		});
-		watch.watch({ collectionId: COLLECTION, readTail: () => Promise.resolve({ tailId: TAIL, revision: 1 }), onChange: () => {} });
+		watch.watch({
+			collectionId: COLLECTION,
+			tails: { readTails: (queries) => Promise.resolve(new Map(queries.map((query) => [query.collectionId, { tail: { tailId: TAIL, revision: 1 } }]))) },
+			onChange: () => {},
+		});
 		await new Promise((resolve) => setImmediate(resolve));
 		expect(registered, 'the watch service registered a subscriber').to.have.length(1);
 		const subscribedAs = decodeSubscribeAppPayload(registered[0]!.appPayload!).collectionId;

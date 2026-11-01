@@ -3,8 +3,8 @@ import type { BlockId, ActionId, IBlock, Transforms } from '@optimystic/db-core'
 import type { RawStoreDriver } from '../../src/storage/raw-store-driver.js';
 import type { IRawStorage } from '../../src/storage/i-raw-storage.js';
 import type { StoreIdentity } from '../../src/storage/store-identity.js';
+import type { FlushOptions, StoreDurability } from '../../src/storage/store-durability.js';
 import { StorageRepo } from '../../src/storage/storage-repo.js';
-import { BlockStorage } from '../../src/storage/block-storage.js';
 
 export const makeBlock = (id: string, data?: Record<string, unknown>): IBlock => ({
 	header: { id: id as BlockId, type: 'test', collectionId: 'collection-1' as BlockId },
@@ -136,6 +136,17 @@ export class CountingStoreDriver implements RawStoreDriver {
 		this.bump('promote');
 		return this.inner.promote(blockId, actionId);
 	}
+	async flush(options?: FlushOptions): Promise<void> {
+		this.bump('flush');
+		return this.inner.flush(options);
+	}
+	async whenDurable(): Promise<void> {
+		this.bump('whenDurable');
+		return this.inner.whenDurable();
+	}
+	get durability(): StoreDurability {
+		return this.inner.durability;
+	}
 }
 
 // `getProof`/`putProof` are deliberately absent from both lists: the proofs store is a
@@ -154,7 +165,7 @@ export const WRITE_METHODS = [
  * read of every known block after each commit. Insert on a block's first touch,
  * in-place update after; commit rev is a global counter. */
 export async function runColdStartWorkload(storage: IRawStorage): Promise<void> {
-	const repo = new StorageRepo(id => new BlockStorage(id, storage));
+	const repo = new StorageRepo(storage);
 	const blockIds = Array.from({ length: 6 }, (_, i) => `blk-${i}` as BlockId);
 	const inserted = new Set<BlockId>();
 

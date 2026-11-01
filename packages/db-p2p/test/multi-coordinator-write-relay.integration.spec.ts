@@ -169,8 +169,8 @@ describe('Multi-coordinator write over a relay (limited inter-coordinator stream
 			description: `A's cohort for '${BLOCK_ID}' includes the relay-only coordinator B`
 		});
 
-		// Exactly {A, B} — set equality, not `includes`. `allowDownsize: true` means a self-only
-		// cohort completes a write happily, so a weaker assertion here would let the spec pass
+		// Exactly {A, B} — set equality, not `includes`. A self-only cohort completes a write
+		// happily (whatever `allowDownsize` says), so a weaker assertion here would let the spec pass
 		// while asserting nothing about a second promise crossing anything.
 		expect([...aCohort].sort(), `A's cohort for '${BLOCK_ID}' is exactly {A, B}`)
 			.to.deep.equal([nodeA.peerId.toString(), bId].sort());

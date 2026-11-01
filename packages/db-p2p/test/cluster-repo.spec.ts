@@ -138,7 +138,7 @@ class MockRepo implements IRepo {
 /**
  * MockRepo whose `pend` throws a transient fault the first `throwCount` times it is
  * called (before recording the call), then behaves like MockRepo. Models a transient
- * storage I/O fault inside applyConsensusOperation so handleConsensus reaches its catch.
+ * storage I/O fault inside applyConsensusOperations so handleConsensus reaches its catch.
  */
 class ThrowOncePendRepo extends MockRepo {
 	throwCount: number;
@@ -310,7 +310,7 @@ describe('ClusterMember', () => {
 			}
 		};
 
-		const storageRepoOver = (raw: MemoryRawStorage): StorageRepo => new StorageRepo(id => new BlockStorage(id, raw));
+		const storageRepoOver = (raw: MemoryRawStorage): StorageRepo => new StorageRepo(raw);
 
 		it('judges a held revision that will not materialize: approves a pend past it, rejects one at it', async () => {
 			const raw = new MemoryRawStorage();
@@ -1520,7 +1520,7 @@ describe('ClusterMember', () => {
 
 			// Drive to consensus: the phase fixpoint takes a single-peer record through promise →
 			// commit → consensus in ONE delivery, where throwingRepo.pend throws →
-			// applyConsensusOperation throws → handleConsensus rolls back the in-memory guard and
+			// applyConsensusOperations throws → handleConsensus rolls back the in-memory guard and
 			// rethrows out of this first update.
 			let threw = false;
 			try {
@@ -1665,6 +1665,56 @@ describe('ClusterMember', () => {
 			const vote = result.promises[ourId];
 			if (vote?.type !== 'reject') expect.fail(`expected a reject vote, got ${vote?.type}`);
 			expect(vote.rejectReason).to.include('Validation failed');
+		});
+
+		it('signs the validity marker a validator returns onto its reject, and a peer refuses the vote with the marker stripped', async () => {
+			// The marker is how a writer tells "refused for good" from "try again", so it must survive the
+			// trip from the validator to the signed vote, and nobody relaying the vote may remove it.
+			const validatingMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: selfKeyPair.peerId,
+				privateKey: selfKeyPair.privateKey,
+				validator: {
+					validate: async () => ({ valid: false, reason: 'Operations hash mismatch', validity: { computedHash: 'ops.v1:aa' } }),
+					getSchemaHash: async () => 'test-hash'
+				}
+			});
+			const other = await makeKeyPair();
+			const otherMember = clusterMember({
+				storageRepo: mockRepo,
+				peerNetwork: mockNetwork,
+				peerId: other.peerId,
+				privateKey: other.privateKey
+			});
+
+			const ourId = selfKeyPair.peerId.toString();
+			const peers = makeClusterPeers([selfKeyPair, other]);
+			const record = await createClusterRecord(
+				peers,
+				[{
+					pend: {
+						actionId: 'a1',
+						transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] },
+						policy: 'c',
+						validation: { transaction: { statements: [], stamp: {} } as any, operationsHash: 'hash' }
+					}
+				}]
+			);
+
+			const result = await validatingMember.update(record);
+
+			const vote = result.promises[ourId];
+			if (vote?.type !== 'reject' || vote.validity === undefined) expect.fail(`expected a marked reject, got ${JSON.stringify(vote)}`);
+			expect(vote.validity).to.deep.equal({ computedHash: 'ops.v1:aa' });
+			const { validity: _stripped, ...unmarked } = vote;
+			let caught: unknown;
+			try {
+				await otherMember.update({ ...result, promises: { [ourId]: unmarked } });
+			} catch (err) {
+				caught = err;
+			}
+			expect((caught as Error | undefined)?.message).to.equal(`Invalid promise signature from ${ourId}`);
 		});
 
 		it('does not retain a transaction it rejected itself', async () => {

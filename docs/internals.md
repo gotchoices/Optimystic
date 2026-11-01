@@ -57,7 +57,10 @@ proximity ranking, whenever the node is one of the block's responsible peers and
 self-coordination guard allows it (`selfReadVerdict` in
 `packages/db-p2p/src/libp2p-key-network.ts`). So on a machine in the block's cohort an idle
 poll costs no network request inside the lazy read-repair window, plus one cohort consult per
-block per window. That adds no staleness: a remote coordinator answers from its own copy
+block per window, batched per peer within one read — which runs behind the read that starts it, not on it, so the poll's latency
+is a local read whatever the cohort is doing. A read marked `skipWindowConsult` (`BlockGets.skipWindowConsult`) costs no request outside the window either: it starts no consult behind it. A consult that found a cohort peer silent arms no
+window, and on a node that declares a link round trip the next one is sent after a hold that
+starts at one round trip and doubles, not on the next poll. That adds no staleness: a remote coordinator answers from its own copy
 under the same window, so answering locally changes which cohort member answers, not what the
 answer guarantees — the bound is the one stated in
 [transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window). Floors,
@@ -69,7 +72,7 @@ A **write** pays that same refresh plus what the write itself needs: one request
 nothing else has committed since this handle last looked, two when another handle has.
 The second is the leaf the other writer changed, which has to be re-read. There is no
 third, because the refresh KEEPS the header and log tail it just read in the collection's
-own cache (`Collection.keepWhatTheRefreshRead`, the last move of
+own cache (`Collection.keepLogEnds`, the last move of
 `Collection.forgetAndAdopt`'s one synchronous step). Without it the tail is fetched twice
 per contended write: the walked entry names the log tail — a commit's blocks include the
 log block its entry was appended to — so the clear beside that entry drops the tail, and
@@ -80,6 +83,19 @@ the view the handle now reads at, and serving that would fabricate a view that n
 existed), and for anything under a floor that applies — checked at the seed itself
 (`BlockFloors.applicableTo`), because this path reads around `TransactorSource`, which is
 what applies floors on every other read.
+
+**Opening** a collection reads the same two blocks once each, with the same reader
+(`Collection.readLogEnds`) — the header, then the tail it names, in two requests, since the
+tail id is known only from the header — and keeps them in the new handle's cache by the same
+rule, so the walk that adopts the log's revision reads neither again. An open costs two
+requests; opening, the first refresh and one point read cost four. The header gets one more
+condition at both sites, because it and the tail are not read at one moment: a commit landing
+between the two reads that rewrote the header — a log roll-over, or a tree's root moving, since
+a tree's header names its root — would leave a header older than the revision the tail was
+adopted at. So the header is kept only when the tail read is still the last log block and none
+of its entries above the header's revision changed the header
+(`Collection.headerCurrentThroughTail` in `packages/db-core/src/collection/collection.ts`);
+otherwise its next read goes to storage, pinned at the adopted revision.
 
 A suspected gap — that `count(*)` alone skipped the pull and so a count-only
 consumer never saw a peer's appends — was investigated and **empirically
@@ -139,6 +155,244 @@ rolls back. That is correct, not a leak: only the separate `committed.<Table>` p
 concurrent peer's commit is expected live-read behavior; snapshot isolation is
 opt-in via `queryCommitted()`, not the default for ordinary reads.
 
+#### Staged actions are segments
+
+A collection's staged actions are two parts, not one list, kept in `SegmentList` in
+`packages/db-core/src/collection/segments.ts`: an ordered list of **sealed segments**, one per
+queued entry of the offline-sync queue
+([offline-sync.md §The segment model](offline-sync.md#the-segment-model)), oldest first, ahead of
+the **open segment** the current transaction stages into. `Collection.act` appends to the open
+segment; `Collection.sealPending` closes it into a sealed segment owned by an entry id, answering
+`false` and changing nothing when the open segment is empty (an invented collection's header,
+log block and root are not an action and are never sealed); `Collection.sealedEntries`,
+`Collection.sealedRefusal` and `Collection.dropSealed` list, inspect and remove them. While nothing
+is sealed every path behaves exactly as it did with one list, because the open segment IS that
+list. Five rules follow from the split:
+
+- **A replay starts from the invented baseline, not from empty, while the collection holds no
+  committed revision.** `Collection.inventedBaseline` is the tracker's transforms right after
+  `createOrOpen`'s create branch has staged the header, the empty log block and (for a tree) the
+  empty root, copied after the `Log.open` that writes the tail id into the header. A replay
+  (`Collection.replayActions`) resets the tracker to a copy of it while `source.actionContext` is
+  undefined, and to empty otherwise, since once a context is adopted those blocks are in storage.
+  Before the baseline a replay on an invented collection dropped its header and left the collection
+  unreadable; `mustReplay` kept the paths that reached it behind "a staged action exists", and
+  `dropSealed` on an invented collection with sealed segments is the first path that gets there
+  with one. The baseline also makes the order of `Collection.syncAttempts`' success branch
+  load-bearing: it folds the committed transforms into the cache and adopts the revision BEFORE
+  replaying, the order `updateInternal` and `TransactionCoordinator.commitOnceLatched` already
+  required. A replay first would reinstate the baseline's header insert over the just-committed
+  header on an invented collection's first commit, and `hasUnsyncedChanges` would never turn
+  false.
+- **A sealed segment replays atomically, and its refusal is recorded rather than thrown.**
+  `Collection.replayActions` stages each sealed segment, in order, through one `internalTransact`
+  call over all of its actions, so a throw discards the whole segment's writes (the Atomic inside
+  gives that). A throw of `ActionRefusedError` in `packages/db-core/src/collection/struct.ts`, a
+  handler's statement that the action cannot be applied over the committed state it is being
+  replayed against (`TreeGuardRefusedError` is the tree's subclass, so every guard refusal is one),
+  is recorded on the segment, logged as `collection:sealed-segment-refused`, reported once through
+  the `onSealedRefused` callback `CollectionInitOptions` carries, and the replay goes on to the
+  next segment. A refused segment is skipped by every later replay and stays listed until it is
+  dropped; dropping it and cascading through the entry's other collections is the queue's job
+  ([offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)). The open segment keeps
+  the earlier behaviour, one `internalTransact` per action with a refusal propagating out of the
+  refresh, because that refusal is the live transaction's own. Any error that is not a refusal
+  propagates from either. The callback runs synchronously under the collection latch, so it must
+  not call a latched method of the collection; a throw out of it is logged
+  (`collection:refusal-callback-threw`) and never aborts the replay. `classifyCommitFailure` and
+  the Quereus bridge keep matching `TreeGuardRefusedError`, which the subclass relation leaves
+  unchanged.
+- **Every replayable action counts.** `mustReplay` and `restageIfBasesMoved` count the non-refused
+  sealed segments' actions plus the open segment's, since a refresh that adopts a newer revision
+  must re-stage every sealed segment too. `hasUnsyncedChanges` keeps its formula (open segment
+  non-empty, or tracker transforms non-empty, which now includes the sealed segments' effects) and
+  therefore says `true` over a sealed collection that `sync` will refuse (next rule).
+- **A whole-collection commit refuses over sealed segments.** `sync`, `updateAndSync` and
+  `actAndSync` commit everything staged as one log entry under one action id; over sealed segments
+  that would merge several queue entries into one, which the queue's identity rules forbid. Each
+  throws `SealedSegmentsError` in `packages/db-core/src/collection/struct.ts`, naming the sealed
+  entry ids, before anything is minted or staged, and so does `getPendingActions`, whose only
+  caller is the coordinator's whole-collection append inside `commitOnceLatched`; the throw lands
+  in that method's existing catch, which restores every participant. `clearPendingActions` clears
+  the open segment only; `filterAgainstEntry` (the `filterConflict` hook) and `consumeOwnEntry`
+  apply to the open segment only, a sealed segment's action list being the entry's own and never
+  rewritten — `consumeOwnEntry` has a second arm for the head commit (sixth rule). A sealed segment
+  is committed on its own by the head commit; the version counter on `SegmentList`, bumped by every
+  seal, drop, refusal and head commit, is what the snapshot restore (next rule) branches on.
+- **A snapshot covers the open segment, and its restore is version-aware.** `CollectionSnapshot`
+  (`Collection.snapshotPending`) captures the WHOLE tracker's transforms — the sealed segments'
+  effects included, which is what `Tree.readView` builds a committed read view from, so a
+  `committed.<Table>` read inside a transaction sees every queued entry the SQL layer was told had
+  committed — but as actions only the OPEN segment's, and it records `SegmentList.version` as
+  `sealedVersion`. `Collection.restorePending` is async, because one of its arms replays, and it
+  chooses from three facts: whether the sealed list has changed since the capture, whether the
+  committed boundary has moved, and whether any segment is sealed now. Nothing changed and nothing
+  moved: the tracker is reset to the captured transforms, the captured pins are restored and the
+  open segment is set to the captured actions — the **verbatim** arm, the restore as it always was,
+  which keeps an invented collection's header. The sealed list changed (a segment sealed, dropped
+  or refused while the snapshot was outstanding), or the boundary moved while a segment is sealed:
+  the open segment is set to the captured actions and the tracker is rebuilt by
+  `Collection.replayActions` — the sealed segments as they are NOW, refused ones skipped, a newly
+  refused one recorded and reported, then the restored open actions — the **replay** arm, because
+  a verbatim restore would put a drained segment's effects back (the next head commit would then
+  commit it a second time) and a reset would drop the sealed segments'. The boundary moved with
+  nothing sealed keeps the two arms it had before segments: an empty captured open segment resets
+  the tracker empty, a non-empty one restores verbatim. The pins differ per arm: the verbatim arm
+  restores the captured pins beside the captured operations; the replay arm restores none, since
+  its reset clears the pin store and each re-staged update pins its base from the read cache as it
+  is now, which is the base it was computed against
+  ([Staged Edits Keep Their Base](#staged-edits-keep-their-base)). A refusal of the open segment
+  inside the replay arm propagates out of `restorePending`, as it would out of a refresh's replay:
+  the caller rolling back is told its transaction's own actions no longer apply at the boundary
+  the collection is now at. Every caller awaits the restore — `TransactionCoordinator`'s five
+  sites, `Tree.restore`, and the Quereus bridge's `rollbackToSavepoint` and `rollbackTransaction`;
+  Quereus types the connection hook as `MaybePromise<void>` and awaits it for each connection in
+  turn (`_rollbackToSavepointBroadcast` in `@quereus/quereus/src/core/database.ts`), so a statement
+  does not continue until every restore has finished. The coordinator's two partial-commit arms
+  fold the committed participants first, in one await-free pass, and restore the failed ones after
+  it, so the committed subset keeps the event-loop atomicity the success fold promises. A rollback
+  restores EVERY collection before it propagates a restore's throw — `TransactionCoordinator.rollback`
+  and the bridge's `rollbackTransaction` and `rollbackToSavepoint` loop through `visitEveryThenThrow`
+  in `packages/db-core/src/utility/visit-every.ts` — since each restore is independent and a
+  collection left un-restored would carry the rolled-back statements into the next transaction, or
+  into a `COMMIT` where Quereus swallows the throw (its statement-level savepoint path does). The
+  bridge ends its transaction either way, as Quereus already has, and sets its degraded latch from
+  the failure instead of releasing it; the two partial-commit restores and the failed commit's own
+  rollback log a restore failure (`commit:restore-failed`, `commit:rollback-failed`) rather than let
+  it replace the error they are raising, which would send the bridge down its clean-rollback path and
+  rewind the committed trees. The throwing collection itself stays half re-staged, the state backlog
+  `debt-a-failed-refresh-can-leave-a-collection-half-restaged` describes. `Collection.unstage` keeps
+  its own verbatim-or-replay split.
+- **The head segment is committed on its own, without holding the latch across the network.**
+  `Collection.commitHead(entryId, options)` commits exactly the oldest sealed segment as one log
+  entry under the action id and timestamp `options` supplies (`HeadCommitOptions` in
+  `packages/db-core/src/collection/struct.ts`; the queue mints both, and re-supplies the same action
+  id when it re-drives an entry whose earlier attempt may have landed). Its preconditions each throw
+  `SealedSegmentsError` with a `reason`: `not-head`, `refused` (the queue drops a refused segment, it
+  never commits it), `in-flight`. The cycle is the sync's — the per-attempt tracker and log append,
+  the retry accounting with its stall check, the refresh-until-settled loop — extracted into
+  `AttemptCycle` and `stageAttempt` in `packages/db-core/src/collection/write-attempts.ts` so the two
+  paths share one implementation; `syncAttempts` and `commitHead` each decide only what an attempt
+  is built from and what to do with a commit. The head commit's steps are exposed one at a time
+  through `HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`: `Collection.openHeadCommit`
+  takes the latch, checks the preconditions, marks the action in flight and returns the handle (a
+  closure over the collection's private state), and `driveHeadCommit` in the same file is the
+  one-collection loop `commitHead` runs over it — refresh, then per attempt stage, record, release,
+  send, retake, then fold and replay or refused — so the coordinator's per-entry commit can drive
+  several collections through the same steps in lock-step. Two hooks on `HeadCommitOptions` serve
+  the queue and the journal: `recordAttempt` is called with each attempt (an `InFlightAttempt`, plain
+  data, carrying its action id) after it is built and before the latch is released, and a throw out
+  of it aborts the cycle with nothing sent; `resume` hands back an attempt an earlier cycle under the
+  same action id recorded, seeded as the retained attempt so the opening refresh finishes a torn
+  attempt from it instead of refusing it as `transforms-not-held`. Four things differ:
+  - **The attempt runs on a head tracker, built once per revision.** The live tracker holds every
+    sealed segment and the open one cumulatively, so an attempt cannot run on a copy of it the way a
+    sync's does. `Collection.headTrackerFor` stages the head segment's actions alone, atomically
+    (`Collection.stageInto`, the path `act` uses), over the committed state — from the invented
+    baseline while the collection has no committed revision, so an invented collection's header,
+    log block and root ride in the head's commit — into a `Tracker` over the handle's read cache
+    with pins of its own. It is built once per revision the attempt requests and reused across
+    attempts, because a rebuild re-runs the handlers and mints fresh ids for the blocks they insert,
+    which would send different content under one `(action id, revision)` (the rule
+    `logAppendBlockIds` closes); a refresh that adopts a newer revision rebuilds it, the write being
+    genuinely different then. Before each attempt its pins are re-judged exactly as
+    `restageIfBasesMoved` re-judges the live queue (`Collection.rereadUnretainedBases`, then
+    `Tracker.movedBases`), and a moved base rebuilds at the same revision — the same narrow
+    exception the `NOTE:` at `syncAttempts`' call records. Staging runs the actions' guards against
+    the committed state; a refusal there is the segment's refusal, recorded and reported once
+    (`Collection.recordSealedRefusal`) and thrown out of `commitHead`, equivalent to the live replay
+    refusing the same segment on a refresh — which usually finds it first, since the cycle opens
+    with a refresh (like `updateAndSync`) that, with the action already marked in flight, also
+    recognises an earlier attempt's own entry and finishes or consumes it rather than committing a
+    second copy. A cycle opened with `resume` builds no head tracker while the revision the next
+    attempt requests equals the recorded attempt's: the handle's `stage` step sends the recorded
+    attempt verbatim (`resumedAttempt` in `packages/db-core/src/collection/write-attempts.ts`),
+    since it is the attempt that may have landed and a rebuild would mint fresh ids under its
+    `(action id, revision)`. It deliberately skips two things the head tracker does: re-judging the
+    base pins, leaving a moved base to storage's base guard as `completeOwnEntry`'s re-send does,
+    and the invented baseline, whose inserts the recorded transforms already carry. The rule is in
+    the `stage` step, so the coordinator's per-entry commit, which opens its handles with
+    `EntryCommit.resume` and calls the same step, shares it.
+  - **The latch is released around the one network `await`.** The handle's `release` and `retake`
+    (`HeadCommitHandle` in `packages/db-core/src/collection/head-commit.ts`) bracket `source.transact`
+    alone, the retake in a `finally`, so nothing on the instance is touched without the latch and
+    `act`, `sealPending`, `update`, a snapshot or restore, and `dropSealed` of another segment all run
+    meanwhile; a second `commitHead` waits on the latch and then meets the `in-flight` precondition.
+    The window is marked by `Collection.headInFlight` — set just before
+    the release, cleared right after the retake, and distinct from `inFlightActionId`, which the
+    head commit's own refreshes run under and must take the own-entry path. Two things read it. A
+    refresh (`updateInternal`) that walks into the in-flight entry returns before `forgetAndAdopt`,
+    changing nothing (`collection:refresh-deferred-to-head-commit`): the entry is not failed, so it
+    is not finished and consumed as the write's own, and it is not a stranger's, so it is not
+    filtered and replayed over state that already contains it; the head commit applies the outcome
+    when it retakes the latch, and the next refresh finds nothing new. And `dropSealed` of the
+    in-flight head throws (`in-flight`). A refresh that finds a rival's entry instead proceeds as
+    any refresh does, and may refuse the head in its replay, so `commitHead` re-checks the head's
+    recorded refusal before every attempt and after every retake, and throws it in place of a retry.
+  - **On success the fold precedes the replay.** Under the retaken latch: the head segment is
+    removed (asserted still first — nothing may remove it while in flight — and the version bumped),
+    the ATTEMPT's transforms — the head's over committed state, plus the log append — are folded
+    into the cache and the revision adopted (`Collection.foldOwnCommit`, shared with the sync), and
+    only then are the remaining sealed segments and the open segment replayed over the committed
+    state that now holds the head. The replay after every head commit is what makes a drain
+    quadratic in the queue length; the tripwire `NOTE:` at that call names the remedy.
+  - **A torn head attempt is finished and consumed as the head.** The refresh between attempts
+    finishes a half-landed attempt from the retained one exactly as a sync's does, and
+    `consumeOwnEntry` then takes its head arm (`Collection.consumeHead`, keyed on
+    `Collection.headCommitEntry`, set for the cycle): the entry records the head segment's actions,
+    so consuming it removes that segment — after asserting the counts agree — and leaves the open
+    segment, which may have grown while the attempt was in flight, untouched. `commitHead` then
+    answers the refresh's durability, or `undefined` when the refresh established the write was
+    saved without re-sending (the status-read fallback of `completeOwnEntry`).
+- **An entry that wrote several collections is committed by the coordinator's per-entry slice,
+  `TransactionCoordinator.commitEntry` in `packages/db-core/src/transaction/coordinator.ts`.** It
+  drives the head commit's steps in lock-step across every collection the entry wrote, through one
+  `HeadCommitHandle` per participant (`EntryParticipants` in
+  `packages/db-core/src/transaction/entry-commit.ts`), opened in sorted collection-id order — the
+  order `commitOnce` acquires the same latches in, so a concurrent whole-collection commit over
+  overlapping collections cannot deadlock against it — held for the whole cycle and closed in
+  reverse. The cycle opens with a refresh round through the handles, as `commitHead` opens with one,
+  so a re-drive under the id of an attempt that may have landed finishes and consumes that attempt's
+  entry in each participant that holds it (such a participant is recorded as saved and leaves the
+  set) instead of committing a second copy. The answer is always a `TransactionDurability`, never
+  `undefined`, since a slice writes at least one collection: a participant the refresh saved without
+  learning who holds it is listed with an `undefined` class, as `commit` lists one. Each attempt then builds every remaining participant's
+  attempt on its head tracker (`stage`), hands them all to the write-ahead hook
+  (`EntryCommit.recordAttempt`, awaited under every latch; a throw aborts with nothing sent),
+  releases every latch, runs the coordinator's own phases over them — every participant pended, then
+  committed, the ordering that keeps a refusal at one participant's pend from leaving any part of the
+  entry durable — and retakes every latch in sorted order before applying the outcome: on a commit,
+  `fold` on every participant in one await-free pass and then `replay` on each, the event-loop
+  atomicity the whole-collection success fold promises; on a partial landing, the committed
+  participants folded, replayed and recorded as saved, the rest refused (their recorded refusal
+  re-checked, their attempt retained), and the refused ones re-driven forward by the retry loop
+  `commit` runs (`commitAttempts`, shared through an `AttemptDriver`), or
+  `CoordinatorPartialCommitError` on a hard failure; on a clean refusal, every participant refused
+  and the failure thrown by its class. The phases read the write off a `WriteContext` — the action
+  id, timestamp, reads and aged priority `commit` and `execute` used to read off their
+  `Transaction` — so the slice fabricates no stamp. It also takes no pre-commit snapshots and runs no
+  `restorePending` (an attempt never touches the live tracker, so a failed one leaves it as it was),
+  no `getPendingActions` or `tracker.reset` (the head segment is dropped and folded through the
+  handle), no stamp (a slice may run while a stamp is open on another coordinator over the same
+  collections — the plugin's open SQL transaction — and the collection latch is what serialises
+  them), and no expiry check. It requires `pendValidation: 'none'`, as the coordinator
+  `commitBatchLegacy` builds is, since an entry has no statements for a member to re-execute. Its
+  refresh rounds refresh the entry's participants only, never the coordinator's whole map, and pass
+  no tail floor (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision` covers the
+  slice too). `packages/db-core/test/coordinator-entry-commit.spec.ts` pins it.
+
+`packages/db-core/test/collection-segments.spec.ts` pins each of the head commit's rules.
+
+#### The offline queue
+
+`OfflineQueue` in `packages/db-core/src/offline/queue.ts` is the in-memory queue over the sealed segments above (docs/offline-sync.md §Draining), usable by a `Tree`/`Diary` application with no SQL. `OfflineQueue.enqueue` seals each given collection's open segment under one entry id (a collection with nothing staged is simply not part of the entry), writes the journal's entry record when a journal is given, and queues the entry, emitting its `queued` status before it resolves so the caller can attribute it to the commit it is in; a journal write that throws unseals every segment again (`Collection.unseal`) and fails the enqueue with nothing queued. The journal is one port, `IOfflineJournal` in `packages/db-core/src/offline/journal.ts`, which the queue writes through at every step of an entry's life and which speaks only the queue's vocabulary (docs/offline-sync.md §What is journaled): the entry record before the entry is admitted, the drive record — action id, retained attempts, committed collections — before each send and again after a partial commit or an identity renewal, and each terminal status before it is emitted. `OfflineQueue.restore` is the inverse, for a journal putting its records back after a restart: it holds the drain — the loop parks at the top of its next iteration, so no submission and no removal of the loop's is under way — registers the entry by its recorded sequence number, inserted ahead of anything queued since, and calls back per collection to insert the segment at that position (`Collection.restoreSealed`, whose replay returns the restored segment's own refusal rather than reporting it) or to say the collection already holds the recorded attempt committed (`Collection.holdsCommitted`), in which case nothing is re-staged. One drain loop per queue then commits the head entry — `Collection.commitHead` for an entry over one collection, `TransactionCoordinator.commitEntry` over several — with **at most one submission on the network at a time**, after asking the reachability gate (`ICohortReachability` in `packages/db-core/src/offline/reachability.ts`, asked with the header id and known log tail id, `Collection.knownLogTailId`, of each collection the head still has to commit; absent, the cohort is always reachable). A networked node's gate is `KeyNetworkCohortReachability` in `packages/db-p2p/src/network/cohort-reachability.ts`, exposed as `node.cohortReachability`: it judges each block's cohort as `findCluster` assembles it now, open when the cohort names another machine, and when it names only this node open only while the node is genuinely alone — no serving member the key network remembers is missing (`absentCohortMembers`), no configured bootstrap peer is still awaited (`awaitingBootstrapContact`), and no identify exchange is in flight on the node (`IdentifyProgress` in `packages/db-p2p/src/network/identify-progress.ts`, since a peer mid-identify is out of every cohort); an empty cohort or a lookup that throws is closed. Its `onChange` (optional on the port, always present on the node's gate) calls a listener, debounced (500 ms by default, `NodeOptions.cohortReachability`), after a connection opens or a peer is identified; a queue used without the Quereus plugin can take it as `wakeOn`, and the plugin routes it through its controller instead (below). The drain then applies each failure by its `classifyCommitFailure` class: a guard refusal, a validator rejection and an oversized write fail the entry; everything else keeps it queued behind one re-check timer the gate and the backoff share. Every submission also asks not to be committed by a lone node that knows it is not alone (`SyncOptions.refuseSoloCommit`, carried as `refuseSolo` on each request), unless the queue was built with `allowSoloCommit: true`: a coordinator whose cohort is only itself then refuses the pend as a `PromiseShortfallError` with `soloRefused` set while it knows of absent members, awaits a bootstrap peer or cannot route the write, so the entry waits for its cohort rather than settling on a write only this machine holds ([offline-sync.md §When to submit: the reachability gate](offline-sync.md#when-to-submit-the-reachability-gate)). Two rules are the queue's own. **One action id for the entry's whole life**, minted at enqueue and re-supplied on every re-drive with the attempts retained under it as `resume`, with one exception: a `torn-not-saved` outcome mints a fresh one, since a re-drive under the old id would find its own stranded log entry on every refresh and loop. **In doubt is sticky**: set the first time the queue's write-ahead wrapper (`OfflineQueue.recordAttempts`, now over `IOfflineJournal.driving`) has written the drive record for an attempt of the entry — the only moment before a send the queue is told about; a write that throws aborts the cycle with nothing sent, so it sets nothing — and cleared only by a terminal outcome or by `torn-not-saved` (except on an entry part of which has committed); an entry in doubt is neither discardable nor expirable. **A partial commit is finished, not rolled back** (`OfflineQueue.partiallyCommitted`): on `CoordinatorPartialCommitError` the entry reports `partially-committed` and stays at the head in doubt with the committed collections recorded on it (listed as `committedCollections` on `queued` and by `entries()`), each later submission drives only the collections still holding its segment under the same action id (a fresh one when the rest failed `torn-not-saved`), the remainder's commit settles it `committed` with one durability over every collection it wrote, and a permanent refusal fails it with `committedCollections` on `failed`. A failed entry's removal cascades through the collections' own refusals: its segments are dropped, each drop's replay reports the later entries it refuses through `onSealedRefused`, and the queue fails those in turn with `causedBy` naming the nearest earlier failing entry (`OfflineQueue.causeOf` says why nearest). The callback records and wakes only; the loop acts, so no latched method is ever called from under the collection latch. `packages/db-core/test/offline-queue.spec.ts` pins it, and `packages/db-p2p/test/offline-queue-mesh.spec.ts` pins the batched path an entry over several collections takes on a real two-member cohort; the rest is in [offline-sync.md §Draining](offline-sync.md#draining) and [§Partial commits](offline-sync.md#partial-commits).
+
+**What a committed entry changed travels through a hook.** `HeadCommitOptions.onCommittedHead` (`packages/db-core/src/collection/struct.ts`) and, per collection, `EntryCommit.onCommittedHead` (`packages/db-core/src/transaction/entry-commit.ts`, threaded into each handle by `EntryParticipants.open` the way `resume` is) are called under the collection latch, once per head segment, with the segment's recorded `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`; see *Conflict replay re-makes the uniqueness decision*, below) at the two places a head segment is dropped as committed: the handle's `fold` when the attempt committed, and `Collection.consumeHead` when the cycle's refresh found the entry's own log entry — so a re-drive that finds its earlier attempt landed reports it too, and the committed half of a partial commit is reported before `CoordinatorPartialCommitError` reaches the queue. A hook rather than a widened return type, because `commitHead`, `commitEntry`, the partial-commit error and `RefreshReport` would otherwise each have to carry tallies. A throw out of it is logged (`collection:committed-head-callback-threw`), never raised, since the commit is durable; a segment with no recorded tally is a defect, logged as `collection:committed-head-tally-missing` and answered with the zero tally. The queue keeps the tallies per collection on the entry (`Entry.applied`, in memory only) and folds them into `effect` on the `committed` status (`CommittedEffect` in `packages/db-core/src/offline/status.ts`, computed by `effectOf` in `packages/db-core/src/offline/entry.ts`): `already-applied` exactly when every collection the entry wrote reported a tally and the sums have `alreadyApplied > 0` and `applied === 0`, `applied` otherwise — an entry with no guarded-variant element included, and any entry one of whose collections has no tally: one a restore found already committed, or the committed half of a partial commit whose tally a restart lost, since that half may have changed rows and a wholly already-applied remainder must not speak for it.
+
+The Quereus plugin layers offline mode on this queue ([offline-sync.md §Application interface](offline-sync.md#application-interface)). One controller per `Database`, `OfflineMode` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-mode.ts` (`plugin.offline`), owns one `OfflineQueue` — writing through `OfflineJournal` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-journal.ts` when `offline.journal` names a key-value store ([offline-sync.md §What is journaled](offline-sync.md#what-is-journaled)) — hands every tree the factory opens its refusal callback (`CollectionFactory.setSealedRefusedListener`), and translates the queue's statuses into table names under the transaction's `StampId()`, announcing a failed entry's tables to the `Database`'s watchers. It judges each queued transaction's outlook when the queue first reports it `queued` (`judgeTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`) — from the guards its sealed segments carry, the entries ahead of it, and the description of each collection that the collection's table publishes beside its offline policy (`TableOutlookSource`) — and holds it until the transaction settles, working out its dependencies and kind again after every status that changes the queue (`followOutlooks`, same file) and announcing a change of kind as `outlook-changed`; an assured transaction that fails anyway is logged (`offline:assured-entry-failed`) and counted in the queue state's `assuredFailures`. The judgement also reads what the statements' write descriptions said: each vtab opts into Quereus's write scope (`wantWriteScope`) and records, after each arm's last stage, which staged elements carry a fresh value (`freshElementsOf` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts`), through `TransactionBridge.noteWriteFacts`, which keeps them with the transaction, truncates them on a savepoint rollback, and folds them into the entry's facts (`EntryFacts`) at commit — and, once per described statement, ahead of its staging, the decisions the statement made against other rows (`uncheckedOf` in the same file, through `TransactionBridge.noteWriteDescription`), from which the judgement lists the entry's `unchecked` and its `via: 'unchecked'` dependencies on the earlier entries whose writes those decisions read ([offline-sync.md §Dependencies between entries](offline-sync.md#dependencies-between-entries)). The facts are journaled in the entry record (`encodeFacts` in the same file) and handed back by the restore ahead of the restored transaction's judgement, so it is judged after a restart as it was before, a `row` read now matched by its table ([offline-sync.md §What is journaled](offline-sync.md#what-is-journaled)). `CommitOutlook()` runs the same judgement over an open transaction's open segments ([offline-sync.md §Predicting whether an entry will commit](offline-sync.md#predicting-whether-an-entry-will-commit)). The gate the queue asks is per transactor: `CollectionFactory.getCohortReachability` hands out one `LateBoundCohortReachability` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/late-bound-reachability.ts`) per transactor key, standing in for the gate registered there — the node's `node.cohortReachability`, which `CollectionFactory.createNetworkTransactor` registers for the `network` transactor unless a test or host registered one first — and forwarding both `reachable` and `onChange` to whichever gate is registered now, so a table that took it early still asks and hears the registered one. Each vtab publishes its transactor's gate with its policy at the start of every full initialization (`OfflineMode.setTablePolicy`), and the controller subscribes once to each distinct gate's `onChange`: a wake first starts a restore pass when a journaled transaction is deferred, then calls `OfflineQueue.wake`. It is routed through the controller rather than handed to the queue as `wakeOn` because of that first step — while the queue is empty no drain iteration asks the gate, so nothing else would retry a deferred record when the cohort returns. `offline.allowSoloCommit` reaches the queue as `OfflineQueueOptions.allowSoloCommit`. A transaction's acknowledgement is fixed when it begins (`TransactionState.acknowledgement`, set in `TransactionBridge.beginTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), and at commit `TransactionBridge.offlineRoute` picks the route: a locally acknowledged transaction is sealed into one entry (`TransactionBridge.sealIntoQueue`, then `OfflineMode.enqueue`) and its commit returns, a network-acknowledged one made while entries are queued is sealed behind them and its commit waits for its own outcome (`TransactionBridge.awaitQueuedCommit`), and every other commit takes the ordinary path. The drain commits what was sealed, so the bridge's single-writer state is never touched by it. After a restart `plugin.hydrate` puts the journaled entries back through `OfflineQueue.restore` (`OfflineMode.restore`, run by `OfflineRestore` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-restore.ts`), where a record whose table cannot be reached is deferred and retried on the table's next initialization or refresh and from the queue's reachability gate ([offline-sync.md §Restore after a restart](offline-sync.md#restore-after-a-restart)). Reads layer on it too: in offline mode a live read of a `'queue'` table whose refresh cannot reach the cohort is served from this machine's own view — `refreshLive` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, the one site every live refresh of the vtab goes through, absorbing only the failures `isCohortUnreachableRead` accepts and skipping the refresh while the transactor's reachability gate (`CollectionFactory.getCohortReachability`), the gate the queue asks, says the cohort is unreachable ([offline-sync.md §Reads in offline mode](offline-sync.md#reads-in-offline-mode)).
+
+**The drain changes a tree beneath its readers.** The vtab's write path and the drain share one `Collection` per tree, and reads are not latched (`concurrencyMode = 'reentrant-reads'`, below), so an insert's point reads and unique probe run while a head commit folds its outcome into the read cache and replays what is still staged, under fresh ids for every block the staged actions insert. Each such change moves the tree's path version through the collection's `onViewChanged`; a point read, a range read as one value (the probe's) and a range scan's setup read again when it moves, and a scan that has already yielded keeps its throw-on-change contract ([packages/db-core/docs/btree.md §Reads under a concurrent change](../packages/db-core/docs/btree.md#reads-under-a-concurrent-change)). Before that, an offline insert into a table with a unique column failed with `Missing block` or `Path is invalid due to mutation of the tree` whenever the drain advanced a microtask at a time — as it does over a transactor and journal that settle without waiting on a disk — pinned by `packages/quereus-plugin-optimystic/test/offline-insert-during-drain.spec.ts` and, at the tree, by `packages/db-core/test/tree-point-read-under-mutation.spec.ts`.
+
 #### A block re-read after a refresh can be answered too old, and is never remembered
 
 The trap the replay-ordering rule above closes — the read cache refilled with old content that no
@@ -193,6 +447,20 @@ are true of it:
 - **It is reported**, as `collection:block-below-floor` (fields in
   [debugging.md](debugging.md#did-a-re-read-come-back-older-than-the-log-says)), which is the only
   trace it leaves.
+
+**An open floors what its log tail names.** An open walks no entries, but it has read the log tail
+block, and each action entry there names the blocks that action changed at its revision.
+`Collection.floorTailEntries` in `packages/db-core/src/collection/collection.ts` raises a floor for
+each, as the walk raises one for each entry it walks. Without it, a handle opened over a repo whose
+copy of such a block was older than its own log tail read the block as it was before the commit, with
+nothing to say otherwise. Two ways to get there: a coordinator that missed the commit, and a node
+whose crash kept a commit's log tail and lost its other blocks inside the store's durability window,
+whose first read of a held block after the restart is answered from that copy while the consult runs
+behind it. The second was seen as a table row whose index entry was missing after an offline-queue
+restore (`packages/quereus-plugin-optimystic/test/offline-restore.spec.ts`). With the floor, the
+coordinator consults its cohort before answering (see *The asker's floor rides out on the request*
+under Key Invariants) and the transactor re-asks another machine for an answer still below it. Only
+the tail block: it holds the newest commits, which are the ones a durability window can tear.
 
 One `BlockFloors` is shared by every read source the handle builds, the way the
 `ReadDependencyCollector` is: a pinned read view created right after a refresh would otherwise fetch
@@ -267,8 +535,8 @@ names a different tail). Without it, a coordinator behind the rival answered the
 the writer already held, the refresh moved nowhere, and the write ended in `SyncRevisionStalledError`
 with the revision it needed one hop away. Three choices keep it narrow:
 
-- **The header carries none.** It is rewritten only when the tail rolls over, so its revision says
-  nothing about the collection's.
+- **The header carries none.** It is rewritten only when the tail rolls over or the collection
+  changes it itself (a tree's root moving), so its revision says nothing about the collection's.
 - **It lasts one refresh.** It is never raised into the handle's `BlockFloors`: a standing floor on the
   tail id the handle remembers would be wrong once that tail fills, since a filled tail's last revision
   is the roll-over's, below the floor, and every later read of it — the chain walk, the invalidation
@@ -295,8 +563,9 @@ read itself, since the floor makes it consult past its window (see *The asker's 
 the request* under Key Invariants), so the old content outlasts one read only when no reachable cohort
 member can corroborate the revision — a partition, or a log entry whose blocks never landed, which
 sets a floor no machine can ever meet, and there the below-floor content is the *correct* content
-(the accepted-tradeoff `NOTE:` at `mayRetain`). It sets no floor for a block first read at open (no entries are walked then) or for the blocks an
-invalidation entry reverts. A write staged over a too-old read keeps the revision it was really
+(the accepted-tradeoff `NOTE:` at `mayRetain`). At open it floors only the blocks named by the log tail
+block's entries, not those of older log blocks, and it sets no floor for the blocks an invalidation
+entry reverts. A write staged over a too-old read keeps the revision it was really
 computed against: once storage catches up, the base under the staged edits is re-judged as moved and
 the edits are re-staged before they are pended, never re-described at the newer revision (see
 [Staged Edits Keep Their Base](#staged-edits-keep-their-base); the storage side of the same defect
@@ -319,7 +588,9 @@ therefore carries an optional serialized guard stating the statement's intent �
 `keepExisting` (skip silently if the key is present; no SQL statement stages it any
 more, see the `unchanged` paragraph below), `absentRange` (secondary-UNIQUE — no entry OTHER than this
 entry's own key may occupy a key *range*; a foreign hit throws `TreeRangeTakenError`,
-a subclass of `TreeKeyTakenError`), and `unchanged` (the lost-update check, below). The
+a subclass of `TreeKeyTakenError`), `unchanged` (the lost-update check, below), and the
+three already-applied variants `absentOrEqual`, `unchangedOrEqual` and `unchangedOrAbsent`
+(after the `unchanged` paragraphs). The
 `replace` handler (`buildInit` in
 `packages/db-core/src/collections/tree/tree.ts`) enforces the guard on **every** run —
 initial staging and every conflict replay — so the decision is always re-made against
@@ -370,13 +641,25 @@ added without that probe is broken, not merely conservative: the guard refuses a
 visible collision the probe should have resolved (evicting under REPLACE, swallowing
 under IGNORE), and the retry re-refuses forever.
 
-The fourth kind, `unchanged`, is the only one that asserts something must still *be* at the key rather than that nothing may be there — the optimistic-concurrency (lost-update) check. The entry at the key must be present AND structurally equal to the image the staged write read, carried in the guard's `expected` field and compared by `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts` (object key order ignored, `Uint8Array` leaves compared by bytes, an `undefined`-valued property treated as absent — so a guard that crossed an encoding boundary still matches an entry that did not). It is also the only kind a **delete** element may carry: every other kind asserts that nothing is present, which would make a delete a no-op by construction, so the handler rejects them there with `TreeDeleteGuardKindError` — a malformed-action error, deliberately outside the `TreeGuardRefusedError` hierarchy, since "a rival won, retry sequentially" does not describe a caller bug — instead of ignoring them the way it used to ignore every guard on a delete. A mismatch throws `TreeEntryChangedError`, which deliberately does **not** subclass `TreeKeyTakenError` — a lost update is not a uniqueness violation, and the bridge's `UNIQUE constraint failed` mapping would misreport it as one. Both extend `TreeGuardRefusedError`, which is where the contract every guard refusal obeys is written down once: it discards the whole action's staged writes, it is not a `StaleFailure`, and it is never downgraded to a retryable condition.
+The fourth kind, `unchanged`, is the first that asserts something must still *be* at the key rather than that nothing may be there — the optimistic-concurrency (lost-update) check. The entry at the key must be present AND structurally equal to the image the staged write read, carried in the guard's `expected` field and compared by `structuralEquals` in `packages/db-core/src/utility/structural-equals.ts` (object key order ignored, `Uint8Array` leaves compared by bytes, an `undefined`-valued property treated as absent — so a guard that crossed an encoding boundary still matches an entry that did not). It is one of the two kinds a **delete** element may carry (`unchangedOrAbsent`, below, is the other): every other kind asserts that nothing is present, which would make a delete a no-op by construction, so the handler rejects them there with `TreeDeleteGuardKindError` — a malformed-action error, deliberately outside the `TreeGuardRefusedError` hierarchy, since "a rival won, retry sequentially" does not describe a caller bug — instead of ignoring them the way it used to ignore every guard on a delete. The mirror check on an upsert rejects the delete-only `unchangedOrAbsent` with `TreeUpsertGuardKindError`. A mismatch throws `TreeEntryChangedError`, which deliberately does **not** subclass `TreeKeyTakenError` — a lost update is not a uniqueness violation, and the bridge's `UNIQUE constraint failed` mapping would misreport it as one. Both extend `TreeGuardRefusedError`, which is where the contract every guard refusal obeys is written down once: it discards the whole action's staged writes, it is not a `StaleFailure`, and it is never downgraded to a retryable condition.
 
 A guard is plain serialized data that rides in the log beside its action, and the live transport for that log is **JSON** in both directions (`JSON.stringify` in `packages/db-p2p/src/protocol-client.ts`, `JSON.parse` in `packages/db-p2p/src/repo/service.ts`) — not a richer codec. Two consequences the comparison is built around. First, an empty tuple slot comes back as `null` rather than `undefined`, so the handler reads both the entry slot and the guard slot by truthiness; a strict `!== undefined` test would have upserted `null` over a row, or read `.kind` off `null` mid-replay. Second, a guard's `expected` must be a value JSON preserves: a genuinely byte-shaped entry would deserialize as an index-keyed object, which `structuralEquals` reports (correctly) as different, and the guard would then refuse an honest write forever. No entry type is byte-shaped today — the plugin base64-encodes BLOB columns under the `json` encoding, and the `msgpack` encoding that would produce raw bytes throws `not yet implemented` — but a byte-shaped entry type introduced later needs a transport-stable encoding for `expected` before the guard can be trusted over the wire.
 
-**An absent entry counts as changed**, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
+**An absent entry counts as changed** for `unchanged`, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
 
-**Which statements carry `unchanged`.** Every main-table entry whose staged index delta was computed from a pre-write row image carries an `unchanged` guard on the stored entry the statement read (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`; the image comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which now hands back the stored entry beside the decoded row): a same-key UPDATE; both halves of a primary-key move — the delete half on the row it leaves, the insert half `unchanged` on the displaced entry when a REPLACE lands on an occupied key and `absent` otherwise; a DELETE; an INSERT OR REPLACE over an occupied key; and each secondary-UNIQUE eviction. So a racing same-row UPDATE or DELETE **refuses the loser** at commit rather than resolving last-writer-wins. Last-writer-wins cannot be made index-coherent: the loser's index delta was computed against a row the collection no longer holds, and no commit mode replays across collections, so re-applying the main-table action would leave that delta beside the rival's row (an entry no row implies, or a deleted row resurrected). Under concurrency every conflict disposition — `or ignore`, `or replace`, `on conflict … do nothing` — resolves to refusal too: an INSERT at a key its probe found clear is guarded `absent` whatever its disposition, because `keepExisting` would skip only the main-table entry while the statement's index entries replayed beside the rival's row, and an unguarded REPLACE would displace the rival without the index deletes a sequential REPLACE stages. The sequential retry, whose probe then sees the rival's row, honours the disposition. Index trees carry no `unchanged` guard: an index entry is keyed `indexKey ‖ pk`, so a stale delta can only be *prevented* by refusing the main-table action it was derived from, never repaired from inside the index tree. The bridge renders a `TreeEntryChangedError` from the main collection through the renderer the vtab registers (`registerEntryChangedRenderer` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, the framed key decoded back to the row's logical values by `decodePrimaryKey` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` — raised as `ConcurrentModificationError` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), a `QuereusError` with `StatusCode.BUSY` and the refusal in `cause`. It is deliberately **not** a `ConstraintError`: no integrity rule was violated, and the engine rewraps a `ConstraintError` under `or fail` / `or rollback` into keeping the statement's prior rows, which is wrong for a lost update. `BUSY` is the code the engine's own memory table raises for the same optimistic-concurrency loss, so a caller can classify by class or by code. Both mapped types extend `QuereusError`, which is what makes the vtab's DML catch rethrow a mapped refusal verbatim rather than wrap it a second time. Within one transaction a later statement's guard expects the earlier statement's *staged* entry, which is what the pre-write read returns and what replay, re-running the actions in order, has put there; a chain such as `insert; update; delete` therefore never refuses itself. A live read inside the doomed transaction refreshes the tree and so replays the staged action too, and can surface the same refusal early, wrapped as `Query failed: …` rather than mapped — the shape the "a live read inside a doomed transaction" note in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` already accepted for the insert guard, pinned by `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`.
+**Three variants accept a change a rival already made** (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`; the design is [offline-sync.md §Guards that make idempotent writes assured](offline-sync.md#guards-that-make-idempotent-writes-assured)), for the offline queue's rebase of a queued entry: two machines marking one task done, or deleting one row, both intended the final state the second one finds. Each has the outcome its base kind lacks — the element is *skipped as already applied* — beside writing and refusing. `absentOrEqual` (upsert) writes when the key is absent, skips when the present entry is structurally equal to the element's own entry, and otherwise refuses with `TreeKeyTakenError`. `unchangedOrEqual` (upsert, with `expected`) writes when the present entry equals `expected`, skips when it equals the element's own entry — checked second, so a no-op update whose `expected` equals its entry writes — and refuses with `TreeEntryChangedError` on an absent or any other entry; absent is still changed for every upsert kind. `unchangedOrAbsent` (delete, with `expected`) deletes when the present entry equals `expected`, skips when the key is absent, and refuses with `TreeEntryChangedError` on any other entry. The post-image an upsert variant compares against is the element's own entry, not a second copy on the guard, so the guard stays the size its base kind is; a kind on the wrong element is malformed, as above. The handler reports what it accepted as an `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`): for each element carrying one of the three kinds, `alreadyApplied` when it was skipped and `applied` when it was written or deleted; and `applied` for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever they do not refuse and that the SQL layer stages on every main-table element, so an entry of a plain insert beside an already-applied update tallies as `applied`, which is what a host reading `already-applied` as "none of my changes landed" needs. Elements with no guard, `keepExisting` or `absentRange` are not counted — a `keepExisting` skip says nothing about equality, and the other two are the shapes an index tree's entries take, whose writes under an already-applied entry restate what the rival's row already implies and must not make the entry read as `applied`. `Collection.stageInto` sums the handlers' tallies, and `Collection.replayActions` and `Collection.buildHeadTracker` record the sum on the sealed segment they staged (`SealedSegment.applied`, set directly, no version bump), which is how the queue hears it (*The offline queue*, above). A whole-collection `sync` discards the open segment's tally.
+
+**Which guard each statement carries.** Every main-table element a statement stages carries a guard, chosen at staging from the statement's write description (`TableWrite`, which Quereus hands the vtab on `UpdateArgs.writeScope`) and the table's tags. The gates are pure over the description and the arm — `insertAcceptsEqualRow` and `rewriteAcceptsEqualRow` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts` — and the image an `expected` field carries comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which hands back the stored entry beside the decoded row; the guard carries the entry AS READ, never a re-encoding (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). Site by site, in `update()` of the same file:
+
+| Statement (site) | Guard | The already-applied variant instead when… |
+|---|---|---|
+| INSERT whose probe found the key clear (`insertGuard`) | `absent` | the description's disposition says a present row is not an error — `or ignore`, `or replace`, `on conflict do nothing` with no target or targeting the primary-key columns — or the table is tagged `"optimystic.content_key" = true`: `absentOrEqual`. A plain `insert` keeps `absent`. |
+| INSERT OR REPLACE over an occupied key, and a same-key UPDATE (`rewriteGuard`) | `unchanged` on the pre-write entry | the description is of that arm and `selfIndependent` (no `set n = n + 1`, nothing read from other rows): `unchangedOrEqual`. The upsert `DO UPDATE` arm receives the INSERT's description and keeps `unchanged`. |
+| DELETE, and each secondary-UNIQUE eviction's delete (`applyUniqueEvictions`) | `unchangedOrAbsent` on the pre-write entry | always; no description is needed, so a cascade child delete carries it too. |
+| primary-key move, delete half | `unchanged` on the row it leaves | never: accepting the absent delete half while still inserting the new row would create a row the sequential execution never would. |
+| primary-key move, insert half | `absent` at a clear key, `unchanged` on the displaced entry under REPLACE | never. |
+
+Index trees are untouched: an index entry carries no `unchanged` guard and a UNIQUE index entry's `absentRange` is unchanged; under an already-applied entry the index segments replay as no-ops of their own accord (the delete of the old entry finds nothing, the insert of the new one finds an equal entry, and `absentRange` excludes the entry's own key, where the rival's identical entry sits). The `optimystic.content_key` tag says the primary key is a deterministic function of the row's other columns (a blob store keyed by hash), so two machines inserting the same content insert the same row; it is read `=== true` at staging time, as `optimystic.single_writer` is, and the variant still compares the whole row, so an equal key under different content refuses as a plain insert would. The gates are a property of the statement, not of offline mode: session mode stages through the same `update()`, and an online transaction's racing identical write — two deletes of one row — commits instead of refusing, the second's delete skipped as already applied (the DELETE-vs-DELETE case of `packages/quereus-plugin-optimystic/test/concurrent-row-change-refusal.spec.ts`, and the delete-vs-delete arm of the racing oracle in `packages/quereus-plugin-optimystic/test/two-node-index-mutation-sweep.spec.ts`). The acceptance can also be met at INITIAL staging on a mesh, where the tracker the guard scans fetched a rival's commit the pre-stage probe's view had not: a DELETE whose row that commit removed is skipped and the statement returns `ok` for a row the sequential execution would not have found, acceptable since the final state is the statement's intent (the note beside the DML catch in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). So a racing same-row UPDATE or DELETE whose rival made a DIFFERENT change **refuses the loser** at commit rather than resolving last-writer-wins. Last-writer-wins cannot be made index-coherent: the loser's index delta was computed against a row the collection no longer holds, and no commit mode replays across collections, so re-applying the main-table action would leave that delta beside the rival's row (an entry no row implies, or a deleted row resurrected). Under concurrency a conflict disposition — `or ignore`, `or replace`, `on conflict … do nothing` — resolves to refusal too whenever the rival's row DIFFERS: an INSERT at a key its probe found clear is guarded `absent` or `absentOrEqual` whatever its disposition, never `keepExisting`, because `keepExisting` would skip only the main-table entry while the statement's index entries replayed beside the rival's row, and an unguarded REPLACE would displace the rival without the index deletes a sequential REPLACE stages; only a rival's EQUAL row is accepted, and only under the dispositions the table above names. The sequential retry, whose probe then sees the rival's row, honours the disposition. Index trees carry no `unchanged` guard: an index entry is keyed `indexKey ‖ pk`, so a stale delta can only be *prevented* by refusing the main-table action it was derived from, never repaired from inside the index tree. The bridge renders a `TreeEntryChangedError` from the main collection through the renderer the vtab registers (`registerEntryChangedRenderer` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`) as `concurrent modification: another writer changed or removed the row in <table> at primary key (…)`, the framed key decoded back to the row's logical values by `decodePrimaryKey` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` — raised as `ConcurrentModificationError` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`), a `QuereusError` with `StatusCode.BUSY` and the refusal in `cause`. It is deliberately **not** a `ConstraintError`: no integrity rule was violated, and the engine rewraps a `ConstraintError` under `or fail` / `or rollback` into keeping the statement's prior rows, which is wrong for a lost update. `BUSY` is the code the engine's own memory table raises for the same optimistic-concurrency loss, so a caller can classify by class or by code. Both mapped types extend `QuereusError`, which is what makes the vtab's DML catch rethrow a mapped refusal verbatim rather than wrap it a second time. Within one transaction a later statement's guard expects the earlier statement's *staged* entry, which is what the pre-write read returns and what replay, re-running the actions in order, has put there; a chain such as `insert; update; delete` therefore never refuses itself. A live read inside the doomed transaction refreshes the tree and so replays the staged action too, and can surface the same refusal early, wrapped as `Query failed: …` rather than mapped — the shape the "a live read inside a doomed transaction" note in `packages/quereus-plugin-optimystic/src/optimystic-module.ts` already accepted for the insert guard, pinned by `packages/quereus-plugin-optimystic/test/external-commit-visibility-after-rollback.spec.ts`.
 
 Regression suites:
 `packages/db-core/test/tree-guard.spec.ts` (every guard kind over raw trees),
@@ -394,10 +677,12 @@ One consequence for rollback: the refusal happens *after* the loser's refresh ad
 the rival's committed revision, so the pre-transaction snapshot its rollback restores
 was captured on an older committed boundary. `Collection.restorePending`
 (`packages/db-core/src/collection/collection.ts`) detects the moved boundary and, for
-a snapshot with an empty pending queue, resets the tracker empty instead of
+a snapshot with an empty pending queue and nothing sealed, resets the tracker empty instead of
 reinstalling the snapshot's transforms — restoring them verbatim would shadow the
 now-committed blocks with stale structure (an invented collection's pre-commit
-header/root making the whole tree read empty being the observed case).
+header/root making the whole tree read empty being the observed case). With a sealed
+segment in place it replays instead, which a reset would have dropped (see
+[Staged actions are segments](#staged-actions-are-segments)).
 
 #### Committed reads are pinned, not shared-cache
 
@@ -522,7 +807,44 @@ Collection.sync()
             → StorageRepo.pend/commit  # Applies to local storage, the log tail first
 ```
 
-The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. `TransactionCoordinator.commit` is the one write path that reports no class; see the note on that method.
+Each storage apply (`StorageRepo.pend` / `commit`) ends with one flush of the node's store, with the window its cohort allows (strict for a solo write), after its block latches are released and before its change events fire — see [packages/db-p2p/docs/storage.md §6](../packages/db-p2p/docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved).
+
+The `WriteDurability` each layer assembles on the way back up returns along this same path, unflattened: `TransactorSource.transact` hands the whole `CommitResult` to `Collection.syncAttempts`, which reports the committing attempt's class out of `sync`/`updateAndSync`, and `Tree`/`Diary` forward it. `undefined` from a sync means nothing was staged, so nothing was written — not that the write failed. Every answer that confirms a commit also names the blocks it committed, each at the revision it committed at (`WriteDurability.blockRevs`): the full-replication event (`BlockDurabilityReachedEvent` in `packages/db-core/src/transactor/change-notifier.ts`) is keyed by block and revision, not by action, so this is what a host matches the events against. It is stamped client-side where the commit is confirmed — `TransactorSource.transact`, `TransactionCoordinator`'s per-collection commit, and `Collection.settleUnfinished` when it finds a superseded write saved — through `withBlockRevs` in `packages/db-core/src/network/durability.ts`, so it never travels on the wire, and it never names a `torn` block; merging two answers keeps the higher revision per block. A commit spanning several collections, `TransactionCoordinator.commit` (and `TransactionSession.commit`, as `ExecutionResult.durability`), answers with a `TransactionDurability` (`packages/db-core/src/transaction/durability.ts`): each collection it wrote, across every attempt, with its own class, and `overall`, the weakest of them, so a caller reading only `overall` is reading the binding constraint. A collection the refresh between attempts saved without learning who holds it is listed with an `undefined` class, and `overall` is then absent rather than fabricated — show such a transaction as pending. `undefined` from the commit means the same as from a sync: nothing was written. A commit that fails after something landed throws `CoordinatorPartialCommitError`, whose `durability` describes exactly the committed half.
+
+The SQL layer passes that answer on rather than dropping it. `TransactionBridge.commitTransaction` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts` takes a `TransactionDurability` from whichever of its three commit routes ran — session mode's `ExecutionResult.durability`, the batched legacy commit's coordinator answer, or, for the per-tree sweep that every single-table write takes, each tree's `sync()` answer folded by collection id — and after a commit that wrote something calls every listener registered with `onCommitDurability`, once, before the commit returns, with an `SqlCommitDurability` (`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-durability.ts`): the transaction's `StampId()`, the per-collection answer, and the same folded per table. Quereus's exec lock is what lets a host attribute a report to the `db.exec` call it arrived during. A commit that wrote nothing calls nobody; the sweep's own partial commit, `PartialCommitError`, carries the committed half's `durability` the way `CoordinatorPartialCommitError` does.
+
+A commit reported below `full` can also be followed until its whole cohort holds it. `DurabilityFollower` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/durability-follower.ts` holds each such commit's `blockRevs` and clears a block when the node's `BlockDurabilityReachedEvent` names it at that revision or later (or a later commit through the bridge writes it at `full`), then calls every `onCommitFullyHeld` listener with the transaction id. It follows a commit only when the event will reach this node — every below-`full` cohort answer names this node as `recordedBy`, nothing is `torn`, `overall` is known — and says so in the report's `followed`. The bridge subscribes when a transaction begins, before its commit is sent, and the follower remembers recent events per block, because the drain can empty the ledger entry and fire the event before the commit's answer has climbed back to the bridge. Followed commits are in memory only; a restart forgets them (backlog `feat-a-host-can-ask-whether-an-earlier-commit-is-fully-held`).
+
+#### A transaction's size limit
+
+One transaction's pend may encode to at most 7.5 MiB, measured as the UTF-8 length of its JSON (`MAX_TRANSACTION_BYTES` in `packages/db-core/src/network/transaction-size.ts`). The payload travels whole twice — writer to coordinator on the repo protocol, then coordinator to each other cohort member inside the cluster record, which the member echoes back with its vote — and both protocols frame it under one cap, `MAX_BLOCK_MESSAGE_BYTES` (8 MiB) in `packages/db-p2p/src/protocol-limits.ts`, derived as the limit plus a 512 KiB reserve for everything around the pend (`TRANSACTION_ENVELOPE_RESERVE_BYTES`). Before this, the cluster record was framed under the 1 MiB control cap, so a write between 1 and 8 MiB committed on one machine and failed with `Failed to get super-majority` as soon as a second joined (GitHub #35).
+
+- **The same at every group size.** A solo cohort takes no cluster hop, and is held to the limit anyway, so a write that commits alone does not start failing when the group grows.
+- **What counts.** Everything the pend carries: every block's transforms, the log entry, and the validation payload when there is one. A log entry repeats the data of the actions it records beside the blocks those actions change, so for a SQL write the row data is counted roughly twice — the batch reported in #35 encoded to 1.06 MB, of which 584 KB was log beside 480 KB of tree — and the usable row volume is about half the limit. A multi-collection transaction whose collections travel together is judged as one sum (`IRepo.pendMany` carries them in one record), with every collection's own copy of the validation payload counted; when that sum is over the limit `NetworkTransactor.pendMany` declines the batch before sending, and each collection is pended — and judged — on its own.
+- **What the writer gets.** `NetworkTransactor.pend` checks first (`assertTransactionFits`), before anything is sent, so nothing is reserved and nothing needs cancelling, and throws `TransactionTooLargeError` (its `actionId`, `bytes` and `limit`, and a message naming `MAX_TRANSACTION_BYTES`). It is not a `StaleFailure` and nothing retries it: it comes out of `Collection.sync` unchanged (`Tree.replace` and `Diary.append` unstage what they staged, as for any failure), and out of `TransactionCoordinator.commit` by name. A writer with more to save splits it into several transactions.
+- **Backstops.** `CoordinatorRepo.pendMany` applies the same check on receipt, for a writer that did not go through `NetworkTransactor`; a remote writer then sees the repo stream reset and the coordinator's log names the cause. And every protocol client refuses, before dialing, a request larger than the cap its server decodes requests under (`ProcessMessageOptions.maxRequestBytes` in `packages/db-p2p/src/protocol-client.ts`), throwing `MessageTooLargeError` rather than sending a frame the far side would reset — which the sender could not tell from a peer that went silent.
+
+**A block has a limit of its own.** Every path that copies a whole block to another machine — a replication push, a sync archive answer, a remote `get` reply — sends it in one message under the same 8 MiB frame, so a block larger than one frame could never be replicated, repaired or read remotely. The transaction limit does not catch it: a block grows by accumulating writes that are each well under that limit. Two constants in `packages/db-core/src/network/block-size.ts` bound it, both measured like the transaction limit, as the UTF-8 length of the block's JSON:
+
+- `MAX_BLOCK_BYTES` (7.5 MiB, equal to `MAX_TRANSACTION_BYTES`) — the most one block may encode to. A block at that size fits the frame inside the same envelope reserve a transaction gets. And a block holding a single entry is never larger than the transaction that wrote it, since the entry is inside that transaction's pend, so no single transaction produces a block over it on its own.
+- `BLOCK_TARGET_BYTES` (1 MiB) — the size past which a block holding more than one entry starts a new one. It keeps one block's copy far under the frame, and it is 32 entries of 32 KiB, so structures of small entries behave exactly as they did before it existed.
+
+**The log rolls over by size as well as by count.** `Chain.add` starts a new tail block when the current one holds `EntriesPerBlock` (32) entries, or when it holds at least one entry and the next would take its JSON past `BLOCK_TARGET_BYTES` (`ChainInitOptions.blockTargetBytes`, which `Log.getChainOptions` sets). An empty tail always takes the entry, so a log block either holds one entry, and is then no larger than the transaction that wrote it, or stays near the target. The entry's `blockIds` are written after the add and are not measured — small slop against the gap between the target and `MAX_BLOCK_BYTES`. The decision is a pure function of the tail block's content and the entry, so a retried append at the same revision splits the same way and mints the same block id (see *A write's log append is a fixed function of the write and the revision it is requesting* under Key Invariants). A tail that a build without the rule already grew past the target stops growing — the next append rolls over — but nothing shrinks it, and if it is past the frame it stays uncopyable.
+
+**A tree node splits by size as well as by count.** Every SQL table is a tree whose leaf entries are whole rows, and each row is its own small transaction, so the per-transaction limit never saw a leaf grow: 64 rows of 130 KB made a leaf over the frame. A `BTree` can be given a byte target (`nodeTargetBytes` in `packages/db-core/src/btree/btree.ts`), and `Tree` sets it to `BLOCK_TARGET_BYTES` on every B-tree it builds. A node then fits when it holds at most `NodeCapacity` (64) items and either no more than the target's bytes or the least a node holds — one entry, or two children for a branch — so a node over the target holds only that, and a leaf of one entry is no larger than the transaction that wrote it. An insert, or an in-place update that grows an entry, divides the node it would overfill (`divideItems` in `packages/db-core/src/btree/node-division.ts`): at the count midpoint as always when the count is the only reason, so trees of entries up to about 16 KiB write exactly the transforms they did; otherwise into the fewest runs that each fit, balanced where two suffice, so an entry larger than the target sits alone in its leaf and a leaf that outgrew the target before the rule is brought within it by its next write. A branch absorbs all of a child's new nodes at once and divides by the same rules. On delete a node is under-full only when below half the count *and* half the target, and a borrow or merge that would take a node past the target is refused (a merge that removes an empty leaf never is). The division is a pure function of the node's content and the edit, so a conflict replay re-stages identical transforms. The detail, and the cost — one serialization of the node per write to it — is in [packages/db-core/docs/btree.md §Node size](../packages/db-core/docs/btree.md#node-size).
+
+**The writer refuses a block over the limit.** The two split rules keep a log or a tree near the target; nothing makes every block type have one, so the writer measures every block a write touches, as it will be after the write, before anything is sent. The measure comes from the pass that declares each block's content digest (`describeTouchedBlocks` in `packages/db-core/src/transform/digest.ts`), as the length of the serialization it already hashes, and `oversizedBlock` in `packages/db-core/src/network/block-size.ts` judges it as a separate step, so declaring content still never breaks committing it.
+
+- **Where.** `Collection.syncAttempts` measures on every attempt, after the log append, so the log blocks the append touched are measured too. `TransactionCoordinator.declareTouchedBlocks` measures once per commit attempt, ahead of the gather and the pend, and keeps the digests as the commit's declaration, so the commit no longer materializes its blocks a second time after the pend.
+- **What the writer gets.** `BlockTooLargeError` (its `blockId`, `bytes` and `limit`, and a message naming `MAX_BLOCK_BYTES`), with the same terms as `TransactionTooLargeError`: nothing was reserved and nothing needs cancelling; it is not a `StaleFailure` and nothing retries it; it comes out of `Collection.sync` unchanged (`Tree.replace` and `Diary.append` unstage what they staged), out of `TransactionCoordinator.commit` by name, and out of `TransactionCoordinator.execute` as a failed result.
+- **What it cannot see.** A block the writer cannot materialize locally is neither declared nor measured: a blind update to a block this node never read, an update whose base was evicted from the read cache before it was staged, and a base that moved under its staged operations. A commit does not pay a network read to describe itself, so a block that outgrows the limit through one of those updates is not refused (the `NOTE:` at `describeTouchedBlocks`).
+- **When it fires.** Not for a log or a tree written under the split rules: each divides by size, and a block holding only its minimum (one log entry, one leaf entry, one branch key) is no larger than the transaction that wrote it. It is the boundary for the next way a block outgrows the frame, such as a new block type with no split rule. It does fire for a block a build without those rules already grew past the limit, on any write that leaves it over: a log tail cannot shrink, so the append that rolls over from it (rewriting its `nextId`) is refused, and so is every later write to that collection; a tree leaf is divided by the next insert or growing update to it, but a delete or a shrinking update that leaves it over is refused.
+
+Both ends of each of these frames name the cap. The length-prefix encoder (`it-length-prefixed`) defaults to 4 MiB, so a request or reply encoded at that default cannot carry a frame between 4 and 8 MiB: `ProtocolClient` encodes a request under no cap beyond `maxRequestBytes`, and the repo, cluster, sync and block-transfer services encode their replies under the cap their clients read them under (`MAX_BLOCK_MESSAGE_BYTES`).
+
+**A remote read's reply is packed to one frame.** `NetworkTransactor.get` sends each coordinator the blocks of one read it coordinates as one `IRepo.get`, and the coordinator answers them in one frame, so blocks that each fit a frame could together outgrow it, and the reader's decoder then refused the whole reply. `RepoService` now packs the reply (`fitGetReply` in `packages/db-p2p/src/repo/get-reply.ts`): entries in request order, the first always whole, each further one whole while the JSON-encoded entries stay within `GET_REPLY_CONTENT_BUDGET_BYTES` (the frame less the envelope reserve, i.e. `MAX_BLOCK_BYTES`), and every other block answered with a left-out entry. `RepoClient.get` asks the same peer again for the left-out blocks, with the same context and the floors and `askerHolds` cut down to them, until every block is answered, and returns one merged answer; each round answers at least one more block, so it ends. A left-out entry never leaves `RepoClient`: it is neither `unavailable` nor an absent answer, both of which mean something to `NetworkTransactor.get`'s retry and merge. A later round is a fresh read on the far side, with its own consult and read-repair window, so the blocks of one read may be answered from different moments — no weaker than before, since every block's answer is judged on its own. Only a request marked `acceptsLeftOut` is packed, because a reader that predates the entry would take it for an authoritative absent; such a reader is answered whole, and a reply too large for one frame fails for it as it always did. The consult a coordinator sends its cohort solved the same problem the same way first (`fitConsultContent` in `packages/db-p2p/src/storage/block-archive.ts`).
+
+What is still open here is tracked by ticket: a transaction larger than one frame would need every hop it takes chunked (backlog `feat-a-transaction-larger-than-one-frame-can-commit`).
 
 #### One commit round when one coordinator covers every block
 
@@ -532,8 +854,56 @@ every cohort, because the pend's cover (`consolidateCoordinators`) collapses ont
 listing the log tail first and the rest after it (`commitInOneRound`). `CoordinatorRepo.commit` runs consensus
 on `blockIds[0]`'s cohort, so that record runs on the tail's cohort, as a tail-only round would; the other
 blocks commit on that cohort too, the approximation a multi-block batch already makes. With one consensus
-operation for the pend and one for the commit, a single-collection write on a two-member group costs 4
-`/cluster` calls to the other member (measured on the in-process mesh), where a tail round plus a sweep costs 6.
+operation for the pend and one for the commit, a single-collection write on a two-member group costs 3
+`/cluster` calls to the other member (measured on the in-process mesh, and by
+`packages/quereus-plugin-optimystic/test/two-node-write-request-count.spec.ts` for a SQL insert): each
+operation is a promise round and a decision, and the pend's decision rides on the commit's promise round
+(see *Both consensus rounds carry the coordinator's own member's vote*). A write spanning several
+collections costs the same 3 when one coordinator covers all of their blocks, because it sends them as one
+pend record and one commit record (below); a write whose collections cannot travel together costs 4 per
+collection, and a tail round plus a sweep costs more again.
+
+A consensus record can carry several collections of one action — a **batch** (`RepoMessage` in
+`packages/db-core/src/network/repo-protocol.ts`): all pends or all commits, one action id, no block named by
+two operations, and each collection keeping its own request (revision, tail, bases, digests). A member refuses
+any other multi-operation record as a fault of the record (`batchShapeFault` in
+`packages/db-p2p/src/cluster/record-operations.ts`), applies a batch's operations one at a time, and keeps ONE
+verdict for the record, folded over them (`applyConsensusOperations` in
+`packages/db-p2p/src/cluster/cluster-repo.ts`). A pend record succeeds only when every collection's pend did;
+otherwise the first conflict-shaped refusal is its answer, so a refusal of any collection reaches the writer. A
+commit record succeeds only when this member holds every collection's revision, and a later reconcile of a
+behind member repeats only the collections it is missing. A coordinator takes a batch in one request
+(`IRepo.pendMany` and `IRepo.commitMany`, carried by `RepoClient` and served by `RepoService`, which refuses a
+multi-operation message that is not a batch) and runs it as one record, answered together: success only if every
+collection's request was accepted. `CoordinatorRepo` runs a single `pend` or `commit` as a batch of one, so both
+share one path. Consensus runs on the cohort of the batch's first block, as for a single request. A refusal of any
+collection refuses the batch: a stale loss is confirmed against each collection's own requested revision, and a
+commit the cohort decided can be answered refused while some of its collections already sit on a majority, when
+members held only part of it (the accepted-tradeoff `NOTE:` at `CoordinatorRepo.commitThroughCluster`).
+One pend record and one commit record per action is what brings a multi-collection write to the three requests
+a one-collection write costs, and it keeps the held-back pend delivery safe: a member that refuses any
+collection's pend late refuses the action's one commit record before anything of it is durable
+(`mayDeferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
+
+The writer sends a batch through two optional transactor methods, `ITransactor.pendMany` and
+`ITransactor.commitMany` (`packages/db-core/src/transactor/transactor.ts`). `TransactionCoordinator.pendPhase`
+and `commitPhase` (`packages/db-core/src/transaction/coordinator.ts`) use them for any transaction of two or more
+collections — every SQL commit route that writes a table and its indexes, or several tables, in session mode and
+in legacy mode's batched commit (`commitBatchLegacy`). `NetworkTransactor.pendMany` sends the batch when the cover
+its pend computes (`coordinatorCover`) puts every collection's blocks on ONE coordinator whose repo takes batches,
+and the whole set fits the per-transaction size limit; every request is marked the action's only reservation, so
+the coordinator may hold the pend's decision back for the commit to carry. `NetworkTransactor.commitMany` sends
+the commit to that same coordinator, which `pendMany` cached for every block. Otherwise either answers
+`undefined` — "they could not go as one", never a verdict — and the coordinator falls back to one request per
+collection, the pends rebuilt without the mark. A batched pend that THREW is cancelled whole and then also falls
+back, since one request cannot be re-batched onto other coordinators the way per-collection pends are; a
+batched commit that threw falls back to per-collection commits, which re-send everything, and whatever the
+thrown request landed is the action's own revision, which storage treats as already done. Batching groups the
+collections WITHIN each phase; it does not merge the phases. The pend and the commit stay two consensus records,
+each with its own promise round, and a member still owed the pend's decision applies, or refuses, it before it
+votes on the commit record. A transactor without both methods (`TestTransactor`, the
+reference peer's) keeps one request per collection; the pend is batched only beside `commitMany`, since its mark
+promises the commit goes as one request too.
 
 What `Collection.bootstrapContext` relies on — wherever committed data of an action exists, its committed tail
 does too — is enforced by storage rather than by the order of rounds: `StorageRepo.commit` applies the tail
@@ -560,8 +930,19 @@ round and `presignLocalCommit` on the commit round, both in
 already voted in, so it is invoked exactly once per phase.
 
 The two rounds want it for different reasons. On the **commit** round the pre-signature is what lets a remote
-member in a cohort of three or fewer reach its majority and apply in the same delivery, which is where the
-reconcile ordering in *A behind member actively reconciles* (under Key Invariants) starts. On the **promise**
+member in a cohort of three reach its majority and apply in the same delivery, which is where the reconcile
+ordering in *A behind member actively reconciles* (under Key Invariants) starts. In a cohort of two the
+pre-signature does more: the remote member already signed its commit while answering the promise round (it saw
+both approvals), the coordinator kept that signature, and the pre-signature completes the majority, so the
+coordinating member applies on its own pre-sign and **no commit round runs**. The remote member is owed only
+the decision. For a pend whose writer marked it the action's only reservation (`PendRequest.soleReservation`),
+that decision is held back and carried on the first request of the action's commit, ahead of the commit's own
+record (`deferPendDelivery` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, sent alone after
+`pendDeliveryDeferralMs`), so the member applies the pend, or refuses it, before it votes on the commit. That is
+how a write costs the other member three requests — one collection's, or several collections' sent as one pend
+record and one commit record (*One commit round when one coordinator covers every block*, above); why a write
+whose collections go one request each does not get it is in
+[correctness.md §2 Definitions](correctness.md#2-definitions). On the **promise**
 round it is what makes the race arbiter run at all. `resolveRace`
 (`packages/db-p2p/src/cluster/race-resolution.ts`) compares the count of `approve` promise votes first, and
 that comparison gates the two below it — the aged priority and the message hash, which are the comparisons
@@ -581,12 +962,16 @@ Three rules hold this together, each of which has a failure mode if dropped:
   the reputation accounting and the shortfall arithmetic see it exactly as they saw a failed local delivery
   before. Pinned by `packages/db-p2p/test/cluster-coordinator-promise-retry.spec.ts` ("does NOT retry the
   LOCAL cluster on a throw").
-- **The promise round merges only `promises`.** Merging a member's promises into a record that already carries
-  commit signatures is the defect in backlog
+- **The promise round keeps a commit signature only when it was signed over the final promise map.** Merging a
+  member's promises into a record that already carries commit signatures is the defect in backlog
   `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`: a commit signature covers the
-  promise map it was signed over, so a late promise invalidates it. The pre-vote cannot hit that, because no
-  commit signature exists anywhere before the promise round completes — a member signs a commit only after
-  seeing a super-majority of approved promises. Keep that true.
+  promise map it was signed over, so a late promise invalidates it. The round therefore merges every answer's
+  promises first, and only then keeps a member's own commit signature from its answer, and only when that
+  answer's promise map equals the merged one exactly (`keepCommitsSignedOverMergedPromises`, compared by
+  `canonicalJson`) — at the default threshold, in a cohort of two. No promise is merged after the keep: it runs
+  only once this node's member's promise is in the map, so the pre-sign has none to add. Any other commit
+  signature is dropped, as every one used to be; one signed over a smaller map would fail every member's check
+  and get its signer penalized. Keep both orderings.
 - **It fixes the two coordinators' members, not the whole cohort.** A member that is neither coordinator still
   votes for whichever record reached it first, and its approval re-inflates that record to two against the
   newcomer's one, so from three members up the count comparison can decide again one layer out. Observed at
@@ -668,8 +1053,8 @@ artifact carrying the commit `RepoMessage` verbatim (including the commit op's `
 the promise-round and commit-round vote signatures, and the membership-v2 digest with its full
 sorted peer-id list. No public keys ride along — every signer's Ed25519 key is recovered from its
 peer id, the same binding `peerIdBindsPublicKey` relies on. Measured size for a 10-peer cohort on
-a two-block commit: 4578 bytes (`test/commit-proof.spec.ts`), comfortably inside the 1 MiB
-control-message bound.
+a two-block commit: 4578 bytes (`test/commit-proof.spec.ts`), a rounding error inside the 8 MiB
+sync-response and block-transfer frames it rides in (`MAX_BLOCK_MESSAGE_BYTES`).
 
 Verification is pure, throw-free on hostile input, and split to match what the two repair stages
 know:
@@ -728,7 +1113,12 @@ cohort of one (1 / true) from a routing failure (0, or a sole peer that is not t
 `quorum` — the durability class the writer was told (`local` for the former, `unrouted` for the
 latter; see `WriteDurability` in `packages/db-core/src/network/struct.ts`), plus `reason` when the
 cohort did not resolve. The log and the returned answer come from the same classification
-(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree. A node briefly
+(`soloCohortDurability` in `packages/db-p2p/src/repo/coordinator-repo.ts`), so they cannot disagree.
+Two more fields say why a node that belongs to a group wrote alone: `knownAbsent` counts the members
+it knows of and could not reach (with their short ids in `absentPeers`), whom the `local` answer names
+as `unconfirmed`, and `awaitingBootstrap` says it is still waiting to hear from a peer it was
+configured to join through. With neither, the node is genuinely alone or has never identified
+another member of its group. A node briefly
 alone can still mint a proof for a revision the rest of its cohort never saw, so the repair
 selectors weigh a proof by **how many distinct peers signed it**: a one-signer proof — which is
 exactly what this branch mints — no longer out-ranks a corroborated claim at equal revision. Two or
@@ -742,8 +1132,8 @@ whether it forked or the other two are simply lagging, and refusing it would bre
 lagging-cohort repair this mint exists for. Closing that needs evidence a claim does not carry today
 (`debt-repair-cannot-tell-a-fork-from-a-lagging-cohort`). See *The certified exception* below.
 
-**Persistence and retention.** `ClusterMember.applyConsensusOperation` builds the proof from the
-consensus record (membership-v2 records only) and passes it into `StorageRepo.commit`, which
+**Persistence and retention.** `ClusterMember.applyConsensusCommits` builds the proof once per
+consensus record (membership-v2 records only) and passes it into every commit operation's `StorageRepo.commit`, which
 applies one rule after materializing: **a member persists the proof only when its own
 materialization matches the digest the commit op declared** — otherwise it stores nothing and
 logs `commit:proof-digest-mismatch` (or `commit:proof-undeclared` when the op declared no digest
@@ -826,16 +1216,20 @@ funnel for both the coordinated and direct paths, so it originates a per-collect
 StorageRepo.commit()                       # critical section (block locks held)
   → internalCommit() returns collectionId  # newBlock.header ?? priorBlock.header (delete)
   → release locks (finally)
+  → storage.flush()                        # strict, or with the cohort's window on a consensus apply (storage.md §6)
   → emitCollectionChanges()                # one CollectionChangeEvent per distinct collection
 StorageRepo.get()                          # read-driven promotion (context proves committed)
   → internalCommit() returns collectionId  # promotes a pending action that landed durably
+  → storage.flush()                        # only when the read took a write latch
   → emitPromotions()                        # group by (actionId, rev), emit per group
 ```
 
 - Subscribe via `onCollectionChange(collectionId, listener)` → idempotent unsubscribe.
-- Events fire **after** locks release, synchronously in commit order, fire-and-forget
+- Events fire **after** locks release and the write group's flush, in commit order, fire-and-forget
   (never awaited); a throwing listener is isolated + logged. Ordering across concurrent
-  commits / across collections is **not** guaranteed.
+  commits / across collections is **not** guaranteed. A per-collection event can fire later than
+  the call that landed it — see the hold below; the catch-all feed (`onAnyCollectionChange`) always
+  fires at the end of that call.
 - **Emission guarantee (Option A — emit eagerly):** a `CollectionChangeEvent` fires
   once for every block that becomes **durably committed** on this node, regardless of
   whether the enclosing `commit()` ultimately reports `success: false`, and regardless
@@ -845,12 +1239,61 @@ StorageRepo.get()                          # read-driven promotion (context prov
   retry rolls `N` forward and emits for it), and (b) a pending action promoted during a
   `get()` whose `context` proves it committed. Idempotent `alreadyDone` re-landings and
   stale partitions never emit, so each `pending → committed` transition emits exactly
-  once. The consumer does coarse whole-table invalidation, where over-firing costs only
-  a re-query but a missed wake serves a stale view indefinitely — hence the asymmetry
-  favors liveness.
+  once — once, and for the per-collection feed possibly later than the landing, never
+  twice and never not at all. The consumer does coarse whole-table invalidation, where
+  over-firing costs only a re-query but a missed wake serves a stale view indefinitely —
+  hence the asymmetry favors liveness.
+- **A collection's wake waits for the action's other collections pending here.** A SQL
+  table and each of its indexes are separate collections, and a transaction writing a row
+  commits them under one action id — in one consensus record when they travel together, one
+  record each when they cannot (`TransactionCoordinator.pendPhase` and `commitPhase` in
+  `packages/db-core/src/transaction/coordinator.ts`). Either way a member applies each
+  collection as its own `StorageRepo.commit` call: back to back within one record, or a few
+  hundred milliseconds apart on a relayed link when they travel separately. A watcher
+  woken by the table's event read the index from this node's own replica before the index's
+  commit had applied, and found nothing; the index's own event wakes nobody (GitHub #47). The
+  writer pends every collection before committing any, so at the moment the table's commit
+  applies here this node already holds the index's **pending record under the same action id**,
+  and that is the signal: `StorageRepo.emitCollectionChanges` holds an action's per-collection
+  events while the action has an open **pend group** here — the blocks one `StorageRepo.pend`
+  call saved for it, one collection's reservation — and releases them, in the order held and
+  ahead of the releasing call's own events, when the action's last open group closes. A group
+  closes when a block of it lands here (a commit, a read-driven promotion in `get`, or a replica
+  of the action's revision through `saveReplicatedBlock`), when the writer's `cancel` names its
+  blocks, or when a check after another collection of the action landed finds none of its blocks
+  still holding the pending record. Groups rather than blocks, because a group already partly
+  landed is the SAME collection mid-commit — the tail-then-sweep path, a mid-loop throw — whose
+  eager emission (case (a) above) stays as it is; only another collection's untouched reservation
+  holds a wake. The bookkeeping is pure state in `ActionChangeHold`
+  (`packages/db-p2p/src/storage/action-change-hold.ts`); the storage reads and the timer stay in
+  `StorageRepo`. What it costs: a single-collection action has one group, which its own commit
+  closes by landing — no storage read, no delay, no timer. After a write group of a
+  multi-collection action ends with groups still open, each open group costs one unlatched read
+  of a pending record. A held event is released at the latest `changeHoldMs` after it was first
+  held (`StorageRepoOptions.changeHoldMs`, default `DEFAULT_CHANGE_HOLD_MS`, 10 s; `0` disables
+  the hold), through one unref'd timer per action, so a writer that died between its commits
+  costs a late wake rather than one that never comes. In memory only, capped (an evicted action's
+  events are released, never dropped), with actions that pended and vanished aged out; a restart
+  forgets every hold, which only means the next commit of an action pended before it wakes at
+  once. Two residuals are accepted and recorded at their sites: a pend delivered to a member
+  after another collection of the action already committed and emitted there holds nothing for
+  that earlier event (`notePendGroup`), and a collection that lands after the timer released
+  fires only its own listeners (`armHoldTimer` — the tripwire is to have the vtab subscribe to its
+  index collections too if gaps beyond `changeHoldMs` are ever seen). Nothing is held for an
+  action with no pend group here — one pended before a restart, an `inv:` invalidation, a
+  collection in this node's cohort whose sibling collection is not (larger groups; such a node
+  behaves as before). The catch-all feed is never held: neither tail-rotation detection nor the
+  owned-block feed wants a delay. (Cohort-topic origination, the feed's third consumer, resolves
+  its commit certificate by the event's collection tail, so a held table event would still find
+  the table record's certificate; holding it for origination is backlog
+  `feat-a-network-watch-wake-sees-the-whole-commit`.) Pinned by the "a hold while another
+  collection of the action is still pending" cases in `packages/db-p2p/test/storage-repo.spec.ts` and end to end by
+  `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts`.
 - Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
   `OptimysticNodeAttachments` (`db-p2p/src/optimystic-node.ts`), which `createLibp2pNode`'s
-  return type carries, so reading it needs no cast. `NetworkTransactor`
+  return type carries, so reading it needs no cast; the same surface carries
+  `node.cohortReachability`, the offline queue's reachability gate (see *The offline queue*
+  above). `NetworkTransactor`
   re-exposes it via an optional `localChangeNotifier` ctor option (no-op when absent).
 
 #### Reactive Watch Bridge (Quereus vtab)
@@ -878,8 +1321,23 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   `header.collectionId` stamped on every block (`TransactorSource.createBlockHeader`)
   and therefore the `CollectionChangeEvent.collectionId`. Index sub-collections
   (`<uri>/index/<name>`) carry their own ids and are NOT separately watched —
-  whole-table invalidation re-queries them anyway. The schema tree
-  (`tree://optimystic/schema`) is skipped (schema writes aren't data-watch events).
+  whole-table invalidation re-queries them anyway. What makes that re-query see the
+  indexes is storage, not the subscription: a node holds the table's event until every
+  other collection of the same action pending there has landed (see *A collection's wake
+  waits for the action's other collections pending here* above), so the wake arrives when
+  the table and its indexes agree, possibly later than the table's own commit applied.
+  The schema tree (`tree://optimystic/schema`) is skipped (schema writes aren't
+  data-watch events).
+- **The network watch has the same shape, and is not held.** Origination fires on the
+  root group member when the TABLE's commit applies there (`selfAppliedTail` over the
+  catch-all feed, which is never held), so a network notification can reach a subscriber
+  before the index's commit has applied anywhere, and the watch service's tick
+  (`ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts`)
+  compares only the table's tail revision, so it never wakes again for that commit. On a
+  subscriber that also stores the collections — every member of a group no larger than a
+  cohort, the two-member case — the network wake is an early over-wake and the held storage
+  wake that follows is consistent. A subscriber that stores nothing of the table still has
+  the gap; that is backlog `feat-a-network-watch-wake-sees-the-whole-commit`.
 - **Coarse invalidation.** `notifyExternalChange` fires every matching watcher as
   a global whole-table change: `full` watches fire with empty hits, `rows`/
   `rowsByGroup` watches surface their registered literals as possibly-changed.
@@ -892,9 +1350,18 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   peer/actionId and let the vtab skip events it just authored.
 - **Double wake from storage and network (accepted).** On a node that both stores
   a table tagged for network change notification (below) and watches it, another
-  machine's commit wakes watchers twice: once from the storage listener, once from
-  the network notification. Both are whole-table invalidations, so the cost is one
-  extra re-query; neither path suppresses the other.
+  machine's commit wakes watchers twice: once from the table's own storage listener,
+  once from the watch service, which hears the same storage landing — and a third
+  time when the network notification reaches the node before the local apply (the
+  service wakes on a notification only for a revision nothing has woken it for). All
+  are whole-table invalidations, so the cost is one or two extra re-queries; the
+  vtab's listener and the service do not suppress each other.
+- **A failed offline transaction is announced the same way.** Its rows leave this
+  machine's view with no commit to announce them, so the offline-mode controller
+  makes the same call for each table its removal changed, through the same
+  error-isolating helper (`announceExternalChange` in
+  `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`;
+  [offline-sync.md §Removing an entry](offline-sync.md#removing-an-entry)).
 - **Lifetime.** The subscription is established once after table init and released
   in `OptimysticModule.destroy` (DROP TABLE). It is deliberately NOT released in
   the per-statement `disconnect()` (a no-op that keeps the table initialized across
@@ -916,8 +1383,13 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   whose wake is the same `notifyExternalChange` path — so a machine storing nothing
   of the table wakes too. The tag is read `=== true`, from the declaration and then
   from every `table_modified` the module hears (`OptimysticModule.followTagChanges`
-  → `OptimysticVirtualTable.followTags`), so `alter table … set tags` starts or stops
-  the watch on a running table. The vtab opens and closes the watch through one
+  → `OptimysticVirtualTable.followSchemaTags`), so `alter table … set tags` starts or stops
+  the watch on a running table. The same listener also saves the table's tags — table,
+  column, named constraint and index — to its catalog record
+  (`SchemaManager.persistTags` in
+  `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`), since Quereus applies
+  a tag change to its own catalog without calling the module, and `hydrate` rebuilds tags
+  from that record. The vtab opens and closes the watch through one
   serial queue, so a tag flipped while an open is in flight is applied after it. It
   needs a node built with `cohortTopic.enabled` (the plugin-level `cohort_topic` for
   a node the plugin builds); without one — or on a non-`network` transactor — the
@@ -936,7 +1408,9 @@ across the network — not just to in-process subscribers.
 ```
 ClusterMember.handleConsensus            # consensus reached on a commit op
   → captureCommitCert(record)            # build CommitCert from record.commits (cluster-repo.ts)
-  → onCommitCertificate(actionId, cert)  # → CommitCertStore.put  (BEFORE storageRepo.commit)
+  → onCommitCertificate(actionId, cert, tailIds)
+                                         # → CommitCertStore.put, one entry per tail the record commits
+                                         #   (BEFORE storageRepo.commit)
   → storageRepo.commit(...)              # critical section; emits CollectionChangeEvent at the end
 StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not per-id)
   → makeCohortTopicChangeNotifier        # the bridge (cohort-topic/change-bridge.ts)
@@ -944,7 +1418,7 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
      → selfAppliedTail(event)?           # tail-less event, or a commit that landed only non-tail blocks
                                          #   here → no-op; the tail among event.blockIds means this node is
                                          #   in the tail's storage group (the announcing group), no ring read
-     → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get
+     → extractCommitCert(event)          # makeClusterCommitCertExtractor → CommitCertStore.get(actionId, tailId)
      → CohortTopicService.onLocalCommit(event, commitCert)   # reactivity originates from here
 ```
 
@@ -962,6 +1436,19 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   the end of the call — so the cert must already be retained when the bridge resolves it.
   No retained cert (e.g. an idempotent re-commit) → the bridge skips origination rather
   than fabricating an unsigned one.
+- **One cert per collection tail, not per action.** A transaction writing a table and its
+  indexes commits them under one action id: as one consensus record (a batch) with one
+  certificate when they travel together, as one record per collection — each signed by its
+  own tail's cohort — when they cannot. A member in both cohorts can apply two such records
+  concurrently, so a store keyed by action alone handed the table's event the index record's
+  certificate, which a subscriber judging the table tail's root group refuses. The store keys
+  each certificate by `(actionId, tailId)` for every tail its record commits
+  (`committedTailIds` in `packages/db-p2p/src/cluster/commit-cert.ts`, the same test
+  `selfAppliedTail` applies to the event), and the extractor reads it by the event's tail. A
+  record that commits no tail — a sweep of a collection's non-tail blocks — retains nothing,
+  since its events never originate. An invalidation's certificate names no tail and is kept
+  action-wide; `get` falls back to it only when no per-tail entry exists, and commit records
+  never write one.
 - **Decorator, not a replacement.** `makeCohortTopicChangeNotifier` returns an
   `IBlockChangeNotifier` that the `NetworkTransactor` takes as its `localChangeNotifier`;
   its `onCollectionChange` delegates straight to the `StorageRepo`, so the Quereus
@@ -1009,20 +1496,30 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
   - **A host subscribes through `node.reactivityWatch`** (`network-collection-watch-service`).
     `ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts` is the typed,
     host-facing surface over all of the above — present exactly when `cohortTopic.enabled` built a host.
-    `watch({ collectionId, readTail, onChange })` returns at once; in the background the service keeps
+    `watch({ collectionId, tails, onChange })` returns at once; in the background the service keeps
     one subscription per collection (shared by every watch of it on the node), registers its one manager in
     the subscriber registry under the collection's topic and with the cohort under the tail block as the
     root key, renews it, and has it follow the tail when the log starts a new block (a registration at the
     root registers again under the new root key; one below the root only updates its root key). The first committed tail the service reads for a collection wakes its watchers once (it
-    cannot know what a caller read before then), so a caller opens the watch and then reads. Each
-    subscription also ticks at the renewal cadence (30 s Core, 20 s Edge) and reads the
-    collection's committed tail: a revision above the last one the watchers were woken for wakes them,
-    and a different tail block is followed. That check is what turns a lost notification, a
+    cannot know what a caller read before then), so a caller opens the watch and then reads. The
+    service also ticks, on one timer at the renewal cadence (30 s Core, 20 s Edge), and reads every
+    watched collection's committed tail: a revision above the last one the watchers were woken for wakes
+    them, and a different tail block is followed. That check is what turns a lost notification, a
     failed registration, an unannounced rotation or a commit nobody announced into one tick of delay
-    instead of a watcher that never wakes; it costs one tail read per watched collection per tick.
-    `Collection.readCommittedTail` in `packages/db-core/src/collection/collection.ts` is the reader a
-    host passes — it opens no collection handle, so it cannot replay a table's staged actions, and
-    given the tail id the service hands `readTail` it is one request. The stop
+    instead of a watcher that never wakes. It costs one read per tail reader per tick, naming every
+    collection that reads through it: `tails` is a `CollectionTailReader`, the service groups watches by
+    reader identity, and `committedTailReader` in the same file — `Collection.readCommittedTails` in
+    `packages/db-core/src/collection/collection.ts` over one transactor — answers a group whose logs
+    stayed on their tail blocks in one request. It opens no collection handle, so it cannot replay a
+    table's staged actions. All but one tick in `verifyEveryTicks` (default 10) mark that read
+    `skipWindowConsult`, so on a node that stores the collections an idle tick is answered from its own
+    copy and sends no request beyond the renewal; the verifying tick's consult is what repairs a copy that
+    missed a commit nobody announced. The node also hands the service its `StorageRepo` as
+    `localChanges`, and a change landing in this node's storage wakes the collection's watchers whatever
+    its revision, since a notification routinely reaches a node that stores the collection before the
+    local apply does; a notification now wakes only for a revision nothing has woken the watchers for. A host builds one reader per transactor and passes it to every watch; the
+    Quereus plugin does (`CollectionFactory`'s `tailReaders`). The cost and the recovery bound are in
+    [reactivity.md § The node's watch service](reactivity.md#the-nodes-watch-service). The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin
     uses it for tables tagged `optimystic.network_watch` (see *Reactive Watch Bridge* above).
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). The bridge hands every commit
@@ -1110,8 +1607,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
   travel with the operations wherever the operations travel: an atomic's flush into its parent
   (`Tracker.absorb`) hands over the atomic's pins as the bases of the flushed operations rather than
   re-probing a cache that may have moved on, and a staged-state snapshot
-  (`Collection.snapshotPending` / `restorePending`) carries and restores them, so a rollback never
-  pairs operations with the bases of some later re-stage.
+  (`Collection.snapshotPending` / `restorePending`) carries them and restores them on the verbatim
+  arm, so a rollback never pairs operations with the bases of some later re-stage. The replay arm
+  restores none: it re-stages the operations, and each re-staged update pins the base it was just
+  computed against (see [Staged actions are segments](#staged-actions-are-segments)).
 - **A pending action is never pended over a moved base; it is re-staged first.**
   `Collection.restageIfBasesMoved` in `packages/db-core/src/collection/collection.ts` runs before
   every attempt of `syncAttempts` and at the top of both coordinator commit spans (`commitOnceLatched`
@@ -1119,7 +1618,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   and the log append): one read per pinned block the cache does not retain (a below-floor answer, so
   storage may have caught up with no log movement), one cache probe per pinned block, and a replay of
   the pending queue if any base moved (logged as `collection:restage-moved-base`). `mustReplay` has
-  the same test as its third reason, beside conflicts and a revision advance.
+  the same test as its third reason, beside conflicts and a revision advance. A head commit's
+  tracker is re-judged the same way before each of its attempts (`Collection.headTrackerFor`), and
+  rebuilt rather than replayed, since it holds the head segment alone.
 
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
@@ -1203,6 +1704,32 @@ saveMaterializedBlock(block): store(structuredClone(block));
   approval either); what they buy is classification, signed evidence, and an operator-visible count
   of how much traffic went unchecked. A node with no checker configured is unaffected by the policy.
   No composition root supplies a checker today (backlog `feat-no-deployment-validates-transactions-at-pend`).
+  Neither shape is marked as a validity judgement (next bullet): both say this node could not judge
+  the transaction, not that it is wrong.
+- **A reject that judges the transaction itself wrong says so in its signature.** Every member
+  refusal other than a `conflict`, a `held` or an expiry is a `reject` with prose, so a stale
+  revision, a membership refusal, a content-digest disagreement and a checker fault look identical
+  to a writer — and the prose must never become control flow. The five `TransactionValidator`
+  refusals that judge the transaction itself wrong — a tampered stamp, a missing or invalid client
+  signature, a failed re-execution and an operations-hash mismatch — return a `validity` class
+  (`ValidityRejection` in `packages/db-core/src/transaction/transaction.ts`), carrying the operations
+  hash the member computed when it got that far; every other refusal returns none.
+  `checkPendValidation` passes a checker's class through untouched, and the pend-validation branch of
+  `ClusterMember.validatePendOperations` is the one site whose verdict can carry it, which `voteFor`
+  in `packages/db-p2p/src/cluster/cluster-repo.ts` signs as `Signature.validity`: encoded
+  `reject-invalid:<json>` the way `expiredAt` is encoded `reject-expired:`, so it cannot be added,
+  stripped or altered in transit, and the type keeps one vote from carrying both. The marker is
+  positive on purpose, so **absent means "not known to be a validity judgement"**: a member on an older
+  build sends none, and its stale-revision reject must never be read as final. Counting is unchanged
+  everywhere — a marked reject is a reject — and `detectEquivocation` treats a differing marker on a
+  re-delivered reject as a re-signed vote. The mixed-version cost is the one the expiry encoding
+  already accepted: an older member verifying a marked vote builds the old preimage and reports
+  `InvalidSignature` against an honest member, tolerable because no deployment re-validates
+  transactions yet, so marked votes are rare, while the common stale-revision reject keeps its
+  encoding byte for byte. The writer's typed failure reads it (`ValidityRejectedError`, see *A pend
+  rejection is returned only when it is classified* below); limiting dispute evidence to marked
+  rejects (backlog `dispute-validity-reject-marker`) is its other consumer. The classification is the
+  design of record in [right-is-right.md §Which rejections are disputes](right-is-right.md#which-rejections-are-disputes).
 - **An expired record is answered with a vote, not a throw.** Expiry is a promise *verdict*, decided
   first in `ClusterMember.evaluatePromise` (and ahead of the conflict race in `getTransactionPhase`,
   so an expired record cannot clear a live rival's reservation), never a check in `validateRecord`,
@@ -1211,8 +1738,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   reading, folded into the signed bytes (`clusterVoteSigningPayload`); the timer-driven
   `handleExpiration` signs the same vote. The reason is the same one that makes a checker fault a
   reject rather than an escape: a throw reaches the coordinator as silence — no vote, a
-  `ConsensusTimeout` penalty against an honest member, and the "super-majority" shortfall a writer
-  retries as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
+  `ConsensusTimeout` penalty against an honest member, and the promise shortfall
+  (`PromiseShortfallError`) a writer stops on as an unreachable cohort. With a vote, the coordinator counts a rejection, and raises
   `TransactionExpiredError` (db-core's, the one class every layer raises — deliberately not a
   `ValidatorRejectionError`) when every reject that sank the transaction is an expiry vote, which
   `CoordinatorRepo` returns to the writer as an `ExpiredFailure` (see *Pend retryability is an
@@ -1221,16 +1748,25 @@ saveMaterializedBlock(block): store(structuredClone(block));
   slow-transaction case, not the skew case. The one delivery it applies is one whose signed votes
   already prove the record rejected (the abandonment broadcast), since that only clears it. See
   [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
-- **A pend rejection is returned only when local storage confirms a revision loss.** When
-  enough members vote reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError`
-  carrying the (free-form, wire-visible) reject reasons. `CoordinatorRepo.pend` then
-  re-reads the affected blocks from its own storage: if any block's `latest.rev >= request.rev`
-  — the same rule the members vote by — the rejection is *returned* as a `StaleFailure` carrying
-  `conflict: true`, so `Collection.sync`'s bounded re-read/rebase/retry loop picks it up instead
-  of an error escaping mid-batch and splitting a multi-tree commit. Every unconfirmed rejection
-  still **throws** — including one whose confirmation read failed, and one only remote members
-  could see (local storage behind). The reject-reason text is never parsed; confirmation is
-  purely the local revision comparison.
+- **A pend rejection is returned only when it is classified: local storage confirms a revision
+  loss, or every member that sank it marked it a validity judgement.** When enough members vote
+  reject, `ClusterCoordinator` throws a typed `ValidatorRejectionError` carrying the (free-form,
+  wire-visible) reject reasons. `CoordinatorRepo.pend` then re-reads the affected blocks from its
+  own storage: if any block's `latest.rev >= request.rev` — the same rule the members vote by — the
+  rejection is *returned* as a `StaleFailure` carrying `conflict: true`, so `Collection.sync`'s
+  bounded re-read/rebase/retry loop picks it up instead of an error escaping mid-batch and splitting
+  a multi-tree commit. Otherwise, when every reject in the record is a validity vote or an expiry
+  vote and at least one is a validity vote (`validityRejectionOf` in
+  `packages/db-p2p/src/repo/cluster-coordinator.ts`, carried as `ValidatorRejectionError.validity`),
+  it is returned as a `RejectedFailure` (see *Pend retryability is an explicit field* below). That
+  order is deliberate: a confirmed revision loss means the writer rebases and sends different
+  content, so a verdict on the old content settles nothing. Every other rejection still **throws** — including one whose confirmation read
+  failed, one only remote members could see (local storage behind), and a validity vote beside an
+  unmarked reject, which may be exactly such a loss: a false "invalid" would make an offline drain
+  drop a change a rebase would have saved, a false "unclassified" costs a retry. The reject-reason
+  text is never parsed; confirmation is purely the local revision comparison and the signed markers.
+  Commit records never run the transaction checker, so `CoordinatorRepo.commit` never meets a marked
+  reject and is unchanged.
 - **…except against the writer's own durable work.** A write touching several blocks commits them
   a group at a time, so it can end up with some blocks durable and the rest refused — a *torn
   action* — and its retry reuses the same action id. Every revision comparison above therefore
@@ -1287,7 +1823,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   content digests the failed attempt declared. Only then does it **consume** the entry
   (`Collection.consumeOwnEntry`) instead of running it through the conflict filter and replaying
   it — replaying re-appends content the committed tail already holds, leaving the same action
-  recorded twice in the log. Consuming drops the entry's actions off the head of `pending` and
+  recorded twice in the log. Consuming drops the entry's actions off the head of the open segment and
   forces the replay that resets the tracker, so `hasUnsyncedChanges()` turns false and the write
   reports success, with the re-send's `WriteDurability` as its answer. Finishing runs before the
   refresh has changed anything on the instance, so when it cannot finish, the staged actions, the
@@ -1304,13 +1840,18 @@ saveMaterializedBlock(block): store(structuredClone(block));
   therefore produce byte-identical transforms, which needs both of the values the append would
   otherwise mint fresh to be per-WRITE:
   - the entry's **timestamp**, minted once beside the action id (`Collection.syncInternal`) and
-    passed down to `Log.addActions`; on the coordinator path it is `transaction.stamp.timestamp`,
-    fixed at BEGIN and already stable across attempts. Nothing in the tree reads
-    `LogEntry.timestamp` for logic — it is informational — so the write's time is a safe value, and
-    arguably the more honest one.
-  - the **id of the data block** the append mints when the current log block is full (32 entries).
+    passed down to `Log.addActions` as part of the write's identity (`WriteIdentity` in
+    `packages/db-core/src/collection/write-attempts.ts`); on the coordinator path it is
+    `transaction.stamp.timestamp`, fixed at BEGIN and already stable across attempts, and on a head
+    commit (`Collection.commitHead`) it is the entry's local commit time, supplied by the queue as
+    `HeadCommitOptions.timestamp`. Nothing in the tree reads `LogEntry.timestamp` for logic — it is
+    informational — so the write's time is a safe value, and arguably the more honest one.
+  - the **id of the data block** the append mints when the current log block is full (32 entries, or
+    `BLOCK_TARGET_BYTES` of JSON — see [A transaction's size limit](#a-transactions-size-limit)).
     `Collection.logAppendBlockIds` hands `Log.open` the ids an earlier attempt of this action minted
-    at this revision, in order, and mints fresh past them. This one is worse than a stray orphan
+    at this revision, in order, and mints fresh past them; every write path reaches it through
+    `stageAttempt` (`packages/db-core/src/collection/write-attempts.ts`) or the coordinator's own
+    append, `commitHead` included. This one is worse than a stray orphan
     block: a second id also rewrites `nextId` on the block that was the tail and `tailId` on the
     collection header, so two attempts send different update operations for two blocks that already
     exist — a machine that landed the first reads the log as ending in one block and a machine that
@@ -1427,8 +1968,8 @@ saveMaterializedBlock(block): store(structuredClone(block));
   by `Collection.beginInFlightAction(actionId)` and cleared by the disposer it returns;
   `updateInternal` reads the field rather than taking the id as a parameter, so no refresh path can
   be correct-only-by-remembering-to-pass-it. `update()` and `updateAndSync()` refresh on a READER's behalf, leave
-  the field unset, and the consume branch cannot fire. Both write paths set it: `Collection.sync`
-  brackets its whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
+  the field unset, and the consume branch cannot fire. Every write path sets it: `Collection.sync`
+  and `Collection.commitHead` each bracket their whole retry loop, and `TransactionCoordinator.commitOnce` marks each participant
   right after taking its latch, pushing the disposers into the commit's `CommitCycle`, which
   `commit` clears in a `finally` around the WHOLE retry loop. The coordinator's clear cannot be
   latch-scoped: its inter-attempt refresh (`collection.refreshInFlight`) — the only reader of the
@@ -1508,16 +2049,51 @@ saveMaterializedBlock(block): store(structuredClone(block));
   aggregate refusal from the per-batch responses (`refusalFrom`, which the commit side shares), so
   it re-derives `conflict` across them — any conflicting batch makes the aggregate a conflict. The
   commit side is deliberately untouched: it keys on `CommitResult` shape (next bullet).
-  **Beside `conflict` sits the one refusal that is never retryable: an expiry.** A pend or commit the
-  cohort refused because the transaction had already expired by its members' clocks comes back as
-  its own failure shape, `ExpiredFailure` (a sibling of `StaleFailure` in `PendResult` and
-  `CommitResult`, carrying the clocks as `TransactionExpiry`), decided by the one predicate
-  `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and `.commit` return it ahead of their
-  stale classifiers, because a thrown answer reaches a remote writer as a reset stream; the rebuild
-  makes an expiry in any batch the whole answer; `isConflictFailure` is false for it; and
-  `Collection.syncAttempts`, `TransactionCoordinator`'s pend phase and its commit phase all stop on
-  it with `TransactionExpiredError` instead of re-driving — a retry's expiration comes from the same
-  clock. See [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  **Beside `conflict` sit the three refusals that are never retryable: an expiry, a promise
+  shortfall and a validity rejection.** A pend or commit the cohort refused because the transaction had already expired by
+  its members' clocks comes back as its own failure shape, `ExpiredFailure` (a sibling of
+  `StaleFailure` in `PendResult` and `CommitResult`, carrying the clocks as `TransactionExpiry`),
+  decided by the one predicate `isExpiryFailure` in the same file. `CoordinatorRepo.pend` and
+  `.commit` return it ahead of their stale classifiers, because a thrown answer reaches a remote
+  writer as a reset stream; the rebuild makes an expiry in any batch the whole answer;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts`, `TransactionCoordinator`'s
+  pend phase and its commit phase all stop on it with `TransactionExpiredError` instead of
+  re-driving — a retry's expiration comes from the same clock. See
+  [correctness.md §7.4 Clock Assumptions](correctness.md#74-clock-assumptions).
+  A pend whose promise round fell short because too few cohort members answered — no conflict or
+  held vote, too few rejections for a rejection — comes back the same way, as `ShortfallFailure`
+  (carrying `approvals`, `rejections`, `peerCount`, `needed` and the `silentPeers` that cast no vote,
+  as `PromiseShortfall`), decided by `isShortfallFailure`: `ClusterCoordinator` raises
+  `PromiseShortfallError`, `CoordinatorRepo.pend` returns it ahead of the stale classifier, the
+  rebuild makes a shortfall in any batch the answer when no batch expired, `isConflictFailure` is
+  false for it, and `Collection.syncAttempts` and `TransactionCoordinator`'s pend phase stop on it by
+  name — every coordinator of that cohort meets the same silent members. The error's message is the
+  sentence the coordinator always threw ("Failed to get super-majority: …"), kept byte-identical for
+  a downstream repository that matches it. Two consequences of returning rather than throwing: the
+  writer's transactor no longer re-picks another coordinator for a shortfall (the accepted-tradeoff
+  `NOTE:` in `CoordinatorRepo.pendThroughCluster`), and a local writer meets the error itself rather
+  than as the `cause` of a `Some peers did not complete` aggregate. **A pend answer only:**
+  `CoordinatorRepo.commit` still throws a commit-phase shortfall, because the commit side reads a
+  returned refusal as a confirmed conflict (the `NOTE:` at its catch).
+  A pend the members that sank it judged invalid (bullet above) comes back as `RejectedFailure`,
+  carrying `TransactionInvalidity` — one `ValidityRefusal` per validity vote, with the member's peer
+  id, its reason and the operations hash it computed — decided by `isRejectedFailure`.
+  `CoordinatorRepo.pend` returns it behind the stale classifier; a cohort of one returns it from its
+  storage tier, when `StorageRepo.pend`'s own check gives a verdict marked `validity` (one refusal, no
+  peer id), while its unmarked refusals (`PEND_NOT_VALIDATABLE`, `VALIDATOR_FAULT`) stay bare reasons a
+  writer retries. The rebuild makes a validity rejection in any batch the whole answer, ahead even of
+  an expiry, for the reason a cohort that judged the content outranks clock votes inside one record;
+  `isConflictFailure` is false for it; and `Collection.syncAttempts` and `TransactionCoordinator`'s
+  pend phase stop on it with `ValidityRejectedError` (`packages/db-core/src/network/validity-rejected-error.ts`),
+  which `commit()` throws by name and `execute()` reports as failed. A writer on an older build
+  receiving it retries it as a reason-only refusal until its budget ends; a member on an older build
+  never marks, so its rejects never produce it. With disputes enabled, a marked rejection beside
+  approvals is held for a ruling first, and its writer is answered with the dispute's refusal instead
+  (backlog `dispute-writer-sees-disputed-pend`).
+  What a writer gets once these refusals have become errors is sorted in one place,
+  `classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts`: by class and
+  structured field alone, and only the error thrown, never its `cause` (see
+  [offline-sync.md §Classifying an attempt's outcome](offline-sync.md#classifying-an-attempts-outcome)).
 - **The revision a writer lost to travels as data, not prose.** `StaleFailure.staleAt`
   (`{ blockId, rev }`) carries the one machine-readable fact inside the free-form reject text, so a
   losing writer never has to parse it. Set **only** where the producer read the revision out of its
@@ -1546,7 +2122,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `missing`), or a `missing-base-revision` refusal is divergence and tolerated; any other
   mid-commit fault (`success:false` with a bare `reason`, no `missing`) is propagated so
   `handleConsensus` rolls back the executed marker and rethrows — same as an unexpected
-  *thrown* fault (`applyCommitToStorage`, called from `applyConsensusOperation`). Whatever shape the
+  *thrown* fault (`applyCommitToStorage`, called from `applyConsensusCommits`). Whatever shape the
   apply took, the member then retains ONE post-reconcile durable verdict for the commit
   (`durableCommitVerdict`): storage's own success, or — after the reconcile a refusal triggered — a
   fresh check that every committed block records the commit's revision under its action (the
@@ -1571,33 +2147,49 @@ saveMaterializedBlock(block): store(structuredClone(block));
   who already holds the revision at that moment.** Before the commit round goes out, the
   coordinator's own member signs its commit vote in process, and that signature rides on the
   round (`commitTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). In a cohort of
-  three or fewer a remote member's own commit plus the coordinator's is already a strict majority,
-  so it applies on receipt of the commit round; in a cohort of four or more it is not, and nobody
-  applies before the consensus broadcast. The broadcast (`broadcastMergedRecord`, same file) then
-  delivers the merged record to the coordinator's own member first, awaited, and only then to the
-  remote members that still need it: one whose commit-round call failed, one whose response does
-  not report having applied (`MemberApplyOutcome.executed`, which an older build never sets), and
-  one that reports a refused commit. In a healthy two- or three-member cohort that list is empty,
-  so a consensus operation costs each remote member two calls rather than three. The coordinating
+  three a remote member's own commit plus the coordinator's is already a strict majority, so it
+  applies on receipt of the commit round; in a cohort of four or more it is not, and nobody
+  applies before the consensus broadcast. In a cohort of two no commit round runs: the remote
+  member's commit came with its promise, the coordinating member applies on its pre-sign, and
+  the remote member applies when the decision reaches it. The broadcast (`broadcastMergedRecord`,
+  same file) then delivers the merged record to the coordinator's own member first, unless it
+  already applied, awaited, and only then to the remote members that still need it: one whose
+  commit-round call failed, one whose response does not report having applied
+  (`MemberApplyOutcome.executed`, which an older build never sets), and one that reports a refused
+  commit — and, in a cohort of two, every remote member. In a healthy two- or three-member cohort a
+  consensus operation therefore costs each remote member two calls rather than three (in a cohort
+  of two, the second is the decision; for a single-collection write's pend it rides on the
+  commit's first request instead). A member that
+  missed that delivery is owed it, and it rides, ahead of the request's own record, on the next
+  request the coordinating node sends that member, rather than waiting for the commit-retry timer
+  to send it alone (`takeOwedRecords` in `packages/db-p2p/src/repo/cluster-coordinator.ts`); either
+  way the coordinating member has applied first. The coordinating
   member's copy carries the cohort's commit proof (`buildBlockCommitProof`), which the certified
   single-holder rule below accepts without a second corroborator, so a whole cohort of behind
   members can heal from it. A single parallel fan-out let the remote reconciles race the local
   apply and decline with `reconcile:no-rev-quorum` (`holders: 0`), which is how a fully-approved
   commit ended up on no responsible node. Each case therefore gets a reconcile after someone holds
-  the revision. A behind *remote* member in a small cohort applied first, found no holder, and
+  the revision. A behind *remote* member in a cohort of three applied first, found no holder, and
   answered with a refused commit, so the broadcast sends it the merged record again once the
   coordinating member has applied; a member receiving a record it already applied runs
   `ClusterMember.reconcileRefusedCommit` (a no-op unless its retained refusal has the behind
-  shape), and its answer carries the refreshed verdict. A behind *coordinating* member in a small
-  cohort finds the remote members' copies on its first reconcile. In a larger cohort, where it
-  applies first, it gets one more reconcile once a remote member reports holding the revision,
-  before the durability gate reads its verdict. A coordinator *outside* `record.peers`
+  shape), and its answer carries the refreshed verdict. In a cohort of two the remote member applies
+  after the coordinating member, so it reconciles from that copy the first time. A behind
+  *coordinating* member in a cohort of three finds the remote members' copies on its first
+  reconcile. In a cohort of two, or of four or more, where it applies first, it gets one more
+  reconcile once a remote member reports holding the revision, before the durability gate reads its
+  verdict. A coordinator *outside* `record.peers`
   is not a reconcile target, so a cohort with no holder at all stays behind; the durability gate
   in `CoordinatorRepo.commit` is what makes that shape refuse rather than acknowledge. The read path
   is no longer blind to it: `CoordinatorRepo` is handed the *same* callback instance and
   runs it once the cohort has corroborated a revision the reader cannot promote locally
   (see [transactions.md](transactions.md#read-consistency-and-staleness)), so the two
-  paths heal by identical rules. It does **not** trust a single peer: the target `(rev, actionId)` must be
+  paths heal by identical rules. The read path also hands it the archives its consult already
+  received (`ConsultedArchives` in `packages/db-p2p/src/cluster/cluster-repo.ts`), so a peer that
+  answered the consult is not asked again; the commit path passes none. A peer that was not ahead
+  of the reader answered the consult with its claim and proof but not the block's bytes
+  (`serveConsultAnswer` in `packages/db-p2p/src/storage/block-archive.ts`); its archive is reused as a
+  claim only, which is all it can be, since that peer is behind the revision being acquired. It does **not** trust a single peer: the target `(rev, actionId)` must be
   corroborated by a quorum of distinct cohort archives, and the block content must
   hash byte-identically across a quorum, before it persists (`cluster/reconcile-block.ts`
   over `cluster/quorum-restore.ts`; the primitives are shared with `CoordinatorRepo`
@@ -1885,8 +2477,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   back to a local commit — which can diverge for reasons the caller is not responsible for. A
   thrown missing pend and a returned `missing-base-revision` refusal are treated identically: if
   the record shows a simple majority approved the commit **and a strict majority of the cohort
-  reports durably holding the revision** (`cohortCommitOutcomes`, the other members' post-reconcile
-  reports), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
+  reports holding the revision** (`cohortCommitOutcomes`, the other members' post-reconcile
+  reports; "holding" in the sense of
+  [correctness.md §1.2 Nodes](correctness.md#12-nodes), *Storage durability*), report success (`coordinator-repo:commit-local-failed-cluster-succeeded`) and let
   replication converge this peer. Returning the refusal instead would surface a *landed*
   transaction as a stale loss, since db-core's `commitPhase` treats any returned `success:false`
   as a stale loss and its coordinator re-drives the refused collection — alone, even after a
@@ -1909,7 +2502,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `GetBlockResult` carries an optional `unavailable` field
   ([`network/struct.ts`](../packages/db-core/src/network/struct.ts)) that a repo sets ONLY when it
   knows its own answer is a guess; an absent field means authoritative, so every producer that
-  never sets it (including `TestTransactor`) keeps its existing meaning. Two producers set it:
+  never sets it (including `TestTransactor`) keeps its existing meaning. Three producers set it:
   `StorageRepo.get` flags `'unmaterializable'` when the block reads as absent but this node holds
   records proving it exists — the missing-base promotion refusal above, a `getBlock()` throw on a
   `latest` this node cannot materialize (truncated history, or a failed restore of a revision whose
@@ -1937,6 +2530,14 @@ saveMaterializedBlock(block): store(structuredClone(block));
   | part of the cohort answered, part was silent — or the consult threw outright | `'peers-unreachable'` |
   | this node knows of cohort members outside itself and could reach none of them | `'cohort-unreachable'` |
   | a peer positively claimed a revision that was neither corroborated to a quorum nor acquired | `'claimed-elsewhere'` |
+
+  The third producer is the transactor, one layer up. `NetworkTransactor.get` returns a block for
+  which no coordinator it asked gave any response — every request carrying it threw, timed out or
+  was still in flight at the deadline, through its second-chance round — as `'peers-unreachable'`
+  with no block, the reason the table gives a consult that threw, so the read of that block fails
+  typed while the other blocks of the same read are returned. A coordinator that responded and left
+  a requested block out is a protocol fault rather than unreachability, and still fails the whole
+  read with its `Some peers did not complete` aggregate.
 
   Note the second row: `'cohort-unreachable'` is *silence from machines this node knows about*, not
   isolation in general. A node whose routing view yields no cohort member at all, and whose
@@ -2009,7 +2610,16 @@ saveMaterializedBlock(block): store(structuredClone(block));
   `absenceFlagFor`: a node configured with a bootstrap peer that is permanently gone, and holding
   no persisted network state, can neither create a collection nor read a block it lacks until that
   peer is heard from or taken out of its configuration. Out of scope here: a write to a collection
-  the node already holds, made before contact, still commits alone.
+  the node already holds, made before contact, still commits alone, at `local`. What it now does is
+  say who it is owed to: every serving member the node knows of that belongs in the block's cohort
+  but is missing from it (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`) is
+  named in the answer's `unconfirmed` and in the under-replication ledger, so the copy is pushed to
+  that member as soon as it is connected (see
+  [packages/db-p2p/docs/repo.md §The durability gate and the under-replication ledger](../packages/db-p2p/docs/repo.md#the-durability-gate-and-the-under-replication-ledger)).
+  A write that asks not to be committed alone (`refuseSolo`, which only the offline queue sets) is
+  refused instead ([offline-sync.md §When to submit: the reachability gate](offline-sync.md#when-to-submit-the-reachability-gate)).
+  Whether other such writes should be admitted at all belongs to the partition-healing design (backlog
+  `6.5-partition-healing`).
 
   "Remembers" has to cover which of those peers serve this network, not only that they exist. The
   cohort admits only peers positively classified as serving, and the classification reads each
@@ -2025,7 +2635,10 @@ saveMaterializedBlock(block): store(structuredClone(block));
 
   When a remembered peer never returns, FRET's own liveness is what ends the doubt, not a timer:
   once FRET marks the peer dead it leaves the cohort, the cohort shrinks to self, and the unflagged
-  absent answers again. Until then reads of blocks this node lacks fail with `'cohort-unreachable'`,
+  absent answers again. Since `p2p-fret` 1.2.0 that verdict waits longer for a peer this node has
+  watched stay up a long time: from 10 minutes of observed uptime it gets a grace of uptime / 12,
+  capped at 5 minutes by default (FRET's `maxDeadGraceMs`), so the doubt can outlast a departed
+  long-lived peer by that much. Until then reads of blocks this node lacks fail with `'cohort-unreachable'`,
   and creating a new collection through this node fails, because its header probe cannot be ruled
   absent. That is the cost the same process already paid, before any restart, when a partner went
   offline; persistence only stops a restart from erasing it. The revisit condition is recorded at
@@ -2400,7 +3013,7 @@ db-core defines seven **ports** (`packages/db-core/src/cohort-topic/ports.ts`) t
 - **TTL renewal** (`renewal.ts`) — participant side pings the primary every `ttl/3`; a ping that fails or is answered `unknown_registration` (or `withdrawn`) — the member holds no record for it — counts as a failure. Three consecutive failures promote `backups[0]` via a re-attach RPC; all-fail re-runs lookup from `d_max`, and the participant adopts where the re-walk landed (primary, backups, epoch hint, correlation id; the service copies the landing's tree tier onto the handle). The failure count resets after a re-walk whatever its outcome, so a lost registration is re-walked at most once per three pings ([docs/cohort-topic.md §TTL and renewal](cohort-topic.md#ttl-and-renewal)). The `cohortEpoch` hint refreshes **lazily** (on the next `primary_moved` reply, not at failover). Cohort side `onRenew` touches `lastPing` + gossips, or returns `primary_moved` when a rotation moved the slot off this member; `sweepStale` evicts + gossips each eviction.
 - **Rotation handoff** (`handoff.ts`) — per-member state machine over an injected transport: `start()` recomputes slots under the new epoch and broadcasts a primary inventory; `onInventory` pulls each record now assigned to this member from its previous holder, re-stamps its `primary`/`backups`, and acks; the previous holder **dual-serves** (answers renews) until that ack arrives (`isServing`/`onAck`).
 
-Transports (`RenewalParticipantTransport`, `RenewalGossip`, `HandoffTransport`) are injected, so storage + sharding + TTL are unit-testable in isolation with mocks. Cross-member replication runs over the cohort-gossip driver in the host (`packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts`): the `RenewalGossip` `touch`/`evicted` hooks append to a per-coord delta queue, and a periodic host timer (`gossipIntervalMs`, default 5 s) drains the batch into a signed `CohortGossipV1` broadcast each round — alongside the TTL sweep, membership-cert refresh, and demotion check. Each frame carries its `coord`, so a node serving many cohorts routes inbound gossip to the right per-coord store/view.
+Transports (`RenewalParticipantTransport`, `RenewalGossip`, `HandoffTransport`) are injected, so storage + sharding + TTL are unit-testable in isolation with mocks. Cross-member replication runs over the cohort-gossip driver in the host (`packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts`): the `RenewalGossip` `touch`/`evicted` hooks append to a per-coord delta queue, and a periodic host timer (`gossipIntervalMs`, default 5 s) runs a round per coord — the TTL sweep, membership-cert refresh, and demotion check — whose signed `CohortGossipV1` goes out only when the round carries deltas, when the frame differs materially from the last one the engine sent, or once `T_willingness_heartbeat` has passed since that one (`isGossipRoundDue` in `packages/db-p2p/src/cohort-topic/cohort-gossip-driver.ts`; [docs/cohort-topic.md §Cohort gossip](cohort-topic.md#cohort-gossip)). A sending round drains the queued batch into the frame; a round that sends nothing leaves it queued. Each frame carries its `coord`, so a node serving many cohorts routes inbound gossip to the right per-coord store/view.
 
 ### Service composition
 
@@ -2415,14 +3028,18 @@ The **FRET host** (`packages/db-p2p/src/cohort-topic/host.ts`) scopes the cohort
 
 ### Protocol IDs
 
-`db-p2p` registers four libp2p protocols on the FRET node, binding the db-core ports to FRET + libp2p:
+`db-p2p` registers six libp2p protocols on the FRET node, binding the db-core ports to FRET + libp2p (`cohortTopicProtocolList` in `packages/db-p2p/src/cohort-topic/protocols.ts`):
 
 ```
 /optimystic/cohort-topic/1.0.0/register       — Register, renew, re-attach
+/optimystic/cohort-topic/1.0.0/renew-batch    — several plain renewal pings to one member, answered entry by entry
 /optimystic/cohort-topic/1.0.0/cohort-gossip  — record replication, willingness, load barometers
 /optimystic/cohort-topic/1.0.0/promote        — threshold-signed promotion/demotion notices
 /optimystic/cohort-topic/1.0.0/membership     — membership certificates
+/optimystic/cohort-topic/1.0.0/sign           — per-member endorsement for k − x threshold-signature assembly
 ```
+
+A participant renewing many registrations sends the plain pings bound for one primary over `renew-batch` in one frame (`CohortTopicService.renewMany` in `packages/db-core/src/cohort-topic/service.ts`); re-attaches and withdraws stay single on `register`, and a primary on an older build that refuses `renew-batch` is sent single pings ([docs/cohort-topic.md §TTL and renewal](cohort-topic.md#ttl-and-renewal)).
 
 The package split is strict: **db-core never imports FRET or libp2p** (enforced by `packages/db-core/test/no-fret-import.spec.ts`); **db-p2p** (`packages/db-p2p/src/cohort-topic`) is the only place the ports are bound to FRET's `RouteAndMaybeAct`, two-sided cohort assembly, and size estimator.
 
@@ -2470,7 +3087,7 @@ The voting subsystem's **discovery** flow is a thin composition over that surfac
 
 libp2p tells a peer's addresses only to the peers it is **directly connected to**.  There is no relay-side gossip of reservations, and this stack registers no peer-routing service (no kad-dht, no `peerRouters`), so a dialer has no `findPeer` fallback either.  A cohort here is chosen by *key position*, not by who happens to be connected, so a node routinely lands in a cohort with a peer it has never met.  When that peer is reachable only through a circuit relay — a phone, a laptop behind NAT — the third party holds an empty address list for it and a dial by peer id alone fails immediately with `NoValidAddressesError`, while membership logs on every node still read healthy.
 
-db-p2p therefore learns third-party addresses from **its own protocol messages**, which already carry them: `ClusterRecord.peers[*].multiaddrs` and a redirect payload's `{ id, addrs }`.  Every ingress for those addresses funnels through one writer, `packages/db-p2p/src/peer-address-book.ts` — the only place in this repository that writes the libp2p peerStore:
+db-p2p therefore learns third-party addresses from **its own protocol messages**, which already carry them: `ClusterRecord.peers[*].multiaddrs` and a redirect payload's `{ id, addrs }`.  Every ingress for those addresses funnels through one writer, `packages/db-p2p/src/peer-address-book.ts` — the only place in this repository that writes addresses into the libp2p peerStore (the only other code in front of the peerStore's writes is the throttle on libp2p's own per-stream protocol merges, below):
 
 - `ClusterService.processOperation` merges the record's peer map *before* deciding to redirect and *before* running consensus, since both go on to dial those peers.
 - `ClusterClient.update` merges the peer map of the record a member returns (the coordinator's half of the same exchange).
@@ -2486,6 +3103,10 @@ Cohort members with no dialable address are still admitted — dropping them wou
 "Publishable to a third party" and "dialable by us" are separate questions, and a relay is where they come apart.  A relay learns its own reservation holders by the address they advertise, `/<relay's transport addr>/p2p/<relay's peer id>/p2p-circuit` — which every other node can use and the relay itself cannot, since using it would mean relaying to the client through itself.  So that address stays **published** (a cohort sibling reaching the client through our relay is the working path) while being undialable by the one node holding it.  `classifySelfDialability`, next to `publishableConnectionAddr` in `peer-address-book.ts`, answers the second question; `Libp2pKeyPeerNetwork.connect` consults it once on the cold path and throws `SelfRelayOnlyAddressesError` rather than attempting a dial that cannot succeed, and `findCluster` reports the count as `selfRelayOnly` on `findCluster:done`.  Both conditions produce the same libp2p error text otherwise, so without the split a log cannot say whether a member was never taught an address or was taught one we cannot use — and only the first of those is ever repaired by a retry.
 
 The seam is the optional `recordPeerAddresses?(peerId, multiaddrs: string[])` on `IPeerNetwork` (`packages/db-core/src/network/i-peer-network.ts`); implementations without an address book (test doubles, the in-memory mesh harness) simply omit it.  `packages/db-p2p/test/relay-third-party-address-gap.spec.ts` pins the libp2p-level premise: if a future libp2p ever propagates third-party addresses on its own, that spec's first assertion fails and tells us this whole mechanism has become redundant rather than load-bearing.
+
+libp2p also writes the peerStore on its own, and one of those writes is frequent enough to matter: it merges each stream's protocol into the remote peer's record on every stream, on both ends, and the peer store's merge decodes, rebuilds and rewrites the record even when the protocol is already there (about 7% of the JavaScript thread on a Galaxy S7, GitHub #40; the connection monitor's ping every 10 s is six of those a minute per connection before any request of ours).  Until libp2p carries the upstream fix (libp2p/js-libp2p#3692, which merges each protocol once per connection), `throttleProtocolMerges` in `packages/db-p2p/src/network/protocol-merge-throttle.ts` wraps `node.peerStore.merge` so a merge into a remote peer's record whose data is exactly one protocol reaches the store at most once a minute per peer and protocol; every other merge passes straight through — `peer-address-book.ts`'s, and every merge into this node's own record, where libp2p's registrar adds each handled protocol in the same shape.  The record's `updated` stamp is therefore refreshed once a minute rather than on every stream, far inside the 6 h after which the store evicts a record.  A protocol identify removes from a record is put back by a later stream up to a minute later instead of at once.  `packages/db-p2p/test/libp2p-merges-protocol-per-stream.spec.ts` pins the libp2p behaviour the throttle exists for, and fails on the libp2p release that no longer needs it.
+
+A node whose advertised addresses include nothing another machine can dial directly — no listen address, only a circuit or loopback one — is built without libp2p's hole-punching service, `dcutr` (`holePunchingWanted` in `packages/db-p2p/src/network/hole-punching.ts`).  On a relayed connection, dcutr's receiving side first dials the other side directly if it advertises a public address, and otherwise makes three relayed attempts to swap address lists, each side discarding every circuit, loopback and private address in the other's.  For such a node those attempts can never succeed, and two relay-only phones joining through one relay were measured spending nine `/libp2p/dcutr` streams per join on them.  dcutr starts only toward a peer that also runs it, so leaving it out on either side silences the pair.  A wildcard or LAN bind still counts as dialable, so two machines behind NAT that listen keep hole punching, which is the case where it can succeed.  What such a node gives up is the direct dial: when a peer with a public address reaches it through a relay, it would have dialed that peer directly.  `NodeOptions.holePunching` overrides the rule either way — `true` for a relay-only node that public peers regularly reach through a relay, `false` to turn it off anywhere.  AutoNAT stays on every node.
 
 ## Cluster Authentication
 
@@ -2517,13 +3138,64 @@ Semantics:
 
 - **Absent predicate → today's behavior exactly.**  Each service holds `InboundStreamAuthorization | undefined`; when it is `undefined` the handler awaits nothing extra and no gate code runs.  This is the default.
 - **Supplied predicate → fail closed.**  Only a literal `true` allows the stream.  `false`, a throw, a rejection, expiry of the timeout, or an inbound connection with no resolvable remote peer id all **deny**, and denial aborts the stream *before* any frame is decoded or any operation executed.  Failures are logged (via the service's error logger), never swallowed.
-- **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (The `repo` protocol's `RepoMessage.operations` is an array, but the handler executes `operations[0]` only.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
+- **Once per inbound stream, not per operation.**  All four protocols are strictly one request per stream — each handler's generator `return`s after the first response, so a second frame queued on the same stream is never read or parsed.  Per-stream and per-operation authorization are therefore equivalent here.  (A `repo` message carries one operation, or a batch — one action's pends, or its commits, of several collections, run as one consensus record; either way it is one request per stream.)  A single `commit`/`pend`/`pull`/`push` may still name many block ids; the gate is not a per-block ACL.
+- **A stream is authorized when it opens, which can be well before its request.**  A node keeps one stream per peer and protocol negotiated ahead of its next request to that peer, for up to 30 s (`PreparedStreams` in `packages/db-p2p/src/network/prepared-streams.ts`), so an honest peer routinely holds an authorized stream open on this node with no request on it yet.  A peer the predicate stops admitting can therefore still deliver one request on each stream it already holds, until that stream's idle time runs out.  This is not a new exposure — any peer could always open a stream and hold it — but revoking a peer now takes full effect on these four protocols only once its held streams expire.  To cut a peer off at once, close its connections, or refuse it at the `connectionGater` as well.
 - **Peer id encoding**: the predicate receives `connection.remotePeer.toString()` — the libp2p base58btc/CIDv1 string (`12D3KooW…`).  Compare against that, never against a multiaddr or a raw public key.
 - **What a caller observes**: a stream reset.  Denial is deliberately *not* reported on the wire — telling an unauthorized peer "you are not a member" confirms membership state to exactly the party the embedder decided not to trust, and the four protocols have four different response shapes with no common error frame.  The denial is loud on the *denying* node instead: logged with peer id, protocol and reason, and the stream is aborted with an `UnauthorizedInboundStreamError` carrying `ERR_INBOUND_STREAM_UNAUTHORIZED`.
 - **Self-dials never reach the gate.**  libp2p refuses to dial self at three layers (connection manager, dial queue, upgrader), and every internal caller short-circuits self before dialling anyway (`ClusterCoordinator.updateMember`, `clusterLatestCallback`, `fetchArchiveFromPeer`, `RestorationCoordinator`, `SpreadOnChurnMonitor`).  An embedder predicate that only knows about remote members will therefore never deny its own node.
 - **Cost**: the predicate sits in the hot path of every inbound stream.  Keep it to an in-memory lookup; memoize anything that would otherwise hit storage or the network per stream.
 
-**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.
+**Scope**: the four database protocols only.  The `dispute` protocol (`packages/db-p2p/src/dispute/service.ts`, which asks this node to vote on a challenge) and the reactivity, matchmaking, cohort-topic and libp2p built-in (`identify`/`ping`/`dcutr`/…) protocols the same node registers are *not* gated by this option.  To refuse a peer across *every* protocol at once, including `identify`, use the connection-level `connectionGater` option instead (`NodeOptions.connectionGater` → libp2p's `denyInboundConnection`); the two are complementary — the gater decides whether to talk to a peer at all, this hook decides whether an already-connected peer may touch the database.  Neither decides which peers this node *sends* its writes to; that is the [Network Membership Predicate](#network-membership-predicate) below, and a private database needs it too.
+
+### Network Membership Predicate
+
+A node chooses the peers that hold and coordinate a block from FRET's ring, then keeps only the ones it classifies as serving its own network: `membershipOf` in `packages/db-p2p/src/libp2p-key-network.ts` reads each peer's libp2p peerStore protocol list and counts a peer that lists `<prefix>/cluster/1.0.0` or `<prefix>/repo/1.0.0`. Any connected peer can put those protocols into that list, in two ways, and `authorizeInboundStream` stops neither:
+
+- **By opening a stream on one.** libp2p's `onIncomingStream` (libp2p 3.3.11, `libp2p/dist/src/connection.js`) merges the negotiated protocol into the remote peer's peerStore record *before* it looks up the handler, so a stream the authorization gate then resets has already written it.
+- **By advertising them.** The peer registers this network's protocol ids on its own node, and identify announces them.
+
+A stranger classified that way is a cohort member like any other. An embedding application measured it: after an outsider opened one refused stream on each members-only protocol of a member, that member's `findCluster` for a control block named the outsider first, and every later write to the block sent the outsider the block's contents (a pend carries the transforms) and counted it toward the cohort.
+
+The protocol list `membershipOf` reads is not fetched from the peerStore on every lookup. The key network keeps each peer's record — its protocols and addresses — per peer (`PeerRecordCache` in `packages/db-p2p/src/network/peer-record-cache.ts`) and drops it when libp2p dispatches `peer:update` for the peer (its stored record changed, which a protocol merged from a stream and a completed identify both do) or `peer:identify`, when a connection to it opens or closes, or after a minute, which covers the changes libp2p reports by no event (address ageing, a record's deletion). So a record is read once per change, not once per band member per lookup, which had made a read on a node with one connected peer several times slower than a solo node's (GitHub #45). Only the record is kept: the predicate below, FRET's band and the remembered serving verdicts are read on every lookup. The one read that bypasses it is the self-relay check before a cold dial (`assertNotSelfRelayOnly`), which must see an address a redirect merged an instant earlier.
+
+`NodeOptions.isNetworkMember` (typed `IsNetworkMember` in `packages/db-p2p/src/network-membership-gate.ts`) lets the embedder overrule the protocol list:
+
+```ts
+const node = await createLibp2pNode({
+  /* … */
+  authorizeInboundStream: (remotePeerId) => memberSet.has(remotePeerId),
+  isNetworkMember: (peerId) => memberSet.has(peerId)
+});
+```
+
+Contract:
+
+- **Absent predicate → today's behavior exactly.** `createNetworkMembershipGate` returns `undefined` and no check runs anywhere.
+- **Synchronous.** It runs inside the per-peer loop of every cohort assembly, so keep it an in-memory lookup. This is one reason it is a separate option rather than derived from `authorizeInboundStream`, which is asynchronous, under a timeout, and asked once per inbound stream. The other is that the two answer different questions: authorization decides who may *send to* this node, membership decides who this node *sends to*.
+- **Fail closed.** Only a literal `true` admits. A throw, or any value other than a boolean (a promise included), refuses and is logged with the peer id under the `network-membership` namespace; nothing is thrown into a lookup.
+- **Self is always a member**, so the predicate may list remote members only — the same contract `authorizeInboundStream` has.
+- **Peer id encoding**: `PeerId.toString()`, the base58btc `12D3KooW…` form.
+- **Read live.** No verdict the predicate gave is kept: a peer the application admits counts on the next lookup, and one it removes drops out of the next lookup. There is no reclassify call to make. The peer records above are cached, but the predicate is asked on every lookup ahead of the cached protocol list, so this holds with no event from libp2p.
+- **Requires network scoping.** `Libp2pKeyPeerNetwork` refuses a gate without a `protocolPrefix`, since the unscoped path classifies nobody; every node `createLibp2pNode` builds has one.
+
+What it gates. `membershipOf` is the one place every cohort and coordinator choice classifies remote peers — `findCluster`, every `findCoordinator` tier, `servingCohortAt` (where a reactivity topic's root group is placed) and `absentCohortMembers` — and a remote peer the gate refuses reads `foreign` there, ahead of both the protocol list and the remembered serving verdict. So a forged list is never added to that memory, and never persisted from it. Around that one place:
+
+- `isSelectable` refuses the peer as well, so it is neither a connected-fallback pick nor a reason for `findCoordinator` to keep its retry window open.
+- The coordinator cache — the one verdict the key network does remember, for 30 minutes by default — is re-checked on every hit: a pick the gate now refuses is evicted (`findCoordinator:cache-refused`) and the lookup runs the tiers (`getCachedCoordinator`).
+- `CoordinatorRepo`'s 60-second responsibility cache needs nothing: it remembers only whether *this* node is responsible for a block, and the replica set a transaction goes to is a fresh `findCluster` made when the transaction runs, so a removed peer receives nothing after the predicate changes.
+- **A bootstrap peer the gate refuses while it serves this network is not yet heard from** (`heardFromBootstrapPeer`). Otherwise a joining node whose predicate has not yet learned its inviter would see a self-only cohort, rule the shared catalog absent and found a second one — GitHub issue #27's failure through a new door. So `awaitingBootstrapContact` stays true, an absence is flagged `'cohort-unreachable'`, and an open fails, retryably, until the predicate admits the peer. A refused bootstrap peer that does not serve this network — a relay, or a peer that refused identify — is heard from as before, so a node behind infrastructure bootstrap peers is unaffected. The cost, that a node configured with a bootstrap peer its predicate permanently refuses cannot create collections, is the `NOTE:` there.
+- The `cohort:membership` log line counts refused peers as `refused=`, apart from `foreign`, so an operator can tell "another network" from "the predicate said no".
+- **The four background senders that take peers from FRET rather than from the key network** get the same gate instance, which `createLibp2pNodeBase` builds once beside the key network, and drop every candidate it refuses before dialing: spread-on-churn's expansion targets (`SpreadOnChurnMonitor`), the ring-shift confirm's qualifying holders (`RingShiftCoordinator`, where a refused peer also does not count toward the floor, so refused peers in the band roll the shift back rather than release a block only an outsider holds), the ring peers restoration asks for an archive (`RestorationCoordinator`), and the under-replication drain's pushable set (`UnderReplicationDrain`, where a ledger entry naming a peer the predicate has since refused waits for it — the `NOTE:` at its `pushablePeers`). The rebalance reaction and the cohort-growth push need nothing, since both take a block's owners from `findCluster`.
+
+So apart from redirect targets and the opt-in dispute path (both below), no peer this node chooses to send block contents to, or to ask for an archive to restore, is one the predicate refuses. Content a refused peer *pushes* to this node is the business of `authorizeInboundStream`, not of this predicate.
+
+What it does not gate:
+
+- **FRET's own ring membership and routing.** A refused peer is still a ring member: it still routes, it still takes one of the over-fetch slots a cohort is cut from (the `NOTE:` at `membershipOverfetch`), and it can still be a member of a cohort-topic tier below a reactivity topic's root, which FRET assembles directly. Backlog `feat-fret-honours-the-network-membership-predicate`.
+- **Dispute arbitrators**, drawn straight from FRET by the `selectArbitrators` hook `createLibp2pNodeBase` hands the dispute service. A challenge carries the disputed `ClusterRecord`, transforms included, so on a node with `dispute.disputeEnabled` (off by default) an escalation can reach a refused peer.
+- **Redirect targets**, which `RepoClient` and `ClusterClient` follow without asking the gate. A redirect comes from a cohort member applying its own predicate, so this matters only where members are configured differently; a coordinator hint the redirect records is re-checked on its next use (the `NOTE:` at the redirect branch in `packages/db-p2p/src/repo/client.ts`).
+
+**An embedder that supplies only `authorizeInboundStream` is still exposed.** Any peer that can open a stream to this node — refused or not — can be chosen as a cohort member and sent every write to the blocks near it on the ring. The two options are complementary: authorization keeps strangers from reading or writing through this node, membership keeps this node from handing them its writes.
 
 ### Equivocation Detection
 
@@ -2586,18 +3258,19 @@ Tracks whether the local node's responsibility for blocks has changed after topo
 
 **Holder evidence.** Every block that lands here enters the owned-block set with no growth memory, so on its own the next check would report its whole cohort `grown` (a push over `/block-transfer`), sending the block straight back to the peers it came from. Without evidence the same check would also report the block `gained`, but that costs nothing on its own — `gained` is a responsibility signal, not a transfer trigger (see `RebalanceEvent.gained`'s doc), so the reaction reads it without touching the network. So a block this node holds seeds the memory through `RebalanceMonitor.recordBlockHolders({ blockIds, holders, unconfirmed? })`, fed by the `BlockHoldersSink` (`onBlockHolders`) that `libp2p-node-base` routes to the monitor. The premise every producer asserts is the same: *these peers are evidenced to hold this block too, so growth needs no push to them (and, incidentally, the block needs no `gained` report either).*
 
-Four producers report through it:
+Five producers report through it:
 
 - `ClusterMember`, after a durable consensus apply — the record's approving commit signers.
-- `CoordinatorRepo`, when it acknowledges a cohort commit it holds — the confirmed members that also signed, plus the members the durability class left `unconfirmed`. Only this producer names any unconfirmed peers; the other three learn about holders, never about non-holders.
+- `CoordinatorRepo`, when it acknowledges a cohort commit it holds — the confirmed members that also signed, plus the members the durability class left `unconfirmed`. Only this producer names any unconfirmed peers; the other four learn about holders, never about non-holders.
 - `BlockTransferService.handlePush`, per accepted pushed block — the peer that sent it. Reported for exactly the set left out of `missing`, so a block that failed parsing, certification or persistence reports nothing; the monotonic no-op acceptance (the pushed revision is one this node already holds, so no collection change fires) reports like any other. A push with no resolvable remote peer id reports nothing.
 - `createReconcileBlock`, after a successful restore — `selected.supporters`, the peers whose archives corroborated the restored revision. A decline persists nothing and reports nothing.
+- The embedder, through `reportBlockHeld` on the node (`OptimysticNodeAttachments` in `packages/db-p2p/src/optimystic-node.ts`) — a peer it delivered the block to itself, such as Sereus's join catch-up, which pushes a joining peer its missing blocks in batches of its own. The same call takes the peer off the block's under-replication entry (see [UnderReplicationDrain](#underreplicationdrain) below). It is the one producer that does not hold the block by construction; evidence for a block the monitor does not track is dropped at the next check, as for every producer.
 
 What the evidence claims is a *copy*, not a revision: the growth arm counts holders of the block, and a push accepted as a monotonic no-op evidences only that its sender holds some revision at or below this node's. Bringing a peer that is behind up to date belongs to the repair paths, not to growth.
 
 Evidence waits for the next check, which folds `holders` into `cohortPeers`, removes `unconfirmed` from it, and does not report the block `gained`. Later evidence about a peer overrides earlier evidence, so the coordinator's report corrects the signer list its own member sent moments earlier. A solo commit reports nothing, so the founder case still reports the whole cohort once peers appear.
 
-How far the evidence is trusted is unchanged by the two non-commit producers: a pushing peer's claim to hold what it pushed is its own word, and so is a receiving peer's report that it persisted a push, which `recordGrowthOutcome` already accepts as confirmation. The cost of a lie is bounded the same way — one cohort member that does not get a copy it would otherwise get, re-detected whenever that peer leaves the cohort and rejoins, or whenever a commit touches the block.
+How far the evidence is trusted is unchanged by the three non-commit producers: a pushing peer's claim to hold what it pushed is its own word, and so is a receiving peer's report that it persisted a push, which `recordGrowthOutcome` already accepts as confirmation — the embedder's report is that same reply, relayed by the process that made the push. The cost of a lie is bounded the same way — one cohort member that does not get a copy it would otherwise get, re-detected whenever that peer leaves the cohort and rejoins, or whenever a commit touches the block.
 
 `getGrowthDiagnostics()` exposes `{ blocksAwaitingConfirmation, abandonedPairs, recheckArmed }`; the node-base `cohort-growth:` log line carries the first two.
 
@@ -2618,13 +3291,15 @@ How far the evidence is trusted is unchanged by the two non-commit producers: a 
 
 Proactively pushes tracked blocks to expansion targets on peer departure. Only "middle" peers (FRET `neighborDistance` rank < d) spread, bounding fan-out to 2d across the cluster. Uses `BlockTransferClient.pushBlocks()` with reason `'replication'`, carrying the source block's `state.latest` as `blockMeta` (so the replica's revision mirrors the source) and the retained commit proof for that revision.
 
-On the receiver, `BlockTransferService.handlePush` persists each pushed block into **local** storage via `IBlockReplicaStore.saveReplicatedBlock()` → `BlockStorage.saveReplica()`, which seeds metadata, advances `latest` monotonically (never downgrades on a stale push), deletes any pending record this node still holds for the landing revision's action id (Invariant P — see [repository.md](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action)), and makes the block durably servable. The monotonic no-op path (the pushed revision is one this node already holds) writes no committed record, so it owes no Invariant-P deletion — the one thing it can still write is a back-filled commit proof, described below. A block is reported `accepted` only when it was both parseable and persisted; a parse/validation/persist failure surfaces it in `missing`. The sender only records a target as `succeeded` when the response does not list the block in `missing`, so a non-throwing round-trip that failed to persist is correctly counted as a failed push. That same accepted set is what the receiver reports its sender as holding, through the holder-evidence path above (§ RebalanceMonitor → **Holder evidence**), so a received replica is not pushed straight back.
+**The push payload.** A push request (`BlockTransferRequest` in `packages/db-p2p/src/cluster/block-transfer-service.ts`) carries each block as its own JSON value (`blocks`, keyed by block id), beside its `blockMeta` and `blockProofs`, so a block up to `MAX_BLOCK_BYTES` and what travels with it fits one `MAX_BLOCK_MESSAGE_BYTES` frame. Its answer (`BlockTransferResponse`) names the block ids the receiver accepted and the ones it did not (`accepted`, `missing`), and carries no block content. Until this shape, the block travelled as base64 of its JSON, a third larger, so a block over about 6 MiB of JSON could not be pushed at all (the client refused the request before dialing), and the answer echoed every accepted block back. No protocol version separates the two shapes, so **a sender and a receiver on builds either side of this change cannot copy blocks to each other**: each answers the other's push with every block `missing`, which the sender counts as a refusal, and nothing is persisted. The protocol also used to answer a pull — a request to send blocks back — which nothing in production sent; it was removed, since remote reads go through the repo protocol and repair fetches through the sync protocol.
+
+On the receiver, `BlockTransferService.handlePush` persists each pushed block into **local** storage via `IBlockReplicaStore.saveReplicatedBlock()` → `BlockStorage.saveReplica()`, which seeds metadata, advances `latest` monotonically (never downgrades on a stale push), deletes any pending record this node still holds for the landing revision's action id (Invariant P — see [repository.md](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action)), and makes the block durably servable. The monotonic no-op path (the pushed revision is one this node already holds) writes no committed record, so it owes no Invariant-P deletion — the one thing it can still write is a back-filled commit proof, described below. A block is reported `accepted` only when it was both a structurally valid block (an object whose `header` is an object) and persisted; a validation, certification or persist failure surfaces it in `missing`, and so does every block of a push whose handling threw. The sender only records a target as `succeeded` when the response does not list the block in `missing`, so a non-throwing round-trip that failed to persist is correctly counted as a failed push. That same accepted set is what the receiver reports its sender as holding, through the holder-evidence path above (§ RebalanceMonitor → **Holder evidence**), so a received replica is not pushed straight back.
 
 **Certified push.** A pushed block is content the receiver will serve — and, because `saveReplicatedBlock` advances `latest` monotonically, content it will later *corroborate* in a read-repair vote. Accepting a push on the pusher's word alone is therefore how a peer manufactures its own corroborators. So `handlePush` requires, per block, the cohort's `BlockCommitProof` for the revision the push declares:
 
 - The wire carries `blockProofs` alongside `blockMeta` (`BlockTransferRequest`). Producers build the two together with `sourceBlockCertification()` from a single unpinned read, so a proof is never paired with metadata for a different revision. The proof itself comes from `servableProof()` — the same accessor that decides what a peer attaches to a served repair archive — which fails closed on a missing accessor, a throwing lookup, or a stored proof whose message names a different `(blockId, rev, actionId)`.
 - The receiver runs one `certifyContent()` call, which covers the signer cap, the vote signatures and thresholds, the claim matching the declared `(rev, actionId)`, and the declared digest matching the pushed bytes. A failure reports the block in `missing` (the existing failure surface, which senders already handle by falling back or retrying) and logs `push:reject-uncertified` with the `ProofFailure` reason. Thresholds come from `proofThresholds(components.superMajorityThreshold)`, threaded from the node's single resolved `consensusConfig` — the same value `assertSuperMajorityCoupling` already binds the member and coordinator to.
-- Decisions are strictly **per block**: in a multi-block push the verifying block is accepted beside one that is refused. `handlePull` is untouched — it serves this node's own storage.
+- Decisions are strictly **per block**: in a multi-block push the verifying block is accepted beside one that is refused.
 - A block accepted on a proof **stores** that proof (`saveReplicatedBlock`'s 4th argument), so the receiver can re-prove onward what it verified instead of becoming a corroboration-only holder. This holds even when the push does **not** advance `latest`: a receiver that already holds the pushed revision back-fills the proof onto it (§ *Persistence and retention* → *Back-filling onto an already-held revision*), so a revision that landed proof-lessly — a legacy uncertified push, a corroboration-only heal — stops being corroboration-only the moment valid evidence for it arrives. The back-fill happens in `StorageRepo`, not in `saveReplica`'s monotonic guard, because it must first check the proof's declared digest against this node's *own* materialization: the proof was verified against the pushed bytes, and a diverged holder's bytes at the same `(rev, actionId)` may differ.
 - **`requirePushCertificate`** (`BlockTransferServiceInit`, default `true`; set per node via the `blockTransfer` option on `createLibp2pNodeBase`) is the migration escape hatch. Pre-proof blocks can never be certified — the signatures no longer exist — so a deployment holding pre-proof data sets it `false` during migration, which restores the pre-proof acceptance path and logs `push:accept-uncertified`. The failure mode of `false` is silent acceptance of forged content. The failure mode of `true` is wider than "no new holders", because a push that a receiver refuses is a push that never *confirms*: an uncertified block stays readable while two or more holders remain, but `BlockTransferCoordinator.confirmReplicated` never counts a holder for it, so a rebalance keeps it `retained` instead of releasing it, and `RingShiftCoordinator`'s confirm phase — which requires **every** block in the shed range to reach the floor — aborts the whole shift on it (`docs/arachnode-ring-handoff.md` § Phase B). The escape hatch is therefore on the *receivers*, not on the node that cannot shed: clearing that backlog means running receivers with the flag `false` until the affected blocks have been rewritten under current code. Every `CoordinatorRepo.commit` path under current code attaches a proof — the solo-cohort short-circuit included, which self-signs a one-peer proof (see *One-peer proofs (solo cohorts)* above) instead of committing proof-lessly — so the commit-driven backlog no longer grows. What is still uncertifiable: blocks whose last write predates those changes; blocks whose commit declared no content digest for them (the retention rule above stores nothing then); and revisions this node landed through the read-driven promotion in `StorageRepo.get`, which promotes a pending the cohort committed elsewhere and holds no proof to attach — those are not permanent, since the back-fill above attaches a verified proof to an already-held revision as soon as a push carries one. Neither change migrates anything — an already proof-less revision gains no signatures retroactively, so clearing the existing backlog still means the `false` window until those blocks are rewritten. A push carrying a proof that *fails* verification is rejected regardless of the flag — that is not a legacy block, it is a bad one.
 - **What the gate does and does not buy.** It ends acceptance on a peer's bare word: forged content now has to arrive under a self-consistent, fully-signed cohort record binding the exact bytes. It does **not** prove those signers are *this block's* cohort — the standing caller obligation stated under *Durable commit proof* above, unclosed until proof anchoring lands (`feat-cluster-membership-threshold-cert-anchoring`). Push is on exactly the same footing as the two repair paths here, no better and no worse.
@@ -2638,7 +3313,7 @@ Both monitors are initialized through `NetworkManagerService.initRebalanceMonito
 
 ### UnderReplicationDrain
 
-The third sender, and the only one driven by a durable record rather than by topology: `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`) walks the under-replication ledger — the per-block record `CoordinatorRepo.commit` writes of which cohort members still miss a block it acknowledged below `full` — and pushes each block to the owed peers that are connected and identified, on start (the entries carried across a restart), on `connection:open` / `peer:identify` (debounced, throttled), and on a re-check timer while anything is outstanding. A confirming peer is taken off the entry; when the entry empties it is deleted and `StorageRepo.emitBlockDurabilityReached` fires the full-replication event. It is constructed directly in `createLibp2pNodeBase`, outside the FRET gate, because it needs only the key network and the node's own store. The rules — who is owed, the solo case that counts no attempt, the per-(block, peer) give-up cleared on reconnect, the revision guard on `satisfy` — are in [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
+The third sender, and the only one driven by a durable record rather than by topology: `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`) walks the under-replication ledger — the per-block record `CoordinatorRepo.commit` writes of which cohort members still miss a block it acknowledged below `full` — and pushes each block to the owed peers that are connected and identified, on start (the entries carried across a restart), on `connection:open` / `peer:identify` (debounced, throttled), and on a re-check timer while anything is outstanding. A confirming peer is taken off the entry; when the entry empties it is deleted and `StorageRepo.emitBlockDurabilityReached` fires the full-replication event. An embedder that delivered a block itself reports it through the node's `reportBlockHeld`, which takes the peer off the entry by the same rule and fires the same event (`recordHeldCopy` in `packages/db-p2p/src/repo/owed-copies.ts`), whether or not the drain is enabled. A later `full` commit that settles an entry fires the same event from `CoordinatorRepo`, and only one of these ever removes a given entry. Both run on the node whose ledger holds the entry, which the commit's answer names as `WriteDurability.recordedBy`, so a writer can tell whether the event will reach it. It is constructed directly in `createLibp2pNodeBase`, outside the FRET gate, because it needs only the key network and the node's own store. The rules — who is owed, the solo case that counts no attempt, the per-(block, peer) give-up cleared on reconnect, the revision guard on `satisfy` — are in [packages/db-p2p/docs/repo.md §The under-replication drain and the full-replication event](../packages/db-p2p/docs/repo.md#the-under-replication-drain-and-the-full-replication-event).
 
 **One push loop.** All three senders — `BlockTransferCoordinator`'s push and confirm, the spread loop, the drain — go through `pushBlockToPeers` in `packages/db-p2p/src/cluster/block-transfer-service.ts`: read the block unpinned, build its certification from that read, push to each peer, and read each answer the one true way (a peer holds the block only when its response does NOT list it as missing). Retry, stopping condition (`stopAfterConfirmed`) and the two per-peer deadlines are the caller's; the helper logs nothing per peer and returns a `PushBlockOutcome` the caller's own diagnostics describe.
 
@@ -2712,13 +3387,16 @@ await doWork();
 **Two markers, two lifetimes.** The *in-memory* guard above must be set eagerly (before
 any `await`) — it is the synchronous check-and-set that closes the concurrent apply-window
 race. The *durable* marker (`stateStore.markExecuted`), used only for post-restart dedup,
-is the opposite: it is written **after** `doWork()` (the apply loop) succeeds. Writing it
-eagerly would leave a stuck marker on a caught fault or a crash mid-apply, and on
+is the opposite: it is written **after** `doWork()` (the apply loop) succeeds, and only once
+the apply's own writes survive a power cut (`markExecutedOnceDurable` waits on the store's
+`whenDurable()`, since a consensus apply may flush with its cohort's durability window).
+Writing it eagerly would leave a stuck marker on a caught fault or a crash mid-apply, and on
 redelivery `handleConsensus` would short-circuit at the async `wasTransactionExecuted`
 check — silently dropping the transaction on that member forever. The window between
-"apply succeeded" and "durable write landed" is safe to re-run on restart because
+"apply succeeded" and "durable write landed" — the whole durability window now, not a few
+writes — is safe to re-run on restart because
 re-applying an already-applied consensus transaction is idempotent (the "ahead" divergence
-path in `applyConsensusOperation` tolerates it as a no-op).
+path in `applyCommitToStorage` tolerates it as a no-op).
 
 ### 5. Latch Deadlocks
 **Bug**: Latches are per-node, not distributed. Concurrent transactions on same block can deadlock.

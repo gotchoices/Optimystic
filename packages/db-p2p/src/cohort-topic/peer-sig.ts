@@ -7,11 +7,14 @@
  *
  * - **Signing** uses the node's libp2p `PrivateKey.sign` (async — fine on the participant outbound
  *   path) and is the seam the threshold-assembly ticket reuses for per-member partial signatures.
- * - **Verification is SYNCHRONOUS**, because the db-core verify ports (e.g. the participant-signature
- *   predicates and `ICohortThresholdCrypto.verify`) are synchronous. libp2p's
- *   `publicKeyFromRaw(raw).verify` is async, so this verifies with `@noble/curves/ed25519` directly
- *   over the raw 32-byte key. noble's `ed25519.verify` (ZIP215) is a strict superset of the RFC8032
- *   signatures the libp2p signer (Node/WebCrypto Ed25519) produces, so it accepts them.
+ * - **Verification comes in two forms.** {@link verifyPeerSigAsync} is the platform's own verifier (libp2p's
+ *   `PublicKey.verify`: native in Node, WebCrypto where the runtime provides Ed25519) and is the one to use
+ *   wherever the caller can await — the inbound cohort-gossip handler, the threshold-assembly collection.
+ *   {@link verifyPeerSig} is synchronous, for the db-core verify ports that are (the participant-signature
+ *   predicates, `ICohortThresholdCrypto.verify`): libp2p's verify may answer with a promise, so it verifies
+ *   with `@noble/curves/ed25519` directly over the raw 32-byte key — pure JavaScript, and much slower on a
+ *   phone. noble's `ed25519.verify` (ZIP215) is a strict superset of the RFC8032 signatures the libp2p
+ *   signer (Node/WebCrypto Ed25519) produces, so it accepts them.
  *
  * The signer id on the cohort wire is the UTF-8 bytes of the peer-id string (see `peer-codec.ts`).
  * For an Ed25519 identity the public key is embedded in the identity multihash, so no network lookup
@@ -80,6 +83,36 @@ export function verifyPeerSig(signer: string | Uint8Array, payload: Uint8Array, 
 			return false;
 		}
 		return ed25519.verify(sig, payload, rawPub);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Verify an Ed25519 peer-key signature with the platform's own verifier — libp2p's `PublicKey.verify`.
+ * Same signer forms as {@link verifyPeerSig}, and equally total: resolves `false` (never rejects) on a
+ * non-Ed25519 id, a missing key, a malformed signature, or any throw or rejection underneath.
+ *
+ * Which verifier runs is `@libp2p/crypto`'s choice:
+ * - **Node**: `node:crypto`'s `verify`, native.
+ * - **Browser / React Native** (the package's `browser` entry, which Metro picks): WebCrypto
+ *   `subtle.verify({ name: 'Ed25519' })` when a probe run once, when `@libp2p/crypto` is first imported,
+ *   finds it; otherwise noble, the same cost as {@link verifyPeerSig}. So a phone verifies natively only if
+ *   its runtime provides WebCrypto Ed25519 — through a polyfill, which must be installed **before**
+ *   `@libp2p/crypto` is first imported, or the probe has already settled on noble.
+ *
+ * Node and WebCrypto verify strict RFC 8032, while noble accepts the wider ZIP215 set, so a crafted
+ * non-canonical signature {@link verifyPeerSig} would take is refused here. Every signer in this codebase
+ * (libp2p `PrivateKey.sign`, {@link signPeerSig}) produces RFC 8032 signatures, so no honest one is.
+ */
+export async function verifyPeerSigAsync(signer: string | Uint8Array, payload: Uint8Array, sig: Uint8Array): Promise<boolean> {
+	try {
+		const peerIdStr = typeof signer === "string" ? signer : bytesToPeerIdString(signer);
+		const peerId = peerIdFromString(peerIdStr);
+		if (peerId.type !== "Ed25519" || peerId.publicKey === undefined) {
+			return false;
+		}
+		return await peerId.publicKey.verify(payload, sig);
 	} catch {
 		return false;
 	}

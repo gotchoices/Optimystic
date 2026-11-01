@@ -155,8 +155,8 @@ still costs is the replication cost in `docs/correctness.md` §"The cost of not 
 
 A block never holds a pending record and a committed record for the same action id at the same
 time. On the commit path this holds because promotion *moves* the record from the pending namespace
-to the committed one atomically (a single rename on the filesystem backend, a synchronous two-map
-swap in memory) rather than copying it.
+to the committed one atomically (two entries of one write-ahead-log record on the filesystem backend,
+a synchronous two-map swap in memory) rather than copying it.
 
 Every **other** writer of a committed transform for a block must maintain the same invariant by
 deleting that action's pending record when it writes the committed one. Today those writers are the
@@ -336,9 +336,24 @@ an attempt on it.
 
 Callers must not let that throw displace the verdict it is cleaning up after: a confirmed conflict
 is still returned as a stale failure so the writer rebases, and a transport fault is still the error
-thrown — the cancel failure rides along beside it. Budgets are finite, so a fault outlasting one
-still strands the record; a node-side backstop for that residual is tracked in backlog
-`debt-unpromotable-pending-records-need-a-sweep`.
+thrown — the cancel failure rides along beside it.
+
+A cancel that runs out of budget is **kept, not forgotten**. Every cancel is itself a cluster
+transaction, so the member whose silence sank a write's commit sinks the cancel too — at three
+members the promise bar is all three — and no budget is long enough to outlast a member that is
+simply off. The writer's transactor keeps the blocks the cancel left unanswered (`OwedCancels` in
+`packages/db-core/src/transactor/owed-cancels.ts`, recorded by `NetworkTransactor.dischargeCancel`
+before it throws, so no caller has to remember to) and re-sends that cancel before its own next pend
+of any of those blocks and on a backoff timer, for the transactor's life; the timer is what frees
+other writers, whom the records refuse too, without this writer writing the block again. Re-sending
+late is safe whenever it arrives, because a cancel deletes only its own action's pending records and
+never moves a revision, so it commutes with every other action — except a re-pend of the *same*
+action id, whose fresh record a late cancel would delete. So a pend of an owed action supersedes the
+owed cancel for every block it names and waits out any re-send already in flight. Only a writer that
+exits, or stops its transactor (`NetworkTransactor.stop`, which the Quereus plugin's
+`CollectionFactory.shutdown` calls before it stops its nodes), while a cancel is owed still strands
+the record; the node-side
+backstop for that residual is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
 
 A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is
 reported as an ordinary optimistic-concurrency loss, because that is what a single refusal is

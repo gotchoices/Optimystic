@@ -55,6 +55,12 @@ const readingThroughCoordinator = (node: MeshNode, inner: ITransactor): ITransac
 	if (inner.getLineage) {
 		transactor.getLineage = ref => inner.getLineage!(ref);
 	}
+	if (inner.pendMany) {
+		transactor.pendMany = requests => inner.pendMany!(requests);
+	}
+	if (inner.commitMany) {
+		transactor.commitMany = requests => inner.commitMany!(requests);
+	}
 	return transactor;
 };
 

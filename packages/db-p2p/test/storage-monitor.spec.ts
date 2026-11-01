@@ -26,6 +26,9 @@ function makeStorage(overrides: Partial<IRawStorage> = {}): IRawStorage {
 		getMaterializedBlock: reject as any,
 		saveMaterializedBlock: reject as any,
 		promotePendingTransaction: reject as any,
+		flush: reject as any,
+		whenDurable: reject as any,
+		durability: 'none',
 		...overrides
 	};
 }

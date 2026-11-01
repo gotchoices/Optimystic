@@ -26,6 +26,7 @@
  */
 import type {
 	ITransactor,
+	IRepo,
 	BlockGets,
 	GetBlockResults,
 	ActionBlocks,
@@ -159,5 +160,26 @@ export function gateTransactor(
 		async cancel(ref: ActionBlocks): Promise<void> {
 			return inner.cancel(ref);
 		},
+	};
+}
+
+/**
+ * `repo` (a mesh node's repo, through `MockMeshOptions.wrapRepo`) with its pends held at the gate
+ * `gateFor()` names when the pend arrives, if any. A node coordinates its own writes, so wrapping the
+ * writer's own node parks its submission after the attempt is built and before the cohort sees it.
+ */
+export function parkingPends(repo: IRepo, gateFor: () => CommitGate | undefined): IRepo {
+	const held = async (): Promise<void> => {
+		await gateFor()?.pass();
+	};
+	const pendMany = repo.pendMany?.bind(repo);
+	const commitMany = repo.commitMany?.bind(repo);
+	return {
+		get: (blockGets, options) => repo.get(blockGets, options),
+		pend: async (request, options) => { await held(); return repo.pend(request, options); },
+		cancel: (actionRef, options) => repo.cancel(actionRef, options),
+		commit: (request, options) => repo.commit(request, options),
+		...(pendMany ? { pendMany: async (...args: Parameters<typeof pendMany>) => { await held(); return pendMany(...args); } } : {}),
+		...(commitMany ? { commitMany } : {}),
 	};
 }

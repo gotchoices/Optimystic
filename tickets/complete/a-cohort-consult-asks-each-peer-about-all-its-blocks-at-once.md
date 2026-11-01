@@ -1,0 +1,38 @@
+description: When a machine checks several blocks with the other members of its group in one read, it now asks each member about all of that read's blocks in a single request instead of one request per block, so a read of a table's header and log tail costs one request per member rather than two.
+prereq: a-cohort-consult-sends-bytes-only-when-the-peer-is-ahead
+architecture: docs/transactions.md#lazy-read-repair-window
+files: packages/db-p2p/src/repo/consult-round.ts, packages/db-p2p/src/with-deadline.ts, packages/db-p2p/src/repo/coordinator-repo.ts, packages/db-p2p/src/sync/protocol.ts, packages/db-p2p/src/sync/service.ts, packages/db-p2p/src/storage/block-archive.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/protocol-limits.ts, packages/db-p2p/src/testing/mesh-harness.ts, packages/db-p2p/src/index.ts, packages/db-p2p/src/rn.ts, packages/db-p2p/test/consult-round.spec.ts, packages/db-p2p/test/block-archive-proof.spec.ts, packages/db-p2p/test/coordinator-repo-read-repair.spec.ts, docs/transactions.md, docs/internals.md, docs/debugging.md
+----
+
+# A cohort consult asks each peer about all its blocks at once
+
+GitHub [#29](https://github.com/gotchoices/Optimystic/issues/29) question 3 and [#43](https://github.com/gotchoices/Optimystic/issues/43) arm 1.
+
+## What landed
+
+Each `CoordinatorRepo.get` that consults the cohort opens one `ConsultRound` (`packages/db-p2p/src/repo/consult-round.ts`). Every per-block pass that consults — blocking, or behind the read when `startHeldBlockConsult` starts one — joins a seat before its first await, registers its per-peer questions instead of sending them, and readies the seat once registered (or, through `leavingSeat`, on any exit that asked nobody). When `get` has closed the round and every seat is ready, the round sends one `sync` request per peer naming every block registered for it (`SyncRequest.blockIds`, chunked at `MAX_CONSULT_BATCH_BLOCKS` = 32). Self is asked through the single-block callback. A failed request silences every block it named; a block left out of an answer silences that block alone; a peer on a build predating `SyncRequest.held` (`unbatched`) has its first block answered from the reply and the rest asked one at a time, logged `cluster-fetch:consult-unbatched`.
+
+The server (`SyncService.answerConsult`) answers each distinct id, the first 32, and `fitConsultContent` keeps block bytes in the response only up to `CONSULT_RESPONSE_CONTENT_BUDGET_BYTES` (4 MiB) — the first byte-carrying answer always keeps them — reducing the rest to claim and proof marked `'size'`, which the asker does not reuse as that peer's archive, so the acquisition asks it again. The node wires a `clusterLatestBatchCallback`; absent, `CoordinatorRepo` behaves exactly as before. The mesh harness serves batches by the same rule and counts requests (`Mesh.consultRequests`).
+
+Implement commit: `ticket(implement): a-cohort-consult-asks-each-peer-about-all-its-blocks-at-once`.
+
+## Review findings
+
+**Checked:** the implement diff in full (round, coordinator wiring, wire types, server, node callbacks, harness, exports, tests, docs); that every path in `readRepairBlock` and `startHeldBlockConsult` ahead of `round.join()` is synchronous, so `get` closing the round right after `map` cannot shut a seat out; that `queryClusterForLatest` is called once per pass, so no seat asks after it readied; that every seat is readied on every exit (`leavingSeat` in a `finally`), so no round can stall on a pass that threw; that `round.close()` with no seats is a no-op send; that a `'size'` answer yields a claim with no archive and so is left out of `ConsultedArchives` (`coordinator-repo.ts` sets an entry only for "holds nothing" or a claim with an archive), sending the acquisition back to that peer; that `answerFromArchiveResponse` + `claimFromConsultAnswer` reproduce the single callback's old inline older-peer branch exactly; the server's id handling (non-array, non-string ids, duplicates, cap).
+
+**Found and fixed — the per-peer deadline started at registration, not at send (major, fixed inline).** Through a seat, `queryClusterForLatest` wrapped `seat.ask` in `withDeadline`, so the clock ran while the round waited for the other seats' cohort lookups. One block's `findCluster` can wait out the bounded bootstrap-contact wait (default at least the libp2p dial timeout) while the default per-peer deadline is 1 s, so a read whose two blocks have different cohorts right after start would have read every peer of the fast block as silent: a `peers-unreachable` flag on a missing block, a silent-peer hold on a held one, and a `cluster-fetch:peers-silent` line against healthy peers. The implementer had parked this as a `NOTE:` tripwire; it is a real defect on a reachable path (node start-up, GitHub #27 territory), so it is fixed rather than parked. `ConsultRound` now takes `deadlineMs` and applies it to each request when it sends it (batch and single alike); `queryClusterForLatest` applies `withDeadline` only on the non-round path. `withDeadline` moved out of `coordinator-repo.ts` into `packages/db-p2p/src/with-deadline.ts` (not in the public barrel) so both use one copy. The barrier's remaining cost — a slow lookup delays the other blocks' requests, but no longer makes their peers read silent — is stated in the `ConsultRound` doc comment, and the `NOTE:` is gone. `docs/transactions.md` § Lazy read-repair window says the deadline counts from send.
+
+**Tests:** added two to `consult-round.spec.ts` — the deadline counts from send (a question registered 60 ms before the round sends, under a 20 ms deadline, still resolves), and a peer that never answers reads silent through the round (the round path now owns that deadline, which hand-built `CoordinatorRepo` specs without a batch callback no longer cover). Kept the implementer's tests: each pins real branching (silence per request vs per block, unbatched, self, chunking, the content budget, the one-request-per-peer mesh count). None cut.
+
+**Considered and left:**
+- The build between the two tickets (reads `held`, not `blockIds`) would answer only the first block, read as silence for the rest. Unreleased (`v1.16.0` predates `held`) and AGENTS.md says not to design for backward compatibility yet; no heuristic added.
+- The server serves a batch's blocks sequentially; at most 32 local reads. Stated in `answerConsult`'s doc comment.
+- `fitConsultContent` JSON-encodes each byte-carrying archive once to measure it, even for a one-block consult. Accepted in the plan and stated at the function; bytes ride only when the peer is ahead.
+- No coalescing across concurrent reads — by design, stated at `openConsultRound`.
+- The `unbatched` path is covered only by the round unit spec; the mesh never plays an older peer. Adequate: the branch is in the round, and the node callback's older-peer projection is the shared `answerFromArchiveResponse`.
+
+**Docs:** `docs/transactions.md`, `docs/internals.md`, `docs/debugging.md` read and current after the deadline wording fix. No other doc names the sync wire.
+
+**Hygiene / types / cleanup:** no `any` added beyond the harness's pre-existing `skipClusterFetch` cast; `consult-round.ts` ~230 lines, single-purpose; every timer cleared on both outcomes; every waiter settles on every outcome. No tripwires added.
+
+**Validation:** `tsc --noEmit` (db-p2p src + test) clean; `yarn lint` and `yarn lint:docs` clean; db-p2p `yarn test` 3502 passing, 73 pending; db-p2p integration specs 50 passing, 2 pending. `yarn check:rn` not re-run — the only new module is a plain `setTimeout`/`Promise.race` helper, and the implementer's run covered the rest.

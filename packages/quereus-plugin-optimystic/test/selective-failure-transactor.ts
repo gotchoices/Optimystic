@@ -30,7 +30,7 @@ import type {
 	BlockId,
 	Transforms,
 } from '@optimystic/db-core';
-import { StorageRepo, BlockStorage, type IRawStorage } from '@optimystic/db-p2p';
+import { StorageRepo, type IRawStorage } from '@optimystic/db-p2p';
 
 export interface SelectiveFailure {
 	/** Which call to fail. A failed pend is a hard rejection at pend time (nothing durable);
@@ -51,7 +51,7 @@ export interface SelectiveFailureTransactor {
 }
 
 export function makeSelectiveFailureTransactor(rawStorage: IRawStorage): SelectiveFailureTransactor {
-	const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
+	const storageRepo = new StorageRepo(rawStorage);
 	const owners = new Map<BlockId, string>();
 	let failure: SelectiveFailure | undefined;
 	let tripped = 0;

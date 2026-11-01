@@ -1,13 +1,22 @@
 import { Path, PathBranch } from "./path.js";
 import type { ITreeTrunk, KeyRange, getTrunkFunc } from "./index.js";
-import type { BlockId, BlockStore } from "../blocks/index.js";
+import type { BlockId, BlockOperation, BlockStore } from "../blocks/index.js";
 import { apply, get } from "../blocks/index.js";
 import { TreeLeafBlockType, TreeBranchBlockType, entries$, nodes$, partitions$ } from "./nodes.js";
 import type { BranchNode, ITreeNode, LeafNode } from "./nodes.js";
 import type { TreeBlock } from "./tree-block.js";
 import { AtomicProxy, type AtomicScope } from "../transform/atomic-proxy.js";
+import { jsonEncodedBytes } from "../network/transaction-size.js";
+import { branchItemBytes, divideItems, emptyBranchBytes, emptyLeafBytes, leafItemBytes, runOf } from "./node-division.js";
+import { createLogger } from "../logger.js";
+
+const log = createLogger('btree');
 
 export const NodeCapacity = 64;
+
+/** One change to a leaf's `entries`, the splice `[entries$, index, deleteCount, [entry]]`: an insert
+ *  at `index` (`deleteCount` 0) or the replacement of the entry there (`deleteCount` 1). */
+type LeafEdit<TEntry> = { index: number; deleteCount: 0 | 1; entry: TEntry };
 
 /**
  * Represents a lightweight B+(ish)Tree (data at leaves, but no linked list of leaves).
@@ -29,6 +38,13 @@ export class BTree<TKey, TEntry> {
 		public readonly keyFromEntry = (entry: TEntry) => entry as unknown as TKey,
 		public readonly compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0 as number,
 		public readonly nodeCapacity = NodeCapacity,
+		/** When set, a node also splits once its JSON (`jsonEncodedBytes`) would pass this many bytes, and
+		 *  a borrow or merge that would take a node past it is refused. A node may exceed it only while
+		 *  holding the least a node holds — one entry for a leaf, two children for a branch — so a leaf is
+		 *  never larger than the entry that was written into it. Absent, nodes split by count alone and
+		 *  are never serialized to be measured. The tree collection sets it to `BLOCK_TARGET_BYTES`; see
+		 *  "Node size" in `docs/btree.md`. */
+		public readonly nodeTargetBytes?: number,
 	) {
 	}
 
@@ -52,12 +68,14 @@ export class BTree<TKey, TEntry> {
 		compare = (a: TKey, b: TKey) => a < b ? -1 : a > b ? 1 : 0 as number,
 		nodeCapacity = NodeCapacity,
 		newId?: BlockId,
+		/** See the constructor's `nodeTargetBytes`. */
+		nodeTargetBytes?: number,
 	) {
 		const proxy = new AtomicProxy(store);
 		const root = BTree.createRoot(proxy as BlockStore<TreeBlock>);
 		proxy.insert(root);
 		const trunk = createTrunk(proxy as BlockStore<TreeBlock>, root.header.id, newId);
-		const tree = new BTree(proxy, trunk, keyFromEntry, compare, nodeCapacity);
+		const tree = new BTree(proxy, trunk, keyFromEntry, compare, nodeCapacity, nodeTargetBytes);
 		tree._proxy = proxy;
 		return tree;
 	}
@@ -83,15 +101,23 @@ export class BTree<TKey, TEntry> {
 		return await this.getPath(await this.trunk.get(), key, navigate);
 	}
 
-	/** Retrieves the entry for the given key.
-	 * Use find instead for a path to the key, the nearest match, or as a basis for navigation.
+	/** Retrieves the entry for the given key, as the tree stood at some moment during the call.
+	 * Never throws for a change that lands while it reads: a descent that a change tore is read
+	 * again ({@link readUnchanged}). Use find instead for a path to the key, the nearest match, or as
+	 * a basis for navigation.
+	 *
+	 * NOTE: "some moment" holds only for changes that move {@link _version}: this tree's own writes
+	 * and {@link invalidatePaths}, which `Tree` calls for every change its collection reports. A
+	 * BTree used on its own over a store that something else mutates gets only the first.
 	 * @returns the entry for the given key if found; undefined otherwise. */
 	async get(key: TKey): Promise<TEntry | undefined> {
 		// Value-of-key point lookup: the result depends ONLY on the terminal leaf's content, so the
 		// interior descent nodes are pure navigation and are dropped from the OCC conflict set. The
-		// returned Path is consumed by `at` and discarded — it never seeds a scan — so navigate=true
-		// is safe here (unlike the public `find`).
-		return this.at(await this.find(key, /* navigate */ true));
+		// returned Path is read here and discarded — it never seeds a scan — so navigate=true is safe
+		// here (unlike the public `find`). Not validated: the leaf it holds was read with nothing
+		// changing, and is that moment's entry however many hops ago the descent finished.
+		const path = await this.readUnchanged('get', () => this.find(key, /* navigate */ true));
+		return path.on ? this.getEntry(path) : undefined;
 	}
 
 	/** @returns the entry for the given path if on an entry; undefined otherwise. */
@@ -100,24 +126,25 @@ export class BTree<TKey, TEntry> {
 		return path.on ? this.getEntry(path) : undefined;
 	}
 
-	/** Iterates based on the given range
-	 * WARNING: mutation during iteration will result in an exception
+	/** Iterates based on the given range.
+	 * Finding where the scan starts and ends never throws for a change that lands meanwhile: it is
+	 * read again ({@link readUnchanged}), so a scan that has yielded nothing has not failed.
+	 * WARNING: mutation during iteration — once a path has been yielded — will result in an exception
 	*/
 	async *range(range: KeyRange<TKey>): AsyncIterableIterator<Path<TKey, TEntry>> {
-		const startPath = range.first
-			? await this.findFirst(range)
-			: (range.isAscending ? await this.first() : await this.last());
-		const endPath = range.last
-			? await this.findLast(range)
-			: (range.isAscending ? await this.last() : await this.first());
-		// If the tree is empty or endPath is not on an entry, return early
-		if (!endPath.on) {
+		let bounds: RangeBounds<TKey, TEntry> | undefined;
+		do {
+			bounds = await this.readUnchanged('range', () => this.rangeBounds(range));
+			// Read with nothing changing, but handed back a few microtask hops ago: checked again here,
+			// in the same synchronous step as the iteration's first validation of the start path below.
+		} while (bounds !== undefined && !this.isValid(bounds.start));
+		if (bounds === undefined) {
 			return;
 		}
-		const endKey = this.keyFromPath(endPath);
+		const { start, endKey } = bounds;
 		const iterable = range.isAscending
-			? this.internalAscending(startPath)
-			: this.internalDescending(startPath);
+			? this.internalAscending(start)
+			: this.internalDescending(start);
 		const iter = iterable[Symbol.asyncIterator]();
 		const ascendingFactor = range.isAscending ? 1 : -1;
 		for await (let path of iter) {
@@ -128,6 +155,65 @@ export class BTree<TKey, TEntry> {
 				break;
 			}
 			yield path;
+		}
+	}
+
+	/** Every entry in `range`, in the range's order, as the tree stood at some moment during the call.
+	 * A range read that hands back one value: like {@link get}, it never throws for a concurrent
+	 * change, but reads the whole range again ({@link readUnchanged}). For a range small enough to
+	 * hold in memory and to read again; a scan that must stream, or may be long, uses {@link range}. */
+	async entriesIn(range: KeyRange<TKey>): Promise<TEntry[]> {
+		return await this.readUnchanged('entriesIn', async () => {
+			const entries: TEntry[] = [];
+			for await (const path of this.range(range)) {
+				entries.push(this.getEntry(path));
+			}
+			return entries;
+		});
+	}
+
+	/** Where a scan of `range` starts and the key it ends at, or `undefined` when the tree is empty or
+	 * the range's end is not on an entry, so there is nothing to scan. */
+	private async rangeBounds(range: KeyRange<TKey>): Promise<RangeBounds<TKey, TEntry> | undefined> {
+		const start = range.first
+			? await this.findFirst(range)
+			: (range.isAscending ? await this.first() : await this.last());
+		const end = range.last
+			? await this.findLast(range)
+			: (range.isAscending ? await this.last() : await this.first());
+		return end.on ? { start, endKey: this.keyFromPath(end) } : undefined;
+	}
+
+	/** Run `read` — one descent or several — until it finishes with no change to the tree landing
+	 * while it ran ({@link _version} unmoved), and return what it read: every block it read is then
+	 * of one moment. Reads are not latched, so a change can land between any two of them — a replay
+	 * that rebuilds staged nodes under fresh ids, a refresh that adopts newer blocks — and a descent
+	 * across one can follow an id that no longer exists, or an old branch to a new leaf that no
+	 * longer holds the key.
+	 *
+	 * A throw while the version moved is retried too: it is that change's symptom (`Missing block`
+	 * for a removed id, an invalid path from a step that validates one), not a fault. With the
+	 * version unmoved it propagates unchanged. That is an exception used as control flow, on purpose,
+	 * and only behind a concurrent change detected independently of it.
+	 *
+	 * NOTE: unbounded. Each retry needs another change to land inside a descent of a few block reads,
+	 * and every source of change (a drain step, a refresh) is finite work. If a storm of
+	 * `btree:read-retried` lines is ever seen, bound the loop and report the contention instead. */
+	private async readUnchanged<T>(what: string, read: () => Promise<T>): Promise<T> {
+		for (;;) {
+			const version = this._version;
+			try {
+				const result = await read();
+				if (this._version === version) {
+					return result;
+				}
+				log('btree:read-retried what=%s reason=changed', what);
+			} catch (err) {
+				if (this._version === version) {
+					throw err;
+				}
+				log('btree:read-retried what=%s reason=%s', what, err instanceof Error ? err.message : String(err));
+			}
 		}
 	}
 
@@ -189,7 +275,7 @@ export class BTree<TKey, TEntry> {
 			const path = await this.find(this.keyFromEntry(entry));
 			Object.freeze(entry);
 			if (path.on) {
-				this.updateEntry(path, entry);
+				await this.updateEntry(path, entry);
 			} else {
 				await this.internalInsertAt(path, entry);
 			}
@@ -510,7 +596,7 @@ export class BTree<TKey, TEntry> {
 				}
 				return [newPath, false];
 			} else {
-				this.updateEntry(path, newEntry);
+				await this.updateEntry(path, newEntry);
 			}
 		}
 		return [path, true];
@@ -549,18 +635,43 @@ export class BTree<TKey, TEntry> {
 	}
 
 	private async internalInsertAt(path: Path<TKey, TEntry>, entry: TEntry) {
-		let split = this.leafInsert(path, entry);
-		let branchIndex = path.branches.length - 1;
-		while (split && branchIndex >= 0) {
-			split = await this.branchInsert(path, branchIndex, split);
-			--branchIndex;
+		await this.applyLeafEdit(path, { index: path.leafIndex, deleteCount: 0, entry });
+	}
+
+	/** Apply `edit` to the path's leaf and absorb whatever splits it causes up the path: each parent
+	 *  that cannot take the new children splits in turn, and a split that reaches the root grows the
+	 *  tree by a level. The path follows the edited entry throughout. */
+	private async applyLeafEdit(path: Path<TKey, TEntry>, edit: LeafEdit<TEntry>) {
+		let overflow = this.leafEdit(path, edit);
+		for (let branchIndex = path.branches.length - 1; overflow && branchIndex >= 0; --branchIndex) {
+			overflow = await this.branchInsert(path, branchIndex, overflow);
 		}
-		if (split) {
-			const newBranch = newBranchNode(this.store, [split.key], [await this.trunk.getId(), split.right.header.id]);
-			this.store.insert(newBranch);
-			await this.trunk.set(newBranch);
-			path.branches.unshift(new PathBranch(newBranch, split.indexDelta));
+		while (overflow) {
+			overflow = await this.growRoot(path, overflow);
 		}
+	}
+
+	/** Put a new root over the old one and the nodes `overflow` left to its right. Written whole when it
+	 *  fits one node, as a root of two children always does. Otherwise — more new nodes than a branch
+	 *  holds, or keys so large that two of them pass the byte target — the root starts as the old root
+	 *  alone and absorbs the rest through {@link branchInsert}, which divides it and may hand back an
+	 *  overflow for the caller to grow another level over. */
+	private async growRoot(path: Path<TKey, TEntry>, overflow: Overflow<TKey>): Promise<Overflow<TKey> | undefined> {
+		const oldRootId = await this.trunk.getId();
+		const keys = overflow.rights.map(right => right.key);
+		const ids = overflow.rights.map(right => right.node.header.id);
+		const whole = newBranchNode(this.store, keys, [oldRootId, ...ids]);
+		if (this.branchRuns(whole, whole.partitions, whole.nodes, overflow.pathRun) === undefined) {
+			this.store.insert(whole);
+			await this.trunk.set(whole);
+			path.branches.unshift(new PathBranch(whole, overflow.pathRun));
+			return undefined;
+		}
+		const root = newBranchNode<TKey>(this.store, [], [oldRootId]);
+		this.store.insert(root);
+		await this.trunk.set(root);
+		path.branches.unshift(new PathBranch(root, 0));
+		return await this.branchInsert(path, 0, overflow);
 	}
 
 	/** Starting from the given node, recursively working down to the leaf, build onto the path based on the beginning-most entry. */
@@ -620,88 +731,139 @@ export class BTree<TKey, TEntry> {
 		}
 	}
 
-	private leafInsert(path: Path<TKey, TEntry>, entry: TEntry): Split<TKey> | undefined {
-		const { leafNode: leaf, leafIndex: index } = path;
-		if (leaf.entries.length < this.nodeCapacity) {  // No split needed
-			apply(this.store, leaf, [entries$, index, 0, [entry]]);
+	/** Apply `edit` to the path's leaf, dividing the leaf when the result would not fit one node (see
+	 *  {@link leafRuns}). The first run of entries stays in the leaf and each further run becomes a new
+	 *  leaf to its right; the edit's entry is placed directly into whichever leaf it falls in rather
+	 *  than logged as an operation on it, so a new leaf is one insert and the old leaf one or two small
+	 *  operations. The path moves to the new leaf when its entry went there.
+	 *  @returns the overflow for the parent to absorb, or `undefined` when the leaf took the edit whole. */
+	private leafEdit(path: Path<TKey, TEntry>, edit: LeafEdit<TEntry>): Overflow<TKey> | undefined {
+		const { leafNode: leaf } = path;
+		const { index, deleteCount, entry } = edit;
+		const op: BlockOperation = [entries$, index, deleteCount, [entry]];
+		const entries = leaf.entries.slice();	// the leaf as it would stand with the edit applied
+		entries.splice(index, deleteCount, entry);
+		const runs = this.leafRuns(leaf, entries, index);
+		if (runs === undefined) {
+			apply(this.store, leaf, op);
 			return undefined;
 		}
-		// Full. Split needed
-
-		const midIndex = (leaf.entries.length + 1) >>> 1;
-		const newEntries = leaf.entries.slice(midIndex);
-
-		// New node
-		if (index >= midIndex) {	// Put the new entry directly rather than log an insert
-			newEntries.splice(index - midIndex, 0, entry);
+		const rights = runs.slice(1, -1).map((from, i) => {
+			const node = newLeafNode(this.store, entries.slice(from, runs[i + 2]!));
+			this.store.insert(node);
+			return { key: this.keyFromEntry(entries[from]!), node };
+		});
+		const end = runs[1]!;	// this leaf keeps the entries before it
+		if (index < end) {	// the edit lands in this leaf: cut the tail off, then apply it
+			this.cutTail(leaf, entries$, leaf.entries.length, end - 1 + deleteCount);	// what stays, counted in the leaf as it stands
+			apply(this.store, leaf, op);
+		} else {	// the edit landed in a new leaf, placed above
+			this.cutTail(leaf, entries$, leaf.entries.length, end);
 		}
-		const newLeaf = newLeafNode(this.store, newEntries);
-		this.store.insert(newLeaf);
-
-		// Delete entries from old node
-		apply(this.store, leaf, [entries$, midIndex, leaf.entries.length - midIndex, []]);
-
-		if (index < midIndex) {	// Insert new entry into old node
-			apply(this.store, leaf, [entries$, index, 0, [entry]]);
-		} else {
-			path.leafNode = newLeaf;
-			path.leafIndex -= midIndex;
+		const pathRun = runOf(runs, index);
+		if (pathRun > 0) {
+			path.leafNode = rights[pathRun - 1]!.node as LeafNode<TEntry>;
+			path.leafIndex = index - runs[pathRun]!;
 		}
-
-		return new Split<TKey>(this.keyFromEntry(newEntries[0]!), newLeaf, index < midIndex ? 0 : 1);
+		return { rights, pathRun };
 	}
 
-	private async branchInsert(path: Path<TKey, TEntry>, branchIndex: number, split: Split<TKey>): Promise<Split<TKey> | undefined> {
+	/** How `entries` — the path's leaf as it would stand after an edit at index `at` — divide into leaves,
+	 *  or `undefined` when they fit one: at most `nodeCapacity` entries and, when the tree has a byte
+	 *  target and the leaf would hold more than one entry, no more than the target's bytes. See
+	 *  {@link divideItems} for the division, a pure function of the leaf's content and the edit, so a
+	 *  replayed or retried action produces the same transforms. */
+	private leafRuns(leaf: LeafNode<TEntry>, entries: readonly TEntry[], at: number): number[] | undefined {
+		// NOTE: serializes every entry of the leaf once per insert or in-place update, the same order
+		// of cost as the commit path's digest of each touched block. If bulk inserts ever show this in
+		// a profile, keep a running byte count per leaf instead of re-measuring it.
+		const bytes = this.nodeTargetBytes !== undefined && entries.length > 1
+			? leafItemBytes(leaf, entries, this.nodeTargetBytes)
+			: undefined;
+		return divideItems(entries.length, this.nodeCapacity, at, 1, bytes);
+	}
+
+	/** Absorb a child's overflow into the branch at `branchIndex` of the path: the new children go after
+	 *  the one that split, each under its key. When the branch cannot hold them all ({@link branchRuns})
+	 *  it divides: the first run of children stays with the keys between them, each further run becomes
+	 *  a new branch to the right, and the key before a run's first child is promoted as that branch's
+	 *  key. As in {@link leafEdit}, a new child is placed directly into whichever branch it falls in.
+	 *  @returns the overflow for the next branch up, or `undefined` when this one took the children whole. */
+	private async branchInsert(path: Path<TKey, TEntry>, branchIndex: number, overflow: Overflow<TKey>): Promise<Overflow<TKey> | undefined> {
 		const pathBranch = path.branches[branchIndex]!;
-		const { index: splitIndex, node } = pathBranch;
-		pathBranch.index += split.indexDelta;
-		if (node.nodes.length < this.nodeCapacity) {  // no split needed
-			apply(this.store, node, [partitions$, splitIndex, 0, [split.key]]);
-			apply(this.store, node, [nodes$, splitIndex + 1, 0, [split.right.header.id]]);
+		const { index: childIndex, node } = pathBranch;
+		pathBranch.index += overflow.pathRun;
+		const keys = overflow.rights.map(right => right.key);
+		const ids = overflow.rights.map(right => right.node.header.id);
+		const partitions = node.partitions.slice();	// the branch as it would stand with the children absorbed
+		partitions.splice(childIndex, 0, ...keys);
+		const nodes = node.nodes.slice();
+		nodes.splice(childIndex + 1, 0, ...ids);
+		const runs = this.branchRuns(node, partitions, nodes, pathBranch.index);
+		if (runs === undefined) {
+			this.insertChildren(node, childIndex, keys, ids);
 			return undefined;
 		}
-		// Full. Split needed
-
-		const midIndex = (node.nodes.length + 1) >>> 1;
-		const newPartitions = node.partitions.slice(midIndex);
-		const newNodes = node.nodes.slice(midIndex);
-		const delta = pathBranch.index < midIndex ? 0 : 1;
-
-		// New node
-		if (delta) {	// If split is on new, add it before the split to avoid logging an insert
-			pathBranch.index -= midIndex;
-			newPartitions.splice(pathBranch.index, 0, split.key);
-			newNodes.splice(pathBranch.index + 1, 0, split.right.header.id);
+		const rights = runs.slice(1, -1).map((from, i) => {
+			const to = runs[i + 2]!;
+			const branch = newBranchNode(this.store, partitions.slice(from, to - 1), nodes.slice(from, to));
+			this.store.insert(branch);
+			return { key: partitions[from - 1]!, node: branch };
+		});
+		// This branch keeps the children before `end` and the keys between them. Of the new children,
+		// those that fall before `end` land here: cut the tail off the branch as it stands, then insert them.
+		const end = runs[1]!;
+		const landed = Math.min(Math.max(end - (childIndex + 1), 0), ids.length);
+		this.cutTail(node, partitions$, node.partitions.length, end - 1 - landed);
+		this.cutTail(node, nodes$, node.nodes.length, end - landed);
+		if (landed > 0) {
+			this.insertChildren(node, childIndex, keys.slice(0, landed), ids.slice(0, landed));
 		}
-		const newBranch = newBranchNode(this.store, newPartitions, newNodes);
-		this.store.insert(newBranch);
-
-		// Delete partitions and nodes
-		const newPartition = node.partitions[midIndex - 1]!;
-		apply(this.store, node, [partitions$, midIndex - 1, newPartitions.length + 1, []]);
-		apply(this.store, node, [nodes$, midIndex, newNodes.length, []]);
-
-		if (pathBranch.index < midIndex) {	// Insert into old node
-			apply(this.store, node, [partitions$, splitIndex, 0, [split.key]]);
-			apply(this.store, node, [nodes$, splitIndex + 1, 0, [split.right.header.id]]);
+		const pathRun = runOf(runs, pathBranch.index);
+		if (pathRun > 0) {
+			pathBranch.node = rights[pathRun - 1]!.node as BranchNode<TKey>;
+			pathBranch.index -= runs[pathRun]!;
 		}
-
-		return new Split<TKey>(newPartition, newBranch, delta);
+		return { rights, pathRun };
 	}
 
+	/** How a branch's children — `partitions` and `nodes` as the branch would stand with new children
+	 *  absorbed, the path following child `at` — divide into branches, or `undefined` when they fit one;
+	 *  the counterpart of {@link leafRuns}. A branch's bytes are its keys and child ids, so only large
+	 *  keys ever make bytes the reason, and a branch of two children (one key) always counts as fitting:
+	 *  nothing smaller routes. */
+	private branchRuns(branch: BranchNode<TKey>, partitions: readonly TKey[], nodes: readonly BlockId[], at: number): number[] | undefined {
+		const bytes = this.nodeTargetBytes !== undefined && nodes.length > 2
+			? branchItemBytes(branch, partitions, nodes, this.nodeTargetBytes)
+			: undefined;
+		return divideItems(nodes.length, this.nodeCapacity, at, 2, bytes);
+	}
+
+	/** After a delete, fill the path's leaf back up when it is under-full ({@link leafUnderfull}):
+	 *  borrow one entry from a sibling with more than half the count, else merge with a sibling. With
+	 *  a byte target a borrow or merge that would take a leaf past it is refused, so a leaf of a few
+	 *  large entries can stay under half the count for good; see "Node size" in `docs/btree.md`.
+	 *
+	 *  NOTE: a leaf that is under-full by both measures and whose siblings refuse it by bytes reads
+	 *  both siblings on every delete from it and writes nothing — one delete of its last entry ends
+	 *  that, since an empty leaf always merges. If such reads ever show up, remember the refusal on
+	 *  the path for the rest of the action. */
 	protected async rebalanceLeaf(path: Path<TKey, TEntry>, depth: number): Promise<ITreeNode | undefined> {
-		if (depth === 0 || path.leafNode.entries.length >= (this.nodeCapacity >>> 1)) {
+		if (depth === 0) {
 			return undefined;
 		}
-
 		const leaf = path.leafNode;
+		const fill = this.measure(leaf);
+		if (!this.leafUnderfull(leaf, fill)) {
+			return undefined;
+		}
 		const parent = path.branches.at(depth - 1)!;
 		const pIndex = parent.index;
 		const pNode = parent.node;
 
 		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as LeafNode<TEntry> : undefined;
-		if (rightSib && rightSib.entries.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from right sibling
+		if (rightSib && rightSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, fill, rightSib.entries[0]!)) {   // Attempt to borrow from right sibling
 			const entry = rightSib.entries[0]!;
 			apply(this.store, rightSib, [entries$, 0, 1, []]);
 			apply(this.store, leaf, [entries$, leaf.entries.length, 0, [entry]]);
@@ -711,7 +873,7 @@ export class BTree<TKey, TEntry> {
 
 		const leftSibId = pNode.nodes[pIndex - 1];
 		const leftSib = leftSibId ? (await get(this.store, leftSibId)) as LeafNode<TEntry> : undefined;
-		if (leftSib && leftSib.entries.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from left sibling
+		if (leftSib && leftSib.entries.length > (this.nodeCapacity >>> 1) && this.leafTakes(leaf, fill, leftSib.entries[leftSib.entries.length - 1]!)) {   // Attempt to borrow from left sibling
 			const entry = leftSib.entries[leftSib.entries.length - 1]!;
 			apply(this.store, leftSib, [entries$, leftSib.entries.length - 1, 1, []]);
 			apply(this.store, leaf, [entries$, 0, 0, [entry]]);
@@ -720,7 +882,7 @@ export class BTree<TKey, TEntry> {
 			return undefined;
 		}
 
-		if (rightSib && rightSib.entries.length + leaf.entries.length <= this.nodeCapacity) {  // Attempt to merge right sibling into leaf (right sib deleted)
+		if (rightSib && this.leavesMerge(leaf, fill, rightSib)) {  // Attempt to merge right sibling into leaf (right sib deleted)
 			apply(this.store, leaf, [entries$, leaf.entries.length, 0, rightSib.entries]);
 			this.deletePartition(pNode, pIndex);
 			if (pIndex === 0) { // 0th node of parent, update parent key
@@ -730,7 +892,7 @@ export class BTree<TKey, TEntry> {
 			return await this.rebalanceBranch(path, depth - 1);
 		}
 
-		if (leftSib && leftSib.entries.length + leaf.entries.length <= this.nodeCapacity) {  // Attempt to merge into left sibling (leaf deleted)
+		if (leftSib && this.leavesMerge(leaf, fill, leftSib)) {  // Attempt to merge into left sibling (leaf deleted)
 			// NOTE: this fixes leafIndex, but the parent-branch index up the path is left pointing at
 			// the now-deleted leaf's old slot (same tolerated-staleness class as rebalanceBranch's
 			// left-merge, part c). Harmless today because deleteAt version-bumps and abandons the
@@ -745,6 +907,10 @@ export class BTree<TKey, TEntry> {
 		}
 	}
 
+	/** The branch counterpart of {@link rebalanceLeaf}, with the same rules: a branch under-full by
+	 *  count and (with a byte target) by bytes borrows a child from a sibling with more than half the
+	 *  count, else merges with a sibling, and neither may take a branch past the byte target. The key
+	 *  that separates the two in the parent comes down with the borrowed child or the merge. */
 	protected async rebalanceBranch(path: Path<TKey, TEntry>, depth: number): Promise<ITreeNode | undefined> {
 		const pathBranch = path.branches[depth]!;
 		const branch = pathBranch.node;
@@ -752,7 +918,11 @@ export class BTree<TKey, TEntry> {
 			return path.branches[depth + 1]?.node ?? path.leafNode;
 		}
 
-		if (depth === 0 || (branch.nodes.length >= this.nodeCapacity >>> 1)) {
+		if (depth === 0) {
+			return undefined;
+		}
+		const fill = this.measure(branch);
+		if (!this.branchUnderfull(branch, fill)) {
 			return undefined;
 		}
 
@@ -762,7 +932,7 @@ export class BTree<TKey, TEntry> {
 
 		const rightSibId = pNode.nodes[pIndex + 1];
 		const rightSib = rightSibId ? (await get(this.store, rightSibId)) as BranchNode<TKey> : undefined;
-		if (rightSib && rightSib.nodes.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from right sibling
+		if (rightSib && rightSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(fill, pNode.partitions[pIndex]!, rightSib.nodes[0]!)) {   // Attempt to borrow from right sibling
 			const node = rightSib.nodes[0]!;
 			const rightKey = rightSib.partitions[0]!;
 			this.insertPartition(branch, branch.partitions.length, pNode.partitions[pIndex]!, node);
@@ -773,7 +943,7 @@ export class BTree<TKey, TEntry> {
 
 		const leftSibId = pNode.nodes[pIndex - 1];
 		const leftSib = leftSibId ? (await get(this.store, leftSibId)) as BranchNode<TKey> : undefined;
-		if (leftSib && leftSib.nodes.length > (this.nodeCapacity >>> 1)) {   // Attempt to borrow from left sibling
+		if (leftSib && leftSib.nodes.length > (this.nodeCapacity >>> 1) && this.branchTakes(fill, pNode.partitions[pIndex - 1]!, leftSib.nodes[leftSib.nodes.length - 1]!)) {   // Attempt to borrow from left sibling
 			const node = leftSib.nodes[leftSib.nodes.length - 1]!;
 			const pKey = leftSib.partitions[leftSib.partitions.length - 1]!;
 			this.insertPartition(branch, 0, pNode.partitions[pIndex - 1]!, node, 0);
@@ -783,7 +953,7 @@ export class BTree<TKey, TEntry> {
 			return undefined;
 		}
 
-		if (rightSib && rightSib.nodes.length + branch.nodes.length <= this.nodeCapacity) {   // Attempt to merge right sibling into self
+		if (rightSib && this.branchesMerge(branch, fill, rightSib, pNode.partitions[pIndex]!)) {   // Attempt to merge right sibling into self
 			const pKey = pNode.partitions[pIndex]!;
 			this.deletePartition(pNode, pIndex);
 			apply(this.store, branch, [partitions$, branch.partitions.length, 0, [pKey]]);
@@ -793,7 +963,7 @@ export class BTree<TKey, TEntry> {
 			return this.rebalanceBranch(path, depth - 1);
 		}
 
-		if (leftSib && leftSib.nodes.length + branch.nodes.length <= this.nodeCapacity) {   // Attempt to merge self into left sibling
+		if (leftSib && this.branchesMerge(branch, fill, leftSib, pNode.partitions[pIndex - 1]!)) {   // Attempt to merge self into left sibling
 			const leftLen = leftSib.nodes.length;	// capture BEFORE the appends below shift it (see leaf path at rebalanceLeaf)
 			const pKey = pNode.partitions[pIndex - 1]!;
 			this.deletePartition(pNode, pIndex - 1);
@@ -819,6 +989,22 @@ export class BTree<TKey, TEntry> {
 	protected insertPartition(branch: BranchNode<TKey>, index: number, key: TKey, node: BlockId, nodeOffset = 1) {
 		apply(this.store, branch, [partitions$, index, 0, [key]]);
 		apply(this.store, branch, [nodes$, index + nodeOffset, 0, [node]]);
+	}
+
+	/** Insert children after the child at `index`, each under its key: `keys` go in at `index` and
+	 *  `nodes` at `index + 1`, one operation each. */
+	private insertChildren(branch: BranchNode<TKey>, index: number, keys: readonly TKey[], nodes: readonly BlockId[]) {
+		apply(this.store, branch, [partitions$, index, 0, keys.slice()]);
+		apply(this.store, branch, [nodes$, index + 1, 0, nodes.slice()]);
+	}
+
+	/** Drop the items of `node`'s `entity` array (now `length` long) from `keep` on. Nothing is
+	 *  recorded when there is nothing to drop: a zero-length splice would still mark the block updated
+	 *  and have it written again. */
+	private cutTail(node: ITreeNode, entity: string, length: number, keep: number) {
+		if (length > keep) {
+			apply(this.store, node, [entity, keep, length - keep, []]);
+		}
 	}
 
 	protected deletePartition(branch: BranchNode<TKey>, index: number, nodeOffset = 1) {
@@ -848,18 +1034,83 @@ export class BTree<TKey, TEntry> {
 		return path.leafNode.entries[path.leafIndex]!;
 	}
 
-	protected updateEntry(path: Path<TKey, TEntry>, entry: TEntry) {
-		apply(this.store, path.leafNode, [entries$, path.leafIndex, 1, [entry]]);
+	/** Replace the entry at the path in place. A larger entry can take the leaf past the byte target
+	 *  with no insert, so this goes through the same split an insert does ({@link leafEdit}); the path
+	 *  follows the entry when it moves to a new leaf. */
+	protected async updateEntry(path: Path<TKey, TEntry>, entry: TEntry) {
+		await this.applyLeafEdit(path, { index: path.leafIndex, deleteCount: 1, entry });
+	}
+
+	// The fill rules a delete rebalances by. The node being rebalanced is serialized once, into a
+	// `NodeFill`, and each sibling it weighs once; none of this runs without a byte target.
+
+	/** A node's bytes against the byte target, or `undefined` when the tree has none. */
+	private measure(node: ITreeNode): NodeFill | undefined {
+		return this.nodeTargetBytes === undefined ? undefined : { bytes: jsonEncodedBytes(node), target: this.nodeTargetBytes };
+	}
+
+	/** A leaf below half the count AND, with a byte target, below half the target — one that a borrow
+	 *  or merge could usefully fill. A leaf of a few large entries is under half the count for good but
+	 *  is a healthy block, so it is left alone and a delete from it reads no sibling. */
+	private leafUnderfull(leaf: LeafNode<TEntry>, fill: NodeFill | undefined): boolean {
+		return leaf.entries.length < (this.nodeCapacity >>> 1) && (fill === undefined || fill.bytes < fill.target / 2);
+	}
+
+	/** Whether `leaf` may take one more `entry` from a sibling without passing the byte target. */
+	private leafTakes(leaf: LeafNode<TEntry>, fill: NodeFill | undefined, entry: TEntry): boolean {
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(entry) + (leaf.entries.length > 0 ? 1 : 0) <= fill.target;
+	}
+
+	/** Whether `leaf` and a sibling may become one: within the count, and within the byte target unless
+	 *  one of them is empty — removing an empty leaf adds nothing to the other, so that is never refused
+	 *  and no empty leaf outlives the delete that emptied it. Whichever of the two survives, the merged
+	 *  leaf is one fixed part plus both sets of entries and the comma that joins them. */
+	private leavesMerge(leaf: LeafNode<TEntry>, fill: NodeFill | undefined, sibling: LeafNode<TEntry>): boolean {
+		if (leaf.entries.length + sibling.entries.length > this.nodeCapacity) {
+			return false;
+		}
+		if (fill === undefined || leaf.entries.length === 0 || sibling.entries.length === 0) {
+			return true;
+		}
+		return fill.bytes + jsonEncodedBytes(sibling) - emptyLeafBytes(sibling) + 1 <= fill.target;
+	}
+
+	/** {@link leafUnderfull} for a branch, by its children. */
+	private branchUnderfull(branch: BranchNode<TKey>, fill: NodeFill | undefined): boolean {
+		return branch.nodes.length < (this.nodeCapacity >>> 1) && (fill === undefined || fill.bytes < fill.target / 2);
+	}
+
+	/** Whether the measured branch may take one more child, `node`, under `key` — the parent's key
+	 *  that comes down with it — without passing the byte target: the key and the id, a comma before each. */
+	private branchTakes(fill: NodeFill | undefined, key: TKey, node: BlockId): boolean {
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(key) + jsonEncodedBytes(node) + 2 <= fill.target;
+	}
+
+	/** Whether `branch` and a sibling may become one under `key`, the parent's key between them: within
+	 *  the count and, with a byte target, within it — the sibling's keys and ids, the key that comes down,
+	 *  and the three commas that join them (one before the key, one before each of the two lists). A
+	 *  branch is never empty, so there is no exemption. */
+	private branchesMerge(branch: BranchNode<TKey>, fill: NodeFill | undefined, sibling: BranchNode<TKey>, key: TKey): boolean {
+		if (branch.nodes.length + sibling.nodes.length > this.nodeCapacity) {
+			return false;
+		}
+		return fill === undefined
+			|| fill.bytes + jsonEncodedBytes(sibling) - emptyBranchBytes(sibling) + jsonEncodedBytes(key) + 3 <= fill.target;
 	}
 }
 
-class Split<TKey> {
-	constructor(
-		public key: TKey,
-		public right: ITreeNode,
-		public indexDelta: number
-	) { }
-}
+/** A node's bytes weighed against the tree's byte target, measured once per rebalance. */
+type NodeFill = { bytes: number; target: number };
+
+/** Where a range scan starts, and the key past which it stops. */
+type RangeBounds<TKey, TEntry> = { start: Path<TKey, TEntry>; endKey: TKey };
+
+/** What a node that divided hands its parent: the nodes now to its right, each under the lowest key
+ *  beneath it, and which of the resulting nodes the path's entry is in — 0 for the node that divided,
+ *  1 for the first to its right, and so on. */
+type Overflow<TKey> = { rights: { key: TKey; node: ITreeNode }[]; pathRun: number };
 
 function newLeafNode<TEntry>(store: BlockStore<ITreeNode>, entries: TEntry[]): LeafNode<TEntry> {
 	const header = store.createBlockHeader(TreeLeafBlockType);
@@ -870,3 +1121,4 @@ function newBranchNode<TKey>(store: BlockStore<ITreeNode>, partitions: TKey[], n
 	const header = store.createBlockHeader(TreeBranchBlockType);
 	return { header, partitions, nodes };
 }
+

@@ -5,6 +5,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
 import type { PeerId, Libp2p, Connection, PendingDial } from '@libp2p/interface';
 import type { SerializedTable } from 'p2p-fret';
+import { hashKey, hashPeerId, lexLess, minDistance } from 'p2p-fret';
 import { waitFor } from '@optimystic/db-core/test';
 import {
 	Libp2pKeyPeerNetwork,
@@ -20,6 +21,7 @@ import {
 	type SelfCoordinationConfig
 } from '../src/libp2p-key-network.js';
 import type { IPeerReputation } from '../src/reputation/types.js';
+import { createNetworkMembershipGate, type IsNetworkMember } from '../src/network-membership-gate.js';
 import { captureLog, formatCaptured, hasTag } from './support/capture-log.js';
 
 const makePeerId = async (): Promise<PeerId> => {
@@ -67,6 +69,30 @@ function unreachedBootstrap(peerIds: string[] = ['unreached-bootstrap-peer']): B
 	};
 }
 
+/** A mock libp2p that can fire its own events, as a real one does. */
+type DispatchingLibp2p = Libp2p & {
+	/** Call every listener for `event` with `{ detail }`, the shape libp2p's `CustomEvent` carries. */
+	dispatch(event: string, detail: unknown): void;
+};
+
+/** What libp2p dispatches when `peerId`'s stored record changes (`PersistentPeerStore`'s `peer:update`). */
+const peerUpdated = (peerId: PeerId): unknown => ({ peer: { id: peerId } });
+
+/** The event half of a mock libp2p: listeners kept by event name, and a `dispatch` that fires them. */
+function mockEvents(): Pick<DispatchingLibp2p, 'addEventListener' | 'removeEventListener' | 'dispatch'> {
+	const listeners: Map<string, Set<Function>> = new Map();
+	return {
+		addEventListener: (event: string, handler: Function) => {
+			if (!listeners.has(event)) listeners.set(event, new Set());
+			listeners.get(event)!.add(handler);
+		},
+		removeEventListener: () => {},
+		dispatch: (event: string, detail: unknown) => {
+			for (const handler of listeners.get(event) ?? []) handler({ type: event, detail });
+		}
+	} as unknown as Pick<DispatchingLibp2p, 'addEventListener' | 'removeEventListener' | 'dispatch'>;
+}
+
 /** Minimal mock Libp2p that satisfies Libp2pKeyPeerNetwork's usage */
 function createMockLibp2p(peerId: PeerId, options?: {
 	connections?: Connection[];
@@ -74,23 +100,18 @@ function createMockLibp2p(peerId: PeerId, options?: {
 	peerStore?: any;
 	/** Dials libp2p is currently attempting; the futility test reads `queued`/`active` entries. */
 	dialQueue?: PendingDial[];
-}): Libp2p {
-	const listeners: Map<string, Set<Function>> = new Map();
+}): DispatchingLibp2p {
 	return {
 		peerId,
 		getConnections: () => options?.connections ?? [],
 		getDialQueue: () => options?.dialQueue ?? [],
 		getMultiaddrs: () => [],
-		addEventListener: (event: string, handler: Function) => {
-			if (!listeners.has(event)) listeners.set(event, new Set());
-			listeners.get(event)!.add(handler);
-		},
-		removeEventListener: () => {},
+		...mockEvents(),
 		...(options?.peerStore ? { peerStore: options.peerStore } : {}),
 		services: {
 			fret: options?.fret
 		}
-	} as unknown as Libp2p;
+	} as unknown as DispatchingLibp2p;
 }
 
 /** In-memory persistence implementation for testing */
@@ -818,7 +839,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 	// self-coordination guard refuses. That refusal used to fail the whole lookup with
 	// SELF_COORDINATION_BLOCKED — which bought no safety, because the SAME node with the SAME
 	// information self-coordinates freely once the clock passes gracePeriodMs (and a self-only
-	// cohort commits under allowClusterDownsize, the default). A grace-period denial is now
+	// cohort always commits alone, whatever allowClusterDownsize says). A grace-period denial is now
 	// DEFERRABLE: the last-resort tier degrades to self with a warning instead of throwing,
 	// and a READ skips the retry loop entirely since answering from our own replica is what an
 	// isolated node must accept anyway. Only a HARD denial — an explicit `disabled` switch, or
@@ -1151,15 +1172,22 @@ describe('Libp2pKeyPeerNetwork', () => {
 		 * A joining node and the one peer it was configured with. `world` is what a case moves: how
 		 * many dials or identify exchanges with the peer are in flight, what identify has answered,
 		 * whether the peer is connected, what its peerStore protocol list says, and whether FRET
-		 * holds it in the ring. `settle()` is one of those flights settling.
+		 * holds it in the ring. `settle()` is one of those flights settling. Setting `protocols` is a
+		 * write to the peer's stored record, so it dispatches `peer:update` as libp2p's store does.
 		 */
-		async function joiner(options?: { contactTimeoutMs?: number; restoredAsServing?: boolean }) {
+		async function joiner(options?: { contactTimeoutMs?: number; restoredAsServing?: boolean; isNetworkMember?: IsNetworkMember }) {
 			const partner = await makePeerId();
+			const events = mockEvents();
+			let protocols: string[] = [];
 			const world = {
 				inFlight: 1,
 				answer: undefined as 'identified' | 'foreign' | undefined,
 				connected: false,
-				protocols: [] as string[],
+				get protocols(): string[] { return protocols; },
+				set protocols(list: string[]) {
+					protocols = list;
+					events.dispatch('peer:update', peerUpdated(partner));
+				},
 				inRing: false
 			};
 			let waiters: Array<() => void> = [];
@@ -1187,8 +1215,7 @@ describe('Libp2pKeyPeerNetwork', () => {
 				getConnections: () => world.connected ? [outboundConnTo(partner)] : [],
 				getDialQueue: () => [],
 				getMultiaddrs: () => [],
-				addEventListener: () => {},
-				removeEventListener: () => {},
+				...events,
 				peerStore,
 				services: { fret }
 			} as unknown as Libp2p;
@@ -1210,7 +1237,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 					servingPeers: [partner.toString()]
 				})
 				: undefined;
-			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, bootstrap, persistence, undefined, PREFIX);
+			const membership = createNetworkMembershipGate(options?.isNetworkMember, selfPeerId.toString(), () => {});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, bootstrap, persistence, undefined, PREFIX, undefined, membership);
 			await network.initFromPersistedState();
 			const cohort = async (): Promise<string[]> => Object.keys(await network.findCluster(KEY));
 			return { network, partner, world, settle, cohort, assemblies: () => assemblies };
@@ -1293,6 +1321,31 @@ describe('Libp2pKeyPeerNetwork', () => {
 		it('does not await a peer whose serving verdict was restored from persisted state', async () => {
 			const { network } = await joiner({ restoredAsServing: true });
 			expect(await network.awaitingBootstrapContact()).to.equal(false);
+		});
+
+		it('awaits a bootstrap peer the membership predicate refuses while it serves this network, but not one that refused identify', async () => {
+			// A joiner whose predicate has not learned its inviter yet must not rule a block absent on
+			// the self-only view the refusal leaves it, or it founds a second copy (GitHub issue #27).
+			let admitted = false;
+			const { network, world } = await joiner({ isNetworkMember: () => admitted });
+			world.connected = true;
+			world.inFlight = 0;
+			world.answer = 'identified';
+			world.protocols = SERVES;
+			expect(await network.awaitingBootstrapContact(), 'serves, refused: not yet heard from').to.equal(true);
+			admitted = true;
+			expect(await network.awaitingBootstrapContact(), 'admitted: heard from').to.equal(false);
+
+			admitted = false;
+			world.answer = 'foreign';
+			expect(await network.awaitingBootstrapContact(), 'refused identify: not on this network, so heard from').to.equal(false);
+
+			// The remembered verdict is never refreshed for a refused peer, so it must not outrank identify's list.
+			const restored = await joiner({ restoredAsServing: true, isNetworkMember: () => false });
+			expect(await restored.network.awaitingBootstrapContact(), 'restored as serving, refused, not yet identified').to.equal(true);
+			restored.world.answer = 'identified';
+			restored.world.protocols = ['/other-network/cluster/1.0.0'];
+			expect(await restored.network.awaitingBootstrapContact(), 'identified as not serving: heard from').to.equal(false);
 		});
 	});
 
@@ -1594,10 +1647,10 @@ describe('Libp2pKeyPeerNetwork', () => {
 			});
 
 			it('dials when the peerStore read itself fails, rather than inventing a verdict', async () => {
-				// `getPeerStoreAddrsByPeer` swallows a failing `store.get` and reports the peer as
-				// holding nothing. That is deliberate fail-open — a datastore we cannot read is not
-				// evidence of a self-relay loop — but it also means a persistently broken peerStore
-				// makes this whole guard silently inert, so pin the direction the failure resolves in.
+				// A failing `store.get` is logged and the peer reported as holding nothing. That is
+				// deliberate fail-open — a datastore we cannot read is not evidence of a self-relay
+				// loop — but it also means a persistently broken peerStore makes this whole guard
+				// inert, so pin the direction the failure resolves in.
 				let dialed = false;
 				const otherPeerId = await makePeerId();
 				const libp2p = createLibp2pWithConnect({
@@ -2088,25 +2141,28 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 		it('findCoordinator selects a peer once it flips from unknown to serves within the retry window', async () => {
 			// The load-bearing claim of this design: an 'unknown' peer is NOT gambled on, but it
-			// is NOT permanently barred either — filterByMembership re-reads the peerStore on every
-			// retry attempt, so a genuine same-network peer that completes `identify` mid-loop flips
-			// to 'serves' and is selected on that attempt. Self is EXCLUDED here so the only way to
-			// return a non-error result is to select the flipped peer (proving the flip path, not
-			// self-coordination). The peerStore reports empty protocols on the first attempt's reads
-			// and the serving protocols thereafter; each attempt issues 2 reads (FRET path + connected
-			// fallback), so the >2 threshold lands the flip on attempt 1's first read.
+			// is NOT permanently barred either — a peer's record is re-read whenever libp2p reports
+			// it changed, so a genuine same-network peer that completes `identify` mid-loop flips
+			// to 'serves' and is selected on the next attempt. Self is EXCLUDED here so the only way
+			// to return a non-error result is to select the flipped peer (proving the flip path, not
+			// self-coordination). Identify lands as attempt 1 starts: the record changes and libp2p
+			// reports it, as its identify write does.
 			const flipPeer = await makePeerId();
-			let getCount = 0;
-			const fret = baseFret({ assembleCohort: () => [flipPeer.toString()] });
+			const record = { protocols: [] as string[] };
+			let assemblies = 0;
+			const fret = baseFret({
+				assembleCohort: () => {
+					if (++assemblies === 2) {
+						record.protocols = servesProto(PREFIX);
+						libp2p.dispatch('peer:update', peerUpdated(flipPeer));
+					}
+					return [flipPeer.toString()];
+				}
+			});
 			const peerStore: any = {
 				all: async () => [],
-				get: async (pid: { toString(): string }) => {
-					if (pid.toString() === flipPeer.toString()) {
-						getCount++;
-						return { protocols: getCount > 2 ? servesProto(PREFIX) : [], addresses: [] };
-					}
-					return { protocols: [], addresses: [] };
-				}
+				get: async (pid: { toString(): string }) =>
+					({ protocols: pid.toString() === flipPeer.toString() ? record.protocols : [], addresses: [] })
 			};
 			// HWM>1 so this is not the solo-bootstrap path; self excluded so it can't mask the flip.
 			const persistence = new MemoryPersistence({
@@ -2177,8 +2233,8 @@ describe('Libp2pKeyPeerNetwork', () => {
 			// An 'unknown' peer (empty peerStore protocol list) is indistinguishable between a
 			// permanently cross-network contaminant and a fresh same-network peer mid-identify.
 			// findCluster therefore never admits one on a viability floor: the cohort is self-only.
-			// A genuine fresh mesh is not starved — the write completes self-only under
-			// allowClusterDownsize (the default) and the peer is re-included as 'serves' on the
+			// A genuine fresh mesh is not starved — the write completes self-only (a lone cohort
+			// always commits alone) and the peer is re-included as 'serves' on the
 			// caller's retry once identify completes.
 			const freshA = await makePeerId();
 			const freshB = await makePeerId();
@@ -2268,6 +2324,48 @@ describe('Libp2pKeyPeerNetwork', () => {
 				.to.deep.equal([remote.toString(), selfPeerId.toString()]);
 		});
 
+		it('a peer refused by the membership predicate is never a cohort member or coordinator', async () => {
+			// O has opened a stream on this network's cluster protocol, which libp2p records in O's
+			// peerStore protocol list, and sits nearest the key in FRET's band.
+			const outsider = await makePeerId();
+			const member = await makePeerId();
+			const O = outsider.toString();
+			const KEY = routingKeyForBlock('control-block');
+			const fret = baseFret({ assembleCohort: () => [O, member.toString(), selfPeerId.toString()], importTable: async () => {} });
+			const peerStore = (outsiderProtocols: string[]): any => peerStoreOf({
+				[O]: { protocols: outsiderProtocols },
+				[member.toString()]: { protocols: servesProto(PREFIX) }
+			});
+			const connections = [outboundConnTo(outsider), outboundConnTo(member)];
+			const build = (isNetworkMember: IsNetworkMember | undefined, options?: { outsiderProtocols?: string[]; persistence?: NetworkStatePersistence }): Libp2pKeyPeerNetwork =>
+				new Libp2pKeyPeerNetwork(
+					createMockLibp2p(selfPeerId, { connections, fret, peerStore: peerStore(options?.outsiderProtocols ?? [`${PREFIX}/cluster/1.0.0`]) }),
+					2, undefined, undefined, options?.persistence, undefined, PREFIX, undefined,
+					createNetworkMembershipGate(isNetworkMember, selfPeerId.toString(), () => {}));
+
+			expect(Object.keys(await build(undefined).findCluster(KEY)), 'without a predicate the forged list admits O').to.include(O);
+
+			let refuseOutsider = false;
+			const network = build(id => !(refuseOutsider && id === O));
+			expect((await network.findCoordinator(KEY)).toString(), 'admitted, O is the nearest pick and is cached').to.equal(O);
+			refuseOutsider = true;
+			expect((await network.findCoordinator(KEY)).toString(), 'the cached pick is re-checked').to.equal(member.toString());
+			expect(Object.keys(await network.findCluster(KEY))).to.deep.equal([member.toString(), selfPeerId.toString()]);
+
+			const restored = build(id => id !== O, {
+				outsiderProtocols: [],
+				persistence: new MemoryPersistence({
+					version: PERSISTED_STATE_VERSION, networkHighWaterMark: 1, lastConnectedTimestamp: Date.now(),
+					consecutiveIsolatedSessions: 0, servingPeers: [O]
+				})
+			});
+			await restored.initFromPersistedState();
+			expect(Object.keys(await restored.findCluster(KEY)), 'a remembered serving verdict does not outrank a refusal').to.not.include(O);
+
+			const throwing = build(id => { if (id === O) throw new Error('membership store unavailable'); return true; });
+			expect(Object.keys(await throwing.findCluster(KEY)), 'a throwing predicate refuses').to.deep.equal([member.toString(), selfPeerId.toString()]);
+		});
+
 		it('with protocolPrefix ABSENT, findCluster retains a cross-network member (filter disabled — regression guard)', async () => {
 			const crossNet = await makePeerId();
 			const fret = baseFret({ assembleCohort: () => [crossNet.toString()] });
@@ -2289,6 +2387,115 @@ describe('Libp2pKeyPeerNetwork', () => {
 			const network = new Libp2pKeyPeerNetwork(libp2p, 16, undefined, undefined);
 			const result = await network.findCoordinator(routingKeyForBlock('k'));
 			expect(result.toString()).to.equal(peerA.toString());
+		});
+	});
+
+	// Every lookup classifies FRET's band by each member's peerStore record. The record is kept per
+	// peer and re-read only when libp2p reports it changed (GitHub #45, #40); everything decided from
+	// it — the membership predicate, the remembered verdicts, FRET's band — is still read per lookup.
+	describe('peerStore records are read once per change, not once per lookup', () => {
+		const PREFIX = '/optimystic/netA';
+		const SERVES = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const KEY = routingKeyForBlock('cached-record-key');
+
+		/**
+		 * A node whose band is self plus `peers`, every one serving this network. `stored` is each
+		 * peer's record as the peerStore holds it; `readsOf` counts `peerStore.get` per peer. With
+		 * `holdReadsOf` set, that peer's reads wait for `releaseHeld()` and then return the record as
+		 * it was when the read began, as a read queued ahead of a write does.
+		 */
+		async function nodeWithBand(peers: PeerId[], isNetworkMember?: IsNetworkMember) {
+			const band = [selfPeerId.toString(), ...peers.map(p => p.toString())];
+			const stored = new Map(peers.map(p => [p.toString(), SERVES]));
+			const reads = new Map<string, number>();
+			const held: Array<() => void> = [];
+			let holdReadsOf: string | undefined;
+			const peerStore = {
+				get: async (pid: PeerId) => {
+					const id = pid.toString();
+					reads.set(id, (reads.get(id) ?? 0) + 1);
+					const record = { protocols: stored.get(id) ?? [], addresses: [] };
+					if (id === holdReadsOf) await new Promise<void>(resolve => { held.push(resolve); });
+					return record;
+				}
+			};
+			const fret = {
+				assembleCohort: () => band,
+				getNetworkSizeEstimate: () => ({ size_estimate: band.length, confidence: 1 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { connections: peers.map(outboundConnTo), fret, peerStore });
+			const membership = createNetworkMembershipGate(isNetworkMember, selfPeerId.toString(), () => {});
+			const network = new Libp2pKeyPeerNetwork(libp2p, 4, undefined, undefined, undefined, undefined, PREFIX, undefined, membership);
+			return {
+				network, libp2p, band, stored,
+				readsOf: (p: PeerId) => reads.get(p.toString()) ?? 0,
+				totalReads: () => [...reads.values()].reduce((a, b) => a + b, 0),
+				holdReadsOf: (p: PeerId) => { holdReadsOf = p.toString(); },
+				releaseHeld: () => { holdReadsOf = undefined; for (const resolve of held.splice(0)) resolve(); },
+				cohort: async (key = KEY) => Object.keys(await network.findCluster(key))
+			};
+		}
+
+		it('a stable view reads each band member once, and a newly-banded peer once on first sight', async () => {
+			const [a, b, c] = [await makePeerId(), await makePeerId(), await makePeerId()];
+			const node = await nodeWithBand([a, b]);
+
+			await node.cohort();
+			expect(node.totalReads(), 'one read per non-self band member').to.equal(2);
+			for (let i = 0; i < 3; i++) {
+				expect((await node.network.findCoordinator(KEY, { intent: 'read' })).toString()).to.equal(selfPeerId.toString());
+			}
+			expect(await node.cohort(routingKeyForBlock('another-key-same-band'))).to.have.members([selfPeerId, a, b].map(String));
+			expect(node.totalReads(), 'repeated reads and lookups of other keys read nothing').to.equal(2);
+
+			node.band.push(c.toString());
+			node.stored.set(c.toString(), SERVES);
+			expect(await node.cohort()).to.include(c.toString());
+			expect(node.readsOf(c), 'the new band member is read on first sight').to.equal(1);
+			expect(node.totalReads(), 'and nobody else is read again').to.equal(3);
+		});
+
+		it('re-reads a peer libp2p reports changed, and classifies it by the new record', async () => {
+			const [a, b] = [await makePeerId(), await makePeerId()];
+			const node = await nodeWithBand([a, b]);
+			expect(await node.cohort()).to.include(a.toString());
+
+			node.stored.set(a.toString(), ['/optimystic/netB/cluster/1.0.0']);
+			node.libp2p.dispatch('peer:update', peerUpdated(a));
+			expect(await node.cohort(), 'A now serves another network').to.not.include(a.toString());
+			expect(node.readsOf(a), 'A read again once').to.equal(2);
+			expect(node.readsOf(b), 'B not read again').to.equal(1);
+		});
+
+		it('applies a membership predicate change on the next lookup with no read and no event', async () => {
+			const [a, b] = [await makePeerId(), await makePeerId()];
+			let refuseB = false;
+			const node = await nodeWithBand([a, b], id => !(refuseB && id === b.toString()));
+			expect(await node.cohort()).to.include(b.toString());
+
+			refuseB = true;
+			expect(await node.cohort(), 'refused on the next lookup').to.not.include(b.toString());
+			refuseB = false;
+			expect(await node.cohort(), 're-admitted on the next lookup').to.include(b.toString());
+			expect(node.totalReads(), 'the predicate is asked live; the records are not re-read').to.equal(2);
+		});
+
+		it('does not keep a read that was in flight when libp2p reported the peer changed', async () => {
+			const [a, b] = [await makePeerId(), await makePeerId()];
+			const node = await nodeWithBand([a, b]);
+			node.holdReadsOf(a);
+			const first = node.cohort();
+			await waitFor(() => node.readsOf(a) === 1, { description: 'the read of A has started' });
+
+			node.stored.set(a.toString(), ['/optimystic/netB/cluster/1.0.0']);
+			node.libp2p.dispatch('peer:update', peerUpdated(a));
+			node.releaseHeld();
+			expect(await first, 'the lookup in flight gets the answer it waited for').to.include(a.toString());
+
+			expect(await node.cohort(), 'the next lookup sees the change').to.not.include(a.toString());
+			expect(node.readsOf(a), 'because it read A again').to.equal(2);
 		});
 	});
 	// --- Self is in a block's cohort only when it is among the nearest ------------
@@ -2532,6 +2739,47 @@ describe('Libp2pKeyPeerNetwork', () => {
 				const network = new Libp2pKeyPeerNetwork(libp2p, 2, undefined, undefined, undefined, undefined, PREFIX);
 				await expectCode(() => network.findCoordinator(KEY, { excludedPeers: [selfPeerId] }), FIND_COORDINATOR_ERROR_CODES.SELF_COORDINATION_EXHAUSTED, 'self excluded');
 			});
+		});
+	});
+
+	describe('absentCohortMembers()', () => {
+		const PREFIX = '/optimystic/netA';
+		const servesProto = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const KEY = routingKeyForBlock('absent-members-key');
+
+		it('names a remembered serving peer that ranks inside the expected cohort, and not one that ranks outside it', async () => {
+			// Four fresh peers in ring-distance order from the key: the nearest and the farthest are
+			// remembered as serving but gone from the ring; the middle two are the live cohort.
+			const coord = await hashKey(KEY);
+			const placed = await Promise.all((await Promise.all([makePeerId(), makePeerId(), makePeerId(), makePeerId()]))
+				.map(async peer => ({ peer: peer.toString(), distance: minDistance(coord, await hashPeerId(peer)) })));
+			placed.sort((a, b) => lexLess(a.distance, b.distance) ? -1 : lexLess(b.distance, a.distance) ? 1 : 0);
+			const [near, live1, live2, far] = placed.map(p => p.peer) as [string, string, string, string];
+			const fret = {
+				assembleCohort: () => [live1, live2],
+				getNetworkSizeEstimate: () => ({ size_estimate: 4, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const peerStore = {
+				all: async () => [],
+				get: async (pid: { toString(): string }) => ({
+					protocols: [live1, live2].includes(pid.toString()) ? servesProto : [],
+					addresses: []
+				})
+			};
+			const persistence = new MemoryPersistence({
+				version: PERSISTED_STATE_VERSION,
+				networkHighWaterMark: 4,
+				lastConnectedTimestamp: Date.now(),
+				consecutiveIsolatedSessions: 0,
+				servingPeers: [near, far]
+			});
+			const network = new Libp2pKeyPeerNetwork(createMockLibp2p(selfPeerId, { fret, peerStore }), 2, undefined, undefined, persistence, undefined, PREFIX);
+			await network.initFromPersistedState();
+
+			expect(Object.keys(await network.findCluster(KEY)), 'the live cohort').to.have.members([live1, live2]);
+			expect(await network.absentCohortMembers(KEY)).to.deep.equal([near]);
 		});
 	});
 

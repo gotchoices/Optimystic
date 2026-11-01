@@ -86,13 +86,12 @@ const NO_MODULE_SCOPE_TEXT_DECODER = {
 // Browsers and React Native return a number from `setTimeout`/`setInterval`, so `.unref` is
 // `undefined` there and an unguarded call throws — a `ClusterMember` constructor doing exactly that
 // stopped every db-p2p node from starting off Node (GitHub issue #28). Every first-party `unref` goes
-// through `unrefTimer` in packages/db-p2p/src/unref-timer.ts. The guarded spelling is banned too, on
-// purpose: one site to read, one place to change. Timer `.ref()` has no first-party call site.
-// NOTE: the rule covers every package but the helper lives in db-p2p, which db-core cannot import;
-// if a package below db-p2p ever needs to unref a timer, move `unrefTimer` to db-core and re-export it.
+// through `unrefTimer` in packages/db-core/src/utility/unref-timer.ts (db-p2p re-exports it from
+// its own src/unref-timer.ts). The guarded spelling is banned too, on purpose: one site to read, one
+// place to change. Timer `.ref()` has no first-party call site.
 const NO_TIMER_UNREF = {
 	selector: "MemberExpression[property.name='unref']",
-	message: 'Timer handles are numbers in browsers and React Native, which have no `unref`. Call `unrefTimer` from packages/db-p2p/src/unref-timer.ts instead.',
+	message: 'Timer handles are numbers in browsers and React Native, which have no `unref`. Call `unrefTimer` from packages/db-core/src/utility/unref-timer.ts instead.',
 };
 
 // NOTE: this Hermes-global guard is deliberately not exhaustive. `TextDecoder` (beyond the
@@ -197,7 +196,7 @@ export default tseslint.config(
 	{
 		// The one sanctioned `.unref` site — the guarded helper every other timer goes through.
 		// Re-declares the full selector list minus NO_TIMER_UNREF (flat config replaces the whole rule config).
-		files: ['packages/db-p2p/src/unref-timer.ts'],
+		files: ['packages/db-core/src/utility/unref-timer.ts'],
 		rules: {
 			'no-restricted-syntax': ['error', NO_LIBP2P_COMPONENT_LOGGER, NO_DIRECT_DEBUG_IMPORT, NO_STATIC_BLOCK, NO_ABORT_SIGNAL_TIMEOUT, NO_ABORT_SIGNAL_ANY, NO_PROMISE_WITH_RESOLVERS, NO_DOM_EXCEPTION, NO_MODULE_SCOPE_TEXT_DECODER],
 		},

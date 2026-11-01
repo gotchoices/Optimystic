@@ -171,6 +171,24 @@ export interface RenewReplyV1 {
 }
 
 /**
+ * Several plain renewal pings to one cohort member, in one frame (`/renew-batch`). Each entry is a complete,
+ * individually signed {@link RenewV1}, byte-for-byte what a single ping sends. Only plain pings travel this
+ * way: an entry carrying `reattach` or `withdraw` makes the whole frame malformed, since those are judged per
+ * record by the member's freshness gate and keep going singly over `/register`.
+ */
+export interface RenewBatchV1 {
+	v: 1;
+	/** 1..`MAX_RENEW_BATCH_ENTRIES` plain pings. */
+	renews: RenewV1[];
+}
+
+/** The answer to a {@link RenewBatchV1}: one {@link RenewReplyV1} per entry, same length and order. */
+export interface RenewBatchReplyV1 {
+	v: 1;
+	replies: RenewReplyV1[];
+}
+
+/**
  * Child cohort → parent cohort link: "I am the tier-`d` cohort at {@link childCohortCoord}; record me as
  * your child." A freshly cold-started deeper forwarder sends this to its tier-`(d − 1)` parent (routed the
  * same way a participant register is, over `routeAndAct` to the parent coord) so the parent authenticates,
@@ -506,6 +524,8 @@ export type CohortMessageV1 =
 	| RegisterReplyV1
 	| RenewV1
 	| RenewReplyV1
+	| RenewBatchV1
+	| RenewBatchReplyV1
 	| ChildLinkV1
 	| ChildLinkReplyV1
 	| PromotionNoticeV1

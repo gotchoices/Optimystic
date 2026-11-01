@@ -4,6 +4,7 @@ import type { BlockMetadata } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -30,13 +31,19 @@ export class KvRawStorage implements IRawStorage {
 	 * for the same reason: it is set only when the driver reports a read cache at or below
 	 * itself, so `withReadCache` sees whether this composition is REALLY already cached
 	 * rather than inferring it from a concrete class name (see {@link IRawStorage.readCached}).
+	 * `close` likewise: only a driver with something to close gets one here.
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	getApproximateBytesUsed?: () => Promise<number>;
 	getStoreIdentity?: () => StoreIdentity;
 	readCached?: true;
+	close?: () => Promise<void>;
+
+	/** Copied from the driver once, at construction — a store's durability never changes over its life. */
+	readonly durability: StoreDurability;
 
 	constructor(private readonly driver: RawStoreDriver) {
+		this.durability = driver.durability;
 		if (driver.storeIdentity) {
 			this.getStoreIdentity = () => driver.storeIdentity!();
 		}
@@ -48,6 +55,9 @@ export class KvRawStorage implements IRawStorage {
 		}
 		if (driver.readCached) {
 			this.readCached = true;
+		}
+		if (driver.close) {
+			this.close = () => driver.close!();
 		}
 	}
 
@@ -163,5 +173,15 @@ export class KvRawStorage implements IRawStorage {
 
 	async promotePendingTransaction(blockId: BlockId, actionId: ActionId): Promise<void> {
 		await this.driver.promote(blockId, actionId);
+	}
+
+	// --- Flush (what a flush does is the driver's; see RawStoreDriver.flush for the contract) ---
+
+	flush(options?: FlushOptions): Promise<void> {
+		return this.driver.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.driver.whenDurable();
 	}
 }

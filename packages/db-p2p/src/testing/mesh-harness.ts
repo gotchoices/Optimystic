@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey } from '@optimystic/db-core';
+import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
@@ -8,17 +8,23 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair, generateKeyPairFromSeed } from '@libp2p/crypto/keys';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback, type DeriveExpectedClusterCallback, type ExpectedClusterView } from '../cluster/cluster-repo.js';
 import { createReconcileBlock } from '../cluster/reconcile-block.js';
+import { applyCarriedRecords, readCarriedOutcomes } from '../cluster/carried-records.js';
+import { createLogger } from '../logger.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
 import { StorageRepo } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
-import { BlockStorage } from '../storage/block-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
+import type { DurabilityWindowFor } from '../storage/durability-window.js';
 import type { BlockArchive } from '../storage/struct.js';
-import { serveBlockArchive, servableProof } from '../storage/block-archive.js';
-import { coordinatorRepo, type ClusterLatestCallback, type CertifiedActionRev } from '../repo/coordinator-repo.js';
+import { claimFromConsultAnswer, fitConsultContent, serveBlockArchive, serveConsultAnswer } from '../storage/block-archive.js';
+import type { SyncBlockAnswer } from '../sync/protocol.js';
+import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES } from '../protocol-limits.js';
+import type { ClusterLatestBatchCallback } from '../repo/consult-round.js';
+import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { stateHoldingsOnReads } from '../repo/stated-holdings.js';
+import { forwardedBatchMethods } from '../repo/request-batch.js';
 import { toString as u8ToString } from 'uint8arrays';
 
 export interface MeshNode {
@@ -63,6 +69,16 @@ export interface MeshOptions {
 	 * with a crashing proxy, or by restart tests to rebuild over preserved state.
 	 */
 	rawStorageFactory?: (index: number) => IRawStorage;
+	/**
+	 * How long a node's apply of a consensus record may let its storage sync wait, from the size of
+	 * the cohort the record ran on — the harness analogue of the `durabilityWindowFor` a real node
+	 * binds from `NodeOptions.storageDurability` (`durabilityWindowMs` in
+	 * `../storage/durability-window.ts`), handed to every member and coordinator here. Omitted →
+	 * every apply is strict, as every direct constructor's is. A power-loss spec whose node store is a
+	 * `WriteGroupDriver` over a `MemoryBatchBackend({ deferSync: true })` passes one so an apply can
+	 * be committed and then lost.
+	 */
+	durabilityWindowFor?: DurabilityWindowFor;
 	/**
 	 * Per-node member-side cluster derivation for the membership admission gate — the harness
 	 * analogue of `libp2p-node-base`'s `deriveExpectedCluster` (findCluster + FRET confidence).
@@ -122,6 +138,20 @@ export interface MeshOptions {
 	 * its own. Omitted → nothing is reported.
 	 */
 	onBlockHolders?: (node: MeshNode, holders: BlockHolders) => void;
+	/**
+	 * Spread over the resolved policy for every node's COORDINATOR only — the knobs a node's
+	 * composition root passes its coordinator that `clusterPolicy` has no field for, such as the
+	 * scheduled commit-retry timing (`commitBroadcastRetryInitialMs` and its siblings). Omitted → the
+	 * coordinator runs on the resolved policy alone.
+	 */
+	coordinatorConfig?: Partial<ClusterConsensusConfig>;
+	/**
+	 * Passed to every node's `StorageRepo` as `changeHoldMs` — how long a per-collection change event
+	 * is held while another collection of the same action is still pending on that node; `0` disables
+	 * the hold. Omitted → the production default. A spec that wants to observe the gap the hold closes
+	 * (a watcher woken for a table before its index landed) sets `0`.
+	 */
+	changeHoldMs?: number;
 }
 
 export interface MeshFailureConfig {
@@ -151,16 +181,35 @@ export interface MeshFailureConfig {
 	partitionSides?: Set<string>[];
 	/**
 	 * Observes every REMOTE cluster delivery — promise round, commit round, commit broadcast and
-	 * scheduled commit retry alike — with the target's peer-id string and the record as sent, BEFORE
-	 * `failingPeers` is consulted for that delivery. It exists so a spec can change reachability at an
-	 * exact protocol step rather than between whole transactions: a member that promised and then
-	 * dropped before voting to commit is set unreachable here, on the delivery that would have carried
-	 * its commit vote, and that very delivery fails.
+	 * scheduled commit retry alike — with the target's peer-id string, the record as sent, and the
+	 * decided records the request carries ahead of it (`ICluster.updateCarrying`; empty when it carries
+	 * none), BEFORE `failingPeers` is consulted for that delivery. It exists so a spec can change
+	 * reachability at an exact protocol step rather than between whole transactions: a member that
+	 * promised and then dropped before voting to commit is set unreachable here, on the delivery that
+	 * would have carried its commit vote, and that very delivery fails. Throwing fails the whole
+	 * request, carried records included.
 	 *
 	 * A coordinator's OWN member is invoked in process, never through this path — as in production,
 	 * where `ClusterCoordinator.updateMember` calls it directly — so the hook never sees it.
+	 *
+	 * May return a promise, which the delivery awaits before it proceeds: that is how a spec holds one
+	 * record's arrival at a member for as long as it needs — one collection's commit lagging another's
+	 * at that member, as a relayed link does — while every other delivery goes through at once.
 	 */
-	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord) => void;
+	onClusterDelivery?: (targetPeerId: string, record: ClusterRecord, carried: readonly ClusterRecord[]) => void | Promise<void>;
+	/**
+	 * A record carried to a member (see {@link onClusterDelivery}) that this answers true for is lost on
+	 * the way: the rest of the request arrives, and the member answers that one not delivered, so it stays
+	 * owed. A spec that makes a member miss one record entirely needs this beside `onClusterDelivery`,
+	 * since the coordinator carries a record it still owes on every later request to that member.
+	 */
+	dropCarried?: (targetPeerId: string, record: ClusterRecord) => boolean;
+	/**
+	 * Members that answer as a build predating carried records does: their answers lack
+	 * `MemberApplyOutcome.acceptsCarried`, and records carried to them are ignored (reported not
+	 * delivered). A coordinator then never carries records to them, nor defers a pend's delivery to them.
+	 */
+	carryUnawarePeers?: Set<string>;
 }
 
 class MockPeerNetwork implements IPeerNetwork {
@@ -266,9 +315,35 @@ export interface Mesh {
 	 * a retry the old process owed cannot quietly deliver after the restart and pass for healing.
 	 *
 	 * Reachability (`failures`) is untouched: a node that was unreachable stays unreachable.
+	 *
+	 * `options.rawStorage` replaces the storage the node is rebuilt over, for a power-loss spec: a
+	 * node whose store is a `WriteGroupDriver` over a `MemoryBatchBackend` keeps writes not yet
+	 * durable in the driver's overlay, so after the backend's `powerLoss()` the OLD driver still
+	 * serves them; the spec passes a fresh `new KvRawStorage(new WriteGroupDriver(backend))` here,
+	 * as the conformance reopen case opens a fresh driver, and later restarts reuse it.
 	 */
-	restart(node: MeshNode): void;
+	restart(node: MeshNode, options?: { rawStorage?: IRawStorage }): void;
+	/**
+	 * How many latest-revision consult requests `asker`'s coordinator has sent `target` — each one
+	 * `sync` request in production, whether it named one block or several. A node asking itself is
+	 * not a request (production reads its own storage) and is not counted. Counts survive a restart.
+	 */
+	consultRequests(asker: MeshNode, target: MeshNode): number;
 }
+
+/**
+ * One block's consult answer from `target`, read straight from its `StorageRepo`. Read under the
+ * asker's context first, as this harness always has: it lets the sibling promote a pending the context
+ * proves committed before it answers. Then answered by the SAME rule a real peer's sync service applies
+ * (`serveConsultAnswer`): the claim, its proof (through `servableProof`), and the block's bytes only
+ * when the sibling is ahead of `held`. A harness that answered by its own rule would let every
+ * mesh-tier test exercise a path real peers do not have.
+ */
+const consultAnswerOf = async (target: MeshNode, blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined): Promise<SyncBlockAnswer> => {
+	const result = await target.storageRepo.get({ blockIds: [blockId], context }, { skipClusterFetch: true } as any);
+	if (!result[blockId]?.state?.latest) return {};
+	return await serveConsultAnswer(target.storageRepo, blockId, held);
+};
 
 /**
  * One cohort peer's archive for a block, read straight from the sibling's `StorageRepo` — the mesh
@@ -354,6 +429,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// mesh ever holds something a timer keeps alive — a real socket, a file handle, a fake clock a
 	// spec advances — give `Mesh` a `dispose()` that walks the nodes, and make the specs use it.
 	const failures: MeshFailureConfig = {};
+	// The member side of the wire, which the harness stands in for, logs under this namespace.
+	const carriedLog = createLogger('cluster-service');
 
 	// NOTE: one policy for the whole mesh, so every node necessarily agrees on cluster size and
 	// thresholds. That is right for repair tests, where disagreement is not the variable. A test
@@ -383,6 +460,16 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	// member, consumed again by the coordinator, so it is stashed here keyed by peer id rather than
 	// widened onto the public `MeshNode` type.
 	const reconcileByPeer = new Map<string, ReconcileBlockCallback>();
+	/** Consult requests sent, by asker then target peer id — read through {@link Mesh.consultRequests}. */
+	const consultCounts = new Map<string, Map<string, number>>();
+	const countConsult = (asker: PeerId, target: PeerId): void => {
+		if (asker.equals(target)) return;
+		let byTarget = consultCounts.get(asker.toString());
+		if (!byTarget) consultCounts.set(asker.toString(), byTarget = new Map());
+		byTarget.set(target.toString(), (byTarget.get(target.toString()) ?? 0) + 1);
+	};
+	const consultRequests = (asker: MeshNode, target: MeshNode): number =>
+		consultCounts.get(asker.peerId.toString())?.get(target.peerId.toString()) ?? 0;
 	/** What outlives a node instance, by peer id: the raw storage it was built over, and its index
 	 *  (`validatorFactory` is invoked with it again on restart). */
 	const durableByPeer = new Map<string, { rawStorage: IRawStorage; index: number }>();
@@ -419,17 +506,27 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	 */
 	const makeNodeKeyNetwork = (selfPeerId: PeerId): IKeyNetwork => {
 		const selfStr = selfPeerId.toString();
+		const sideOfSelf = () => failures.partitionSides?.find(s => s.has(selfStr));
 		return {
 			findCoordinator: (key, opts) => keyNetwork.findCoordinator(key, opts),
 			async findCluster(key) {
 				const peers = await keyNetwork.findCluster(key);
-				const side = failures.partitionSides?.find(s => s.has(selfStr));
+				const side = sideOfSelf();
 				if (side) {
 					for (const id of Object.keys(peers)) {
 						if (!side.has(id)) delete peers[id];
 					}
 				}
 				return peers;
+			},
+			// The mesh's analogue of "remembered serving, missing from the view": the members of the
+			// unpartitioned cohort that this node's side filter removes, nearest first. `[]` with no
+			// partition, as on a real node that has never seen another serving peer go missing.
+			async absentCohortMembers(key) {
+				const side = sideOfSelf();
+				if (!side) return [];
+				const peers = await keyNetwork.findCluster(key);
+				return Object.keys(peers).filter(id => id !== selfStr && !side.has(id));
 			}
 		};
 	};
@@ -441,9 +538,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	const buildMember = (meshNode: MeshNode, lifetime: NodeLifetime): void => {
 		const { peerId, privateKey } = meshNode;
 		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
-		const storageRepo = new StorageRepo(
-			(blockId: BlockId) => new BlockStorage(blockId, rawStorage)
-		);
+		const storageRepo = new StorageRepo(rawStorage, options.changeHoldMs === undefined ? undefined : { changeHoldMs: options.changeHoldMs });
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
 		// reader holds a corroborated revision it cannot promote locally, pull the committed revision
@@ -495,7 +590,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// Absent by default: `undefined` here is identical to omitting the field, and
 			// `validatePendOperations` then skips the validation step entirely.
 			validator: options.validatorFactory?.(index, peerId),
-			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(meshNode, holders)),
+			// Production shape (`libp2p-node-base`): the member's consensus applies stamp its own node's
+			// read-repair window. Read at call time, so it reaches the coordinator built after this member,
+			// and after a restart the rebuilt one.
+			onCohortCommitApplied: (applied) => meshNode.coordinatorRepo.noteCohortCommitApplied(applied),
+			durabilityWindowFor: options.durabilityWindowFor
 		});
 	};
 
@@ -506,13 +606,38 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		if (!target) {
 			throw new Error(`Unknown peer: ${targetPeerId.toString()}`);
 		}
+		const targetStr = targetPeerId.toString();
+		// Awaits the spec's hook, so a delivery it holds arrives when it says and not before.
+		const reach = async (record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<void> => {
+			await failures.onClusterDelivery?.(targetStr, record, carried);
+			if (failures.failingPeers?.has(targetStr)) {
+				throw new Error(`Peer ${targetStr} is unreachable`);
+			}
+		};
+		const carryUnaware = (): boolean => failures.carryUnawarePeers?.has(targetStr) === true;
+		/** The member's answer, without its `acceptsCarried` stamp when it plays an older build. */
+		const answerFrom = async (record: ClusterRecord): Promise<ClusterRecord> => {
+			const answer = await target.clusterMember.update(record);
+			const own = answer.applyOutcomes?.[targetStr];
+			if (!carryUnaware() || own === undefined) return answer;
+			const { acceptsCarried: _stamp, ...unstamped } = own;
+			return { ...answer, applyOutcomes: { ...answer.applyOutcomes, [targetStr]: unstamped } };
+		};
 		return {
 			async update(record: ClusterRecord): Promise<ClusterRecord> {
-				failures.onClusterDelivery?.(targetPeerId.toString(), record);
-				if (failures.failingPeers?.has(targetPeerId.toString())) {
-					throw new Error(`Peer ${targetPeerId.toString()} is unreachable`);
-				}
-				return target.clusterMember.update(record);
+				await reach(record, []);
+				return await answerFrom(record);
+			},
+			// The member side runs the SAME loop `ClusterService` does, so carried records are applied
+			// ahead of the request's own record here exactly as over the wire. Mesh nodes are always
+			// members of the records they are sent and learn no addresses, so the loop's address and
+			// redirect steps have nothing to do. An older build ignores the carried records, which then
+			// read as not delivered.
+			async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]): Promise<{ answer: ClusterRecord; carried: CarriedOutcome[] }> {
+				await reach(record, carried);
+				const arriving = carryUnaware() ? [] : carried.filter(owed => failures.dropCarried?.(targetStr, owed) !== true);
+				const outcomes = await applyCarriedRecords(arriving, { cluster: target.clusterMember, selfId: targetStr, log: carriedLog });
+				return { answer: await answerFrom(record), carried: readCarriedOutcomes(carried, outcomes) };
 			}
 		};
 	};
@@ -530,30 +655,35 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// provide — masking exactly the defect that ticket `read-repair-cannot-transfer-block-content`
 		// existed to expose. Transfer now happens where it does in production: through
 		// `acquireBlockFromCohort` below, gated on a corroborated revision.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?): Promise<CertifiedActionRev | undefined> => {
+		/**
+		 * One request reaching `peerId`: counted, then refused when this node was restarted or the peer
+		 * is silent. Silence REJECTS, mirroring what a dial failure does to the production callbacks — the
+		 * coordinator must count it as "did not answer", never as an absent claim (a resolved `undefined`
+		 * remains the peer answering "I hold nothing").
+		 */
+		const reachConsulted = (peerId: PeerId): MeshNode | undefined => {
 			if (lifetime.stopped) throw stoppedError();
-			// Silence: the peer never answers. REJECTS, mirroring what a dial failure does to the
-			// production callback — the coordinator must count this as "did not answer", never as
-			// an absent claim (a resolved `undefined` remains the peer answering "I hold nothing").
+			countConsult(node.peerId, peerId);
 			if (failures.silentPeers?.has(peerId.toString())) {
 				throw new Error(`Peer ${peerId.toString()} is silent`);
 			}
-			const target = nodes.find(n => n.peerId.equals(peerId));
-			if (!target) return undefined;
-			const result = await target.storageRepo.get(
-				{ blockIds: [blockId], context },
-				{ skipClusterFetch: true } as any
-			);
-			const latest = result[blockId]?.state?.latest;
-			if (!latest) return undefined;
-			// The commit proof rides along exactly as it does in production, and through the SAME
-			// lookup `serveBlockArchive` uses (`servableProof`) rather than a hand-rolled one — a
-			// harness that attached proofs by its own rule would let every mesh-tier test exercise a
-			// certification path real peers do not have, or miss one they do. Production reads the
-			// proof out of the served archive; the harness reads the sibling's repo directly, so
-			// sharing the lookup is what keeps the two answers identical.
-			const proof = await servableProof(target.storageRepo, blockId, latest);
-			return proof ? { ...latest, proof } : latest;
+			return nodes.find(n => n.peerId.equals(peerId));
+		};
+		// Each answer is projected by the SAME function production's callbacks use (`claimFromConsultAnswer`):
+		// the claim, its proof, and the archive the acquisition then reuses.
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId: PeerId, blockId: BlockId, context?, held?): Promise<ClusterLatestAnswer | undefined> => {
+			const target = reachConsulted(peerId);
+			return target ? claimFromConsultAnswer(await consultAnswerOf(target, blockId, context, held)) : undefined;
+		};
+		// Serves each block as a real peer's sync service serves a batched consult, content budget included.
+		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks, context?) => {
+			const target = reachConsulted(peerId);
+			const served: Array<[BlockId, SyncBlockAnswer]> = [];
+			for (const { blockId, held } of asks) {
+				served.push([blockId, target ? await consultAnswerOf(target, blockId, context, held) : {}]);
+			}
+			const fitted = fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES);
+			return { answers: new Map(fitted.map(([blockId, answer]) => [blockId, claimFromConsultAnswer(answer)])) };
 		};
 		// The node's own (partition-aware) key-network view — the SAME instance the member's admission
 		// derivation reads, matching real Libp2pKeyPeerNetwork behavior.
@@ -569,6 +699,10 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 					async update(record: ClusterRecord): Promise<ClusterRecord> {
 						if (lifetime.stopped) throw stoppedError();
 						return await client.update(record);
+					},
+					async updateCarrying(record: ClusterRecord, carried: readonly ClusterRecord[]) {
+						if (lifetime.stopped) throw stoppedError();
+						return await client.updateCarrying!(record, carried);
 					}
 				};
 			},
@@ -578,17 +712,19 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// production `minAbsoluteClusterSize` (2, not the coordinator's own fallback of 3), and the
 			// `allowUnvalidatedSmallCluster` gate — ARMED (false) unless the mesh opted out at its call
 			// site.
-			{ ...policy }
+			{ ...policy, ...options.coordinatorConfig }
 		);
 		node.coordinatorRepo = factory({
 			storageRepo: node.storageRepo,
 			localCluster: node.clusterMember,
 			localPeerId: node.peerId,
 			clusterLatestCallback,
+			clusterLatestBatchCallback,
 			// The read path's transfer mechanism — the SAME instance the member uses on the commit
 			// path, mirroring how `libp2p-node-base` shares one `reconcileBlock` between both.
 			acquireBlockFromCohort: reconcileByPeer.get(node.peerId.toString())!,
-			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders))
+			onBlockHolders: options.onBlockHolders && ((holders) => options.onBlockHolders!(node, holders)),
+			durabilityWindowFor: options.durabilityWindowFor
 		});
 	};
 
@@ -623,10 +759,13 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		buildCoordinator(node, lifetimeByPeer.get(node.peerId.toString())!);
 	}
 
-	const restart = (node: MeshNode): void => {
+	const restart = (node: MeshNode, restartOptions: { rawStorage?: IRawStorage } = {}): void => {
 		const peerIdStr = node.peerId.toString();
 		if (!nodes.includes(node)) {
 			throw new Error(`restart: ${peerIdStr} is not a node of this mesh`);
+		}
+		if (restartOptions.rawStorage !== undefined) {
+			durableByPeer.set(peerIdStr, { ...durableByPeer.get(peerIdStr)!, rawStorage: restartOptions.rawStorage });
 		}
 		// NOTE: this severs the old instance's traffic to OTHER nodes, not its in-process path to its own
 		// member and storage repo, which still write the shared raw storage if called. After a restart
@@ -642,7 +781,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		buildCoordinator(node, lifetime);
 	};
 
-	return { nodes, failures, keyNetwork, restart };
+	return { nodes, failures, keyNetwork, restart, consultRequests };
 }
 
 /**
@@ -728,6 +867,23 @@ export interface BuildTransactorOptions {
 	 * therefore all of the production code after the injection — untouched.
 	 */
 	wrapRepo?: (repo: IRepo, node: MeshNode) => IRepo;
+	/**
+	 * Give each node's transactor its node's `storageRepo` as `localChangeNotifier`, as production gives
+	 * it `node.blockChangeNotifier`, so a subscription through the transactor
+	 * (`NetworkTransactor.onCollectionChange`) hears the commits that node's storage applies. Off by
+	 * default: the subscription is then an inert no-op, as it always was here. Only meaningful with
+	 * `buildNetworkTransactors`; a transactor that runs on no node has no storage to listen to.
+	 */
+	notifyLocalChanges?: boolean;
+	/**
+	 * A node's transactor answers a READ's `findCoordinator` (`intent: 'read'`) with its own node
+	 * whenever that node is in the key's cohort and not excluded, deferring to the mesh key network
+	 * otherwise — what `selfReadVerdict` does on a real node, so a spec can see what a machine reads
+	 * from its OWN replica. Off by default: reads then route by ring proximity, and a spec that relies
+	 * on a read reaching a particular remote coordinator keeps doing so. Only meaningful with
+	 * `buildNetworkTransactors`.
+	 */
+	selfFirstReads?: boolean;
 }
 
 /**
@@ -748,13 +904,13 @@ export const buildNetworkTransactor = (mesh: Mesh, options: BuildTransactorOptio
  * node is in a block's cohort and ties another member on coverage, it
  * coordinates the write itself. Reads and retries still route by proximity.
  *
- * NOTE: production differs for reads — a node in a block's cohort answers its own reads from its own
- * replica whenever its self-coordination guard allows (`selfReadVerdict` in
- * `Libp2pKeyPeerNetwork`), so mesh specs exercise the remote-coordinator read path for keys whose
- * nearest node is another member, and no mesh spec exercises the self-first path (the real-socket
- * `routing-key-convention-divergence.integration.spec.ts` does). If a mesh spec needs that path, give
- * each node's transactor a key network whose read picks `localNode` when it is in the key's cohort
- * and not excluded — expect specs that rely on reads reaching a particular coordinator to move.
+ * NOTE: production differs for reads by default — a node in a block's cohort answers its own reads
+ * from its own replica whenever its self-coordination guard allows (`selfReadVerdict` in
+ * `Libp2pKeyPeerNetwork`), while a mesh transactor routes reads by ring proximity, so most mesh specs
+ * exercise the remote-coordinator read path for keys whose nearest node is another member. A spec
+ * that needs a node to read its own replica opts in with `selfFirstReads`; it is not the default
+ * because specs that rely on a read reaching a particular coordinator would move. The real-socket
+ * `routing-key-convention-divergence.integration.spec.ts` exercises production's own path.
  */
 export const buildNetworkTransactors = (mesh: Mesh, options: BuildTransactorOptions = {}): Map<string, ITransactor> => {
 	const transactors = new Map<string, ITransactor>();
@@ -774,14 +930,40 @@ function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: 
 		abortOrCancelTimeoutMs: options.abortOrCancelTimeoutMs ?? 5_000,
 		// NOTE: every transactor, `localNode`'s included, reads the unpartitioned shared view, not `localNode.keyNetwork`;
 		// no spec drives `partitionSides` through a node's transactor today. If one does, pass the node's own view.
-		keyNetwork: mesh.keyNetwork,
+		keyNetwork: options.selfFirstReads && localNode ? selfFirstReadKeyNetwork(mesh.keyNetwork, localNode) : mesh.keyNetwork,
 		getRepo: (peerId: DbPeerId) => {
 			const repo = repoByPeer.get(peerId.toString());
 			if (!repo) throw new Error(`Unknown peer ${peerId.toString()}`);
 			return repo;
 		},
-		localPeerId: localNode?.peerId
+		localPeerId: localNode?.peerId,
+		// Resolved per call rather than bound to the repo instance: `Mesh.restart` gives a node a new one.
+		...(options.notifyLocalChanges && localNode ? { localChangeNotifier: changeNotifierOf(localNode) } : {})
 	});
+}
+
+/** `node`'s storage as an `IBlockChangeNotifier`, read at subscribe time so a restarted node's new repo is the one listened to. */
+function changeNotifierOf(node: MeshNode): IBlockChangeNotifier {
+	return { onCollectionChange: (collectionId, listener) => node.storageRepo.onCollectionChange(collectionId, listener) };
+}
+
+/**
+ * `shared` with reads answered by `self` whenever `self` is in the key's cohort and not excluded — the
+ * mesh stand-in for `selfReadVerdict` (see `BuildTransactorOptions.selfFirstReads`). Writes, and reads
+ * that excluded `self` or whose cohort leaves it out, go to `shared` unchanged.
+ */
+function selfFirstReadKeyNetwork(shared: IKeyNetwork, self: MeshNode): IKeyNetwork {
+	const selfStr = self.peerId.toString();
+	return {
+		async findCoordinator(key, options) {
+			const excluded = options?.excludedPeers?.some(peer => peer.toString() === selfStr) ?? false;
+			if (options?.intent === 'read' && !excluded && selfStr in await shared.findCluster(key)) {
+				return self.peerId;
+			}
+			return await shared.findCoordinator(key, options);
+		},
+		findCluster: key => shared.findCluster(key)
+	};
 }
 
 /**
@@ -793,12 +975,29 @@ function meshTransactor(mesh: Mesh, options: BuildTransactorOptions, localNode: 
  * reaching itself, get neither end, as in production.
  */
 function repoAsReachedBy(target: MeshNode, reader: MeshNode | undefined, wrapRepo: BuildTransactorOptions['wrapRepo']): IRepo {
-	const coordinator = target.coordinatorRepo as unknown as IRepo;
+	const coordinator = currentCoordinatorOf(target);
 	if (!reader || reader === target) return wrapRepo ? wrapRepo(coordinator, target) : coordinator;
 	const received = arrivingFrom(coordinator, reader.peerId.toString());
 	const sent = wrapRepo ? wrapRepo(received, target) : received;
 	// The reader's store is looked up per read: `Mesh.restart` gives a node a new one.
 	return stateHoldingsOnReads(sent, { heldRevisions: blockIds => reader.storageRepo.heldRevisions(blockIds) });
+}
+
+/**
+ * `node`'s coordinator as an `IRepo`, resolved on every call rather than bound to the instance:
+ * `Mesh.restart` gives the node a new coordinator, and a transactor built before the restart has to
+ * reach the new one — the old instance is inert, and its storage repo is the old store's.
+ */
+function currentCoordinatorOf(node: MeshNode): IRepo {
+	const current = (): IRepo => node.coordinatorRepo as unknown as IRepo;
+	return {
+		get: (blockGets, options) => current().get(blockGets, options),
+		pend: (request, options) => current().pend(request, options),
+		cancel: (actionRef, options) => current().cancel(actionRef, options),
+		commit: (request, options) => current().commit(request, options),
+		pendMany: (requests, options) => current().pendMany!(requests, options),
+		commitMany: (requests, options) => current().commitMany!(requests, options)
+	};
 }
 
 /** `repo` as `RepoService` hands it a read that arrived over a connection from `asker`. */
@@ -807,6 +1006,7 @@ function arrivingFrom(repo: IRepo, asker: string): IRepo {
 		get: (blockGets, options) => repo.get(blockGets, { ...options, asker }),
 		pend: (request, options) => repo.pend(request, options),
 		cancel: (actionRef, options) => repo.cancel(actionRef, options),
-		commit: (request, options) => repo.commit(request, options)
+		commit: (request, options) => repo.commit(request, options),
+		...forwardedBatchMethods(repo)
 	};
 }

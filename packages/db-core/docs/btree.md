@@ -62,6 +62,9 @@ for await (const path of tree.range(range)) {
   console.log(entry);
 }
 
+// Read a small range as one value: never throws for a concurrent change
+const entries = await tree.entriesIn(range);
+
 // Count entries in range
 const count = await tree.getCount({
   path: await tree.find(startKey),
@@ -169,9 +172,9 @@ apply(store, leafNode, [entries$, index, 1, []]);
 
 The tree automatically rebalances during insertions and deletions:
 
-- **Splits** - When nodes exceed capacity (64 entries)
-- **Merges** - When nodes fall below minimum capacity
-- **Borrowing** - Transfer entries between siblings
+- **Splits** - When a node would exceed its capacity (64 entries or children) or, under a byte target, its size (see [Node size](#node-size))
+- **Merges** - When nodes fall below minimum capacity, and the merged node stays within the byte target
+- **Borrowing** - Transfer entries between siblings, within the byte target
 - **Root changes** - Create new root during splits or collapse during merges
 
 ## Type Safety
@@ -235,16 +238,17 @@ The B-tree maintains these structural invariants at all times:
 | Property | Value | Notes |
 |----------|-------|-------|
 | Node capacity | 64 entries/children | `NodeCapacity` constant |
-| Minimum fill (non-root) | 32 entries/children | `NodeCapacity >>> 1` |
-| Split point | `(length + 1) >>> 1` | Midpoint of overfull node |
+| Node size target (optional) | `nodeTargetBytes` of JSON | `Tree` sets `BLOCK_TARGET_BYTES` (1 MiB); a node over it holds one entry (leaf) or two children (branch) |
+| Minimum fill (non-root) | 32 entries/children, or half the byte target | Under-full only when below both (`NodeCapacity >>> 1`, `nodeTargetBytes / 2`) |
+| Split point | `(length + 1) >>> 1` | Midpoint of overfull node when the count is the reason; by bytes otherwise (see [Node size](#node-size)) |
 | Data location | Leaf nodes only | B+-tree variant (no leaf linked list) |
 | Entry immutability | `Object.freeze()` on insert/upsert | Prevents mutation after storage |
 
 ### Rebalancing Rules
 
-- **Split**: triggered when a node reaches `NodeCapacity` during insert. Splits at `(entries.length + 1) >>> 1`, promoting the first key of the new right node into the parent branch.
-- **Borrow**: after a delete, if a sibling has more than `NodeCapacity >>> 1` entries, one entry is transferred.
-- **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity`, they are merged and the parent partition is removed. Merges cascade upward.
+- **Split**: triggered when an insert or an in-place update would take a node past `NodeCapacity`, or past the byte target. When the count is the reason it splits at `(entries.length + 1) >>> 1`, promoting the first key of the new right node into the parent branch; when bytes are, see [Node size](#node-size).
+- **Borrow**: after a delete, if a sibling has more than `NodeCapacity >>> 1` entries, one entry is transferred — unless it would take the receiving node past the byte target.
+- **Merge**: after a delete, if two siblings' combined entries fit within `NodeCapacity` and the byte target, they are merged and the parent partition is removed. Merges cascade upward. A merge that removes an empty leaf is never refused.
 - **Root collapse**: when the root branch has zero partitions (one child), that child becomes the new root.
 
 ### Atomic Mutations
@@ -255,7 +259,39 @@ Trees constructed directly via `new BTree()` do not get atomicity; this path is 
 
 ### Path Invalidation
 
-A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version.
+A monotonic `_version` counter tracks tree mutations. Paths capture the version at creation time; any subsequent mutation increments the version, making all outstanding paths invalid. Operations that accept a path (`at`, `deleteAt`, `updateAt`, `moveNext`, `movePrior`, `ascending`, `descending`) call `validatePath()` which throws on stale paths. Mutation operations (`insert`, `upsert`, `deleteAt`, `updateAt`, `merge`) return a fresh path with the new version. A `Tree` also moves the counter for every change made beneath its read btree rather than through it (next section).
+
+### Reads under a concurrent change
+
+Reads are not latched, so a `Tree`'s collection can refresh, replay and commit on the same instance while a reader is part-way through a descent; the offline queue's drain does all three. Each block a descent reads is sound on its own, but two of them can describe different moments: a branch read before a replay rebuilt the staged nodes under fresh ids names a child that is gone (`Missing block`), and a branch read before a refresh adopted a rival's split points at a leaf that no longer holds the key, so a present key reads as absent. The tree learns of every such change through `_version`: `Tree` wires its collection's `onViewChanged` (`CollectionInitOptions` in `packages/db-core/src/collection/collection.ts`) to `invalidatePaths`, and the collection calls it in the same synchronous step as each change — a staged action landing in the tracker, a replay or a restore resetting it, a refresh adopting the log, a commit folded into the read cache.
+
+What a read does about it depends on whether it has handed anything back yet:
+
+- **A point read (`get`) never throws for a concurrent change.** It notes the version, descends, and returns the leaf's entry when the version did not move; otherwise it descends again. A throw from a descent while the version moved — a torn descent's `Missing block` — is retried as the change's symptom; with the version unmoved it propagates unchanged. The answer is the entry as the tree stood at some moment during the call.
+- **A range scan's setup does the same.** Finding where `range` starts and ends is repeated until it completes with nothing changing, so a scan that has yielded nothing never fails for a concurrent change.
+- **A range read as one value does the same.** `entriesIn(range)` collects every entry of the range and reads the whole range again when a change lands meanwhile, so it too answers as of some moment and never throws for a concurrent change. It suits a range small enough to hold in memory and cheap to read again; the Quereus plugin's unique-constraint probe reads its hit range this way.
+- **A scan that has yielded keeps its contract**: every step after a yield validates its path, so a change landing between a yield and the next step throws `Path is invalid due to mutation of the tree`.
+
+The retry is unbounded, because each one needs another change to land inside a descent of a few block reads and every source of change is finite work; the `NOTE:` at `readUnchanged` in `packages/db-core/src/btree/btree.ts` says what to do if a retry storm is ever seen. The guarantee reaches as far as changes that move `_version`: a `BTree` used on its own, over a store that something else mutates, sees only its own writes. A pinned read view (`Tree.readView`) reads a private tracker that nothing changes, and needs none of this.
+
+## Node size
+
+Every node is a block, and a block that outgrows what one message carries can never be copied to another machine (see [docs/internals.md §A transaction's size limit](../../../docs/internals.md#a-transactions-size-limit)). A node holds up to 64 entries however large they are, and nothing else would stop a table of large rows from building a leaf past that limit: each row is its own small transaction, so the per-transaction limit never sees the leaf grow. So a tree can also be given a byte target, `nodeTargetBytes` on the `BTree` constructor and `BTree.create` in `packages/db-core/src/btree/btree.ts`, measured like every block limit as the UTF-8 length of the node's JSON (`jsonEncodedBytes` in `packages/db-core/src/network/transaction-size.ts`). The tree collection sets it to `BLOCK_TARGET_BYTES` (1 MiB, `packages/db-core/src/network/block-size.ts`) on every B-tree it writes through: the tree an action is staged in, the one that creates a collection and the one that reopens it. A pinned read view (`Tree.readView` in `packages/db-core/src/collections/tree/tree.ts`) writes nothing and is given none. A bare `BTree` without one splits by count alone and never serializes a node to measure it.
+
+**Fit.** A node fits when it holds at most `NodeCapacity` items and either no more than the target's bytes or the least a node of its kind holds: one entry for a leaf, two children (one key) for a branch, since nothing smaller routes. So a node may exceed the target only while holding that minimum, and a leaf of one entry is never larger than the transaction that wrote the entry.
+
+**Division** (`divideItems` in `packages/db-core/src/btree/node-division.ts`, the pure arithmetic; `leafEdit` and `branchInsert` in `packages/db-core/src/btree/btree.ts` apply it). An insert, or an in-place update that grows an entry (`upsert`, `updateAt`, `merge`), is judged on the node as it would stand with the edit applied:
+
+- Over the count alone, the node splits in two at the midpoint, the odd item going to the half the edit lands in — the division the tree has always made, kept exactly so a tree of small entries writes the transforms it always did (64 entries of 16 KiB is 1 MiB, so for entries of that size and below the count still decides).
+- Over the bytes, the node divides into the fewest runs that each fit, and where two suffice into the two whose larger run is smallest. An entry larger than the target by itself is therefore left alone in a leaf of its own, with its neighbours within the target on either side, and a leaf that outgrew the target before this rule existed is brought within it by its next insert or update, in one write.
+- A parent absorbs all of a child's new nodes at once, each under the lowest key beneath it, and divides by the same rules if it cannot hold them. A branch's bytes are its keys and child ids, so only large keys ever make bytes the reason there.
+- A node that keeps every item it had (the new entry alone goes right, because nothing else fits beside it) is not written: no operation is recorded against a block the division leaves unchanged.
+
+The division is a pure function of the node's content and the edit, so a conflict replay or a retried attempt re-stages identical transforms.
+
+**Rebalance on delete.** A node is under-full only when it is below half the count *and* below half the byte target, so a leaf of a few large entries — under half the count for good — is a healthy block that no delete tries to fill, and a delete from it reads no sibling. A borrow is refused when the receiving node would pass the target, and a merge when the merged node would, so a merge the count allows can still be refused; the one exception is a merge that removes an empty leaf, which adds nothing to the other and is never refused, so no empty leaf outlives the delete that emptied it. A leaf that is under-full by both measures and refused by both siblings costs a delete from it two sibling reads and no write.
+
+**Cost.** One serialization of the node's entries per insert or in-place update, and one each of the rebalanced node and of the siblings it weighs per rebalance — the same order of cost as the commit path's digest of each touched block. The `NOTE:` at `leafRuns` in `packages/db-core/src/btree/btree.ts` names the remedy (a running byte count per leaf) if bulk inserts ever show it in a profile.
 
 ## Performance Characteristics
 
@@ -279,7 +315,7 @@ A monotonic `_version` counter tracks tree mutations. Paths capture the version 
 - **Branching factor 64** → tree height ≈ log₆₄(n). A tree with 1M entries is ~3 levels deep.
 - **Blocks loaded on demand** via the `BlockStore` abstraction; no full-tree materialization.
 - **Structured cloning** (`structuredClone`) used for block isolation — reads never alias stored data.
-- **Block size** depends on entry size; `ring-selector.ts` estimates ~100 KB typical.
+- **Block size** depends on entry size, bounded for a tree collection by `BLOCK_TARGET_BYTES` (see [Node size](#node-size)); `ring-selector.ts` estimates ~100 KB typical.
 
 ### Network Efficiency
 

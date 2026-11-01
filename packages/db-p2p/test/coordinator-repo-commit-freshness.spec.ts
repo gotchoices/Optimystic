@@ -130,6 +130,9 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 				undefined,
 				async () => undefined
 			);
+			// The specs count consults per window for a HELD block; in production the window's consult
+			// runs behind the read, so it waits here.
+			repo.awaitWindowConsults = true;
 			let clock = BASE_TIME;
 			repo.now = () => clock;
 			return { repo, setClock: (t: number) => { clock = t; } };
@@ -263,10 +266,13 @@ describe('CoordinatorRepo commit-side freshness (quorum-intersection gate)', () 
 				async getClusterSize(): Promise<number> { return Object.keys(cluster).length; },
 				async resolveCohort(): Promise<CohortResolution> { return { resolved: true, peerIds: Object.keys(cluster) }; },
 				async recoverTransactions(): Promise<void> { /* unused */ },
+				takeLatePendRefusals: () => ({}),
 				async executeClusterTransaction(): Promise<{ record: ClusterRecord, localExecuted: boolean, cohortCommitOutcomes: { [peerId: string]: CommitResult } }> {
 					return { record: opts.record, localExecuted: opts.localExecuted, cohortCommitOutcomes };
 				}
 			};
+			// Same reason as `makeSoloRepo`: a read after the commit must show its consult, or none, at once.
+			repo.awaitWindowConsults = true;
 			let clock = BASE_TIME;
 			repo.now = () => clock;
 			return { repo, callbackInvocations, setClock: (t: number) => { clock = t; } };

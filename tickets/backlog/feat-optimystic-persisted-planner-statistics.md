@@ -9,8 +9,10 @@ tradeoffs: The planner works correctly on default estimates today, and real stat
 ## Context
 
 `OptimysticModule.getBestAccessPlan` estimates query cost from
-`request.estimatedRows || 1000000` and a handful of hardcoded selectivity constants
-(0.1 per equality, 0.25 per range, etc.). There is no real per-table statistics source:
+`request.estimatedRows ?? 1000` (the catalog's `analyze` figure, else Quereus's memory-module
+default) and, for equality seeks, from the `analyze` per-column distinct counts when the catalog
+holds them, falling back to a flat 0.1 per equality tuple; ranges still take a fixed 0.25. Those
+`analyze` statistics live only in the process's catalog. There is no persisted statistics source:
 an earlier `StatisticsCollector` was inert (it only counted rows seen in the current
 process, was never persisted, and was never read back by the planner) and was removed
 in `optimystic-statistics-remove`.
@@ -90,3 +92,12 @@ make the partiality explicit.
   planned cost/rows for a subsequent query.
 - Multi-node — two nodes computing stats for the same collection must not corrupt each
   other's persisted stats.
+
+## Arm: someone has now complained — GitHub #44 (added 2026-10-24, plan pass of `joins-over-optimystic-tables-get-the-plans-memory-tables-get`)
+
+The `tradeoffs:` line above says no one has complained about the plans. GitHub #44 is that complaint: a filtered join over two small Optimystic tables ran as a per-row lookup loop, 10–30× slower than the same SQL on memory tables. The immediate cause was the un-analyzed fallback of 1,000,000 rows, which the implement ticket above replaces with the memory module's 1000; with `analyze`, the plan was already right.
+
+What that ticket does not fix, and what makes this one matter more than it looked: real application tables are planned on the fallback for their whole life. Quereus's `auto_analyze` refreshes a table only after `auto_analyze_min_mutations` (500 by default) rows changed *in the current process*, and statistics vanish on restart, so a phone app whose tables hold a few hundred rows written across many sessions never gets statistics at all. Rows another node wrote are never counted either. Two shapes that would close it, for whoever plans this:
+
+- **Persist what `analyze` collects** (`saveStatistics` on the vtab, read back at hydration), as this ticket already describes — covers tables someone analyzed once.
+- **Size the table itself** at plan time: Quereus lets a module substitute its own count into `request.estimatedRows` when the catalog has none (`@quereus/quereus/docs/module-authoring.md`, and `sizeRequestFromLiveCount` in `quereus-store`'s `store-module.ts` for a module that does). `getBestAccessPlan` is synchronous and `Tree.getCount` walks every leaf, so this needs a count cached on the table instance — taken at initialization, adjusted by local writes, refreshed by the pull every read already does. Covers never-analyzed tables, which is the #44 case.

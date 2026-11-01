@@ -65,6 +65,7 @@ interface IPeerNetwork {
 // Cluster repository operations
 interface IRepo {
   get / pend / commit / cancel operations
+  pendMany? / commitMany?   // a coordinator's: one action's collections as one consensus record
 }
 ```
 

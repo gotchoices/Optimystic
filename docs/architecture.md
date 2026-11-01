@@ -94,7 +94,7 @@ Block storage (see [repository.md](repository.md)) is versioned and reconstructi
 
 Built on the block layer (see `db-core` [documentation index](../packages/db-core/README.md#documentation)):
 
-* **Chains** — linked blocks used as stacks, queues, or logs (32 entries/block).
+* **Chains** — linked blocks used as stacks, queues, or logs (at most 32 entries per block; a log block also rolls over at 1 MiB of entries, so large entries never build a block too large to copy between machines).
 * **BTrees** — B+trees with path-based cursors, range queries, and automatic rebalancing.
 * **Logs** — SHA-256-hashed transaction logs built on chains; every entry carries the transaction ID, revision, affected blocks, and action payload.
 * **Collections** — high-level wrappers combining a data structure with a log:
@@ -162,7 +162,10 @@ and the conventions behind it are in `packages/db-p2p/docs/repo.md` § Protocol 
 These protocols are open to any peer that can connect. An embedder whose database is private can
 supply `createLibp2pNode({ authorizeInboundStream })` — one optional, fail-closed predicate consulted
 once per inbound stream on the `repo`, `cluster`, `sync` and `block-transfer` protocols, before any
-decoding or execution. See [internals](internals.md) § Inbound Stream Authorization.
+decoding or execution. See [internals](internals.md) § Inbound Stream Authorization. That gates
+who may send to this node; who this node chooses to hold and coordinate its writes is gated
+separately, by `createLibp2pNode({ isNetworkMember })` — see
+[internals § Network Membership Predicate](internals.md#network-membership-predicate).
 
 ```mermaid
 graph LR
@@ -304,7 +307,7 @@ Two applications are designed to run on the substrate:
 * **Reactivity** ([reactivity.md](reactivity.md)) — push-tree mode. Notifications about collection commits are designed to fan out through a tree rooted at the tail block's coordinate (rotating, to deny attackers a persistent target). Threshold signatures reuse the commit certificate; subscribers backfill from a replay buffer at the nearest forwarder. T3 (luxury) — never starves transaction processing.
 * **Matchmaking** ([matchmaking.md](matchmaking.md)) — directory mode. Providers and seekers register at a stable per-task topic; cohorts return advisory provider sets to seekers. Designed for cluster formation, task distribution, capability lookup, and voting-quorum assembly. T2 (functional).
 
-Both are built on a **single-node, in-process** change-notification primitive, which is also all the Quereus plugin uses today. The `IBlockChangeNotifier` interface (`packages/db-core/src/transactor/change-notifier.ts`) emits a `CollectionChangeEvent` when a commit's critical section completes on that node (`packages/db-p2p/src/storage/storage-repo.ts`); `network-transactor.ts` forwards it to an optional `localChangeNotifier` (else a logged no-op), and the Quereus plugin bridges that local signal into vtab reactivity. That signal only reaches listeners in the **same process** where the commit was applied. On a node built with `cohortTopic.enabled` the same signal is also where a network notification originates, and `node.reactivityWatch` is how an application on another machine is woken by it ([reactivity.md §The node's watch service](reactivity.md#the-nodes-watch-service)).
+Both are built on a **single-node, in-process** change-notification primitive, which is also all the Quereus plugin uses today. The `IBlockChangeNotifier` interface (`packages/db-core/src/transactor/change-notifier.ts`) emits a `CollectionChangeEvent` when a commit's critical section completes on that node (`packages/db-p2p/src/storage/storage-repo.ts`) — or, for a transaction spanning several collections, once every collection of it that the node is due to store has landed there ([internals.md §Change Notification](internals.md#change-notification-reactive-wake)); `network-transactor.ts` forwards it to an optional `localChangeNotifier` (else a logged no-op), and the Quereus plugin bridges that local signal into vtab reactivity. That signal only reaches listeners in the **same process** where the commit was applied. On a node built with `cohortTopic.enabled` the same signal is also where a network notification originates, and `node.reactivityWatch` is how an application on another machine is woken by it ([reactivity.md §The node's watch service](reactivity.md#the-nodes-watch-service)).
 
 ### Implementation / Doc Sync Status
 
@@ -367,6 +370,7 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 | [matchmaking.md](matchmaking.md) | Peer discovery and quorum assembly (cohort-topic directory application) |
 | [crdt-sync.md](crdt-sync.md) | Convergent replicated state sync underpinning partition recovery |
 | [partition-healing.md](partition-healing.md) | Partition-induced invariant reconciliation: two-tier intent/invariant rules, deterministic application-defined merge |
+| [offline-sync.md](offline-sync.md) | Offline mode (design; stages 1–3 implemented): SQL commits acknowledged once queued locally, optionally journaled, drained to the network in order with per-transaction status |
 | [correctness.md](correctness.md) | Formal safety and liveness properties |
 | [internals.md](internals.md) | Developer guide: data flow, invariants, pitfalls |
 | [debugging.md](debugging.md) | DEBUG namespaces and logging conventions |

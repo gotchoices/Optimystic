@@ -41,8 +41,8 @@ export interface BlockFloorCheck {
 
 	/** The same comparison {@link answeredBelowFloor} makes, without reporting it — for content that
 	 * is not an answer being served to a reader, where the `collection:block-below-floor` line would
-	 * misdescribe what happened. `Collection.keepWhatTheRefreshRead` weighs the header and log tail
-	 * its refresh read around `TransactorSource` this way.
+	 * misdescribe what happened. `Collection.keepLogEnds` weighs the header and log tail an open or a
+	 * refresh read around `TransactorSource` this way.
 	 *
 	 * @param servedRev the revision the content is.
 	 * @returns `true` when no floor applies or the content meets the one that does. */

@@ -1,9 +1,13 @@
 /**
  * Cohort-topic libp2p protocol IDs (`docs/cohort-topic.md` §FRET integration L432-460).
  *
- * Five protocols ride the same FRET/libp2p node:
+ * Six protocols ride the same FRET/libp2p node:
  *
  * - `register`      — Register, renew, re-attach (`RegisterV1` / `RenewV1`, routed via `RouteAndMaybeAct`).
+ * - `renew-batch`   — several plain renewal pings to one member in one frame (`RenewBatchV1` / `RenewBatchReplyV1`).
+ *                     A protocol of its own rather than a frame shape on `register`, so a member on a build that
+ *                     predates it refuses the stream at negotiation — a definite answer — instead of failing a frame
+ *                     it does not recognise in a way the dialer cannot tell from a dead link.
  * - `cohort-gossip` — record replication, willingness, load barometers (`CohortGossipV1`).
  * - `promote`       — threshold-signed promotion / demotion notices.
  * - `membership`    — membership certificates (`MembershipCertV1`).
@@ -21,6 +25,8 @@ export const COHORT_TOPIC_BASE = "/optimystic/cohort-topic/1.0.0" as const;
 
 /** `RegisterV1` / `RenewV1` — register, renew, re-attach. */
 export const PROTOCOL_COHORT_REGISTER = `${COHORT_TOPIC_BASE}/register` as const;
+/** `RenewBatchV1` / `RenewBatchReplyV1` — several plain renewal pings to one member, answered entry by entry. */
+export const PROTOCOL_COHORT_RENEW_BATCH = `${COHORT_TOPIC_BASE}/renew-batch` as const;
 /** `CohortGossipV1` — record replication, willingness, load barometers. */
 export const PROTOCOL_COHORT_GOSSIP = `${COHORT_TOPIC_BASE}/cohort-gossip` as const;
 /** Threshold-signed promotion / demotion notices. */
@@ -30,9 +36,10 @@ export const PROTOCOL_COHORT_MEMBERSHIP = `${COHORT_TOPIC_BASE}/membership` as c
 /** `SignRequestV1` / `SignReplyV1` — intra-cohort per-member endorsement for threshold-signature assembly. */
 export const PROTOCOL_COHORT_SIGN = `${COHORT_TOPIC_BASE}/sign` as const;
 
-/** The five cohort-topic protocol IDs in registration order. */
+/** The six cohort-topic protocol IDs in registration order. */
 export interface CohortTopicProtocols {
 	readonly register: string;
+	readonly renewBatch: string;
 	readonly gossip: string;
 	readonly promote: string;
 	readonly membership: string;
@@ -42,6 +49,7 @@ export interface CohortTopicProtocols {
 /** Default (network-agnostic) protocol IDs, matching `docs/cohort-topic.md` §FRET integration. */
 export const DEFAULT_COHORT_TOPIC_PROTOCOLS: CohortTopicProtocols = {
 	register: PROTOCOL_COHORT_REGISTER,
+	renewBatch: PROTOCOL_COHORT_RENEW_BATCH,
 	gossip: PROTOCOL_COHORT_GOSSIP,
 	promote: PROTOCOL_COHORT_PROMOTE,
 	membership: PROTOCOL_COHORT_MEMBERSHIP,
@@ -58,6 +66,7 @@ export function makeCohortTopicProtocols(networkName = "default"): CohortTopicPr
 	const base = `/optimystic/${networkName}/cohort-topic/1.0.0`;
 	return {
 		register: `${base}/register`,
+		renewBatch: `${base}/renew-batch`,
 		gossip: `${base}/cohort-gossip`,
 		promote: `${base}/promote`,
 		membership: `${base}/membership`,
@@ -65,7 +74,7 @@ export function makeCohortTopicProtocols(networkName = "default"): CohortTopicPr
 	};
 }
 
-/** All five protocol IDs as an array (for `node.handle` / `unhandle` over the set). */
+/** All six protocol IDs as an array (for `node.handle` / `unhandle` over the set). */
 export function cohortTopicProtocolList(p: CohortTopicProtocols): string[] {
-	return [p.register, p.gossip, p.promote, p.membership, p.sign];
+	return [p.register, p.renewBatch, p.gossip, p.promote, p.membership, p.sign];
 }

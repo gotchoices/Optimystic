@@ -60,25 +60,52 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 interface OpenBackend {
 	storage: () => IRawStorage;
 	kvStore: IKVStore;
-	/** Releases what the node does not own: the LevelDB handle, which the backend never closes. */
+	/** Releases what the node does not own: the two stores, and for LevelDB the handle they share, which neither store closes. */
 	close(): Promise<void>;
 }
 
 /** The current build's storage over the files the older build left, mirroring `BACKENDS` in the writer. */
 async function openBackend(dataDir: string, layout: StorageLayout): Promise<OpenBackend> {
 	switch (layout.backend) {
-		case 'fs':
+		case 'fs': {
+			// Kept and closed here: the node never closes a store it was handed, and closing is what
+			// checkpoints each directory's write-ahead log, releases its lock and makes the restart
+			// below reopen it from disk.
+			const storage = new FileRawStorage(join(dataDir, layout.blocks));
+			const kvStore = new FileKVStore(join(dataDir, layout.kv));
 			return {
-				storage: () => new FileRawStorage(join(dataDir, layout.blocks)),
-				kvStore: new FileKVStore(join(dataDir, layout.kv)),
-				close: async () => { },
+				storage: () => storage,
+				kvStore,
+				close: async () => {
+					try {
+						await kvStore.close();
+					} finally {
+						await storage.close();
+					}
+				},
 			};
+		}
 		case 'leveldb': {
+			// One storage and one key-value store over the handle, kept and closed here as the `fs`
+			// case keeps its two: each holds a group's writes until a flush, and closing is what
+			// applies what it still holds and disarms its timers before the handle goes away.
 			const db = await openClassicLevel(join(dataDir, layout.path));
+			const storage = new LevelDBRawStorage(db);
+			const kvStore = new LevelDBKVStore(db);
 			return {
-				storage: () => new LevelDBRawStorage(db),
-				kvStore: new LevelDBKVStore(db),
-				close: () => db.close(),
+				storage: () => storage,
+				kvStore,
+				close: async () => {
+					try {
+						await kvStore.close();
+					} finally {
+						try {
+							await storage.close();
+						} finally {
+							await db.close();
+						}
+					}
+				},
 			};
 		}
 	}

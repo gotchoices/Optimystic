@@ -1,8 +1,9 @@
 import { expect } from 'chai';
 import {
-	latestClaimFromArchive, servableProof, serveBlockArchive, singleRevisionArchive,
-	type ArchiveServingRepo
+	claimFromConsultAnswer, fitConsultContent, latestClaimFromArchive, servableProof, serveBlockArchive, serveConsultAnswer,
+	singleRevisionArchive, type ArchiveServingRepo
 } from '../src/storage/block-archive.js';
+import type { SyncBlockAnswer } from '../src/sync/protocol.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { verifyBlockCommitProofClaim, verifyBlockCommitProofContent, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
@@ -40,7 +41,7 @@ const makeCommit = (over: Partial<CommitRequest> = {}): CommitRequest => ({
 /** A `StorageRepo` over its own `MemoryRawStorage`, so a test can also reach the raw proof keys. */
 const makeRepo = () => {
 	const raw = new MemoryRawStorage();
-	return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+	return { raw, repo: new StorageRepo(raw) };
 };
 
 /**
@@ -69,7 +70,7 @@ const landRevision = async (
 	}
 	const commit = makeCommit({ rev, actionId, blockDigests: { [BLOCK]: { digest: await canonicalBlockHash(block) } } });
 	const { proof } = await makeSignedProof(peers, commit);
-	expect((await repo.commit(commit, undefined, proof)).success).to.equal(true);
+	expect((await repo.commit(commit, undefined, { proof })).success).to.equal(true);
 	return proof;
 };
 
@@ -245,8 +246,7 @@ describe('block archive commit proof', () => {
 		const askerForgettingRev1 = async () => {
 			const server = makeRepo();
 			const askerRaw = new MemoryRawStorage();
-			const asker = new StorageRepo((blockId) => new BlockStorage(
-				blockId, askerRaw, (id, rev) => serveBlockArchive(server.repo, id, rev)));
+			const asker = new StorageRepo(askerRaw, { createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, (id, rev) => serveBlockArchive(server.repo, id, rev)) });
 			for (const repo of [server.repo, asker]) {
 				await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
 				await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
@@ -328,6 +328,65 @@ describe('block archive commit proof', () => {
 				expect(archive.range, `requested ${requested}: latest is at or below the pin`).to.deep.equal([4, 5]);
 				expect(soleEntry(archive).action.actionId).to.equal(ACTION);
 			}
+		});
+	});
+
+	describe('serveConsultAnswer', () => {
+		it('sends the block\'s bytes only when the asker holds nothing, or something older or forked', async () => {
+			const { repo } = makeRepo();
+			await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(BLOCK, 'one'), certified: true });
+			const proof = await landRevision(repo, { rev: 2, actionId: ACTION_2, block: makeBlock(BLOCK, 'two'), certified: true });
+
+			const cases: { name: string; held: ActionRev | undefined; bytes: boolean }[] = [
+				{ name: 'asker holds nothing', held: undefined, bytes: true },
+				{ name: 'served above held', held: { rev: 1, actionId: ACTION }, bytes: true },
+				{ name: 'equal revision, different action (a fork)', held: { rev: 2, actionId: 'action-fork' as ActionId }, bytes: true },
+				{ name: 'equal revision, same action', held: { rev: 2, actionId: ACTION_2 }, bytes: false },
+				{ name: 'served below held', held: { rev: 3, actionId: 'action-3' as ActionId }, bytes: false }
+			];
+			for (const { name, held, bytes } of cases) {
+				const answer = await serveConsultAnswer(repo, BLOCK, held);
+				const entry = soleEntry(answer.archive!);
+				// The claim and its proof ride in every shape, so a certified claim stays certified without bytes.
+				expect(answer.archive!.range, `${name}: served revision`).to.deep.equal([2, 3]);
+				expect(entry.action.actionId, `${name}: served action`).to.equal(ACTION_2);
+				expect(entry.proof, `${name}: proof`).to.deep.equal(proof);
+				if (bytes) {
+					expect(answer.contentOmitted, `${name}: nothing omitted`).to.equal(undefined);
+					expect(entry.block, `${name}: bytes`).to.deep.equal(makeBlock(BLOCK, 'two'));
+				} else {
+					expect(answer.contentOmitted, `${name}: omitted`).to.equal('held');
+					expect(entry.block, `${name}: no block`).to.equal(undefined);
+					expect(entry.action.transform.insert, `${name}: no transform copy`).to.equal(undefined);
+				}
+			}
+
+			expect(await serveConsultAnswer(repo, OTHER_BLOCK, { rev: 2, actionId: ACTION_2 }), 'repo holds nothing').to.deep.equal({});
+		});
+	});
+
+	describe('fitConsultContent', () => {
+		it('keeps the first block\'s bytes whatever their size, and serves a later one past the budget as its claim and proof', async () => {
+			const { proof: proofA } = await makeSignedProof(3, makeCommit());
+			const { proof: proofB } = await makeSignedProof(3, makeCommit({ blockIds: [OTHER_BLOCK], tailId: OTHER_BLOCK }));
+			const first = singleRevisionArchive(BLOCK, { rev: 1, actionId: ACTION }, makeBlock(BLOCK), proofA);
+			const second = singleRevisionArchive(OTHER_BLOCK, { rev: 1, actionId: ACTION }, makeBlock(OTHER_BLOCK), proofB);
+			const answers: [BlockId, SyncBlockAnswer][] = [[BLOCK, { archive: first }], [OTHER_BLOCK, { archive: second }], ['block-3' as BlockId, {}]];
+
+			const fitted = fitConsultContent(answers, 1);
+
+			expect(fitted[0], 'the first block carrying bytes keeps them').to.deep.equal(answers[0]);
+			const [, sized] = fitted[1]!;
+			expect(sized.contentOmitted).to.equal('size');
+			expect(sized.archive!.range, 'its own revision').to.deep.equal([1, 2]);
+			expect(soleEntry(sized.archive!).block, 'no block').to.equal(undefined);
+			expect(soleEntry(sized.archive!).action.transform.insert, 'no transform copy').to.equal(undefined);
+			expect(soleEntry(sized.archive!).proof, 'its proof still rides').to.deep.equal(proofB);
+			// The asker must not reuse it as the peer's archive: unlike 'held', the peer may be ahead.
+			expect(claimFromConsultAnswer(sized)).to.deep.equal({ rev: 1, actionId: ACTION, proof: proofB });
+			expect(fitted[2], 'holds nothing passes through').to.deep.equal(answers[2]);
+
+			expect(fitConsultContent(answers, MAX_BLOCK_MESSAGE_BYTES), 'within budget, nothing is left out').to.deep.equal(answers);
 		});
 	});
 

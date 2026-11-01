@@ -95,7 +95,7 @@ Linked block primitives that can function as stacks, queues, or logs:
 
 - **Flexible access patterns**: LIFO (stack), FIFO (queue), or sequential (log)
 - **Efficient traversal**: Forward and backward iteration with precise navigation
-- **Block efficiency**: 32 entries per block optimized for network transfer
+- **Block efficiency**: at most 32 entries per block, and a log block rolls over at `BLOCK_TARGET_BYTES` (1 MiB) as well, so every block stays small enough to copy between machines
 - **Distributed ready**: Lazy loading and efficient network operations
 
 ```typescript
@@ -115,6 +115,7 @@ B+tree implementation providing efficient sorted access to data:
 - **Sorted access**: Keys maintained in order for efficient range queries
 - **Path-based navigation**: Cursor-like traversal through the tree
 - **Automatic rebalancing**: Splits, merges, and borrowing maintain optimal structure
+- **Bounded node size**: a tree collection's nodes split by size as well as by count, so a table of large rows never builds a block too large to copy between machines (see [Node size](docs/btree.md#node-size))
 - **Type-safe**: Generic implementation supporting custom key/entry types
 
 ```typescript

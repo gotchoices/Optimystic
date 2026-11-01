@@ -1,13 +1,14 @@
 /**
  * index-integrity — does a secondary index agree with its table, in both directions?
  *
- * An index tree entry is `[indexEntryKey(indexKey, primaryKey), primaryKey]`. Every row
- * implies exactly one such entry per index, and every entry should be implied by exactly
- * one row. Two kinds of disagreement follow:
+ * An index tree entry is `[indexEntryKey(indexKey, primaryKey), primaryKey]`. Every row the
+ * index admits implies exactly one such entry — every row, except under a partial index
+ * (`create index … where …`), which admits only the rows its predicate is TRUE for — and every
+ * entry should be implied by exactly one admitted row. Two kinds of disagreement follow:
  *
- *   - a MISSING entry: a row whose implied tree key the tree does not hold, so an
+ *   - a MISSING entry: an admitted row whose implied tree key the tree does not hold, so an
  *     index-routed lookup for the row's value silently skips the row;
- *   - an ORPHANED entry: one no row implies. Queries cannot see these. `executeIndexScan`
+ *   - an ORPHANED entry: one no admitted row implies. Queries cannot see these. `executeIndexScan`
  *     fetches each entry's row by primary key and then asks this same question of it —
  *     {@link rowImpliesEntry} — skipping every entry the row does not imply, whether its row
  *     is gone or its row moved off the indexed value. So a lookup returns nothing extra, and
@@ -61,9 +62,13 @@ export interface MissingIndexEntry extends DecodedIndexTreeKey {
  *   - `malformed` — its stored primary key is not the primary-key half of its own tree key, so
  *     where the entry sits and the row a seek resolves it to disagree. At a row's own tree key
  *     it also hides that row from lookups, but the tree does hold the key, so it is reported
- *     once, here, and not also as missing.
+ *     once, here, and not also as missing;
+ *   - `outside-predicate` — it resolves to a row that implies exactly this entry, but the index
+ *     is partial and its predicate does not admit the row. Builds before partial indexes were
+ *     maintained by their predicate wrote such an entry for every row; one written now means
+ *     maintenance is over-populating the index again.
  */
-export type OrphanReason = 'no-row' | 'stale-value' | 'malformed';
+export type OrphanReason = 'no-row' | 'stale-value' | 'malformed' | 'outside-predicate';
 
 /** An index entry no row implies. Its payloads decode `treeKey`, i.e. where the entry sits. */
 export interface OrphanedIndexEntry extends DecodedIndexTreeKey {
@@ -71,7 +76,7 @@ export interface OrphanedIndexEntry extends DecodedIndexTreeKey {
 	/** The entry's stored value, `entry[1]`: the row a seek resolves it to. */
 	primaryKey: PrimaryKey;
 	reason: OrphanReason;
-	/** The row `primaryKey` resolves to, for `stale-value`. */
+	/** The row `primaryKey` resolves to, for `stale-value` and `outside-predicate`. */
 	currentRow?: Row;
 }
 
@@ -94,6 +99,8 @@ export interface IndexIntegrityInput {
 	kind: IndexKind;
 	/** Every row of the table, keyed by its framed primary key (`RowCodec.extractPrimaryKey`). */
 	rows: ReadonlyMap<PrimaryKey, Row>;
+	/** Whether `index` holds an entry for the row. Pass `IndexManager.admits` bound to the index. */
+	admits: (row: Row) => boolean;
 	/** Every entry the index tree holds. */
 	entries: readonly IndexEntry[];
 	/**
@@ -108,11 +115,6 @@ export function compareIndexToRows(input: IndexIntegrityInput): IndexIntegrityRe
 	const { index, kind, rows } = input;
 	const width = index.columns.length;
 
-	// NOTE: `index.predicate` (a partial index) is ignored, because maintenance ignores it too:
-	// insertIndexEntries and backfillIndexTrees index every row (see the NOTE on
-	// backfillIndexTrees). Honouring it here alone would report every row the predicate
-	// excludes as missing. The check and maintenance must change together.
-	//
 	// NOTE: holds every row's expected key in memory, next to the rows and entries the caller
 	// already materialized. Fine for a diagnostic over modest tables; if this is ever run on
 	// large ones, stream it per index instead: sort the expected keys and merge them against
@@ -120,6 +122,7 @@ export function compareIndexToRows(input: IndexIntegrityInput): IndexIntegrityRe
 	const expected = new Map<string, { primaryKey: PrimaryKey; row: Row }>();
 	const optional = new Set<string>();
 	for (const [primaryKey, row] of rows) {
+		if (!input.admits(row)) continue;
 		const treeKey = indexEntryKey(input.indexKeyOf(row), primaryKey);
 		expected.set(treeKey, { primaryKey, row });
 		if (isEntryOptional(index, kind, row)) optional.add(treeKey);
@@ -129,7 +132,7 @@ export function compareIndexToRows(input: IndexIntegrityInput): IndexIntegrityRe
 	const orphaned: OrphanedIndexEntry[] = [];
 	for (const [treeKey, primaryKey] of input.entries) {
 		present.add(treeKey);
-		const orphan = classifyEntry(treeKey, primaryKey, width, input.indexKeyOf, rows);
+		const orphan = classifyEntry(treeKey, primaryKey, width, input, rows);
 		if (orphan) orphaned.push(orphan);
 	}
 
@@ -161,12 +164,15 @@ function isEntryOptional(index: StoredIndexSchema, kind: IndexKind, row: Row): b
 	return kind === 'unique-enforcement' && hasNullIndexValue(index, row);
 }
 
-/** The orphan report for one stored entry, or `undefined` when some row implies it exactly. */
+/**
+ * The orphan report for one stored entry, or `undefined` when an admitted row implies it
+ * exactly.
+ */
 function classifyEntry(
 	treeKey: string,
 	primaryKey: PrimaryKey,
 	width: number,
-	indexKeyOf: (row: Row) => IndexKey,
+	input: Pick<IndexIntegrityInput, 'indexKeyOf' | 'admits'>,
 	rows: ReadonlyMap<PrimaryKey, Row>,
 ): OrphanedIndexEntry | undefined {
 	// The common case, answered without decoding: the row this entry resolves to implies
@@ -176,16 +182,19 @@ function classifyEntry(
 	// self-delimiting tuples, so its primary-key half is recoverable and can only be this
 	// entry's own. Looking the row up by that half therefore misses no candidate.)
 	const currentRow = rows.get(primaryKey);
-	if (currentRow !== undefined && rowImpliesEntry(currentRow, [treeKey, primaryKey], indexKeyOf)) {
+	const impliedByItsRow = currentRow !== undefined && rowImpliesEntry(currentRow, [treeKey, primaryKey], input.indexKeyOf);
+	if (impliedByItsRow && input.admits(currentRow)) {
 		return undefined;
 	}
 
-	const decoded = decodeTreeKey(treeKey, width);
-	const base = { treeKey, primaryKey, ...decoded };
+	const base = { treeKey, primaryKey, ...decodeTreeKey(treeKey, width) };
+	if (impliedByItsRow) {
+		return { ...base, reason: 'outside-predicate', currentRow };
+	}
 	// Well formed means the stored primary key is exactly the tree key's primary-key half. A
 	// well-formed key some row implies has passed the check above, so past this point a
 	// well-formed entry is implied by no row at all.
-	if (treeKey !== indexEntryKey(encodeKeyTuple(decoded.indexPayloads), primaryKey)) {
+	if (treeKey !== indexEntryKey(encodeKeyTuple(base.indexPayloads), primaryKey)) {
 		return { ...base, reason: 'malformed' };
 	}
 	return currentRow === undefined

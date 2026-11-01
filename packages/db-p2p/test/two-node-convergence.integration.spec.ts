@@ -1,6 +1,6 @@
 import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
-import { BlockUnavailableError, Tree, routingKeyForBlock } from '@optimystic/db-core';
+import { BlockUnavailableError, Diary, Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
@@ -139,6 +139,26 @@ describe('Two-node convergence over real libp2p', function () {
 		await treeA.sync();
 		expect(await treeA.get(4), "A sees the joiner's row").to.deep.equal({ key: 4, value: 'from-B' });
 		expect(await treeB.get(2), "the joiner sees A's earlier rows").to.deep.equal({ key: 2, value: 'from-A-2' });
+	});
+
+	// GitHub issue #35. A pend record carries the transaction's transforms to the other member, and
+	// both that request and the member's echoed answer used to be framed under the 1 MiB control cap,
+	// so a write above it failed with `Failed to get super-majority` once a second machine shared the
+	// collection. 1.1 MB is above the old cap and far below the per-transaction limit.
+	it('a write above the old 1 MiB cluster frame commits on a two-member cohort', async function () {
+		const [a, b] = await stabilizedPair();
+		const diaryId = 'two-node-conv-large-append';
+		const pad = 'x'.repeat(1_100_000);
+
+		const diaryA = await Diary.createOrOpen<{ pad: string }>(transactorFor(a, NETWORK_NAME), diaryId);
+		await diaryA.append({ pad });
+
+		const diaryB = await Diary.open<{ pad: string }>(transactorFor(b, NETWORK_NAME), diaryId);
+		expect(diaryB, 'B opens the diary A wrote').to.not.equal(undefined);
+		const entries: { pad: string }[] = [];
+		for await (const entry of diaryB!.select()) entries.push(entry);
+		expect(entries.length, 'B reads the one entry').to.equal(1);
+		expect(entries[0]!.pad.length).to.equal(pad.length);
 	});
 
 	// GitHub issue #27. Every case above waits for the mesh before opening anything, which is why

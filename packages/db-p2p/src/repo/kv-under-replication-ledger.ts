@@ -1,6 +1,6 @@
 import type { BlockId } from "@optimystic/db-core";
 import type { IKVStore } from "../storage/i-kv-store.js";
-import type { IUnderReplicationLedger, ShortfallQuorum, UnderReplicatedEntry } from "./i-under-replication-ledger.js";
+import type { IUnderReplicationLedger, SatisfyOutcome, ShortfallQuorum, UnderReplicatedEntry } from "./i-under-replication-ledger.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('under-replication-ledger');
@@ -24,6 +24,15 @@ export type KvUnderReplicationLedgerOptions = {
 	/** Hard cap on outstanding entries; the oldest-recorded entry is evicted beyond it. Default
 	 *  {@link DEFAULT_UNDER_REPLICATION_MAX_ENTRIES}. Must be at least 1. */
 	maxEntries?: number;
+	/**
+	 * Awaited at the start of every `record`, before any write to the key-value store. The node wires
+	 * a strict flush of its block store, so a shortfall entry is never on disk ahead of the commit it
+	 * describes (write order 8 of `packages/db-p2p/docs/storage.md`, Invariant 6): the entry's store and
+	 * the block store are two durability domains with no prefix rule between them, and the commit's
+	 * own flush may have been given a window. A rejection makes `record` reject, which
+	 * `CoordinatorRepo.noteReplicationShortfall` logs per block and answers without `recordedBy`.
+	 */
+	beforeRecord?: () => Promise<void>;
 };
 
 const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unrouted'];
@@ -42,6 +51,7 @@ const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unr
  */
 export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	private readonly maxEntries: number;
+	private readonly beforeRecord: (() => Promise<void>) | undefined;
 	private readonly queues = new Map<BlockId, Promise<void>>();
 	private indexLoad: Promise<Set<BlockId>> | undefined;
 
@@ -51,15 +61,19 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 			throw new Error(`KvUnderReplicationLedger: maxEntries must be a positive integer, got ${maxEntries}`);
 		}
 		this.maxEntries = maxEntries;
+		this.beforeRecord = options?.beforeRecord;
 	}
 
 	async record(entry: UnderReplicatedEntry): Promise<void> {
-		await this.serialized(entry.blockId, async () => {
+		// Ahead of the block's queue, not inside it: the hook syncs another store, and a flush there
+		// need not hold this block's other ledger operations behind the disk.
+		await this.beforeRecord?.();
+		const wrote = await this.serialized(entry.blockId, async () => {
 			const index = await this.index();
 			const existing = await this.read(entry.blockId);
 			if (existing !== undefined && existing.rev > entry.rev) {
 				log('record:skip-lower-rev %o', { blockId: entry.blockId, rev: entry.rev, recordedRev: existing.rev });
-				return;
+				return false;
 			}
 			const sameShortfall = existing !== undefined && existing.rev === entry.rev;
 			const stored: UnderReplicatedEntry = sameShortfall
@@ -71,25 +85,30 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 				index.delete(entry.blockId);
 				index.add(entry.blockId);
 			}
+			return true;
 		});
-		await this.evictBeyondCap();
+		const evicted = await this.evictBeyondCap();
+		if (wrote || evicted) await this.flushWrites();
 	}
 
-	async settle(blockId: BlockId, rev: number): Promise<void> {
-		await this.serialized(blockId, async () => {
+	async settle(blockId: BlockId, rev: number): Promise<UnderReplicatedEntry | undefined> {
+		const settled = await this.serialized(blockId, async () => {
 			// Every fully replicated commit settles each of its blocks, and almost none has an entry:
 			// answer those from the index instead of a store read. An entry missing from the index is
 			// one `read` would report absent anyway (malformed), so nothing is skipped that could be settled.
 			const index = await this.index();
-			if (!index.has(blockId)) return;
+			if (!index.has(blockId)) return undefined;
 			const existing = await this.read(blockId);
-			if (existing === undefined) return;
+			if (existing === undefined) return undefined;
 			if (existing.rev > rev) {
 				log('settle:keep-higher-rev %o', { blockId, rev, recordedRev: existing.rev });
-				return;
+				return undefined;
 			}
 			await this.remove(blockId);
+			return existing;
 		});
+		if (settled !== undefined) await this.flushWrites();
+		return settled;
 	}
 
 	async get(blockId: BlockId): Promise<UnderReplicatedEntry | undefined> {
@@ -126,31 +145,37 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		return entries.sort((a, b) => a.recordedAt - b.recordedAt);
 	}
 
-	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<UnderReplicatedEntry | undefined> {
-		return this.serialized(blockId, async () => {
+	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<SatisfyOutcome> {
+		let wrote = false;
+		const outcome = await this.serialized(blockId, async (): Promise<SatisfyOutcome> => {
 			const existing = await this.read(blockId);
-			if (existing === undefined) return undefined;
+			if (existing === undefined) return { status: 'absent' };
 			if (heldRev !== undefined && existing.rev > heldRev) {
 				log('satisfy:keep-higher-rev %o', { blockId, heldRev, recordedRev: existing.rev });
-				return existing;
+				return { status: 'owed', entry: existing };
 			}
 			// Unknown is not empty: see `IUnderReplicationLedger.satisfy`.
-			if (existing.missingPeerIds.length === 0) return existing;
+			if (existing.missingPeerIds.length === 0) return { status: 'owed', entry: existing };
 			const confirmed = new Set(peerIds);
 			const remaining = existing.missingPeerIds.filter(peerId => !confirmed.has(peerId));
 			if (remaining.length === 0) {
 				await this.remove(blockId);
-				return undefined;
+				wrote = true;
+				return { status: 'cleared', entry: existing };
 			}
-			if (remaining.length === existing.missingPeerIds.length) return existing;
+			if (remaining.length === existing.missingPeerIds.length) return { status: 'owed', entry: existing };
 			const updated: UnderReplicatedEntry = { ...existing, missingPeerIds: remaining };
 			await this.kv.set(keyFor(blockId), JSON.stringify(updated));
-			return updated;
+			wrote = true;
+			return { status: 'owed', entry: updated };
 		});
+		if (wrote) await this.flushWrites();
+		return outcome;
 	}
 
 	async name(blockId: BlockId, rev: number, missingPeerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined> {
-		return this.serialized(blockId, async () => {
+		let wrote = false;
+		const named = await this.serialized(blockId, async () => {
 			const existing = await this.read(blockId);
 			if (existing === undefined) return undefined;
 			if (existing.rev !== rev) {
@@ -160,21 +185,38 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 			if (existing.missingPeerIds.length > 0) return existing;
 			const updated: UnderReplicatedEntry = { ...existing, missingPeerIds: [...missingPeerIds] };
 			await this.kv.set(keyFor(blockId), JSON.stringify(updated));
+			wrote = true;
 			return updated;
 		});
+		if (wrote) await this.flushWrites();
+		return named;
 	}
 
 	async noteAttempt(blockId: BlockId): Promise<void> {
-		await this.serialized(blockId, async () => {
+		const wrote = await this.serialized(blockId, async () => {
 			const existing = await this.read(blockId);
-			if (existing === undefined) return;
+			if (existing === undefined) return false;
 			const updated: UnderReplicatedEntry = { ...existing, attempts: existing.attempts + 1 };
 			await this.kv.set(keyFor(blockId), JSON.stringify(updated));
+			return true;
 		});
+		if (wrote) await this.flushWrites();
 	}
 
 	async delete(blockId: BlockId): Promise<void> {
 		await this.serialized(blockId, () => this.remove(blockId));
+		await this.flushWrites();
+	}
+
+	/**
+	 * Make a public call's writes durable before it returns (`IKVStore.flush`, absent on a store whose
+	 * writes are already as durable as they get). Once per call, after the block's queue is released.
+	 * The ledger exists so a shortfall outlives a restart: `CoordinatorRepo` records one before it
+	 * answers the writer naming this node as `recordedBy`, and the drain satisfies through the same
+	 * calls, so neither may report what a restart would forget.
+	 */
+	private async flushWrites(): Promise<void> {
+		await this.kv.flush?.();
 	}
 
 	/** Delete from the store and the eviction index. Callers hold the block's queue. */
@@ -192,24 +234,34 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	 * recordings at the cap never evict more than the overflow.
 	 *
 	 * An eviction failure is logged and ends the pass rather than failing the recording that
-	 * triggered it: that entry is already written, and the next recording tries again.
+	 * triggered it: that entry is already written, and the next recording tries again. Returns whether
+	 * anything was removed, so `record` knows whether it has writes to flush.
+	 *
+	 * NOTE: an evicted entry's write was answered naming this node as `recordedBy`, and its
+	 * full-replication event will now never fire, so a host following that write waits on it until
+	 * its own bookkeeping gives up. Negligible at the default cap; if a deployment ever sits at the
+	 * cap, have eviction announce what it dropped (a distinct "no longer tracked" signal, not the
+	 * full-replication event, which would be false).
 	 */
-	private async evictBeyondCap(): Promise<void> {
+	private async evictBeyondCap(): Promise<boolean> {
 		const index = await this.index();
+		let evicted = false;
 		while (index.size > this.maxEntries) {
 			const victim = index.values().next().value;
-			if (victim === undefined) return;
+			if (victim === undefined) return evicted;
 			try {
 				await this.serialized(victim, async () => {
 					if (!index.has(victim)) return;
 					await this.remove(victim);
+					evicted = true;
 					log('evict:over-cap %o', { blockId: victim, maxEntries: this.maxEntries });
 				});
 			} catch (err) {
 				log.error('evict:failed %o', { blockId: victim, error: (err as Error).message });
-				return;
+				return evicted;
 			}
 		}
+		return evicted;
 	}
 
 	/**

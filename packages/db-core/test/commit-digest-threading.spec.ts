@@ -371,6 +371,21 @@ describe('commit content digest threading', () => {
 			expect(baseKeys(cPend!)).to.deep.equal([ids.b1])
 			expect(baseKeys(aPend!)).to.deep.equal([ids.b3])
 		})
+
+		it('drops soleReservation from every batch of a pend split across coordinators, retries included', async () => {
+			// A split pend is several reservations; a coordinator deferring one of them could let its late
+			// refusal surface after another batch's commit landed (PendRequest.soleReservation).
+			const { ids, repos, networkTransactor } = await setup(1)
+			const result = await networkTransactor.pend({
+				actionId: generateRandomActionId(), rev: 8, policy: 'r',
+				transforms: updatesOf([ids.tail, ids.b1, ids.b2, ids.b3]),
+				soleReservation: true,
+			})
+			expect(result.success).to.be.true
+			const sent = Object.values(repos).flatMap(repo => repo.pends)
+			expect(sent.length, 'the pend went out split, its failed batch split again on retry').to.be.greaterThan(2)
+			for (const request of sent) expect(request, 'no batch claims to be the whole pend').to.not.have.property('soleReservation')
+		})
 	})
 
 	describe('Collection.sync declares its blocks', () => {

@@ -1,5 +1,5 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, CollectionChangeListener, TransactionSigner } from '@optimystic/db-core';
-import { Tree, Collection, NetworkTransactor, isBlockChangeNotifier, bytesToB64url } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
+import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
@@ -8,7 +8,6 @@ import {
 	RepoClient,
 	stateHoldingsOnReads,
 	StorageRepo,
-	BlockStorage,
 	MemoryRawStorage,
 	type ReadCacheLease,
 	withReadCache,
@@ -16,11 +15,14 @@ import {
 	resolveLinkDeadlines,
 	type OptimysticNodeAttachments,
 	type CollectionWatchHandle,
+	type CollectionTailReader,
+	committedTailReader,
 } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
+import { LateBoundCohortReachability } from './late-bound-reachability.js';
 
 const log = createLogger('collection-factory');
 
@@ -55,6 +57,16 @@ export class CollectionFactory {
    */
   private nodeTagValue = randomNodeTag();
   private transactors = new Map<string, ITransactor>();
+  /**
+   * Transactor constructions still in flight, by the key {@link transactors} will hold them under.
+   * A table's first initialization opens its collection and reads the catalog together, and both
+   * resolve the same transactor: without this, each would miss {@link transactors} and build its
+   * own — two libp2p nodes, or two `local` stores neither of which sees the other's writes.
+   */
+  // NOTE: dispose()/clearCache() do not touch this map, so a construction in flight across them
+  // still lands in `transactors` afterwards (as the old await-then-set did). If a host ever
+  // disposes while a table is mid-initialization, drop in-flight results that settle after dispose.
+  private transactorsInFlight = new Map<string, Promise<ITransactor>>();
   private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
@@ -73,6 +85,41 @@ export class CollectionFactory {
    * cohort registration until the node stops.
    */
   private networkWatches = new Set<CollectionWatchHandle>();
+  /**
+   * One tail reader per transactor, handed to every network watch through it: the watch service reads
+   * the tails of every collection that shares a reader in one call per tick, so sharing is what makes an
+   * idle tick one request however many tables are watched.
+   */
+  private tailReaders = new WeakMap<ITransactor, CollectionTailReader>();
+  /**
+   * The sealed-segment refusal callback every tree this factory opens is built with
+   * ({@link setSealedRefusedListener}): the offline queue's, so a replay that refuses a queued
+   * entry's segment reaches the queue whichever of this `Database`'s collections reported it.
+   * `Collection.onSealedRefused` is fixed at construction and the collections open before any
+   * `plugin.offline.enter()`, which is why the listener is set once, at registration, rather than
+   * per tree.
+   */
+  private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
+  /**
+   * The one stable gate per transactor key that {@link getCohortReachability} hands out, standing in
+   * for the gate registered for the key ({@link registerCohortReachability}) and for the always-open
+   * gate until one is.
+   */
+  private cohortGates = new Map<string, LateBoundCohortReachability>();
+
+  /**
+   * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
+   * Once: a second controller would silently take the first's refusals.
+   */
+  setSealedRefusedListener(listener: NonNullable<TreeCollectionOptions['onSealedRefused']>): void {
+    if (this.sealedRefusedListener !== undefined) throw new Error('a sealed-segment refusal listener is already set on this factory');
+    this.sealedRefusedListener = listener;
+  }
+
+  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set. */
+  private treeOptions(): TreeCollectionOptions | undefined {
+    return this.sealedRefusedListener === undefined ? undefined : { onSealedRefused: this.sealedRefusedListener };
+  }
 
   /**
    * Create or get a tree collection, bringing it into existence when nothing has ever
@@ -93,7 +140,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
 
     this.cacheCollection(options, txnState, collection);
@@ -123,7 +172,9 @@ export class CollectionFactory {
       transactor,
       collectionId,
       keyExtractor,
-      compare // Total order
+      compare, // Total order
+      undefined,
+      this.treeOptions()
     );
     if (!collection) {
       return undefined;
@@ -196,7 +247,9 @@ export class CollectionFactory {
   }
 
   /**
-   * Get or create a transactor (with caching)
+   * Get or create a transactor (with caching). Concurrent callers for one key share a single
+   * construction ({@link transactorsInFlight}); a construction that fails is not remembered, so
+   * the next caller tries again.
    */
   async getOrCreateTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const transactorKey = this.getTransactorKey(options);
@@ -205,9 +258,17 @@ export class CollectionFactory {
       return this.transactors.get(transactorKey)!;
     }
 
-    const transactor = await this.createTransactor(options);
-    this.transactors.set(transactorKey, transactor);
-    return transactor;
+    let inFlight = this.transactorsInFlight.get(transactorKey);
+    if (!inFlight) {
+      inFlight = this.createTransactor(options)
+        .then(transactor => {
+          this.transactors.set(transactorKey, transactor);
+          return transactor;
+        })
+        .finally(() => this.transactorsInFlight.delete(transactorKey));
+      this.transactorsInFlight.set(transactorKey, inFlight);
+    }
+    return await inFlight;
   }
 
   /**
@@ -265,14 +326,7 @@ export class CollectionFactory {
     if (!watchService) {
       return undefined;
     }
-    const handle = watchService.watch({
-      collectionId,
-      readTail: async (knownTailId) => {
-        const tail = await Collection.readCommittedTail(transactor, collectionId, knownTailId);
-        return tail && { tailId: tail.tailId, revision: tail.rev };
-      },
-      onChange: listener,
-    });
+    const handle = watchService.watch({ collectionId, tails: this.tailReaderFor(transactor), onChange: listener });
     // NOTE: a dispose() landing during the await above has already emptied this set, so the handle
     // escapes it and lives until its table's DROP closes it; if hosts ever dispose while tables are
     // still initializing, refuse new watches after dispose (or close them on the spot).
@@ -281,6 +335,15 @@ export class CollectionFactory {
       this.networkWatches.delete(handle);
       await handle.close();
     };
+  }
+
+  private tailReaderFor(transactor: ITransactor): CollectionTailReader {
+    let reader = this.tailReaders.get(transactor);
+    if (!reader) {
+      reader = committedTailReader(transactor);
+      this.tailReaders.set(transactor, reader);
+    }
+    return reader;
   }
 
   /**
@@ -324,6 +387,7 @@ export class CollectionFactory {
     }
 
     const { node, coordinatedRepo, blockChangeNotifier } = nodeInfo;
+    this.registerNodeCohortReachability(this.getTransactorKey(options), node);
 
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
@@ -344,7 +408,7 @@ export class CollectionFactory {
     // The node's own derived deadlines, so a declared link round trip reaches every repo dial and
     // the budget around them. A node a host injected without building it through `createLibp2pNode`
     // carries none; it gets the undeclared ones.
-    const { dialTimeoutMs, transactionTimeoutMs } = node.linkDeadlines ?? resolveLinkDeadlines();
+    const { dialTimeoutMs, transactionTimeoutMs, retryBackoffBaseMs } = node.linkDeadlines ?? resolveLinkDeadlines();
 
     return new NetworkTransactor({
       // Four dial deadlines (30 s when undeclared): a dial to a dead coordinator that runs out its
@@ -363,10 +427,12 @@ export class CollectionFactory {
       // NOTE: holds a warm-connection cancel with five round trips to spare, but not one that must
       // first open a cold relayed connection (up to ten more). A cancel usually reuses the connection
       // its pend just opened; if cancels on slow links run out of time anyway (a failed cancel leaves
-      // its pending records standing; see `NetworkTransactor.dischargeCancel`), give this budget its
-      // own number of round trips.
+      // its pending records standing until a re-send lands; see `NetworkTransactor.dischargeCancel`),
+      // give this budget its own number of round trips.
       abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
       dialTimeoutMs,
+      // One declared round trip before a retry, doubling; 0 (no wait) on an undeclared link.
+      retryBackoffBaseMs,
       keyNetwork,
       getRepo,
       localChangeNotifier: blockChangeNotifier,
@@ -374,6 +440,17 @@ export class CollectionFactory {
       // peers go to this node and its own writes skip the network hop.
       localPeerId: node.peerId,
     });
+  }
+
+  /**
+   * Register `node`'s reachability gate (`node.cohortReachability`) for the transactor under `key`,
+   * unless a gate is registered there already: one a test or host registered explicitly wins. A node a
+   * host injected without building it through `createLibp2pNode` may carry none; its transactor then
+   * stays always reachable, and nothing wakes the drain but its own re-check timer.
+   */
+  private registerNodeCohortReachability(key: string, node: FactoryNode): void {
+    const gate = this.cohortGateFor(key);
+    if (node.cohortReachability !== undefined && !gate.bound) gate.bind(node.cohortReachability);
   }
 
   /**
@@ -407,7 +484,7 @@ export class CollectionFactory {
     if (lease) {
       this.readCacheLeases.push(lease);
     }
-    const storageRepo = new StorageRepo((blockId: string) => new BlockStorage(blockId, rawStorage));
+    const storageRepo = new StorageRepo(rawStorage);
 
     // LocalTransactor implementation (simple wrapper around StorageRepo).
     // Also implements IBlockChangeNotifier by delegating to the StorageRepo —
@@ -440,7 +517,7 @@ export class CollectionFactory {
   private async createTestTransactor(): Promise<ITransactor> {
     const memoryStorage = new MemoryRawStorage();
 
-    const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, memoryStorage));
+    const storageRepo = new StorageRepo(memoryStorage);
 
     // Simple local transactor that wraps StorageRepo; also an IBlockChangeNotifier
     // (delegating to the StorageRepo) so plugin-level reactive-watch specs can
@@ -617,6 +694,21 @@ export class CollectionFactory {
   }
 
   /**
+   * The full-replication event source (`BlockDurabilityReachedEvent`) of the node behind the
+   * `network` transactor: its `StorageRepo`, whose under-replication ledger records the copies a
+   * write acknowledged below full replication still owes. `undefined` for every other transactor —
+   * `local`, `test` and `mesh-test` keep no ledger and run no drain, so nothing would ever fire —
+   * and for an injected node built without a store.
+   */
+  getBlockDurabilityNotifier(options: ParsedOptimysticOptions): IBlockDurabilityNotifier | undefined {
+    if (options.transactor !== 'network') {
+      return undefined;
+    }
+    const store = this.libp2pNodes.get(this.getNodeKey(options))?.node.storageRepo;
+    return isBlockDurabilityNotifier(store) ? store : undefined;
+  }
+
+  /**
    * A {@link TransactionSigner} bound to the current libp2p node's Ed25519 identity key, or
    * `undefined` when no node/key is available (legacy `local`/`test`/`mesh-test` transactors, or a
    * node created without an exposed key). The session is then built unsigned — unchanged behavior.
@@ -708,6 +800,40 @@ export class CollectionFactory {
   }
 
   /**
+   * The gate saying whether the cohort behind `options`' transactor can be reached now
+   * (`ICohortReachability`, docs/offline-sync.md §When to submit: the reachability gate). The offline
+   * queue asks it before submitting an entry, and a live read in offline mode before it refreshes
+   * (docs/offline-sync.md §Reads in offline mode), so both ask one gate; the offline-mode controller
+   * also subscribes to its `onChange`, which wakes the drain. The same object for every call with one
+   * transactor key, late-bound to the registration ({@link LateBoundCohortReachability}): a gate
+   * registered after a table took this one is the one it asks and hears. A transactor with no gate
+   * registered is always reachable and never wakes anyone — `local`, `test` and `mesh-test` have no
+   * cohort to lose; the `network` transactor registers its node's ({@link createNetworkTransactor}).
+   */
+  getCohortReachability(options: ParsedOptimysticOptions): ICohortReachability {
+    return this.cohortGateFor(this.getTransactorKey(options));
+  }
+
+  /**
+   * Register the reachability gate for the transactor under `key` — `${transactor}:${keyNetwork}`, the
+   * key {@link registerTransactor} takes. For tests and hosts; the `network` transactor registers its
+   * node's gate itself unless one is registered here first. Replaces any gate registered under `key`
+   * before, moving every wake subscription to it.
+   */
+  registerCohortReachability(key: string, reachability: ICohortReachability): void {
+    this.cohortGateFor(key).bind(reachability);
+  }
+
+  private cohortGateFor(key: string): LateBoundCohortReachability {
+    let gate = this.cohortGates.get(key);
+    if (gate === undefined) {
+      gate = new LateBoundCohortReachability();
+      this.cohortGates.set(key, gate);
+    }
+    return gate;
+  }
+
+  /**
    * Register a custom transactor class by name.
    * When `options.transactor` matches `name`, the factory will instantiate this class.
    */
@@ -782,6 +908,11 @@ export class CollectionFactory {
    * Shutdown all libp2p nodes, then release the read caches ({@link dispose}).
    */
   async shutdown(): Promise<void> {
+    // A network transactor keeps re-sending cancels it could not land; through a stopped node they
+    // never would, and the retry timer would keep the transactor and the node alive.
+    for (const transactor of this.transactors.values()) {
+      if (transactor instanceof NetworkTransactor) transactor.stop();
+    }
     for (const [key, { node }] of this.libp2pNodes.entries()) {
       log('Stopping libp2p node: %s', key);
       await node.stop();

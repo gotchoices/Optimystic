@@ -88,7 +88,7 @@ export function willingnessBitsHex(bits: number): string {
  * This member's gossiped (coarse) willingness vector: bit `t` set iff the profile serves `t` and the
  * tier is not shed under load. The per-tier primary-topic budget is deliberately **not** folded in
  * — it is a live per-registration gate, not a gossiped signal (§Willingness: the gossiped vector is
- * "one bit per tier per member… refreshed every gossip round").
+ * "one bit per tier per member, sent on the next gossip round whenever it changes").
  */
 export function selfWillingnessBits(self: NodeProfile, barometer: LoadBarometerState): number {
 	return packWillingnessBits((t) => self.willingTiers.has(t) && barometer.loadWilling(t));

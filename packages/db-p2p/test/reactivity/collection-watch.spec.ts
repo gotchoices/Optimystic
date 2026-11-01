@@ -3,17 +3,25 @@ import {
 	bytesToB64url,
 	coreProfile,
 	reactivityCollectionTopicId,
+	type ActionId,
 	type BlockId,
 	type CohortTopicService,
 	type CollectionChangeEvent,
+	type CollectionChangeListener,
 	type CommitCert,
+	type IBlockChangeNotifier,
 	type MembershipVerifier,
 	type NotificationV1,
 	type RegisterRequest,
 	type RegistrationHandle,
 	type VerifyResult,
 } from '@optimystic/db-core';
-import { ReactivityCollectionWatch, type CollectionTail } from '../../src/reactivity/collection-watch.js';
+import {
+	ReactivityCollectionWatch,
+	type CollectionTail,
+	type CollectionTailReader,
+	type ReactivityCollectionWatchOptions,
+} from '../../src/reactivity/collection-watch.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
 import { reactivityCollectionIdBytes, reactivityTailBytes } from '../../src/reactivity/topic-bytes.js';
 
@@ -59,6 +67,7 @@ class HeldRegistrationService implements CohortTopicService {
 		});
 	}
 	async renew(): Promise<void> {}
+	async renewMany(): Promise<void> {}
 	async lookup(): Promise<never> {
 		throw new Error('lookup is not used by the watch service');
 	}
@@ -93,8 +102,47 @@ function notification(tail: BlockId, revision: number): NotificationV1 {
 	};
 }
 
+/**
+ * A tail reader answering each collection from `tailOf`, recording the collection ids each call named and whether
+ * that call let the answering repo consult its cohort.
+ */
+function tailReader(tailOf: (collectionId: string) => CollectionTail | undefined): { reader: CollectionTailReader; calls: string[][]; consults: boolean[] } {
+	const calls: string[][] = [];
+	const consults: boolean[] = [];
+	const reader: CollectionTailReader = {
+		readTails: (queries, options) => {
+			calls.push(queries.map((query) => query.collectionId));
+			consults.push(options?.skipWindowConsult !== true);
+			return Promise.resolve(new Map(queries.map((query) => [query.collectionId, { tail: tailOf(query.collectionId) }])));
+		},
+	};
+	return { reader, calls, consults };
+}
+
+/** A stand-in for the node's storage change feed: `land(rev)` fires a change to `COLLECTION` at `rev`. */
+function localFeed(): { notifier: Pick<IBlockChangeNotifier, 'onCollectionChange'>; land(rev: number): void; listening(): number } {
+	const listeners = new Map<string, Set<CollectionChangeListener>>();
+	return {
+		notifier: {
+			onCollectionChange: (collectionId, listener) => {
+				const set = listeners.get(collectionId) ?? new Set();
+				listeners.set(collectionId, set.add(listener));
+				return () => { set.delete(listener); };
+			},
+		},
+		land: (rev) => {
+			for (const listener of listeners.get(COLLECTION) ?? []) {
+				listener({ collectionId: COLLECTION, blockIds: [OLD_TAIL], actionId: `action-${rev}` as ActionId, rev });
+			}
+		},
+		listening: () => listeners.get(COLLECTION)?.size ?? 0,
+	};
+}
+
+type WatchExtras = Pick<ReactivityCollectionWatchOptions, 'localChanges' | 'verifyEveryTicks'>;
+
 /** A watch whose first registration (under the old tail) is in flight, with the service, registry, tick and tail under the test's control. */
-async function attachedWatch() {
+async function attachedWatch(extras: WatchExtras = {}) {
 	const service = new HeldRegistrationService();
 	const registry = new ReactivitySubscriberRegistry();
 	const ticks: Array<() => void> = [];
@@ -106,15 +154,16 @@ async function attachedWatch() {
 		subscribers: registry,
 		scheduleRotation: () => {},
 		setTimer: (fn) => { ticks.push(fn); return () => {}; },
+		...extras,
 	});
-	const handle = watch.watch({ collectionId: COLLECTION, readTail: () => Promise.resolve(state.tail), onChange: () => { state.changes++; } });
+	const handle = watch.watch({ collectionId: COLLECTION, tails: tailReader(() => state.tail).reader, onChange: () => { state.changes++; } });
 	await settle();
 	return { service, registry, state, handle, watch, fireTick: (): void => ticks[ticks.length - 1]!() };
 }
 
 /** The same watch once its first registration has landed at tree tier `treeTier`. */
-async function registeredWatch(treeTier: number) {
-	const fixture = await attachedWatch();
+async function registeredWatch(treeTier: number, extras: WatchExtras = {}) {
+	const fixture = await attachedWatch(extras);
 	fixture.service.registrations[0]!.resolve(treeTier);
 	await settle();
 	expect(fixture.watch.isAttached(COLLECTION)).to.equal(true);
@@ -218,5 +267,144 @@ describe('reactivity / collection watch', () => {
 		registry.deliver(TOPIC, notification(OLD_TAIL, 8));
 		await settle();
 		expect(state.changes - before, 'revision 8 is contiguous with what the tick read').to.equal(2);
+	});
+
+	it('collections sharing a reader are read in one call per tick, and a commit only the read sees wakes only its own watchers', async () => {
+		const service = new HeldRegistrationService();
+		const ticks: Array<() => void> = [];
+		const watch = new ReactivityCollectionWatch({
+			service,
+			profile: coreProfile(),
+			quorumRatio: 0.75,
+			subscribers: new ReactivitySubscriberRegistry(),
+			scheduleRotation: () => {},
+			setTimer: (fn) => { ticks.push(fn); return () => {}; },
+		});
+		const collections = ['app/a', 'app/b', 'app/c'];
+		const revisions = new Map(collections.map((id) => [id, 1]));
+		const { reader, calls } = tailReader((id) => ({ tailId: OLD_TAIL, revision: revisions.get(id)! }));
+		const changes = new Map(collections.map((id) => [id, 0]));
+		for (const id of collections) {
+			watch.watch({ collectionId: id, tails: reader, onChange: () => { changes.set(id, changes.get(id)! + 1); } });
+		}
+		await settle();
+		for (const registration of service.registrations) {
+			registration.resolve();
+		}
+		await settle();
+		expect(ticks, 'one timer for the service, not one per collection').to.have.length(1);
+
+		calls.length = 0;
+		for (let tick = 0; tick < 3; ++tick) {
+			ticks[ticks.length - 1]!();
+			await settle();
+		}
+		expect(calls, 'each idle tick read every collection in one call').to.deep.equal([collections, collections, collections]);
+
+		const before = new Map(changes);
+		revisions.set('app/b', 2);
+		ticks[ticks.length - 1]!();
+		await settle();
+		for (const id of collections) {
+			expect(changes.get(id)! - before.get(id)!, `wakes of ${id}`).to.equal(id === 'app/b' ? 1 : 0);
+		}
+	});
+
+	it('a collection whose earlier tick is still queued behind its registration sits later ticks out', async () => {
+		const service = new HeldRegistrationService();
+		const ticks: Array<() => void> = [];
+		const watch = new ReactivityCollectionWatch({
+			service,
+			profile: coreProfile(),
+			quorumRatio: 0.75,
+			subscribers: new ReactivitySubscriberRegistry(),
+			scheduleRotation: () => {},
+			setTimer: (fn) => { ticks.push(fn); return () => {}; },
+		});
+		const { reader, calls } = tailReader(() => ({ tailId: OLD_TAIL, revision: 1 }));
+		watch.watch({ collectionId: COLLECTION, tails: reader, onChange: () => {} });
+		await settle();
+		calls.length = 0;
+
+		for (let tick = 0; tick < 3; ++tick) {
+			ticks[ticks.length - 1]!();
+			await settle();
+		}
+		expect(calls, 'only the first tick read while the registration held the queue').to.have.length(1);
+
+		service.registrations[0]!.resolve();
+		await settle();
+		calls.length = 0;
+		ticks[ticks.length - 1]!();
+		await settle();
+		expect(calls, 'the tick reads again once the queued answer was applied').to.deep.equal([[COLLECTION]]);
+	});
+
+	it('a tick consults only when a collection it reads is verifyEveryTicks ticks past its last consulting read, which restarts every count it names', async () => {
+		const service = new HeldRegistrationService();
+		const ticks: Array<() => void> = [];
+		const watch = new ReactivityCollectionWatch({
+			service,
+			profile: coreProfile(),
+			quorumRatio: 0.75,
+			subscribers: new ReactivitySubscriberRegistry(),
+			scheduleRotation: () => {},
+			setTimer: (fn) => { ticks.push(fn); return () => {}; },
+			verifyEveryTicks: 3,
+		});
+		const { reader, calls, consults } = tailReader(() => ({ tailId: OLD_TAIL, revision: 1 }));
+		const fireTick = async (): Promise<void> => {
+			ticks[ticks.length - 1]!();
+			await settle();
+		};
+		const attach = async (collectionId: string): Promise<void> => {
+			watch.watch({ collectionId, tails: reader, onChange: () => {} });
+			await settle();
+			service.registrations[service.registrations.length - 1]!.resolve();
+			await settle();
+		};
+
+		await attach('app/a');
+		await fireTick();
+		await attach('app/b');
+		for (let tick = 0; tick < 3; ++tick) {
+			await fireTick();
+		}
+		const ab = ['app/a', 'app/b'];
+		expect(calls).to.deep.equal([['app/a'], ['app/a'], ['app/a'], ['app/b'], ['app/b'], ab, ab, ab]);
+		expect(consults, 'first read and post-registration re-read consult; then app/a is due on its third tick, and that read restarts app/b too').to.deep.equal([
+			true, true, // app/a: first read, re-read once its registration landed
+			false, // tick 1
+			true, true, // app/b joins mid-cycle
+			false, // tick 2: app/a at 2, app/b at 1
+			true, // tick 3: app/a at 3
+			false, // tick 4: both restarted
+		]);
+	});
+
+	it('a change landing in local storage wakes even for a revision a notification already woke for, and a notification or tick read after it does not', async () => {
+		const feed = localFeed();
+		const fixture = await registeredWatch(0, { localChanges: feed.notifier });
+		const { registry, state, fireTick, handle } = fixture;
+		const before = state.changes;
+
+		feed.land(5);
+		expect(state.changes - before, 'the local landing woke the watcher').to.equal(1);
+		state.tail = { tailId: OLD_TAIL, revision: 5 };
+		fireTick();
+		await settle();
+		expect(state.changes - before, 'a tick reading the revision the landing woke for').to.equal(1);
+		registry.deliver(TOPIC, notification(OLD_TAIL, 5));
+		await settle();
+		expect(state.changes - before, 'a notification for the revision the landing woke for').to.equal(1);
+
+		registry.deliver(TOPIC, notification(OLD_TAIL, 6));
+		await settle();
+		expect(state.changes - before, 'a notification ahead of the local apply').to.equal(2);
+		feed.land(6);
+		expect(state.changes - before, 'the local apply that follows it, which is when a local re-read can see it').to.equal(3);
+
+		await handle.close();
+		expect(feed.listening(), 'closing the last watch stops listening to local storage').to.equal(0);
 	});
 });

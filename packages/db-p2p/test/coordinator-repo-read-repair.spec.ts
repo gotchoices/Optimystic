@@ -26,6 +26,7 @@ import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
+import { createMesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const captureCoordinatorLog = (fn: () => Promise<void>): Promise<unknown[][]> =>
 	captureLog('coordinator-repo', fn);
@@ -234,6 +235,9 @@ describe('CoordinatorRepo read-repair', () => {
 			clusterLatestCallback
 		);
 
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
+
 		// Stub the clock so the spec is deterministic.
 		const baseTime = 1_000_000;
 		repo.now = () => baseTime;
@@ -277,6 +281,9 @@ describe('CoordinatorRepo read-repair', () => {
 			clusterLatestCallback
 		);
 
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
+
 		// No setLastSeenForTest call — block has never been marked seen, so lazy
 		// must treat it as stale and trigger.
 		await repo.get({ blockIds: [blockId] });
@@ -307,6 +314,9 @@ describe('CoordinatorRepo read-repair', () => {
 			undefined,
 			clusterLatestCallback
 		);
+
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
 
 		const baseTime = 3_000_000;
 		repo.now = () => baseTime;
@@ -350,6 +360,9 @@ describe('CoordinatorRepo read-repair', () => {
 			undefined,
 			clusterLatestCallback
 		);
+
+		// Asserts on what the consult concluded, so the window's consult waits here (behind the read in production).
+		repo.awaitWindowConsults = true;
 
 		const baseTime = 2_000_000;
 		repo.now = () => baseTime;
@@ -667,6 +680,9 @@ describe('CoordinatorRepo read-repair', () => {
 				clusterLatestCallback
 			);
 			repo.now = () => 1_000_000;
+			// Asserts on what each consult concluded about the window, so the consults wait here
+			// (behind the read in production).
+			repo.awaitWindowConsults = true;
 
 			await repo.get({ blockIds: [blockId] });
 			const afterFirst = invocations.length;
@@ -1095,7 +1111,7 @@ describe('CoordinatorRepo read-repair', () => {
 				expect(await servedRev(7), 'the floor gets the cohort asked, and the newer revision served').to.equal(7);
 			});
 			expect(consults()).to.equal(1);
-			expect(triggers(captured)).to.deep.equal([{ blockId, mode: 'lazy', ageMs: 0, localRev: 6, reason: 'floor', floor: 7 }]);
+			expect(triggers(captured)).to.deep.equal([{ blockId, mode: 'lazy', ageMs: 0, localRev: 6, reason: 'floor', background: false, floor: 7 }]);
 
 			// Met: the local copy is at the floor now, so the floor is no reason to ask again.
 			expect(await servedRev(7)).to.equal(7);
@@ -1123,6 +1139,8 @@ describe('CoordinatorRepo read-repair', () => {
 			// consults and re-stamps without a floor, and the old floor consults once more.
 			repo.now = () => baseTime + window + 1;
 			await servedRev();
+			// The lapsed window's consult runs behind the read; let it end before counting.
+			await repo.settleHeldBlockConsults();
 			expect(consults(), 'the lapsed window consulted').to.equal(3);
 			await servedRev(7);
 			expect(consults(), 'the re-stamp without a floor forgot the floor consulted under').to.equal(4);
@@ -1194,9 +1212,49 @@ describe('CoordinatorRepo read-repair', () => {
 		);
 
 		const result = await repo.get({ blockIds });
+		// The window's consults run behind the read; wait for them before counting how many overlapped.
+		await repo.settleHeldBlockConsults();
 
 		expect(mostOpenAtOnce, 'both blocks\' consults in flight at once').to.equal(blockIds.length);
 		for (const id of blockIds) expect(result[id]?.state?.latest).to.deep.equal(held);
+	});
+
+	it('asks each cohort peer about every block of a read in one request', async () => {
+		// GitHub #43 counts `sync` requests between idle machines. The refresh every live query runs
+		// reads two blocks, so a request per block per peer doubled that count for nothing.
+		const mesh = await createMesh(3, { responsibilityK: 3 });
+		const [reader, ...holders] = mesh.nodes;
+		const blockIds: BlockId[] = ['block-header', 'block-log-tail'];
+		const inserts = Object.fromEntries(blockIds.map(id => [id, { header: { id, type: 'test', collectionId: 'collection-1' } }]));
+		for (const holder of holders) {
+			expect((await holder.storageRepo.pend({ actionId: 'a-two-blocks', transforms: { inserts, updates: {}, deletes: [] }, policy: 'c' })).success).to.equal(true);
+			expect((await holder.storageRepo.commit({ actionId: 'a-two-blocks', tailId: blockIds[0]!, rev: 1, blockIds })).success).to.equal(true);
+		}
+
+		const result = await reader!.coordinatorRepo.get({ blockIds });
+
+		for (const holder of holders) expect(mesh.consultRequests(reader!, holder), 'one request per peer, not one per block').to.equal(1);
+		for (const id of blockIds) expect(result[id]?.block, `${id} acquired from the answers`).to.not.equal(undefined);
+	});
+
+	it('a member that applied a commit another machine coordinated reads it inside the window without a consult', async () => {
+		// GitHub #43: on a two-member group the member that did not coordinate a write asked the writer,
+		// on its next read of each block, whether anything was newer than what the writer had just sent.
+		const mesh = await createMesh(2, { responsibilityK: 2, clusterPolicy: { repairCorroborationClusterSize: 2 } });
+		const [writer, member] = mesh.nodes as [MeshNode, MeshNode];
+		const written: BlockId = 'block-written-by-the-other-machine';
+		const transforms = { inserts: { [written]: { header: { id: written, type: 'test', collectionId: 'collection-1' } } }, updates: {}, deletes: [] };
+		expect((await writer.coordinatorRepo.pend({ actionId: 'a-write', rev: 1, transforms, policy: 'c' })).success, 'pend').to.equal(true);
+		expect((await writer.coordinatorRepo.commit({ actionId: 'a-write', blockIds: [written], tailId: written, rev: 1 })).success, 'commit').to.equal(true);
+
+		const captured = await captureCoordinatorLog(async () => {
+			const result = await member.coordinatorRepo.get({ blockIds: [written] });
+			await member.coordinatorRepo.settleHeldBlockConsults();
+			expect(result[written]?.state?.latest, 'the member holds the write').to.deep.equal({ actionId: 'a-write', rev: 1 });
+		});
+
+		expect(hasTag(captured, 'cluster-tx:read-repair-triggered'), 'no consult started').to.equal(false);
+		expect(mesh.consultRequests(member, writer), 'the writer is not asked about its own write').to.equal(0);
 	});
 
 	describe('a read from a cohort member that says what it holds', () => {

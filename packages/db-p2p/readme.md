@@ -124,7 +124,7 @@ The storage layer implements the core database abstractions over a pluggable raw
 
 - **StorageRepo**: Implements the `IRepo` interface on top of `BlockStorage` — backend-agnostic
 - **BlockStorage**: Provides versioned block storage with conflict resolution, reading/writing through an injected `IRawStorage`
-- **`IRawStorage`**: The raw persistence interface. An in-memory backend ships in this package; the filesystem backend (`FileRawStorage`) lives in `@optimystic/db-p2p-storage-fs`
+- **`IRawStorage`**: The raw persistence interface. An in-memory backend ships in this package; the filesystem backend (`FileRawStorage`) lives in `@optimystic/db-p2p-storage-fs`. Every backend reports a fixed `durability` — what a write survives once a later `flush()` has resolved: `'none'` for the in-memory backend, `'power-loss'` for the filesystem one, `'process-crash'` for the LevelDB, IndexedDB and SQLite ones — and a node logs it once at start-up. See [docs/storage.md §6](docs/storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved)
 - **Data restoration**: Pluggable restoration for missing data from network peers
 
 ## Detailed Component Architecture
@@ -288,11 +288,14 @@ class BlockStorage implements IBlockStorage {
 `BlockStorage` persists through the `IRawStorage` interface, so the backing store is pluggable:
 
 - **In-memory** (`MemoryRawStorage`) — ships in this package; used for tests and ephemeral nodes.
-- **Filesystem** (`FileRawStorage`) — lives in the separate [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs) package; JSON files with atomic writes, organized per block:
+- **Filesystem** (`FileRawStorage`) — lives in the separate [`@optimystic/db-p2p-storage-fs`](../db-p2p-storage-fs) package; JSON files written through a write-ahead log, organized per block:
 
 ```typescript
 // Filesystem backend layout (@optimystic/db-p2p-storage-fs)
 {basePath}/
+├── write-ahead.log              # Groups written since the last checkpoint
+├── write-ahead.log.sealed       # Present only while a checkpoint runs, or after a crash in one
+├── store.lock                   # { pid, hostname } of the process holding the store
 ├── {blockId}/
 │   ├── meta.json                # Block metadata and revision ranges
 │   ├── revs/{rev}.json          # Revision → ActionId mappings
@@ -372,6 +375,23 @@ const node = await createLibp2pNode({
 Omitting it is the default and leaves behavior unchanged. See
 [internals](../../docs/internals.md) § Inbound Stream Authorization for the full contract.
 
+**Network membership (optional).** Authorization decides who may send to this node, not who this
+node sends to: a peer counts as a member of the network, and so as a candidate cohort member or
+coordinator, or a target of background replication, when its advertised protocol list names this network's protocols, and any connected
+peer can fill that list. A private database therefore also supplies `isNetworkMember`, a
+synchronous, fail-closed predicate (this node is always a member):
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  bootstrapNodes: [],
+  authorizeInboundStream: (remotePeerId) => memberSet.has(remotePeerId),
+  isNetworkMember: (peerId) => memberSet.has(peerId)
+});
+```
+
+See [internals § Network Membership Predicate](../../docs/internals.md#network-membership-predicate).
+
 **Announcing a different address than you bind (optional).** A node behind a NAT, port forward,
 reverse proxy or DNS front binds one address but is reachable at another. `announceAddrs` advertises
 the reachable address *instead of* whatever the transports report; `appendAnnounceAddrs` advertises
@@ -408,13 +428,16 @@ disagree about the same key's cohort.
 import { createLibp2pNode } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 
+// In-memory when omitted; a raw-storage backend makes it durable. Options such as
+// { idleFlushMs, checkpointBytes, checkpointIdleMs } are in that package's README.
+const storage = new FileRawStorage('/var/lib/optimystic');
+
 // Create (and start) a libp2p node. The repo and cluster protocol services are registered by the
 // factory itself — there is no `services` option to pass them in.
 const node = await createLibp2pNode({
   networkName: 'my-net',
   bootstrapNodes: ['...'],
-  // In-memory when omitted; a raw-storage backend makes it durable
-  storage: new FileRawStorage('/var/lib/optimystic'),
+  storage,
 });
 
 // The handles the node already owns (see `OptimysticNodeAttachments`)
@@ -424,6 +447,8 @@ const keyNetwork = node.keyNetwork;            // Peer/coordinator discovery
 
 // ... use them, then:
 await node.stop();
+// The node never closes a store it was handed: closing it flushes, checkpoints and releases its lock
+await storage.close();
 ```
 
 `createLibp2pNode` is all-or-nothing: the node is started early and then wired, so if any wiring step
@@ -435,6 +460,25 @@ Constructing a `StorageRepo`, `CoordinatorRepo` or `Libp2pKeyPeerNetwork` yourse
 host assembling a stack *without* `createLibp2pNode`. A standalone `CoordinatorRepo` or
 `Libp2pKeyPeerNetwork` must be told its cluster size; pass `DEFAULT_CLUSTER_SIZE` (exported from
 this package) to match what an unconfigured node resolves to.
+
+### How long a write may wait for its sync (`storageDurability`)
+
+A node may leave a storage write unsynced for a short window before forcing it onto disk; how long is computed per write from the size of the cohort the write's consensus ran on, as the longest wait for which every machine that would have to lose the write losing power within it stays less likely than the accepted loss chance (`durabilityWindowMs` in `src/storage/durability-window.ts`). A write only this machine holds — every solo pend and commit — is synced before it is reported. The formula, its table, and which writes carry a window are in [docs/storage.md §How long a write may wait for its sync](docs/storage.md#how-long-a-write-may-wait-for-its-sync); what an acknowledged write survives on each backend is in [§What an acknowledged write survives](docs/storage.md#what-an-acknowledged-write-survives).
+
+```typescript
+const node = await createLibp2pNode({
+  networkName: 'my-net',
+  storage,
+  storageDurability: {
+    independentFailures: true,  // default; false when machines share power — every write then syncs first
+    lossRatePerHour: 1 / 720,   // default: one power cut or OS crash per machine per 30 days
+    lossTarget: 1e-9,           // default: accepted chance of losing one acknowledged write
+    maxWindowMs: 5000,          // default: cap on any window
+  },
+});
+```
+
+At the defaults every cohort of two or more members gets the 5000 ms cap. The window matters only on storage that can sync (`durability: 'power-loss'`); a `'process-crash'` backend cannot sync at all, so a power cut may lose any write the operating system has not yet written out, whatever the window. The node's start-up storage line reports the windows in force. An out-of-range value throws at node construction.
 
 ### External Client Operations
 
@@ -732,7 +776,7 @@ Optimystic's own code does not require a global `Buffer` — it encodes with `ui
 
 Optimystic's own code never touches `TextDecoder` or `structuredClone` while a module is loading: each `TextDecoder` is built the first time something decodes, and then reused. So importing `@optimystic/db-p2p/rn` (or db-core, or db-p2p-storage-rn) does not throw *because of Optimystic* on a runtime whose polyfill is not installed yet. **Both are still required polyfills**, and should still be installed before any other import: the third-party dependencies in the table construct `TextDecoder` at load and fail startup without it, and Optimystic needs both as soon as it decodes or applies an update. `NO_MODULE_SCOPE_TEXT_DECODER` in `eslint.config.js` keeps `TextDecoder` construction out of module scope in every package, and `test/module-load-globals.spec.ts` checks both globals at runtime (for the `/rn` entry's load path only, which includes db-core but not db-p2p-storage-rn). The spec loads the `/rn` entry in a fresh process and fails if any first-party module uses either global during the load.
 
-Optimystic's own code also does not call `AbortSignal.timeout` or `AbortSignal.any`, call `Promise.withResolvers`, or construct `DOMException` — none of those are guaranteed under Hermes. (It does call `signal.throwIfAborted()`, which stays a required host polyfill per the table above because libp2p needs it anyway.) Every deadline is an explicit `AbortController` plus a timer, cleared on every exit path (see `dialRelay` in `src/network/relay-reservation.ts` and `RepoClient.processRepoMessage` in `src/repo/client.ts`, which hand-rolls the "abort on any of several signals" case rather than using `AbortSignal.any` or the `any-signal` package — the code comment there explains why). `no-restricted-syntax` in `eslint.config.js` keeps it that way. It also never calls `.unref()` on a timer directly: every call goes through `unrefTimer` in `src/unref-timer.ts`, which skips the call where the handle is a number (browsers, React Native), and the same lint rule bans any other `.unref` access.
+Optimystic's own code also does not call `AbortSignal.timeout` or `AbortSignal.any`, call `Promise.withResolvers`, or construct `DOMException` — none of those are guaranteed under Hermes. (It does call `signal.throwIfAborted()`, which stays a required host polyfill per the table above because libp2p needs it anyway.) Every deadline is an explicit `AbortController` plus a timer, cleared on every exit path (see `dialRelay` in `src/network/relay-reservation.ts` and `RepoClient.processRepoMessage` in `src/repo/client.ts`, which hand-rolls the "abort on any of several signals" case rather than using `AbortSignal.any` or the `any-signal` package — the code comment there explains why). `no-restricted-syntax` in `eslint.config.js` keeps it that way. It also never calls `.unref()` on a timer directly: every call goes through `unrefTimer` (defined in `@optimystic/db-core`, re-exported here from `src/unref-timer.ts`), which skips the call where the handle is a number (browsers, React Native), and the same lint rule bans any other `.unref` access.
 
 **Dormant, not yet reached:** `crypto.subtle` on React Native provides only `digest`. `@libp2p/crypto`'s ECDSA/RSA import-export and `@libp2p/keychain`'s AES-GCM call other `crypto.subtle` methods and would throw if a host application reached them; nothing in Optimystic's own code path does — peer identity uses Ed25519 through `@noble/curves`/`@noble/hashes`, not the platform `crypto.subtle`. Revisit if a host ever adds a feature that reaches `@libp2p/keychain` or a non-Ed25519 key type on React Native.
 
@@ -768,22 +812,25 @@ The value is libp2p's own connection-monitor init, passed through unchanged; uns
 
 **`pingInterval` has to be longer than the deadline, or the deadline does not apply.** The monitor opens a ping stream every `pingInterval` whether or not the previous ping has answered, and it pings on `/ipfs/ping/1.0.0` — the same protocol the `@libp2p/ping` service that every node here registers serves, and that service allows one outbound ping stream per connection. So the second ping to a peer that has not yet answered the first is refused before it leaves the phone, the monitor cannot tell that from a late reply, and it aborts the connection. A peer really gets `min(minTimeout, pingInterval)` to answer, so leaving the interval at its 10-second default caps a 30-second deadline at 10 seconds — which is what the measurement above actually ran with. `test/connection-monitor-ping-overlap.spec.ts` reproduces both halves on two real nodes.
 
+**The answering side's ping timeout is the third bound.** Every node's `@libp2p/ping` service aborts an inbound ping stream after its own handler timeout — the timer covers the echo, waiting for the pinger to close, and the close itself — and the pinging node's monitor reads that reset as a dead peer and aborts the connection. So a peer's deadline is also capped at the handler timeout of the node it pings. That library fixes it at 10 seconds; here it now follows the declared deadline: unset, it is twice `connectionMonitor.pingTimeout.maxTimeout` (60 seconds for the shape above, never below 10) — twice libp2p's 60-second default `maxTimeout` when only `minTimeout` is declared, since that default is what caps the monitor then — and 10 seconds when `pingTimeout` declares neither bound. Set `pingHandlerTimeoutMs` to choose it outright; a declared value is used as given (`resolvePingHandlerTimeoutMs` in `src/rpc-deadline.ts`). The default assumes the peers pinging this node have the same monitor setting, as the advice below already does. The cost is that a stalled inbound ping stream is held that long.
+
 **What the patient shape costs is how long a dead peer is held.** The next ping after a peer freezes is due within `pingInterval`, and then waits out `minTimeout`, so the connection is reclaimed within about `pingInterval + minTimeout` — a little over a minute for the numbers above. A large `maxTimeout` does not extend that; it is not a grace period, and the shape above sets it equal to `minTimeout`, which pins the deadline there.
 
-**Slow relayed links: declare the round trip, and every deadline follows.** Opening a relayed connection costs about four link round trips (eight one-way delays; measured: 7.3 s at 900 ms one-way, 12.1 s at 1500 ms) when the dialer already has a connection to the relay. When it does not — the ordinary case for a node joining through an invitation, which dials through the inviter's relay — libp2p opens the relay connection first, inside the same per-address limit, and the whole open costs up to about 6.6 round trips when the dialer's leg to the relay carries most of the delay (`test/cold-relayed-dial-fits-the-address-limit.spec.ts`). That measurement leaves out the socket setup on the dialer's leg, one leg round trip each for TCP, a WebSocket upgrade and TLS under `wss`, so a real cold open costs up to about 8.6 round trips over WebSocket and 9.6 over `wss`, taking the leg's round trip to be at most the declared one. Opening a stream costs one more round trip even on a connection that is already open (`test/stream-open-costs-a-round-trip.spec.ts`). The deadlines this package applies by default are sized for a LAN: its RPC clients give a dial 3 s, so a relayed connection cannot open above about 375 ms one-way, and above a 3 s round trip even an open connection fails every request; libp2p gives a connection 10 s at each end, and when only the listener's limit is exceeded the dialer's dial succeeds against a connection the listener has already discarded, so every stream on it dies with `Unexpected EOF`. Declare `linkRoundTripMs` — the slowest round trip, in milliseconds, between any two nodes that will talk to each other, relayed hops included — on every node, with the same value, and each deadline is derived from it (`resolveLinkDeadlines` in `src/rpc-deadline.ts`):
+**Slow relayed links: declare the round trip, and every deadline follows.** Opening a relayed connection costs about four link round trips (eight one-way delays; measured: 7.3 s at 900 ms one-way, 12.1 s at 1500 ms) when the dialer already has a connection to the relay. When it does not — the ordinary case for a node joining through an invitation, which dials through the inviter's relay — libp2p opens the relay connection first, inside the same per-address limit, and the whole open costs up to about 6.6 round trips when the dialer's leg to the relay carries most of the delay (`test/cold-relayed-dial-fits-the-address-limit.spec.ts`). That measurement leaves out the socket setup on the dialer's leg, one leg round trip each for TCP, a WebSocket upgrade and TLS under `wss`, so a real cold open costs up to about 8.6 round trips over WebSocket and 9.6 over `wss`, taking the leg's round trip to be at most the declared one. Opening a stream costs one more round trip even on a connection that is already open (`test/stream-open-costs-a-round-trip.spec.ts`); a node keeps the next stream to a peer it is talking to negotiated in advance (`src/network/prepared-streams.ts`), so a request in a busy spell skips it, but the first after a quiet spell pays it. The deadlines this package applies by default are sized for a LAN: its RPC clients give a dial 3 s, so a relayed connection cannot open above about 375 ms one-way, and above a 3 s round trip even an open connection fails every request that has to negotiate its stream; libp2p gives a connection 10 s at each end, and when only the listener's limit is exceeded the dialer's dial succeeds against a connection the listener has already discarded, so every stream on it dies with `Unexpected EOF`. Declare `linkRoundTripMs` — the slowest round trip, in milliseconds, between any two nodes that will talk to each other, relayed hops included — on every node, with the same value, and each deadline is derived from it (`resolveLinkDeadlines` in `src/rpc-deadline.ts`):
 
 | Deadline | Derived as (`r` = `linkRoundTripMs`) | Why |
 |---|---|---|
 | RPC dial — cluster consensus, sync, dispute, block pushes | `max(3000, 11 × r)` | a cold connection open (10 r, below), then stream negotiation 1 r |
 | RPC response, and block pushes' | `max(10000, 3 × r)` | request plus reply is 1 r; the rest covers payload and the peer's own work |
 | libp2p `connectionManager.addressDialTimeout` | `max(6000, 10 × r)` | one address must carry a whole cold connection open, relay connection included (up to ≈ 8.6 r over WebSocket, 9.6 r over `wss`); libp2p applies it inside every dial, RPC dials included |
-| libp2p `connectionManager.dialTimeout` | `max(10000, 10 × r)` | governs every dial that carries no signal of its own, so never shorter than the per-address limit |
+| libp2p `connectionManager.dialTimeout`, and FRET's `dialTimeoutMs` | `max(10000, 10 × r)` | governs every dial that carries no signal of its own, so never shorter than the per-address limit; FRET's maintenance redial always passes a signal, so the node hands it the same value as its whole-dial limit |
 | libp2p `connectionManager.inboundUpgradeTimeout` | `max(10000, 5 × r)` | the listener's timer covers only its own upgrade, never the dialer's relay open: ≈ 4 r plus margin |
 | `clusterPolicy.cohortQueryTimeoutMs`, when not declared | `max(1000, 3 × r)` | a read-path request over an open connection is 2 r |
 | Stream hedge (`hedgeDelayMs`) | `max(250, 1.5 × r)` | a stream open on one connection to a peer that has not answered within this is hedged with the next open connection, then a fresh dial, without cancelling it, so one dead connection cannot strand a peer; stream negotiation is 1 r, so a merely slow connection keeps its chance |
 | Dead connection (`deadConnectionDelayMs`) | `dial` | a stream open on an existing connection that stays pending for a whole RPC dial deadline has that connection aborted as dead (`open-stream:connection-dead`), on its own timer rather than the request's |
 | Rebalance push and confirm (`transferTimeoutMs`) | `max(30000, dial)` | never shorter than a dial |
 | A host's `NetworkTransactor` `timeoutMs` (`transactionTimeoutMs`), not applied by the node | `max(30000, 4 × dial)` | a dial to a dead coordinator that runs out, a cold dial to the next, its cold dial to a cohort member, and the warm consensus round trips |
+| A host's `NetworkTransactor` `retryBackoffBaseMs` (retry backoff base), and the node's first hold before re-sending a read-repair consult a silent cohort peer left unanswered | `r`, 0 when undeclared | the first wait before a retry of an unanswered request, doubling per further coordinator, and the first hold, doubling per consecutive silent consult up to the reconcile pass bound; a request given up on is usually still in this node's send queue, so a retry sent at once lengthens it. No floor: undeclared means no wait, and `rpcDeadlines` does not move it |
 
 At a 3 s round trip that is a 30 s per-address limit and libp2p dial, a 33 s RPC dial, transfer and dead-connection delay, a 15 s inbound upgrade, a 10 s response, a 9 s cohort query, a 4.5 s stream hedge and a 132 s transaction budget. The time an application's own admission checks take — a relay or a target deciding whether to accept the dialer — is not part of `r`: add it on top through three of the explicit overrides below, `connectionManager.addressDialTimeout`, `connectionManager.dialTimeout` and `rpcDeadlines.dialTimeoutMs`.
 
@@ -791,7 +838,7 @@ At a 3 s round trip that is a 30 s per-address limit and libp2p dial, a 33 s RPC
 const node = await createLibp2pNode({ /* … */ transports, linkRoundTripMs: 3_000 });
 ```
 
-Every derived value floors at the one it replaces, so leaving the option unset keeps the LAN deadlines exactly. A value that is not a finite number above zero, or one so large that a derived deadline would overflow the 32-bit delay `setTimeout` accepts (above `MAX_LINK_ROUND_TRIP_MS`, about 13 hours), throws when the node is built rather than falling back to the LAN deadlines. An explicit per-deadline setting still wins over the derived value: `connectionManager: { dialTimeout, inboundUpgradeTimeout, addressDialTimeout }` (typed `Libp2pConnectionTimeouts`), `rpcDeadlines: { dialTimeoutMs, responseTimeoutMs }` (typed `RpcDeadlineDefaults`, either field alone), the `push*` fields of `spreadOnChurn` and `underReplicationDrain`, `clusterPolicy.cohortQueryTimeoutMs`, and a caller's own `dialTimeoutMs`. An `rpcDeadlines` value is used exactly as given, with no floor; the transfer deadline, the transaction budget and the dead-connection delay are derived from the dial deadline, so they follow an explicit one (the first two keeping their 30 s floor). The `push*` fields and a caller's own value still win over it. Keep `rpcDeadlines.dialTimeoutMs` no longer than `connectionManager.addressDialTimeout`, which libp2p applies to each address inside every RPC dial. A field that is not a finite number above zero throws when the node is built, as does a dial above `MAX_RPC_DIAL_TIMEOUT_MS` (about 5 days, so that four dials and a few seconds fit a 32-bit timer) or a response above 2^31 − 1. The resolved values are attached to the node as `node.linkDeadlines`, so a host that dials through the node — a `NetworkTransactor`'s `dialTimeoutMs`, and its `timeoutMs` from `transactionTimeoutMs` — reads them there rather than restating a LAN number.
+Every derived value floors at the one it replaces, so leaving the option unset keeps the LAN deadlines exactly. A value that is not a finite number above zero, or one so large that a derived deadline would overflow the 32-bit delay `setTimeout` accepts (above `MAX_LINK_ROUND_TRIP_MS`, about 13 hours), throws when the node is built rather than falling back to the LAN deadlines. An explicit per-deadline setting still wins over the derived value: `connectionManager: { dialTimeout, inboundUpgradeTimeout, addressDialTimeout }` (typed `Libp2pConnectionTimeouts`), `rpcDeadlines: { dialTimeoutMs, responseTimeoutMs }` (typed `RpcDeadlineDefaults`, either field alone), the `push*` fields of `spreadOnChurn` and `underReplicationDrain`, `clusterPolicy.cohortQueryTimeoutMs`, and a caller's own `dialTimeoutMs`. An `rpcDeadlines` value is used exactly as given, with no floor; the transfer deadline, the transaction budget and the dead-connection delay are derived from the dial deadline, so they follow an explicit one (the first two keeping their 30 s floor). The `push*` fields and a caller's own value still win over it. Keep `rpcDeadlines.dialTimeoutMs` no longer than `connectionManager.addressDialTimeout`, which libp2p applies to each address inside every RPC dial. A field that is not a finite number above zero throws when the node is built, as does a dial above `MAX_RPC_DIAL_TIMEOUT_MS` (about 5 days, so that four dials and a few seconds fit a 32-bit timer) or a response above 2^31 − 1. `connectionManager.dialTimeout` is checked the same way (above zero, at most 2^31 − 1), because FRET takes it too and refuses what libp2p alone would accept; the other two `connectionManager` fields reach libp2p unchecked. The resolved values are attached to the node as `node.linkDeadlines`, so a host that dials through the node — a `NetworkTransactor`'s `dialTimeoutMs`, its `timeoutMs` from `transactionTimeoutMs`, and its `retryBackoffBaseMs` — reads them there rather than restating a LAN number.
 
 **Set `maxTimeout` equal to `minTimeout`, and the deadline is exactly that.** `pingTimeout` is an adaptive-timeout init: the connection monitor reports each ping's duration back to it, and the next ping's deadline is 1.2 times the moving average of those durations (a ping that ran out its deadline is entered at twice its duration), held between `minTimeout` and `maxTimeout`. With the two equal, as above, the deadline is always exactly `minTimeout`. A `maxTimeout` left above `minTimeout` would let a slow reply widen the deadline for one ping before the next fast one brought it back — tolerance of a single slow ping, not a deadline that grows toward `maxTimeout`.
 

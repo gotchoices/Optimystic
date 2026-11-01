@@ -1,6 +1,6 @@
 {
   "name": "@optimystic/substrate-simulator",
-  "version": "1.12.1",
+  "version": "1.22.0",
   "private": true,
   "type": "module",
   "description": "Discrete-event virtual-clock engine for the Optimystic design simulator (mock-only, not shipped to runtime consumers)",
@@ -36,7 +36,7 @@
     "@libp2p/interface": "^3.3.0",
     "@libp2p/peer-id": "^6.0.15",
     "libp2p": "^3.3.11",
-    "p2p-fret": "^1.0.1"
+    "p2p-fret": "^1.2.1"
   },
   "devDependencies": {
     "@types/chai": "^5.2.3",

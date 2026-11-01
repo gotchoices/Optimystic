@@ -40,7 +40,7 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import { Tree, TransactionCoordinator } from '@optimystic/db-core';
 import type { ITransactor, CollectionId } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
@@ -89,7 +89,7 @@ interface Gate {
  * Built once per case so every `Database` in it shares one tracker and sees the others' writes.
  */
 function instrumentedTransactor(storage: MemoryRawStorage, gate: Gate, counts: Counts, trail?: Trail): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
+	const repo = new StorageRepo(storage);
 	const count = (method: string) => { counts[method] = (counts[method] ?? 0) + 1; };
 	return {
 		async get(blockGets) {

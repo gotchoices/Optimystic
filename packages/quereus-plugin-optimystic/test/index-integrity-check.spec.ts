@@ -264,6 +264,19 @@ describe('verifyIndexes (two-way index-versus-table check)', () => {
 		expect([report.rowCount, report.entryCount]).to.deep.equal([4, 4]);
 	});
 
+	it('reports an entry for a row outside a partial index\'s predicate as an outside-predicate orphan', async () => {
+		await db.exec(`create table Flagged (Id integer primary key, Token text, Flag integer) using optimystic('tree://integrity/Flagged')`);
+		await db.exec(`create index flagged_by_token on Flagged(Token) where Flag = 1`);
+		await db.exec(`insert into Flagged (Id, Token, Flag) values (1, 'tok-a', 1), (2, 'tok-b', 0)`);
+		// The entry a build that indexed every row wrote for row 2, which the predicate excludes.
+		const treeKey = encodeKeyTuple(['tok-b']) + encodeKeyTuple(['2']);
+		await stageRawEntry('Flagged', 'flagged_by_token', treeKey, encodeKeyTuple(['2']));
+
+		const [report] = await plugin.verifyIndexes(db, 'Flagged');
+		expect(orphans(report!)).to.deep.equal([{ reason: 'outside-predicate', value: ['tok-b'], pk: ['2'] }]);
+		expect(report!.missing).to.deep.equal([]);
+	});
+
 	it('reports no indexes for a table with none, and an index over an empty table as clean', async () => {
 		await db.exec(`create table Bare (Id integer primary key, Token text null) using optimystic('tree://integrity/Bare')`);
 		expect(await plugin.verifyIndexes(db, 'Bare')).to.deep.equal([]);

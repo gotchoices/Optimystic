@@ -39,7 +39,7 @@ describe('commit proofs do not share the transactions keyspace', () => {
 
 	beforeEach(() => {
 		storage = new MemoryRawStorage();
-		repo = new StorageRepo(id => new BlockStorage(id, storage));
+		repo = new StorageRepo(storage);
 	});
 
 	it('Order A: committing an action named `~proof:5`, then retaining a proof for rev 5, leaves the committed transform intact', async () => {

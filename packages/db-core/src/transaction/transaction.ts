@@ -2,6 +2,7 @@ import { randomBytes } from "@noble/hashes/utils.js";
 import { toString as uint8ArrayToString } from "uint8arrays/to-string";
 import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
+import type { TransactionDurability } from "./durability.js";
 import { hashString } from "../utility/hash-string.js";
 
 /**
@@ -386,6 +387,14 @@ export type ExecutionResult = {
 	committedCollections?: CollectionId[];
 	/** On a partial multi-collection commit failure, the collections that failed to commit. */
 	failedCollections?: CollectionId[];
+	/**
+	 * Who holds what this commit wrote, present whenever something was written: on success, every
+	 * collection the commit wrote; on a partial failure, exactly {@link committedCollections}. Absent
+	 * when nothing was written — a failure where nothing landed, or a success with nothing staged.
+	 * Test it through `isFullyDurable(durability.overall)`; an absent `overall` means a collection is
+	 * saved but who holds it is unknown, so show the change as pending.
+	 */
+	durability?: TransactionDurability;
 };
 
 /**
@@ -415,6 +424,25 @@ export type ActionsStatement = {
 };
 
 /**
+ * The structured class on a refusal that judges the transaction ITSELF wrong: the checker re-ran it,
+ * or checked what it claims about itself, and found it false. Such a refusal fails the same way on
+ * every retry and at every honest validator.
+ *
+ * Present only for that class. A refusal that is out of date (a stale read), expired, or that this
+ * node could not judge (an unknown engine, a schema it does not hold, an operations-hash format it
+ * does not produce, a checker that threw) carries none — so absent means "not known to be a validity
+ * judgement", which is also what an older build that never sets it means.
+ *
+ * It exists because the refusal's `reason` is free-form prose that must never become control flow: a
+ * cluster member signs this into its reject vote (`Signature`'s `validity`), and that signed marker is
+ * what lets a writer tell "refused for good" from "try again".
+ */
+export type ValidityRejection = {
+	/** The operations hash this node computed by re-executing the transaction, when it got that far. */
+	computedHash?: string;
+};
+
+/**
  * Result of transaction validation.
  */
 export type ValidationResult = {
@@ -424,6 +452,8 @@ export type ValidationResult = {
 	reason?: string;
 	/** The operations hash computed during validation (for debugging) */
 	computedHash?: string;
+	/** Set only on a failure that judges the transaction itself wrong; see {@link ValidityRejection}. */
+	validity?: ValidityRejection;
 };
 
 /**

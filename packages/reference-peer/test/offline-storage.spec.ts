@@ -1,10 +1,5 @@
 import { expect } from 'chai';
-import {
-	createLibp2pNode,
-	StorageRepo,
-	BlockStorage,
-	MemoryRawStorage,
-} from '@optimystic/db-p2p';
+import { createLibp2pNode, StorageRepo, MemoryRawStorage } from '@optimystic/db-p2p';
 import { Diary } from '@optimystic/db-core';
 
 /**
@@ -27,9 +22,7 @@ describe('Offline mode storage sharing', () => {
 			expect(nodeStorageRepo, 'node.storageRepo must be set').to.exist;
 
 			// A fresh StorageRepo is a separate instance — this is what the bug created
-			const orphanRepo = new StorageRepo(
-				(id: string) => new BlockStorage(id, new MemoryRawStorage()),
-			);
+			const orphanRepo = new StorageRepo(new MemoryRawStorage());
 			expect(orphanRepo).to.not.equal(
 				nodeStorageRepo,
 				'identity check: fresh StorageRepo must differ from node.storageRepo',

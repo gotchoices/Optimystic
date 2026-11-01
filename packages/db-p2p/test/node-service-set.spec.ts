@@ -12,7 +12,8 @@
  * It covers the same two spawn shapes the old spec did (default TCP node, browser-shaped WS-only
  * custom-transports node), plus the `@optimystic/db-p2p/rn` factory — which shares the same base
  * and therefore inherits the same services — and a `relay: true` node, the one branch of the
- * services map that adds a key.
+ * services map that adds a key. The browser-shaped and RN nodes listen on nothing, so they also
+ * cover the branch that drops one: `dcutr` (see {@link EXPECTED_UNDIALABLE_SERVICE_KEYS}).
  *
  * Behavioral coverage lives elsewhere: hole-punching in `dcutr-direct-upgrade.spec.ts`, identify
  * protocol ids in `identify-protocol-id.spec.ts`, and identify/push address propagation in
@@ -28,8 +29,8 @@ import { createLibp2pNode as createLibp2pNodeRn } from '../src/libp2p-node-rn.js
 import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
 
 /**
- * Every service key `createLibp2pNodeBase` registers on a non-relay node, written out as a
- * literal rather than derived from the code under test. Deriving it would restate whatever the
+ * Every service key `createLibp2pNodeBase` registers on a non-relay node with a directly dialable
+ * listen address (the default TCP node below), written out as a literal rather than derived from the code under test. Deriving it would restate whatever the
  * services map happens to contain and assert nothing.
  *
  *  - `identify` / `identifyPush` — peer metadata exchange at connection-open time, and the
@@ -52,6 +53,27 @@ const EXPECTED_SERVICE_KEYS = [
 	'blockTransfer',
 	'cluster',
 	'dcutr',
+	'fret',
+	'identify',
+	'identifyPush',
+	'networkManager',
+	'ping',
+	'repo',
+	'sync'
+].sort();
+
+/**
+ * The service keys on a node that advertises no address another machine could dial directly — the
+ * browser-shaped and RN nodes below, which pass `listenAddrs: []`. Everything in
+ * {@link EXPECTED_SERVICE_KEYS} except `dcutr`: hole punching can never succeed for such a node,
+ * and each relayed connection to it would spend three streams finding that out
+ * (`holePunchingWanted` in `src/network/hole-punching.ts`). Written out, not derived, for the same
+ * reason as the literal above.
+ */
+const EXPECTED_UNDIALABLE_SERVICE_KEYS = [
+	'autoNAT',
+	'blockTransfer',
+	'cluster',
 	'fret',
 	'identify',
 	'identifyPush',
@@ -85,7 +107,7 @@ describe('node service set (createLibp2pNodeBase)', function () {
 		}
 	});
 
-	it('a browser-shaped (WS-only custom transports) node registers the same set', async () => {
+	it('a browser-shaped (WS-only custom transports) node registers the same set less hole punching', async () => {
 		const transports: Libp2pTransports = [webSockets(), circuitRelayTransport()];
 		const node = await createLibp2pNode({
 			bootstrapNodes: [],
@@ -96,14 +118,14 @@ describe('node service set (createLibp2pNodeBase)', function () {
 		});
 		try {
 			expect(serviceKeysOf(node), 'complete services key set on a browser-shaped node')
-				.to.deep.equal(EXPECTED_SERVICE_KEYS);
+				.to.deep.equal(EXPECTED_UNDIALABLE_SERVICE_KEYS);
 			expectWellFormedProtocolIds(node.getProtocols() as string[], 'browser-shaped node');
 		} finally {
 			await node.stop();
 		}
 	});
 
-	it('the /rn factory path registers the same set (it shares createLibp2pNodeBase)', async () => {
+	it('the /rn factory path registers the same set as the browser shape (it shares createLibp2pNodeBase)', async () => {
 		// The RN entrypoint refuses to pick transports for the caller, so it gets the browser shape.
 		const transports: Libp2pTransports = [webSockets(), circuitRelayTransport()];
 		const node = await createLibp2pNodeRn({
@@ -115,7 +137,7 @@ describe('node service set (createLibp2pNodeBase)', function () {
 		});
 		try {
 			const keys = serviceKeysOf(node);
-			expect(keys, 'complete services key set on an RN-factory node').to.deep.equal(EXPECTED_SERVICE_KEYS);
+			expect(keys, 'complete services key set on an RN-factory node').to.deep.equal(EXPECTED_UNDIALABLE_SERVICE_KEYS);
 			// Called out explicitly because the RN subpath is a separate published entrypoint that a
 			// reader can easily assume is a different node builder: it is not, and #7's fix reaches it.
 			expect(keys, 'the RN entrypoint inherits identifyPush (#7)').to.include('identifyPush');

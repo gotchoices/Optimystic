@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import type { BlockId, IBlock, BlockHeader, Transforms } from '@optimystic/db-core';
+import { isShortfallFailure, type BlockId, type IBlock, type BlockHeader, type Transforms } from '@optimystic/db-core';
 import { createMesh, nonResponsibleNodes, responsibleNodes, nodeWithBlocksInCohort, type Mesh, type MeshNode } from '../src/testing/mesh-harness.js';
 
 const makeHeader = (id: string): BlockHeader => ({
@@ -230,12 +230,13 @@ describe('Mesh Sanity Tests', () => {
 			mesh.failures.failingPeers = new Set([failingPeer]);
 
 			try {
-				await coordinator.coordinatorRepo.pend(
+				// Returned, not thrown, so a writer on another machine receives the counts rather than a reset stream.
+				const result = await coordinator.coordinatorRepo.pend(
 					{ actionId: 'a1', transforms: makeTransforms(blockId), policy: 'c' }
 				);
-				expect.fail('Should have thrown due to insufficient promises');
-			} catch (err) {
-				expect((err as Error).message).to.include('super-majority');
+				expect(result.success, 'too few promises refuse the pend').to.equal(false);
+				expect(!result.success && isShortfallFailure(result) ? result.shortfall : result)
+					.to.deep.equal({ approvals: 2, rejections: 0, peerCount: 3, needed: 3, silentPeers: [failingPeer] });
 			} finally {
 				mesh.failures.failingPeers = undefined;
 			}

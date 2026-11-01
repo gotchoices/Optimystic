@@ -1,7 +1,7 @@
-import type { ICohortGossipTransport, PeerRef, RingCoord } from "@optimystic/db-core";
+import type { CohortGossipV1, ICohortGossipTransport, RingCoord } from "@optimystic/db-core";
+import { b64urlToBytes, bytesKey } from "@optimystic/db-core";
 import type { Libp2p } from "libp2p";
 import { peerIdFromString } from "@libp2p/peer-id";
-import { peerIdToBytes } from "./peer-codec.js";
 import { sendOneWay } from "./stream-util.js";
 import { PROTOCOL_COHORT_GOSSIP } from "./protocols.js";
 import type { StreamOpenDeadlines } from "../rpc-deadline.js";
@@ -22,15 +22,18 @@ export interface FretCohortGossipTransportOptions {
 	readonly streamOpen?: StreamOpenDeadlines;
 }
 
+type GossipHandler = (g: CohortGossipV1) => void;
+
 /**
  * FRET-backed {@link ICohortGossipTransport}: intra-cohort gossip over
  * `/optimystic/cohort-topic/1.0.0/cohort-gossip`. `broadcast` fans a frame out to the FRET-assembled
- * cohort for `coord` (fire-and-forget, self excluded); inbound frames arrive through the host's gossip
- * protocol handler, which calls {@link deliver}. Subscribers registered via `onMessage` see every
- * delivered frame.
+ * cohort for `coord` (fire-and-forget, self excluded). Inbound frames arrive through the host's gossip
+ * protocol handler, which decodes each one once, authenticates it, and calls {@link deliver}; the frame
+ * then reaches only the subscribers registered via `onGossip` under the coord it names.
  */
 export class FretCohortGossipTransport implements ICohortGossipTransport {
-	private readonly handlers = new Set<(from: PeerRef, msg: Uint8Array) => void>();
+	/** Subscribers per coord, keyed by {@link bytesKey}; a coord with none has no entry. */
+	private readonly subscribers = new Map<string, Set<GossipHandler>>();
 	private readonly gossipProtocol: string;
 	private readonly wants: number;
 	private readonly selfPeerId: string;
@@ -64,26 +67,56 @@ export class FretCohortGossipTransport implements ICohortGossipTransport {
 		}
 	}
 
-	onMessage(handler: (from: PeerRef, msg: Uint8Array) => void): () => void {
-		this.handlers.add(handler);
-		return () => this.handlers.delete(handler);
+	onGossip(coord: RingCoord, handler: GossipHandler): () => void {
+		const key = bytesKey(coord);
+		let handlers = this.subscribers.get(key);
+		if (handlers === undefined) {
+			handlers = new Set();
+			this.subscribers.set(key, handlers);
+		}
+		handlers.add(handler);
+		return (): void => {
+			const held = this.subscribers.get(key);
+			if (held !== undefined && held.delete(handler) && held.size === 0) {
+				this.subscribers.delete(key);
+			}
+		};
 	}
 
 	/**
-	 * Number of live inbound subscriptions (one per subscribed gossip bus). Test/diagnostic introspection:
-	 * each {@link CoordEngine}'s bus subscribes via {@link onMessage} and drops its subscription on `close()`,
-	 * so this tracks the number of live coord engines (+ the node-level participant bus) — used to observe that
-	 * the coord-engine registry's LRU eviction actually tears evicted engines down (no leaked subscriptions).
+	 * True iff some bus is subscribed under `coord`. A plain map lookup: it touches no engine, so asking it of an
+	 * unauthenticated frame bumps nothing's eviction recency.
 	 */
-	get subscriberCount(): number {
-		return this.handlers.size;
+	hasSubscriber(coord: RingCoord): boolean {
+		return this.subscribers.has(bytesKey(coord));
 	}
 
-	/** Feed an inbound gossip frame (called by the host's `/cohort-gossip` protocol handler). */
-	deliver(fromPeerId: string, msg: Uint8Array): void {
-		const from: PeerRef = { id: peerIdToBytes(fromPeerId) };
-		for (const handler of this.handlers) {
-			handler(from, msg);
+	/**
+	 * Number of live inbound subscriptions over all coords (one per subscribed gossip bus). Test/diagnostic
+	 * introspection: each {@link CoordEngine}'s bus subscribes via {@link onGossip} and drops its subscription on
+	 * `close()`, so this tracks the number of live coord engines (+ the node-level participant bus) — used to
+	 * observe that the coord-engine registry's LRU eviction actually tears evicted engines down (no leaked
+	 * subscriptions).
+	 */
+	get subscriberCount(): number {
+		let count = 0;
+		for (const handlers of this.subscribers.values()) {
+			count += handlers.size;
+		}
+		return count;
+	}
+
+	/**
+	 * Hand a decoded, already-authenticated inbound frame to the subscribers of the coord it names (called by the
+	 * host's `/cohort-gossip` protocol handler). A frame for a coord nobody subscribes to reaches no one.
+	 */
+	deliver(g: CohortGossipV1): void {
+		const handlers = this.subscribers.get(bytesKey(b64urlToBytes(g.coord)));
+		if (handlers === undefined) {
+			return;
+		}
+		for (const handler of handlers) {
+			handler(g);
 		}
 	}
 }

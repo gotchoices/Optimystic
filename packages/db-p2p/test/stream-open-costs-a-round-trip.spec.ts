@@ -20,6 +20,10 @@
  *
  * The two cases are assertions about libp2p plus `ProtocolClient`, not about any deadline value —
  * the values are scaled down so the file runs in about two seconds.
+ *
+ * The third case is the in-repo answer to that premise: a `PreparedStreams` pool behind the key
+ * network's `connect` negotiates the next request's stream while the current request is in flight,
+ * so the first request still pays both round trips and the next one pays only its own.
  */
 import { expect } from 'chai';
 import type net from 'node:net';
@@ -34,6 +38,8 @@ import { pipe } from 'it-pipe';
 import * as lp from 'it-length-prefixed';
 import { ProtocolClient, DialTimeoutError } from '../src/protocol-client.js';
 import { openProtocolStream } from '../src/network/open-protocol-stream.js';
+import { PreparedStreams } from '../src/network/prepared-streams.js';
+import { Libp2pKeyPeerNetwork } from '../src/libp2p-key-network.js';
 import { registerProtocolHandler } from '../src/network/register-protocol-handler.js';
 import { listenDelayProxy, proxyPort } from './util/delay-proxy.js';
 
@@ -61,6 +67,8 @@ async function echoOnce(stream: Stream): Promise<void> {
 	});
 	await stream.close();
 }
+
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 class EchoClient extends ProtocolClient {
 	async echo(dialTimeoutMs: number): Promise<unknown> {
@@ -112,5 +120,30 @@ describe('opening a stream on an open connection costs a round trip', function (
 			caught = err;
 		}
 		expect(caught).to.be.instanceOf(DialTimeoutError);
+	});
+
+	it('with a prepared stream, a request after the first pays only its own round trip', async () => {
+		const pool = new PreparedStreams(dialer, { protocols: [ECHO_PROTOCOL] });
+		try {
+			const keyNetwork = new Libp2pKeyPeerNetwork(dialer, 1, undefined, undefined, undefined, undefined, undefined, undefined, undefined, pool);
+			const client = new EchoClient(listener.peerId, keyNetwork);
+
+			const firstStarted = Date.now();
+			expect(await client.echo(0)).to.deep.equal({ ping: 1 });
+			expect(Date.now() - firstStarted, 'nothing was prepared yet').to.be.at.least(2 * ROUND_TRIP_MS);
+
+			// The replacement's negotiation rides the wire beside the first request and finishes with its
+			// reply; a request issued in that same instant could race it, which a sequence of real
+			// requests (each with work between) does not.
+			await sleep(ROUND_TRIP_MS / 4);
+
+			const secondStarted = Date.now();
+			expect(await client.echo(0)).to.deep.equal({ ping: 1 });
+			const elapsed = Date.now() - secondStarted;
+			expect(elapsed).to.be.at.least(ROUND_TRIP_MS);
+			expect(elapsed, 'the second request took the prepared stream').to.be.below(2 * ROUND_TRIP_MS);
+		} finally {
+			pool.close();
+		}
 	});
 });

@@ -1,11 +1,5 @@
 import { expect } from 'chai';
-import {
-	createLibp2pNode,
-	StorageRepo,
-	BlockStorage,
-	MemoryRawStorage,
-	RepoClient
-} from '@optimystic/db-p2p';
+import { createLibp2pNode, StorageRepo, MemoryRawStorage, RepoClient } from '@optimystic/db-p2p';
 import { Diary, NetworkTransactor } from '@optimystic/db-core';
 import { waitForValue, delay } from '@optimystic/db-core/test';
 
@@ -299,9 +293,7 @@ describe('Distributed Diary Operations', () => {
 		});
 
 		const rawStorage = new MemoryRawStorage();
-		const storageRepo = new StorageRepo((blockId: string) =>
-			new BlockStorage(blockId, rawStorage)
-		);
+		const storageRepo = new StorageRepo(rawStorage);
 
 		const keyNetwork = (node as any).keyNetwork;
 		const coordinatedRepo = (node as any).coordinatedRepo;

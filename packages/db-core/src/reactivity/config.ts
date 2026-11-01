@@ -43,9 +43,13 @@ export const SUBSCRIBER_TTL_CORE_MS = 90_000;
 /** Subscriber registration TTL on an Edge node (ms), inherited from cohort-topic. */
 export const SUBSCRIBER_TTL_EDGE_MS = 60_000;
 /**
- * Entries per log block — drives tail rotation. The collection log starts a new tail block every
- * `EntriesPerBlock` entries (`chain/chain.ts`), so this is that number, not a tunable of its own: the fill
- * tracker's warm-up and filling signals fire at the commit counts the log actually rotates at.
+ * Entries per log block — the most commits a tail block takes before the log rotates. The collection log
+ * starts a new tail block after `EntriesPerBlock` entries (`chain/chain.ts`), or sooner once the block
+ * reaches `BLOCK_TARGET_BYTES` (`network/block-size.ts`), so this is an upper bound, not a tunable of its
+ * own: a log of small entries rotates exactly here, while a log of large entries rotates earlier and its
+ * fill tracker's warm-up fires late or not at all. Nothing depends on the count being exact — the warm-up
+ * and filling signals are logged only, and live rotation is detected from observed tail changes
+ * (`ReactivityOriginationManager.observeTailCommit` in db-p2p).
  */
 export const BLOCK_FILL_SIZE_DEFAULT = EntriesPerBlock;
 /** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
@@ -73,7 +77,7 @@ export interface ReactivityConfig {
 	readonly subscriberTtlCoreMs: number;
 	/** Subscriber TTL on an Edge node (ms). */
 	readonly subscriberTtlEdgeMs: number;
-	/** Entries per log block — drives tail rotation; the log's `EntriesPerBlock`. */
+	/** Most entries per log block before the tail rotates — the log's `EntriesPerBlock`, an upper bound (see {@link BLOCK_FILL_SIZE_DEFAULT}). */
 	readonly blockFillSize: number;
 	/** Old-tail drain time after rotation (ms). Simulator-validated-pending. */
 	readonly tDrainMs: number;

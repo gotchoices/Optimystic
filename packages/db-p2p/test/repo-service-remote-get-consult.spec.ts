@@ -190,9 +190,9 @@ describe('repo-protocol get consults the cohort', () => {
 		expect(entry!.unavailable, 'a cohort that answered is authoritative — no flag').to.equal(undefined);
 	});
 
-	// A locally-present block still consults (lazy read-repair, no last-seen timestamp yet),
-	// but the cohort corroborates the revision this node already holds, so the read is served
-	// from local state unflagged rather than being downgraded by the consult it now reaches.
+	// A locally-present block still starts a consult (lazy read-repair, no last-seen timestamp yet),
+	// behind the read; the read is served from local state unflagged rather than being downgraded
+	// by the consult it now reaches, and the cohort corroborates the revision this node holds anyway.
 	it('serves a locally-present block unflagged when the cohort corroborates it', async () => {
 		const latest: ActionRev = { actionId: 'held-action', rev: 2 };
 		const { repo, localPeer } = await buildCoordinator({

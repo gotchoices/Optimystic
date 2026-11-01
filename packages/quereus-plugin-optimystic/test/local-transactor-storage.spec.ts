@@ -111,4 +111,32 @@ describe('local transactor honours rawStorageFactory', function () {
 		// default storage instance — that's an internal detail.
 		await collection.replace([['k1', ['k1', '"v1"']]]);
 	});
+
+	// A table's first initialization opens its collection and reads the catalog together, and the
+	// two resolve the same transactor. Built once per caller, they would land on two stores, neither
+	// of which sees the other's writes.
+	it('builds one transactor, over one store, for concurrent first callers', async () => {
+		const factory = createPlugin().collectionFactory;
+		let factoryCalls = 0;
+		const options = (collectionUri: string): ParsedOptimysticOptions => ({
+			collectionUri,
+			transactor: 'local',
+			keyNetwork: 'test',
+			libp2pOptions: {},
+			cache: false,
+			encoding: 'json',
+			rawStorageFactory: () => {
+				factoryCalls++;
+				return new MemoryRawStorage();
+			},
+		});
+
+		const [table, catalog] = await Promise.all([
+			factory.getOrCreateTransactor(options('tree://local-test/table')),
+			factory.getOrCreateTransactor(options('tree://optimystic/schema')),
+		]);
+
+		expect(catalog).to.equal(table);
+		expect(factoryCalls).to.equal(1);
+	});
 });

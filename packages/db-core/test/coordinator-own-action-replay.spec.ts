@@ -361,11 +361,16 @@ describe('TransactionCoordinator: own committed action on retry', () => {
 			{ collectionId: idB, value: 'local-b' },
 		]);
 
-		await coordinator.commit(transaction, retryFast);
+		const durability = await coordinator.commit(transaction, retryFast);
 
 		expect(transactor.tears, 'both participants were torn').to.equal(2);
 		expect(await unlandedBlocks(inner, idA, transaction.id), 'participant A is whole').to.deep.equal([]);
 		expect(await unlandedBlocks(inner, idB, transaction.id), 'participant B is whole').to.deep.equal([]);
+		// No attempt committed either participant; the refresh saved both, so the class each reports
+		// is its re-send's — `local`, all the inner TestTransactor ever answers.
+		expect([...durability!.collections.keys()]).to.have.members([idA, idB]);
+		expect(durability!.collections.get(idA)?.quorum).to.equal('local');
+		expect(durability!.collections.get(idB)?.quorum).to.equal('local');
 		expect(await logValues(a)).to.deep.equal(['seed', 'local-a']);
 		expect(await logValues(b)).to.deep.equal(['seed', 'local-b']);
 		expect(a.hasUnsyncedChanges() || b.hasUnsyncedChanges(), 'nothing left staged').to.equal(false);

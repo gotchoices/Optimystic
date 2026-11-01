@@ -5,8 +5,8 @@ import { NetworkSimulation } from './simulation.js'
 import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { routingKeyForBlock } from '../src/network/routing-key.js'
-import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
-import { BlockUnavailableError, BlockPossiblyStaleError } from '../src/index.js'
+import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResult, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError, MAX_TRANSACTION_BYTES, TransactionTooLargeError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -259,6 +259,108 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]!.unavailable).to.equal(undefined)
     })
 
+    // Ticket coordinator-and-read-retries-back-off: a batch whose request threw is likely still in
+    // this node's send queue to that peer, so its retry waits; a batch that ANSWERED is out of the
+    // queue, so its retry goes at once. Each wait is distinguishable by its length: one base for a
+    // chain that has tried one coordinator, two for one that has tried two.
+    it('in the second-chance round, a retry that answered unavailable goes on at once and the coordinator it replaced is not asked again', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B', 'peer-C'])
+      const blockId = 'slow-block' as BlockId
+      const sleeps: number[] = []
+      const asked: string[] = []
+      const answer = (peer: string, entry: GetBlockResult) => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+        asked.push(peer)
+        const res: GetBlockResults = {}
+        for (const bid of blockIds) res[bid] = entry
+        return res
+      })
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { asked.push('peer-A'); throw new Error('response timeout') }),
+        'peer-B': answer('peer-B', { state: {}, unavailable: 'peers-unreachable' }),
+        'peer-C': answer('peer-C', { state: {} }),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      // A threw: `processBatches` re-batched it onto B after one base (100). In the round only B is
+      // retried, and at once (it would have waited two bases, having tried A and B). A, already
+      // re-batched, is not retried — that re-ask used to cost a second wait and a second request to B.
+      expect(sleeps).to.deep.equal([100])
+      expect(asked).to.deep.equal(['peer-A', 'peer-B', 'peer-C'])
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    it('in the second-chance round, a batch that threw and was never re-batched waits before its retry', async () => {
+      const blockId = 'lookup-flake' as BlockId
+      const sleeps: number[] = []
+      // The first lookup past A fails (processBatches cannot re-batch A); the round's lookup succeeds.
+      let lookupsPastA = 0
+      class FlakyPastA extends CountingKeyNetwork {
+        override async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          if ((options?.excludedPeers ?? []).length > 0 && lookupsPastA++ === 0) throw new Error('No coordinator found')
+          return super.findCoordinator(key, options)
+        }
+      }
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
+        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => Object.fromEntries(blockIds.map(bid => [bid, { state: {} }]))),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: new FlakyPastA(['peer-A', 'peer-B']),
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      const result = await networkTransactor.get({ blockIds: [blockId] })
+
+      expect(sleeps).to.deep.equal([100])
+      expect(result[blockId]!.unavailable).to.equal(undefined)
+    })
+
+    it('does not ask again in the second-chance round about blocks a retried coordinator already settled', async () => {
+      const net = new CountingKeyNetwork(['peer-A', 'peer-B'])
+      const blockId = 'settled-block' as BlockId
+      const sleeps: number[] = []
+      let bGets = 0
+      const repos: Record<string, IRepo> = {
+        'peer-A': makeGetOnlyRepo(async () => { throw new Error('response timeout') }),
+        'peer-B': makeGetOnlyRepo(async ({ blockIds }: BlockGets) => {
+          bGets++
+          const res: GetBlockResults = {}
+          for (const bid of blockIds) res[bid] = { state: {} }
+          return res
+        }),
+      }
+
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retryBackoffBaseMs: 100,
+        retrySleep: async ms => { sleeps.push(ms) },
+      })
+
+      await networkTransactor.get({ blockIds: [blockId] })
+
+      // `processBatches`' own retry reached B, which answered authoritatively; the round leaves A alone.
+      expect(sleeps).to.deep.equal([100])
+      expect(bGets).to.equal(1)
+    })
+
     it('carries the unavailable flag through when every consulted peer is indeterminate', async () => {
       const peerA = 'peer-A'
       const peerB = 'peer-B'
@@ -289,6 +391,62 @@ describe('NetworkTransactor', () => {
       expect(result[blockId]).to.exist
       expect(result[blockId]!.block).to.equal(undefined)
       expect(result[blockId]!.unavailable).to.equal('peers-unreachable')
+    })
+
+    // Ticket network-get-names-unreachable-blocks: `answered` routes to peer-A, `unanswered` to
+    // peer-B, then peer-C, then nobody — through `processBatches`' re-batch and the second-chance round.
+    const splitRouteTransactor = (repos: Record<string, IRepo>) => {
+      const routes: Record<string, string[]> = { 'answered-block': ['peer-A'], 'unanswered-block': ['peer-B', 'peer-C'] }
+      const net: IKeyNetwork = {
+        async findCoordinator(key: Uint8Array, options?: Partial<FindCoordinatorOptions>): Promise<PeerId> {
+          const excluded = new Set((options?.excludedPeers ?? []).map(p => p.toString()))
+          const pick = routes[new TextDecoder().decode(key)]!.find(p => !excluded.has(p))
+          if (!pick) throw new Error('No coordinator found')
+          return peerIdFromString(pick)
+        },
+        async findCluster(): Promise<ClusterPeers> { return {} },
+      }
+      return new NetworkTransactor({
+        timeoutMs: 5000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork: net,
+        getRepo: (peerId: PeerId) => repos[peerId.toString()]!,
+        retrySleep: async () => { },
+      })
+    }
+    const answersAbsent = () => makeGetOnlyRepo(async ({ blockIds }: BlockGets) => Object.fromEntries(blockIds.map(bid => [bid, { state: {} }])))
+
+    // A block no coordinator answered at all — every request for it failed in transport — is
+    // flagged 'peers-unreachable' rather than failing its siblings with an untyped aggregate.
+    it('flags a block no coordinator answered and still returns its answered sibling', async () => {
+      const asked: string[] = []
+      const unreachable = (peer: string) => makeGetOnlyRepo(async () => { asked.push(peer); throw new Error('dial timeout') })
+      const networkTransactor = splitRouteTransactor({ 'peer-A': answersAbsent(), 'peer-B': unreachable('peer-B'), 'peer-C': unreachable('peer-C') })
+
+      const result = await networkTransactor.get({ blockIds: ['answered-block' as BlockId, 'unanswered-block' as BlockId] })
+
+      expect(asked).to.deep.equal(['peer-B', 'peer-C'])
+      expect(result['answered-block']).to.deep.equal({ state: {} })
+      expect(result['unanswered-block']).to.deep.equal({ state: {}, unavailable: 'peers-unreachable' })
+    })
+
+    // The other side of that split: a coordinator that responded and left the block out is a
+    // protocol fault, not unreachability, so the read fails whole — even when the coordinator
+    // asked after it failed in transport.
+    it('fails the whole read when a coordinator responded without a requested block', async () => {
+      const networkTransactor = splitRouteTransactor({
+        'peer-A': answersAbsent(),
+        'peer-B': makeGetOnlyRepo(async () => ({})),
+        'peer-C': makeGetOnlyRepo(async () => { throw new Error('dial timeout') }),
+      })
+
+      let thrown: unknown
+      try {
+        await networkTransactor.get({ blockIds: ['answered-block' as BlockId, 'unanswered-block' as BlockId] })
+      } catch (e) {
+        thrown = e
+      }
+      expect((thrown as Error | undefined)?.message).to.match(/^Some peers did not complete/)
     })
 
     // Ticket absence-verdict-names-the-evidence (review pass): the reason now travels out
@@ -904,6 +1062,36 @@ describe('NetworkTransactor', () => {
         // Restore the node for future tests
         firstNode!.transactor.available = true
       }
+    })
+
+    it('refuses a transaction too large to send, by name, before asking any coordinator', async () => {
+      const contacted: string[] = []
+      const keyNetwork: IKeyNetwork = {
+        async findCoordinator() { contacted.push('findCoordinator'); throw new Error('no coordinator lookup expected') },
+        async findCluster() { contacted.push('findCluster'); throw new Error('no cohort lookup expected') },
+      }
+      const networkTransactor = new NetworkTransactor({
+        timeoutMs: 1000,
+        abortOrCancelTimeoutMs: 500,
+        keyNetwork,
+        getRepo: () => { contacted.push('getRepo'); throw new Error('no repo expected') },
+      })
+      const blockId = generateBlockId()
+      const pendRequest: PendRequest = {
+        actionId: generateRandomActionId(),
+        transforms: { inserts: {}, updates: { [blockId]: [['entries', 0, 0, ['x'.repeat(MAX_TRANSACTION_BYTES)]]] }, deletes: [] },
+        policy: 'r'
+      }
+
+      let refusal: unknown
+      try { await networkTransactor.pend(pendRequest) } catch (err) { refusal = err }
+
+      expect(refusal).to.be.instanceOf(TransactionTooLargeError)
+      const tooLarge = refusal as TransactionTooLargeError
+      expect(tooLarge.limit).to.equal(MAX_TRANSACTION_BYTES)
+      expect(tooLarge.bytes).to.be.greaterThan(tooLarge.limit)
+      expect(tooLarge.message).to.contain('MAX_TRANSACTION_BYTES')
+      expect(contacted, 'nothing was looked up or sent').to.deep.equal([])
     })
   })
 
@@ -1931,10 +2119,12 @@ describe('NetworkTransactor', () => {
         timeoutMs: 1000,
         abortOrCancelTimeoutMs: 500,
         keyNetwork: net,
-        getRepo: (peerId: PeerId) => {
+        getRepo: (peerId: PeerId): IRepo => {
           const t = transactors.get(peerId.toString());
           if (!t) throw new Error(`No transactor for ${peerId.toString()}`);
-          return t;
+          // A repo's view of the transactor: its batch methods answer differently (`undefined` means
+          // "send them one by one"), so they are not a repo's, and the repo offers none.
+          return { get: t.get.bind(t), pend: t.pend.bind(t), cancel: t.cancel.bind(t), commit: t.commit.bind(t) };
         },
       });
 

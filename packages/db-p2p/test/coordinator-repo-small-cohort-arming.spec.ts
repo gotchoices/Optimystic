@@ -152,6 +152,9 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 			undefined,
 			clusterLatestCallback
 		);
+		// Every spec here asserts what a held block's consult concluded (arming, consult counts, the
+		// doubt memo); in production that consult runs behind the read, so it waits here.
+		repo.awaitWindowConsults = true;
 		let clock = BASE_TIME;
 		repo.now = () => clock;
 		return { repo, callbackInvocations, partnerPeers, setClock: (t: number) => { clock = t; } };
@@ -235,6 +238,8 @@ describe('CoordinatorRepo small-cohort arming rule', () => {
 			// with any silent peer proves nothing, even in a declared cohort whose arithmetic would
 			// otherwise relax the floor. This is also the relay-outage shape for two phones — a
 			// relay-only partner that cannot be reached lands in `silent` exactly like a dead one.
+			// Runs at the default `retryBackoffBaseMs` of 0; with a declared base the block is held
+			// between consults instead (coordinator-repo-silent-consult-backoff.spec.ts).
 			for (const cfg of [undefined, { assumedClusterSize: 2 }]) {
 				const { repo, setClock } = await makeCohortRepo([{ kind: 'silent' }], cfg);
 

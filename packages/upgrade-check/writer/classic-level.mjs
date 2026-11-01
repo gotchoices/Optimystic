@@ -6,7 +6,9 @@
  * as data a phone wrote through `rn-leveldb`.
  *
  * Plain JavaScript because the writer runs it inside a published build's scratch install, and the
- * reader imports the same file (typed by `classic-level.d.mts`) so the two cannot drift.
+ * reader imports the same file (typed by `classic-level.d.mts`) so the two cannot drift. It keeps
+ * `put` and `delete` whatever the current `LevelDBLike` declares: the published builds that wrote
+ * each write directly call them, and the writer runs those builds over this handle.
  */
 
 import { ClassicLevel } from 'classic-level';
@@ -16,6 +18,8 @@ export async function openClassicLevel(path) {
 	const db = new ClassicLevel(path, { keyEncoding: 'view', valueEncoding: 'view' });
 	await db.open();
 	return {
+		// `classic-level` honours `WriteOptions.sync`, as the package's own test adapter reports.
+		canSync: true,
 		async get(key) {
 			const value = await db.get(key);
 			return value === undefined ? undefined : new Uint8Array(value);
@@ -37,8 +41,8 @@ export async function openClassicLevel(path) {
 					chain.del(key);
 					return this;
 				},
-				async write() {
-					await chain.write();
+				async write(options) {
+					await chain.write({ sync: options?.sync === true });
 				},
 			};
 		},

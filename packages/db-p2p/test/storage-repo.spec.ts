@@ -3,10 +3,13 @@ import { StorageRepo, MISSING_BASE_REVISION_REASON, PEND_NOT_VALIDATABLE } from 
 import { blockWriteLatchKey, withBlockWriteLatch, type BlockWriteLatch } from '../src/storage/block-latch.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
+import { WriteGroupDriver } from '../src/storage/write-group-driver.js';
+import { MemoryBatchBackend } from '../src/testing/memory-batch-backend.js';
 import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storage/struct.js';
 import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
-import { delay } from '@optimystic/db-core/test';
+import { delay, waitFor } from '@optimystic/db-core/test';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -56,7 +59,7 @@ describe('StorageRepo', () => {
 
 	beforeEach(() => {
 		rawStorage = new MemoryRawStorage();
-		repo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage));
+		repo = new StorageRepo(rawStorage);
 	});
 
 	describe('pend', () => {
@@ -270,12 +273,9 @@ describe('StorageRepo', () => {
 		});
 
 		it('validates transaction when validator is configured', async () => {
-			const validatingRepo = new StorageRepo(
-				(blockId) => new BlockStorage(blockId, rawStorage),
-				{
-					validatePend: async (_txn, _hash) => ({ valid: false, reason: 'Test rejection' })
-				}
-			);
+			const validatingRepo = new StorageRepo(rawStorage, {
+				validatePend: async (_txn, _hash) => ({ valid: false, reason: 'Test rejection' })
+			});
 
 			const result = await validatingRepo.pend({
 				actionId: 'action-1' as ActionId,
@@ -293,12 +293,9 @@ describe('StorageRepo', () => {
 		it('accepts a pend with NO validation payload under the default policy — accept is asserted, not assumed', async () => {
 			// The single-collection `Collection.sync` shape: bare transforms, nothing to re-execute.
 			// The hook rejects everything, proving it is never consulted on this path.
-			const validatingRepo = new StorageRepo(
-				(blockId) => new BlockStorage(blockId, rawStorage),
-				{
-					validatePend: async () => ({ valid: false, reason: 'hook must not be consulted for a validation-free pend' })
-				}
-			);
+			const validatingRepo = new StorageRepo(rawStorage, {
+				validatePend: async () => ({ valid: false, reason: 'hook must not be consulted for a validation-free pend' })
+			});
 
 			const result = await validatingRepo.pend({
 				actionId: 'action-unvalidatable-accept' as ActionId,
@@ -312,13 +309,10 @@ describe('StorageRepo', () => {
 		it("refuses a pend with NO validation payload under unvalidatablePendPolicy: 'reject'", async () => {
 			// Fail-closed posture: same validation-free shape, hook approves everything — the refusal
 			// can only come from the policy branch, with the stable greppable prefix.
-			const validatingRepo = new StorageRepo(
-				(blockId) => new BlockStorage(blockId, rawStorage),
-				{
-					validatePend: async () => ({ valid: true }),
-					unvalidatablePendPolicy: 'reject'
-				}
-			);
+			const validatingRepo = new StorageRepo(rawStorage, {
+				validatePend: async () => ({ valid: true }),
+				unvalidatablePendPolicy: 'reject'
+			});
 
 			const result = await validatingRepo.pend({
 				actionId: 'action-unvalidatable-reject' as ActionId,
@@ -336,10 +330,7 @@ describe('StorageRepo', () => {
 			// The policy answers "what does a node that CAN re-check do when it cannot?", so a node that
 			// re-checks nothing must be unaffected by it. Without this the knob would silently brick
 			// every storage-only node that set it.
-			const storageOnlyRepo = new StorageRepo(
-				(blockId) => new BlockStorage(blockId, rawStorage),
-				{ unvalidatablePendPolicy: 'reject' }
-			);
+			const storageOnlyRepo = new StorageRepo(rawStorage, { unvalidatablePendPolicy: 'reject' });
 
 			const result = await storageOnlyRepo.pend({
 				actionId: 'action-no-hook' as ActionId,
@@ -353,12 +344,9 @@ describe('StorageRepo', () => {
 		it("turns a THROWING validation hook into a 'validator-fault:' rejection, not an escaping error", async () => {
 			// An engine fault (missing table, parse error) must cast a hard rejection the caller can
 			// classify, never an exception out of pend.
-			const validatingRepo = new StorageRepo(
-				(blockId) => new BlockStorage(blockId, rawStorage),
-				{
-					validatePend: async () => { throw new Error('engine exploded: no such table t'); }
-				}
-			);
+			const validatingRepo = new StorageRepo(rawStorage, {
+				validatePend: async () => { throw new Error('engine exploded: no such table t'); }
+			});
 
 			const result = await validatingRepo.pend({
 				actionId: 'action-hook-throws' as ActionId,
@@ -1282,8 +1270,8 @@ describe('StorageRepo', () => {
 			let reachedResolve!: () => void;
 			const reached = new Promise<void>((r) => { reachedResolve = r; });
 
-			const gatedRepo = new StorageRepo((blockId) => {
-				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+			const gatedRepo = new StorageRepo(rawStorage, { createBlockStorage: (blockId, store) => {
+				const storage = new BlockStorage(blockId, store);
 				if (blockId === 'block-1') {
 					const originalSetLatest = storage.setLatest.bind(storage);
 					storage.setLatest = async (latest: ActionRev, builtOnPrior: boolean, l: BlockWriteLatch) => {
@@ -1296,7 +1284,7 @@ describe('StorageRepo', () => {
 					};
 				}
 				return storage;
-			});
+			} });
 
 			// block-1 committed at rev 1, with a2 and a3 both pending (neither committed yet).
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
@@ -1705,8 +1693,8 @@ describe('StorageRepo', () => {
 			// throw-once state lives in the factory closure because commit() builds a
 			// fresh BlockStorage per call.
 			let block2SaveRevisionThrown = false;
-			const failingRepo = new StorageRepo((blockId) => {
-				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+			const failingRepo = new StorageRepo(rawStorage, { createBlockStorage: (blockId, store) => {
+				const storage = new BlockStorage(blockId, store);
 				if (blockId === 'block-2') {
 					const originalSaveRevision = storage.saveRevision.bind(storage);
 					storage.saveRevision = async (rev: number, actionId: ActionId, l: BlockWriteLatch) => {
@@ -1718,7 +1706,7 @@ describe('StorageRepo', () => {
 					};
 				}
 				return storage;
-			});
+			} });
 
 			// Both blocks committed at rev 1 in collection-1.
 			for (const id of ['block-1', 'block-2']) {
@@ -1784,8 +1772,8 @@ describe('StorageRepo', () => {
 			// block-b's saveRevision throws once; block-a (a different collection) lands
 			// first. Pre-fix, collection-A would NEVER be woken — the permanent miss.
 			let blockBSaveRevisionThrown = false;
-			const failingRepo = new StorageRepo((blockId) => {
-				const storage = new BlockStorage(blockId as BlockId, rawStorage);
+			const failingRepo = new StorageRepo(rawStorage, { createBlockStorage: (blockId, store) => {
+				const storage = new BlockStorage(blockId, store);
 				if (blockId === 'block-b') {
 					const originalSaveRevision = storage.saveRevision.bind(storage);
 					storage.saveRevision = async (rev: number, actionId: ActionId, l: BlockWriteLatch) => {
@@ -1797,7 +1785,7 @@ describe('StorageRepo', () => {
 					};
 				}
 				return storage;
-			});
+			} });
 
 			const setup = async (id: string, collectionId: string) => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
@@ -1841,6 +1829,64 @@ describe('StorageRepo', () => {
 			expect(aEvents[0]!.collectionId).to.equal('collection-A');
 			expect(aEvents[0]!.blockIds).to.deep.equal(['block-a']);
 			expect(bEvents.length).to.equal(0);
+		});
+	});
+
+	describe('change notification — a hold while another collection of the action is still pending', () => {
+		// Two collections pended under ONE action id in two `pend` calls — what a transaction writing a
+		// table and its index sends a member — then committed one call at a time, as a member applies them.
+		const pendBoth = async (target: StorageRepo): Promise<void> => {
+			await target.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-a' as BlockId, makeBlockInCollection('block-a', 'collection-A')), policy: 'c' });
+			await target.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms('block-b' as BlockId, makeBlockInCollection('block-b', 'collection-B')), policy: 'c' });
+		};
+		const commitOne = (target: StorageRepo, blockId: string) =>
+			target.commit({ actionId: 'a1' as ActionId, blockIds: [blockId as BlockId], tailId: blockId as BlockId, rev: 1 });
+		/** Both collections' per-collection events in the order they fired, and the catch-all feed. */
+		const observe = (target: StorageRepo): { fired: CollectionChangeEvent[]; any: CollectionChangeEvent[] } => {
+			const fired: CollectionChangeEvent[] = [];
+			const any: CollectionChangeEvent[] = [];
+			target.onCollectionChange('collection-A' as BlockId, e => fired.push(e));
+			target.onCollectionChange('collection-B' as BlockId, e => fired.push(e));
+			target.onAnyCollectionChange(e => any.push(e));
+			return { fired, any };
+		};
+
+		it("holds the first collection's event while the second is pending, then fires both in order when the second lands", async () => {
+			const { fired, any } = observe(repo);
+			await pendBoth(repo);
+
+			expect((await commitOne(repo, 'block-a')).success).to.equal(true);
+			expect(fired.map(e => e.collectionId), "the per-collection listener waits for the action's other collection").to.deep.equal([]);
+			expect(any.map(e => e.collectionId), 'the catch-all feed is never held').to.deep.equal(['collection-A']);
+
+			expect((await commitOne(repo, 'block-b')).success).to.equal(true);
+			expect(fired.map(e => e.collectionId), 'the held event, then the closing commit\'s own').to.deep.equal(['collection-A', 'collection-B']);
+			expect(fired[0]!.blockIds).to.deep.equal(['block-a']);
+			expect(any.map(e => e.collectionId)).to.deep.equal(['collection-A', 'collection-B']);
+		});
+
+		it("releases the held event when the writer cancels the other collection's pend", async () => {
+			const { fired } = observe(repo);
+			await pendBoth(repo);
+			await commitOne(repo, 'block-a');
+			expect(fired).to.have.length(0);
+
+			await repo.cancel({ actionId: 'a1' as ActionId, blockIds: ['block-b' as BlockId] });
+
+			expect(fired.map(e => e.collectionId)).to.deep.equal(['collection-A']);
+		});
+
+		it('releases a held event when changeHoldMs elapses with the other collection still pending', async () => {
+			const bounded = new StorageRepo(rawStorage, { changeHoldMs: 40 });
+			const { fired } = observe(bounded);
+			await pendBoth(bounded);
+			await commitOne(bounded, 'block-a');
+			expect(fired).to.have.length(0);
+
+			await waitFor(() => fired.length === 1, { description: 'the hold timer released the event' });
+
+			expect(fired[0]!.collectionId).to.equal('collection-A');
+			expect(await bounded.pendingClaimOf('block-b' as BlockId, 'a1' as ActionId), 'the other collection is still pending').to.not.equal(undefined);
 		});
 	});
 
@@ -2333,7 +2379,7 @@ describe('StorageRepo', () => {
 						await super.saveMaterializedBlock(blockId, actionId, block);
 					}
 				})();
-				const faultingRepo = new StorageRepo((blockId) => new BlockStorage(blockId, faulting));
+				const faultingRepo = new StorageRepo(faulting);
 
 				await faultingRepo.pend({
 					actionId: 'a-fault' as ActionId,
@@ -2376,7 +2422,7 @@ describe('StorageRepo', () => {
 						throw new Error('injected cleanup fault');
 					}
 				})();
-				const breakingRepo = new StorageRepo((blockId) => new BlockStorage(blockId, breaking));
+				const breakingRepo = new StorageRepo(breaking);
 
 				// Pend on OK only, then commit a batch naming BLOCK too — BLOCK has no pend, so the
 				// pre-loop divergence throw fires and cleanup runs over the batch.
@@ -2436,7 +2482,7 @@ describe('StorageRepo', () => {
 		/** A repo over its OWN raw storage, so two members can drift apart independently. */
 		const makeMember = () => {
 			const raw = new MemoryRawStorage();
-			return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+			return { raw, repo: new StorageRepo(raw) };
 		};
 
 		/**
@@ -2851,7 +2897,7 @@ describe('StorageRepo', () => {
 				};
 				return archive;
 			};
-			restoringRepo = new StorageRepo((blockId) => new BlockStorage(blockId, rawStorage, restoreCallback));
+			restoringRepo = new StorageRepo(rawStorage, { createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback) });
 		});
 
 		/**
@@ -3348,7 +3394,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 	async function runStrandingRepro() {
 		const B = 'block-strand' as BlockId;
 		const { raw, parked, arm, release } = gatedStorage(B);
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const transforms = makeInsertTransforms(B, makeBlock('block-strand', { items: [] }));
 
 		// The original pend of a1 — the write whose commit is about to land.
@@ -3400,7 +3446,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 	it('a commit for a DIFFERENT action landing in pend’s window is refused, and strands nothing', async () => {
 		const B = 'block-strand-rival' as BlockId;
 		const { raw, parked, arm, release } = gatedStorage(B);
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		await repo.pend({ actionId: 'a1' as ActionId, transforms: makeInsertTransforms(B, makeBlock('block-strand-rival', { items: [] })), rev: 1, policy: 'c' });
 		expect((await repo.commit({ actionId: 'a1' as ActionId, blockIds: [B], tailId: B, rev: 1 })).success).to.equal(true);
@@ -3430,7 +3476,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 		const X = 'block-atomic-x' as BlockId;
 		const Y = 'block-atomic-y' as BlockId;
 		const { raw, parked, arm, release } = gatedStorage(X);
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 
 		const seed: Transforms = {
 			inserts: { [X]: makeBlock('block-atomic-x', { items: [] }), [Y]: makeBlock('block-atomic-y', { items: [] }) },
@@ -3464,7 +3510,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 
 	it('a torn-action retry at exactly the committed revision is still waved through with no record', async () => {
 		const raw = new MemoryRawStorage();
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const B = 'block-satisfied' as BlockId;
 		const transforms = makeInsertTransforms(B, makeBlock('block-satisfied', { items: [] }));
 
@@ -3481,7 +3527,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 		// Both go through `acquireBlockWriteLatches`, which sorts, so opposite request orders cannot
 		// build a cycle. A regression here hangs rather than fails, hence the explicit timeout race.
 		const raw = new MemoryRawStorage();
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const X = 'block-deadlock-x' as BlockId;
 		const Y = 'block-deadlock-y' as BlockId;
 
@@ -3529,7 +3575,7 @@ describe('StorageRepo.pend — classification and save are one atomic step', () 
 describe('StorageRepo.pend — a stale block is refused even when nothing can be enumerated for it', () => {
 	it('returns a stale conflict, not a throw, when the revision index is sparse over the lost range', async () => {
 		const raw = new MemoryRawStorage();
-		const repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		const repo = new StorageRepo(raw);
 		const B = 'block-sparse-index' as BlockId;
 
 		// A committed tip with no revision record under it — the shape a torn/repaired index leaves.
@@ -3569,7 +3615,7 @@ describe('StorageRepo.pend — a pending record claiming a superseded slot is no
 
 	beforeEach(async () => {
 		raw = new MemoryRawStorage();
-		repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		repo = new StorageRepo(raw);
 		// The block at revision 1, and a rival pended at revision 2 whose commit this node never saw.
 		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r1' as ActionId, rev: 1 });
 		const rival = await repo.pend({ actionId: 'a-missed' as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, ['x']]]), rev: 2, policy: 'r' });
@@ -3622,7 +3668,7 @@ describe('StorageRepo.pend — the apply-time rival scan keeps the revision rule
 
 	beforeEach(async () => {
 		raw = new MemoryRawStorage();
-		repo = new StorageRepo((id) => new BlockStorage(id, raw));
+		repo = new StorageRepo(raw);
 		// The block at revision 4, and a rival pended at revision 5 over it whose commit has not landed here.
 		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r4' as ActionId, rev: 4 });
 		const rival = await repo.pend({
@@ -3668,7 +3714,7 @@ describe('StorageRepo.get — read-driven promotion applies a record only to the
 
 	const makeMember = () => {
 		const raw = new MemoryRawStorage();
-		return { raw, repo: new StorageRepo((blockId) => new BlockStorage(blockId, raw)) };
+		return { raw, repo: new StorageRepo(raw) };
 	};
 
 	const splice = (index: number, values: unknown[]): Transforms => makeUpdateTransforms(BLOCK, [['items', index, 0, values]]);
@@ -3801,5 +3847,166 @@ describe('StorageRepo.get — read-driven promotion applies a record only to the
 		expect(served.block).to.equal(undefined);
 		expect(served.unavailable).to.equal('unmaterializable');
 		expect(await raw.getPendingTransaction(BLOCK, 'a2' as ActionId), 'declined, not refused: the record stays').to.not.equal(undefined);
+	});
+});
+
+describe('StorageRepo — every write group ends with one flush (storage.md Invariant 6)', () => {
+	/** A memory store whose flush records into `trace` and can be made to reject. */
+	const makeTracedStore = (trace: string[]) => {
+		const store = new MemoryRawStorage();
+		const flushState = { fail: false };
+		store.flush = async () => {
+			trace.push('flush');
+			if (flushState.fail) {
+				throw new Error('disk gone');
+			}
+		};
+		return { store, flushState };
+	};
+
+	const pendInsert = (repo: StorageRepo, actionId: string, blockId: string) => repo.pend({
+		actionId: actionId as ActionId,
+		transforms: makeInsertTransforms(blockId as BlockId, makeBlock(blockId)),
+		policy: 'c'
+	});
+
+	it('flushes once before the change event, and a contextless read flushes nothing', async () => {
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		repo.onCollectionChange('collection-1' as BlockId, () => trace.push('event'));
+
+		await pendInsert(repo, 'a1', 'block-1');
+		trace.length = 0;
+		const result = await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+		expect(result.success).to.equal(true);
+		expect(trace).to.deep.equal(['flush', 'event']);
+
+		trace.length = 0;
+		await repo.get({ blockIds: ['block-1' as BlockId] });
+		expect(trace, 'a read that took no write latch must not flush').to.deep.equal([]);
+	});
+
+	it('a flush that rejects after the work makes commit throw and announce nothing', async () => {
+		const trace: string[] = [];
+		const { store, flushState } = makeTracedStore(trace);
+		const repo = new StorageRepo(store);
+		repo.onCollectionChange('collection-1' as BlockId, () => trace.push('event'));
+
+		await pendInsert(repo, 'a1', 'block-1');
+		flushState.fail = true;
+		trace.length = 0;
+		let thrown: unknown;
+		try {
+			await repo.commit({ actionId: 'a1' as ActionId, blockIds: ['block-1' as BlockId], tailId: 'block-1' as BlockId, rev: 1 });
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as Error | undefined)?.message).to.equal('disk gone');
+		expect(trace).to.deep.equal(['flush']);
+	});
+
+	it('a read whose one block fails still flushes only after a sibling block\'s promotion has written', async () => {
+		// Block `bad` fails before any latch; block `good` promotes its pending under the write latch,
+		// slowly. The group's flush must cover `good`'s writes, so it waits for them before reporting
+		// `bad`'s failure.
+		const trace: string[] = [];
+		const { store } = makeTracedStore(trace);
+		const repo = new StorageRepo(store, { createBlockStorage: (blockId, raw) => {
+			const storage = new BlockStorage(blockId, raw);
+			if (blockId === 'bad') {
+				storage.getLatest = async () => { throw new Error('bad block'); };
+			} else {
+				const setLatest = storage.setLatest.bind(storage);
+				storage.setLatest = async (latest, deleted, latch) => {
+					await delay(20);
+					await setLatest(latest, deleted, latch);
+					trace.push('good:setLatest');
+				};
+			}
+			return storage;
+		} });
+		await pendInsert(repo, 'a1', 'good');
+		trace.length = 0;
+
+		let thrown: unknown;
+		try {
+			await repo.get({ blockIds: ['bad' as BlockId, 'good' as BlockId], context: { committed: [{ actionId: 'a1' as ActionId, rev: 1 }], rev: 1 } });
+		} catch (err) {
+			thrown = err;
+		}
+		expect((thrown as Error | undefined)?.message).to.equal('bad block');
+		expect(trace).to.deep.equal(['good:setLatest', 'flush']);
+	});
+});
+
+describe('StorageRepo — a commit applied with a window is reported before it is power-loss durable (storage.md Invariant 6)', () => {
+	/**
+	 * A repo over a backend that defers every sync a flush allows. A fresh driver per open: the
+	 * driver's overlay keeps serving a write until its batch is durable, so only a driver opened
+	 * after `powerLoss()` reads what the backend alone kept.
+	 */
+	const openRepo = (backend: MemoryBatchBackend): StorageRepo => new StorageRepo(new KvRawStorage(new WriteGroupDriver(backend)));
+
+	const insertRequest = (actionId: string, blockId: string): PendRequest => ({
+		actionId: actionId as ActionId,
+		transforms: makeInsertTransforms(blockId as BlockId, makeBlock(blockId)),
+		policy: 'c'
+	});
+
+	const commitRequest = (actionId: string, blockId: string) => ({
+		actionId: actionId as ActionId, blockIds: [blockId as BlockId], tailId: blockId as BlockId, rev: 1
+	});
+
+	/** Whether `whenDurable()` has resolved by the time a short delay has, i.e. whether anything is still deferred. */
+	const durableSoon = (repo: StorageRepo): Promise<boolean> => Promise.race([
+		repo.whenDurable().then(() => true),
+		delay(20).then(() => false)
+	]);
+
+	it('with a window the commit is answered and announced before its sync, and a power cut takes it back', async () => {
+		const backend = new MemoryBatchBackend({ deferSync: true });
+		const repo = openRepo(backend);
+		let announced = 0;
+		repo.onCollectionChange('collection-1' as BlockId, () => { announced++; });
+
+		// Synced before the window: a strict commit, so the power cut below has something to keep.
+		await repo.pend(insertRequest('a0', 'block-0'));
+		expect((await repo.commit(commitRequest('a0', 'block-0'))).success).to.equal(true);
+		expect(backend.committed.every(batch => batch.durable), 'a strict group is synced before it is answered').to.equal(true);
+		expect(announced).to.equal(1);
+
+		// Inside the window: pended and committed with five seconds to spare on each group.
+		await repo.pend(insertRequest('a1', 'block-1'), undefined, { syncWithinMs: 5000 });
+		const result = await repo.commit(commitRequest('a1', 'block-1'), undefined, { syncWithinMs: 5000 });
+		expect(result.success, 'the commit is answered success').to.equal(true);
+		expect(announced, 'the change event fired on the relaxed flush').to.equal(2);
+		const last = backend.committed[backend.committed.length - 1]!;
+		expect(last.durable, 'the batch the commit sealed is not yet synced').to.equal(false);
+		expect(last.syncWithinMs, 'the backend was told the time left to the window').to.be.above(0).and.at.most(5000);
+		expect(await durableSoon(repo), 'whenDurable() waits for the deferred sync').to.equal(false);
+
+		backend.powerLoss();
+		const reopened = openRepo(backend);
+		const after = await reopened.get({ blockIds: ['block-0' as BlockId, 'block-1' as BlockId] });
+		expect(after['block-0' as BlockId]!.state.latest?.rev, 'everything synced before the window survived').to.equal(1);
+		expect(after['block-1' as BlockId]!.state.latest, 'the window let the power cut take the commit back').to.equal(undefined);
+		expect(after['block-1' as BlockId]!.block).to.equal(undefined);
+	});
+
+	it('with no window the same commit is synced before it is answered and survives the power cut', async () => {
+		const backend = new MemoryBatchBackend({ deferSync: true });
+		const repo = openRepo(backend);
+
+		await repo.pend(insertRequest('a1', 'block-1'));
+		expect((await repo.commit(commitRequest('a1', 'block-1'))).success).to.equal(true);
+		expect(backend.committed.every(batch => batch.durable), 'a strict commit syncs before it is answered').to.equal(true);
+		expect(await durableSoon(repo), 'nothing is deferred').to.equal(true);
+
+		backend.powerLoss();
+		const reopened = openRepo(backend);
+		const after = await reopened.get({ blockIds: ['block-1' as BlockId] });
+		expect(after['block-1' as BlockId]!.state.latest?.rev).to.equal(1);
+		expect(after['block-1' as BlockId]!.block).to.not.equal(undefined);
 	});
 });

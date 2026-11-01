@@ -7,13 +7,7 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
-import {
-	createLibp2pNode,
-	StorageRepo,
-	BlockStorage,
-	MemoryRawStorage,
-	RepoClient
-} from '@optimystic/db-p2p';
+import { createLibp2pNode, StorageRepo, MemoryRawStorage, RepoClient } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
 import { waitForValue, delay } from '@optimystic/db-core/test';
 import { queryAll, queryGet } from './query-helpers.js';
@@ -381,9 +375,7 @@ describe('Distributed Quereus Operations', function () {
 		});
 
 		const rawStorage = new MemoryRawStorage();
-		const storageRepo = new StorageRepo((blockId: string) =>
-			new BlockStorage(blockId, rawStorage)
-		);
+		const storageRepo = new StorageRepo(rawStorage);
 
 		// The node's OWN key network — a second one built from constructor defaults would resolve a
 		// different cohort width and drop the network-membership filter.

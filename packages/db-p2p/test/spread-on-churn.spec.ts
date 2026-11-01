@@ -179,7 +179,7 @@ function makeMockPeerNetwork(
 
 function createMockStream(missing: string[] = []) {
 	// Build a varint-LP-encoded response matching BlockTransferResponse
-	const response: { blocks: Record<string, string>; missing: string[] } = { blocks: {}, missing };
+	const response: { accepted: string[]; missing: string[] } = { accepted: [], missing };
 	const payload = new TextEncoder().encode(JSON.stringify(response));
 	// Varint encode the length (works for payloads < 128 bytes)
 	const frame = new Uint8Array(1 + payload.length);
@@ -449,6 +449,25 @@ describe('SpreadOnChurnMonitor', () => {
 			const event = await monitor.checkNow();
 			expect(event).to.not.be.null;
 			expect(event!.spread[0]!.targets).to.deep.equal([peer3Str]);
+		});
+
+		it('never pushes to an expansion target the membership gate refuses', async () => {
+			const selfStr = selfId.toString();
+			const peer4Str = peerId4.toString();
+			const peer5Str = peerId5.toString();
+
+			mockFret.setNeighborDistance(0);
+			mockFret.setCohort('*', [selfStr, peerId2.toString()]);
+			mockFret.setExpandResult('*', [selfStr, peerId2.toString(), peer4Str, peer5Str]);
+
+			const monitor = makeMonitor({ membership: peerId => peerId !== peer5Str });
+			monitor.trackBlock('block-1');
+
+			const event = await monitor.checkNow();
+			expect(event).to.not.be.null;
+			expect(event!.spread[0]!.targets).to.deep.equal([peer4Str]);
+			expect(event!.spread[0]!.succeeded).to.deep.equal([peer4Str]);
+			expect(pushCalls.map(call => call.peerId)).to.deep.equal([peer4Str]);
 		});
 
 		it('records failed pushes in the spread result', async () => {

@@ -20,10 +20,10 @@ import {
 	UnderReplicationDrain, type BoundBlockPusher, type DrainLibp2p, type UnderReplicationDrainConfig, type UnderReplicationDrainDeps
 } from '../src/repo/under-replication-drain.js';
 import type { UnderReplicatedEntry } from '../src/repo/i-under-replication-ledger.js';
+import { recordHeldCopy, takeConfirmedCopies, type HeldCopyDeps } from '../src/repo/owed-copies.js';
 import { KvUnderReplicationLedger } from '../src/repo/kv-under-replication-ledger.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { buildBlockTransferProtocol, type PushBlockOutcome } from '../src/cluster/block-transfer-service.js';
 import { captureLog, hasLine, hasTag } from './support/capture-log.js';
@@ -394,7 +394,7 @@ describe('UnderReplicationDrain', () => {
 	describe('the full-replication event', () => {
 		it('reaches every listener even when one throws, and the drain carries on', async () => {
 			const drain = await startDrain();
-			const storageRepo = new StorageRepo((blockId) => new BlockStorage(blockId, new MemoryRawStorage(), async () => undefined));
+			const storageRepo = new StorageRepo(new MemoryRawStorage());
 			deps.emit = (event) => storageRepo.emitBlockDurabilityReached(event);
 			const seen: BlockDurabilityReachedEvent[] = [];
 			storageRepo.onBlockDurabilityReached(() => { throw new Error('listener bug'); });
@@ -445,20 +445,23 @@ describe('UnderReplicationDrain', () => {
 			expect(events).to.deep.equal([]);
 		});
 
-		it('an unnamed entry settled by a full commit mid-push is not resurrected under the resolved names', async () => {
+		it('an unnamed entry settled by a full commit mid-push is not resurrected, and is left to the settling commit to announce', async () => {
 			const drain = await startDrain();
 			await ledger.record(entryFor(BLOCK_A, { rev: 5, quorum: 'local' }));
 			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerX.toString(), peerY.toString()]);
 			libp2p.connect(peerX, { emit: false }); // peerY stays away, so naming would leave it owed
-			pusher.beforeAnswer = async () => { await ledger.settle(BLOCK_A, 6); };
+			let settled: UnderReplicatedEntry | undefined;
+			pusher.beforeAnswer = async () => { settled = await ledger.settle(BLOCK_A, 6); };
 			pusher.latestRev = 5;
 
-			await drain.checkNow();
+			const pass = await drain.checkNow();
 
 			expect(await ledger.get(BLOCK_A), 'the settled entry stays gone').to.equal(undefined);
-			// The block IS fully replicated (the rev-6 commit was full), so the event still fires — see
-			// the NOTE on `recordConfirmed` for why it carries the older revision.
-			expect(events.map(e => e.blockIds)).to.deep.equal([[BLOCK_A]]);
+			// The settling commit removed the entry, so it owes the one event (`CoordinatorRepo`
+			// announces what `settle` returns); the drain firing as well would announce the block twice.
+			expect(settled?.rev, 'the settle is the remover').to.equal(5);
+			expect(pass).to.include({ pushed: 1, cleared: 0 });
+			expect(events).to.deep.equal([]);
 		});
 
 		it('a copy of a NEWER revision than the entry records satisfies it', async () => {
@@ -471,6 +474,54 @@ describe('UnderReplicationDrain', () => {
 
 			expect(pass).to.include({ cleared: 1 });
 			expect(events[0]).to.include({ rev: 5 });
+		});
+	});
+
+	describe('an embedder report', () => {
+		const heldCopyDeps = (): HeldCopyDeps => ({ ledger, keyNetwork, selfId: self.toString(), emit: deps.emit });
+
+		it('clears an entry that could not name its members, and the next pass pushes nothing', async () => {
+			const drain = await startDrain();
+			const entry = entryFor(BLOCK_A, { quorum: 'local' });
+			await ledger.record(entry);
+			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerX.toString()]);
+
+			const outcome = await recordHeldCopy(heldCopyDeps(), BLOCK_A, entry.rev, peerX.toString());
+
+			expect(outcome).to.equal('cleared');
+			expect(await ledger.get(BLOCK_A)).to.equal(undefined);
+			expect(events.map(e => e.blockIds)).to.deep.equal([[BLOCK_A]]);
+			libp2p.connect(peerX, { emit: false });
+			await drain.checkNow();
+			expect(pusher.calls, 'nothing left to push').to.deep.equal([]);
+			expect(events.length, 'no second event').to.equal(1);
+		});
+
+		it('leaves the entry unnamed when the cohort does not contain the reported peer', async () => {
+			const drain = await startDrain();
+			const entry = entryFor(BLOCK_A, { quorum: 'local' });
+			await ledger.record(entry);
+			keyNetwork.setCohort(BLOCK_A, [self.toString(), peerY.toString()]);
+
+			const outcome = await recordHeldCopy(heldCopyDeps(), BLOCK_A, entry.rev, peerX.toString());
+
+			expect(outcome).to.equal('not-owed');
+			expect(await ledger.get(BLOCK_A)).to.deep.equal(entry);
+			expect(events).to.deep.equal([]);
+			libp2p.connect(peerY, { emit: false });
+			await drain.checkNow();
+			expect(pusher.calls, 'the drain still owes the cohort its copy').to.deep.equal([{ blockId: BLOCK_A, peerIds: [peerY.toString()] }]);
+		});
+
+		it('announces the newer shortfall a copy of that revision cleared, not the entry read before it', async () => {
+			const read = entryFor(BLOCK_A, { rev: 5, missingPeerIds: [peerX.toString()] });
+			const newer = entryFor(BLOCK_A, { rev: 6, actionId: 'action-newer', missingPeerIds: [peerX.toString()] });
+			await ledger.record(newer);
+
+			const status = await takeConfirmedCopies(heldCopyDeps(), read, { kind: 'peers', peerIds: [peerX.toString()], named: true }, [peerX.toString()], 6);
+
+			expect(status).to.equal('cleared');
+			expect(events.map(e => [e.rev, e.actionId])).to.deep.equal([[6, 'action-newer']]);
 		});
 	});
 

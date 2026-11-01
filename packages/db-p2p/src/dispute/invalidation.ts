@@ -473,12 +473,18 @@ export async function hashBlockContent(block: IBlock): Promise<string> {
 
 // ─── Deterministic apply ───
 
-/** Everything the apply primitive needs from the host: the collection log and per-block storage. */
+/** Everything the apply primitive needs from the host: the collection log, per-block storage, and its flush. */
 export type InvalidationContext = {
 	/** The collection log of the collection `T_inv` wrote (where the compensating entry is appended). */
 	readonly log: Log<unknown>;
 	/** Resolves a block's storage so the compensating revision can be written. */
 	readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
+	/**
+	 * Makes the compensating writes durable: `flush` of the store `createBlockStorage` writes to (see
+	 * the flush contract on `RawStoreDriver.flush`). Called once, after the block latches are released
+	 * and before the invalidation entry naming those revisions is appended.
+	 */
+	readonly flush: () => Promise<void>;
 };
 
 export type ApplyInvalidationParams = {
@@ -707,6 +713,12 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 		release();
 	}
 
+	// The compensating revisions are made durable before the entry naming them is written and before
+	// the result is reported, so a crash can leave revisions with no entry (the recoverable direction,
+	// below) but never an entry naming revisions the store lost. Outside the latches, like every
+	// write group's flush in `StorageRepo`.
+	await ctx.flush();
+
 	// 4. Durable, append-only invalidation entry (the source of truth for committed-invalidated).
 	//    Appended OUTSIDE the block latches on purpose: `ctx.log` writes through a `BlockStore` that may
 	//    itself be repo-backed, and `Latches` has no re-entrancy — appending under a block latch could
@@ -719,6 +731,10 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	// under-claim, and re-delivery re-applies (step 1 dedups on the entry, which is not there). The
 	// asymmetry only stops being acceptable if a consumer starts treating "revision present, entry
 	// absent" as authoritative rather than as a state to re-sync.
+	//
+	// NOTE: the entry's own durability belongs to the store `ctx.log` writes through — flushed by its
+	// group when that is a `StorageRepo`. If a composition root ever backs the log with a store written
+	// directly (no `StorageRepo` in between), flush after this append too before reporting `applied`.
 	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);
 

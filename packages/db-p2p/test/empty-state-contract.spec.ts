@@ -63,7 +63,7 @@ describe('Empty-state contract (cross-layer)', function () {
 
 		beforeEach(() => {
 			rawStorage = new MemoryRawStorage();
-			storageRepo = new StorageRepo(blockId => new BlockStorage(blockId, rawStorage));
+			storageRepo = new StorageRepo(rawStorage);
 		});
 
 		it('unknown block: storageRepo.get returns { state: {} }, no throw', async function () {

@@ -3,6 +3,7 @@ import type {
 	LevelDBIteratorOptions,
 	LevelDBLike,
 	LevelDBWriteBatchLike,
+	LevelDBWriteOptions,
 } from './leveldb-like.js';
 
 /**
@@ -95,6 +96,11 @@ export function wrapRNLevelDB(native: RNLevelDBNative, WriteBatch: RNLevelDBWrit
 }
 
 class RNLevelDBAdapter implements LevelDBLike {
+	// `rn-leveldb` 3.11 writes every batch with LevelDB's default `WriteOptions` (`sync = false`)
+	// and offers no way to ask for a sync; `react-native-storage-syncs-once-rn-leveldb-can` is
+	// the upstream change that flips this to true.
+	readonly canSync = false;
+
 	constructor(
 		private readonly native: RNLevelDBNative,
 		private readonly WriteBatch: RNLevelDBWriteBatchCtor,
@@ -103,14 +109,6 @@ class RNLevelDBAdapter implements LevelDBLike {
 	async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		const result = this.native.getBuf(toArrayBuffer(key));
 		return result === null ? undefined : new Uint8Array(result);
-	}
-
-	async put(key: Uint8Array, value: Uint8Array): Promise<void> {
-		this.native.put(toArrayBuffer(key), toArrayBuffer(value));
-	}
-
-	async delete(key: Uint8Array): Promise<void> {
-		this.native.delete(toArrayBuffer(key));
 	}
 
 	batch(): LevelDBWriteBatchLike {
@@ -142,8 +140,12 @@ class RNLevelDBWriteBatchAdapter implements LevelDBWriteBatchLike {
 		return this;
 	}
 
-	async write(): Promise<void> {
+	/** Unsynced, as every `rn-leveldb` write is. A sync asked of a handle whose `canSync` is false is a caller bug, refused before anything is written. */
+	async write(options?: LevelDBWriteOptions): Promise<void> {
 		try {
+			if (options?.sync) {
+				throw new Error('rn-leveldb cannot sync a write: callers check canSync before asking (react-native-storage-syncs-once-rn-leveldb-can)');
+			}
 			this.native.write(this.batch);
 		} finally {
 			this.batch.close();

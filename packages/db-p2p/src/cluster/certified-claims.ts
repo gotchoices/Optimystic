@@ -89,7 +89,8 @@ export type CertifyFailure = ProofFailure | 'oversized-cohort';
  * bound the proof's serialized SIZE: `computeClusterMessageHash` / `...PromiseHash` /
  * `...CommitHash` canonically serialize `message`, `promises` and `commits`, whose entry counts a
  * peer chooses freely inside the transport byte cap. That cost is linear and today bounded by the
- * 1 MiB control-message cap; if repair verification ever shows up in a profile, or a deployment
+ * 8 MiB block-message cap the sync responses and pushes that carry proofs are framed under
+ * (`MAX_BLOCK_MESSAGE_BYTES`); if repair verification ever shows up in a profile, or a deployment
  * raises those transport caps, add a serialized-size bound here alongside the signer count.
  */
 export const MAX_PROOF_SIGNERS = 256;

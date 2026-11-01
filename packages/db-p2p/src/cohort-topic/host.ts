@@ -70,7 +70,7 @@
  * (`cohort-topic-followon-derivation`); this milestone serves a **single tier-0 cohort**, so `followOn`
  * stays `false` and tier-0 bootstrap instantiation goes through the `bootstrap: true` path. The
  * behavioral substrate is validated at mock-tier by `test/cohort-topic/service.spec.ts` and end-to-end
- * across a real multi-node cohort (real Ed25519 keys, mock transport routing the five protocols + FRET
+ * across a real multi-node cohort (real Ed25519 keys, mock transport routing the cohort-topic protocols + FRET
  * `routeAct`/`assembleCohort`) by `test/cohort-topic/live-tier.spec.ts`.
  */
 
@@ -116,6 +116,7 @@ import {
 	encodeCohortMessage,
 	decodeCohortMessage,
 	decodeCohortGossipV1,
+	decodeRenewBatchV1,
 	membershipCertSignable,
 	membershipCertSigningPayload,
 	toCohortTopicSummary,
@@ -163,6 +164,7 @@ import {
 	type RegisterReplyV1,
 	type RegisterV1,
 	type RegistrationRecord,
+	type RenewBatchReplyV1,
 	type RenewReplyV1,
 	type RenewV1,
 	type ReputationEvidenceV1,
@@ -183,7 +185,17 @@ import {
 import { peerIdFromString } from "@libp2p/peer-id";
 import { FretTopicRouter } from "./topic-router.js";
 import { FretCohortGossipTransport, type CohortPeerResolver } from "./cohort-gossip-transport.js";
-import { buildCohortGossip, createPendingDeltas, DEFAULT_GOSSIP_INTERVAL_MS, DEFAULT_WILLINGNESS_HEARTBEAT_MS, type GossipDeltas } from "./cohort-gossip-driver.js";
+import {
+	buildCohortGossip,
+	createPendingDeltas,
+	DEFAULT_GOSSIP_INTERVAL_MS,
+	DEFAULT_WILLINGNESS_HEARTBEAT_MS,
+	emptyGossipDeltas,
+	gossipMaterialKey,
+	isGossipRoundDue,
+	type GossipDeltas,
+	type SentGossip,
+} from "./cohort-gossip-driver.js";
 import { createColdQuorumWait, DEFAULT_COLD_QUORUM_WAIT_MS } from "./cold-quorum-wait.js";
 import { FretMembershipSource } from "./membership-source.js";
 import { FretMembershipPublishSink } from "./membership-publish-sink.js";
@@ -192,7 +204,7 @@ import { FretTrustAnchor } from "./fret-trust-anchor.js";
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
-import { signPeer, verifyPeerSig } from "./peer-sig.js";
+import { signPeer, verifyPeerSig, verifyPeerSigAsync } from "./peer-sig.js";
 import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
 import { createBootstrapEvidenceBuilder, powTimeBudgetFor } from "./bootstrap-evidence-builder.js";
@@ -231,13 +243,15 @@ export interface CohortTopicHostOptions {
 	 */
 	readonly gossipIntervalMs?: number;
 	/**
-	 * `T_willingness_heartbeat` (ms): how often a genuinely-**idle but willing** {@link CoordEngine}
-	 * re-broadcasts a willingness-only heartbeat so a cold cohort can bootstrap (siblings hear it, instantiate
-	 * their own engine, and reciprocate — §Cold-start instantiation). Default
-	 * {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS} (~30 s). The first idle round after an engine is created emits
-	 * immediately regardless of this interval; a record-carrying round resets the clock, so this only paces the
-	 * steady-state re-broadcast of an idle willing cohort. Independent of {@link gossipIntervalMs} (the tick
-	 * cadence): the tick can fire fast while heartbeats stay throttled.
+	 * `T_willingness_heartbeat` (ms): the longest a {@link CoordEngine} goes without sending a frame while it has
+	 * one to send. A round sends when it carries deltas or its frame differs materially from the last one sent,
+	 * and otherwise only once this long has passed since that one. For an idle but willing engine that is the
+	 * willingness heartbeat that lets a cold cohort bootstrap (siblings hear it, instantiate their own engine,
+	 * and reciprocate — §Cold-start instantiation); for an engine holding records it is how often its unchanged
+	 * frame refreshes the advisory traffic rates siblings hold. It also paces the child-set re-advertisement.
+	 * Default {@link DEFAULT_WILLINGNESS_HEARTBEAT_MS} (~30 s). The first round after an engine is created sends
+	 * regardless of this interval. Independent of {@link gossipIntervalMs} (the tick cadence): the tick can fire
+	 * fast while unchanged frames stay throttled.
 	 */
 	readonly willingnessHeartbeatMs?: number;
 	/**
@@ -640,8 +654,10 @@ export interface CoordEngine {
 	 * This cohort's current gossip-derived traffic barometer for `topicId` (own last-published counts +
 	 * siblings' last-gossiped summaries + `directParticipants` from the store). The matchmaking `QueryV1`
 	 * reply attaches it and the seeker hang-out decision consumes it (`docs/matchmaking.md` §Hang-out vs.
-	 * continue). Non-mutating — a synchronous read over the same in-memory state a `gossipRound` mutates,
-	 * lagging at most one gossip round (it reflects the last frozen summaries, never raw mid-round counts).
+	 * continue). Non-mutating — a synchronous read over the same in-memory state a `gossipRound` mutates. It
+	 * reflects frozen summaries, never raw mid-round counts: this member's own as of its last round, and each
+	 * sibling's as of the last frame that sibling sent — up to `T_willingness_heartbeat` old for a sibling whose
+	 * frame has not otherwise changed.
 	 */
 	topicTraffic(topicId: Uint8Array): TopicTrafficV1;
 	/**
@@ -667,9 +683,11 @@ export interface CoordEngine {
 	pumpMembership(now: number): Promise<MembershipCertV1 | undefined>;
 	/**
 	 * One gossip round: TTL-sweep stale records (firing the `evicted` deltas), freeze the per-topic
-	 * traffic summaries, drain the accumulated record/eviction deltas, and broadcast a signed
-	 * {@link CohortGossipV1} (willingness/load/traffic + deltas) to the cohort. Returns the broadcast
-	 * frame, or `undefined` when the engine is idle (no resident topics and no deltas → nothing to send).
+	 * traffic summaries, and — when the round is due — drain the accumulated record/eviction deltas and
+	 * broadcast a signed {@link CohortGossipV1} (willingness/load/traffic + deltas) to the cohort. A round is
+	 * due when it carries deltas, when its frame differs materially from the last one this engine sent, or when
+	 * `T_willingness_heartbeat` has passed since that one. Returns the broadcast frame, or `undefined` for a
+	 * round that sent nothing (not due, or idle and willing for no tier); such a round leaves the deltas queued.
 	 */
 	gossipRound(now: number): Promise<CohortGossipV1 | undefined>;
 	/**
@@ -843,7 +861,7 @@ interface CoordEngineContext {
 	readonly wantK: number;
 	readonly minSigs: number;
 	readonly maxBytes: number;
-	/** `T_willingness_heartbeat` (ms): idle-but-willing heartbeat throttle (§Cold-start instantiation). */
+	/** `T_willingness_heartbeat` (ms): the slow refresh of an unchanged frame, and the idle-but-willing heartbeat (§Cold-start instantiation). */
 	readonly willingnessHeartbeatMs: number;
 	/** The gossip-round cadence (ms): an engine sends at most one out-of-band willingness advert per interval. */
 	readonly gossipIntervalMs: number;
@@ -887,16 +905,17 @@ interface CoordEngineContext {
 	/**
 	 * Sign an outbound `CohortGossipV1` envelope with the node peer key over its canonical image
 	 * ({@link cohortGossipSigningPayload}). Live-signer mode only; absent → gossip ships unsigned (interim,
-	 * matching the participant signer) and the receiver's {@link verifyGossip} gate is likewise absent.
+	 * matching the participant signer) and the receiver's {@link gossipFromMember} gate is likewise absent.
 	 */
 	readonly signGossip?: (g: CohortGossipSignable) => Promise<string>;
 	/**
-	 * Authenticate an inbound `CohortGossipV1` against the cohort it should come from: its `fromMember`
-	 * peer-key signature must verify over the gossip image **and** `fromMember` must be one of `members`
-	 * (peer-id strings — the engine's own cohort view, so a root-placed engine checks against its root
-	 * group). Live-signer mode only; absent → the bus skips the gate (key-less / unit composition).
+	 * Check an inbound `CohortGossipV1` came from the cohort it should: `fromMember` must be one of `members`
+	 * (peer-id strings — the engine's own cohort view, so a root-placed engine checks against its root group).
+	 * Membership only: the host's `/cohort-gossip` handler has already verified `fromMember`'s signature once,
+	 * before any bus saw the frame. Live-signer mode only; absent → the bus skips the gate (key-less / unit
+	 * composition).
 	 */
-	readonly verifyGossip?: (g: CohortGossipV1, members: readonly string[]) => boolean;
+	readonly gossipFromMember?: (g: CohortGossipV1, members: readonly string[]) => boolean;
 	/**
 	 * Broadcast a freshly threshold-signed promotion/demotion notice this engine produced over the
 	 * `promote` protocol — to the cohort around `servedCoord`, plus the parent coord for a demotion.
@@ -1002,19 +1021,23 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	};
 
 	// --- ports (node-wide singletons, injected into every coord engine) ---
-	// The router's `routeToRoot` exists only on a host that serves root placement; it resolves the group by the
-	// rule that chose it (never by ring routing, whose nearest peers can differ from the storage group on a
-	// shared ring — see the router) and runs a frame addressed to this node through the local register
-	// handler, since libp2p refuses a self-dial.
+	// Every direct dial addressed to this node — a renewal (or a batch of them) whose primary is this node, or a
+	// root-group member that is — runs through the local register or renew-batch handler, since libp2p refuses a
+	// self-dial. The router's
+	// `routeToRoot` exists only on a host that serves root placement; it resolves the group by the rule that
+	// chose it (never by ring routing, whose nearest peers can differ from the storage group on a shared ring —
+	// see the router).
 	const router = new FretTopicRouter(node, fret, {
 		registerProtocol: protocols.register,
+		renewBatchProtocol: protocols.renewBatch,
 		maxBytes,
 		streamOpen,
+		selfPeerId: selfPeerStr,
+		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
+		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => handleRenewBatchFrame(frame),
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
 				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
-			selfPeerId: selfPeerStr,
-			handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
 		}),
 	});
 	const sizeEstimator = new FretSizeEstimator(fret);
@@ -1086,17 +1109,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	const signGossip = nodeKey === undefined
 		? undefined
 		: async (g: CohortGossipSignable): Promise<string> => bytesToB64url(await signPeer(nodeKey, cohortGossipSigningPayload(g)));
-	// The two halves of the gate are separate because the cold-sibling path needs them apart: the signature
-	// is checked before the (possibly async) root-group read, and membership against whichever cohort the
-	// frame's rule names.
-	const verifyGossipSig = nodeKey === undefined
-		? undefined
-		: (g: CohortGossipV1): boolean =>
-			g.signature.length > 0 && verifyPeerSig(b64urlToBytes(g.fromMember), cohortGossipSigningPayload(g), b64urlToBytes(g.signature));
-	const verifyGossip = verifyGossipSig === undefined
+	// The two halves of the gate run in different places. The signature is checked once per frame, in the
+	// `/cohort-gossip` handler, with the platform verifier (`gossipSignatureVerifies`); membership is checked
+	// by each bus the frame reaches, and by the cold-sibling path, against whichever cohort the frame's rule names.
+	const gossipFromMember = nodeKey === undefined
 		? undefined
 		: (g: CohortGossipV1, members: readonly string[]): boolean =>
-			verifyGossipSig(g) && members.includes(bytesToPeerIdString(b64urlToBytes(g.fromMember)));
+			members.includes(bytesToPeerIdString(b64urlToBytes(g.fromMember)));
 
 	// Node-level `promote`-handler anti-abuse gate (`cohort-topic-promote-handler-verify-amplification`):
 	// a per-(peer, topic) rate limiter (own instance — the register-path limiter is per-coord inside each
@@ -1219,7 +1238,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		verifyRegisterSig,
 		verifyParticipantSig,
 		signGossip,
-		verifyGossip,
+		gossipFromMember,
 		broadcastNotice,
 		// Cache this node's own freshly-published cohort cert into the verifier, so an inbound notice
 		// signed by this node's cohort verifies locally without a network refetch. `verifier` is declared
@@ -1263,14 +1282,15 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// are not subscribed to the coord's gossip, and silently drop the willingness/record frames the served
 	// member sends. So replication/failover never materialise. This gate lets a co-member's frame (e.g. the
 	// idle-but-willing willingness heartbeat) instantiate the sibling engine, which then joins the gossip and
-	// reciprocates its own willingness. Called from the `/cohort-gossip` handler BEFORE `deliver`, so the fresh
-	// bus is subscribed in time to merge the very frame that woke it.
+	// reciprocates its own willingness. Called from the `/cohort-gossip` handler for a frame no bus subscribes to,
+	// after its signature verified and BEFORE `deliver`, so the fresh bus is subscribed in time to merge the very
+	// frame that woke it.
 	//
-	// Bounded to genuine co-members by the existing `verifyGossip` auth check (peer-key signature verifies for
-	// `fromMember` AND `fromMember` ∈ `cohortAround(coord).members`), so a peer can only make us instantiate an
-	// engine for a coord where FRET assembly agrees we are both members. Live-signer mode only: without a key
-	// there is no co-member gate, and unauthenticated engine creation would be a DoS vector, so key-less/interim
-	// mode keeps today's behaviour (drop gossip for an unknown coord).
+	// Bounded to genuine co-members: the handler has verified `fromMember`'s peer-key signature, and this path
+	// requires `fromMember` ∈ `cohortAround(coord).members` (`gossipFromMember`), so a peer can only make us
+	// instantiate an engine for a coord where FRET assembly agrees we are both members. Live-signer mode only:
+	// without a key there is no co-member gate, and unauthenticated engine creation would be a DoS vector, so
+	// key-less/interim mode keeps today's behaviour (drop gossip for an unknown coord).
 	//
 	// Scope: tier-0 only (`treeTier === 0`). A tier-`d > 0` frame carries no topic/participantCoord context a
 	// bare willingness heartbeat could seed the parent-coord derivation from, and overlaps the parent-child
@@ -1286,30 +1306,12 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// A frame carrying `rootPlaced` names a root group, not a FRET cohort: the group is read (on demand, async)
 	// and the engine is created root-placed — only when this node is one of the group's members. A host that
 	// serves no root placement ignores such frames.
-	const maybeInstantiateColdSibling = async (frame: Uint8Array): Promise<void> => {
-		if (verifyGossip === undefined || verifyGossipSig === undefined) {
+	const maybeInstantiateColdSibling = async (g: CohortGossipV1, coord: RingCoord): Promise<void> => {
+		if (gossipFromMember === undefined) {
 			return; // key-less / interim mode: no co-member gate, so never auto-instantiate
-		}
-		let g: CohortGossipV1;
-		try {
-			g = decodeCohortGossipV1(frame, maxBytes);
-		} catch {
-			return; // malformed → the normal deliver path drops it
 		}
 		if (g.treeTier !== 0) {
 			return; // tier-0 milestone only (a tier-d>0 unknown-coord frame falls through to drop)
-		}
-		const coord = b64urlToBytes(g.coord);
-		// NOTE: findByCoord bumps LRU recency as a side effect, and this runs BEFORE the verifyGossip
-		// co-member gate — so an unverified gossip frame naming a coord we already serve can pin that engine
-		// against idle-eviction. Marginal today (an outsider can only pin engines that already exist, bounded
-		// by real co-membership; it cannot create engines — that path is gated below). If gossip-flood
-		// recency-pinning ever matters, add a touch-free `has(coord)` lookup for this existence probe.
-		if (registry.findByCoord(coord) !== undefined) {
-			return; // already serving this coord — nothing to instantiate
-		}
-		if (!verifyGossipSig(g)) {
-			return; // a bad signature never earns a root-group read, let alone an engine
 		}
 		const claimsRoot = g.rootPlaced === true;
 		let members: readonly string[];
@@ -1329,7 +1331,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		} else {
 			members = memberStrsAround(coord);
 		}
-		if (!verifyGossip(g, members)) {
+		if (!gossipFromMember(g, members)) {
 			return; // co-member gate: non-member → do not instantiate
 		}
 		if (registry.findByCoord(coord) !== undefined) {
@@ -1345,6 +1347,44 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			}
 			throw err;
 		}
+	};
+
+	// --- inbound cohort gossip (the `/cohort-gossip` handler body) ---
+	// Each frame is decoded once, dropped before any signature work unless a bus here subscribes to the coord it
+	// names or it could wake a cold sibling, signature-checked once with the platform verifier (live-signer mode;
+	// key-less mode delivers unsigned frames, as the bus gates are absent there too), and handed only to the
+	// subscribers of its coord.
+	//
+	// Two frames can finish verifying in the opposite order to their arrival. Every merge they feed is
+	// reorder-safe: records are last-writer-wins by `lastPing`, an eviction is gated on `lastPing`, the member
+	// view keeps each member's newest `timestamp`, and child deltas are last-writer-wins by `effectiveAt`.
+	const handleGossipFrame = async (frame: Uint8Array, fromPeerStr: string): Promise<void> => {
+		let g: CohortGossipV1;
+		try {
+			g = decodeCohortGossipV1(frame, maxBytes);
+		} catch (err) {
+			log("cohort-topic: dropped a malformed gossip frame from %s: %o", fromPeerStr, err);
+			return;
+		}
+		const coord = b64urlToBytes(g.coord);
+		const mayWakeColdSibling = gossipFromMember !== undefined && g.treeTier === 0;
+		if (!gossipTransport.hasSubscriber(coord) && !mayWakeColdSibling) {
+			return; // nothing here would read it
+		}
+		if (nodeKey !== undefined && !(await gossipSignatureVerifies(g))) {
+			return;
+		}
+		// Subscribers are looked up only now, after the verify: an engine created while the frame verified receives
+		// it, and one closed or evicted meanwhile has unsubscribed, so its frame takes the cold-sibling path (which
+		// re-creates it for a tier-0 co-member frame) or reaches nobody.
+		// NOTE: delivery never touches the registry, so verified gossip does not refresh an engine's LRU recency (the
+		// pre-verify probe that used to bump it was an unauthenticated pin). A rank-0 engine kept alive only by gossip
+		// ages out under a coord spray and is re-created by its siblings' next heartbeat; if that churn ever shows up,
+		// bump recency here only after the bus's membership gate passed, never on a signature alone.
+		if (!gossipTransport.hasSubscriber(coord)) {
+			await maybeInstantiateColdSibling(g, coord);
+		}
+		gossipTransport.deliver(g);
 	};
 
 	// --- intra-cohort sign endorsement (the `/sign` handler body) ---
@@ -1417,10 +1457,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		store: participantStore,
 		coord: selfCoord,
 		localEpoch: (): Uint8Array => cohortAround(selfCoord).cohortEpoch,
-		// Same per-coord auth gate as the coord engines: only a signed gossip from a member of the cohort
-		// around the node's own ring position merges here (live-signer mode); absent in key-less composition.
-		// The node's own ring position is never a root group, so a frame claiming that rule is refused.
-		verifyInbound: verifyGossip === undefined ? undefined : (g): boolean => g.rootPlaced !== true && verifyGossip(g, memberStrsAround(selfCoord)),
+		// Same per-coord membership gate as the coord engines: only a gossip from a member of the cohort around
+		// the node's own ring position merges here (live-signer mode, the signature already verified by the
+		// `/cohort-gossip` handler); absent in key-less composition. The node's own ring position is never a root
+		// group, so a frame claiming that rule is refused.
+		verifyInbound: gossipFromMember === undefined ? undefined : (g): boolean => g.rootPlaced !== true && gossipFromMember(g, memberStrsAround(selfCoord)),
 	});
 	const certSource: IMembershipSource = membershipSource;
 	const membershipRouter = createMembershipSourceRouter({ committed: certSource, fret: certSource });
@@ -1623,7 +1664,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		verifyChildLinkSig,
 	};
 
-	// --- the `/register` protocol body, shared by the inbound handler and the router's local root step ---
+	// --- the `/register` protocol body, shared by the inbound handler and the router's in-process self-dials ---
 	// A direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this parent), or
 	// a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic). The three shapes are
 	// disjoint, so try each in turn.
@@ -1643,10 +1684,21 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return encodeCohortMessage(reply, maxBytes);
 	};
 
+	// --- the `/renew-batch` protocol body, shared by the inbound handler and the router's in-process self-dials ---
+	// Each entry gets exactly the answer the same RenewV1 gets on `/register`; the validator has already refused a
+	// frame carrying a re-attach or a withdraw, which stay per-record and single.
+	// Async (with nothing to await) so a malformed frame rejects, as `handleRegisterFrame`'s does, rather than throws.
+	const handleRenewBatchFrame = async (frame: Uint8Array): Promise<Uint8Array> => {
+		const { renews } = decodeRenewBatchV1(frame, maxBytes);
+		const now = Date.now();
+		const reply: RenewBatchReplyV1 = { v: 1, replies: renews.map((renew) => resolveRenew(registry, renew, now)) };
+		return encodeCohortMessage(reply, maxBytes);
+	};
+
 	// --- protocol handlers + activity callback ---
-	// Await registration so the host is not returned (and dialed) before the five handlers are live —
+	// Await registration so the host is not returned (and dialed) before the six handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, signEndorse, verifier, promoteGate, gossipTransport, maybeInstantiateColdSibling, publishSink, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, handleRenewBatchFrame, signEndorse, verifier, promoteGate, handleGossipFrame, publishSink, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -2536,8 +2588,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		store,
 		coord: servedCoord,
 		localEpoch,
-		// A frame claiming the other placement rule for this coord is refused before its signature is checked.
-		verifyInbound: ctx.verifyGossip === undefined ? undefined : (g): boolean => (g.rootPlaced === true) === rootPlaced && ctx.verifyGossip!(g, memberStrs()),
+		// A frame claiming the other placement rule for this coord is refused before its membership is checked.
+		verifyInbound: ctx.gossipFromMember === undefined ? undefined : (g): boolean => (g.rootPlaced === true) === rootPlaced && ctx.gossipFromMember!(g, memberStrs()),
 		// Sibling-drain half of the topic-budget release: a topic whose participants are sharded onto a
 		// sibling primary drains into this store as a gossip eviction (never this member's own TTL sweep),
 		// so re-`touch` the budget down from the post-delete store count — mirroring the engine's `sweepStale`
@@ -2816,6 +2868,10 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		gossip: {
 			// Per-touch replication, batched to one gossip round: a served ping/re-attach queues the touched
 			// record; the next round drains it so cohort members converge on the active set + assignments.
+			// A touch is a delta, so it makes that round send even when nothing else changed.
+			// NOTE: if renewal-driven frames on engines holding many records ever show up in profiles, defer a
+			// touch that changes only `lastPing` by up to ttl/6 and batch it with others — weighed against a
+			// backup replica one ping older at failover, closer to its own TTL eviction before re-attach reaches it.
 			touch: (rec): void => pending.touch(rec),
 			// A TTL sweep eviction is gossiped so siblings drop the dead record (convergence on eviction).
 			evicted: (rec): void => pending.evicted(rec),
@@ -2829,27 +2885,26 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 
 	// --- frame emission: the round's frame and the out-of-band willingness advert (§Cold-start instantiation) ---
 
-	// Timestamp of the last frame this engine actually emitted (any frame carries willingness). Drives the
-	// idle-but-willing heartbeat throttle: an idle round heartbeats only if this engine has never emitted
-	// (first idle round → immediate) or `T_willingness_heartbeat` has elapsed. A record-carrying round emits
-	// every round and updates this clock, so the throttle governs only genuinely-idle engines; a willingness
-	// advert updates it too, so the round after one does not repeat it. `undefined` until the first emit.
-	// NOTE: re-broadcasts willingness for every idle-but-willing cohort every T_willingness_heartbeat; if a
-	// node ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
-	let lastGossipAt: number | undefined;
+	// The last frame this engine emitted — a round's or a willingness advert's — as its material key and time:
+	// what siblings last heard from it. A round sends only when it carries deltas, differs materially from this,
+	// or `T_willingness_heartbeat` has passed since it (`isGossipRoundDue`). Recorded when the frame is handed to
+	// signing, so a round racing a slow sign compares against it; a frame lost to a close while signing is
+	// recorded anyway, since the engine is gone either way. `undefined` until the first emit.
+	// NOTE: re-broadcasts an unchanged frame for every willing cohort every T_willingness_heartbeat; if a node
+	// ever serves very many idle cohorts, batch the heartbeats or lengthen the interval.
+	let lastSent: SentGossip | undefined;
 
 	// Timestamp of the last willingness advert: an engine sends at most one per gossip interval, however many
 	// registers and newly heard members ask for one.
 	let lastAdvertAt: number | undefined;
 
 	/** This engine's frame at `now` over `topicSummaries` and `deltas`, or `undefined` when it has nothing to say. */
-	const frameAt = (now: number, heartbeat: boolean, topicSummaries: CohortTopicSummary[], deltas: GossipDeltas): CohortGossipV1 | undefined =>
+	const frameAt = (now: number, topicSummaries: CohortTopicSummary[], deltas: GossipDeltas): CohortGossipV1 | undefined =>
 		buildCohortGossip({
 			fromMember: selfMember,
 			coord: bytesToB64url(servedCoord),
 			cohortEpoch: bytesToB64url(localEpoch()),
 			treeTier,
-			heartbeat,
 			profile: ctx.profile,
 			barometer: ctx.barometer,
 			windowSeconds: DEFAULT_TRAFFIC_WINDOW_SECONDS,
@@ -2871,25 +2926,27 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 
 	/**
 	 * Tell the cohort this member's willingness at `at`, outside the round cadence, and say whether a frame
-	 * went out. The advert is the frame an idle round's heartbeat sends — no summaries, no deltas, nothing
-	 * drained from `pending`, no sweep — so a round racing it neither double-sends a delta nor heartbeats again.
+	 * went out. The advert is the frame an idle round sends — no summaries, no deltas, nothing drained from
+	 * `pending`, no sweep — and is recorded as this engine's last frame, so a round racing it neither
+	 * double-sends a delta nor repeats it.
 	 *
 	 * Only an idle engine (no records, nothing queued) adverts. A member's contribution replaces its previous
 	 * one in a sibling's view as a whole, so a summary-less frame from an engine holding records would blank
-	 * its topic summaries there until its next round — and such an engine gossips every round anyway. Only a
-	 * live-signer host adverts: without a key there is no co-member gate on the frames it would be answering.
+	 * its topic summaries there until its next frame — and such an engine's frames already carry its
+	 * willingness, sent on its next round whenever it changes. Only a live-signer host adverts: without a key
+	 * there is no co-member gate on the frames it would be answering.
 	 */
 	const advertiseWillingness = (at: number): boolean => {
 		const askedRecently = lastAdvertAt !== undefined && at - lastAdvertAt < ctx.gossipIntervalMs;
 		if (closed || ctx.signGossip === undefined || askedRecently || store.listAll().length > 0 || !pending.isEmpty()) {
 			return false;
 		}
-		const advert = frameAt(at, true, [], { records: [], evicted: [], childLinks: [], childUnlinks: [] });
+		const advert = frameAt(at, [], emptyGossipDeltas());
 		if (advert === undefined) {
 			return false; // willing for no tier: nothing to advertise
 		}
 		lastAdvertAt = at;
-		lastGossipAt = at;
+		lastSent = { key: gossipMaterialKey(advert), at };
 		void signAndBroadcast(advert).catch((err: unknown) => {
 			log("cohort-topic: willingness advert failed at coord %s: %o", bytesToB64url(servedCoord), err);
 		});
@@ -2971,10 +3028,12 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	let lastChildReadvertAt: number | undefined;
 
 	// One gossip round: sweep stale records (firing the `evicted` deltas), freeze each resident topic's
-	// traffic summary, re-advertise the linked child set on its throttle, drain the touch/evicted/child deltas,
-	// then assemble + sign + broadcast the frame. An idle engine (no topics, no deltas) normally builds no
-	// frame — except a willingness heartbeat, where an idle but willing engine still emits a willingness/load-
-	// only frame so a cold cohort can bootstrap.
+	// traffic summary, re-advertise the linked child set on its throttle, then send a frame only if the round
+	// is due (`isGossipRoundDue`): it carries deltas, it differs materially from the last frame this engine
+	// sent, or `T_willingness_heartbeat` has passed since that one. An idle engine (no topics, no deltas) has a
+	// willingness/load-only frame while it is willing for some tier, which is what lets a cold cohort bootstrap,
+	// and nothing at all while it is willing for none. Answers the frame sent, or `undefined` for a round that
+	// sent nothing.
 	const gossipRound = async (now: number): Promise<CohortGossipV1 | undefined> => {
 		if (closed) {
 			return undefined;
@@ -2982,6 +3041,8 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		await refreshRootGroup();
 		engine.sweepStale(now);
 		const topicSummaries = residentTopics().map((topicId) =>
+			// Publishes even on a round that sends nothing, so this member's own replies can use counts newer than
+			// its siblings hold — both are advisory.
 			toCohortTopicSummary(topicId, traffic.publish(topicId, now), {
 				tier: tierOfTopic(store, topicId),
 				directParticipants: store.directParticipants(topicId),
@@ -3004,7 +3065,7 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		// registry rather than the queue is what makes the unlink direction safe: an already-released child is
 		// simply absent from `linkedChildren()`, and nothing between here and `drain()` awaits, so a
 		// re-advertisement can never race a same-round unlink. Bounded to one extra frame per engine per
-		// heartbeat, and the round is deliberately non-idle — the frame is the carrier.
+		// heartbeat: the re-advertised links are deltas, so the round sends — the frame is the carrier.
 		// NOTE: this heals a missed *link*, never a missed *unlink* — absence is not advertised, so a member
 		// that dropped an unlink frame over-counts until it hears another delta for that child. Both consumers
 		// fail conservatively there (demotion stays blocked; a seeker sweeps a no-longer-promoted tier —
@@ -3020,15 +3081,19 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 				lastChildReadvertAt = now;
 			}
 		}
-		const deltas = pending.drain();
-		const idle = topicSummaries.length === 0 && deltas.records.length === 0 && deltas.evicted.length === 0
-			&& deltas.childLinks.length === 0 && deltas.childUnlinks.length === 0;
-		const heartbeat = idle && (lastGossipAt === undefined || now - lastGossipAt >= ctx.willingnessHeartbeatMs);
-		const g = frameAt(now, heartbeat, topicSummaries, deltas);
+		// A round that sends nothing must keep what is queued. Only a round with something queued drains, and a
+		// queued delta makes the round due on its own, so the drain only ever feeds a frame that goes out. Nothing
+		// between the `isEmpty` check and the drain awaits, so no delta can slip in between.
+		const hasDeltas = !pending.isEmpty();
+		const g = frameAt(now, topicSummaries, hasDeltas ? pending.drain() : emptyGossipDeltas());
 		if (g === undefined) {
+			return undefined; // idle and willing for no tier
+		}
+		const key = gossipMaterialKey(g);
+		if (!isGossipRoundDue({ hasDeltas, key, lastSent, now, heartbeatMs: ctx.willingnessHeartbeatMs })) {
 			return undefined;
 		}
-		lastGossipAt = now;
+		lastSent = { key, at: now };
 		await signAndBroadcast(g);
 		return g;
 	};
@@ -3935,12 +4000,13 @@ async function registerCohortTopicProtocols(
 	registry: CoordRegistry,
 	/** The `/register` body: a RenewV1, a ChildLinkV1 or a RegisterV1 frame in, the encoded reply out. */
 	handleRegisterFrame: (frame: Uint8Array) => Promise<Uint8Array>,
+	/** The `/renew-batch` body: a RenewBatchV1 frame in, the encoded RenewBatchReplyV1 out. */
+	handleRenewBatchFrame: (frame: Uint8Array) => Promise<Uint8Array>,
 	signEndorse: (request: SignRequestV1, fromPeerStr: string) => Promise<SignReplyV1>,
 	verifier: MembershipVerifier,
 	promoteGate: PromoteGate,
-	gossipTransport: FretCohortGossipTransport,
-	/** Instantiate a cold sibling's coord engine off a verified co-member frame (§Cold-start instantiation). */
-	maybeInstantiateColdSibling: (frame: Uint8Array) => Promise<void>,
+	/** The `/cohort-gossip` body: decode, authenticate and route one inbound frame (instantiating a cold sibling for it). */
+	handleGossipFrame: (frame: Uint8Array, fromPeerStr: string) => Promise<void>,
 	publishSink: FretMembershipPublishSink,
 	maxBytes: number,
 ): Promise<void> {
@@ -3949,14 +4015,15 @@ async function registerCohortTopicProtocols(
 		// parent), or a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic).
 		registerProtocolHandler(node, protocols.register, makeRequestHandler((frame): Promise<Uint8Array> => handleRegisterFrame(frame), maxBytes)),
 
-		// cohort-gossip: feed inbound gossip into the shared transport (one-way). It fans the frame to
-		// every coord engine's bus; per-bus epoch matching governs which engine merges the record deltas.
-		// First, if this is a verified co-member frame for a coord we hold no engine for, instantiate that
-		// engine (§Cold-start instantiation) so its freshly-subscribed bus merges this very frame on `deliver`.
-		registerProtocolHandler(node, protocols.gossip, makeOneWayHandler(async (frame, from): Promise<void> => {
-			await maybeInstantiateColdSibling(frame);
-			gossipTransport.deliver(from.toString(), frame);
-		}, maxBytes)),
+		// renew-batch: several plain pings to this member in one frame, answered entry by entry as `/register`
+		// answers each. Like `/register` it is not behind `authorizeInboundStream`, which gates the database protocols.
+		registerProtocolHandler(node, protocols.renewBatch, makeRequestHandler((frame): Promise<Uint8Array> => handleRenewBatchFrame(frame), maxBytes)),
+
+		// cohort-gossip: one-way. Each frame is decoded and signature-checked once, then handed only to the buses
+		// subscribed to the coord it names; a verified co-member frame for a coord with no engine first instantiates
+		// that engine (§Cold-start instantiation), so its freshly-subscribed bus merges this very frame.
+		registerProtocolHandler(node, protocols.gossip, makeOneWayHandler((frame, from): Promise<void> =>
+			handleGossipFrame(frame, from.toString()), maxBytes)),
 
 		// promote: threshold-signed promotion/demotion notices (one-way, gossip-style fan-out). The dialing
 		// peer arrives as `from`, so the handler can gate per-(peer, topic) before any expensive work. The
@@ -4041,6 +4108,26 @@ function makeFrameHandler(
 			}
 		})();
 	};
+}
+
+/**
+ * True iff `g` carries a signature that verifies, with the platform verifier, as `fromMember`'s over the frame's
+ * canonical image. A signer or signature that does not decode is logged and fails.
+ */
+async function gossipSignatureVerifies(g: CohortGossipV1): Promise<boolean> {
+	if (g.signature.length === 0) {
+		return false;
+	}
+	let signer: Uint8Array;
+	let signature: Uint8Array;
+	try {
+		signer = b64urlToBytes(g.fromMember);
+		signature = b64urlToBytes(g.signature);
+	} catch (err) {
+		log("cohort-topic: gossip frame at %s carries an undecodable signer or signature: %o", g.coord, err);
+		return false;
+	}
+	return verifyPeerSigAsync(signer, cohortGossipSigningPayload(g), signature);
 }
 
 /** Run `fn`, returning `undefined` if it throws (used to try one validator then fall through). */

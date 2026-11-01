@@ -2,7 +2,8 @@
  * Reactivity — tail rotation lifecycle (`docs/reactivity.md` §Anchor, §Tail rotation).
  *
  * A collection's topic is stable (`reactivityCollectionTopicId`, `topic-anchor.ts`); what rotates is its
- * **root**. When the tail block fills (`block_fill_size` entries, the log's `EntriesPerBlock`) a new tail
+ * **root**. When the tail block fills (at most `block_fill_size` entries, the log's `EntriesPerBlock`, or
+ * sooner by size — `BLOCK_TARGET_BYTES`) a new tail
  * block is born and the root — the tail's storage group at `H(tailId)` — moves to the new tail's group. The
  * tiers below the root sit at `coord_d(P, topicId)` and never move, so a rotation is "same topic, the root
  * moved": a registration at the root re-registers under the new root key; one below the root keeps its place
@@ -13,7 +14,8 @@
  *    by {@link buildRotationHint} and detected subscriber-side by {@link detectRotation}.
  *  - **Block-fill tracking** — {@link BlockFillTracker} counts transactions in the current tail block and
  *    fires anticipatory **warm-up** at `block_fill_size − warm_threshold` and the **filling** signal at
- *    `block_fill_size` (the commit that carries the hint).
+ *    `block_fill_size` (the commit that carries the hint). The count is an upper bound: a log of large
+ *    entries rolls over by size first, so for it the signals come late or not at all.
  *  - **Drain** — {@link TailDrainGate} keeps the outgoing root serving renewals/replays for `T_drain` while
  *    bouncing *new* subscriptions with a `Promoted`-shaped {@link RotationRedirectV1} naming the new tail.
  *  - **Jittered re-registration** — {@link planReRegistration} / {@link planReRegistrationWave} schedule a
@@ -131,7 +133,7 @@ export type BlockFillSignal =
 
 /** Construction inputs for a {@link BlockFillTracker}. */
 export interface BlockFillTrackerInit {
-	/** Entries per log block before the tail rotates (default {@link BLOCK_FILL_SIZE_DEFAULT}, the log's `EntriesPerBlock`). */
+	/** Most entries per log block before the tail rotates (default {@link BLOCK_FILL_SIZE_DEFAULT}, the log's `EntriesPerBlock`; a log of large entries rotates sooner, by size). */
 	readonly blockFillSize?: number;
 	/** Transactions remaining in the tail when anticipatory warm-up fires (default {@link WARM_THRESHOLD_DEFAULT}). */
 	readonly warmThreshold?: number;
@@ -141,6 +143,10 @@ export interface BlockFillTrackerInit {
  * Counts transactions committed into the current tail block and emits the {@link BlockFillSignal} that
  * drives anticipatory warm-up and the block-filling rotation trigger (`docs/reactivity.md` §Tail rotation,
  * §Anticipatory warm-up). One tracker per collection on the tail-cohort primary.
+ *
+ * It counts commits only, so it assumes the block rotates at `blockFillSize`; a log that rolls over earlier
+ * by size leaves it out of step. That is harmless because nothing acts on its signals for correctness: a
+ * live node only logs them, and detects the rotation itself from the commit that names a new tail.
  */
 export class BlockFillTracker {
 	readonly blockFillSize: number;

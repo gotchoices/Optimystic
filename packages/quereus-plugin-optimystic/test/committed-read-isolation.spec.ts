@@ -34,7 +34,7 @@
 import { expect } from 'chai';
 import { Database, getModuleConcurrencyMode, getModuleReadCommittedSnapshot } from '@quereus/quereus';
 import type { SqlValue, FilterInfo } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo, BlockStorage } from '@optimystic/db-p2p';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
@@ -137,7 +137,7 @@ function createTestDb(): { db: Database; plugin: Plugin } {
 /** Shared `local`-style transactor over one raw storage, so two Database instances
  * see each other's commits (same shape as committed-read-interleave.spec.ts). */
 function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
-	const repo = new StorageRepo((blockId) => new BlockStorage(blockId, storage));
+	const repo = new StorageRepo(storage);
 	return {
 		async get(blockGets) { return await repo.get(blockGets); },
 		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },

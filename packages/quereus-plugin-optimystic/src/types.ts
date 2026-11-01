@@ -1,6 +1,7 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
 import type { IRawStorage, NodeOptions } from '@optimystic/db-p2p';
+import type { TransactionWriteFacts } from './optimystic-adapter/write-description.js';
 
 /**
  * Configuration for the optimystic virtual table
@@ -106,4 +107,19 @@ export interface TransactionState {
   isActive: boolean;
   collections: Map<string, any>; // Tree collections used in this transaction
   stampId: string; // Unique identifier for this transaction (stable within transaction, cycles between)
+  /**
+   * Who acknowledges this transaction's commit, fixed when it began (`TransactionBridge.beginTransaction`):
+   * `'network'`, the commit resolves once storage holds it; `'local'`, offline mode was entered when
+   * the transaction began, and the commit resolves once the transaction is queued on this machine
+   * (docs/offline-sync.md §Entering and leaving the mode). A mode change while the transaction is
+   * open changes nothing about it.
+   */
+  acknowledgement: 'local' | 'network';
+  /**
+   * What the statements' write descriptions said about the elements this transaction staged
+   * (`WriteFact`, recorded by the vtab through `TransactionBridge.noteWriteFacts`), with the marks
+   * its savepoints left; `emptyWriteFacts()` to begin with. Folded into the queue entry's facts at
+   * commit and read live by `CommitOutlook()`.
+   */
+  writeFacts: TransactionWriteFacts;
 }

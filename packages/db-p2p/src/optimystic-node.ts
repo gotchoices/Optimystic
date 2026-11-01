@@ -1,7 +1,8 @@
 import type { Libp2p, PrivateKey } from '@libp2p/interface';
-import type { IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
+import type { BlockId, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
+import type { NodeCohortReachability } from './network/cohort-reachability.js';
 import type { ReactivityCollectionWatch } from './reactivity/collection-watch.js';
 import type { PeerReputationService } from './reputation/peer-reputation.js';
 import type { ArrivalPushReceiver } from './matchmaking/arrival-push-receiver.js';
@@ -40,8 +41,8 @@ export interface OptimysticNodeAttachments {
 	/**
 	 * Every network deadline the node derived from `NodeOptions.linkRoundTripMs` (the undeclared
 	 * constants when it was not set). A host that dials through the node — a `NetworkTransactor`'s
-	 * `dialTimeoutMs`, and its `timeoutMs` from `transactionTimeoutMs` — reads its deadlines here
-	 * rather than restating ones that ignore the declaration.
+	 * `dialTimeoutMs`, its `timeoutMs` from `transactionTimeoutMs`, and its `retryBackoffBaseMs` — reads
+	 * its deadlines here rather than restating ones that ignore the declaration.
 	 */
 	linkDeadlines: LinkDeadlines;
 	/**
@@ -57,6 +58,36 @@ export interface OptimysticNodeAttachments {
 	 * was built with `cohortTopic.enabled`; without it a seeker session takes the poll path.
 	 */
 	matchmakingArrivalPush?: ArrivalPushReceiver;
+	/**
+	 * Whether the cohorts responsible for some blocks can be reached now, or this node is genuinely
+	 * alone in them — the offline queue's reachability gate (docs/offline-sync.md §When to submit: the
+	 * reachability gate), built over this node's own key network. Its `onChange` wakes a listener,
+	 * debounced (`NodeOptions.cohortReachability`), when a connection opens or a peer is identified.
+	 */
+	cohortReachability: NodeCohortReachability;
+	/**
+	 * Record that `peerId` holds `blockId` at revision `rev` or later, as learned by the embedder — for
+	 * example from a block push the embedder made itself and the peer accepted. Two effects:
+	 *
+	 *  - the rebalance monitor counts `peerId` as holding the block, so its growth arm does not push it
+	 *    there (when the monitor runs on this node; otherwise nothing);
+	 *  - the under-replication ledger's entry for the block, when it owes `peerId` a copy of a revision
+	 *    at or below `rev`, no longer owes it; an entry left with nobody owed is removed and the
+	 *    full-replication event fires for it, exactly as when this node's own push is confirmed. That
+	 *    event carries no `collectionId`.
+	 *
+	 * The report is taken on the embedder's word: nothing is checked against the peer or local storage.
+	 * A wrong report costs the peer a copy it should have received, until a later commit to the block
+	 * records a new shortfall or the peer leaves the cohort and rejoins.
+	 *
+	 * `peerId` is `PeerId.toString()`, the `12D3KooW…` form. Works with the under-replication drain
+	 * disabled: that option stops pushing, not recording.
+	 *
+	 * Resolves once the ledger has been updated. Rejects with a `RangeError`, having recorded nothing,
+	 * when `rev` is not a non-negative integer; otherwise only on a fault reading or writing the ledger
+	 * (a node that has stopped may have closed its store). Reporting this node's own peer id does nothing.
+	 */
+	reportBlockHeld(blockId: BlockId, rev: number, peerId: string): Promise<void>;
 }
 
 export type OptimysticNode = Libp2p & OptimysticNodeAttachments;

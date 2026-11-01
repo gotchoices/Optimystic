@@ -1,5 +1,6 @@
 import type { BlockId, ActionId } from "@optimystic/db-core";
 import type { RawStoreDriver } from "./raw-store-driver.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 
 /**
  * In-memory {@link RawStoreDriver}: the six logical block-storage stores as
@@ -12,6 +13,9 @@ import type { RawStoreDriver } from "./raw-store-driver.js";
  * kernel or exposed to callers as a mutable handle.
  */
 export class MemoryStoreDriver implements RawStoreDriver {
+	// Nothing in a Map survives a restart.
+	readonly durability: StoreDurability = 'none';
+
 	private readonly metadata = new Map<BlockId, Uint8Array>();
 	private readonly revisions = new Map<string, Uint8Array>(); // `${blockId}:${rev}` -> actionId bytes
 	private readonly pending = new Map<string, Uint8Array>();    // `${blockId}:${actionId}` -> transform bytes
@@ -139,6 +143,17 @@ export class MemoryStoreDriver implements RawStoreDriver {
 		}
 		this.transactions.set(key, value);
 		this.pending.delete(key);
+	}
+
+	// --- flush ---
+
+	// No-op: with durability 'none' there is nothing for a flush, or a deferred sync, to protect.
+	flush(_options?: FlushOptions): Promise<void> {
+		return Promise.resolve();
+	}
+
+	whenDurable(): Promise<void> {
+		return Promise.resolve();
 	}
 
 	// --- optional passthroughs ---

@@ -5,6 +5,7 @@ import { KvRawStorage } from "./kv-raw-storage.js";
 import { CachedStoreDriver } from "./cached-store-driver.js";
 import type { SharedCachePool } from "./shared-cache-pool.js";
 import type { StoreIdentity } from "./store-identity.js";
+import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import { encodeJson, decodeJson, encodeActionId, decodeActionId } from "./raw-store-codec.js";
 
 /**
@@ -34,7 +35,11 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	storeIdentity?: () => StoreIdentity;
 	readCached?: true;
 
+	/** The wrapped storage's; this adapter only re-encodes values and adds no durability of its own. */
+	readonly durability: StoreDurability;
+
 	constructor(private readonly inner: IRawStorage) {
+		this.durability = inner.durability;
 		if (inner.getStoreIdentity) {
 			this.storeIdentity = () => inner.getStoreIdentity!();
 		}
@@ -154,6 +159,16 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	async promote(blockId: BlockId, actionId: ActionId): Promise<void> {
 		await this.inner.promotePendingTransaction(blockId, actionId);
 	}
+
+	// --- flush ---
+
+	flush(options?: FlushOptions): Promise<void> {
+		return this.inner.flush(options);
+	}
+
+	whenDurable(): Promise<void> {
+		return this.inner.whenDurable();
+	}
 }
 
 /**
@@ -211,8 +226,9 @@ export class CachedRawStorage extends KvRawStorage {
 	 * Release this storage's cache registration with the shared pool (drops all entries,
 	 * retires the store id). Call when the workspace departs; a skipped dispose leaks only
 	 * cold entries the pool will evict under pressure, but the polite release keeps a
-	 * long-lived process's occupancy honest. `IRawStorage` itself has no close, so this is
-	 * the wrapper's own lifecycle method.
+	 * long-lived process's occupancy honest. The kernel also wires `close` here, from
+	 * `CachedStoreDriver.close`, and the two do the same thing; `dispose` is the name
+	 * `withReadCache`'s last lease release calls.
 	 */
 	async dispose(): Promise<void> {
 		await this.cacheDriver.close();

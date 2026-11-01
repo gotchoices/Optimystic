@@ -18,13 +18,15 @@ import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
+import type { StoreDurability } from './storage/store-durability.js';
+import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindowFor, type DurabilityWindowPolicy, type StorageDurabilityOptions } from './storage/durability-window.js';
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
-import { latestClaimFromArchive, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
+import { answerFromArchiveResponse, claimFromConsultAnswer, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
-import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
+import { clusterMember, type ReconcileBlockCallback, type CommitCertificateSink, type BlockHoldersSink, type CohortCommitAppliedSink, type DeriveExpectedClusterCallback } from './cluster/cluster-repo.js';
 import { createReconcileBlock } from './cluster/reconcile-block.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions } from './cluster/cluster-policy.js';
 import { assertClusterSizeCoupling } from './cluster/cluster-size-coupling.js';
@@ -35,22 +37,30 @@ import { Libp2pKeyPeerNetwork, type BootstrapContactOptions, type NetworkStatePe
 import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticNode, OptimysticNodeAttachments } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
-import { identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
+import { combineIdentifyObservers, identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
+import { IdentifyProgress } from './network/identify-progress.js';
+import { throttleProtocolMerges } from './network/protocol-merge-throttle.js';
+import { KeyNetworkCohortReachability } from './network/cohort-reachability.js';
+import { holePunchingWanted } from './network/hole-punching.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
 import { BlockTransferCoordinator } from './cluster/block-transfer.js';
-import { pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-transfer-service.js';
+import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
+import { assertReportedRevision, recordHeldCopy, type HeldCopyDeps } from './repo/owed-copies.js';
 import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
-import { resolveBootstrapContactTimeoutMs, resolveLinkDeadlines, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
-import type { ClusterLatestCallback } from './repo/coordinator-repo.js';
+import { buildSyncProtocol } from './sync/protocol.js';
+import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLinkDeadlines, resolvePingHandlerTimeoutMs, withinRequestBudget, type LinkDeadlines, type RpcDeadlineDefaults } from './rpc-deadline.js';
+import type { ClusterLatestAnswer, ClusterLatestCallback } from './repo/coordinator-repo.js';
+import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
@@ -110,6 +120,7 @@ import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
 import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
+import { createNetworkMembershipGate, type IsNetworkMember } from './network-membership-gate.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -250,15 +261,40 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * `{ reservations: { applyDefaultLimit: false } }` to lift the cap.
 	 */
 	relayServerInit?: CircuitRelayServerInit;
+	/**
+	 * Whether this node runs libp2p's hole-punching service (`@libp2p/dcutr`), which tries to turn a
+	 * relayed connection into a direct one.
+	 *  - Unset: automatic. The node runs it only when its advertised addresses
+	 *    ({@link NodeOptions.announceAddrs}, else {@link NodeOptions.listenAddrs} plus
+	 *    {@link NodeOptions.appendAnnounceAddrs}) include one another machine could dial directly
+	 *    — not a circuit address, and a DNS name or a non-loopback IP (`holePunchingWanted` in
+	 *    `network/hole-punching.ts`). A relay-only or loopback-only node leaves it out: hole punching
+	 *    can never succeed for it, and costs three relayed streams per relayed connection.
+	 *  - `true`: always run it. For a relay-only node that peers with public addresses regularly
+	 *    reach through a relay, so it can dial those peers directly.
+	 *  - `false`: never run it.
+	 */
+	holePunching?: boolean;
 	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
 	storage?: RawStorageProvider;
+	/**
+	 * How long a storage write may wait before it is forced onto disk, computed per write from the size
+	 * of the cohort its consensus ran on (see `durabilityWindowMs` in `storage/durability-window.ts`).
+	 * Defaults assume machines lose power independently, one loss per machine per 30 days, and accept a
+	 * one-in-10^9 chance of losing an acknowledged write, with no window above 5000 ms. Set
+	 * `independentFailures: false` when machines share power, so every write syncs before it is reported.
+	 * Applies only on storage that can sync (`durability: 'power-loss'`). A value out of range throws at
+	 * node construction.
+	 */
+	storageDurability?: StorageDurabilityOptions;
 	/**
 	 * Durable key-value store for node-local state that must survive a restart — today, the
 	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
 	 * is still missing each). An instance or a factory, the same shape as {@link NodeOptions.storage}.
 	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger still works, but what it
 	 * records is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
-	 * `FileRawStorage`'s base path; see its README.
+	 * `FileRawStorage`'s base path; see its README. Like the raw storage, the node never closes it:
+	 * a host that supplies one closes it after `stop()`.
 	 */
 	kvStore?: KVStoreProvider;
 	/**
@@ -339,6 +375,14 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 */
 	underReplicationDrain?: Partial<UnderReplicationDrainConfig> & { enabled?: boolean; pushDialTimeoutMs?: number; pushResponseTimeoutMs?: number };
 
+	/**
+	 * The node's cohort reachability gate (`node.cohortReachability`), which the offline queue asks
+	 * before it submits. `wakeDebounceMs` is how long after the last `connection:open` or
+	 * `peer:identify` the gate's `onChange` listeners are woken; default `DEFAULT_WAKE_DEBOUNCE_MS`
+	 * (500 ms), long enough to coalesce a connection with the identify that follows it.
+	 */
+	cohortReachability?: { wakeDebounceMs?: number };
+
 	/** Transaction validator for cluster consensus */
 	validator?: ITransactionValidator;
 
@@ -373,9 +417,10 @@ export type NodeOptions = ClusterPolicyOptions & {
 	transactionStateStore?: ITransactionStateStore;
 
 	/**
-	 * Optional sink for the consensus commit certificate, fired per committed action just before the
-	 * commit is applied to local storage (see {@link CommitCertificateSink}). This is the cluster-side
-	 * half of the reactivity origination path: a caller wiring reactivity supplies a
+	 * Optional sink for the consensus commit certificate, fired per committed consensus record just
+	 * before the record is applied to local storage, with the collection tails the record committed
+	 * (see {@link CommitCertificateSink}; a sink that ignores the third argument still works). This is
+	 * the cluster-side half of the reactivity origination path: a caller wiring reactivity supplies a
 	 * {@link CommitCertStore}'s `put` here, then resolves it via {@link makeClusterCommitCertExtractor}
 	 * when it installs the change-notifier bridge ({@link attachCohortChangeBridge}) on the running
 	 * node. Absent → zero cost (no cert is assembled).
@@ -454,6 +499,29 @@ export type NodeOptions = ClusterPolicyOptions & {
 	authorizeInboundStreamTimeoutMs?: number;
 
 	/**
+	 * Optional predicate answering "is this peer a member of this node's network?", consulted
+	 * wherever this node chooses peers to hold or coordinate its writes. Without it, a peer counts
+	 * as serving this network when its peerStore protocol list names this network's `cluster` or
+	 * `repo` protocol — a list any connected peer can fill, by opening a stream on one of them
+	 * (even a stream {@link NodeOptions.authorizeInboundStream} then refuses) or by advertising
+	 * them. Supplied, a remote peer it refuses is never a cohort member and never a coordinator,
+	 * whatever its protocol list says.
+	 *
+	 * A separate option from {@link NodeOptions.authorizeInboundStream}, which answers who may SEND
+	 * to this node; this one answers who this node sends TO. An embedder whose database is private
+	 * needs both: with only the authorization predicate, any peer that opens a stream can still be
+	 * chosen as a cohort member and sent every write to the blocks it lands near.
+	 *
+	 * Synchronous — it runs inside every cohort assembly's per-peer loop, so keep it an in-memory
+	 * lookup. Fail closed: only a literal `true` admits; a throw or a non-boolean refuses, logged.
+	 * This node is always a member, so the predicate may list remote members only. `peerId` is
+	 * `PeerId.toString()` (base58btc). Read live on every lookup, so admitting or removing a member
+	 * takes effect on the next one. Absent → no check at all. See {@link IsNetworkMember} and
+	 * `docs/internals.md` § Network Membership Predicate.
+	 */
+	isNetworkMember?: IsNetworkMember;
+
+	/**
 	 * Optional libp2p connection gater. The libp2p browser default denies
 	 * dialing insecure WebSockets and private/loopback addresses; callers
 	 * that need to dial local or unsecured bootstraps (web reference dev,
@@ -530,12 +598,37 @@ export type NodeOptions = ClusterPolicyOptions & {
 	connectionMonitor?: ConnectionMonitorInit;
 
 	/**
+	 * How long this node lets an INBOUND ping stream (`/ipfs/ping/1.0.0`) live before aborting it, in
+	 * milliseconds — `@libp2p/ping`'s `timeout`, which it otherwise fixes at 10s. The timer covers the
+	 * whole stream: the echo, waiting for the pinger to close its side, and the final close, so a slow
+	 * outbound queue on this node eats into it. When it fires first, this node resets the stream, the
+	 * pinging node's connection monitor cannot tell the reset from a dead peer, and it aborts the
+	 * connection — so a peer's {@link connectionMonitor} deadline is capped at THIS node's handler
+	 * timeout, the same shape as the `pingInterval` cap above, from the other end of the stream.
+	 *
+	 * Unset → twice `connectionMonitor.pingTimeout.maxTimeout` when `pingTimeout` declares either bound
+	 * (libp2p's 60s default `maxTimeout` standing in when only `minTimeout` is declared; never below
+	 * 10s, never above 2^31 − 1), else 10s as before. That default assumes the peers pinging this node have
+	 * their monitor configured like this one — the same "both ends alike" assumption the
+	 * `connectionMonitor` advice makes. A declared value is used as given, never raised; one that is not
+	 * a finite number above zero, or is above 2^31 − 1, throws when the node is built.
+	 *
+	 * Cost: a stalled inbound ping stream is held up to this long, bounded per connection by
+	 * `@libp2p/ping`'s `maxInboundStreams`.
+	 */
+	pingHandlerTimeoutMs?: number;
+
+	/**
 	 * Explicit connection-manager deadlines, passed to libp2p unchanged. Each one set here overrides
 	 * the value derived from {@link NodeOptions.linkRoundTripMs}; a deployment that declares its link
 	 * round trip has no need to set any of them.
 	 *
 	 * - `dialTimeout` — how long an outbound dial may take, socket through upgrade, when the caller
-	 *   passes no abort signal of its own.
+	 *   passes no abort signal of its own. The same value bounds each dial FRET's maintenance redial
+	 *   makes (FRET's `dialTimeoutMs`): FRET's dials carry a signal, so libp2p's limit would not
+	 *   otherwise reach them. Unlike the other two, it is checked: a value that is not a finite number
+	 *   above zero, or is above 2^31 − 1, throws at node construction. libp2p would take `0` and fail
+	 *   every signal-less dial at once; FRET refuses it.
 	 * - `inboundUpgradeTimeout` — how long an inbound connection may take to finish its upgrade
 	 *   (encryption + muxer) before this node discards it.
 	 * - `addressDialTimeout` — how long one address of a peer may take to connect, inside any dial,
@@ -655,6 +748,43 @@ function resolveStorage(provider: RawStorageProvider | undefined, networkName: s
 	return withReadCache(storage, `node:${networkName}`);
 }
 
+/** What a flushed write survives, phrased for an operator reading the node's start-up log. */
+const STORAGE_DURABILITY_LINES: Record<StoreDurability, string> = {
+	'none': 'storage: in memory — nothing written survives a restart',
+	'process-crash': 'storage: a flushed write survives this process crashing, but not an operating-system crash or power cut',
+	'power-loss': 'storage: a flushed write survives a power cut or operating-system crash',
+};
+
+/**
+ * Report, once at start-up, what the resolved storage's writes survive. Keep this the ONE line
+ * that says so: a later report about the same storage (a backend that cannot sync, say) extends
+ * this function rather than logging from somewhere else.
+ */
+function logStorageDurability(durability: StoreDurability, policy: DurabilityWindowPolicy): void {
+	wiringLog('%s%s', STORAGE_DURABILITY_LINES[durability], durabilityWindowClause(durability, policy));
+}
+
+/** Largest cohort size the start-up line spells a window out for. */
+const LOGGED_WINDOW_COHORT_LIMIT = 10;
+
+/** What the durability window means on this storage, appended to the start-up storage line. */
+function durabilityWindowClause(durability: StoreDurability, policy: DurabilityWindowPolicy): string {
+	switch (durability) {
+		case 'none':
+			return '';
+		case 'process-crash':
+			return '; this backend cannot sync, so a power cut may lose any write the operating system has not yet written out, whatever the window';
+		case 'power-loss': {
+			if (!policy.independentFailures) {
+				return '; every write is synced before it is reported held';
+			}
+			const limit = Math.min(policy.declaredCohortSize, LOGGED_WINDOW_COHORT_LIMIT);
+			const windows = Array.from({ length: Math.max(limit, 1) }, (_, i) => `n=${i + 1} ${durabilityWindowMs(i + 1, policy)}ms`);
+			return `; a write may wait for its sync up to: ${windows.join(', ')} (independent failures assumed; storageDurability.independentFailures=false makes every write sync first)`;
+		}
+	}
+}
+
 /**
  * Resolve the node's durable key-value store, beside {@link resolveStorage}. The memory fallback is
  * LOUD on purpose: a silent one would look like the under-replication ledger works and then fail the
@@ -706,6 +836,20 @@ function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collec
 	return ps === undefined ? undefined : b64urlToBytes(ps.tailIdAtJoin);
 }
 
+/**
+ * The protocols a node's own clients send requests on that get a prepared stream: repo, cluster, sync
+ * and block-transfer, under the same ids the four services register. Dispute is left out — rare, and
+ * off by default, so a prepared stream for it would almost always expire unused.
+ */
+function preparedStreamProtocols(protocolPrefix: string): string[] {
+	return [
+		`${protocolPrefix}/repo/1.0.0`,
+		`${protocolPrefix}/cluster/1.0.0`,
+		buildSyncProtocol(protocolPrefix),
+		buildBlockTransferProtocol(protocolPrefix)
+	];
+}
+
 export async function createLibp2pNodeBase(
 	options: NodeOptions,
 	defaults: {
@@ -717,20 +861,54 @@ export async function createLibp2pNodeBase(
 	// throws, and there is nothing yet to release. Every network deadline below is read off this one result.
 	const linkDeadlines = resolveLinkDeadlines(options.linkRoundTripMs, options.rpcDeadlines);
 	const bootstrapContactTimeoutMs = resolveBootstrapContactTimeoutMs(options.bootstrapContactTimeoutMs, linkDeadlines);
+	// One value for libp2p's connection manager and FRET's maintenance redial, so the two cannot drift.
+	const libp2pDialTimeoutMs = resolveLibp2pDialTimeoutMs(options.connectionManager?.dialTimeout, linkDeadlines);
+	const pingHandlerTimeoutMs = resolvePingHandlerTimeoutMs(options.pingHandlerTimeoutMs, options.connectionMonitor);
+
+	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
+	// gate and the repair corroboration floor resolve to different values when nothing is declared,
+	// and why they take TWO operator fields (`clusterPolicy.assumedClusterSize`, which sets both, and
+	// `clusterPolicy.repairCorroborationClusterSize`, which sets the repair yardstick alone so a host
+	// can tighten repair without also raising the low-confidence write floor). Resolved ONCE, here,
+	// before anything that reads a cluster size is constructed: `networkManagerService` below,
+	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
+	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
+	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
+	// below is the fail-fast backstop if a future edit reintroduces that split.
+	//
+	// The cohort budget is filled from the declared link round trip BEFORE resolution, so the member,
+	// the coordinator and `reconcilePassTimeoutMs` all read the one resolved number.
+	const consensusConfig = resolveClusterPolicy(withLinkDerivedCohortBudget(options, linkDeadlines));
+	// Also before storage is acquired, so a bad value throws with nothing to release; read from the
+	// one resolved cluster policy, never a second copy of the size or threshold.
+	const durabilityWindowPolicy = resolveDurabilityWindowPolicy(options.storageDurability, consensusConfig);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
+	logStorageDurability(rawStorage.durability, durabilityWindowPolicy);
+	// The one window function: the member's apply of a consensus record and the coordinator's own
+	// fallback apply flush with the window for the record's cohort, from the one resolved policy.
+	const durabilityWindowFor: DurabilityWindowFor = cohortSize => durabilityWindowMs(cohortSize, durabilityWindowPolicy);
 	const kvStore = resolveKvStore(options.kvStore);
-	const underReplicationLedger = new KvUnderReplicationLedger(kvStore);
+	// A shortfall entry describes a commit in the block store, whose flush may have been given a
+	// window; a strict flush of that store first keeps the entry off disk until the commit it names is
+	// on it (storage.md Invariant 6, write order 8). Nothing to sync after a solo commit, which was
+	// strict; one early sync for a `majority` commit that fell short, a degraded case.
+	// NOTE: `noteReplicationShortfall` records every block of a commit concurrently, so this runs
+	// once per block; `WriteGroup` shares one sync among concurrent strict flushes with nothing to
+	// seal, and every production store runs over it. A backend that synced on every flush regardless
+	// would pay one sync per block here — coalesce in `noteReplicationShortfall` if one ever does.
+	const underReplicationLedger = new KvUnderReplicationLedger(kvStore, { beforeRecord: () => rawStorage.flush() });
 
-	// Create placeholder restore callback (will be replaced after node starts)
+	// Placeholder restore callback, reassigned once the restoration coordinator exists after start.
 	let restoreCallback: RestoreCallback = async (_blockId, _rev?) => {
 		return undefined;
 	};
 
-	// Create shared storage layers with restoration callback
-	const storageRepo = new StorageRepo((blockId) =>
-		new BlockStorage(blockId, rawStorage, restoreCallback)
-	);
+	// The factory reads the `restoreCallback` binding each time it builds a block storage, so a block
+	// storage created after the reassignment below restores through the coordinator.
+	const storageRepo = new StorageRepo(rawStorage, {
+		createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback)
+	});
 
 	let clusterImpl: ICluster | undefined;
 	let coordinatedRepo: IRepo | undefined;
@@ -794,6 +972,17 @@ export async function createLibp2pNodeBase(
 	const relayPlan = planRelayListenAddrs(options.listenAddrs ?? defaults.listenAddrs);
 	assertRelayAddrsAdvertisable(relayPlan.supervisedRelays, options.announceAddrs);
 	const listenAddrs = relayPlan.listenAddrs;
+	const holePunching = holePunchingWanted({
+		holePunching: options.holePunching,
+		listenAddrs,
+		announceAddrs: options.announceAddrs,
+		appendAnnounceAddrs: options.appendAnnounceAddrs
+	});
+	if (!holePunching) {
+		wiringLog(options.holePunching === false
+			? 'hole punching off: NodeOptions.holePunching is false'
+			: 'hole punching off: no directly dialable listen or announce address');
+	}
 	const transports = options.transports ?? defaults.transports;
 
 	// --- cohort-topic substrate activation (opt-in; default off → today's bare behavior, zero cost) ---
@@ -802,7 +991,7 @@ export async function createLibp2pNodeBase(
 	const cohortWantK = options.cohortTopic?.wantK ?? 16;
 	// When enabled, the cluster member records the consensus commit cert into this store synchronously,
 	// BEFORE `storageRepo.commit` emits the change event the bridge's extractor resolves it from (see
-	// cluster-repo.ts §applyConsensusOperation). Created early because the sink must be passed into
+	// cluster-repo.ts §captureConsensusCommitCert). Created early because the sink must be passed into
 	// `clusterMember(...)` below. Composed with any caller-supplied `onCommitCertificate` so both fire.
 	const certStore: CommitCertStore | undefined = cohortEnabled ? createCommitCertStore() : undefined;
 	const onCommitCertificate: CommitCertificateSink | undefined = certStore
@@ -810,30 +999,15 @@ export async function createLibp2pNodeBase(
 		// sink: the whole composed call is isolated in `ClusterMember.captureCommitCert`, so a caller sink
 		// that threw before the store was written would make that commit silently never originate. Ordering
 		// the store first keeps origination correct regardless of the caller sink (`put` never throws).
-		? (actionId, cert): void => { certStore.put(actionId, cert); options.onCommitCertificate?.(actionId, cert); }
+		? (actionId, cert, tailIds): void => { certStore.put(actionId, cert, tailIds); options.onCommitCertificate?.(actionId, cert, tailIds); }
 		: options.onCommitCertificate;
 
-	// Every cluster-policy default lives in `cluster/cluster-policy.ts` — including WHY the admission
-	// gate and the repair corroboration floor resolve to different values when nothing is declared,
-	// and why they take TWO operator fields (`clusterPolicy.assumedClusterSize`, which sets both, and
-	// `clusterPolicy.repairCorroborationClusterSize`, which sets the repair yardstick alone so a host
-	// can tighten repair without also raising the low-confidence write floor). Resolved ONCE, here,
-	// before anything that reads a cluster size is constructed: `networkManagerService` below,
-	// `Libp2pKeyPeerNetwork`, and the spread-on-churn monitor init must all read `consensusConfig.clusterSize`
-	// rather than `options.clusterSize` directly, or they can each apply their own fallback default and
-	// silently disagree (ticket bug-cluster-size-resolution-single-source). `assertClusterSizeCoupling`
-	// below is the fail-fast backstop if a future edit reintroduces that split.
-	//
-	// The cohort budget is filled from the declared link round trip BEFORE resolution, so the member,
-	// the coordinator and `reconcilePassTimeoutMs` all read the one resolved number.
-	const consensusConfig = resolveClusterPolicy(withLinkDerivedCohortBudget(options, linkDeadlines));
-
 	// Who is evidenced to hold each block this node holds, for the rebalance monitor (so it neither
-	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Four
+	// pushes a block back to a peer that already has it nor pulls a copy it already holds). Five
 	// producers report through this one sink: the cluster member after a durable consensus apply, the
 	// coordinator on acknowledging a cohort commit, the block-transfer service for the peer that
-	// pushed an accepted replica, and the reconcile closure for the peers that corroborated a
-	// restored revision.
+	// pushed an accepted replica, the reconcile closure for the peers that corroborated a restored
+	// revision, and the embedder through `node.reportBlockHeld`.
 	//
 	// Declared HERE, above `libp2pOptions`, rather than beside the member and coordinator below: the
 	// `blockTransfer` service factory lives inside `libp2pOptions` and is evaluated at `createLibp2p`,
@@ -863,7 +1037,7 @@ export async function createLibp2pNodeBase(
 			// Always explicit, so the undeclared fallback (10_000, libp2p's own default) does not move
 			// with libp2p. Both ends: every node is someone's listener.
 			inboundUpgradeTimeout: options.connectionManager?.inboundUpgradeTimeout ?? linkDeadlines.inboundUpgradeTimeoutMs,
-			dialTimeout: options.connectionManager?.dialTimeout ?? linkDeadlines.libp2pDialTimeoutMs,
+			dialTimeout: libp2pDialTimeoutMs,
 			// libp2p applies this inside every dial, signalled or not, so left at its 6 s default it cut off
 			// a relayed connection open on a slow link whatever the dial's own deadline said.
 			addressDialTimeout: options.connectionManager?.addressDialTimeout ?? linkDeadlines.addressDialTimeoutMs
@@ -908,7 +1082,8 @@ export async function createLibp2pNodeBase(
 			identifyPush: identifyPush({
 				protocolPrefix: `optimystic/${options.networkName}`
 			}),
-			// NOTE: constructed bare, so `@libp2p/ping`'s own `maxOutboundStreams: 1` is the outbound
+			// NOTE: constructed with only `timeout` (see {@link NodeOptions.pingHandlerTimeoutMs}), so
+			// `@libp2p/ping`'s own `maxOutboundStreams: 1` is still the outbound
 			// limit the registrar reports for `/ipfs/ping/1.0.0` to every caller on this node —
 			// including libp2p's connection monitor, which pings on that same protocol. That limit is
 			// what makes an overlapping ping abort the connection, and so what makes the deadline rule
@@ -916,13 +1091,24 @@ export async function createLibp2pNodeBase(
 			// necessary. Raising it here would retire that rule, change what every node accepts from an
 			// application's own pings, and falsify `test/connection-monitor-ping-overlap.spec.ts` plus
 			// both documents it backs — re-check all three before doing so.
-			ping: ping(),
-			// DCUtR (hole-punch) upgrades relayed node↔node connections to direct
-			// ones; AutoNAT learns this node's public reachability via peer dial-back.
-			// Both are always-on and depend on `identify` above. They are inert where
-			// the transport can't hole-punch or dial back (e.g. browser/WS-only), which
-			// is acceptable — they neither throw nor break the build in that case.
-			dcutr: dcutr(),
+			ping: ping({ timeout: pingHandlerTimeoutMs }),
+			// DCUtR (hole punching) upgrades a relayed node↔node connection to a direct one. It runs
+			// only on a node that advertises an address another machine could dial directly
+			// (`holePunchingWanted`, overridden by `NodeOptions.holePunching`). Any other node —
+			// relay-only, or listening only on loopback — can never complete dcutr's relayed exchange,
+			// which needs a dialable address from both sides; the side that received the relayed
+			// connection still makes three attempts at it: three wasted streams per relayed connection.
+			// Leaving the service out on one side silences the pair, since dcutr starts only toward a
+			// peer that advertises it too.
+			// NOTE: accepted tradeoff — a node left without dcutr by the rule also loses the one
+			// upgrade that can work for it: when a peer with a public address reaches it through a
+			// relay, it would have dialed that peer directly. `holePunching: true` restores that per
+			// node; revisit if relay-only nodes are found staying on relayed links to public peers that
+			// could have been direct.
+			...(holePunching ? { dcutr: dcutr() } : {}),
+			// AutoNAT learns this node's public reachability through peer dial-back. It depends on
+			// `identify` above and stays on every node: on a relay-only node it has nothing to confirm,
+			// but nothing measured shows it costing streams there. Gate it by the same rule if it does.
 			autoNAT: autoNAT(),
 			// NOTE: no `pubsub` service. `@chainsafe/libp2p-gossipsub` (currently at 14.1.2, the newest
 			// published version) is built against `@libp2p/interface@^2` — its `Stream` still expects
@@ -1052,6 +1238,8 @@ export async function createLibp2pNodeBase(
 					capacity: 2048,
 					profile: options.fretProfile ?? ((options.bootstrapNodes?.length ?? 0) > 0 ? 'core' : 'edge'),
 					networkName: options.networkName,
+					// FRET dials with a signal, so libp2p's `dialTimeout` never bounds its redials; this does.
+					dialTimeoutMs: libp2pDialTimeoutMs,
 					// NOTE: FRET's `seedFromBootstraps` seeds the FIRST `/p2p/` id of each entry, so a partner's circuit
 					// address (`<relay>/p2p/<relay>/p2p-circuit/p2p/<partner>`) seeds the relay, not the partner. Harmless
 					// today: the partner is learned once its connection opens, and the relay is classified foreign. If a
@@ -1128,7 +1316,14 @@ export async function createLibp2pNodeBase(
 	// built here so it observes identify (which this node triggers itself, see the `identify`
 	// service above) before anything can connect.
 	const bootstrapContact = new BootstrapContactTracker(node.peerId, bootstrapTargets);
-	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, bootstrapContact);
+	// Every identify exchange in flight, with any peer: a cohort view that names nobody but this node
+	// while one is in flight may be about to widen, which the cohort reachability gate reads.
+	const identifyProgress = new IdentifyProgress();
+	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, combineIdentifyObservers(bootstrapContact, identifyProgress));
+	// libp2p merges a stream's protocol into the remote peer's record on every stream, both ends, at a
+	// cost that showed up on phones (GitHub #40). Until libp2p/js-libp2p#3692 ships, cap that at once a
+	// minute per peer and protocol; the module says when to delete this.
+	throttleProtocolMerges(node.peerStore, node.peerId);
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
@@ -1182,8 +1377,53 @@ export async function createLibp2pNodeBase(
 		// bootstraps registers a different (network-namespaced) identify protocol, so it is
 		// never selected and can't drag this network's super-majority below quorum.
 		const protocolPrefix = `/optimystic/${options.networkName}`;
-		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines);
+		// Built once, here, and handed to every peer-selection path that must obey it (`undefined`
+		// without a predicate, which every consumer skips): the key network, and the four senders that
+		// take peers from FRET directly — spread-on-churn, the ring-shift confirm, restoration and the
+		// under-replication drain.
+		const membership = createNetworkMembershipGate(options.isNetworkMember, node.peerId.toString(),
+			createLogger('network-membership', node.peerId.toString()));
+		// Streams negotiated ahead of the request that takes them, so a request to a peer this node is
+		// already talking to skips the protocol negotiation's round trip (`network/prepared-streams.ts`).
+		// Its stop wrapper is installed at once, so a startup rollback closes it too; it reports its
+		// background opens under the same peer-suffixed `open-protocol-stream` namespace the key network does.
+		const preparedStreams = new PreparedStreams(node, {
+			protocols: preparedStreamProtocols(protocolPrefix),
+			deadlines: linkDeadlines,
+			streamOpenLog: createLogger('open-protocol-stream', node.peerId.toString())
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					preparedStreams.close();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership, preparedStreams);
 		await keyNetwork.initFromPersistedState();
+		// The offline queue's reachability gate (`node.cohortReachability`). Outside every optional
+		// subsystem's gate: it needs only the key network, the identify count and the node's events. Its
+		// stop wrapper is installed at once, so a startup rollback releases its event listeners too.
+		const cohortReachability = new KeyNetworkCohortReachability({
+			keyNetwork,
+			selfId: node.peerId.toString(),
+			identifying: () => identifyProgress.inFlight(),
+			events: node,
+			wakeDebounceMs: options.cohortReachability?.wakeDebounceMs
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					cohortReachability.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
 		const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
 		// Inject reputation into NetworkManagerService. Load-bearing and non-optional: the service is
@@ -1205,13 +1445,8 @@ export async function createLibp2pNodeBase(
 		// A timed-out fetch resolves to "no archive", exactly as a peer that holds nothing does — the
 		// pass moves on to the next peer. Only the number is configurable; the contract is unchanged.
 		//
-		// NOTE: this is the SAME request `clusterLatestCallback` already made of the same peer — both ask
-		// `requestBlock({ blockId, rev: undefined })` and get the whole archive back; the consult just
-		// projects the claim out of it and drops the bytes. So a read that goes on to repair pays two
-		// identical round trips per peer rather than one, which is invisible on a LAN and is a second
-		// `cohortQueryTimeoutMs` per peer on a relayed link. If read-repair latency on slow links ever
-		// needs cutting, carry the consult's archive through to the acquisition instead of shortening
-		// either deadline.
+		// The read path's acquisition reaches this only for a peer its consult has no archive from:
+		// the consult made this same request and hands its archives on (`ConsultedArchives`).
 		const fetchArchiveFromPeer = async (peerIdStr: string, blockId: BlockId): Promise<BlockArchive | undefined> => {
 			let peerId: ReturnType<typeof peerIdFromString>;
 			try {
@@ -1283,6 +1518,13 @@ export async function createLibp2pNodeBase(
 			return { peers: peers ?? {}, confidence };
 		};
 
+		// A consensus commit the member applies — whichever node coordinated it — marks its blocks
+		// freshly checked in the coordinator's read-repair window, by the rule the coordinator's own
+		// commits stamp under (`CoordinatorRepo.noteCohortCommitApplied`). Late-bound because the member
+		// is built before the coordinator it reports to; bound right after the coordinator below.
+		let cohortCommitAppliedTarget: CohortCommitAppliedSink | undefined;
+		const onCohortCommitApplied: CohortCommitAppliedSink = (applied) => cohortCommitAppliedTarget?.(applied);
+
 		clusterImpl = clusterMember({
 			storageRepo,
 			peerNetwork: keyNetwork,
@@ -1298,8 +1540,10 @@ export async function createLibp2pNodeBase(
 			reconcileBlock,
 			onCommitCertificate,
 			onBlockHolders,
+			onCohortCommitApplied,
 			deriveExpectedCluster,
-			createClusterClient
+			createClusterClient,
+			durabilityWindowFor
 			// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 			// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
 			// late-joiners (a liveness regression). Until that is tuned against live topology — and the
@@ -1331,7 +1575,9 @@ export async function createLibp2pNodeBase(
 			createClusterClient,
 			{
 				// clusterSize is now part of consensusConfig (member + coordinator share one reference).
-				...consensusConfig
+				...consensusConfig,
+				// Read by the coordinator only: its first hold after a read-repair consult a silent peer left unarmed.
+				retryBackoffBaseMs: linkDeadlines.retryBackoffBaseMs
 			},
 			fretSvc,
 			reputation,
@@ -1339,7 +1585,7 @@ export async function createLibp2pNodeBase(
 		);
 
 		// Create callback for querying cluster peers for their latest block revision. Three-way
-		// contract (see ClusterLatestCallback): a CertifiedActionRev is the peer's claim, a resolved
+		// contract (see ClusterLatestCallback): a ClusterLatestAnswer is the peer's claim, a resolved
 		// `undefined` is the peer answering "I hold nothing", and a REJECTION is silence — the
 		// coordinator counts it as "did not answer" and refuses to report an authoritative absent
 		// over it. Transport errors must therefore propagate, not collapse into `undefined` (that
@@ -1351,7 +1597,7 @@ export async function createLibp2pNodeBase(
 		// paths verify it before weighing it (the shared layer in `cluster/certified-claims.ts`):
 		// the coordinator's certifyClaim pass in `queryClusterForLatest`, and reconcile's
 		// certification pass in `cluster/reconcile-block.ts`.
-		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?) => {
+		const clusterLatestCallback: ClusterLatestCallback = async (peerId, blockId, context?, held?) => {
 			// Self-read short-circuit: dialling self via SyncClient is a round trip
 			// with no remote on the other end, and on nodes without listen addresses
 			// (solo WebSocket-only, bare-RN, etc.) the self-dial can hang the dial
@@ -1389,37 +1635,71 @@ export async function createLibp2pNodeBase(
 			// fixed at a few seconds whatever the declared round trip. Fine while a coordinator's cohort
 			// members are also its consensus peers. If a node ever has to read from a peer nothing else
 			// dials, size this budget for a cold open.
+			// Always the form that says what this node holds — an empty map meaning "nothing" — so a peer on
+			// this build answers in `answers` either way, and sends the bytes only when it is ahead.
 			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
-				options => syncClient.requestBlock({ blockId, rev: undefined }, options));
-			if (response.success && response.archive) {
-				// Projection lives with the archive shape (`latestClaimFromArchive`) rather than
-				// re-read inline here — it reads the claim and its proof out of ONE revision entry,
-				// so a serving peer cannot pair a proof with a revision it does not certify.
-				const claim = latestClaimFromArchive(response.archive);
-				if (claim) return claim;
-			}
-			// The peer DID answer, without data: `success:false` is the sync service's "Block not
-			// found in local storage", and an archive with no usable revisions holds nothing either
-			// way. Both are absent claims, not silence.
-			return undefined;
+				options => syncClient.requestBlock({ blockId, rev: undefined, held: held ? { [blockId]: held } : {} }, options));
+			// A peer on an older build ignores `held` and answers with the original single archive, full bytes.
+			const answer = response.answers ? response.answers[blockId] : answerFromArchiveResponse(response);
+			// An answer map that leaves out the asked block is malformed, not "holds nothing": reject, so
+			// the coordinator counts the peer silent rather than reading an absent claim into it.
+			if (!answer) throw new Error(`consult answer from ${peerId.toString()} omits block ${blockId}`);
+			return claimFromConsultAnswer(answer);
 		};
 
-		coordinatedRepo = coordinatorRepoFactory({
+		// The same consult for several blocks of one read in one request (`ConsultRound` in
+		// `repo/consult-round.ts`), under the same budget and three-way contract as the single callback
+		// above, which still asks this node itself and the blocks an older peer answers one at a time.
+		// Each block's answer is projected by the same function as there (`claimFromConsultAnswer`): the
+		// claim and its proof, read out of ONE revision entry so a serving peer cannot pair a proof with
+		// a revision it does not certify, and the archive the acquisition that follows reuses instead of
+		// asking again. That archive is attached even when its bytes were left out as 'held' — safe only
+		// because such a peer is never ahead of this node — and not when they were left out as 'size',
+		// where the peer may be ahead; the reasoning is at `claimFromConsultAnswer`.
+		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks) => {
+			const blockIds = asks.map(ask => ask.blockId);
+			const held: Record<BlockId, ActionRev> = {};
+			for (const ask of asks) if (ask.held) held[ask.blockId] = ask.held;
+			const syncClient = new SyncClient(peerId, keyNetwork, protocolPrefix, linkDeadlines);
+			// No try/catch, as above: a dial or protocol failure rejects, and every block asked reads silent.
+			const response = await withinRequestBudget(peerId.toString(), syncClient.getProtocol(), consensusConfig.cohortQueryTimeoutMs,
+				options => syncClient.requestBlock({ blockId: blockIds[0]!, blockIds, held, rev: undefined }, options));
+			if (!response.answers) {
+				// A peer on a build that predates `held` answered the first block alone, the original way.
+				return { answers: new Map([[blockIds[0]!, claimFromConsultAnswer(answerFromArchiveResponse(response))]]), unbatched: true };
+			}
+			const answers = new Map<BlockId, ClusterLatestAnswer | undefined>();
+			for (const blockId of blockIds) {
+				const answer = response.answers[blockId];
+				// A block the answer map leaves out stays out, so the round reads that block alone as silent.
+				if (answer) answers.set(blockId, claimFromConsultAnswer(answer));
+			}
+			return { answers };
+		};
+
+		const coordinator = coordinatorRepoFactory({
 			storageRepo,
 			localCluster: clusterImpl,
 			localPeerId: node.peerId,
 			clusterLatestCallback,
+			clusterLatestBatchCallback,
 			// Read-driven acquisition shares the commit path's reconcile callback verbatim: same bounded
 			// archive fetch, same (rev, actionId) and content quorums, same monotonic saveReplicatedBlock
 			// funnel. `clusterLatestCallback` alone can only tell the reader WHICH revision the cohort
 			// holds; this is what moves the bytes. Only reached once a corroborated revision exists, so a
 			// genuinely absent block still costs no archive fetch.
 			acquireBlockFromCohort: reconcileBlock,
-			// Records who is still missing each block of a commit acknowledged below `full`. Nothing
-			// drains it yet: sending those copies is `under-replication-drain-and-full-replication-event`.
+			// Records who is still missing each block of a commit acknowledged below `full`; the
+			// under-replication drain below sends those copies.
 			underReplicationLedger,
-			onBlockHolders
+			onBlockHolders,
+			// A `full` commit that settles a ledger entry announces it through the same callable the
+			// drain emits through, so a host hears one event per entry whichever of the two removed it.
+			onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event),
+			durabilityWindowFor
 		});
+		coordinatedRepo = coordinator;
+		cohortCommitAppliedTarget = (applied) => coordinator.noteCohortCommitApplied(applied);
 
 		// Fail-fast coupling: the cluster member (what accepts a super-majority as sufficient) and the
 		// coordinator (what declares a transaction committed on that super-majority) MUST run the same
@@ -1428,13 +1708,13 @@ export async function createLibp2pNodeBase(
 		// HERE at construction. See `assertSuperMajorityCoupling`.
 		assertSuperMajorityCoupling(
 			clusterImpl as import('./cluster/cluster-repo.js').ClusterMember,
-			coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo
+			coordinator
 		);
 
 		// Recover persisted transaction state before accepting new requests
 		if (options.transactionStateStore) {
 			await (clusterImpl as import('./cluster/cluster-repo.js').ClusterMember).recoverTransactions();
-			await (coordinatedRepo as import('./repo/coordinator-repo.js').CoordinatorRepo).recoverTransactions();
+			await coordinator.recoverTransactions();
 		}
 
 		// --- Shared owned-block set for the resilience monitors ---
@@ -1501,6 +1781,7 @@ export async function createLibp2pNodeBase(
 						pushResponseTimeoutMs: linkDeadlines.responseTimeoutMs,
 						...options.spreadOnChurn
 					},
+					membership,
 				);
 				await spreadMonitor.start();
 				ensureOwnedBlockFeed();
@@ -1550,6 +1831,7 @@ export async function createLibp2pNodeBase(
 				keyNetwork,
 				partitionDetector,
 				protocolPrefix,
+				membership,
 				pushBlock: (blockId, peerIds) => pushBlockToPeers(storageRepo, keyNetwork, blockId, peerIds, {
 					reason: 'replication',
 					protocolPrefix,
@@ -1571,6 +1853,25 @@ export async function createLibp2pNodeBase(
 		// Expose for tests/diagnostics (mirrors node.spreadOnChurnMonitor / node.rebalanceMonitor).
 		(node as any).underReplicationDrain = underReplicationDrain;
 		(node as any).underReplicationLedger = underReplicationLedger;
+
+		// --- Embedder holder reports (`node.reportBlockHeld`, attached with the host surface below) ---
+		// Outside the drain's `enabled` gate: disabling the drain stops pushing, not recording, and the
+		// ledger half needs only the ledger, the key network and the repo's event sink, all built above
+		// unconditionally. The rebalance half goes through the same late-bound sink as the other
+		// producers, so it is a no-op wherever no monitor was built.
+		const heldCopyDeps: HeldCopyDeps = {
+			ledger: underReplicationLedger,
+			keyNetwork,
+			selfId: node.peerId.toString(),
+			emit: (event) => storageRepo.emitBlockDurabilityReached(event)
+		};
+		const reportBlockHeld: OptimysticNodeAttachments['reportBlockHeld'] = async (blockId, rev, peerId) => {
+			// Ahead of both halves, so a malformed report reaches neither.
+			assertReportedRevision(rev);
+			// Before the ledger, because it is synchronous and never throws: the monitor hears it even when the ledger rejects.
+			onBlockHolders({ blockIds: [blockId], holders: [peerId] });
+			await recordHeldCopy(heldCopyDeps, blockId, rev, peerId);
+		};
 
 		// Initialize Arachnode ring membership and restoration
 		const enableArachnode = options.arachnode?.enableRingZulu ?? true;
@@ -1635,17 +1936,13 @@ export async function createLibp2pNodeBase(
 					keyNetwork,
 					`/optimystic/${options.networkName}`,
 					node.peerId.toString(),
-					linkDeadlines
+					linkDeadlines,
+					membership
 				);
 
-				// Update restore callback to use new coordinator
-				const newRestoreCallback: RestoreCallback = async (blockId, rev?) => {
+				restoreCallback = async (blockId, rev?) => {
 					return await restorationCoordinatorV2.restore(blockId, rev);
 				};
-
-				// Replace the restore callback (this is a bit hacky, but works for now)
-				(storageRepo as any).createBlockStorage = (blockId: string) =>
-					new BlockStorage(blockId, rawStorage, newRestoreCallback);
 
 				// --- Rebalance reaction: drive RebalanceMonitor + react via BlockTransferCoordinator ---
 				// Nothing previously activated the rebalance path on a real node: initRebalanceMonitor was
@@ -1760,6 +2057,7 @@ export async function createLibp2pNodeBase(
 							confirmer: coordinator,
 							ownedBlocks,
 							selfPeerId: peerId,
+							membership,
 							getFloor: () => rebalanceMonitor.getCohortSize(),
 							onRelease: (blockIds) => {
 								for (const blockId of blockIds) {
@@ -1900,6 +2198,9 @@ export async function createLibp2pNodeBase(
 					// (hash(blockId ‖ round ‖ epoch ‖ i)) rather than the block's XOR neighborhood, so an attacker
 					// who owns the block's locale does not thereby own the arbitrators. `assembleCohort` already
 					// filters to known members; excluding the original cluster + self keeps arbitrators independent.
+					// NOTE: not filtered by `membership` — a node-local predicate would make the draw differ between
+					// nodes — so a refused peer can be drawn and sent the disputed record. Settled before the dispute
+					// subsystem goes live (`feat-dispute-subsystem-live-activation`, "Who may arbitrate?").
 					const excludeSet = new Set(excludePeers);
 					// NOTE: adding the local node's own id to `exclude` makes the draw node-relative. Cross-node
 					// determinism (the verifiable-recompute property) holds today only because the dissent
@@ -1944,6 +2245,8 @@ export async function createLibp2pNodeBase(
 			// Ed25519 by construction (options.privateKey defaults to generateKeyPair('Ed25519')).
 			peerPrivateKey: nodePrivateKey,
 			linkDeadlines,
+			reportBlockHeld,
+			cohortReachability,
 		};
 		Object.assign(node, attachments);
 
@@ -1977,7 +2280,16 @@ export async function createLibp2pNodeBase(
 			// proof names. `docs/reactivity.md` §Authentication and integrity.
 			const commitLogAnchor = new CommitLogTrustAnchor({
 				membersAt: rootGroupAt,
-				latestClaimFrom: (peerIdStr, blockId) => clusterLatestCallback(peerIdFromString(peerIdStr), blockId),
+				// The anchor reads only the claim and its proof, so it is not handed the archive to hold.
+				// NOTE: it says nothing of what this node holds, so a peer sends the block's bytes, which are
+				// thrown away here. Fine — it runs once per distant root certificate, not per read; if anchor
+				// lookups ever show in request accounting, give the request a claims-only mode.
+				latestClaimFrom: async (peerIdStr, blockId) => {
+					const answer = await clusterLatestCallback(peerIdFromString(peerIdStr), blockId);
+					if (!answer) return undefined;
+					const { archive: _archive, ...claim } = answer;
+					return claim;
+				},
 				thresholds: proofThresholds(consensusConfig.superMajorityThreshold),
 				hash: createRingHash(),
 			});
@@ -2187,7 +2499,8 @@ export async function createLibp2pNodeBase(
 				// A frame for a root this node serves no push state for is let through: there is nothing to
 				// protect, and the resolve step drops it as unserved.
 				// NOTE: reads the key network's serving cohort per inbound frame (one per collection per member
-				// per gossip round). If it shows in profiles, memoize per tail with a TTL of one gossip interval.
+				// for each change to its push state, plus one per refresh, 30 s by default). If it shows in
+				// profiles, memoize per tail with a TTL of one gossip interval.
 				isCohortMember: async (fromPeerId: string, g: PushStateGossipV1): Promise<boolean> => {
 					const served = servedPushStateForGossip(g);
 					if (served === undefined) return true;
@@ -2273,13 +2586,16 @@ export async function createLibp2pNodeBase(
 			// 7. Collection watch service — the host-facing surface of everything above: one call per collection an
 			// application wants to be woken for. It builds one subscription manager per collection, registers it in
 			// `reactivitySubscribers` under the collection's topic, renews it, and has it follow the tail on a
-			// rotation (driving the scheduler above).
+			// rotation (driving the scheduler above). It also hears this node's own storage: the per-collection
+			// feed holds a table's event until the action's other collections pending here have landed, so the
+			// wake it gives a watcher is one whose local re-read sees the whole commit.
 			const scheduler = reactivityRotation;
 			reactivityWatch = new ReactivityCollectionWatch({
 				service: host.service,
 				profile: reactivityProfile,
 				quorumRatio: reactivityQuorumRatio,
 				subscribers: reactivitySubscribers,
+				localChanges: storageRepo,
 				scheduleRotation: (notice): void => scheduler.schedule(notice),
 				recover,
 				recoverSigners,

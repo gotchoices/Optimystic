@@ -99,7 +99,7 @@ type SeedAction = {
 async function makeCollection(collectionId: string): Promise<Collection> {
 	const raw = new MemoryRawStorage();
 	const createBlockStorage = (id: BlockId) => new BlockStorage(id, raw);
-	const repo = new StorageRepo(createBlockStorage);
+	const repo = new StorageRepo(raw);
 	const log = await Log.create<unknown>(new MemLogStore(collectionId));
 	const committedBlocks = new Set<BlockId>();
 
@@ -116,13 +116,13 @@ async function makeCollection(collectionId: string): Promise<Collection> {
 		await log.addActions(['op'], actionId, rev, () => writes.map(w => w.blockId), { reads });
 	};
 
-	return { collectionId, log, createBlockStorage, repo, seed };
+	return { collectionId, log, createBlockStorage, flush: () => raw.flush(), repo, seed };
 }
 
 /** Apply the root invalidation through the single-collection primitive and build the cascade seed from it. */
 async function applyRoot(coll: Collection, actionId: string, rev: number, blockIds: BlockId[], proof: DisputeResolutionProof): Promise<CascadeSeed[]> {
 	const result = await applyInvalidation(
-		{ log: coll.log, createBlockStorage: coll.createBlockStorage },
+		{ log: coll.log, createBlockStorage: coll.createBlockStorage, flush: coll.flush },
 		{ invalidatedActionId: actionId, invalidatedRev: rev, blockIds, proof }
 	);
 	expect(result.applied, 'root invalidation applied').to.equal(true);
@@ -345,7 +345,7 @@ describe('Invalidation cascade', () => {
 		const proof = await challengerWinsProof('d1');
 		const seed: CascadeSeed[] = [{ collectionId: 'C', blockId: 'A', rev: 5, restoredContentHash: 'whatever' }];
 
-		await applyInvalidation({ log: c.log, createBlockStorage: c.createBlockStorage }, { invalidatedActionId: 'tinv', invalidatedRev: 2, blockIds: ['A'], proof });
+		await applyInvalidation({ log: c.log, createBlockStorage: c.createBlockStorage, flush: c.flush }, { invalidatedActionId: 'tinv', invalidatedRev: 2, blockIds: ['A'], proof });
 
 		let threw = false;
 		try {

@@ -7,6 +7,7 @@ import { SyncClient } from '../sync/client.js';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import type { ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { partitionCovers } from './arachnode-partition.js';
+import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { createLogger } from '../logger.js';
 import type { RpcDeadlineDefaults } from '../rpc-deadline.js';
 
@@ -34,7 +35,13 @@ export class RestorationCoordinator {
 		/** Optional self peer id — used to skip dialing self on solo/bootstrap nodes. */
 		private readonly selfPeerId?: string,
 		/** The fallback deadlines of every `SyncClient` it builds — the node's resolved `LinkDeadlines`. */
-		private readonly rpcDeadlines?: RpcDeadlineDefaults
+		private readonly rpcDeadlines?: RpcDeadlineDefaults,
+		/**
+		 * The node's network-membership gate (`createNetworkMembershipGate`). Every candidate here comes
+		 * from FRET, whose ring a stranger can join, and a restored archive is vetted but not verified
+		 * (`BlockStorage.restoreRevision`), so a peer the gate refuses is never asked. Absent → no check.
+		 */
+		private readonly membership?: NetworkMembershipGate
 	) {}
 
 	private readonly log = createLogger('storage:restoration')
@@ -53,7 +60,8 @@ export class RestorationCoordinator {
 		const blockCoord = await hashKey(routingKeyForBlock(blockId));
 
 		// 1. Try my transaction ring peers first
-		const myPeers = this.getMyRingPeers(blockCoord);
+		const ringPeers = this.getMyRingPeers(blockCoord);
+		const myPeers = this.membersOnly(ringPeers);
 		const myRingDepth = this.getMyRingDepth();
 
 		// Avoid dialing self: on a solo/bootstrap node with no listenAddrs, dialing self
@@ -63,7 +71,8 @@ export class RestorationCoordinator {
 			? myPeers.filter(p => p !== this.selfPeerId)
 			: myPeers;
 		if (nonSelfMyPeers.length === 0 && myRingDepth <= 0) {
-			this.log('restore:solo-node-skip blockId=%s', blockId);
+			// `refused` > 0 means peers exist but the membership gate turned every one down — not a solo node.
+			this.log('restore:solo-node-skip blockId=%s refused=%d', blockId, ringPeers.length - myPeers.length);
 			return undefined;
 		}
 
@@ -82,7 +91,7 @@ export class RestorationCoordinator {
 			const storagePeers = this.fretAdapter.findPeersAtRing(ringDepth);
 
 			// Filter to peers responsible for this block's partition (skip self — cannot dial self).
-			const responsiblePeers = this.filterByPartition(storagePeers, blockCoord, ringDepth)
+			const responsiblePeers = this.membersOnly(this.filterByPartition(storagePeers, blockCoord, ringDepth))
 				.filter(p => !this.selfPeerId || p !== this.selfPeerId);
 
 			for (const peerIdStr of responsiblePeers) {
@@ -117,6 +126,11 @@ export class RestorationCoordinator {
 	 */
 	private getMyRingPeers(blockCoord: RingCoord): string[] {
 		return this.fretAdapter.getFret().assembleCohort(blockCoord, 10);
+	}
+
+	/** Drop the FRET-derived candidates the membership gate refuses. */
+	private membersOnly(peers: string[]): string[] {
+		return peers.filter(peerId => admittedBy(this.membership, peerId));
 	}
 
 	/**

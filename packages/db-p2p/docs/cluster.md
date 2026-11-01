@@ -36,6 +36,7 @@ The `ClusterClient` provides a network client for communicating with remote clus
 - **Network Abstraction**: Simplifies peer-to-peer cluster communication
 - **Protocol Handling**: Manages libp2p protocol details
 - **Record Updates**: Sends and receives cluster record updates
+- **Carried Records**: `updateCarrying` sends decided records the member is still owed ahead of the request's own record (see [Owed deliveries ride on the next request](#owed-deliveries-ride-on-the-next-request))
 - **Error Management**: Handles network failures and timeouts
 
 **Implementation:**
@@ -248,7 +249,9 @@ sensibly. Each variant's extra field (`rejectReason`, `conflictWith`) is folded 
 payload (`clusterVoteSigningPayload` in db-core), so neither can be rewritten in transit.
 
 The coordinator counts the three kinds separately and reports a promise-phase shortfall as whichever
-it actually was: `ValidatorRejectionError` (invalid — permanent), `ConflictRaceLostError` (lost race
+it actually was: `ValidatorRejectionError` (enough members rejected — which `CoordinatorRepo.pend`
+returns as a `RejectedFailure` when every reject was a signed validity vote or an expiry vote, and
+otherwise throws unless its own storage confirms a revision loss), `ConflictRaceLostError` (lost race
 — surfaced by BOTH `CoordinatorRepo.pend` and `CoordinatorRepo.commit` as a retryable `StaleFailure`
 with `conflict: true`, never as a throw: db-core retries a thrown commit verbatim, and a re-driven
 dead commit can assemble a consensus no member will durably store), or the legacy super-majority
@@ -271,7 +274,10 @@ checked this"):
    checks abstain — so without this it would blindly co-sign the commit of a write it had just refused.
    A member that merely *missed* the pend retains no refusal and abstains exactly as before, which is
    what keeps the lagging-member tolerance intact; so does a member whose refusal is no longer
-   corroborated, or whose retention has aged out.
+   corroborated, or whose retention has aged out. The refusal is remembered per block the refused pend
+   named, under the action id: every collection of a multi-collection transaction pends and commits
+   under one action id, so a commit is vetoed only for a block whose pend was refused, and an accepted
+   pend of one collection's blocks does not retire the refusal of another's.
 3. `validateCommitOperations` — does the declared per-block content digest reproduce locally? (See
    `docs/correctness.md` § Content digest declaration.)
 
@@ -307,20 +313,45 @@ Once super-majority promises are collected, the commit phase begins. **Commits o
 **The coordinator's own member votes first, and its vote rides on the commit round.** Before the
 round goes out, `ClusterCoordinator.commitTransaction` delivers the promise-complete record to its own
 member in process; the member signs its commit, and the round carries that signature to every remote
-member. A remote member adds its own commit, and in a cohort of two (2 of 2) or three (2 of 3) that is
-already the majority its phase loop needs, so it reaches consensus and applies in the same delivery,
-answering with its apply report. Nothing about what a member accepts changes — it reaches consensus
-only on commit signatures it verified, having signed its own only after seeing a super-majority of
-approved promises — the record simply arrives one round earlier than the broadcast would bring it. In a
-cohort of four or more the two commits are short of a majority and nobody applies on receipt.
+member. A remote member adds its own commit, and in a cohort of three (2 of 3) that is already the
+majority its phase loop needs, so it reaches consensus and applies in the same delivery, answering with
+its apply report. Nothing about what a member accepts changes — it reaches consensus only on commit
+signatures it verified, having signed its own only after seeing a super-majority of approved promises —
+the record simply arrives one round earlier than the broadcast would bring it. In a cohort of four or
+more the two commits are short of a majority and nobody applies on receipt.
+
+**In a cohort of two there is no commit round.** The other member, answering the promise round, already
+sees both approvals (the coordinator's pre-vote and its own) and signs its commit in the same answer.
+The coordinator keeps that signature when the answer's promise map equals the round's merged one — the
+map a commit signature covers — so its own member's pre-sign completes the majority and applies, and
+the other member is owed only the decision (`keepCommitsSignedOverMergedPromises` and
+`deliverDecidedWithoutCommitRound` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). A commit
+signature signed over any other map is dropped, as every one from the promise round used to be.
 
 Once the merged commits reach the majority, `broadcastMergedRecord` delivers the record to the
-coordinator's own member (awaited) and then only to the remote members still needing it: a member whose
-commit-round call failed, one whose answer does not report having applied (`MemberApplyOutcome.executed`,
-which a member on an older build never sets), and one reporting a refused commit — sending that one the
-record again, now that the coordinator's member holds the revision, gives a behind member another
-reconcile. In a healthy two- or three-member cohort that list is empty, so a consensus operation costs
-each remote member two calls instead of three.
+coordinator's own member (awaited, unless it already applied) and then only to the remote members still
+needing it: a member whose commit-round call failed, one whose answer does not report having applied
+(`MemberApplyOutcome.executed`, which a member on an older build never sets), one reporting a refused
+commit — sending that one the record again, now that the coordinator's member holds the revision, gives
+a behind member another reconcile — and, in a cohort of two, the other member. In a healthy two- or
+three-member cohort a consensus operation therefore costs each remote member two calls instead of three.
+
+**A write's pend delivers its decision with the commit.** In a cohort of two, the decision of a pend
+record whose writer marked every operation the action's only reservation (`PendRequest.soleReservation`:
+`TransactorSource.transact`; `TransactionCoordinator` for a one-collection transaction, and for every
+request of a set of collections it sends as one batch, `ITransactor.pendMany`, whose commit then goes as
+one batch too) is not sent on its own. It is owed to the other member, and the action's commit carries it on its first request,
+ahead of the commit's own record ([below](#owed-deliveries-ride-on-the-next-request)), so the member
+applies the pend, or refuses it, before it votes on the commit — every collection of a batch before the
+batch's one commit record. Such a write costs the other member three requests instead of four, however
+many collections it writes. The decision is held back only when this node's own member applied the pend
+and its storage accepted it, every remote member can be carried to — its answers stamp
+`acceptsCarried` and this node's client for it can carry — and the record's expiration is more than
+twice the deferral away (`mayDeferPendDelivery`). If no commit follows within `pendDeliveryDeferralMs`
+the decision goes alone, as a scheduled retry that does not count against
+`commitBroadcastRetryMaxAttempts`. A pend without the mark — a pend of a transaction whose collections
+go one request each — is delivered at once: its late refusal could surface after a sibling collection's
+commit landed, tearing the write (see [`docs/correctness.md` §2](../../../docs/correctness.md#2-definitions)).
 
 This simple majority is the *cluster-internal* commit-signature count — how many members have signed commit — not the writer-facing acknowledgement. The coordinator's answer to the writer is gated separately, by a post-reconcile storage-durability majority (the durability gate); it does not follow from commit-signature count alone. See [`docs/correctness.md` Theorem 6](../../../docs/correctness.md#theorem-6-durability) for the full three-checkpoint pipeline.
 
@@ -358,7 +389,7 @@ private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> 
 
 When majority consensus is reached, the transaction is executed. Execution is guarded by a synchronous check-and-set on `executedTransactions` to prevent duplicate execution — JavaScript's single-threaded event loop makes this atomic as long as the guard runs before the first `await`.
 
-The real `handleConsensus` lives on `ClusterMember` in `packages/db-p2p/src/cluster/cluster-repo.ts` (not in `cluster-coordinator.ts` — that is the *coordinator* side). The snippet below is a simplification: current code delegates the per-operation dispatch to `applyConsensusOperation` and, after the loop succeeds, writes a durable executed-marker via `stateStore.markExecuted` for post-restart dedup.
+The real `handleConsensus` lives on `ClusterMember` in `packages/db-p2p/src/cluster/cluster-repo.ts` (not in `cluster-coordinator.ts` — that is the *coordinator* side). The snippet below is a simplification: current code delegates the per-operation dispatch to `applyConsensusOperations` and, after the loop succeeds and its writes are power-loss durable (`markExecutedOnceDurable`), writes a durable executed-marker via `stateStore.markExecuted` for post-restart dedup.
 
 ```typescript
 private async handleConsensus(record: ClusterRecord): Promise<void> {
@@ -649,11 +680,27 @@ Once the tail block commits, the coordinator now tracks any peers that promised 
 
 Unless the node was built with a `transactionStateStore` (from which `recoverTransactions` resumes a persisted retry after a restart), the retry lives only in the coordinator's memory: a member that stays away longer than the schedule, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
 
-Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort whose other member missed the commit round, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
+Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort that ran a commit round (the other member's promise-round commit was not kept) and whose other member missed it, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
+
+The same retry carries a pend's decision that is waiting for its commit ([Phase 2](#phase-2-commit-execution-simple-majority-required)). `pendDeliveryDeferralMs` (`ClusterConsensusConfig`, default 2000 ms, `DEFAULT_PEND_DELIVERY_DEFERRAL_MS`; resolved in the `CoordinatorRepo` constructor beside the retry settings above) is that retry's first interval, and it is not a counted attempt: the attempt budget and the backoff start with the first retry after it. `0` turns the deferral off, and a two-member single-collection write then costs the other member four requests. The commit that follows a pend usually arrives within milliseconds when the writer runs on the coordinating node, and within one writer-to-coordinator round trip otherwise, so a deferral that runs out first costs only the standalone delivery it replaced.
 
 A successful retry clears the pending list; hitting the max attempts emits `cluster-tx:retry-abort` so operators can intervene. The coordinator keeps the transaction in memory while the retry is live, ensuring follow-up requests (reads, additional commits) see a consistent state, and releases it when the retry ends — whichever way it ends. All three terminal exits (the commit finished with no retry pending, the retry caught every peer up, the retry gave up) go through one `releaseTransaction` in `packages/db-p2p/src/repo/cluster-coordinator.ts`, which cancels any armed retry and then deletes the in-memory entry and the persisted coordinator state on a 100 ms deferral, logging `cluster-tx:transaction-remove` with a `reason` naming the exit.
 
 Cluster members are idempotent: they ignore duplicate commits once their signature is present, so forced retries do not double-apply user operations.
+
+The timer is not the only way a pending peer gets the record: any other request the coordinator sends that peer carries it first ([below](#owed-deliveries-ride-on-the-next-request)), and a peer that takes it that way leaves the retry exactly as one the timer reached does. The timer skips a peer while the record is riding to it on another request, and it is still pending until that request's answer says it took the record.
+
+### Owed deliveries ride on the next request
+
+A record whose retry still lists a peer, and which already carries a commit majority, is **owed** to that peer: it is decided, and the peer only has to receive it. `ClusterCoordinator.updateMember` is the one place a request goes to a remote member, and there it attaches the peer's owed records ahead of the request's own record — oldest first, at most `MaxCarriedRecords` (4, `packages/db-core/src/cluster/structs.ts`), never the record the request is for, and only once the coordinator's own member has applied the record, so the coordinating member still applies first. A record short of a majority is never carried: re-sending it asks for a vote, and the compact answer below has no room for one.
+
+On the wire the request envelope `{ operation: 'update', record }` gains an optional `carried: ClusterRecord[]`, and the answer to a request that carried any gets one more field, `carried: CarriedOutcome[]`, on whatever it already returns — the record, a redirect, or the error envelope. Each `CarriedOutcome` is `{ messageHash, delivered, outcome?, error? }`, one per carried record in the order sent, where `outcome` is the member's own `applyOutcomes` entry. `ClusterService` applies the carried records first, in order, each exactly as it takes a standalone record — address learning, the redirect check (a redirect is "not delivered"), then the member's `update` in its own `try`, so one carried record's failure never fails the request — and then the request's own record. The loop is `applyCarriedRecords` in `packages/db-p2p/src/cluster/carried-records.ts`, which the mesh harness's client runs too. A `carried` that is not a list of at most four records is ignored, not refused.
+
+- **Who is carried to.** Every answer a member gives stamps `MemberApplyOutcome.acceptsCarried`. The coordinator remembers, per peer, what that peer's own last answer said (1024 peers, least recently used dropped), and carries only to a peer whose last answer stamped it — and only when this node's client for that peer can carry at all (`ICluster.updateCarrying`), whatever the peer advertises. An older member never stamps it, so it is never carried to and gets the timer's deliveries, as before; an older coordinator never sends the field.
+- **A commit carries its own pend.** A request that commits or cancels an action carries that action's owed pends first, ahead of the other owed records and even while another request is already carrying them. For a single-collection write on a two-member cohort the pend is owed this way by design, so this is its ordinary path. The member has then applied the pend — or refused it — before it votes on the commit or applies the cancel, which is what the commit-promise guard (`validateCommitAgainstRefusedPend`, below) needs to see; a cancel that overtook its pend would leave a pending record nothing removes. A second copy is answered from the member's dedup.
+- **A late pend refusal answers the commit.** A conflict-shaped pend refusal a peer reports on a carried or retried delivery is kept, by action id and the blocks the pend named, until a commit of the action touching one of those blocks reads it (`ClusterCoordinator.takeLatePendRefusals`, 1024 actions, dropped when a new pend of the same action and blocks starts). Scoping by block is what keeps one collection of a multi-collection transaction, which commits concurrently with the others under the same action id, from taking a sibling's refusal. When the commit throws — typically that peer refusing to co-sign it — `CoordinatorRepo.commit` answers with the refusal instead: the retryable conflict the pend would have returned had the peer applied it in time. A commit that returned an answer keeps it, and so does a throw over a revision this node already holds under the same action (`coordinator-repo:commit-late-pend-refusal` records which).
+- **Taking and returning.** A record is marked in flight for the peer when it is attached, so two concurrent requests never both carry it (a commit's own pend excepted, above). When the answer says the peer took it, the coordinator books it as it books a delivery by the timer — the peer's report joins the record, the peer leaves the retry, the retry ends when nobody is left (or, when the timer's own run is in progress, that run ends it, since its broadcast can still put a peer back), and the coordinating member gets its second reconcile if the peer now reports holding the revision. Otherwise — not delivered, or the carrying request failed — the record stays owed for the timer or the next request. A member dedups a record it already applied, so a lost answer costs only a re-send.
+- **Size.** `ClusterClient.updateCarrying` sends the request without its carried records, reporting each not delivered, when they would push it past the cluster protocol's frame limit — `MAX_BLOCK_MESSAGE_BYTES` (8 MiB) in `packages/db-p2p/src/protocol-limits.ts`, the same limit the request is then sent and decoded under (`carried:too-large` under `cluster-client`). A held-back pend record near the per-transaction limit plus the commit record it rides with fits inside the limit's envelope reserve, so in practice this fires only when several decided pend records are owed to one peer at once.
 
 ### Timeout Management
 
@@ -804,7 +851,7 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 
 - **Promise Phase**: Single round-trip to all peers (~100-500ms)
 - **Commit Phase**: Second round-trip for final confirmation (~100-500ms)
-- **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer, where members apply on receipt of the commit round; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
+- **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer — in a cohort of three members apply on receipt of the commit round; in a cohort of two there is no commit round, and the second is the decision, which for a single-collection write's pend rides on the commit's first request instead, so such a write costs three in all; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
 
 ### Throughput Optimization
 
@@ -825,7 +872,7 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 Errors are thrown as plain `Error` instances with descriptive messages. Key error conditions:
 
 - **Cluster too small**: `Cluster size N below minimum M and not validated` — cluster doesn't meet `minAbsoluteClusterSize` and FRET validation failed
-- **Downsize rejected**: `Cluster size N below configured minimum M` — `allowClusterDownsize` is false and cluster shrank
+- **Downsize rejected**: `Cluster size N below configured minimum M` — `allowClusterDownsize` is false and a cohort of two or more members is smaller than `clusterSize`. A cohort of at most one peer never reaches this check: it commits alone, answered as durability class `local` or `unrouted`, whatever the flag says
 - **Super-majority failed**: `Failed to get super-majority: N/M approvals (needed K, R rejections)` — too few approving promises
 - **Validator rejection**: `Transaction rejected by validators (N/M rejected): reasons` — rejection count exceeds `maxAllowedRejections`
 - **Membership not admitted**: a member declines to vote on the coordinator's declared peer set. Carried as the `rejectReason` on the member's `reject` promise (not thrown), so it feeds the dispute accounting. Variants:
@@ -859,7 +906,7 @@ Errors are thrown as plain `Error` instances with descriptive messages. Key erro
 
 - **Peer Identity**: Ed25519 key pairs tied to libp2p peer IDs
 - **Cluster Membership**: Only peers returned by `findCluster()` (via FRET) participate in consensus for a given block — the coordinator included. `ClusterCoordinator.executeClusterTransaction` refuses to run a transaction for a resolved cohort that excludes its own member; `CoordinatorRepo` refuses a write for a block whose cohort excludes this node, or whose cohort lookup failed (`ResponsibilityRefusalError`); and `RepoService.checkRedirect` sends a misrouted inbound request to the cohort, asking the node's own key network the same question. See [docs/internals.md §Proximity Verification](../../../docs/internals.md#proximity-verification)
-- **Network-Membership Scoping**: When several networks share the same physical nodes/bootstraps, FRET's network-agnostic seeding can admit a peer that only belongs to *another* network (`control-B`) into this network's (`control-A`) routing ring. Such a peer registers a different (network-namespaced) `identify` protocol, so its identify never completes here and its peerStore protocol list stays empty forever. `Libp2pKeyPeerNetwork` (constructed with this network's `protocolPrefix`) classifies each candidate from its peerStore protocols as `serves` (advertises `${protocolPrefix}/cluster|repo/1.0.0`), `foreign` (advertises only another network's), or `unknown` (not yet identified — a fresh same-network peer *or* a permanent cross-network contaminant). `findCoordinator` and `findCluster` derive their candidates from one shared, ordered assembly (`assembleServingCohort` in `packages/db-p2p/src/libp2p-key-network.ts`): FRET's nearest live ring members for the key, over-fetched to a wider proximity band so a cross-network peer cannot displace a legitimate same-network peer, filtered to `serves` members with proximity order preserved, and cut to the nearest `clusterSize`. Neither ever selects a `foreign` **or** `unknown` peer: an `unknown` (possibly cross-network) peer is never gambled on, because a permanent cross-network contaminant and a fresh same-network peer mid-identify are indistinguishable while `unknown`, so picking one risks contaminating the write — its `cluster`/`repo` dial then negotiates a different network's protocol and fails. The membership filter re-reads the peerStore on every retry attempt, so an unconfirmed peer becomes selectable only once `identify` flips it to `serves` within the retry window; otherwise selection falls to self-coordination — but only when self is itself in the cohort. Self is classified on the same footing as every other peer, from the protocols this node itself registers (`selfServes` in `packages/db-p2p/src/libp2p-key-network.ts`): a node that serves this network's `cluster`/`repo` protocol is in a block's cohort exactly when it is among the nearest `clusterSize` serving peers — at its proximity position, never as an extra copy — and a node that registers neither (a client-only node) is in no cohort at any width, may see an empty `findCluster`, and never self-coordinates. When the serving peers number at most `clusterSize`, the nearest `clusterSize` are all of them, self included, so every documented small deployment sees every serving node in every cohort; on a wider network a writer is responsible for only some of the blocks it writes, and the rest go to their cohorts over the network. The writer's `NetworkTransactor` groups a write's blocks onto as few coordinators as cover them, and on a tie picks its own node when that node is in the cohort (`localPeerId`; `bestCoveringPeer` in `packages/db-core/src/transactor/network-transactor.ts`), so a block the writer is responsible for costs no network hop. It never picks itself over a member covering more blocks, so blocks with disjoint cohorts go out as one batch per cohort. A freshly-formed single-network mesh is not starved — when self is the only serving member the cohort is self-only, which completes the write under `allowClusterDownsize` (the default), and the legitimate peer is re-selected as `serves` on the caller's retry once its `identify` completes. One exception to "empty means `unknown`": a peer this node has already seen advertising this network's protocols reads `serves` while its list is empty, and with network-state `persistence` that verdict survives a restart (`rememberedServing` in `packages/db-p2p/src/libp2p-key-network.ts`), so a restarted node whose peerStore is still empty assembles the cohort it had before rather than a self-only one; a non-empty list always replaces the verdict. When self is unavailable (excluded by the caller, or not among the key's responsible peers) and only `foreign`/`unknown` (not-yet-confirmed) peers remain, `findCoordinator` throws `NO_NETWORK_COORDINATOR` rather than a generic no-coordinator/super-majority error.
+- **Network-Membership Scoping**: When several networks share the same physical nodes/bootstraps, FRET's network-agnostic seeding can admit a peer that only belongs to *another* network (`control-B`) into this network's (`control-A`) routing ring. Such a peer registers a different (network-namespaced) `identify` protocol, so its identify never completes here and its peerStore protocol list stays empty forever. `Libp2pKeyPeerNetwork` (constructed with this network's `protocolPrefix`) classifies each candidate from its peerStore protocols as `serves` (advertises `${protocolPrefix}/cluster|repo/1.0.0`), `foreign` (advertises only another network's), or `unknown` (not yet identified — a fresh same-network peer *or* a permanent cross-network contaminant). `findCoordinator` and `findCluster` derive their candidates from one shared, ordered assembly (`assembleServingCohort` in `packages/db-p2p/src/libp2p-key-network.ts`): FRET's nearest live ring members for the key, over-fetched to a wider proximity band so a cross-network peer cannot displace a legitimate same-network peer, filtered to `serves` members with proximity order preserved, and cut to the nearest `clusterSize`. Neither ever selects a `foreign` **or** `unknown` peer: an `unknown` (possibly cross-network) peer is never gambled on, because a permanent cross-network contaminant and a fresh same-network peer mid-identify are indistinguishable while `unknown`, so picking one risks contaminating the write — its `cluster`/`repo` dial then negotiates a different network's protocol and fails. The membership filter re-reads a peer's peerStore record whenever libp2p reports it changed, which `identify` completing does (`PeerRecordCache` in `packages/db-p2p/src/network/peer-record-cache.ts`), so an unconfirmed peer becomes selectable only once `identify` flips it to `serves` within the retry window; otherwise selection falls to self-coordination — but only when self is itself in the cohort. Self is classified on the same footing as every other peer, from the protocols this node itself registers (`selfServes` in `packages/db-p2p/src/libp2p-key-network.ts`): a node that serves this network's `cluster`/`repo` protocol is in a block's cohort exactly when it is among the nearest `clusterSize` serving peers — at its proximity position, never as an extra copy — and a node that registers neither (a client-only node) is in no cohort at any width, may see an empty `findCluster`, and never self-coordinates. When the serving peers number at most `clusterSize`, the nearest `clusterSize` are all of them, self included, so every documented small deployment sees every serving node in every cohort; on a wider network a writer is responsible for only some of the blocks it writes, and the rest go to their cohorts over the network. The writer's `NetworkTransactor` groups a write's blocks onto as few coordinators as cover them, and on a tie picks its own node when that node is in the cohort (`localPeerId`; `bestCoveringPeer` in `packages/db-core/src/transactor/network-transactor.ts`), so a block the writer is responsible for costs no network hop. It never picks itself over a member covering more blocks, so blocks with disjoint cohorts go out as one batch per cohort. A freshly-formed single-network mesh is not starved — when self is the only serving member the cohort is self-only, which completes the write alone (the solo path runs no consensus and does not read `allowClusterDownsize`), and the legitimate peer is re-selected as `serves` on the caller's retry once its `identify` completes. One exception to "empty means `unknown`": a peer this node has already seen advertising this network's protocols reads `serves` while its list is empty, and with network-state `persistence` that verdict survives a restart (`rememberedServing` in `packages/db-p2p/src/libp2p-key-network.ts`), so a restarted node whose peerStore is still empty assembles the cohort it had before rather than a self-only one; a non-empty list always replaces the verdict. When self is unavailable (excluded by the caller, or not among the key's responsible peers) and only `foreign`/`unknown` (not-yet-confirmed) peers remain, `findCoordinator` throws `NO_NETWORK_COORDINATOR` rather than a generic no-coordinator/super-majority error.
 - **Which Addresses A Published Record Carries**: the `ClusterPeers` map `findCluster` returns is dialed by *other* peers, so every address in it must be reachable by a third party. Two sources feed it, in this order: the remote address of each **outbound** connection we hold to the member, then that member's peerStore addresses (which arrive via `identify`/`identifyPush`). Both halves are joined by one function — `publishableAddrsForPeer` in `peer-address-book.ts` — which `findCluster` and every redirect-address resolver share, so a record and a redirect cannot describe the same peer differently. **Inbound** connections contribute nothing. For an outbound connection `remoteAddr` is the address we dialed — a real listen or circuit address; for an inbound one it is the far side's *ephemeral source socket*, the port their OS picked for that single connection, which nobody else can reach. Publishing it was worse than publishing nothing: a receiving peer cannot distinguish it from a listen address (`mergeRecordPeerAddresses` drops only empty lists, `validMultiaddrStrings` only unparseable strings), so it merged, consumed a slot against `MAX_MERGED_ADDRS_PER_PEER`, turned an instant `NoValidAddressesError` into a burned connection attempt, and could only be displaced by a *successful* connection — the one thing that address made impossible. It also silenced the `findCluster:addressless-members` diagnostic, which counts members with **zero** parsed addresses and therefore never fired on an entry holding one bad address. The rule lives in one predicate, `publishableConnectionAddr` in `peer-address-book.ts`, next to `validMultiaddrStrings` — "an address string we are willing to carry" and "an address we are willing to publish to a third party" are different questions, and each has exactly one definition. **Redirect payloads obey the same rule**, since they are handed to a third party for the same purpose: the `getConnectionAddrs` resolver wired in `libp2p-node-base.ts` and the fallbacks in `cluster/service.ts` and `repo/service.ts` all go through `publishableAddrsForPeer`. They previously read connections alone and so omitted the peerStore half — meaning a cohort member reachable only through a relay, that had only ever dialed *us*, was published with no address at all in a redirect while a cluster record carried its circuit address. Because a peerStore read is asynchronous, `ClusterService.checkRedirect` and both `getConnectionAddrs` hooks are async. The narrower rule of keeping inbound addresses that contain `/p2p-circuit` was considered and rejected: on a destination peer, an inbound relayed connection's `remoteAddr` is composed as `<our own connection to the relay>` + `/p2p-circuit/p2p/<dialer>`, which is only dialable if *our* hop to the relay was itself outbound. The decisive reason is a reservation asymmetry — a relay grants a hop only when the **destination** holds a reservation with it, never the dialer (`@libp2p/circuit-relay-v2` `handleConnect`, status `NO_RESERVATION`), so the relay that address names is *ours*, and a third party dialing it reaches the dialer only if the dialer coincidentally also holds a reservation there. The decision is recorded as an accepted-tradeoff `NOTE:` on `publishableConnectionAddr` itself, so a future reader meets it at the three lines that tempt the change. The cost of the rule is that an inbound-only member with an empty peerStore is published with no address at all — which is correct, and now visible, because `addressless` counts it.
 
 - **This Node's Own Entry Is Memoized**: the two sources above describe how a record's entry for a *remote* member is built. Self's entry is not built that way — it carries `libp2p.getMultiaddrs()`, and that call is expensive **on a node with a wildcard listen address**: expanding `0.0.0.0` across the host's interfaces goes through `os.networkInterfaces()`, a full network-interface sweep measured at 3.19 ms of a 3.49 ms `findCluster`. The cost is a property of the configuration, not of the call — measured on one host, `getMultiaddrs()` costs 4.44 ms/call with a TCP listener and 0.001 ms/call on a dial-only client with no listen addrs (nothing to expand, empty address list). Listening peers pay it; an edge client does not. Since every commit resolves a cohort (`CoordinatorRepo.commit` → `getClusterPeerIds` → `findCluster`), a cold `apply schema` was paying one interface sweep per commit — on a solo node, about half the operation's entire wall time (gotchoices/Optimystic#8) — to recompute an identical answer each time. `Libp2pKeyPeerNetwork` therefore derives self's addresses once and holds them until libp2p reports `self:peer:update`, the event fired when this node's own address set changes. Two consequences worth knowing: libp2p debounces that event by 1000 ms behind a fire-and-forget peer-record write, so a published record can carry the previous address set for about a second after a transport starts or stops listening; and the freshness of self's entry now depends on that event arriving at all. Neither is load-bearing while addresses change at startup and relay-reservation time rather than per write, and a momentarily-stale entry lands on the same retry/exclude paths as an `addressless` or undialable one — but a stale *self* address that nobody can account for should send a reader to this memo first.
@@ -950,7 +997,7 @@ interface ClusterConsensusConfig {
   superMajorityThreshold: number;     // Default 0.75 (3/4)
   simpleMajorityThreshold: number;    // Default 0.51 (>50%)
   minAbsoluteClusterSize: number;     // Default 3
-  allowClusterDownsize: boolean;      // Default true
+  allowClusterDownsize: boolean;      // Default true — lets a cohort of 2+ members below clusterSize run consensus; no effect on a lone node, which always commits alone
   clusterSizeTolerance: number;       // Default 0.5 (50% variance)
   partitionDetectionWindow: number;   // Default 60000ms (1 min)
   clusterSize?: number;               // Replication factor / target cohort breadth (default 10)
@@ -958,6 +1005,8 @@ interface ClusterConsensusConfig {
   membershipAdmissionFraction?: number; // Default 0.75 — fraction of the size reference a declared set must meet
   cohortQueryTimeoutMs?: number;      // Default 1000ms, or max(1000, 3 × linkRoundTripMs) when the node declares one — one cohort peer's budget for one read-path request
   slotHoldWindowMs?: number;          // Default 3000ms; 0 disables — how long a member holds a block's next slot for a writer it has refused as stale SlotHoldAfterLosses (3) times
+  readRepairMode?: 'off' | 'lazy' | 'paranoid'; // Default 'lazy' — whether a read of a block this node holds re-verifies it against the cohort behind the read (lazy), on every read and waiting (paranoid), or never (off)
+  readRepairWindowMs?: number;        // Default 10000ms — how long a held block is served without starting a cohort consult (lazy only); must be a finite number above 0
 }
 ```
 
@@ -1095,7 +1144,9 @@ deadlines on that path:
   `packages/db-p2p/src/repo/coordinator-repo.ts`), where a miss puts the peer in the `silent` set, and
 - the archive fetch the acquisition runs (`fetchArchiveFromPeer` in
   `packages/db-p2p/src/libp2p-node-base.ts`), where a miss resolves to "that peer holds nothing" and
-  the pass moves on.
+  the pass moves on. On the read path this fetch runs only for a peer the consult has no archive
+  from: the consult's request already returned each answering peer's archive, and the acquisition
+  restores from those (`ConsultedArchives` in `packages/db-p2p/src/cluster/cluster-repo.ts`).
 
 Each is the whole budget for its request: dial, protocol negotiation, request and reply all share it,
 and nothing inside the request is shorter. Both run through `withinRequestBudget` in
@@ -1113,11 +1164,13 @@ callers of that bound derive it the same way from the same input: the read path'
 pair exactly, and a deployment that raises the per-peer budget widens the pass that spends it instead
 of having a slow pass cut short under it.
 
-Raise it when the link is slower than a LAN. Every one of these requests is a fresh stream — dial or
-reuse the connection, select the sync protocol, send, receive — and selecting the protocol costs a
-round trip of its own even on an open connection (`packages/db-p2p/test/stream-open-costs-a-round-trip.spec.ts`),
-so a request over a reused connection costs two round trips. Size the field to comfortably exceed two
-of the link's real round trips. A relayed link whose round trip is near 1.8 s cannot finish one inside
+Raise it when the link is slower than a LAN. A request that has to open its stream does it all inside
+the budget — dial or reuse the connection, select the sync protocol, send, receive — and selecting the
+protocol costs a round trip of its own even on an open connection (`packages/db-p2p/test/stream-open-costs-a-round-trip.spec.ts`),
+so such a request over a reused connection costs two round trips. A later request in a busy spell takes
+a stream negotiated ahead of it (`PreparedStreams` in `packages/db-p2p/src/network/prepared-streams.ts`)
+and costs one; the first after a quiet spell, and each concurrent one beyond the first, still costs two.
+Size the field to comfortably exceed two of the link's real round trips. A relayed link whose round trip is near 1.8 s cannot finish one inside
 a second: every honest answer arrives late and counts as silence.
 In a two-member cohort one late answer is the whole quorum, so the consult declines on every read and
 a machine that re-attaches after being away never catches up. The symptom in the logs is steady

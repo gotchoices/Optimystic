@@ -62,7 +62,7 @@ describe('BlockFloors', () => {
 		expect(reported).to.have.length(1)
 	})
 
-	// `Collection.keepWhatTheRefreshRead` weighs the header and log tail its refresh read around
+	// `Collection.keepLogEnds` weighs the header and log tail an open or a refresh read around
 	// `TransactorSource`, which is not an answer being served to a reader — so it must reach the same
 	// verdict without the `collection:block-below-floor` line, which would misdescribe it.
 	it('answers the same question silently for content that was not served to a reader', () => {

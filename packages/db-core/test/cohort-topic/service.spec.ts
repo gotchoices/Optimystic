@@ -1,10 +1,10 @@
 import { expect } from 'chai';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { createCohortTopicService } from '../../src/cohort-topic/service.js';
+import { createCohortTopicService, RENEW_BATCH_UNSUPPORTED_RECHECK_MS } from '../../src/cohort-topic/service.js';
 import { createRingHash } from '../../src/cohort-topic/ring-hash.js';
-import type { ITopicRouter, ISizeEstimator, PeerRef, TopicRouteKey } from '../../src/cohort-topic/ports.js';
-import { bytesToB64url, encodeCohortMessage, decodeRegisterV1, decodeRenewV1 } from '../../src/cohort-topic/wire/codec.js';
-import type { RegisterReplyV1, RenewReplyV1 } from '../../src/cohort-topic/wire/types.js';
+import { RenewBatchUnsupportedError, type ITopicRouter, type ISizeEstimator, type PeerRef, type TopicRouteKey } from '../../src/cohort-topic/ports.js';
+import { bytesToB64url, encodeCohortMessage, decodeRegisterV1, decodeRenewBatchV1, decodeRenewV1 } from '../../src/cohort-topic/wire/codec.js';
+import type { RegisterReplyV1, RenewBatchReplyV1, RenewReplyV1, RenewV1 } from '../../src/cohort-topic/wire/types.js';
 import type { CohortGossipBus } from '../../src/cohort-topic/gossip/bus.js';
 import type { MembershipVerifier } from '../../src/cohort-topic/membership/verifier.js';
 
@@ -27,9 +27,10 @@ const acceptedReply: RegisterReplyV1 = {
 	cohortMembers: [],
 };
 
-function makeService(router: ITopicRouter) {
+function makeService(router: ITopicRouter, clock?: () => number) {
 	return createCohortTopicService({
 		self: SELF,
+		clock,
 		hash: createRingHash(),
 		router,
 		sizeEstimator: { estimate: () => ({ nEst: 1000, confidence: 1 }) } as ISizeEstimator,
@@ -229,5 +230,158 @@ describe('CohortTopicService / renewal re-walk', () => {
 		expect(handle.treeTier, 'the handle names the tier the re-walk landed at').to.equal(0);
 		expect(bytesToB64url(handle.primary), 'and its primary').to.equal(bytesToB64url(NEW_PRIMARY));
 		expect(bytesToB64url(handle.cohortEpoch), 'and its epoch').to.equal(bytesToB64url(NEW_EPOCH));
+	});
+});
+
+describe('CohortTopicService / renewMany', () => {
+	it('pings to one primary travel in one batch frame, and each registration acts on its own reply', async () => {
+		const OK_TOPIC = bytes('topic-ok');
+		const MOVED_TOPIC = bytes('topic-moved');
+		const LOST_TOPIC = bytes('topic-lost');
+		const NEW_PRIMARY = bytes('moved-primary', 8);
+		const NEW_EPOCH = bytes('moved-epoch', 32);
+		const replyFor = (renew: RenewV1): RenewReplyV1 => {
+			if (renew.topicId === bytesToB64url(MOVED_TOPIC)) {
+				return { v: 1, result: 'primary_moved', newPrimary: bytesToB64url(NEW_PRIMARY), newBackups: [], cohortEpoch: bytesToB64url(NEW_EPOCH) };
+			}
+			return renew.topicId === bytesToB64url(LOST_TOPIC) ? { v: 1, result: 'unknown_registration' } : { v: 1, result: 'ok' };
+		};
+		const batches: { target: string; topics: string[] }[] = [];
+		const singles: { target: string; topic: string }[] = [];
+		const walked: string[] = [];
+		let registering = true;
+		const router: ITopicRouter = {
+			routeAndAct: async (_key: TopicRouteKey, activity: Uint8Array) => {
+				if (!registering) {
+					walked.push(decodeRegisterV1(activity).topicId);
+				}
+				return encodeCohortMessage(acceptedReply);
+			},
+			dialMember: async (member: PeerRef, activity: Uint8Array) => {
+				singles.push({ target: bytesToB64url(member.id), topic: decodeRenewV1(activity).topicId });
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+			dialMemberRenewBatch: async (member: PeerRef, frame: Uint8Array) => {
+				const { renews } = decodeRenewBatchV1(frame);
+				batches.push({ target: bytesToB64url(member.id), topics: renews.map((r) => r.topicId) });
+				const reply: RenewBatchReplyV1 = { v: 1, replies: renews.map(replyFor) };
+				return encodeCohortMessage(reply);
+			},
+		};
+		const service = makeService(router);
+		const ok = await service.register({ topicId: OK_TOPIC, tier: 1 });
+		const moved = await service.register({ topicId: MOVED_TOPIC, tier: 1 });
+		const lost = await service.register({ topicId: LOST_TOPIC, tier: 1 });
+		registering = false;
+		const handles = [ok, moved, lost];
+		const [okB64, movedB64, lostB64] = [OK_TOPIC, MOVED_TOPIC, LOST_TOPIC].map(bytesToB64url);
+
+		await service.renewMany(handles);
+		expect(batches, 'the three pings to the shared primary went in one frame').to.deep.equal([{ target: bytesToB64url(PRIMARY), topics: [okB64, movedB64, lostB64] }]);
+		expect(singles, 'and none went singly').to.be.empty;
+		expect(bytesToB64url(ok.primary), 'ok keeps its primary').to.equal(bytesToB64url(PRIMARY));
+		expect(bytesToB64url(moved.primary), 'primary_moved adopts the named primary').to.equal(bytesToB64url(NEW_PRIMARY));
+		expect(bytesToB64url(moved.cohortEpoch), 'and epoch').to.equal(bytesToB64url(NEW_EPOCH));
+		expect(bytesToB64url(lost.primary), 'unknown_registration is a strike, not a move').to.equal(bytesToB64url(PRIMARY));
+
+		batches.length = 0;
+		await service.renewMany(handles);
+		await service.renewMany(handles);
+		expect(batches, 'the moved registration now pings its new primary, apart from the batch').to.deep.equal([
+			{ target: bytesToB64url(PRIMARY), topics: [okB64, lostB64] },
+			{ target: bytesToB64url(PRIMARY), topics: [okB64, lostB64] },
+		]);
+		expect(singles, 'a lone ping to a primary goes singly').to.deep.equal([
+			{ target: bytesToB64url(NEW_PRIMARY), topic: movedB64 },
+			{ target: bytesToB64url(NEW_PRIMARY), topic: movedB64 },
+		]);
+		expect(walked, 'the third strike re-walked the lost registration').to.not.be.empty;
+		expect(new Set(walked), 'and it alone').to.deep.equal(new Set([lostB64]));
+	});
+
+	it('a registration whose failover is still waiting on its re-walk is skipped by the next call, which still renews the others', async () => {
+		const OK_TOPIC = bytes('topic-steady');
+		const LOST_TOPIC = bytes('topic-failing');
+		const [okB64, lostB64] = [OK_TOPIC, LOST_TOPIC].map(bytesToB64url);
+		const pinged: string[][] = [];
+		let registering = true;
+		let walkStarted = false;
+		let releaseWalk: (reply: Uint8Array) => void = () => {};
+		const router: ITopicRouter = {
+			routeAndAct: async () => {
+				if (registering) {
+					return encodeCohortMessage(acceptedReply);
+				}
+				walkStarted = true;
+				return new Promise<Uint8Array>((resolve) => { releaseWalk = resolve; });
+			},
+			dialMember: async (_member: PeerRef, activity: Uint8Array) => {
+				pinged.push([decodeRenewV1(activity).topicId]);
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+			dialMemberRenewBatch: async (_member: PeerRef, frame: Uint8Array) => {
+				const { renews } = decodeRenewBatchV1(frame);
+				pinged.push(renews.map((r) => r.topicId));
+				const reply: RenewBatchReplyV1 = {
+					v: 1,
+					replies: renews.map((r): RenewReplyV1 => ({ v: 1, result: r.topicId === lostB64 ? 'unknown_registration' : 'ok' })),
+				};
+				return encodeCohortMessage(reply);
+			},
+		};
+		const service = makeService(router);
+		const handles = [await service.register({ topicId: OK_TOPIC, tier: 1 }), await service.register({ topicId: LOST_TOPIC, tier: 1 })];
+		registering = false;
+
+		await service.renewMany(handles);
+		await service.renewMany(handles);
+		const failingOver = service.renewMany(handles); // the third strike: no backups, so it re-walks — and the walk is held
+		while (!walkStarted) {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		}
+		pinged.length = 0;
+
+		await service.renewMany(handles);
+		expect(pinged, 'the failing-over registration sat this call out; the other was renewed without waiting for it').to.deep.equal([[okB64]]);
+
+		releaseWalk(encodeCohortMessage(acceptedReply));
+		await failingOver;
+		pinged.length = 0;
+		await service.renewMany(handles);
+		expect(pinged, 'once its failover ended, it is renewed again').to.deep.equal([[okB64, lostB64]]);
+	});
+
+	it('a member that does not speak the batch protocol is sent the same pings singly in the same call, and singly until the recheck interval passes', async () => {
+		const TOPICS = [bytes('topic-a'), bytes('topic-b')];
+		let now = 1_000_000;
+		let batchAttempts = 0;
+		const singles: string[] = [];
+		const router: ITopicRouter = {
+			routeAndAct: async () => encodeCohortMessage(acceptedReply),
+			dialMember: async (_member: PeerRef, activity: Uint8Array) => {
+				singles.push(decodeRenewV1(activity).topicId);
+				return encodeCohortMessage({ v: 1, result: 'ok' } as RenewReplyV1);
+			},
+			dialMemberRenewBatch: async (member: PeerRef) => {
+				batchAttempts++;
+				throw new RenewBatchUnsupportedError(member.id);
+			},
+		};
+		const service = makeService(router, () => now);
+		const handles = [await service.register({ topicId: TOPICS[0]!, tier: 1 }), await service.register({ topicId: TOPICS[1]!, tier: 1 })];
+		const topics = TOPICS.map(bytesToB64url).sort();
+
+		await service.renewMany(handles);
+		expect(batchAttempts, 'the batch was tried').to.equal(1);
+		expect([...singles].sort(), 'and its pings re-sent singly in the same call').to.deep.equal(topics);
+
+		singles.length = 0;
+		await service.renewMany(handles);
+		expect(batchAttempts, 'the refusal is remembered').to.equal(1);
+		expect([...singles].sort(), 'so the next call sends singly at once').to.deep.equal(topics);
+
+		now += RENEW_BATCH_UNSUPPORTED_RECHECK_MS;
+		await service.renewMany(handles);
+		expect(batchAttempts, 'a batch is tried again once the recheck interval has passed').to.equal(2);
 	});
 });

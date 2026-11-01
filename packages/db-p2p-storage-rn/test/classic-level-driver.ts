@@ -7,6 +7,7 @@ import type {
 	LevelDBIteratorOptions,
 	LevelDBLike,
 	LevelDBWriteBatchLike,
+	LevelDBWriteOptions,
 } from '../src/leveldb-like.js';
 
 /**
@@ -14,6 +15,9 @@ import type {
  * LevelDB binding maintained by the Level team. Production code uses
  * `openOptimysticRNDb` (which wraps `rn-leveldb`); this driver lets the same
  * storage classes run under Mocha without the React Native native module.
+ * Unlike `rn-leveldb` it can sync a batch (`WriteOptions.sync`), which is what
+ * lets the suite exercise the synced apply path the phone binding cannot
+ * take yet.
  *
  * Each `openTestDb()` returns an isolated, file-backed database in a fresh
  * temp directory; the matching `cleanup()` closes the handle and removes the
@@ -21,19 +25,13 @@ import type {
  * close + reopen path that the identity helper relies on.
  */
 class ClassicLevelAdapter implements LevelDBLike {
+	readonly canSync = true;
+
 	constructor(private readonly db: ClassicLevel<Uint8Array, Uint8Array>) {}
 
 	async get(key: Uint8Array): Promise<Uint8Array | undefined> {
 		const value = await this.db.get(key);
 		return value === undefined ? undefined : new Uint8Array(value);
-	}
-
-	async put(key: Uint8Array, value: Uint8Array): Promise<void> {
-		await this.db.put(key, value);
-	}
-
-	async delete(key: Uint8Array): Promise<void> {
-		await this.db.del(key);
 	}
 
 	batch(): LevelDBWriteBatchLike {
@@ -47,8 +45,8 @@ class ClassicLevelAdapter implements LevelDBLike {
 				chain.del(key);
 				return this;
 			},
-			async write() {
-				await chain.write();
+			async write(options?: LevelDBWriteOptions) {
+				await chain.write({ sync: options?.sync === true });
 			},
 		};
 	}

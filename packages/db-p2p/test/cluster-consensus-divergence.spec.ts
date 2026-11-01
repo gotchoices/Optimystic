@@ -3,7 +3,6 @@ import { localDurability } from '@optimystic/db-core';
 import { ClusterMember, clusterMember, type ReconcileBlockCallback } from '../src/cluster/cluster-repo.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, Signature, ClusterPeers, Transforms,
 	IBlock, BlockId, BlockHeader, BlockGets, GetBlockResults, PendRequest,
@@ -139,7 +138,7 @@ class MockPeerNetwork implements IPeerNetwork {
 /** Real storage so commit/pend genuinely enforce revisions and pending-action presence. */
 const realStorageRepo = (): StorageRepo => {
 	const raw = new MemoryRawStorage();
-	return new StorageRepo((blockId: BlockId) => new BlockStorage(blockId, raw));
+	return new StorageRepo(raw);
 };
 
 /**
@@ -487,7 +486,7 @@ describe('ClusterMember consensus-execution divergence (stream-reset root cause)
 /**
  * Ticket: consensus-pend-refusal-commit-tier-verify2 (member-side commit-verdict retention).
  *
- * `ClusterMember.applyConsensusOperation` retains local storage's CommitResult per messageHash
+ * `ClusterMember.applyConsensusOperations` retains local storage's CommitResult per messageHash
  * (`getExecutedCommitResult`) so the coordinator can detect when the 'ahead' tolerance above
  * swallowed a refusal whose real cause was a rival action holding the requested revision. The
  * missing-pend behind path deliberately retains NOTHING (no CommitResult exists there), and a
@@ -733,13 +732,13 @@ describe('ClusterMember commit-certificate capture (reactivity origination feed)
 		// Stage the pend locally so the commit genuinely lands (and so emission semantics match production).
 		await storage.pend({ actionId: 'a1', transforms: { inserts: { 'block-1': makeBlock('block-1') }, updates: {}, deletes: [] }, policy: 'c' });
 
-		const captured: { actionId: string; cert: CommitCert }[] = [];
+		const captured: { actionId: string; cert: CommitCert; tailIds: readonly BlockId[] | undefined }[] = [];
 		member = clusterMember({
 			storageRepo: storage,
 			peerNetwork: mockNetwork,
 			peerId: self.peerId,
 			privateKey: self.privateKey,
-			onCommitCertificate: (actionId, cert): void => { captured.push({ actionId, cert }); },
+			onCommitCertificate: (actionId, cert, tailIds): void => { captured.push({ actionId, cert, tailIds }); },
 		});
 
 		const record = await buildConsensusCommitRecord(self, other, makeCommitOperation('a1', 'block-1', 1));
@@ -747,6 +746,7 @@ describe('ClusterMember commit-certificate capture (reactivity origination feed)
 
 		expect(captured.length, 'cert captured once for the committed action').to.equal(1);
 		expect(captured[0]!.actionId).to.equal('a1');
+		expect(captured[0]!.tailIds, 'the cert signs for the tail the record committed').to.deep.equal(['block-1']);
 		// Default super-majority is unanimity over the 2-peer cohort → minSigs 2.
 		expect(captured[0]!.cert.minSigs).to.equal(2);
 		// Both approve-commit signers contribute (self adds its own commit during consensus, joining `other`).

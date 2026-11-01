@@ -522,6 +522,10 @@ export class DisputeService {
 	 * commit arm that field is now always present (the coordinator derives it from `commit.blockIds[0]`,
 	 * the very key it selected the cohort by), so the middle fallback resolves to the same id the final
 	 * `commit.blockIds[0]` fallback used to produce — the branch taken changed, the id did not.
+	 *
+	 * NOTE: a batch record carries one commit operation per collection of the action, and this returns
+	 * the first only, so a ruling over a batch reverses one collection. Dormant while disputes are off;
+	 * the fix is owed by backlog `feat-dispute-subsystem-live-activation` (§ A dispute over a batch).
 	 */
 	private static extractInvalidationTarget(record: ClusterRecord): { actionId: string; rev: number; blockIds: string[]; collectionId: CollectionId } | undefined {
 		for (const operation of record.message.operations) {

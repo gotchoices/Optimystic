@@ -6,13 +6,15 @@
  * of indexed column values.
  */
 
-import type { Tree, TreeEntryGuard, TreeReadView } from '@optimystic/db-core';
+import type { Tree, TreeReadView, TreeReplaceAction, TreeUpsertGuard } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import type { ITransactor } from '@optimystic/db-core';
 import type { Row, SqlValue } from '@quereus/quereus';
 import type { StoredTableSchema, StoredIndexSchema } from './schema-manager.js';
-import { encodeKeyTuple, KEY_PREFIX_END } from './key-encoding.js';
+import { repositionIndexColumns } from './schema-manager.js';
+import { encodeKeyTuple, KEY_PREFIX_END, splitKeyTuple } from './key-encoding.js';
 import type { IndexColumnTuple, UnbrandedValues } from './key-tuples.js';
+import { IndexPredicate } from './index-predicate.js';
 
 /**
  * Serialize a single value for use in a secondary-index key.
@@ -69,6 +71,39 @@ export function serializeIndexValue(value: SqlValue): string | null {
 	}
 	// Fallback
 	return String(value);
+}
+
+/** What {@link serializeIndexValue} emits for a BLOB: standard, padded base64. */
+const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
+/**
+ * Decode a framed index tuple (an {@link indexKeyFromValues} result, or the leading index-value half
+ * of an {@link indexEntryKey}) back into its values, one per framed element, each under the affinity
+ * at its position — the rendering-only inverse of {@link serializeIndexValue}, for a report that names
+ * a unique value a human can match back to their SQL (the offline outlook's exposures). A NULL element
+ * is `null`; a numeric affinity's payload parses back to a number (a bigint was already lossy in the
+ * encoding, see the `NOTE:` on {@link serializeIndexValue}); a BLOB's restores its bytes; any other
+ * payload, and one that does not parse, stays its string. Never throws: a renderer must not be the
+ * second failure. The caller checks the arity, since a truncated tuple decodes to fewer values.
+ */
+export function decodeIndexKey(indexKey: IndexKey, affinities: readonly (string | undefined)[]): SqlValue[] {
+	return splitKeyTuple(indexKey).map((element, i) =>
+		element.isNull ? null : indexPayloadToValue(element.payload, affinities[i]));
+}
+
+function indexPayloadToValue(payload: string, affinity: string | undefined): SqlValue {
+	switch (affinity?.toUpperCase()) {
+		case 'INTEGER':
+		case 'REAL':
+		case 'NUMERIC': {
+			const value = Number(payload);
+			return payload.trim() === '' || Number.isNaN(value) ? payload : value;
+		}
+		case 'BLOB':
+			return BASE64.test(payload) ? Uint8Array.from(atob(payload), char => char.charCodeAt(0)) : payload;
+		default:
+			return payload;
+	}
 }
 
 /**
@@ -194,7 +229,7 @@ export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
  * proves the value clear in this writer's own snapshot. The exact-key `absent` guard
  * cannot express this: the two rows sit at different tree keys inside one prefix.
  */
-export function uniquePrefixGuard(indexKey: IndexKey): TreeEntryGuard<IndexKey, IndexEntry> {
+export function uniquePrefixGuard(indexKey: IndexKey): TreeUpsertGuard<IndexKey, IndexEntry> {
 	return { kind: 'absentRange', range: indexValueRange(indexKey) };
 }
 
@@ -226,19 +261,29 @@ export class IndexManager {
 	 */
 	private uniqueEnforcementIndexes: StoredIndexSchema[] = [];
 
+	/**
+	 * The predicate of each partial index this manager maintains, keyed by index name — see
+	 * {@link admits}. An index with no entry admits every row; unique-enforcement descriptors never
+	 * have one (`buildUniqueEnforcementIndexes` in the vtab synthesizes none for a partial
+	 * constraint). Compiled against the column list of the schema the descriptors arrived in, where
+	 * the predicate's column names and the column positions agree.
+	 */
+	private predicates: Map<string, IndexPredicate>;
+
 	constructor(
 		private schema: StoredTableSchema,
 		private indexTreeFactory: IndexTreeFactory
-	) {}
+	) {
+		this.predicates = compileIndexPredicates(schema);
+	}
 
 	/**
-	 * Initialize all indexes for the table
+	 * Open a tree for every declared index and for each of `uniqueEnforcement` (see
+	 * {@link setUniqueEnforcementIndexes}), all at once.
 	 */
-	async initialize(transactor?: ITransactor): Promise<void> {
-		for (const index of this.schema.indexes) {
-			const tree = await this.indexTreeFactory(index.name, transactor);
-			this.indexTrees.set(index.name, tree);
-		}
+	async initialize(transactor: ITransactor | undefined, uniqueEnforcement: StoredIndexSchema[]): Promise<void> {
+		this.uniqueEnforcementIndexes = uniqueEnforcement;
+		await this.openTrees([...this.schema.indexes, ...uniqueEnforcement], transactor);
 	}
 
 	/**
@@ -252,24 +297,32 @@ export class IndexManager {
 
 	/**
 	 * Replace the set of unique-enforcement index descriptors and open a tree for each
-	 * that does not already have one. Called once during table init AFTER
-	 * {@link initialize}, with the descriptors the vtab synthesized for every
-	 * point-enforceable UNIQUE constraint that lacks a declared backing index. The
-	 * trees land in the same `indexTrees` map as declared indexes, so
-	 * {@link getIndexTrees} (and thus the vtab's dirty-marking / bridge registration)
-	 * includes them with no further wiring.
+	 * that does not already have one. The descriptors are the ones the vtab synthesized
+	 * for every point-enforceable UNIQUE constraint that lacks a declared backing index:
+	 * table init hands its set to {@link initialize}, and a `DROP INDEX` that leaves such a
+	 * constraint without its declared backing index calls this with the enlarged set
+	 * (`reassignUniqueEnforcement` in the vtab). The trees land in the same
+	 * `indexTrees` map as declared indexes, so {@link getIndexTrees} (and thus the vtab's
+	 * dirty-marking / bridge registration) includes them with no further wiring.
 	 */
 	async setUniqueEnforcementIndexes(
 		descriptors: StoredIndexSchema[],
 		transactor?: ITransactor
 	): Promise<void> {
 		this.uniqueEnforcementIndexes = descriptors;
-		for (const descriptor of descriptors) {
-			if (!this.indexTrees.has(descriptor.name)) {
-				const tree = await this.indexTreeFactory(descriptor.name, transactor);
-				this.indexTrees.set(descriptor.name, tree);
-			}
-		}
+		await this.openTrees(descriptors, transactor);
+	}
+
+	/**
+	 * Open, concurrently, a tree for each of `descriptors` that has none yet. The trees are
+	 * registered in descriptor order once every open has resolved, so the order of
+	 * {@link getIndexTrees} — which the bridge registers collections in — never depends on
+	 * which open finished first. When one open fails, none is registered.
+	 */
+	private async openTrees(descriptors: StoredIndexSchema[], transactor: ITransactor | undefined): Promise<void> {
+		const unopened = descriptors.filter(descriptor => !this.indexTrees.has(descriptor.name));
+		const trees = await Promise.all(unopened.map(descriptor => this.indexTreeFactory(descriptor.name, transactor)));
+		unopened.forEach((descriptor, i) => this.indexTrees.set(descriptor.name, trees[i]!));
 	}
 
 	/**
@@ -324,6 +377,7 @@ export class IndexManager {
 			return undefined;
 		}
 		this.schema = { ...this.schema, indexes: this.schema.indexes.filter(idx => idx !== declared) };
+		this.predicates.delete(declared.name);
 		const tree = this.indexTrees.get(declared.name);
 		this.indexTrees.delete(declared.name);
 		return tree;
@@ -335,7 +389,44 @@ export class IndexManager {
 	 * update staging iterates the new index alongside the existing ones.
 	 */
 	setSchema(schema: StoredTableSchema): void {
+		const predicates = compileIndexPredicates(schema);
 		this.schema = schema;
+		this.predicates = predicates;
+	}
+
+	/**
+	 * Renumber the column positions of every index this manager maintains — declared and
+	 * unique-enforcement alike — after the table's columns moved: the table instance's half of a
+	 * catalog-only `ALTER TABLE … DROP COLUMN`. The maintained set is unchanged, so no tree is
+	 * opened, closed or re-registered, and descriptors already handed out (a running scan's) keep
+	 * their old numbering. `reposition` throws for a removed column, which no maintained index may
+	 * cover.
+	 *
+	 * NOTE: deliberately not a {@link setSchema} from the record. The record can list an index
+	 * another machine added that this manager has no tree for, and a listed index with no tree
+	 * makes every staging path throw; and it can lack one this manager maintains.
+	 *
+	 * Partial-index predicates are remapped ({@link IndexPredicate.repositioned}), not recompiled:
+	 * `this.schema.columns` keeps its old numbering here, so a recompile would bind the predicate's
+	 * column names to the old positions.
+	 */
+	repositionColumns(reposition: (position: number) => number): void {
+		const indexes = this.schema.indexes.map(idx => repositionIndexColumns(idx, reposition));
+		const uniqueEnforcementIndexes = this.uniqueEnforcementIndexes.map(idx => repositionIndexColumns(idx, reposition));
+		const predicates = new Map([...this.predicates].map(([name, predicate]) => [name, predicate.repositioned(reposition)]));
+		this.schema = { ...this.schema, indexes };
+		this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
+		this.predicates = predicates;
+	}
+
+	/**
+	 * Whether `index` holds an entry for `row` (a full row): always, unless it is a partial index
+	 * (`create index … where …`) whose predicate is not SQL TRUE for the row. Every staging path
+	 * below asks it, and so do the vtab's backfill and integrity check, so they agree on what a
+	 * partial index should hold.
+	 */
+	admits(index: StoredIndexSchema, row: Row): boolean {
+		return this.predicates.get(index.name)?.admits(row) ?? true;
 	}
 
 	/**
@@ -400,6 +491,8 @@ export class IndexManager {
 	 * constraint that binds the row (the vtab resolves the set; see
 	 * `OptimysticVirtualTable.guardedUniqueIndexes`). Every other index stages a bare
 	 * upsert exactly as before: no guard, no extra descent, no behaviour change.
+	 *
+	 * A partial index the row is outside ({@link admits}) stages nothing.
 	 */
 	async insertIndexEntries(
 		row: Row,
@@ -408,6 +501,7 @@ export class IndexManager {
 		uniqueIndexes?: ReadonlySet<string>,
 	): Promise<void> {
 		for (const index of this.getAllMaintainedIndexes()) {
+			if (!this.admits(index, row)) continue;
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
 			if (!tree) {
@@ -427,13 +521,19 @@ export class IndexManager {
 		index: StoredIndexSchema,
 		indexKey: IndexKey,
 		uniqueIndexes: ReadonlySet<string> | undefined,
-	): TreeEntryGuard<IndexKey, IndexEntry> | undefined {
+	): TreeUpsertGuard<IndexKey, IndexEntry> | undefined {
 		return uniqueIndexes?.has(index.name) ? uniquePrefixGuard(indexKey) : undefined;
 	}
 
 	/**
 	 * Stage deletion of index entries for a row (staged, not flushed — see
-	 * {@link insertIndexEntries} for the flush/discard contract).
+	 * {@link insertIndexEntries} for the flush/discard contract). A partial index the row is
+	 * outside ({@link admits}) holds no entry for it, so stages nothing.
+	 *
+	 * NOTE: an entry an older build wrote for a row outside the predicate (it indexed every row) is
+	 * therefore left behind when the row is deleted. Harmless to reads, since the planner never
+	 * seeks a partial index, and to uniqueness, since no full constraint is enforced through one;
+	 * `verifyIndexes` reports it as `outside-predicate`. No migration removes these.
 	 */
 	async deleteIndexEntries(
 		row: Row,
@@ -441,6 +541,7 @@ export class IndexManager {
 		_transactor?: ITransactor
 	): Promise<void> {
 		for (const index of this.getAllMaintainedIndexes()) {
+			if (!this.admits(index, row)) continue;
 			const indexKey = this.createIndexKey(index, row);
 			const tree = this.indexTrees.get(index.name);
 			if (!tree) {
@@ -467,6 +568,12 @@ export class IndexManager {
 	 * {@link insertIndexEntries} for the flush/discard contract). `uniqueIndexes` is the
 	 * same per-row guard set {@link insertIndexEntries} takes, applied to the NEW entry;
 	 * the old entry's delete is never guarded.
+	 *
+	 * Per index, the old row's entry is deleted when the index admits the old row
+	 * ({@link admits}), and the new row's entry inserted when it admits the new one — so an
+	 * UPDATE that moves a row out of a partial index's predicate only deletes, one that moves it
+	 * in only inserts, and one that stays outside stages nothing. When both rows are admitted
+	 * and their tree keys agree, nothing is staged either.
 	 */
 	async updateIndexEntries(
 		oldRow: Row,
@@ -476,39 +583,41 @@ export class IndexManager {
 		_transactor?: ITransactor,
 		uniqueIndexes?: ReadonlySet<string>,
 	): Promise<void> {
-		// For each index, check if the indexed columns changed
 		for (const index of this.getAllMaintainedIndexes()) {
-			const oldIndexKey = this.createIndexKey(index, oldRow);
-			const newIndexKey = this.createIndexKey(index, newRow);
-
 			const tree = this.indexTrees.get(index.name);
 			if (!tree) {
 				throw new Error(`Index tree not found: ${index.name}`);
 			}
 
-			const oldTreeKey = indexEntryKey(oldIndexKey, oldPrimaryKey);
-			const newTreeKey = indexEntryKey(newIndexKey, newPrimaryKey);
-
-			if (oldTreeKey !== newTreeKey) {
-				// Index key or primary key changed - delete old, insert new. ONE action, delete
-				// first: the replace handler runs the entries in order, so a unique guard on
-				// the new entry scans a range the old entry has already left — a PK move that
-				// keeps its unique value (old and new keys share the value prefix) must not
-				// refuse itself on its own outgoing entry.
-				await tree.stage([
-					// NOTE: the old-entry delete is blind in the same way `deleteIndexEntries` is,
-					// and rests on the same db-core replay rule. Small trees mask it — the sibling
-					// upsert below writes a block, so when old and new entries share a leaf the
-					// resulting transform conflicts with the adopted revision and forces a replay
-					// anyway. Once the two keys land in different leaves that overlap is gone, which
-					// `packages/db-core/test/two-handle-collection-fork.spec.ts` ("a blind delete
-					// paired with an upsert in a different leaf still lands") reproduces directly on
-					// a small-fan-out tree.
-					[oldTreeKey, undefined],
-					[newTreeKey, [newTreeKey, newPrimaryKey], this.guardFor(index, newIndexKey, uniqueIndexes)]
-				]);
+			const oldTreeKey = this.admits(index, oldRow)
+				? indexEntryKey(this.createIndexKey(index, oldRow), oldPrimaryKey)
+				: undefined;
+			const newIndexKey = this.admits(index, newRow) ? this.createIndexKey(index, newRow) : undefined;
+			const newTreeKey = newIndexKey === undefined ? undefined : indexEntryKey(newIndexKey, newPrimaryKey);
+			if (oldTreeKey === newTreeKey) {
+				continue;
 			}
-			// If both keys are the same, no update needed
+
+			// ONE action, delete first: the replace handler runs the entries in order, so a unique
+			// guard on the new entry scans a range the old entry has already left — a PK move that
+			// keeps its unique value (old and new keys share the value prefix) must not refuse
+			// itself on its own outgoing entry.
+			const changes: TreeReplaceAction<IndexKey, IndexEntry> = [];
+			if (oldTreeKey !== undefined) {
+				// NOTE: the old-entry delete is blind in the same way `deleteIndexEntries` is,
+				// and rests on the same db-core replay rule. Small trees mask it — the sibling
+				// upsert below writes a block, so when old and new entries share a leaf the
+				// resulting transform conflicts with the adopted revision and forces a replay
+				// anyway. Once the two keys land in different leaves that overlap is gone, which
+				// `packages/db-core/test/two-handle-collection-fork.spec.ts` ("a blind delete
+				// paired with an upsert in a different leaf still lands") reproduces directly on
+				// a small-fan-out tree.
+				changes.push([oldTreeKey, undefined]);
+			}
+			if (newIndexKey !== undefined && newTreeKey !== undefined) {
+				changes.push([newTreeKey, [newTreeKey, newPrimaryKey], this.guardFor(index, newIndexKey, uniqueIndexes)]);
+			}
+			await tree.stage(changes);
 		}
 	}
 
@@ -519,25 +628,28 @@ export class IndexManager {
 	 * range scan over the framed-prefix `indexKey`: from `indexKey` (inclusive) to
 	 * `indexKey + KEY_PREFIX_END` (exclusive) to find all entries matching it.
 	 */
-	async* findByIndex(
+	async findByIndex(
 		indexName: string,
 		indexKey: IndexKey
-	): AsyncIterable<PrimaryKey> {
+	): Promise<PrimaryKey[]> {
 		const tree = this.indexTrees.get(indexName);
 		if (!tree) {
 			throw new Error(`Index tree not found: ${indexName}`);
 		}
 
-		// Update tree to get latest data, then scan the live tree.
+		// Update tree to get latest data, then read the live tree.
 		await tree.update();
-		yield* this.findByIndexIn(tree, indexKey);
+		return await this.findByIndexIn(tree, indexKey);
 	}
 
 	/**
-	 * Range-scan a supplied index read source for all primary keys whose entry matches
-	 * `indexKey` — a projection of {@link findEntriesIn}, for a caller that needs no more
-	 * than the primary key. One range definition serves both, so the two cannot drift apart.
-	 * The read source is assumed already current (this method never refreshes it).
+	 * Every primary key whose entry in a supplied index read source matches `indexKey`, from the
+	 * range {@link findEntriesIn} scans — one range definition ({@link indexValueRange}) serves
+	 * both, so the two cannot drift apart. Read as ONE value (`entriesIn`), not streamed: the
+	 * answer is the range as the tree stood at some moment, read again rather than failed when the
+	 * tree changes beneath it, where a streaming scan throws for a change once it has yielded. The
+	 * offline queue's drain changes a tree beneath this read (docs/internals.md §The offline
+	 * queue). The read source is assumed already current (this method never refreshes it).
 	 *
 	 * The query read path does NOT use this: it needs each entry's tree key to verify the
 	 * entry against its row, so it scans {@link findEntriesIn} directly. The one production
@@ -547,13 +659,12 @@ export class IndexManager {
 	 * `bug-stale-index-entry-causes-false-unique-refusal`. ({@link findByIndex} also wraps it,
 	 * and has no caller of its own.)
 	 */
-	async* findByIndexIn(
+	async findByIndexIn(
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
-	): AsyncIterable<PrimaryKey> {
-		for await (const entry of this.findEntriesIn(read, indexKey)) {
-			yield entry[1];
-		}
+	): Promise<PrimaryKey[]> {
+		const entries = await read.entriesIn(indexValueRange(indexKey));
+		return entries.map(entry => entry[1]);
 	}
 
 	/**
@@ -658,3 +769,28 @@ export class IndexManager {
 	}
 }
 
+/**
+ * A predicate for each partial index `schema` declares, keyed by index name, compiled against
+ * `schema`'s own column list. Throws naming the table and the index when one cannot be compiled:
+ * an index left unmaintained, or maintained for every row, would be the worse outcome.
+ * `OptimysticVirtualTable.addIndex` compiles a new index's predicate before its record is
+ * written, so a predicate that reaches a record has compiled once already.
+ *
+ * NOTE: a record written by a build without that check (or a Quereus whose `compilePredicate`
+ * narrows) can still list one that does not compile, and then every initialization of the table
+ * throws — including the one `dropIndex` runs before it can remove the index. If that is ever met
+ * outside a development database, let `dropIndex` remove a partial index without compiling it.
+ */
+function compileIndexPredicates(schema: StoredTableSchema): Map<string, IndexPredicate> {
+	const predicates = new Map<string, IndexPredicate>();
+	for (const index of schema.indexes) {
+		if (index.predicate === undefined) continue;
+		try {
+			predicates.set(index.name, IndexPredicate.compile(index.predicate, schema.columns, schema.name));
+		} catch (error) {
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new Error(`Table '${schema.name}': cannot evaluate the predicate of partial index '${index.name}': ${reason}`, { cause: error });
+		}
+	}
+	return predicates;
+}

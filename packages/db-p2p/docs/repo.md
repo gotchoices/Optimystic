@@ -37,6 +37,7 @@ The `RepoClient` provides a client-side implementation of the `IRepo` interface 
 - **Protocol Abstraction**: Handles libp2p protocol communication details
 - **Message Serialization**: Converts operations to/from network messages
 - **Error Handling**: Manages network errors and timeouts
+- **Multi-round reads**: a `get` whose blocks together outgrow one reply frame is answered with some blocks left out (`fitGetReply` in `packages/db-p2p/src/repo/get-reply.ts`, applied by `RepoService` only to a request marked `acceptsLeftOut`), and `get` asks the same peer again for those until every block is answered; see [docs/internals.md §A transaction's size limit](../../../docs/internals.md#a-transactions-size-limit)
 
 **Implementation Details:**
 ```typescript
@@ -133,9 +134,10 @@ Below `full`, somebody is still owed a copy, and the coordinator knows who only 
 
 | Class the commit was acknowledged at | What the ledger does, per block |
 |---|---|
-| `full` | Settles (deletes) any entry at the same or a lower revision. Records nothing. |
+| `full` | Settles (deletes) any entry at the same or a lower revision, and fires one `BlockDurabilityReachedEvent` per entry it removed, at this commit's revision and action — every member now holds that revision, which supersedes the entry's. Records nothing. |
 | `majority` | Records the unconfirmed members by peer id. |
-| `local`, `unrouted` | Records an **empty** missing set, meaning *unknown* — no cohort could be named, so whatever drains the entry re-resolves the cohort then. |
+| `local` | Records the unconfirmed members by peer id when the answer names any — the serving members this node knows belong in the block's cohort but were missing from it when it wrote alone (`absentCohortMembers` in `packages/db-p2p/src/libp2p-key-network.ts`). Otherwise an **empty** missing set, meaning *unknown*. |
+| `unrouted` | Records an **empty** missing set, meaning *unknown* — no cohort could be named, so whatever drains the entry re-resolves the cohort then. |
 
 Rules the recording follows:
 
@@ -144,8 +146,9 @@ Rules the recording follows:
 - **Torn blocks are skipped.** A block an abandoned sweep cancelled holds nothing to push.
 - **One entry per block, at the highest revision.** A newer revision supersedes an older one — pushing the newer materialization satisfies both — and resets the give-up counter; an older commit finishing late cannot lower or settle a newer entry. This bounds the ledger by the node's owned-block count, and a hard cap (`DEFAULT_UNDER_REPLICATION_MAX_ENTRIES` in `packages/db-p2p/src/repo/kv-under-replication-ledger.ts`) evicts oldest-recorded first as a backstop.
 - **A ledger fault never fails the commit.** The write is already durable at the class the answer states; the failure is logged as `coordinator-repo:under-replication-record-failed` and the answer goes out unchanged.
+- **The answer names the ledger that owes the copies.** When this node's ledger recorded an entry for every non-torn block of the commit, the answer carries `recordedBy` — this node's peer id (`WriteDurability.recordedBy` in `packages/db-core/src/network/struct.ts`). That node, and only that node, will fire the full-replication event for those blocks, so a writer that coordinated its own write knows the event will reach it, and one whose write another member coordinated knows it will not. The field is absent whenever no event should be expected: a `full` answer, a node holding nothing, no ledger, a ledger fault on any block (the answer goes out, but not naming a ledger that failed to record), or a coordinator built without a peer id. Merging answers keeps two otherwise identical cohort answers recorded by different nodes apart (`mergeDurability` in `packages/db-core/src/network/durability.ts`).
 
-`KvUnderReplicationLedger` stores entries as JSON under `under-replicated/<blockId>` in the node's `IKVStore`, supplied as `NodeOptions.kvStore`. Without one the node uses an in-memory store and logs a `node-wiring` warning, because the ledger then does not survive a restart — the one case it exists for. `FileKVStore` may share `FileRawStorage`'s base path; see `packages/db-p2p-storage-fs/README.md`.
+`KvUnderReplicationLedger` stores entries as JSON under `under-replicated/<blockId>` in the node's `IKVStore`, supplied as `NodeOptions.kvStore`. Without one the node uses an in-memory store and logs a `node-wiring` warning, because the ledger then does not survive a restart — the one case it exists for. Before it writes an entry it runs the `beforeRecord` hook `createLibp2pNodeBase` wires to a strict flush of the block store, so an entry is never on disk ahead of the commit it describes when that commit's own flush was given a durability window (write order 8 in [storage.md §6](storage.md#6-a-write-survives-a-crash-once-a-flush-called-after-it-has-resolved)); after a solo commit, which is always synced, that flush finds nothing to do. `FileKVStore` may share `FileRawStorage`'s base path; see `packages/db-p2p-storage-fs/README.md`.
 
 #### The under-replication drain and the full-replication event
 
@@ -155,13 +158,15 @@ Rules the recording follows:
 
 **What one pass does**, per entry, over at most `blockBudget` entries (rotating, oldest-recorded first, so a backlog wider than the budget is swept in full and nothing starves):
 
-- **Works out who is owed a copy.** A named missing set (a `majority` entry) is taken as recorded and never re-resolved — those members were in the cohort when the write was acknowledged, and a copy there is never harmful. An empty set (`local`, `unrouted`) re-resolves the block's cohort through `IKeyNetwork.findCluster` now. A cohort of this node alone is not a failure: the entry is left untouched and no attempt is counted, so a node that is genuinely by itself never burns its give-up budget.
-- **Pushes only to reachable peers**: connected, and identified as serving this network's block-transfer protocol. Nobody reachable → the entry waits for the next arrival; the drain does not dial the world.
+- **Works out who is owed a copy.** A named missing set (a `majority` entry, or a `local` entry that named the members it wrote without) is taken as recorded and never re-resolved — those members were in the cohort, or known to belong in it, when the write was acknowledged, and a copy there is never harmful. So a member the node remembers is pushed its copy as soon as it is connected and identified, whether or not FRET has re-admitted it to the ring. An empty set (an unnamed `local` entry, or `unrouted`) re-resolves the block's cohort through `IKeyNetwork.findCluster` now. A cohort of this node alone is not a failure: the entry is left untouched and no attempt is counted, so a node that is genuinely by itself never burns its give-up budget.
+- **Pushes only to reachable peers**: connected, identified as serving this network's block-transfer protocol, and admitted by the node's network membership predicate when it has one ([internals § Network Membership Predicate](../../../docs/internals.md#network-membership-predicate)). An entry naming a member the predicate has since refused waits for it, so its full-replication event does not fire while the refusal holds (the `NOTE:` at `UnderReplicationDrain.pushablePeers`). Nobody reachable → the entry waits for the next arrival; the drain does not dial the world.
 - **Pushes through `pushBlockToPeers`** in `packages/db-p2p/src/cluster/block-transfer-service.ts` — the one read-certify-push-interpret loop the rebalance handoff and spread-on-churn also use. A peer whose answer does not list the block as missing has confirmed it and is taken off the entry (`satisfy`, guarded by the revision pushed so a newer shortfall recorded mid-push is left alone). An entry that could not name its members is named with the resolved cohort (`name`, which touches only an entry still standing at that revision, so a `full` commit that settled it mid-push is not undone) before the first confirmation is taken off it, and stays unnamed while nobody confirms, so the next pass resolves the cohort afresh. A block gone from local storage has its entry deleted — it is not one this node can owe. A receiver's refusal of a block this node holds no proof for is logged as "cannot place", apart from "cannot reach".
 - **Counts an unsuccessful round** (`noteAttempt`) when a reachable peer did not confirm; after `maxAttempts` consecutive such rounds that peer is abandoned for that block — no longer pushed to — until it reconnects, which retries it from scratch. The entry itself is never deleted for that: it stays in the ledger, visible, and the ledger's size cap is the backstop for a peer that never returns.
-- **When the entry empties**, the ledger deletes it and ONE `BlockDurabilityReachedEvent` fires — after the deletion, never before — through `StorageRepo.emitBlockDurabilityReached`, the one method the node hands the drain, reaching every `onBlockDurabilityReached` listener with the same isolation as `onCollectionChange` (a throwing listener is logged; the rest still run).
+- **When the entry empties**, the ledger deletes it and ONE `BlockDurabilityReachedEvent` fires — after the deletion, never before — through `StorageRepo.emitBlockDurabilityReached`, the one method the node hands the drain, reaching every `onBlockDurabilityReached` listener with the same isolation as `onCollectionChange` (a throwing listener is logged; the rest still run). An entry a `full` commit settled while its copy was in flight is reported by `satisfy` as `absent`, not `cleared` (`SatisfyOutcome` in `packages/db-p2p/src/repo/i-under-replication-ledger.ts`), and the drain fires nothing for it: the settling commit already did.
 
-**The event.** `IBlockDurabilityNotifier` in `packages/db-core/src/transactor/change-notifier.ts` is the complement of the durability class on the write's own result: a write acknowledged below `full` is pending until these events cover its blocks. `StorageRepo` implements it beside `IBlockChangeNotifier`, so a host has one subscription point for change events. It is keyed by **block**, deliberately: the ledger keeps one entry per block at its highest under-replicated revision, so a block rewritten by a later action replaces the earlier entry and the earlier action never fires an event of its own. A host holds the block ids the write's result named (`PendSuccess.blockIds`) and clears each as an event covers it; keying pending state by action alone waits forever for a superseded write.
+**The event.** `IBlockDurabilityNotifier` in `packages/db-core/src/transactor/change-notifier.ts` is the complement of the durability class on the write's own result: a write acknowledged below `full` is pending until these events cover its blocks. `StorageRepo` implements it beside `IBlockChangeNotifier`, so a host has one subscription point for change events. It has two producers, both on the node whose ledger holds the entry — the one a below-`full` answer names as `recordedBy`: the drain side emptying an entry, by its own push or an embedder's report (the event carries the entry's own revision and action), and a `full` commit settling one (`CoordinatorRepo`, handed the same `emitBlockDurabilityReached` the drain is; the event carries the settling commit's revision and action, and no `collectionId`). The ledger serializes operations per block, so when both race for one entry exactly one removes it and exactly one event fires. It is keyed by **block**, deliberately: the ledger keeps one entry per block at its highest under-replicated revision, so a block rewritten by a later action replaces the earlier entry and the earlier action never fires an event of its own. A host holds the blocks the write's durability names (`WriteDurability.blockRevs` in `packages/db-core/src/network/struct.ts`, each at the revision it committed at) and clears a block when an event names it at that revision or a later one; keying pending state by action alone waits forever for a superseded write.
+
+**An embedder's report.** A host that delivers blocks to a peer by its own means — Sereus's join catch-up pushes a joining peer every block it lacks, many per request — tells the node through `reportBlockHeld(blockId, rev, peerId)` on `OptimysticNodeAttachments` in `packages/db-p2p/src/optimystic-node.ts`. That is a third way an entry shrinks, beside the drain's own confirmed push and a `full` commit's settle, and the second way the drain-side event fires: `recordHeldCopy` in `packages/db-p2p/src/repo/owed-copies.ts` takes the peer off the entry through the same `takeConfirmedCopies` the drain calls, so the two cannot differ on naming, the revision guard or the event. The report is the embedder's word, checked against neither the peer nor local storage, the same footing as a receiver's reply to a push. It writes nothing unless the entry owes `peerId` a copy at or below `rev`: an entry recording a newer revision is left alone, and an unnamed entry is named with the block's resolved cohort only when `peerId` is in it (naming fixes the set the drain pushes to, and the report says nothing about the other members). When the report clears an entry the event carries no `collectionId`, since nothing on that path reads the block. A `rev` that is not a non-negative integer is refused with a `RangeError` before either half runs. Whichever path clears an entry, the event names the entry `satisfy` removed (`SatisfyOutcome` carries it), so a shortfall recorded at a newer revision while a copy of that revision was in flight is announced at its own revision, not at the one the caller read. It depends only on the ledger, the key network and the repo's event sink, so it records with the drain disabled; the same call tells the rebalance monitor the peer holds the block (see [internals § RebalanceMonitor](../../../docs/internals.md#rebalancemonitor), *Holder evidence*). A report racing the drain's push of the same entry is decided by the ledger's per-block ordering: whichever `satisfy` empties the entry fires the one event, and the push already in flight is not recalled.
 
 **Overlaps and suppression.** The rebalance growth arm and spread-on-churn may push the same block to the same peer; the receiver is idempotent, so no cross-monitor coordination exists. Like the neighbouring monitors, a pass is skipped while `PartitionDetector` reports a partition. The drain adds no ordering guarantee for a push landing mid-commit — the receiver's own push handling decides. Log namespace `under-replication-drain`.
 
@@ -192,22 +197,37 @@ Once promise super-majority is reached, the coordinator drives the commit phase.
 All network communication uses the `RepoMessage` format:
 
 ```typescript
+export type RepoOperation =
+	{ get: BlockGets } |
+	{ pend: PendRequest } |
+	{ cancel: { actionRef: ActionBlocks } } |
+	{ commit: CommitRequest } |
+	{ invalidate: InvalidateRequest };
+
 export type RepoMessage = {
-	operations: [
-		{ get: BlockGets } |
-		{ pend: PendRequest } |
-		{ cancel: { actionRef: ActionBlocks } } |
-		{ commit: CommitRequest } |
-		{ invalidate: InvalidateRequest }
-	],
+	operations: [RepoOperation, ...RepoOperation[]],
 	expiration?: number,
 	coordinatingBlockIds?: string[],
 };
 ```
 
+A message of more than one operation must be a batch: every operation a `pend`, or every one a
+`commit`, all naming one action, with no block in two operations. A cluster member refuses any other
+multi-operation record (`batchShapeFault` in `packages/db-p2p/src/cluster/record-operations.ts`), and so
+does the repo protocol's handler, which aborts the stream. A batch that passes is handed to the coordinated
+repo's `pendMany` or `commitMany`, which run it as one consensus record and answer it with one result;
+`RepoClient.pendMany` and `RepoClient.commitMany` send one. Its redirect check is keyed on the batch's first
+block, the block the coordinator resolves its cohort for.
+
 One request per stream: the service answers the first frame and completes the generator, so a client
 dials, writes one length-prefixed JSON `RepoMessage`, reads one length-prefixed JSON response, and
 closes. A second frame queued on the same stream is never read.
+
+`cancel` answers `void`, which the service sends as a zero-length frame (there is no JSON text for
+`undefined`). The client reads a zero-length frame as `undefined` rather than parsing it (the decode stage
+in `ProtocolClient.exchange`, `packages/db-p2p/src/protocol-client.ts`, which every protocol client
+shares); no JSON value serializes to an empty string, so the empty frame is exactly a `void` reply. A
+cancel that fails is still a failure: the service aborts the stream and the client's read rejects.
 
 `invalidate` is the one operation the repo protocol does not serve. It reaches a node only through
 consensus on the cluster protocol (`ClusterRecord.message`, applied by `cluster/cluster-repo.ts`);
@@ -264,7 +284,8 @@ from selecting each other's peers into a cohort.
 | routing (FRET) | `/optimystic/<network>/fret/1.0.0/{ping,neighbors,neighbors/announce,maybeAct,leave}` | `p2p-fret` |
 
 A node also advertises the stock libp2p protocols its services bring with them — `/ipfs/ping/1.0.0`,
-`/libp2p/dcutr`, `/libp2p/autonat/1.0.0`, `/libp2p/circuit/relay/0.2.0/…`. Those keep their upstream
+`/libp2p/dcutr` (only on a node with a directly dialable address — see `holePunchingWanted` in
+`packages/db-p2p/src/network/hole-punching.ts`), `/libp2p/autonat/1.0.0`, `/libp2p/circuit/relay/0.2.0/…`. Those keep their upstream
 ids and are **not** network-scoped, so two nodes on different Optimystic networks can still ping each
 other; only the ids above decide whether a peer is treated as part of this network.
 
@@ -308,7 +329,10 @@ option (the default) serve all four to anyone who can connect.
 
 Coordinator and cohort selection route work only to peers confirmed `serves`. A peer built to speak
 the repo protocol therefore becomes routable the moment its identify exchange completes; a peer whose
-ids are misspelled stays `foreign` forever and is silently skipped.
+ids are misspelled stays `foreign` forever and is silently skipped. The list is read from a per-peer
+copy of the peer's peerStore record (`PeerRecordCache` in
+`packages/db-p2p/src/network/peer-record-cache.ts`), which is refreshed when identify lands, since
+identify's write is reported as `peer:update`.
 
 ### Responsibility K and the redirect-skip check
 
@@ -401,7 +425,7 @@ const node = await createLibp2pNode({
 
 // Create coordinator repo for distributed consensus
 const repo = coordinatorRepo(keyNetwork, createClusterClient)({
-  storageRepo: new StorageRepo(createBlockStorage)
+  storageRepo: new StorageRepo(rawStorage)
 });
 ```
 

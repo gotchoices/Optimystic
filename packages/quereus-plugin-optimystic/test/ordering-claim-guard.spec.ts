@@ -74,9 +74,8 @@ function makeTableInfo(indexes: Array<{ name: string; columns: Array<{ index: nu
  * It rides on the REQUEST, not on the schema: quereus 4.19 retired
  * `TableSchema.estimatedRows`, and `rule-select-access-path` now passes the catalog's count
  * down as `BestAccessPlanRequest.estimatedRows`. Stating it here rather than leaving it
- * `undefined` is what keeps these cases exercising a SUPPLIED row count — the module's
- * no-answer fallback happens to be 1,000,000 too, so an omitted value would leave every
- * assertion below passing for the wrong reason.
+ * `undefined` is what keeps these cases exercising a SUPPLIED row count rather than the
+ * module's fallback for an un-analyzed table.
  */
 const TABLE_ROWS = 1_000_000;
 
@@ -158,6 +157,31 @@ describe('Ordering-claim guard (getBestAccessPlan.providesOrdering)', () => {
 		);
 		expect(result.indexName).to.equal('idx_cat_city');
 		expect(result.providesOrdering, 'non-BINARY ordering must NOT be promised').to.be.undefined;
+	});
+
+	it('does NOT keep the ordering promise of an index that lost to a cheaper one', () => {
+		// idx_cat_name could deliver (category, name), but with these statistics the seek pinning
+		// category AND price matches far fewer rows, and they come in no particular name order.
+		const tableInfo = {
+			...makeTableInfo([
+				{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] },
+				{ name: 'idx_cat_price', columns: [{ index: CATEGORY }, { index: PRICE }] },
+			]),
+			statistics: {
+				rowCount: TABLE_ROWS,
+				columnStats: new Map([
+					['category', { distinctCount: 2, nullCount: 0 }],
+					['price', { distinctCount: 100, nullCount: 0 }],
+				]),
+			},
+		};
+		const result = plan(
+			tableInfo,
+			[eqFilter(CATEGORY), eqFilter(PRICE)],
+			[{ columnIndex: CATEGORY, desc: false }, { columnIndex: NAME, desc: false }]
+		);
+		expect(result.indexName).to.equal('idx_cat_price');
+		expect(result.providesOrdering, 'the losing index\'s ordering must NOT be promised').to.be.undefined;
 	});
 
 	it('does NOT promise a single-column DESC ordering on the leading index column', () => {

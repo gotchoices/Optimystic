@@ -1,0 +1,25 @@
+/** A promise with its settlement in hand. */
+export interface Deferred {
+	readonly promise: Promise<void>;
+	readonly resolve: () => void;
+	readonly reject: (err: unknown) => void;
+}
+
+const noop = (): void => undefined;
+
+/**
+ * A {@link Deferred} whose rejection is never unhandled: a settlement nobody awaits — a write
+ * batch's durability that no strict flush or `whenDurable()` is waiting on — must not surface as an
+ * unhandled rejection, while every awaiter still sees it.
+ */
+// NOTE: every promise `WriteGroup.flush` returns is one of these or is pre-observed the same way,
+// so a `flush()` nobody awaits fails silently rather than as an unhandled rejection. Every caller
+// awaits today (`StorageRepo.endGroup`, `WriteGroup.close`, the idle timer with its own catch); if
+// one ever fires and forgets, log at that call site.
+export function deferred(): Deferred {
+	let resolve!: () => void;
+	let reject!: (err: unknown) => void;
+	const promise = new Promise<void>((res, rej) => { resolve = res; reject = rej; });
+	promise.catch(noop);
+	return { promise, resolve, reject };
+}

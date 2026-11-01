@@ -70,6 +70,9 @@ class RecordingService implements CohortTopicService {
 	async renew(): Promise<void> {
 		this.renews++;
 	}
+	async renewMany(handles: readonly RegistrationHandle[]): Promise<void> {
+		this.renews += handles.length;
+	}
 	async lookup(): Promise<never> {
 		throw new Error('lookup not used by managers');
 	}

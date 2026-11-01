@@ -1,0 +1,20 @@
+/**
+ * Keep a pending timer from holding a Node process open. Browsers and React Native return a number
+ * from `setTimeout` / `setInterval`, which has no `unref`, so the call is guarded. Every first-party
+ * `unref` goes through here; the `NO_TIMER_UNREF` lint rule in `eslint.config.js` enforces that.
+ */
+export function unrefTimer<T>(handle: T): T {
+	(handle as { unref?: () => void }).unref?.();
+	return handle;
+}
+
+/** Arm a one-shot timer that never holds a process open; returns its cancel. The default behind the injectable `setTimer` seams. */
+export function armUnrefTimer(fn: () => void, ms: number): () => void {
+	const handle = unrefTimer(setTimeout(fn, ms));
+	return (): void => clearTimeout(handle);
+}
+
+/** Resolve after `ms` on a timer that never holds a process open. The default behind the injectable `sleep` seams. */
+export function unrefDelay(ms: number): Promise<void> {
+	return new Promise<void>(resolve => { armUnrefTimer(resolve, ms); });
+}

@@ -151,6 +151,16 @@ export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
 	 * start-up bootstrap dial, plus identify on the opened connection.
 	 */
 	bootstrapContactTimeoutMs: number;
+	/**
+	 * A host's `NetworkTransactorInit.retryBackoffBaseMs`: the first wait before a retry of a request
+	 * that went unanswered, doubling for each further coordinator tried. Exactly the declared round
+	 * trip, and 0 — no wait, every retry at once — when none is declared, with no floor: a node on the
+	 * LAN deadlines sends a retry over a link whose queue does not hold its predecessor back. The node
+	 * applies it once itself, as its coordinator's first hold after a read-repair consult a silent
+	 * cohort peer left unarmed (`CoordinatorRepoConfig.retryBackoffBaseMs`). `rpcDeadlines` does not
+	 * move it.
+	 */
+	retryBackoffBaseMs: number;
 };
 
 /**
@@ -194,6 +204,8 @@ export type LinkDeadlines = RpcDeadlineDefaults & StreamOpenDeadlines & {
  *   its 1000.
  * - dead connection: the dial deadline itself, the bound already placed on one connection open plus
  *   negotiation; it follows an explicit `rpcDeadlines.dialTimeoutMs` as the transfer budget does.
+ * - retry backoff base: one round trip, the time a retry waits so it stops lengthening the send queue
+ *   its predecessor is still in; the one value with no floor, 0 when undeclared (no wait).
  */
 const CONNECTION_ROUND_TRIPS = 10;
 const DIAL_ROUND_TRIPS = CONNECTION_ROUND_TRIPS + 1;
@@ -274,6 +286,7 @@ export function resolveLinkDeadlines(linkRoundTripMs?: number, rpcDeadlines?: Pa
 		bootstrapContactTimeoutMs: Math.max(DEFAULT_LIBP2P_DIAL_TIMEOUT_MS, BOOTSTRAP_CONTACT_ROUND_TRIPS * roundTripMs),
 		hedgeDelayMs: Math.max(DEFAULT_STREAM_HEDGE_DELAY_MS, STREAM_HEDGE_ROUND_TRIPS * roundTripMs),
 		deadConnectionDelayMs: dialTimeoutMs,
+		retryBackoffBaseMs: roundTripMs,
 	};
 }
 
@@ -291,6 +304,81 @@ export function resolveBootstrapContactTimeoutMs(declared: number | undefined, d
 		);
 	}
 	return declared;
+}
+
+/**
+ * The whole-dial deadline a node applies: `NodeOptions.connectionManager.dialTimeout` when declared,
+ * else `LinkDeadlines.libp2pDialTimeoutMs`. One value serves two consumers — libp2p's connection
+ * manager, and FRET's maintenance redial, which always dials with a signal and so is never reached
+ * by libp2p's limit.
+ *
+ * A declared value that is not a finite number above zero, or is above the 32-bit timer limit,
+ * throws. libp2p alone would take `0` and arm `AbortSignal.timeout(0)` on every signal-less dial,
+ * failing each at once, and FRET's constructor refuses it — but only at `node.start()`, under a
+ * name (`dialTimeoutMs`) the host never set. Refusing it here names the option the host did set,
+ * before the node has acquired anything.
+ */
+export function resolveLibp2pDialTimeoutMs(declared: number | undefined, deadlines: LinkDeadlines): number {
+	return declared === undefined
+		? deadlines.libp2pDialTimeoutMs
+		: validDeclaredMs('connectionManager.dialTimeout', declared, MAX_TIMER_DELAY_MS);
+}
+
+/**
+ * How long `@libp2p/ping` lets an inbound ping stream live before aborting it, on a node that neither
+ * declares one nor declares a connection-monitor deadline. Equal to `@libp2p/ping`'s own `TIMEOUT`,
+ * stated here so the fallback does not move with that package.
+ */
+export const DEFAULT_PING_HANDLER_TIMEOUT_MS = 10_000;
+
+/**
+ * libp2p's `AdaptiveTimeout` default `maxTimeout`, which caps the connection monitor's deadline when a
+ * node declares a `pingTimeout` without one. Stated here so the derivation does not move with libp2p.
+ */
+export const LIBP2P_DEFAULT_PING_MAX_TIMEOUT_MS = 60_000;
+
+/** The part of libp2p's `ConnectionMonitorInit` the ping handler timeout is derived from. */
+export type DeclaredPingDeadline = { pingTimeout?: { minTimeout?: number; maxTimeout?: number } };
+
+/**
+ * The timeout this node's ping service puts on every inbound ping stream (`NodeOptions.pingHandlerTimeoutMs`).
+ *
+ * The answering side's timer runs over the whole stream — echo, waiting for the pinger to close, and
+ * the final close — and when it fires first it resets the stream, which the pinging node's connection
+ * monitor cannot tell from a dead peer, so it aborts the connection. So a deadline the pinger declares
+ * is capped at the answerer's handler timeout. Declared → used exactly as given, never raised (an
+ * embedder who sets it low has decided). Undeclared with a monitor deadline declared → twice that
+ * deadline's ceiling (strictly above it, with room for the close), floored at the library default and
+ * capped at the 32-bit timer limit; this assumes the remote's monitor is configured like this node's.
+ * Otherwise → {@link DEFAULT_PING_HANDLER_TIMEOUT_MS}, today's behaviour.
+ *
+ * NOTE: an unconfigured libp2p monitor's adaptive deadline can rise toward its own 60 s default
+ * `maxTimeout` for one slow ping, so even a stock pair can in principle meet the 10 s handler cap; the
+ * undeclared default is left at 10 s on purpose. If stock-config deployments report reset-driven
+ * aborts (`aborting connection due to ping failure` with a stream reset or unexpected EOF), derive
+ * from libp2p's default max too.
+ */
+export function resolvePingHandlerTimeoutMs(declared: number | undefined, connectionMonitor: DeclaredPingDeadline | undefined): number {
+	if (declared !== undefined) return validDeclaredMs('pingHandlerTimeoutMs', declared, MAX_TIMER_DELAY_MS);
+	const monitorCeiling = declaredMonitorDeadlineCeiling(connectionMonitor);
+	return monitorCeiling === undefined
+		? DEFAULT_PING_HANDLER_TIMEOUT_MS
+		: Math.min(MAX_TIMER_DELAY_MS, Math.max(DEFAULT_PING_HANDLER_TIMEOUT_MS, 2 * monitorCeiling));
+}
+
+/**
+ * The longest deadline a declared connection monitor can give one ping, or `undefined` when the node
+ * declares neither bound. libp2p raises the adaptive deadline to `minTimeout` and only then caps it at
+ * `maxTimeout`, so the ceiling is `maxTimeout` — libp2p's own default when it is undeclared or unusable,
+ * since that default is what libp2p then applies. A node that declares only `minTimeout` therefore
+ * derives from 60 s, not from nothing: its monitor waits at least that `minTimeout`, so a 10 s handler
+ * would cut it off.
+ */
+function declaredMonitorDeadlineCeiling(connectionMonitor: DeclaredPingDeadline | undefined): number | undefined {
+	const pingTimeout = connectionMonitor?.pingTimeout;
+	if (pingTimeout?.minTimeout === undefined && pingTimeout?.maxTimeout === undefined) return undefined;
+	const max = pingTimeout.maxTimeout;
+	return max !== undefined && Number.isFinite(max) && max > 0 ? max : LIBP2P_DEFAULT_PING_MAX_TIMEOUT_MS;
 }
 
 function validDeclaredMs(field: string, declared: number, ceiling: number): number {
@@ -344,7 +432,8 @@ export class RequestBudgetExceededError extends Error {
  * For a caller that owns a per-peer budget of its own. The client defaults cannot simply be left
  * underneath it: opening a stream costs one link round trip even on a connection that is already
  * open (`test/stream-open-costs-a-round-trip.spec.ts`), so on a link whose round trip reaches
- * {@link DEFAULT_DIAL_TIMEOUT_MS} the default dial deadline fails every request, and a larger
+ * {@link DEFAULT_DIAL_TIMEOUT_MS} the default dial deadline fails every request that has to negotiate
+ * its stream (the first to a peer after a quiet spell; later ones take a prepared stream), and a larger
  * budget above it never takes effect. So `request` receives explicit `0`s for both phase deadlines
  * ("no cap", see {@link withRpcDeadlineDefaults}) and a signal that aborts with a
  * {@link RequestBudgetExceededError} once the budget runs out. `ProtocolClient.processMessage`

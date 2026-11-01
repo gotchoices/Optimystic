@@ -22,13 +22,15 @@ routing through the kernel, and a test double (`CrashingRawStorage` in
 backend today reuses the shared `KvRawStorage` kernel over a small
 `RawStoreDriver` that only speaks bytes: `MemoryRawStorage`, `FileRawStorage`,
 `IndexedDBRawStorage`, `LevelDBRawStorage`, and `SqliteRawStorage` all `extends
-KvRawStorage`, each supplying only a driver for its native mechanism. The
+KvRawStorage`, each supplying only a driver for its native mechanism — or, for the
+backends that take their writes a group at a time, a `BatchBackend` or a `JournalStore`
+under the shared `WriteGroupDriver` (Invariant 6 below). The
 migration from direct implementation onto drivers (mentioned in older revisions
 of this doc) is complete.
 
 ## Invariants
 
-These five properties are what make it safe to build another layer (e.g. a
+These six properties are what make it safe to build another layer (e.g. a
 cache) over `IRawStorage`. Each entry states the rule, where it's enforced, and
 what breaks if it's violated.
 
@@ -170,16 +172,18 @@ observer can see both records.
 ### 5. A store is owned by exactly one process
 
 No two processes may point an `IRawStorage` (or a `RawStoreDriver`) at the same
-underlying path/keyspace at the same time. This is **not enforced anywhere in
-code today** — it holds only because every current deployment happens to wire
-one store per node (and, in the Sereus fabric layered over Optimystic, one store
-per trust domain besides), so nothing shares a directory in practice. Nothing
-stops a future host from embedding two nodes over one path.
+underlying path/keyspace at the same time. The filesystem backend enforces it on
+one machine: its `store.lock` refuses a second live process on the same host (see
+*The file backend* under Invariant 6). **No other backend enforces it** — there it
+holds only because every current deployment happens to wire one store per node
+(and, in the Sereus fabric layered over Optimystic, one store per trust domain
+besides), so nothing shares a keyspace in practice. Nothing stops a future host
+from embedding two nodes over one path.
 
 **Violate it and:** Invariant 1 breaks silently. A second process writing to the
 same backend produces writes that never funnel through the first process's
 `IRawStorage`, so any in-process cache the first process keeps — including one
-built over this document's other four invariants — serves stale data, potentially
+built over this document's other invariants — serves stale data, potentially
 into a consensus decision.
 
 **For embedders:** wire exactly one `IRawStorage` instance (one
@@ -206,6 +210,465 @@ carry:
   equality, but must never treat inequality as proof that two stores are distinct.
   Each backend's `NOTE:` states its own gaps.
 
+### 6. A write survives a crash once a `flush()` called after it has resolved
+
+Every `RawStoreDriver` and every `IRawStorage` has a `flush(options?)`, a `whenDurable()` and
+a `durability`. The durability (`StoreDurability` in
+`packages/db-p2p/src/storage/store-durability.ts`) names which crashes a flushed write
+survives: `'none'` (nothing survives a restart), `'process-crash'` (this process crashing, but
+not an operating-system crash or power cut) or `'power-loss'` (a power cut or operating-system
+crash too). It is fixed when the store is constructed and never changes. A flush may be given
+`withinMs` (`FlushOptions` in `packages/db-p2p/src/storage/store-durability.ts`): how long after
+the call the writes it covers may stay exposed to a crash the durability names — the caller
+trading a bounded window of exposure for a sync that waits. Absent or 0, the flush is *strict*
+and resolves only once the writes survive, which is what every caller asks except a node
+applying a write its cohort agreed to (see *Who calls `flush()`* below); otherwise it is
+*relaxed*. `whenDurable()` resolves once every write covered by a flush that resolved before
+the call survives every crash the durability names, and never hastens a sync. All three members
+are required, so a wrapper that forgets to forward one does not compile. `IKVStore` has an
+optional `flush` instead, because hosts implement that interface outside this repository; absent
+means every write is already as durable as it will ever be when it resolves.
+
+The contract, stated in full on `RawStoreDriver.flush` in
+`packages/db-p2p/src/storage/raw-store-driver.ts`:
+
+1. A write method resolves once its effect is visible to every later read in this process.
+2. Once a `flush()` called after the write resolved has itself resolved, the write survives a
+   crash of this process where `durability` names one; it survives every crash `durability`
+   names once `withinMs` has passed since that flush was called (at once, for 0 or absent), or
+   once a `whenDurable()` called after the flush resolved has itself resolved.
+3. **What survives any crash is a prefix of the resolved writes, in the order they
+   resolved.** No write survives while one that resolved before it is lost. A deferred sync is
+   exactly when a power cut can take a suffix, so a caller that allows one relies on this rule.
+4. A `flush()` covers every write resolved before it was called, including writes made by
+   other callers; concurrent flushes may share one sync. A flush with `withinMs` 0 covers every
+   earlier deferred write too, so it hastens their sync.
+5. A rejected `flush()` is a storage fault. After one, the store rejects every later write
+   and flush until it is reopened, because a retried sync can report success for data the
+   operating system already dropped. A deferred sync that fails latches the store the same
+   way, is logged, and is reported by the next write, flush or `whenDurable()`.
+
+Rule 3 is what keeps the crash-recovery reasoning in `BlockStorage` and `StorageRepo` valid
+once a backend stops syncing each write on its own. Rules 4 and 5 bind a store whose flush
+does real work: `WriteGroupDriver`, whose flush is the sync, and the file and NativeScript
+SQLite backends built on it (see *Writes that wait in memory* below); every other backend
+satisfies them trivially, and every store that cannot defer a sync treats `withinMs` as 0 and
+resolves `whenDurable()` at once. Only `WriteGroupDriver` honours `withinMs`, and only over a
+backend that defers its sync: today the file backend, the NativeScript SQLite backend, and the
+journal backend (*The journal backend* below) over the browser store, and over the React Native
+store once its LevelDB binding can sync a batch (it cannot today, so there every window is 0):
+
+| Driver | What a write waits for today | What `flush()` does | `withinMs` | `durability` |
+|---|---|---|---|---|
+| `MemoryStoreDriver` | the in-memory map update | nothing | ignored | `'none'` |
+| `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`; a strict flush resolves when the batch is durable, a relaxed one when it is committed | the time left to the earliest deadline of the flushes sharing the seal is passed to the backend's `commit` as `syncWithinMs`; honoured only as far as the backend defers | the backend's |
+| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
+| `JournalBatchBackend` (`packages/db-p2p/src/storage/journal-batch-backend.ts`), under `WriteGroupDriver`, over a `JournalStore` the engine implements | nothing: it is recorded in memory and served from there | over a store that can sync: a strict flush is one synced apply of every journal record held plus the group itself; a relaxed one appends the group as one unsynced journal record and resolves, and the held records are applied in one synced apply by the earliest deadline among them. Over a store that cannot sync: one atomic apply per group, never journaled | honoured over a store that can sync: one apply covers every record appended since the last, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed; ignored over one that cannot | the store's: `'power-loss'` when it can sync an apply, else what the engine gives |
+| `LevelDBJournalStore` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the handle can sync a batch (`canSync` on the package's `LevelDBLike`, which `classic-level` reports and `rn-leveldb` cannot yet): as the journal backend's row, an append being one unsynced LevelDB batch putting the record under the journal's tag byte and an apply one batch over the data tags and the journal written with LevelDB's `sync` option. Where it cannot: one unsynced batch per group, never journaled | honoured where the handle can sync, as the journal backend's row; ignored where it cannot | `'power-loss'` where the handle can sync, else `'process-crash'`, which `rn-leveldb` is today |
+| `IndexedDBJournalStore` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the browser honours `durability: 'strict'` (every current release): as the journal backend's row, an append being one relaxed `readwrite` transaction on the `journal` object store and an apply one strict transaction over the six data stores and the journal, which completes only once the browser has put it on the disk. Where it does not: one relaxed transaction per group, never journaled | honoured where the browser honours strict transactions, as the journal backend's row; ignored where it does not | `'power-loss'` where the browser honours strict transactions, else `'process-crash'` |
+| `SqliteBatchBackend` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | one SQLite transaction applying the batch, committed in write-ahead-log mode (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`); a strict flush commits it under `synchronous = FULL`, which syncs the log before the flush resolves, a relaxed one under `NORMAL`, and the log syncs by the earliest deadline among the batches waiting | honoured: one `FULL` commit — a strict batch's own, or the one-row commit the timer makes — covers every batch committed since the last sync, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed | `'power-loss'` |
+
+The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStorage` with every
+storage class built on it — report the durability of what they wrap, flush by flushing it with
+the same options, and answer `whenDurable()` with the wrapped store's. The cache is
+write-through and holds no dirty state, so flushing it is flushing the driver underneath.
+
+**Writes that wait in memory.** `WriteGroupDriver` in
+`packages/db-p2p/src/storage/write-group-driver.ts` is a `RawStoreDriver` over a `BatchBackend`
+(`packages/db-p2p/src/storage/batch-backend.ts`): a backend with reads, listings and one write,
+`commit`, which applies a whole batch atomically and as durably as its `durability` says. Over
+this driver every write of every store — metadata, revisions, pending, transactions, proofs,
+materialized, and the two entries a promote records — resolves at once, recorded in an
+in-memory overlay that point reads consult first and listings merge over the backend's rows.
+`flush()` seals the writes recorded so far into one batch and hands it to the backend's
+`commit`, which resolves once the batch is applied and survives a crash of this process and
+hands back a `durable` promise (`CommittedBatch` in `packages/db-p2p/src/storage/write-group.ts`)
+that settles once it survives every crash the durability names. A strict flush resolves on
+`durable`, a relaxed one on the commit. Every flush that shares one seal contributes its
+deadline, and the batch is committed with `syncWithinMs` the time left to the earliest of them,
+so a backend may defer the sync of a batch every flush of which allowed it; a strict flush with
+nothing to seal has the backend `sync()` whatever is committed and not yet durable, and a relaxed
+one with nothing to seal does the same in the background when its deadline is sooner than those
+batches were given, since rule 2 binds them to it and the backend cannot be told a sooner
+deadline after the commit. Batches
+commit one at a time, in sequence, and their `durable` settle in commit order (rule 3); a flush
+arriving while a commit is in flight waits for it and then shares the next commit with every
+other flush that arrived meanwhile (rule 4); and a rejected commit — or a rejected sync no
+caller is waiting on, a deferred one or the hasten behind a relaxed flush, which is logged once
+on `optimystic:db-p2p:write-group:error` — latches the driver failed, after which every write, flush and `whenDurable()`
+throws `StoreFailedError` (rule 5) while reads keep serving the overlay. An overlay entry stays
+until its batch is durable, not merely committed, so a write a crash could still take back is
+never read from the backend alone; the overlay is bounded by `maxUnsyncedBytes`
+(`WriteGroupOptions` in `packages/db-p2p/src/storage/write-group.ts`, 64 MiB by default): a seal
+that would leave more than that not yet durable is committed with `syncWithinMs` 0 whatever its
+flushes asked. `whenDurable()` is the `durable` of the latest committed batch. The key-agnostic
+part — overlay, open batch, commit chain, deadlines, failure latch and idle timer — is
+`WriteGroup` in the same file, which `FileKVStore` also uses over string keys and which exposes
+`whenDurable()` there too. A write that no group flushes is flushed, strictly, by the driver's
+own idle timer, `idleFlushMs` (default one second) after the first write of an open batch.
+`IRawStorage.close`, optional and wired by the kernel only when the driver has one, flushes
+strictly once more — which syncs every deferred batch — and releases the backend; the
+conformance suite's reopen case closes the first store before opening the second, since a
+second store opened beside the first would otherwise read the first's memory. The test double
+for all of this is `MemoryBatchBackend` in `packages/db-p2p/src/testing/memory-batch-backend.ts`,
+whose `deferSync` option holds a batch not durable until a `sync()` and whose `powerLoss()`
+rebuilds the store from the durable prefix alone.
+
+**The file backend.** `FileBatchBackend` commits each group through `FileWriteLog`
+(`packages/db-p2p-storage-fs/src/file-write-log.ts`): the batch is encoded as one record (a length,
+a CRC-32, then each put or delete with its path relative to the store directory) and appended to
+`<basePath>/write-ahead.log` with one `write`. The record has reached the operating system then, so
+it survives a crash of this process from that moment: the next open's replay applies it. What the
+sync adds is surviving a power cut, and the log makes one sync cover many records
+(`FileWriteLog.commit`): a batch committed with `syncWithinMs` 0 is synced before its commit
+resolves, with every batch waiting ahead of it; one committed with a window resolves at once and
+waits in the log's `unsynced` list with its deadline, counted from the commit's call, and a timer
+armed for the earliest deadline runs the sync for everything waiting. A commit that finds the
+earliest waiting deadline already passed syncs before it resolves whatever its own window, so when
+the disk falls behind, writers wait for it rather than the window growing; a sync that started
+after a deadline it covered is logged once per episode as `window-overrun` on the
+`optimystic:db-p2p-storage-fs:write-log` channel. That bookkeeping — the waiting batches in order,
+the earliest deadline and its timer, the backpressure test and the overrun episode — is
+`SyncDeadlines` in `packages/db-p2p/src/storage/sync-deadlines.ts`, which every store that defers
+its sync shares; the log supplies only the sync step. The sink's `sync()` (`FileWriteLog.sync`), which a
+strict flush with nothing to seal calls, runs the same step; a checkpoint's seal runs it first, so a
+sealed segment holds only synced records. Only after the sync is each entry written to its
+canonical tree file — straight to the path, no temp file or rename — or unlinked, without syncing
+anything, and only then does the batch's `durable` resolve, so the overlay above each store serves a
+batch until the tree holds it. A tree file therefore only ever holds content whose log record is
+durable, so what a crash leaves is the log's durable prefix plus whatever the tree held, and the
+next open replays the log in order (puts and deletes are idempotent), syncs every file and directory
+the replay touched, and truncates the log to its header before serving anything. Replay reads
+strictly: a torn final record, a record whose length runs past the end of the file, a CRC mismatch,
+or a header that is not this build's stops the read before that record, and the records before it
+are applied. Rule 3 holds by construction, since the log is one sequence of whole groups and a power
+cut that keeps a later page of it while losing an earlier one fails the earlier record's CRC, which
+ends the replay there; a promote is two entries of one record, which is what makes it atomic and
+durable; and a new block's directory needs no sync of its own ahead of its files. A failure of the
+sync step — the sync itself or a tree write after it — latches the log and rejects the `durable` of
+every batch it covered, so no flush waits for a sync the store will not make.
+
+The log keeps every file it wrote and every directory whose entries changed since the last
+checkpoint, and a checkpoint (`FileWriteLog.checkpoint`) spends that set to discard the log: it
+**seals** the log, in line with commits so no apply is in flight, by renaming it to
+`write-ahead.log.sealed`, starting an empty one and taking the set; it **syncs** every file and then
+every directory in the set, sixteen at a time, while commits carry on into the new log; and it
+**truncates** by deleting the sealed segment and syncing the directory. A file deleted since the seal
+is skipped and one rewritten since is synced with content the new log also covers. It runs when the
+log reaches `checkpointBytes` (16 MiB by default), `checkpointIdleMs` (5 s) after the last append,
+and on the last close of the directory's log, one at a time, and a failure latches the store failed
+as a rejected commit does. An open replays the sealed segment, if a crash left one, before the
+current log — harmless, since the current log holds every later write of the same paths in order —
+and deletes it, with a directory sync, before truncating the current log, so the older segment can
+never be replayed alone over newer content. A sealed segment that stops short ends the replay there,
+the current log included — the two files are read as one log, by the same rule as a bad record
+inside one. Directories are therefore
+synced only at a checkpoint and at open, never per write; on win32, where a directory cannot be
+synced, only files are.
+
+Opening also takes `<basePath>/store.lock` (`acquireStoreLock` in
+`packages/db-p2p-storage-fs/src/store-lock.ts`): a lock naming a live process on this machine refuses
+the open with `StoreLockedError`, any other is stale and replaced. One `FileWriteLog` per directory
+per process, shared by reference count, so every store over one directory — `FileRawStorage` and
+`FileKVStore` (`packages/db-p2p-storage-fs/src/file-kv-store.ts`), which writes through a
+`WriteGroup` over string keys into the same log — shares one log, one lock and one checkpoint, and
+two stores' commits never interleave within a record. Each keeps its own overlay, which is why a
+second store opened beside a first does not see the first's unflushed writes.
+
+**The journal backend.** `JournalBatchBackend` in
+`packages/db-p2p/src/storage/journal-batch-backend.ts` is the `BatchBackend` for an engine that
+writes a group atomically but cannot be trusted to keep write order across a power cut. IndexedDB
+can make one transaction durable but promises nothing about the order earlier relaxed transactions
+reach the disk; LevelDB syncs only its current log file, closes an old one unsynced when it switches
+to a new one, and under default options skips a damaged log record and keeps reading the ones after
+it. Either way a later write can survive while an earlier one is lost, which is what rule 3 forbids.
+The backend keeps the rule without relying on the engine's order by writing each relaxed group
+twice, through a `JournalStore` (same file) the engine implements beside its reads: `appendJournal`,
+one atomic unsynced write of the group as a journal record numbered by a sequence with no gaps, not
+applied to the stores reads come from; `applyJournal`, one atomic synced write that applies, in
+order, every record not yet applied — and, for a strict group, the group itself — sets the
+applied-through mark to the last of them, and deletes those records; and `readJournal`. The journal
+is a keyspace of the engine's own (an IndexedDB object store, a LevelDB tag byte) that the six
+block-storage stores never touch. When a group is applied is `SyncDeadlines`'s rules, the same as the
+file log's: a strict group, or one that finds its own or a held deadline already passed, is applied
+at once together with everything held; a relaxed one is appended and held with its deadline, counted
+from the commit's call, and the timer armed for the earliest deadline applies everything held. An
+apply carries every byte it applies, so its durability depends on nothing written before it, and
+every apply is synced before the next starts, so a later apply can never survive without an earlier
+one. Recovery at open reads the journal, deletes any record at or below the mark (an apply deleted
+those in the write that set the mark, so one is there only if the store lost part of an atomic
+write), applies the run of consecutive records after the mark, and discards everything after the
+first missing number, logging the gap on `optimystic:db-p2p:journal`. A record the engine lost — a
+damaged LevelDB log record, an IndexedDB transaction the browser did not keep, an unsynced old log
+file — is a missing number, so nothing after it is applied, and what survives is a prefix of the
+groups. The next sequence is one past the last applied, so a discarded number is reused only after
+the apply that deleted it. The overlay above serves a journaled group until its apply, so a reader
+never depends on the journal, and a held record's entries are the arrays the overlay's own bytes are
+held in, bounded with it by `maxUnsyncedBytes`. Over a store whose `durability` is below
+`'power-loss'` — an engine that cannot sync, such as today's React Native LevelDB binding — the
+backend journals nothing and applies each group at once as one atomic write: the atomicity half of
+the contract now, and the ordering half the moment the engine can sync, with nothing above it
+changing. A rejected store write latches the backend as a rejected commit latches the driver (rule
+5). For an engine that stores bytes, `encodeJournalRecord` and `decodeJournalRecord` in
+`packages/db-p2p/src/storage/journal-record-codec.ts` give a record one format — a version byte,
+the sequence, then each entry's key as JSON, a put-or-delete flag and the value — and a store that
+cannot decode a record leaves it out of `readJournal`, which recovery treats as a gap. The browser
+store is `IndexedDBJournalStore` in `packages/db-p2p-storage-web/src/indexeddb-storage.ts`: an
+append is one relaxed `readwrite` transaction on its `journal` object store, an apply one strict
+transaction over the six data stores and the journal — strict where the browser honours
+`durability: 'strict'`, which every current release does and which the store detects once at
+construction (`supportsStrictDurability` in `packages/db-p2p-storage-web/src/durability.ts`); where
+it does not, the store reports `'process-crash'` and the backend applies each group at once — and a
+record is stored by structured clone, with no codec. The React Native store is `LevelDBJournalStore`
+in `packages/db-p2p-storage-rn/src/leveldb-storage.ts`: the journal is one tag byte of the one
+LevelDB keyspace (`TAG_JOURNAL` in `packages/db-p2p-storage-rn/src/keys.ts`, each record under its
+sequence as 8 bytes big-endian and the mark under the bare tag), an append is one unsynced batch, an
+apply is one batch over the data tags and the journal written with LevelDB's `sync` option wherever
+the handle reports it can (`canSync` on the package's `LevelDBLike`), and a record is bytes through
+the codec above. Every write that package makes is a batch — the key-value store's and the identity
+helper's included, and the handle surface has no single put or delete — so no unsynced direct write
+sits in an old log file outside the journal's reach. `rn-leveldb` cannot sync today, so on a phone
+the store reports `'process-crash'` and the backend applies each group at once as one unsynced
+batch; the synced path runs in the package's suite over `classic-level`, and the blocked
+`react-native-storage-syncs-once-rn-leveldb-can` is the binding change that turns it on. The test
+double is `MemoryJournalStore` in
+`packages/db-p2p/src/testing/memory-journal-store.ts`, whose `powerLoss` drops the journal records
+not yet applied, all or a chosen few, and keeps the applied stores.
+
+**Rule 3 past the crashes a store names.** The NativeScript SQLite backend (`SqliteBatchBackend`
+in `packages/db-p2p-storage-ns/src/sqlite-storage.ts`) needs no log of its own for it: SQLite's
+write-ahead log is one append-only file whose recovery stops at the first frame whose checksum
+fails, and under `synchronous = NORMAL` the log is synced before every checkpoint, so what a
+power cut leaves is a prefix of the committed transactions, and a batch is one transaction. Its
+sync is one commit under `synchronous = FULL`, which syncs the log and so every commit before
+it, the key-value store's and the identity helper's included. The browser backend
+(`IndexedDBJournalStore` in `packages/db-p2p-storage-web/src/indexeddb-storage.ts`) has it from the
+journal backend wherever the browser honours strict transactions: every apply is one strict
+transaction carrying every byte it applies, synced before the next apply starts, so no group
+survives a power cut without the groups applied before it. Its key-value store and identity helper
+commit strictly too, so they leave nothing for a journal to order. The React Native backend
+(`LevelDBJournalStore` in `packages/db-p2p-storage-rn/src/leveldb-storage.ts`) is built over the
+same journal backend, its key-value store and identity helper commit as one batch each, and nothing
+in that package writes outside a batch, so it has rule 3 the moment its handle can sync a batch. In
+a browser that ignores the option, and on React Native LevelDB today, rule 3 under an
+operating-system crash or power cut is not established: such a browser promises nothing about the
+order relaxed transactions reach the disk, and `rn-leveldb` offers no synced write while LevelDB
+under default options skips a damaged log record and keeps reading the records after it. The React
+Native case waits on the blocked `react-native-storage-syncs-once-rn-leveldb-can`, the binding
+change; the `NOTE:` at `durability` on `LevelDBJournalStore` records it, and the `NOTE:` at
+`durability` on `IndexedDBJournalStore` the browser case.
+
+**Visible on a running node.** `createLibp2pNodeBase` logs one line on the `node-wiring`
+channel at start-up naming what the resolved storage's flushed writes survive and what the
+durability window means on it (`logStorageDurability` in
+`packages/db-p2p/src/libp2p-node-base.ts`): on a `'power-loss'` store, the window for each
+cohort size up to the declared `clusterSize` (at most ten), or that every write is synced
+first when failures are not independent; on a `'process-crash'` store, that it cannot sync, so
+a power cut may lose any write the operating system has not written out, whatever the window.
+
+Every persistent backend's conformance suite registers `{ persistent: true }`, which adds a
+case that flushes a write of every kind and reads each back through a fresh store over the
+same location (`runRawStorageConformance` in
+`packages/db-p2p/src/testing/raw-storage-conformance.ts`).
+
+**Who calls `flush()`.** Exactly once at the end of every group of writes whose outcome the
+node is about to report to another machine:
+
+- `StorageRepo` ends each write group through `endGroup` in
+  `packages/db-p2p/src/storage/storage-repo.ts`: `pend`, `commit`, `cancel`, `recoverBlock`,
+  `saveReplicatedBlock`, and a `get` that entered a block write latch (a read-driven
+  promotion, or a coverage restore). The flush runs after the group's latches are released,
+  so a concurrent group on the same blocks is not held behind the disk and several groups can
+  share one sync, and before the group's change events. A group whose work throws is flushed
+  before the error propagates, strictly whatever window it was given, and one fanned out per
+  block (`get`, `cancel`) first waits for every block to settle, so the flush covers a sibling
+  block still writing when another failed; a flush that rejects after the work returned makes
+  the call throw and emit nothing. A `get` that took no latch does not flush, so the plain
+  read path costs nothing extra.
+
+  Which groups carry a window. `pend` and `commit` take a third argument, `StorageApplyOptions`
+  in `packages/db-p2p/src/storage/storage-repo.ts`, whose `syncWithinMs` is the group's
+  `withinMs`; absent, the group is strict. A node passes a window only for an apply that runs
+  on a consensus record — `ClusterMember.applyConsensusOperations` for the pend and commit of
+  every record it applies, and `CoordinatorRepo` for its own fallback pend and commit after
+  consensus ran without its member — and the window is `durabilityWindowMs` in
+  `packages/db-p2p/src/storage/durability-window.ts` for the size of that record's cohort
+  (`recordDurabilityWindowMs`, from `record.peers`, this node included and capped by the policy
+  at the declared `clusterSize`), bound to the node's policy once by `createLibp2pNodeBase` and
+  handed to both as `durabilityWindowFor`. Every other group is strict; the table under
+  [How long a write may wait for its sync](#how-long-a-write-may-wait-for-its-sync) lists
+  them. Repair and bookkeeping are off the per-write hot path, and a replica a pusher counts as
+  held should not sit in a window. A `pend` or `commit` given a window flushes with it on every
+  exit, a refusal included: what a refusal writes is at most a dropped pending record, and the
+  writer is told to retry, so nothing is announced on it. A member or coordinator built without
+  `durabilityWindowFor` applies strictly, and on a backend that does not defer its sync (every
+  one but the file backend, the table above) a window changes nothing a node does.
+- `applyInvalidation` in `packages/db-p2p/src/dispute/invalidation.ts` calls
+  `InvalidationContext.flush` after releasing its latches and before appending the entry that
+  names the compensating revisions, so an entry never names revisions the store lost. Nothing
+  wires the dispute path in production yet; this is the contract for when something does.
+- `KvUnderReplicationLedger` in `packages/db-p2p/src/repo/kv-under-replication-ledger.ts`
+  flushes its key-value store after every call that wrote to it, so a shortfall
+  `CoordinatorRepo` names in its answer, and a peer the drain reports satisfied, outlive a
+  restart.
+
+The one block-storage write outside a group is the read path's re-cache of a materialized
+block (`materializeBlock` in `packages/db-p2p/src/storage/block-storage.ts`), which can be
+recomputed and becomes durable with the next group's flush. `PersistentTransactionStateStore`
+(`packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`), wired only when a host
+passes `NodeOptions.transactionStateStore`, writes without waiting and promises nothing before
+it replies, so it is not flushed. Over `WriteGroupDriver` both wait in memory, like every other
+write, until the next group's flush or the driver's idle flush, whichever comes first.
+
+**Visible before durable (accepted).** Between a write resolving and its group's flush,
+readers in this process can see it, and through them other machines. What a read can expose
+is consensus-decided content or a pending record, and what a crash takes back is always a
+later suffix of the resolved writes (rule 3): a vote built on a record's absence stays valid
+when the record is lost, and one built on its presence was a refusal. Likewise a second group
+on the same blocks can read the first's writes before they are durable and build on them;
+its own writes resolved later, so under rule 3 they cannot survive without the first's.
+
+A group flushed with a window stays visible longer: its change events fire when the flush
+resolves, which for a relaxed flush is once the writes survive a process crash, not a power
+cut. Within the window a power cut can take back a write this node announced to its
+subscribers and reported held to the coordinator, which is the accepted risk the window's
+loss target prices (`durabilityWindowMs` in `packages/db-p2p/src/storage/durability-window.ts`
+and [docs/correctness.md Theorem 6](../../../docs/correctness.md#theorem-6-durability)): the
+cohort acknowledged the write on a majority, and the window is sized so that the members a
+rival would need to out-vote are vanishingly unlikely to all lose power inside it. A deferred
+sync that fails latches the store (rule 5), so the next group on the node fails and is logged,
+but the writer answered inside the window was already told the write landed — the same risk.
+What the window does not price is a holder that lost a write writing alone before its partner
+returns, which forks the collection; that residual is stated under
+[Theorem 6](../../../docs/correctness.md#theorem-6-durability).
+
+**The write orders crash recovery relies on.** Every backend's flush is reviewed against this
+list. Under a crash of this process every persistent backend keeps every resolved write, so
+each order holds. Under a power cut the file and NativeScript SQLite backends, which sync only
+at the flush or within the window, are held to them by rule 3: what survives is a prefix of the
+resolved writes, which
+never keeps a later step without an earlier one. On the `'process-crash'` backends they are not
+established across a power cut (*Rule 3 past the crashes a store names*, above).
+
+1. **Claim before record.** `BlockStorage.savePendingTransaction` writes the slot and base the
+   record claims into the block's metadata before the pending record itself, so a crash
+   between them leaves an inert claim and never a claim-less record, which every reader treats
+   as the strongest reservation (`isReservationAgainst` in
+   `packages/db-p2p/src/storage/pending-claim.ts`).
+2. **One block's commit, in order** (`internalCommit` in
+   `packages/db-p2p/src/storage/storage-repo.ts`): materialized block, revision record,
+   promote, `setLatest`, proof, prune of the prior materialization. `latest` is never on disk
+   naming a revision whose record or transform is not, and the prune is never on disk without
+   the new materialization and `setLatest`. The only partial states the retry path heals are
+   revision-saved-not-promoted (Crash-D2) and promoted-with-`setLatest`-lost (Crash-D3, healed
+   by `BlockStorage.recover` from `StorageRepo.commit`).
+3. **Promote is one atomic move** ([Invariant P](../../../docs/repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action),
+   and Invariant 4 above). On the file backend it is two entries of one log record, so a crash
+   leaves both or neither.
+4. **Log tail first** (`tailFirst` in `packages/db-p2p/src/storage/storage-repo.ts`): a member
+   holding a committed non-tail block of an action also holds the action's committed log tail.
+5. **Forward writes** (`BlockStorage.saveForwardRevision`): revision record, transform,
+   materialization and proof before the metadata that advances `latest`, and the same action's
+   pending record deleted no later than that metadata.
+6. **Coverage restore** (`BlockStorage.restoreRevision`): the restored records before the
+   `ranges` entry that claims them.
+7. **Delete before the claim is dropped** (`BlockStorage.deletePendingTransaction`, and
+   `refuseMissingBase` and `dropUnpromotablePendings` in `StorageRepo`). On the file backend the
+   delete and the metadata write that follows it are records of one log, in that order.
+8. **Across stores:** the durable executed marker (`markExecuted`, written by
+   `ClusterMember.handleConsensus` in `packages/db-p2p/src/cluster/cluster-repo.ts`) after the
+   apply it describes, and the under-replication entry after the commit it describes. Two
+   stores are two durability domains, with no prefix rule between them, and the apply's own
+   flush may have been given a window, so the second write waits for the first to survive a
+   power cut rather than merely for its flush: the marker is written by
+   `markExecutedOnceDurable` in `packages/db-p2p/src/cluster/cluster-repo.ts` once the block
+   store's `whenDurable()` resolves (the `IDurableStorage` capability of `StorageRepo`, which
+   never hastens the sync; a repo without it has the marker written at once, and a rejection
+   writes none), and the ledger entry is written after the strict flush of the block store
+   that `KvUnderReplicationLedger`'s `beforeRecord` hook runs, wired by `createLibp2pNodeBase`.
+   A process crash between the apply and its marker loses only the marker, and redelivery
+   re-applies idempotently.
+
+#### How long a write may wait for its sync
+
+A node lets a write's sync wait only where other machines also hold the write, and only as long
+as the size of the cohort that agreed to it allows. `durabilityWindowMs` in
+`packages/db-p2p/src/storage/durability-window.ts` computes that window `w` for a cohort of `n`
+members at the node's promise threshold `t` (`superMajorityThreshold`):
+
+- a rival write needs `a = ⌈t·n⌉` approvals to take the write's revision;
+- a write is acknowledged once at least `h = ⌊n/2⌋ + 1` members hold it (the acknowledgement
+  gate's strict majority, [docs/correctness.md §2](../../../docs/correctness.md#2-definitions));
+- so at least `m = max(1, a + h − n)` of those holders must lose the write before a rival can
+  gather its approvals, since every other approval comes from a member that never held it.
+
+With `p` the rate of power cuts and operating-system crashes per machine and `ε` the accepted
+chance of losing one acknowledged write, machines that fail independently lose the write with a
+chance of about `C(h, m)·(p·w)^m`, so `w = (ε / C(h, m))^(1/m) / p`, rounded down to whole
+milliseconds and capped at `maxWindowMs`. Four rules decide before the formula does:
+
+1. `n` is capped at the node's declared `clusterSize`, so a record listing more peers cannot buy a
+   longer window.
+2. `n ≤ 1` gives 0: no other machine holds the write.
+3. `m = 1` gives 0: one machine losing the write would be enough. At a threshold of one half or
+   below this is every cohort.
+4. `independentFailures: false` gives 0 for every write, for a deployment whose machines share a
+   failure (two machines on one circuit).
+
+The inputs are `NodeOptions.storageDurability` (`StorageDurabilityOptions`), filled and validated
+once at node construction by `resolveDurabilityWindowPolicy`, which throws a `RangeError` naming
+the field for an out-of-range value. The defaults: independent failures assumed, `p` one per
+machine per 30 days (`lossRatePerHour` 1/720), `ε` 10⁻⁹ (`lossTarget`), and a 5000 ms cap
+(`maxWindowMs`). At those and the default threshold of 0.75:
+
+| n | a | h | m | C(h, m) | formula | window |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 | 1 | — | — | 0 ms |
+| 2 | 2 | 2 | 2 | 1 | 82 s | 5000 ms |
+| 3 | 3 | 2 | 2 | 1 | 82 s | 5000 ms |
+| 4 | 3 | 3 | 2 | 3 | 47 s | 5000 ms |
+| 5 | 4 | 3 | 2 | 3 | 47 s | 5000 ms |
+| 6 | 5 | 4 | 3 | 4 | 1633 s | 5000 ms |
+| 7 | 6 | 4 | 3 | 4 | 1633 s | 5000 ms |
+| 8 | 6 | 5 | 3 | 10 | 1203 s | 5000 ms |
+| 9 | 7 | 5 | 3 | 10 | 1203 s | 5000 ms |
+| 10 | 8 | 6 | 4 | 15 | 7406 s | 5000 ms |
+
+So at the defaults the cap, not the loss target, sets every window from two members up; the
+formula binds only at a higher loss rate (`lossRatePerHour: 1` gives 113 ms at `n = 2` and 65 ms
+at `n = 4`). The window column and those two values are pinned by
+`packages/db-p2p/test/durability-window.spec.ts`.
+
+Which writes carry a window (mechanism under *Who calls `flush()`* above):
+
+| Write | Window |
+|---|---|
+| `pend` and `commit` of a consensus record, applied by `ClusterMember.applyConsensusOperations` | `w` for the record's cohort |
+| `CoordinatorRepo`'s own fallback `pend` and `commit` after consensus ran without its member | `w` for the record's cohort |
+| a solo `pend` or `commit` (`CoordinatorRepo.pendSolo`, `CoordinatorRepo.commitSolo`): only this machine holds the write | 0 |
+| `cancel`, `recoverBlock`, `saveReplicatedBlock`, a `get` that took a write latch, a consensus `get` or `cancel` operation | 0 |
+| a group whose work threw | 0, whatever it was given |
+| the under-replication entry, and the flush of the block store its `beforeRecord` runs first | 0 |
+| the durable executed marker (`markExecutedOnceDurable`) | none of its own: written once the block store's `whenDurable()` resolves |
+
+#### What an acknowledged write survives
+
+From the moment the write's flush resolves, per backend:
+
+| Backend | `durability` | Process crash | Power cut or operating-system crash |
+|---|---|---|---|
+| File (`FileBatchBackend`) | `'power-loss'` | survives at once | survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving |
+| React Native LevelDB (`LevelDBJournalStore`) | `'process-crash'` until `rn-leveldb` can sync a batch, then `'power-loss'` | survives at once; a group not yet flushed is lost whole, never in part | survives whenever the operating system writes it out; the window cannot be kept, and the node says so at start. Once the binding can sync: as the browser row with strict transactions |
+| Browser IndexedDB (`IndexedDBJournalStore`) | `'power-loss'` where the browser honours strict transactions (every current release), else `'process-crash'` | survives at once | with strict transactions: survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving. Without: as LevelDB |
+| NativeScript SQLite (`SqliteBatchBackend`) | `'power-loss'` | survives at once | survives once its window has passed, at once for `w = 0`; a power cut inside the window takes the most recent groups whole, a prefix surviving |
+| Memory (`MemoryStoreDriver`) | `'none'` | lost | lost |
+
+The React Native row changes when the blocked `react-native-storage-syncs-once-rn-leveldb-can`
+lands, and
+[docs/correctness.md §1.2](../../../docs/correctness.md#12-nodes) with it. The browser row rests
+on what a browser does with `durability: 'strict'`; nothing in this repository cuts the power, so
+the package's tests check which durability each transaction asked for and no more.
+
 ## Core Components
 
 ### 1. Storage Repository (`StorageRepo`)
@@ -223,6 +686,10 @@ The `StorageRepo` class provides the main interface for database operations, imp
 - `pend()`: Creates pending transactions with conflict detection
 - `commit()`: Atomically commits transactions across multiple blocks
 - `cancel()`: Cancels pending transactions
+
+**Construction and durability:** `new StorageRepo(storage, options?)` takes the raw store;
+`options.createBlockStorage` builds each block's storage over that same store (default
+`BlockStorage`), and every write group ends with one `flush()` of it (Invariant 6).
 
 ### 2. Block Storage (`BlockStorage`)
 
@@ -258,13 +725,22 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 - **Transaction Storage**: Both pending and committed transactions
 - **Block Materialization**: Storing and retrieving materialized blocks
 - **Revision Management**: Mapping revisions to transaction IDs
+- **Durability**: `flush()` makes every write resolved before it survive the crashes the store's fixed `durability` names (Invariant 6 above)
 
 ### 4. File-based Storage (`FileRawStorage`)
 
-`FileRawStorage` in `packages/db-p2p-storage-fs/src/file-storage.ts` is a thin
-shell over the shared `KvRawStorage` kernel: it supplies a `FileStoreDriver` that
-lays out the six logical stores as filesystem subdirectories, and the kernel
-owns JSON (de)serialization on top. See "Shared KV Kernel" below.
+`FileRawStorage` in `packages/db-p2p-storage-fs/src/file-storage.ts` is the shared
+`KvRawStorage` kernel over a `WriteGroupDriver` over a `FileBatchBackend`
+(`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), which lays out the six
+logical stores as filesystem subdirectories and commits each write group through
+the directory's write-ahead log (`FileWriteLog` in
+`packages/db-p2p-storage-fs/src/file-write-log.ts`). The kernel owns JSON
+(de)serialization on top; the driver holds each group in memory until its flush;
+the backend appends the group to the log with one sync, writes the tree, and
+replays the log on the next open; a checkpoint syncs the tree and discards the
+log in the background, and on the last close. The constructor is synchronous; the first
+operation takes the directory's lock and replays. How the log holds Invariant 6
+is under *The file backend* there. See "Shared KV Kernel" below.
 
 ### 5. Shared KV Kernel (`KvRawStorage` + `RawStoreDriver`)
 
@@ -281,18 +757,29 @@ read yields a fresh object *by construction*. The `structuredClone`-on-every-get
 discipline the old in-memory backend needed is now structural, not a rule — see
 docs/internals.md "Storage Returns References". `promote` (pending → committed) is
 the only cross-key atomic operation the kernel requires; each backend satisfies it
-with its native atomic primitive (batch / DB transaction / rename).
+with its native atomic primitive (batch / DB transaction / one write-ahead-log record).
 
-Every shipping backend uses this kernel today: in-memory (`MemoryStoreDriver`),
-filesystem (`FileStoreDriver`), IndexedDB, LevelDB, and SQLite each supply only a
-driver. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
+Every shipping backend uses this kernel today: in-memory (`MemoryStoreDriver`) supplies only a
+driver, the filesystem and NativeScript SQLite backends each supply a `BatchBackend`
+(`FileBatchBackend`, `SqliteBatchBackend`) under `WriteGroupDriver`, and IndexedDB and LevelDB
+each supply a `JournalStore` (`IndexedDBJournalStore`, `LevelDBJournalStore`) under
+`JournalBatchBackend` under `WriteGroupDriver`. A shared conformance suite (`src/testing/raw-storage-conformance.ts`,
 exported from the `./testing/conformance` entry — separate from `./testing` because
 it imports `chai`, which is a devDependency consumers never install) asserts every
 backend behaves identically against the shared kernel contract.
 
+A backend that would rather take its writes a group at a time supplies a `BatchBackend`
+(`packages/db-p2p/src/storage/batch-backend.ts`) instead of a driver and is composed as
+`KvRawStorage` over `WriteGroupDriver` over that backend; the suite runs that composition over
+the test-only `MemoryBatchBackend` (`packages/db-p2p/src/testing/memory-batch-backend.ts`). What
+the driver does is under Invariant 6, *Writes that wait in memory*.
+
 **File System Structure:**
 ```
 {basePath}/
+├── write-ahead.log         # Groups written since the last checkpoint
+├── write-ahead.log.sealed  # The log a checkpoint is syncing the tree under (only during one, or after a crash in one)
+├── store.lock              # { pid, hostname } of the process holding the store
 ├── {blockId}/
 │   ├── meta.json           # Block metadata
 │   ├── revs/
@@ -303,6 +790,9 @@ backend behaves identically against the shared kernel contract.
 │   │   └── ...
 │   ├── actions/
 │   │   ├── {actionId}.json # Committed actions
+│   │   └── ...
+│   ├── proofs/
+│   │   ├── {rev}.json      # Commit proof retained for that revision
 │   │   └── ...
 │   └── blocks/
 │       ├── {actionId}.json # Materialized blocks
@@ -554,10 +1044,10 @@ Semantics worth knowing:
   **What remains of Invariant 5 for the cache.** Dedupe plus the guard close the
   in-process case only as far as identity reaches, and only within one pool.
   Still open:
-  - the *cross-process* case (the filesystem driver takes no lock — the
-    proper-lockfile TODO in `db-p2p-storage-fs/src/file-storage.ts` — and a
-    second process's writes bypass this cache entirely). Out of scope for any
-    in-process check;
+  - the *cross-process* case. The filesystem backend's lock (`acquireStoreLock` in
+    `packages/db-p2p-storage-fs/src/store-lock.ts`) refuses a second live process on
+    the same machine, but a second machine over a network share is not refused, and
+    its writes bypass this cache entirely. Out of scope for any in-process check;
   - **two different pools.** The guard's claim map lives on the pool, so two
     caches over one store registered with two different `SharedCachePool`
     instances both succeed and both diverge. Left open deliberately: closing it
@@ -712,10 +1202,10 @@ One write latch per block, described in full under Invariant 2 above:
 ### Basic Block Operations
 
 ```typescript
-// Create a storage repository
-const repo = new StorageRepo(blockId => 
-  new BlockStorage(blockId, rawStorage, restoreCallback)
-);
+// Create a storage repository over a raw store; every write group ends with one flush of it
+const repo = new StorageRepo(rawStorage, {
+  createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback)
+});
 
 // Get blocks with context
 const result = await repo.get({
@@ -768,7 +1258,7 @@ const blockStorage = new BlockStorage(
 
 - **Directory Structure**: Organizes files for efficient access
 - **JSON Serialization**: Uses JSON for cross-platform compatibility
-- **Atomic Operations**: Uses file system atomicity for consistency
+- **One sync per strict write group, one per window otherwise**: the write-ahead log is synced before a strict flush resolves, and once by the earliest deadline for the groups whose flushes allowed a wait; the tree is written after the sync, without waiting for its own
 
 ### 3. Memory Management
 

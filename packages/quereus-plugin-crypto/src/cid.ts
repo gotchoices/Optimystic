@@ -18,7 +18,8 @@
  * All framing/parsing comes from the audited `multiformats` library — there is
  * no bespoke byte-pushing here. The actual hashing reuses the same synchronous,
  * cross-platform `@noble/hashes` functions the rest of the plugin uses (via
- * {@link resolveHasher}), so the output is byte-identical to the CID an external
+ * {@link resolveHasher}, which routes sha2 to an installed native backend that must
+ * match them byte for byte), so the output is byte-identical to the CID an external
  * content-addressed store (IPFS/IPLD) computes for the same bytes:
  * `cid(utf8('hello world'))` === `bafkreifzjut3te2nhyekklss27nh3k72ysco7y32koao5eei66wof36n5e`.
  */

@@ -420,7 +420,7 @@ describe('BlockCommitProof', () => {
 
 		const seededRepo = async (block: IBlock = insertBlock()) => {
 			const raw = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, raw));
+			const repo = new StorageRepo(raw);
 			const pended = await repo.pend({
 				actionId: ACTION,
 				transforms: { inserts: { [BLOCK]: block }, updates: {}, deletes: [] },
@@ -436,21 +436,21 @@ describe('BlockCommitProof', () => {
 			const commit = makeCommit({ [BLOCK]: { digest } });
 			const proof = stubProof(commit);
 			expect(proofDeclaredDigest(proof, claimFor(commit)), 'stub declares via the shared resolver').to.equal(digest);
-			expect((await repo.commit(commit, undefined, proof)).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.deep.equal(proof);
 		});
 
 		it('withholds the proof on a digest mismatch (the commit itself still lands)', async () => {
 			const { raw, repo } = await seededRepo();
 			const commit = makeCommit({ [BLOCK]: { digest: 'tampered-declaration' } });
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.equal(undefined);
 		});
 
 		it('withholds the proof when the commit op declares no digest', async () => {
 			const { raw, repo } = await seededRepo();
 			const commit = makeCommit();
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev)).to.equal(undefined);
 		});
 
@@ -466,7 +466,7 @@ describe('BlockCommitProof', () => {
 			expect(pended.success, 'delete pend must land').to.equal(true);
 			const commit = makeCommit({ [BLOCK]: { digest: 'any-declared-digest' } },
 				{ actionId: 'delete-action' as ActionId, rev: 2 });
-			expect((await repo.commit(commit, undefined, stubProof(commit))).success).to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof: stubProof(commit) })).success).to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, 2)).to.equal(undefined);
 		});
 
@@ -478,7 +478,7 @@ describe('BlockCommitProof', () => {
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'nothing to back-fill yet').to.equal(undefined);
 
 			const proof = stubProof(commit);
-			expect((await repo.commit(commit, undefined, proof)).success, 'retry is an idempotent no-op').to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success, 'retry is an idempotent no-op').to.equal(true);
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'retry back-fills the proof').to.deep.equal(proof);
 		});
 
@@ -499,7 +499,7 @@ describe('BlockCommitProof', () => {
 
 			const commit = makeCommit({ [BLOCK]: { digest: await canonicalBlockHash(block) } });
 			const proof = stubProof(commit);
-			expect((await repo.commit(commit, undefined, proof)).success, 'recover() rolls the block forward').to.equal(true);
+			expect((await repo.commit(commit, undefined, { proof })).success, 'recover() rolls the block forward').to.equal(true);
 			expect((await storage.getLatest())?.rev, 'latest reconciled to the durable rev').to.equal(1);
 			expect(await raw.getBlockProof(BLOCK, commit.rev), 'recovered block retains the proof').to.deep.equal(proof);
 		});
@@ -513,11 +513,11 @@ describe('BlockCommitProof', () => {
 		/**
 		 * Drive a FULLY-SIGNED v2 record through a real member backed by a pend-seeded StorageRepo.
 		 * With every promise and commit already signed (2 peers -- both must sign both rounds), update()
-		 * goes straight to Consensus and applyConsensusOperation hands the proof down the commit path.
+		 * goes straight to Consensus and applyConsensusOperations hands the proof down the commit path.
 		 */
 		const consensusCommit = async (declaredDigest: string) => {
 			const raw = new MemoryRawStorage();
-			const repo = new StorageRepo((blockId) => new BlockStorage(blockId, raw));
+			const repo = new StorageRepo(raw);
 			const pended = await repo.pend({
 				actionId: ACTION,
 				transforms: { inserts: { [BLOCK]: insertBlock() }, updates: {}, deletes: [] },

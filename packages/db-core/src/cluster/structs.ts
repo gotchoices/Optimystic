@@ -1,5 +1,6 @@
 import type { RepoMessage } from "../network/repo-protocol.js";
 import type { CommitResult, PendResult } from "../network/struct.js";
+import type { ValidityRejection } from "../transaction/transaction.js";
 
 /**
  * One member's vote on a cluster transaction, in either the promise or the commit map.
@@ -11,6 +12,10 @@ import type { CommitResult, PendResult } from "../network/struct.js";
  */
 export type Signature =
 	| { type: 'approve'; signature: string }
+	/**
+	 * A plain reject, or an **expiry vote**. Never a validity vote: `validity` belongs to the other
+	 * reject arm, so one vote cannot claim both a clock disagreement and a validity judgement.
+	 */
 	| {
 		type: 'reject';
 		signature: string;
@@ -23,6 +28,25 @@ export type Signature =
 		 * Still a `reject` in every count — the record really is dead for this member.
 		 */
 		expiredAt?: number;
+		validity?: never;
+	}
+	/**
+	 * A **validity vote**: the member re-checked the transaction and judged it wrong in a way that holds
+	 * on every retry and at every honest validator (see {@link ValidityRejection} for which refusals
+	 * qualify). `validity.computedHash` is the operations hash the member computed, when re-execution got
+	 * that far. Signed like `expiredAt`, so a coordinator can tell "refused for good" from "try again"
+	 * without reading `rejectReason`.
+	 *
+	 * Absent means "not known to be a validity judgement" — a stale revision, a reservation, a refusal the
+	 * member could not judge, or a member on a build that predates the field — so a reader must never
+	 * treat an unmarked reject as final. Still a `reject` in every count.
+	 */
+	| {
+		type: 'reject';
+		signature: string;
+		rejectReason?: string;
+		validity: ValidityRejection;
+		expiredAt?: never;
 	}
 	/**
 	 * This member refuses the transaction *for now*: it holds a conflicting transaction that won
@@ -68,13 +92,21 @@ export type ClusterVote = Unsigned<Signature>;
  * held's `heldBy`, nothing for an approve. Folding the extra in is what makes it integrity-protected in
  * transit rather than free-floating prose.
  *
- * One variant carries two fields: an expiry vote, a `reject` with {@link Signature} `expiredAt`. It is
- * encoded `<hash>:reject-expired:<json>`, where `<json>` is `JSON.stringify([expiredAt, rejectReason ??
- * null])`. Two properties make that unambiguous: the tag differs from every other vote's at the
- * character after `reject` (a hash is base64url, so the first `:` always ends it), and a JSON array
- * cannot be read as a different pair of values. A reason that itself contains `:` — `"x:5"` — can
- * therefore never verify as reason `"x"` with `expiredAt: 5`, and a string smuggled into `expiredAt`
- * changes the bytes. Every vote without `expiredAt` encodes exactly as before the field existed.
+ * Two reject variants carry two fields each, and each has its own tag:
+ *  - an expiry vote, a `reject` with {@link Signature} `expiredAt`, is encoded
+ *    `<hash>:reject-expired:<json>`, where `<json>` is `JSON.stringify([expiredAt, rejectReason ?? null])`;
+ *  - a validity vote, a `reject` with {@link Signature} `validity`, is encoded
+ *    `<hash>:reject-invalid:<json>`, where `<json>` is `JSON.stringify([computedHash ?? null,
+ *    rejectReason ?? null])`.
+ *
+ * Two properties make that unambiguous. The tag is decided character by character after the hash (a
+ * hash is base64url, so the first `:` always ends it): a plain reject continues `reject` with `:` or
+ * nothing, the two marked ones with `-`, and those two differ at the next character (`e` and `i`); every
+ * other vote's tag differs from all three at its first character. And a JSON array cannot be read as a
+ * different pair of values. A reason that itself contains `:` — `"x:5"` — can therefore never verify as
+ * reason `"x"` with `expiredAt: 5`, a string smuggled into `expiredAt` changes the bytes, and adding,
+ * removing or altering a vote's `validity` changes them too. The type keeps the two marked forms apart
+ * (no vote carries both). Every vote with neither field encodes exactly as before either existed.
  *
  * Producers and verifiers must both build the preimage here. It lives beside {@link Signature}
  * rather than in either consumer because a second copy that forgets a variant does not fail loudly:
@@ -98,6 +130,9 @@ export function clusterVoteVerificationPayload(hash: string, signature: Signatur
 function voteTagAndExtra(vote: ClusterVote): string {
 	switch (vote.type) {
 		case 'reject':
+			if (vote.validity !== undefined) {
+				return 'reject-invalid:' + JSON.stringify([vote.validity.computedHash ?? null, vote.rejectReason ?? null]);
+			}
 			return vote.expiredAt === undefined
 				? withExtra('reject', vote.rejectReason)
 				: 'reject-expired:' + JSON.stringify([vote.expiredAt, vote.rejectReason ?? null]);
@@ -157,6 +192,35 @@ export type MemberApplyOutcome = {
 	 * for the operator's benefit — the coordinator reads only `success`.
 	 */
 	commit?: CommitResult;
+	/**
+	 * This member applies decided records carried ahead of a request's own record
+	 * ({@link CarriedOutcome}). Stamped on every answer, so a coordinator can tell a member that
+	 * understands carried records from one on an older build, which never sets it; a coordinator
+	 * carries records only to a member whose last answer stamped it.
+	 */
+	acceptsCarried?: true;
+};
+
+/**
+ * The most decided records one cluster request may carry ahead of its own record. A coordinator never
+ * sends more, and a member ignores a request's carried list that is longer.
+ */
+export const MaxCarriedRecords = 4;
+
+/**
+ * A member's answer for one decided record carried ahead of a request's own record — one per carried
+ * record, in the order sent. Compact on purpose: echoing whole records back would double the size of
+ * the response.
+ */
+export type CarriedOutcome = {
+	/** The carried record's `messageHash`. */
+	messageHash: string;
+	/** True only when the member ran `update` on the record without throwing and without redirecting it. */
+	delivered: boolean;
+	/** The member's own {@link ClusterRecord.applyOutcomes} entry from its answer to the carried record. */
+	outcome?: MemberApplyOutcome;
+	/** Why the member did not take the record, when it threw. */
+	error?: string;
 };
 
 export type ClusterRecord = {
@@ -185,6 +249,12 @@ export type ClusterRecord = {
 	commits: { [peerId: string]: Signature };
 	/** Sender's recommended cluster size: min(estimated network size, configured cluster size) */
 	suggestedClusterSize?: number;
+	/**
+	 * The coordinator's `clusterSize` when its `allowClusterDownsize` is false, else absent.
+	 * NOTE: advisory only — nothing reads it but the coordinator's `cluster-tx:start` log line, and it
+	 * sits outside `messageHash`, so any relaying peer can rewrite it. If members ever need a size
+	 * floor, derive it from the member's own configuration rather than trusting this field.
+	 */
 	minRequiredSize?: number;
 	/** Sender's current network size estimate */
 	networkSizeHint?: number;
@@ -267,7 +337,11 @@ export interface ClusterConsensusConfig {
 	simpleMajorityThreshold: number;
 	/** Minimum absolute cluster size (default 3) */
 	minAbsoluteClusterSize: number;
-	/** Allow cluster to operate below configured size (default false) */
+	/**
+	 * Whether a cohort of two or more members smaller than the configured `clusterSize` may run
+	 * consensus (db-p2p resolves it to true when unset). It has no effect on a cohort of at most one
+	 * peer, which commits alone without consensus.
+	 */
 	allowClusterDownsize: boolean;
 	/** Tolerance for cluster size variance as fraction (default 0.5 = 50%) */
 	clusterSizeTolerance: number;
@@ -326,6 +400,18 @@ export interface ClusterConsensusConfig {
 	/** Immediate in-line retries per failed peer inside the broadcast (default 1) */
 	commitBroadcastImmediateRetries?: number;
 	/**
+	 * How long a coordinator may hold back a pend's final "apply it" delivery to the other members, in
+	 * ms (default 2000, `DEFAULT_PEND_DELIVERY_DEFERRAL_MS` in db-p2p), so it rides on the first request
+	 * of the action's commit instead of costing a request of its own. Only for a pend on a two-member
+	 * cohort that reached its commit majority without a commit round, whose writer marked it the action's
+	 * only reservation (`PendRequest.soleReservation`), and only to a member this node can carry records
+	 * to. When the time runs out first the delivery goes alone, and that does not count against
+	 * `commitBroadcastRetryMaxAttempts`. `0` turns the deferral off: a
+	 * single-collection write on a two-member cohort then costs the other member four requests instead
+	 * of three.
+	 */
+	pendDeliveryDeferralMs?: number;
+	/**
 	 * Immediate in-line retries per peer while collecting promises (default 1).
 	 * The promise phase rides the same libp2p stream the commit broadcast does;
 	 * a circuit-relay ("limited") connection can reset that stream once a
@@ -334,9 +420,22 @@ export interface ClusterConsensusConfig {
 	 * single reset here would otherwise drop the peer and sink super-majority.
 	 */
 	promiseImmediateRetries?: number;
-	/** Read-repair behavior: 'off' (only fetch on missing — legacy), 'lazy' (fetch when local age > window), 'paranoid' (always verify against cluster on read). Default 'lazy'. In every mode a block missing locally consults its cohort on every read. */
+	/**
+	 * How a block the node HOLDS is re-verified against its cohort on a read. Default 'lazy'.
+	 *  - 'lazy': the held copy is served at once; when the block was last checked more than
+	 *    `readRepairWindowMs` ago (or never, as after a restart) the read also starts a cohort
+	 *    consult that runs BEHIND it, and what that consult learns (a repair, the window's stamp,
+	 *    the `unconfirmedAheadRev` doubt) reaches the next read of the block. A read never waits
+	 *    on a cohort peer that is connected but silent. A read carrying a floor above the held
+	 *    copy still waits for its consult, because the asker has proof the copy is too old.
+	 *  - 'paranoid': every read of a held block consults the cohort and waits for the consult —
+	 *    for callers that cannot tolerate any staleness, including the first read after a restart.
+	 *  - 'off': never consults for a held block (legacy; staleness unbounded).
+	 * In every mode a block missing locally consults its cohort on every read, and that read waits.
+	 * On a node, set through `clusterPolicy.readRepairMode`.
+	 */
 	readRepairMode?: 'off' | 'lazy' | 'paranoid';
-	/** For 'lazy' mode: read-repair triggers when (now - localEntry.lastSeenCommitMs) > this. Default 10000. */
+	/** For 'lazy' mode: a held block's read starts a cohort consult when (now - lastSeenCommitMs) > this. Default 10000. On a node, set through `clusterPolicy.readRepairWindowMs`. */
 	readRepairWindowMs?: number;
 	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
@@ -352,10 +451,12 @@ export interface ClusterConsensusConfig {
 	 * client's own dial and response defaults do not apply underneath it.
 	 *
 	 * Raise it for a deployment whose links are slower than a LAN: two phones reaching each other
-	 * only through a public circuit relay have a round trip near 1.8s, and every fresh stream (dial
-	 * or reuse, protocol select, send, receive) must fit inside this budget or the peer counts as
-	 * silent. The protocol select costs a round trip even on an open connection, so a request over a
-	 * reused connection costs two. In a two-member cohort one late answer is the whole quorum, so the
+	 * only through a public circuit relay have a round trip near 1.8s, and a request that opens its
+	 * stream (dial or reuse, protocol select, send, receive) must fit inside this budget or the peer
+	 * counts as silent. The protocol select costs a round trip even on an open connection, so such a
+	 * request over a reused connection costs two. db-p2p negotiates the next stream to a peer it is
+	 * talking to in advance, so a later request in a busy spell costs one, but the first after a quiet
+	 * spell still costs two. In a two-member cohort one late answer is the whole quorum, so the
 	 * consult declines every time and a rejoining node never catches up.
 	 *
 	 * Fractional values are accepted — this is a duration, not a count of peers. A value that is not

@@ -1,11 +1,12 @@
 import { pipe } from 'it-pipe'
 import { decode as lpDecode, encode as lpEncode } from 'it-length-prefixed'
 import type { Startable, Stream, Connection, StreamHandler, PeerId, Libp2p } from '@libp2p/interface'
-import type { IKeyNetwork, IRepo, RepoMessage } from '@optimystic/db-core'
+import type { CommitResult, GetBlockResults, IKeyNetwork, IRepo, PendResult, RepoMessage } from '@optimystic/db-core'
 import { LruMap, blockIdsForTransforms, routingKeyForBlock } from '@optimystic/db-core'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { encodePeers, type RedirectPayload } from './redirect.js'
-import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
+import { fitGetReply, type RepoBlockGets, type RepoGetReply } from './get-reply.js'
+import { GET_REPLY_CONTENT_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import { createLogger, type Logger } from '../logger.js'
 import { publishableAddrsForPeer, type AddressLog, type DirectionalConnection } from '../peer-address-book.js'
@@ -13,6 +14,7 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { registerProtocolHandler } from '../network/register-protocol-handler.js'
 import type { OptimysticNodeAttachments } from '../optimystic-node.js'
 import { RESPONSIBILITY_TTL_MS } from './responsibility.js'
+import { batchShapeFault, getAffectedBlockIds } from '../cluster/record-operations.js'
 
 // Define Components interface
 interface BaseComponents {
@@ -241,6 +243,18 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * The redirect routing key and op name for a whole message: its one operation's
+	 * ({@link deriveBlockKey}), or for a batch the first block it writes — the block
+	 * `CoordinatorRepo.pendMany` and `commitMany` resolve the batch's cohort for, since the repo protocol
+	 * hands the coordinator no coordinating list of its own.
+	 */
+	deriveMessageKey(message: RepoMessage): { blockKey: string | undefined, opName: string } {
+		const [first, ...rest] = message.operations
+		if (rest.length === 0) return this.deriveBlockKey(first)
+		return { blockKey: getAffectedBlockIds(message.operations)[0], opName: 'pend' in first ? 'pendMany' : 'commitMany' }
+	}
+
+	/**
 	 * Check if this node should redirect the request for a given key.
 	 * Returns a RedirectPayload if not responsible, null if should handle locally.
 	 * Also attaches the responsible peer ids to the message for downstream use.
@@ -297,6 +311,47 @@ export class RepoService implements Startable {
 	}
 
 	/**
+	 * Run a batch — one action's pends, or its commits, of several collections — as one consensus record
+	 * on the coordinated repo. The message passed {@link batchShapeFault}, so every operation is the kind
+	 * of the first. A repo without the batch method cannot run it, and the throw aborts the stream: the
+	 * writer then sends the collections one request each.
+	 */
+	private async runBatch(message: RepoMessage): Promise<PendResult | CommitResult> {
+		const options = { expiration: message.expiration }
+		if ('pend' in message.operations[0]) {
+			if (!this.repo.pendMany) throw new Error('this node cannot run a batch of pends')
+			return await this.repo.pendMany(message.operations.flatMap(operation => 'pend' in operation ? [operation.pend] : []), options)
+		}
+		if (!this.repo.commitMany) throw new Error('this node cannot run a batch of commits')
+		return await this.repo.commitMany(message.operations.flatMap(operation => 'commit' in operation ? [operation.commit] : []), options)
+	}
+
+	/**
+	 * Answer a remote read, packed to fit one frame when the asker reads left-out entries
+	 * (`RepoBlockGets.acceptsLeftOut`, see `fitGetReply`); any other asker is answered whole, as before.
+	 * The flag is a wire detail and is not passed on to the repo.
+	 */
+	private async answerGet(request: RepoBlockGets, expiration: number | undefined, asker: PeerId | undefined): Promise<GetBlockResults | RepoGetReply> {
+		const { acceptsLeftOut, ...blockGets } = request
+		// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
+		// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for
+		// a block a cohort peer holds is an authoritative lie the transactor never
+		// retries. Only the sync protocol keeps the flag (`sync/service.ts`, where the
+		// consult itself lands), and that is what stops the recursion.
+		// NOTE: this also puts lazy read-repair on remote reads of locally-present blocks
+		// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
+		// block ids. If a working set wider than that LRU ever shows a consult on every
+		// read, widen the LRU rather than reinstating the skip.
+		// The connection's authenticated peer is the only identity a read's `askerHolds` may be
+		// bound to, so it is passed here rather than read from anything the request says.
+		const results = await this.repo.get(blockGets, {
+			expiration,
+			...(asker ? { asker: asker.toString() } : {})
+		})
+		return acceptsLeftOut === true ? fitGetReply(results, blockGets.blockIds, GET_REPLY_CONTENT_BUDGET_BYTES) : results
+	}
+
+	/**
 	 * Handle incoming streams on the repo protocol
 	 */
 	private handleIncomingStream(stream: Stream, connection?: Connection): void {
@@ -308,10 +363,15 @@ export class RepoService implements Startable {
 				const decoded = new TextDecoder().decode(msg.subarray())
 				const message = JSON.parse(decoded) as RepoMessage
 
-				// Process each operation. Derive the redirect routing key once (keyed on the
-				// block the handler actually coordinates), redirect-check it, then dispatch.
+				// A message of several operations must be a batch; anything else is refused before any
+				// routing or execution — the throw aborts the stream, as for any other malformed request.
+				const shapeFault = batchShapeFault(message.operations)
+				if (shapeFault !== undefined) throw new Error(`Malformed batch: ${shapeFault}`)
+
+				// Derive the redirect routing key once (keyed on the block the handler actually
+				// coordinates), redirect-check it, then dispatch.
 				const operation = message.operations[0]
-				const { blockKey, opName } = this.deriveBlockKey(operation)
+				const { blockKey, opName } = this.deriveMessageKey(message)
 				const redirect = blockKey !== undefined
 					? await this.checkRedirect(blockKey, opName, message)
 					: null
@@ -319,22 +379,10 @@ export class RepoService implements Startable {
 				let response: any
 				if (redirect) {
 					response = redirect
+				} else if (message.operations.length > 1) {
+					response = await this.runBatch(message)
 				} else if ('get' in operation) {
-					// No `skipClusterFetch` here: a read on this protocol comes from ANOTHER node, so
-					// it must reach `CoordinatorRepo`'s cohort consult — answering a bare absent for
-					// a block a cohort peer holds is an authoritative lie the transactor never
-					// retries. Only the sync protocol keeps the flag (`sync/service.ts`, where the
-					// consult itself lands), and that is what stops the recursion.
-					// NOTE: this also puts lazy read-repair on remote reads of locally-present blocks
-					// — one consult per block per `readRepairWindowMs`, damped by a 1000-entry LRU of
-					// block ids. If a working set wider than that LRU ever shows a consult on every
-					// read, widen the LRU rather than reinstating the skip.
-					// The connection's authenticated peer is the only identity a read's `askerHolds` may be
-					// bound to, so it is passed here rather than read from anything the request says.
-					response = await this.repo.get(operation.get, {
-						expiration: message.expiration,
-						...(peerId ? { asker: peerId.toString() } : {})
-					})
+					response = await this.answerGet(operation.get, message.expiration, peerId)
 				} else if ('pend' in operation) {
 					response = await this.repo.pend(operation.pend, { expiration: message.expiration })
 				} else if ('cancel' in operation) {
@@ -343,8 +391,9 @@ export class RepoService implements Startable {
 					response = await this.repo.commit(operation.commit, { expiration: message.expiration })
 				}
 
-				// Encode and yield the response
-				yield new TextEncoder().encode(JSON.stringify(response))
+				// `cancel` answers `void`, sent as a zero-length frame: `JSON.stringify(undefined)` is not a
+				// string, so the frame is built explicitly rather than left to how `TextEncoder` treats it.
+				yield response === undefined ? new Uint8Array(0) : new TextEncoder().encode(JSON.stringify(response))
 				// One request per stream: every real RepoClient sends exactly one request
 				// per dial (see ProtocolClient.processMessage), so complete the generator
 				// after the first response. A second frame a peer queued is then never read
@@ -362,7 +411,8 @@ export class RepoService implements Startable {
 					stream,
 					(source) => lpDecode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES }),
 					processStream.bind(this),
-					(source) => lpEncode(source)
+					// The cap `RepoClient` reads the reply under; the encoder's own default is 4 MiB.
+					(source) => lpEncode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES })
 				)
 				for await (const chunk of responses) {
 					stream.send(chunk)

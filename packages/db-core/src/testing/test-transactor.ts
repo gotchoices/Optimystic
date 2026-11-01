@@ -508,6 +508,18 @@ export abstract class DelegatingTransactor implements ITransactor {
 	get queryClusterNominees(): ((blockId: BlockId) => Promise<ClusterNomineesResult>) | undefined {
 		return this.inner.queryClusterNominees?.bind(this.inner);
 	}
+
+	// Getters for the same reason: the coordinator treats their absence as "pend and commit each
+	// collection on its own". `TestTransactor` offers neither, so a wrapped one keeps that path.
+	get pendMany(): ITransactor['pendMany'] {
+		const inner: ITransactor = this.inner;
+		return inner.pendMany?.bind(inner);
+	}
+
+	get commitMany(): ITransactor['commitMany'] {
+		const inner: ITransactor = this.inner;
+		return inner.commitMany?.bind(inner);
+	}
 }
 
 /**
@@ -653,6 +665,36 @@ export class TailLandsButReportsStale extends DelegatingTransactor {
 			this.rivalDue = false;
 			await this.afterCancel!(this.inner);
 		}
+	}
+}
+
+/**
+ * Answers every pend with a promise shortfall — the cohort's silence, in the shape
+ * `CoordinatorRepo.pend` returns it — and delegates nothing, so nothing is reserved and nothing
+ * lands. For the write paths' "stopped by name" cases: a shortfall is not a conflict a retry can
+ * win, so one attempt is made and `PromiseShortfallError` escapes with every staged action still
+ * staged.
+ */
+export class RefusesPendsAsShortfall extends DelegatingTransactor {
+	/** Pends refused so far. */
+	pends = 0;
+	/** While `true` every pend is refused; set `false` to let pends through again — the cohort back
+	 *  in reach, for a test of what waits on it. */
+	refusing = true;
+
+	constructor(inner: TestTransactor) {
+		super(inner);
+	}
+
+	override async pend(request: PendRequest): Promise<PendResult> {
+		if (!this.refusing) return this.inner.pend(request);
+		this.pends++;
+		return {
+			success: false,
+			conflict: false,
+			reason: 'Failed to get super-majority: injected shortfall',
+			shortfall: { approvals: 1, rejections: 0, peerCount: 3, needed: 3, silentPeers: ['peer-b', 'peer-c'] },
+		};
 	}
 }
 
@@ -858,6 +900,29 @@ export class GatedCommitTransactor extends DelegatingTransactor {
 }
 
 /**
+ * Throws, nothing delegated, on every commit of the collection whose log tail is `tailId` while
+ * `armed` — the hard failure of one participant's commit after its siblings' landed, which a
+ * multi-collection commit reports as `CoordinatorPartialCommitError`. Disarmed, everything delegates.
+ */
+export class ThrowsOnCommitOf extends DelegatingTransactor {
+	/** Commits thrown so far. */
+	thrown = 0;
+	armed = true;
+
+	constructor(inner: TestTransactor, private readonly tailId: BlockId) {
+		super(inner);
+	}
+
+	override async commit(request: CommitRequest): Promise<CommitResult> {
+		if (this.armed && request.tailId === this.tailId) {
+			this.thrown++;
+			throw new Error('connection dropped before the commit was sent');
+		}
+		return this.inner.commit(request);
+	}
+}
+
+/**
  * Parks the FIRST pend BEFORE it reaches the inner transactor, so a rival can durably take the
  * revision while the coordinator is already committed to a set of transforms it captured at the
  * log append.
@@ -951,12 +1016,15 @@ function committedAt(blockState: BlockState, pin: number | undefined): { block: 
 	return block ? { block, rev: blockState.latestRev } : undefined;
 }
 
-/** Returns the materialized block at the highest revision ≤ the given revision, together with
- *  that revision — the caller reports it as {@link GetBlockResult.materialized}. */
+/** Returns the block as it stood at the highest revision ≤ the given revision that committed it,
+ *  together with that revision — the caller reports it as {@link GetBlockResult.materialized} — or
+ *  `undefined` when that revision deleted it, as storage answers a tombstone: a committed revision
+ *  with no materialized block is a delete, never a reason to serve the content before it. */
 function latestMaterializedAt(blockState: BlockState, maxRev: number): { block: IBlock, rev: number } | undefined {
 	for (let rev = maxRev; rev >= 0; rev--) {
 		const block = blockState.materializedBlocks.get(rev);
 		if (block) return { block, rev };
+		if (blockState.revisionActions.has(rev)) return undefined;
 	}
 	return undefined;
 }

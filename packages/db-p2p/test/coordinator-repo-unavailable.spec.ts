@@ -187,22 +187,31 @@ const makeUnmaterializableStorageRepo = (blockId: BlockId): { repo: IRepo } => {
 describe('CoordinatorRepo unavailable vs absent', () => {
 	const blockId: BlockId = 'block-unavailable';
 
+	/**
+	 * `awaitWindowConsults` is for a `'lazy'`-mode spec about what a held block's consult CONCLUDES: in
+	 * production that consult runs behind the read, so such a spec makes it wait and asserts on one read.
+	 */
 	const buildRepo = (
 		keyNetwork: IKeyNetwork,
 		storageRepo: IRepo,
 		localPeer: PeerId,
 		clusterLatestCallback: ClusterLatestCallback,
-		cfg?: { readRepairMode?: 'off' | 'lazy' | 'paranoid' }
-	): CoordinatorRepo => new CoordinatorRepo(
-		keyNetwork,
-		makeClusterClient,
-		storageRepo,
-		{ clusterSize: 3, ...(cfg ?? {}) },
-		undefined,
-		localPeer,
-		undefined,
-		clusterLatestCallback
-	);
+		cfg?: { readRepairMode?: 'off' | 'lazy' | 'paranoid'; awaitWindowConsults?: true }
+	): CoordinatorRepo => {
+		const { awaitWindowConsults, ...policy } = cfg ?? {};
+		const repo = new CoordinatorRepo(
+			keyNetwork,
+			makeClusterClient,
+			storageRepo,
+			{ clusterSize: 3, ...policy },
+			undefined,
+			localPeer,
+			undefined,
+			clusterLatestCallback
+		);
+		if (awaitWindowConsults) repo.awaitWindowConsults = true;
+		return repo;
+	};
 
 	it('flags a locally-missing block peers-unreachable when the cohort consult throws', async () => {
 		const localPeer = await makePeerId();
@@ -616,7 +625,7 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 			it('keeps marking a read whose consult the window skipped', async () => {
 				const { localPeer, cluster, callback, consultCount } = await buildUnacquirableCohort(3);
 				const { repo: storageRepo } = makePresentStorageRepo(blockId, 1);
-				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy' });
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy', awaitWindowConsults: true });
 
 				const first = await repo.get({ blockIds: [blockId] });
 				expect(first[blockId]?.unconfirmedAheadRev, 'the consulting read is marked').to.equal(3);
@@ -665,7 +674,7 @@ describe('CoordinatorRepo unavailable vs absent', () => {
 					},
 					...writeStubs
 				};
-				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy' });
+				const repo = buildRepo(makeKeyNetwork(cluster), storageRepo, localPeer, callback, { readRepairMode: 'lazy', awaitWindowConsults: true });
 
 				expect((await repo.get({ blockIds: [blockId] }))[blockId]?.unconfirmedAheadRev).to.equal(3);
 

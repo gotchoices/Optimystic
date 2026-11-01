@@ -16,6 +16,10 @@
  *   - proofs:       rev (8-byte big-endian unsigned, same as revisions)
  *   - materialized: actionId UTF-8 (terminal)
  *
+ * The journal (`TAG_JOURNAL`) has no `blockId` envelope: a record key is the
+ * tag then its `seq` as 8 bytes big-endian, and the applied-through mark is the
+ * bare tag, which sorts before every numbered key.
+ *
  * `kv` and `identity` keys are flat — no `blockId` envelope — under their
  * own tag bytes (`TAG_KV`, `TAG_IDENTITY`) and use UTF-8 of the full key.
  *
@@ -30,6 +34,7 @@ export const TAG_PENDING = 0x03;
 export const TAG_TRANSACTIONS = 0x04;
 export const TAG_MATERIALIZED = 0x05;
 export const TAG_PROOFS = 0x06;
+export const TAG_JOURNAL = 0x07;
 export const TAG_KV = 0x10;
 export const TAG_IDENTITY = 0x20;
 
@@ -148,6 +153,58 @@ export function actionIdFromKey(key: Uint8Array, blockId: string): string {
 	const blockIdLen = textEncoder.encode(blockId).length;
 	const suffixOffset = 1 + 4 + blockIdLen;
 	return textDecoder().decode(key.subarray(suffixOffset));
+}
+
+// --- the journal ---
+
+const SEQ_BYTES = 8;
+
+/** `seq` as 8 bytes big-endian, the suffix of a record key and the value of the mark. */
+function encodeSeq(seq: number): Uint8Array {
+	const out = new Uint8Array(SEQ_BYTES);
+	new DataView(out.buffer).setBigUint64(0, BigInt(seq), false);
+	return out;
+}
+
+/** The number 8 bytes big-endian hold, or `undefined` for any other length. */
+function decodeSeq(bytes: Uint8Array): number | undefined {
+	if (bytes.byteLength !== SEQ_BYTES) return undefined;
+	return Number(new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getBigUint64(0, false));
+}
+
+/** `TAG_JOURNAL || seq (8 BE)`: the key of the journal record numbered `seq`. */
+export function journalRecordKey(seq: number): Uint8Array {
+	return concat(Uint8Array.of(TAG_JOURNAL), encodeSeq(seq));
+}
+
+/** The bare tag: the key of the applied-through mark, which sorts before every record key. */
+export function journalMarkKey(): Uint8Array {
+	return Uint8Array.of(TAG_JOURNAL);
+}
+
+/** The mark's value: the number of the last record applied, as 8 bytes big-endian. */
+export function encodeJournalMark(appliedThrough: number): Uint8Array {
+	return encodeSeq(appliedThrough);
+}
+
+/** The number a mark value holds, or `undefined` when it is not 8 bytes. */
+export function decodeJournalMark(value: Uint8Array): number | undefined {
+	return decodeSeq(value);
+}
+
+/** Returns the inclusive lower / exclusive upper range covering the mark and every record key. */
+export function journalRange(): { gte: Uint8Array; lt: Uint8Array } {
+	return { gte: Uint8Array.of(TAG_JOURNAL), lt: Uint8Array.of(TAG_JOURNAL + 1) };
+}
+
+/** Whether a key inside `journalRange` is the mark's (the bare tag) rather than a record's. */
+export function isJournalMarkKey(key: Uint8Array): boolean {
+	return key.byteLength === 1;
+}
+
+/** The `seq` a record key names, or `undefined` for a key of another shape. */
+export function seqFromJournalKey(key: Uint8Array): number | undefined {
+	return decodeSeq(key.subarray(1));
 }
 
 export function kvKey(key: string): Uint8Array {

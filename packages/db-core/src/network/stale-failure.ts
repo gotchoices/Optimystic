@@ -1,5 +1,5 @@
 import type { ActionId, ActionRev } from "../collection/action.js";
-import type { ExpiredFailure, StaleFailure, WriteFailure } from "./struct.js";
+import type { ExpiredFailure, RejectedFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
 
 /**
  * The single rule for "is this non-success retryable after a re-read?" Both write paths and the
@@ -7,11 +7,12 @@ import type { ExpiredFailure, StaleFailure, WriteFailure } from "./struct.js";
  *
  * {@link StaleFailure.conflict} is authoritative when present. The `missing`/`pending` fallback
  * covers producers that have not been taught the field, including a remote peer on an older build
- * (the repo protocol is plain JSON, so an unset field simply arrives absent). An expiry is never a
- * conflict ({@link isExpiryFailure}), whatever else arrived beside it.
+ * (the repo protocol is plain JSON, so an unset field simply arrives absent). An expiry
+ * ({@link isExpiryFailure}), a promise shortfall ({@link isShortfallFailure}) and a validity
+ * rejection ({@link isRejectedFailure}) are never a conflict, whatever else arrived beside them.
  */
 export function isConflictFailure(failure: WriteFailure): boolean {
-	if (isExpiryFailure(failure)) return false;
+	if (isExpiryFailure(failure) || isShortfallFailure(failure) || isRejectedFailure(failure)) return false;
 	return failure.conflict ?? Boolean(failure.missing?.length || failure.pending?.length);
 }
 
@@ -24,6 +25,28 @@ export function isConflictFailure(failure: WriteFailure): boolean {
  */
 export function isExpiryFailure(failure: WriteFailure): failure is ExpiredFailure {
 	return failure.expired !== undefined;
+}
+
+/**
+ * The single rule for "did the cohort refuse this pend because too few of its members answered the
+ * promise round?" ({@link ShortfallFailure}). Every write path stops on it rather than retrying, since
+ * every coordinator of the cohort meets the same silent members. Decided by the structured field,
+ * never the reason text; a coordinator on a build that predates the field throws the shortfall
+ * instead of returning it, which a writer sees as it always did.
+ */
+export function isShortfallFailure(failure: WriteFailure): failure is ShortfallFailure {
+	return failure.shortfall !== undefined;
+}
+
+/**
+ * The single rule for "did the cohort refuse this pend because the members that sank it judged the
+ * transaction invalid?" ({@link RejectedFailure}). Every write path stops on it rather than retrying,
+ * since re-sending the same content to the same checks is refused the same way. Decided by the
+ * structured field, never the reason text; a coordinator on a build that predates the field throws the
+ * rejection instead of returning it, which a writer sees as it always did.
+ */
+export function isRejectedFailure(failure: WriteFailure): failure is RejectedFailure {
+	return failure.rejected !== undefined;
 }
 
 /**
@@ -41,13 +64,16 @@ export function isExpiryFailure(failure: WriteFailure): failure is ExpiredFailur
  * the transactor's aggregate meaningful: if a producer reported an arbitrary block instead of its
  * highest, taking the max across producers would still understate the constraint.
  *
- * NOTE: comparing revisions across blocks is only meaningful because one pend covers one
- * collection, so every candidate comes from the same revision counter. If a pend is ever allowed
- * to span collections, these numbers come from unrelated counters and selection must become
- * per-collection. `Collection.syncAttempts` now compares the winner against its OWN next revision
- * to decide whether a retry could differ (`SyncRevisionStalledError`), so a cross-collection
- * candidate would not merely muddy a diagnostic — it would fail a sync against an unrelated
- * counter.
+ * NOTE: comparing revisions across blocks is meaningful only within one collection, where every
+ * candidate comes from the same revision counter. A batch (`IRepo.pendMany` / `commitMany`) spans
+ * collections, and `CoordinatorRepo` still picks the highest across them, so its `staleAt` names the
+ * block — and so the collection — of one loser among several counters. That is harmless while the
+ * multi-collection coordinator, the only writer that sends a batch, does not read the number (backlog
+ * `debt-multi-collection-retry-cannot-see-the-taken-revision`). A consumer that compares it against a
+ * revision counter, as `Collection.syncAttempts` does against its OWN next revision to decide whether a
+ * retry could differ (`SyncRevisionStalledError`), must compare it against the counter of the
+ * collection owning `staleAt.blockId` — and once one does for a batch, selection must become
+ * per-collection.
  */
 export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): StaleFailure['staleAt'] {
 	let best: StaleFailure['staleAt'];

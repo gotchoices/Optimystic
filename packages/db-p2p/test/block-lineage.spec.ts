@@ -44,7 +44,7 @@ describe('Block lineage: whether a block was built from a committed write', () =
 
 	beforeEach(() => {
 		rawStorage = new MemoryRawStorage();
-		repo = new StorageRepo(id => new BlockStorage(id, rawStorage));
+		repo = new StorageRepo(rawStorage);
 	});
 
 	/** Pend and commit one action on the block, through the same path a cohort member applies. */

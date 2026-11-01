@@ -123,6 +123,8 @@ export class TransactionSession {
 	 *
 	 * @param options - Optional retry knobs forwarded to {@link TransactionCoordinator.commit}
 	 *   (bounded backoff+jitter retry of a clean stale loss). Defaults are safe out of the box.
+	 * @returns on success, `durability` says who holds what the commit wrote; it is absent when the
+	 *   transaction wrote nothing (see {@link ExecutionResult.durability}).
 	 */
 	async commit(options?: SyncOptions): Promise<ExecutionResult> {
 		if (this.committed) {
@@ -165,13 +167,13 @@ export class TransactionSession {
 
 		// Commit through coordinator (which will orchestrate PEND/COMMIT, with bounded
 		// backoff+jitter retry of a clean stale loss)
-		await this.coordinator.commit(transaction, options);
+		const durability = await this.coordinator.commit(transaction, options);
 
 		// Clear read dependencies after successful commit
 		this.coordinator.clearReadDependencies();
 
 		this.committed = true;
-		return { success: true };
+		return { success: true, ...(durability === undefined ? {} : { durability }) };
 	}
 
 	/**

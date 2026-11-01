@@ -23,8 +23,8 @@ import { toString as uint8ArrayToString } from "uint8arrays/to-string";
  *
  * **Measured size**: 4578 bytes serialized for a 10-peer cohort signing a two-block fully-signed
  * commit (`JSON.stringify(proof).length`, pinned by the "size" test in `test/commit-proof.spec.ts`).
- * It rides inside sync responses bounded by `MAX_CONTROL_MESSAGE_BYTES` (1 MiB), which already carry
- * whole blocks, so proof size is a rounding error there.
+ * It rides inside sync responses and block-transfer pushes, both framed under `MAX_BLOCK_MESSAGE_BYTES`
+ * (8 MiB), which already carry whole blocks, so proof size is a rounding error there.
  */
 export type BlockCommitProof = {
 	v: 1;
@@ -77,6 +77,14 @@ export type ProofVerdict =
  * storage layer JSON-snapshots on save). Returns `undefined` for a v1 / unversioned record: its
  * hashes bind no peer set, so its signer list is unbound and it can never be certified (the caller
  * logs the skip).
+ *
+ * NOTE: the proof carries the commit message whole, so a batch's proof — and every block's stored
+ * copy of it — grows with the number of collections the record commits: each operation adds its
+ * block ids, log tail and digests, roughly 150 bytes per block by field size (estimated, not
+ * measured). Six collections of a few blocks each add a few kilobytes to the 4.6 KB measured for a
+ * two-block commit, well inside the 1 MiB message bound. If proof storage ever matters, trim a
+ * proof to the claimed operation — which needs a message hash that commits to each operation
+ * separately, since verification recomputes the hash from the message the proof carries.
  */
 export function buildBlockCommitProof(record: ClusterRecord): BlockCommitProof | undefined {
 	if (record.membershipVersion !== 2 || typeof record.membershipDigest !== 'string') {

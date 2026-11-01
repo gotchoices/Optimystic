@@ -1,22 +1,25 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure, isExpiryFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
+import { assertTransactionFits, transactionBytes, MAX_TRANSACTION_BYTES } from "../network/transaction-size.js";
 import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
+import { refuseSoloField } from "../network/refuse-solo.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
 import { groupBy } from "../utility/groupby.js";
 import { routingKeyForBlock } from "../network/routing-key.js";
 import { isRecordEmpty } from "../utility/is-record-empty.js";
-import { type CoordinatorBatch, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload } from "../utility/batch-coordinator.js";
+import { type CoordinatorBatch, type RetryBackoff, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload, retryWaitWithinBudget, retrySleep } from "../utility/batch-coordinator.js";
 import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
+import { OwedCancels, type OwedCancelClock } from "./owed-cancels.js";
 import { createLogger, verbose } from "../logger.js";
 
 const log = createLogger('network-transactor');
@@ -54,6 +57,24 @@ type NetworkTransactorInit = {
 	 * which is the nearest.
 	 */
 	localPeerId?: PeerId;
+	/**
+	 * The first wait, in ms, before a retry of a request that went unanswered: one declared link round
+	 * trip (`LinkDeadlines.retryBackoffBaseMs` on a db-p2p node), doubling for each further coordinator
+	 * the retry's chain tries, and never less than the failed request was outstanding when the retry
+	 * goes out through this node's own send queue to the same peer (`retryWaitMs` in
+	 * `utility/batch-coordinator.ts`). A request given up on at a deadline is usually still in that
+	 * queue, so a retry sent at once only lengthens it. Omit, or pass 0, on a node that declared no round
+	 * trip: every retry then goes out at once, as before the wait existed.
+	 */
+	retryBackoffBaseMs?: number;
+	/** Test seam for the retry waits; omit in production (an unref'd `setTimeout`). */
+	retrySleep?: (ms: number) => Promise<void>;
+	/**
+	 * Time for the re-sends of cancels this transactor could not discharge ({@link OwedCancels}).
+	 * Omit in production (`Date.now` and an unref'd `setTimeout`); a test injects a fake to fire the
+	 * re-send without waiting on the wall clock.
+	 */
+	owedCancelClock?: OwedCancelClock;
 }
 
 /**
@@ -74,6 +95,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly localChangeNotifier: IBlockChangeNotifier | undefined;
 	/** `NetworkTransactorInit.localPeerId` as a string, the form cohort peer ids arrive in. */
 	private readonly localPeerId: string | undefined;
+	/** The pace of every retry this transactor sends: each {@link processBatches} call, and {@link get}'s retry round. */
+	private readonly retryBackoff: RetryBackoff;
 
 	/**
 	 * Per-transaction coordinator cache: `actionId → (blockId → resolved coordinator)`.
@@ -95,6 +118,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	private readonly txnCoordinatorCache = new Map<ActionId, { coordinators: Map<BlockId, PeerId>; expires: number }>();
 	private static readonly MAX_TXN_COORDINATOR_CACHE_ENTRIES = 1000;
 
+	/**
+	 * Cancels {@link dischargeCancel} gave up on, kept and re-sent before this transactor's next pend
+	 * of their blocks and on a backoff timer, for this transactor's life — see {@link OwedCancels}.
+	 */
+	private readonly owedCancels: OwedCancels;
+
 	constructor(
 		init: NetworkTransactorInit,
 	) {
@@ -109,6 +138,29 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		this.getRepo = init.getRepo;
 		this.localChangeNotifier = init.localChangeNotifier;
 		this.localPeerId = init.localPeerId?.toString();
+		this.retryBackoff = { baseMs: init.retryBackoffBaseMs ?? 0, localPeerId: init.localPeerId, sleep: init.retrySleep };
+		this.owedCancels = new OwedCancels({
+			attempt: actionRef => this.resendOwedCancel(actionRef),
+			clock: init.owedCancelClock
+		});
+	}
+
+	/**
+	 * Every action this transactor owes a cancel for — one it sent, could not get answered, and is
+	 * still re-sending — with the blocks still owed. A snapshot, for diagnostics: an embedder about to
+	 * drop this transactor can see what it would leave standing.
+	 */
+	owedCancelBlocks(): Map<ActionId, BlockId[]> {
+		return this.owedCancels.snapshot();
+	}
+
+	/**
+	 * Stops re-sending owed cancels; whatever is still owed is logged (`cancel:owed-abandoned`) and
+	 * left standing. Call when the node this transactor sends through stops, or its re-send timer keeps
+	 * the transactor alive, retrying against a node that can no longer answer, for the life of the process.
+	 */
+	stop(): void {
+		this.owedCancels.stop();
 	}
 
 	/**
@@ -158,7 +210,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(bid => bid === blockId)],
 				expiration,
-				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' }),
+				this.retryBackoff
 			);
 		} catch (e) {
 			error = e as Error;
@@ -223,7 +276,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		};
 
 		// Retry only genuine no-response / partial-response batches. An authoritative
-		// absent answer is not retried.
+		// absent answer is not retried. Neither is a batch `processBatches` already
+		// re-batched: a coordinator that threw has retries in the tree that carry the chain
+		// on with it excluded, and they are judged here in its place. Asking it again —
+		// after a fresh backoff wait, under the outstanding floor a whole request deadline
+		// when this node coordinates — would only add a request and latency. Skipping it also
+		// leaves the retried batches covering disjoint blocks, so no block is asked twice.
 		// NOTE: a 'cohort-unreachable' entry earns this retry like any other flagged entry,
 		// and on a genuinely isolated node the retry re-picks the same node (the
 		// findCoordinator:all-excluded path) and repeats the same futile consult. Fine
@@ -237,15 +295,21 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// the below-floor content is the correct content and every machine agrees on it
 		// (see the accepted-tradeoff NOTE at `TransactorSource.mayRetain`). The reader
 		// judges it again and returns it uncached.
-		const retryable = Array.from(allBatches(batches)).filter(b =>
-			!isAuthoritative(b as any)
-		) as CoordinatorBatch<BlockId[], GetBlockResults>[];
+		const retryable = Array.from(allBatches(batches)).filter(b => !b.rebatched && !isAuthoritative(b));
 
 		if (retryable.length > 0 && Date.now() < expiration) {
 			log('get:retry retryable=%d', retryable.length);
-			// Fan out the per-batch retries concurrently. Each root batch builds its own
-			// excluded-peer set and attaches its own `subsumedBy`, so the retry rounds are
-			// independent per root and safe to run in parallel.
+			// Fan out the per-batch retries concurrently. Each retried batch builds its own
+			// excluded-peer set and attaches its own `subsumedBy`, and retried batches cover
+			// disjoint blocks (above), so the retry rounds are independent and safe to run in parallel.
+			// Only a batch with NO valid response (its request threw or timed out) waits before its
+			// retry: its frames are likely still in this node's send queue to that peer, and a retry
+			// sent at once would queue behind them. Such a batch reaches this round only when
+			// `processBatches` did not re-batch it: its retry lookup threw, or its wait did not fit
+			// the budget. A batch that got a response which was not authoritative (an entry
+			// `unavailable`, `unconfirmedAheadRev`, below its floor, or missing) retries at once —
+			// its predecessor is out of the queue, so waiting would add latency and buy nothing.
+			// That narrows "wait before each retry" deliberately.
 			const retryOutcomes = await Promise.allSettled(retryable.map(async b => {
 				const excluded = new Set<PeerId>([b.peerId, ...((b.excludedPeers ?? []) as PeerId[])]);
 				const retries = await createBatchesForPayload<BlockId[], GetBlockResults>(
@@ -255,7 +319,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					Array.from(excluded),
 					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
 				);
-				if (retries.length > 0) {
+				if (retries.length > 0 && (hasValidResponse(b) || await this.waitedForReadRetry(b, excluded.size, retries, expiration))) {
 					b.subsumedBy = [...(b.subsumedBy ?? []), ...retries];
 					await processBatches(
 						retries,
@@ -263,7 +327,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 						batch => batch.payload,
 						(gets, blockId, mergeWithGets) => [...(mergeWithGets ?? []), ...gets.filter(id => id === blockId)],
 						expiration,
-						(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' })
+						(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), { ...options, intent: 'read' }),
+						this.retryBackoff
 					);
 				}
 			}));
@@ -361,24 +426,59 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				}
 			}
 		}
-		// Ensure we have at least one response per requested block id
-		const missingIds = distinctBlockIds.filter(bid => !resultEntries.has(bid));
-		if (missingIds.length > 0) {
-			log('get:missing blockIds=%o', missingIds);
+		// A block with no entry is one of two things. When no batch carrying it got any response — each
+		// threw, timed out or was still in flight at the deadline — no coordinator was heard from, the
+		// `'peers-unreachable'` answer `CoordinatorRepo` gives for a consult that threw: flagged, so the
+		// read of THAT block fails typed (`BlockUnavailableError`) while its siblings are returned. When
+		// some coordinator responded and left it out, that is a protocol fault, not unreachability, and
+		// fails the whole read as it always has. Flagged entries are added after the merge, so they
+		// never compete with a real answer.
+		const responded = respondedBlocks(batches);
+		const omittedIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && responded.has(bid));
+		const unansweredIds = distinctBlockIds.filter(bid => !resultEntries.has(bid) && !responded.has(bid));
+		const rootCause = firstBatchError(batches) ?? error;
+		if (omittedIds.length > 0) {
+			log('get:missing blockIds=%o', omittedIds);
 			const details = this.formatBatchStatuses(batches,
 				b => {
 					const status = b.request == null ? 'no-response' : (b.request.isResponse ? 'response' : 'in-flight')
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const rootCause = firstBatchError(batches) ?? error;
 			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
 			(aggregate as any).cause = rootCause;
 			throw aggregate;
 		}
+		if (unansweredIds.length > 0) {
+			log('get:unanswered blockIds=%o root=%s', unansweredIds, errorMessage(rootCause));
+			for (const bid of unansweredIds) {
+				resultEntries.set(bid, { state: {}, unavailable: 'peers-unreachable' } satisfies GetBlockResult);
+			}
+		}
 
 		log('get:done blockIds=%d ms=%d', distinctBlockIds.length, Date.now() - t0);
 		return Object.fromEntries(resultEntries) as GetBlockResults;
+	}
+
+	/**
+	 * Waits out the backoff before {@link get}'s second-chance round re-sends `failed` — a batch with no
+	 * valid response — to `retries`, whose chain has tried `attempt` coordinators. False when the wait
+	 * would reach `expiration`: the retry is then not sent, and the batch keeps its own failure.
+	 */
+	private async waitedForReadRetry(
+		failed: CoordinatorBatch<BlockId[], GetBlockResults>,
+		attempt: number,
+		retries: CoordinatorBatch<BlockId[], GetBlockResults>[],
+		expiration: number
+	): Promise<boolean> {
+		const outstandingMs = failed.outstandingMs ?? 0;
+		const waitMs = retryWaitWithinBudget(this.retryBackoff, { attempt, failedPeer: failed.peerId, outstandingMs, retryPeers: retries.map(r => r.peerId) }, expiration);
+		if (waitMs === undefined) return false;
+		if (waitMs > 0) {
+			log('get:retry-wait peer=%s excluded=%d waitMs=%d outstandingMs=%d', failed.peerId.toString(), attempt, waitMs, outstandingMs);
+			await retrySleep(this.retryBackoff)(waitMs);
+		}
+		return true;
 	}
 
 	async getStatus(blockActions: ActionBlocks[]): Promise<BlockActionStatus[]> {
@@ -556,16 +656,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return judgeCohortLineage(members);
 	}
 
-	private async consolidateCoordinators(
-		blockIds: BlockId[],
-		transforms: Transforms,
-		transformForBlock: (payload: Transforms, blockId: BlockId, mergeWith?: Transforms) => Transforms
-	): Promise<CoordinatorBatch<Transforms, PendResult>[]> {
-		// Use cluster intersections to minimize the number of coordinators.
-		// For each block, find its full cluster, then greedily assign blocks to
-		// peers that appear in the most clusters — reducing round trips when
-		// blocks share cluster members.
-
+	/**
+	 * Which coordinator drives which blocks, keyed by peer id string. For each block, find its full
+	 * cluster, then greedily assign blocks to the peer appearing in the most clusters
+	 * ({@link bestCoveringPeer}), reducing round trips when blocks share cluster members; a block whose
+	 * cluster could not be looked up, or that no member covers, goes to `findCoordinator`.
+	 */
+	private async coordinatorCover(blockIds: readonly BlockId[]): Promise<Map<string, BlockId[]>> {
 		// Step 1: Get cluster peer sets for each block
 		const blockClusterPeerIds: Map<BlockId, Set<string>> = new Map();
 		const fallbackBlocks: BlockId[] = [];
@@ -615,8 +712,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			existing.push(blockId);
 			assignments.set(key, existing);
 		}
+		return assignments;
+	}
 
-		// Step 5: Convert assignments to batches
+	/** One pend batch per coordinator of {@link coordinatorCover}, carrying that coordinator's share of `transforms`. */
+	private async consolidateCoordinators(
+		blockIds: BlockId[],
+		transforms: Transforms,
+		transformForBlock: (payload: Transforms, blockId: BlockId, mergeWith?: Transforms) => Transforms
+	): Promise<CoordinatorBatch<Transforms, PendResult>[]> {
+		const assignments = await this.coordinatorCover(blockIds);
 		const batches: CoordinatorBatch<Transforms, PendResult>[] = [];
 		for (const [peerIdStr, consolidatedBlocks] of assignments) {
 			const peerId = peerIdFromString(peerIdStr);
@@ -640,6 +745,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	async pend(blockAction: PendRequest): Promise<PendResult> {
+		// Refused before anything is sent, so no cancel is owed. The whole pend is judged, not each
+		// coordinator's share: a share is a subset, so a whole that fits means every share does.
+		assertTransactionFits([blockAction]);
 		const t0 = Date.now();
 		const transformForBlock = (payload: Transforms, blockId: BlockId, mergeWithPayload: Transforms | undefined): Transforms => {
 			const filteredTransform = transformForBlockId(payload, blockId);
@@ -648,6 +756,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				: transformsFromTransform(filteredTransform, blockId);
 		};
 		const blockIds = blockIdsForTransforms(blockAction.transforms);
+		// A cancel this transactor still owes on any of these blocks goes out first: its records would
+		// otherwise refuse this pend — or, for this same action id, the late cancel would delete it.
+		await this.owedCancels.beforePend(blockAction.actionId, blockIds);
 		const batches = await this.consolidateCoordinators(blockIds, blockAction.transforms, transformForBlock);
 		log('pend actionId=%s blockIds=%d batches=%d', blockAction.actionId, blockIds.length, batches.length);
 		if (verbose) {
@@ -678,14 +789,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => blockIdsForTransforms(batch.payload),
 				transformForBlock,
 				expiration,
-				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options),
+				this.retryBackoff
 			);
 			// Cache resolved coordinators for follow-up commit to hit the same peers
-			try {
-				for (const b of Array.from(allBatches(batches))) {
-					this.keyNetwork.recordCoordinator?.(routingKeyForBlock(b.blockId), b.peerId);
-				}
-			} catch (e) { log('WARN: Failed to record coordinator hint %o', e); }
+			this.recordCoordinatorHints(Array.from(allBatches(batches), b => [b.blockId, b.peerId] as const));
 		} catch (e) {
 			error = e as Error;
 		}
@@ -770,6 +878,116 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			// durability means at that caller; do not make the merge invent one.
 			durability: mergeDurability(completed.map(b => (b.request!.response! as PendSuccess).durability))
 		};
+	}
+
+	/**
+	 * Pends every request as ONE request to the one coordinator covering all their blocks — one consensus
+	 * record, answered together (`IRepo.pendMany`). Each request goes whole, `soleReservation` and bases
+	 * exactly as given, with one expiration and the union of their blocks as the blocks that coordinator
+	 * drives.
+	 *
+	 * Returns `undefined` before sending anything when they cannot go as one: their blocks need more than
+	 * one coordinator by the cover {@link pend} computes ({@link coordinatorCover}), a lookup failed, that
+	 * coordinator's repo takes no batch, or together they are over the per-transaction size limit (which
+	 * binds one record, so each may still fit on its own). The caller then pends them its usual way, and
+	 * each of those pends repeats the lookups and the size check for itself.
+	 *
+	 * Answered as {@link pend} answers, cancelling every block first on a failure: a RETURNED refusal is
+	 * rebuilt by {@link refusalFrom}. A THROW returns `undefined` too: unlike a pend's batches, this one
+	 * request cannot be re-batched onto other coordinators, so it is the caller's per-request pends —
+	 * which {@link processBatches} retries elsewhere — that try again. A cancel that did not discharge is
+	 * owed ({@link owedCancels}), and those pends, of the same action, supersede it on the blocks they
+	 * write afresh.
+	 */
+	async pendMany(requests: readonly PendRequest[]): Promise<PendResult | undefined> {
+		if (requests.length === 0) throw new Error('pendMany: no requests to pend');
+		const actionId = requests[0]!.actionId;
+		const blockIds = requests.flatMap(request => blockIdsForTransforms(request.transforms));
+		if (transactionBytes(requests) > MAX_TRANSACTION_BYTES) {
+			log('pendMany:inapplicable actionId=%s reason=too-large', actionId);
+			return undefined;
+		}
+		const coordinator = await this.solePendCoordinator(blockIds, actionId);
+		const repo = coordinator === undefined ? undefined : this.getRepo(coordinator);
+		if (coordinator === undefined || !repo?.pendMany) {
+			if (coordinator !== undefined) log('pendMany:inapplicable actionId=%s reason=no-batch-repo', actionId);
+			return undefined;
+		}
+		await this.owedCancels.beforePend(actionId, blockIds);
+		log('pendMany actionId=%s requests=%d blockIds=%d', actionId, requests.length, blockIds.length);
+
+		let answer: PendResult;
+		try {
+			answer = await repo.pendMany(requests, {
+				expiration: Date.now() + this.timeoutMs,
+				dialTimeoutMs: this.dialTimeoutMs,
+				coordinatingBlockIds: blockIds
+			});
+		} catch (e) {
+			log('WARN: batched pend threw; pending each request on its own: actionId=%s peer=%s error=%s',
+				actionId, coordinator.toString(), errorMessage(e));
+			await this.cancelBatchedPend(coordinator, actionId, blockIds);
+			return undefined;
+		}
+		if (!answer.success) {
+			await this.cancelBatchedPend(coordinator, actionId, blockIds);
+			return refusalFrom([answer]);
+		}
+
+		const txnCoordinators = this.txnCoordinatorsFor(actionId);
+		for (const bid of blockIds) txnCoordinators.set(bid, coordinator);
+		this.recordCoordinatorHints([[blockIds[0]!, coordinator]]);
+		return { success: true, pending: answer.pending, blockIds, durability: mergeDurability([answer.durability]) };
+	}
+
+	/**
+	 * The one coordinator {@link coordinatorCover} assigns every block in `blockIds` to, or `undefined`
+	 * when it assigns more than one, or a lookup failed (logged).
+	 */
+	private async solePendCoordinator(blockIds: BlockId[], actionId: ActionId): Promise<PeerId | undefined> {
+		let cover: Map<string, BlockId[]>;
+		try {
+			cover = await this.coordinatorCover(blockIds);
+		} catch (e) {
+			log('pendMany:unplanned actionId=%s error=%s', actionId, errorMessage(e));
+			return undefined;
+		}
+		const [only, ...others] = cover.keys();
+		if (only === undefined || others.length > 0) {
+			log('pendMany:inapplicable actionId=%s coordinators=%d', actionId, cover.size);
+			return undefined;
+		}
+		return peerIdFromString(only);
+	}
+
+	/**
+	 * Discharges every block a batched pend named, its first round sent to the coordinator the pend went
+	 * to. Awaited, and never thrown: as in {@link pend}'s failure path, a cancel that did not discharge is
+	 * logged and owed, and must not replace the pend's own answer.
+	 */
+	private async cancelBatchedPend(coordinator: PeerId, actionId: ActionId, blockIds: BlockId[]): Promise<void> {
+		const seed: CoordinatorBatch<BlockId[], PendResult> = {
+			peerId: coordinator,
+			blockId: blockIds[0]!,
+			payload: blockIds,
+			coordinatingBlockIds: blockIds,
+			excludedPeers: []
+		};
+		try {
+			await this.cancelBatch([seed], { actionId, blockIds });
+		} catch (cancelError) {
+			log('WARN: cancel after batched pend did not discharge: %o', cancelError);
+		}
+	}
+
+	/** Tells the key network which coordinator answered for each block, so later requests reach the same
+	 *  peer. A hint: a failure is logged, never thrown. */
+	private recordCoordinatorHints(hints: Iterable<readonly [BlockId, PeerId]>): void {
+		try {
+			for (const [blockId, peerId] of hints) {
+				this.keyNetwork.recordCoordinator?.(routingKeyForBlock(blockId), peerId);
+			}
+		} catch (e) { log('WARN: Failed to record coordinator hint %o', e); }
 	}
 
 	/**
@@ -880,6 +1098,47 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	}
 
 	/**
+	 * Commits every request as ONE request to the one coordinator covering all their blocks — one
+	 * consensus record, answered together (`IRepo.commitMany`). Each request lists its tail first and its
+	 * other blocks after, as {@link commitInOneRound} sends one action's, and is built where every commit
+	 * request is ({@link repoCommitRequest}), so its digests name only its own blocks.
+	 *
+	 * Returns `undefined` when they cannot go as one — their blocks need more than one coordinator
+	 * ({@link soleCommitCoordinator}, which prefers what {@link pendMany} cached), or that coordinator's
+	 * repo takes no batch — and when the one request THREW: the caller's per-request commits then re-send
+	 * everything, and whatever the thrown request landed is this action's own revision, which storage
+	 * treats as already done (`isOwnRevision`), the reasoning {@link commitInOneRound}'s fallback rests on.
+	 * A RETURNED answer is the batch's verdict.
+	 */
+	async commitMany(requests: readonly CommitRequest[]): Promise<CommitResult | undefined> {
+		if (requests.length === 0) throw new Error('commitMany: no requests to commit');
+		const actionId = requests[0]!.actionId;
+		const blockLists = requests.map(tailFirst);
+		const coordinator = await this.soleCommitCoordinator(blockLists.flat(), actionId);
+		const repo = coordinator === undefined ? undefined : this.getRepo(coordinator);
+		if (coordinator === undefined || !repo?.commitMany) {
+			if (coordinator !== undefined) log('commitMany:inapplicable actionId=%s reason=no-batch-repo', actionId);
+			return undefined;
+		}
+		log('commitMany actionId=%s requests=%d', actionId, requests.length);
+
+		let answer: CommitResult;
+		try {
+			answer = await repo.commitMany(
+				requests.map((request, i) => repoCommitRequest(blockLists[i]!, request)),
+				{ expiration: Date.now() + this.timeoutMs, dialTimeoutMs: this.dialTimeoutMs }
+			);
+		} catch (e) {
+			log('WARN: batched commit threw; committing each request on its own: actionId=%s peer=%s error=%s',
+				actionId, coordinator.toString(), errorMessage(e));
+			return undefined;
+		}
+		return answer.success
+			? { success: true, durability: mergeDurability([answer.durability]) }
+			: refusalFrom([answer]);
+	}
+
+	/**
 	 * The one coordinator covering every block in `blockIds` — resolved as {@link commitBlocks}
 	 * resolves them, preferring what the pend already resolved — or `undefined` when they need more
 	 * than one, or a lookup failed (logged; the two-step path then repeats the lookups and reports
@@ -906,7 +1165,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * its tail, and for a {@link commitInOneRound} that threw.
 	 */
 	private async commitTailThenSweep(request: CommitRequest, remainingBlocks: BlockId[]): Promise<CommitResult> {
-		const tailResult = await this.commitBlock(request.tailId, request.actionId, request.rev, request.tailId, request.blockDigests);
+		const tailResult = await this.commitBlock(commitOf(request, [request.tailId]));
 		if (!tailResult.success) {
 			// NOTE: a refused tail is NOT an absent tail. The coordinator's durability gate answers
 			// `commit-not-durable` whenever fewer than a majority hold the revision — even though
@@ -938,7 +1197,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// walk. Sweeping before the tail would also let a committed header point at a never-committed
 		// tail: a dangling pointer, strictly worse than an orphaned block.
 		if (remainingBlocks.length > 0) {
-			const { batches, error } = await this.commitBlocks({ blockIds: remainingBlocks, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests });
+			const { batches, error } = await this.commitBlocks(commitOf(request, remainingBlocks));
 			cohortReports.push(...confirmedDurabilities(batches));
 			if (error) {
 				// Split by the failure's NATURE, exactly as commitBlock does for the tail: a RETURNED
@@ -1009,14 +1268,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 *    record, so the cancel is a no-op there;
 	 *  - it did not land ⇒ the cancel is exactly the repair;
 	 *  - its consensus is still in flight and lands AFTER the cancel ⇒ the member meets a missing
-	 *    pend, which `ClusterMember.applyConsensusOperation` already treats as "behind" divergence and
+	 *    pend, which `ClusterMember.applyCommitToStorage` already treats as "behind" divergence and
 	 *    cures by reconciling the block from a cohort peer.
 	 *
 	 * Confirmed blocks are excluded only to skip a pointless consensus round — cancelling one would
 	 * also be a no-op — so an over-broad `confirmed` set costs latency, never correctness.
 	 *
-	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}) but still bounded, so a
-	 * fault outlasting its budget leaves the record wedged until a node-side backstop sweep exists (backlog:
+	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}), and one that outlasts its
+	 * budget is kept and re-sent for this transactor's life ({@link owedCancels}), so only a writer that
+	 * exits first leaves the record wedged until a node-side backstop sweep exists (backlog:
 	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
@@ -1046,13 +1306,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		try {
 			await this.cancel({ actionId, blockIds: abandoned });
 		} catch (cancelError) {
-			try { log('WARN: cancel of abandoned sweep blocks failed — pending records may wedge until the node-side sweep lands: %o', cancelError); } catch { /* ignore */ }
+			try { log('WARN: cancel of abandoned sweep blocks failed — kept and re-sent until it lands (cancel:owed): %o', cancelError); } catch { /* ignore */ }
 		}
 		return abandoned;
 	}
 
-	private async commitBlock(blockId: BlockId, actionId: ActionId, rev: number, tailId?: BlockId, blockDigests?: BlockContentDigests): Promise<CommitResult> {
-		const { batches: tailBatches, error: tailError } = await this.commitBlocks({ blockIds: [blockId], actionId, rev, tailId, blockDigests });
+	/** Commits `request`'s one block (the tail), returning a confirmed conflict and throwing a transient fault. */
+	private async commitBlock(request: RepoCommitRequest): Promise<CommitResult> {
+		const { batches: tailBatches, error: tailError } = await this.commitBlocks(request);
 		if (tailError) {
 			// commit is a pure attempt: stale → { success:false }, transient → throw. Cancellation
 			// is the CALLER's responsibility (coordinator cancelPhase; TransactorSource.transact),
@@ -1080,19 +1341,9 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		return stale.length === 0 ? undefined : refusalFrom(stale.map(b => b.request!.response! as WriteFailure));
 	}
 
-	/**
-	 * The one place a commit request to a coordinator is built — shared by {@link commitInOneRound}
-	 * and {@link commitBlocks}. `blockDigests` arrives as the action's FULL declaration map and is
-	 * narrowed to `blockIds` here, at send time, never up front: each request becomes its own cluster
-	 * record, so shipping the whole map would make one cohort sign for blocks it is not responsible
-	 * for; and `processBatches` re-batches failed blocks onto different coordinators, so only a
-	 * send-time subset stays correct across retries.
-	 */
-	private sendCommit(peerId: PeerId, blockIds: BlockId[], { actionId, rev, tailId, blockDigests }: RepoCommitRequest, expiration: number): Promise<CommitResult> {
-		return this.getRepo(peerId).commit(
-			{ actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds) },
-			{ expiration, dialTimeoutMs: this.dialTimeoutMs }
-		);
+	/** Sends `request`'s commit of `blockIds` to `peerId` — shared by {@link commitInOneRound} and {@link commitBlocks}. */
+	private sendCommit(peerId: PeerId, blockIds: BlockId[], request: RepoCommitRequest, expiration: number): Promise<CommitResult> {
+		return this.getRepo(peerId).commit(repoCommitRequest(blockIds, request), { expiration, dialTimeoutMs: this.dialTimeoutMs });
 	}
 
 	/** Attempts to commit a set of blocks, and handles failures and errors. */
@@ -1111,7 +1362,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				batch => batch.payload,
 				mergeBlocks,
 				expiration,
-				async (blockId, options) => this.resolveCoordinator(blockId, options, actionId)
+				async (blockId, options) => this.resolveCoordinator(blockId, options, actionId),
+				this.retryBackoff
 			);
 		} catch (e) {
 			error = e as Error;
@@ -1280,8 +1532,14 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * cost latency only. Each round narrows to the blocks still outstanding, so a partially
 	 * successful round does not re-issue the cancels that already landed.
 	 *
-	 * NOTE: a fault that outlasts these bounds still strands the record, and nothing node-side
-	 * reclaims it. That residual is the backstop tracked in backlog
+	 * **What happens when the bounds run out.** The blocks still outstanding are handed to
+	 * {@link owedCancels} before the throw, which re-sends their cancel before this transactor's next
+	 * pend of any of them and on a backoff timer, for the transactor's life — a fault that outlasts
+	 * this loop costs the records' holders some refused writes, not the block. Recording it here,
+	 * from this loop's own outstanding set, is what spares every caller from having to remember to.
+	 *
+	 * NOTE: a writer that exits (or stops this transactor, {@link stop}) while a cancel is still owed
+	 * strands the record, and nothing node-side reclaims it. That residual is the backstop tracked in backlog
 	 * `debt-unpromotable-pending-records-need-a-sweep`.
 	 *
 	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
@@ -1291,7 +1549,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		actionRef: ActionBlocks,
 		seedBatches?: CoordinatorBatch<BlockId[], void>[]
 	): Promise<void> {
-		let outstanding = Array.from(new Set(actionRef.blockIds));
+		const requested = Array.from(new Set(actionRef.blockIds));
+		let outstanding = requested;
 		if (outstanding.length === 0) {
 			return;
 		}
@@ -1299,30 +1558,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		let roundBatches: CoordinatorBatch<BlockId[], void>[] = [];
 		let lastError: Error | undefined;
 		for (let round = 0; ; ++round) {
-			roundBatches = [];
-			try {
-				// Batch construction can throw (coordinator lookup); `processBatches` cannot.
-				roundBatches = round === 0 && seedBatches
-					? seedBatches
-					: await this.batchesForPayload<BlockId[], void>(outstanding, outstanding, mergeBlocks, []);
-				await processBatches(
-					roundBatches,
-					(batch) => this.getRepo(batch.peerId).cancel({ actionId: actionRef.actionId, blockIds: batch.payload }, { expiration: deadline, dialTimeoutMs: this.dialTimeoutMs }),
-					batch => batch.payload,
-					mergeBlocks,
-					deadline,
-					(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options)
-				);
-			} catch (e) {
-				lastError = asError(e);
-			}
-
-			const discharged = dischargedBlocks(roundBatches);
-			outstanding = outstanding.filter(bid => !discharged.has(bid));
+			const result = await this.cancelRound(actionRef.actionId, outstanding, deadline, round === 0 ? seedBatches : undefined);
+			roundBatches = result.batches;
+			lastError = result.error ?? lastError;
+			outstanding = outstanding.filter(bid => !result.discharged.has(bid));
 			if (outstanding.length === 0) {
 				if (round > 0) {
 					log('cancel:discharged actionId=%s rounds=%d', actionRef.actionId, round + 1);
 				}
+				this.owedCancels.discharged(actionRef.actionId, requested);
 				return;
 			}
 
@@ -1341,12 +1585,59 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 				return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`;
 			});
 		const rootCause = firstBatchError(roundBatches) ?? lastError;
+		const stillHeld = new Set(outstanding);
+		this.owedCancels.discharged(actionRef.actionId, requested.filter(bid => !stillHeld.has(bid)));
+		this.owedCancels.record(actionRef.actionId, outstanding, rootCause?.message);
 		const aggregate = new Error(`Cancel of action ${actionRef.actionId} did not discharge ${outstanding.length} block(s): ${outstanding.join(', ')}`
 			+ (details ? `; peers: ${details}` : '')
 			+ (rootCause ? `; root: ${rootCause.message}` : ''));
 		(aggregate as any).cause = rootCause;
 		(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
 		throw aggregate;
+	}
+
+	/**
+	 * One cancel round for `blockIds`: batches built from `seedBatches` or resolved live, sent, and
+	 * judged by which blocks some peer answered for. Never throws — a failed lookup is returned as
+	 * `error` beside an empty discharged set.
+	 */
+	private async cancelRound(
+		actionId: ActionId,
+		blockIds: BlockId[],
+		deadline: number,
+		seedBatches?: CoordinatorBatch<BlockId[], void>[]
+	): Promise<{ batches: CoordinatorBatch<BlockId[], void>[]; discharged: Set<BlockId>; error?: Error }> {
+		let batches: CoordinatorBatch<BlockId[], void>[] = [];
+		let error: Error | undefined;
+		try {
+			// Batch construction can throw (coordinator lookup); `processBatches` cannot.
+			batches = seedBatches ?? await this.batchesForPayload<BlockId[], void>(blockIds, blockIds, mergeBlocks, []);
+			await processBatches(
+				batches,
+				(batch) => this.getRepo(batch.peerId).cancel({ actionId, blockIds: batch.payload }, { expiration: deadline, dialTimeoutMs: this.dialTimeoutMs }),
+				batch => batch.payload,
+				mergeBlocks,
+				deadline,
+				(blockId, options) => this.keyNetwork.findCoordinator(routingKeyForBlock(blockId), options),
+				this.retryBackoff
+			);
+		} catch (e) {
+			error = asError(e);
+		}
+		return { batches, discharged: respondedBlocks(batches), error };
+	}
+
+	/**
+	 * One re-send of a cancel {@link dischargeCancel} gave up on, for {@link owedCancels}: a single
+	 * round within `abortOrCancelTimeoutMs`, never the full loop — it runs ahead of a pend, and a
+	 * cohort that still cannot approve the cancel cannot approve the pend either.
+	 */
+	private async resendOwedCancel(actionRef: ActionBlocks): Promise<ReadonlySet<BlockId>> {
+		const { discharged, error } = await this.cancelRound(actionRef.actionId, actionRef.blockIds, Date.now() + this.abortOrCancelTimeoutMs);
+		if (discharged.size < actionRef.blockIds.length) {
+			log('cancel:owed-retry-short actionId=%s answered=%d of %d%s', actionRef.actionId, discharged.size, actionRef.blockIds.length, error ? ` error=${error.message}` : '');
+		}
+		return discharged;
 	}
 
 	/** Renders the batches worth naming in an aggregate error: the ones that never completed, or —
@@ -1389,17 +1680,18 @@ function bestCoveringPeer(peerBlocks: Map<string, BlockId[]>, uncovered: Set<Blo
 }
 
 /**
- * The block ids some batch in the tree got an ANSWER for. A cancel batch that errored, or never
- * responded, discharged nothing — its blocks' pending records are still standing. Batch payloads
- * are block-id lists (built with {@link mergeBlocks}), including the retry batches
- * `processBatches` re-homes, so the union across the whole tree is the discharged set.
+ * The block ids some batch in the tree got an ANSWER for, whatever the answer said. A cancel batch
+ * that errored, or never responded, discharged nothing — its blocks' pending records are still
+ * standing — so for a cancel this is the discharged set. For a read it separates a block no
+ * coordinator answered from one a coordinator answered without. Batch payloads are block-id lists,
+ * including the retry batches `processBatches` re-homes, so the union across the whole tree counts.
  */
-function dischargedBlocks(batches: CoordinatorBatch<BlockId[], void>[]): Set<BlockId> {
-	const discharged = new Set<BlockId>();
+function respondedBlocks<TResponse>(batches: CoordinatorBatch<BlockId[], TResponse>[]): Set<BlockId> {
+	const responded = new Set<BlockId>();
 	for (const b of allBatches(batches, bb => bb.request?.isResponse === true)) {
-		for (const bid of b.payload) discharged.add(bid);
+		for (const bid of b.payload) responded.add(bid);
 	}
-	return discharged;
+	return responded;
 }
 
 /**
@@ -1418,9 +1710,16 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * {@link NetworkTransactor.pend} and the commit paths use, since the action-level answer is rebuilt
  * from per-batch ones rather than forwarded, and anything not carried here is lost.
  *
- * - An **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first one. No
- *   retry can succeed while that cohort's clocks disagree with the writer's, so a conflict beside it
- *   must not make the write look retryable, and its numbers must reach the writer whole.
+ * - A **validity rejection** anywhere ({@link isRejectedFailure}) is the answer, verbatim — the first
+ *   one. Members judged the content, which no retry changes. Above an expiry for the reason a cohort
+ *   that judged the content outranks clock votes inside one record: reporting the verdict as a clock
+ *   problem would invite a retry the verdict already refuses.
+ * - Otherwise an **expiry** anywhere ({@link isExpiryFailure}) is the answer, verbatim — the first
+ *   one. No retry can succeed while that cohort's clocks disagree with the writer's, so a conflict
+ *   beside it must not make the write look retryable, and its numbers must reach the writer whole.
+ * - Otherwise a **promise shortfall** anywhere ({@link isShortfallFailure}) is the answer, verbatim —
+ *   the first one, for the same reason: no retry can succeed while that cohort's members are silent.
+ *   Below an expiry because a shortfall clears when the members come back, and an expiry does not.
  * - Otherwise a {@link StaleFailure}: `reason` is the first one any response gave (the only diagnostic
  *   that survives an exhausted retry budget and the coordinator's error text — a refusal whose reason
  *   is `commit-not-durable` must not read as "stale commit", a rival's win); `staleAt` is the highest
@@ -1437,9 +1736,9 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
 function refusalFrom(responses: WriteFailure[]): WriteFailure {
-	const expired = responses.find(isExpiryFailure);
-	if (expired !== undefined) {
-		return expired;
+	const unretryable = responses.find(isRejectedFailure) ?? responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
+	if (unretryable !== undefined) {
+		return unretryable;
 	}
 	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
 	const reason = responses.map(r => r.reason).find(r => r !== undefined);
@@ -1450,6 +1749,31 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
 		conflict: responses.some(isConflictFailure),
 		success: false as const
 	};
+}
+
+/**
+ * The one place a commit request to a coordinator is built, for `blockIds` of `request`'s action —
+ * every commit {@link NetworkTransactor} sends, batched or not. `blockDigests` arrives as the action's
+ * FULL declaration map and is narrowed to `blockIds` here, at send time, never up front: each request
+ * becomes its own cluster record, or its own operation of one, so shipping the whole map would make a
+ * cohort sign for blocks the request is not committing; and `processBatches` re-batches failed blocks
+ * onto different coordinators, so only a send-time subset stays correct across retries.
+ */
+function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests, refuseSolo }: RepoCommitRequest): RepoCommitRequest {
+	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds), ...refuseSoloField(refuseSolo) };
+}
+
+/** `request`'s commit of `blockIds` alone, for {@link NetworkTransactor}'s two-step path to hand to its
+ * batching: everything the write carries, with its declarations still action-wide — every send goes
+ * through {@link repoCommitRequest}, which narrows them to the blocks that send commits. */
+function commitOf(request: CommitRequest, blockIds: BlockId[]): RepoCommitRequest {
+	return { blockIds, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests,
+		...refuseSoloField(request.refuseSolo) };
+}
+
+/** `request`'s blocks with its log tail first, each once — the order a coordinator commits them in. */
+function tailFirst(request: CommitRequest): BlockId[] {
+	return [request.tailId, ...new Set(request.blockIds)].filter((blockId, i) => i === 0 || blockId !== request.tailId);
 }
 
 /** The entries of `all` whose ids appear in `batchBlockIds` — the per-batch narrowing both
@@ -1481,10 +1805,26 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
 /** `action` re-scoped to one coordinator batch: the batch's own transforms, and the bases for the
  * blocks in it alone (see {@link PendRequest.baseRevs}). The action-wide `baseRevs` key is dropped
  * BEFORE the subset is spread, so a batch none of whose blocks names a base carries no key at all
- * rather than the whole action's map — and no cohort signs for a block it is not responsible for. */
+ * rather than the whole action's map — and no cohort signs for a block it is not responsible for.
+ *
+ * `soleReservation` survives only on a batch carrying every block of the action: a pend split across
+ * coordinators — by `consolidateCoordinators`, or by `processBatches` re-batching a failed batch — is
+ * several reservations, which the field must never claim to be. Decided per send, like the bases.
+ * Every other field goes on every batch as given — `refuseSolo` included, whose loss on one batch would
+ * let that coordinator's share be written by a lone node the write asked not to be written by. */
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
-	const { baseRevs, ...rest } = action;
-	return { ...rest, transforms: payload, ...baseRevsFor(baseRevs, blockIdsForTransforms(payload)) };
+	const { baseRevs, soleReservation, ...rest } = action;
+	const batchBlockIds = blockIdsForTransforms(payload);
+	const whole = (): boolean => {
+		const inBatch = new Set(batchBlockIds);
+		return blockIdsForTransforms(action.transforms).every(blockId => inBatch.has(blockId));
+	};
+	return {
+		...rest,
+		transforms: payload,
+		...baseRevsFor(baseRevs, batchBlockIds),
+		...(soleReservation === true && whole() ? { soleReservation } : {})
+	};
 }
 
 /** The read one coordinator batch sends downstream: the batch's ids, the caller's context, and the
@@ -1497,6 +1837,7 @@ function downstreamGets(batchBlockIds: BlockId[], blockGets: BlockGets): BlockGe
 		blockIds: batchBlockIds,
 		context: blockGets.context,
 		...(isRecordEmpty(floors) ? {} : { floors }),
+		...(blockGets.skipWindowConsult ? { skipWindowConsult: true } : {}),
 	};
 }
 

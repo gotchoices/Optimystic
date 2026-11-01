@@ -15,6 +15,40 @@ export type Action<T> = {
 
 export type ActionHandler<T, TResult = void> = (action: Action<T>, store: BlockStore<IBlock>) => Promise<TResult>;
 
+/**
+ * What one run of a collection's action handler accepted as ALREADY APPLIED — the answer a handler may
+ * give (`CollectionInitOptions.modules` types every handler as returning one or nothing), summed by
+ * `Collection.stageInto` over the actions it stages and recorded on the sealed segment they belong to
+ * (`SealedSegment.applied`). Today only the tree's `replace` handler counts anything: for each element
+ * whose guard is one of the three already-applied kinds (`TreeAlreadyAppliedGuard` in
+ * `packages/db-core/src/collections/tree/struct.ts`), `alreadyApplied` when the element was skipped
+ * because a rival had made exactly its change, `applied` when it was written or deleted; and `applied`
+ * for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever
+ * they do not refuse and that the SQL layer stages on every main-table element, so a plain insert
+ * beside an already-applied update keeps the entry `applied`. Elements with no guard, or with
+ * `keepExisting` (a skip that says nothing about equality) or `absentRange` — the shapes an index
+ * tree's entries take — are not counted, so {@link ZeroTally} is the tally of an action with no counted
+ * element, and of a handler that returns nothing (`Diary`'s).
+ *
+ * The offline queue sums an entry's tallies over every collection it wrote and reports
+ * `effect: 'already-applied'` on its `committed` status exactly when `alreadyApplied > 0` and
+ * `applied === 0`: every element that could have been already applied was, and at least one was
+ * (docs/offline-sync.md §Guards that make idempotent writes assured). "All, not any", because a host
+ * reading `already-applied` as "none of my guarded changes landed" must be right.
+ */
+export type AlreadyAppliedTally = {
+	readonly alreadyApplied: number;
+	readonly applied: number;
+};
+
+/** The tally of a handler that counted nothing. */
+export const ZeroTally: AlreadyAppliedTally = Object.freeze({ alreadyApplied: 0, applied: 0 });
+
+/** `a + b`, field by field. */
+export function addTallies(a: AlreadyAppliedTally, b: AlreadyAppliedTally): AlreadyAppliedTally {
+	return { alreadyApplied: a.alreadyApplied + b.alreadyApplied, applied: a.applied + b.applied };
+}
+
 export type ActionRev = {
 	actionId: ActionId;
 	rev: number;

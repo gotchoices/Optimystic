@@ -34,10 +34,27 @@ export type ValidationCoordinatorFactory = () => {
 export type BlockStateProvider = (blockId: BlockId) => Promise<BlockActionState | undefined>;
 
 /**
+ * A refusal that judges the transaction itself wrong, marked so (see {@link ValidityRejection}).
+ * `computedHash` is this node's own re-execution result, present once re-execution produced one.
+ */
+function validityRefusal(reason: string, computedHash?: string): ValidationResult {
+	return computedHash === undefined
+		? { valid: false, reason, validity: {} }
+		: { valid: false, reason, computedHash, validity: { computedHash } };
+}
+
+/**
  * Transaction validator implementation.
  *
  * Validates transactions by re-executing them and comparing operations hash.
  * Used by cluster participants when receiving PendRequests.
+ *
+ * Every refusal is classed, because a writer and the dispute path act on the class and must never
+ * read the prose to find it. Five refusals judge the transaction itself wrong and carry
+ * `validity` ({@link validityRefusal}): a tampered stamp, a missing or invalid client signature, a
+ * failed re-execution, and an operations-hash mismatch. The rest carry none: an expired stamp (a
+ * clock judgement), a stale read (out of date — a re-read can win), and an unknown engine, a schema
+ * mismatch or an operations-hash format this node does not produce (this node cannot judge).
  */
 export class TransactionValidator implements ITransactionValidator {
 	constructor(
@@ -56,7 +73,7 @@ export class TransactionValidator implements ITransactionValidator {
 		// a tampered stamp corrupts expiration and engine selection regardless of signatures.
 		const expectedId = await computeStampId(stamp);
 		if (expectedId !== stamp.id) {
-			return { valid: false, reason: 'Tampered transaction stamp' };
+			return validityRefusal('Tampered transaction stamp');
 		}
 
 		// 0. Check expiration before any other work. Ordered BEFORE the signature check so
@@ -73,11 +90,11 @@ export class TransactionValidator implements ITransactionValidator {
 		// both pass — the p2p enforcement flag decides whether to inject the port at all.
 		if (this.verifyClientSignature) {
 			if (transaction.signature === undefined) {
-				return { valid: false, reason: 'Missing client signature' };
+				return validityRefusal('Missing client signature');
 			}
 			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads);
 			if (!this.verifyClientSignature(stamp.peerId, payload, transaction.signature)) {
-				return { valid: false, reason: 'Invalid client signature' };
+				return validityRefusal('Invalid client signature');
 			}
 		}
 
@@ -137,10 +154,7 @@ export class TransactionValidator implements ITransactionValidator {
 			//       skipped by the empty-actions guard.
 			const result = await registration.engine.execute(transaction);
 			if (!result.success) {
-				return {
-					valid: false,
-					reason: `Re-execution failed: ${result.error}`
-				};
+				return validityRefusal(`Re-execution failed: ${result.error}`);
 			}
 
 			// 6. Apply actions to the isolated validation coordinator (builds transforms).
@@ -176,11 +190,7 @@ export class TransactionValidator implements ITransactionValidator {
 						computedHash
 					};
 				}
-				return {
-					valid: false,
-					reason: `Operations hash mismatch`,
-					computedHash
-				};
+				return validityRefusal('Operations hash mismatch', computedHash);
 			}
 
 			return { valid: true, computedHash };

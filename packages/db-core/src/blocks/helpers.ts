@@ -20,7 +20,14 @@ export function apply<T extends IBlock>(store: BlockStore<T>, block: IBlock, op:
  * content-agreement (db-p2p `selectQuorumBlock` candidates) and commit content digests. Keep ONE
  * implementation: a drifted copy reports honest content as forged. */
 export async function canonicalBlockHash(block: IBlock): Promise<string> {
+	return (await canonicalBlockHashAndBytes(block)).hash;
+}
+
+/** {@link canonicalBlockHash}, together with how many bytes it hashed. That count is the block's
+ * `jsonEncodedBytes`: canonical JSON is `JSON.stringify` with object keys reordered, which changes no
+ * length, so one serialization both declares a block's content and measures it. */
+export async function canonicalBlockHashAndBytes(block: IBlock): Promise<{ hash: string; bytes: number }> {
 	const bytes = new TextEncoder().encode(canonicalJson(block));
 	const digest = await sha256.digest(bytes);
-	return uint8ArrayToString(digest.digest, 'base64url');
+	return { hash: uint8ArrayToString(digest.digest, 'base64url'), bytes: bytes.byteLength };
 }

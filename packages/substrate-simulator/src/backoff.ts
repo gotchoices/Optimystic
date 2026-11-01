@@ -100,8 +100,8 @@ export class BackoffAdmission {
 
 /**
  * Per-cohort willingness gossip with ~1-heartbeat staleness (cohort-topic.md §Willingness: "the
- * cohort gossips a coarse willingness vector… refreshed every gossip round. Stale gossip is
- * acceptable"). A member's *live* willingness can flip between heartbeats; the gossiped snapshot
+ * cohort gossips a coarse willingness vector… sent on the next gossip round whenever it changes…
+ * Stale gossip is acceptable"). A member's *live* willingness can flip between heartbeats; the gossiped snapshot
  * only catches up on `refresh()`. Admission routes against the stale snapshot to pick candidate
  * servers but verifies the actually-routed member against its *live* willingness — so a member
  * that just became unwilling while a sibling still gossips it as willing yields `UnwillingMember`,

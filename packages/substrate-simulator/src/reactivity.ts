@@ -59,10 +59,11 @@ export const DEFAULT_REACTIVITY_CONFIG: ReactivityConfig = {
 	dedupeWindow: 64,
 	queueMax: 32,
 	// NOTE: the simulator still models the earlier rotating-anchor design: a 64-entry block and a whole-tree
-	// re-registration wave on every rotation. The live log rotates every `EntriesPerBlock` (32) and, since the
-	// topic became the collection anchor, only the root's direct subscribers re-register. Its rotation figures
-	// (docs/reactivity.md §Worked scenarios) are an upper bound for the current design, not a measurement of it;
-	// re-model before quoting them as one.
+	// re-registration wave on every rotation. The live log rotates every `EntriesPerBlock` (32) entries — sooner
+	// for a log of large entries, which rolls over at `BLOCK_TARGET_BYTES` — and, since the topic became the
+	// collection anchor, only the root's direct subscribers re-register. Its rotation figures (docs/reactivity.md
+	// §Worked scenarios) are an upper bound for the current design on a log of small entries, not a measurement of
+	// it; re-model before quoting them as one, and before quoting them at all for a log of large entries.
 	blockFillSize: 64,
 	tRejoinJitterMs: 30_000,
 	tDrainMs: 60_000,

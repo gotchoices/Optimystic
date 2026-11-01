@@ -7,17 +7,18 @@
  *
  * - **broadcasts** outbound gossip over the injected {@link ICohortGossipTransport} (FRET cohort
  *   gossip underneath — db-core never imports FRET);
- * - **routes by coord**: a delivered frame is fanned to every coord engine's bus on a node, so each
- *   bus merges only the gossip whose `coord` names its own cohort (epoch alone never isolates two
- *   coords — they can share a member set, hence an epoch);
+ * - **subscribes by coord**: the transport decodes each inbound frame once and hands it only to the
+ *   buses subscribed under the `coord` it names; the bus still checks the coord itself before any merge
+ *   (epoch alone never isolates two coords — they can share a member set, hence an epoch);
  * - **merges inbound** gossip — record deltas into the {@link RegistrationStore} (last-writer-wins
  *   by `lastPing`; evictions remove), and willingness/load/summaries into the per-member
  *   {@link CohortView};
  * - **detects epoch drift**: an inbound `cohortEpoch` that differs from the local epoch fires the
  *   drift handlers, and record deltas under a foreign epoch are *not* merged (their slot
  *   assignments belong to a different membership snapshot);
- * - **optionally authenticates** inbound transport frames via an injected {@link GossipInboundVerifier}
- *   (db-p2p binds peer-sig + cohort membership), dropping forged or non-member gossip before any merge.
+ * - **optionally gates** inbound transport frames via an injected {@link GossipInboundVerifier} (db-p2p
+ *   binds cohort membership), dropping non-member gossip before any merge. The frame's signature is the
+ *   transport's job: an authenticating transport verifies it once, before any bus sees the frame.
  *
  * Convergence target (doc): a single gossip round spreads a touched record / willingness flip to all
  * members — one {@link CohortGossipBus.applyInbound} of that gossip makes it visible locally.
@@ -26,8 +27,8 @@
 import { bytesEqual, bytesKey } from "../registration/bytes.js";
 import type { RegistrationStore } from "../registration/types.js";
 import { clampTtl } from "../registration/types.js";
-import type { ICohortGossipTransport, PeerRef, RingCoord } from "../ports.js";
-import { b64urlToBytes, decodeCohortGossipV1, encodeCohortMessage } from "../wire/codec.js";
+import type { ICohortGossipTransport, RingCoord } from "../ports.js";
+import { b64urlToBytes, encodeCohortMessage } from "../wire/codec.js";
 import type { ChildLinkRefV1, CohortGossipV1 } from "../wire/types.js";
 import { fromGossipRecord } from "./records.js";
 import { createCohortView, type CohortView, type MutableCohortView } from "./view.js";
@@ -36,7 +37,7 @@ import { createCohortView, type CohortView, type MutableCohortView } from "./vie
 export type GossipHandler = (g: CohortGossipV1) => void;
 /** Handler for a detected cohort-epoch drift on an inbound gossip. */
 export type DriftHandler = (inboundEpoch: Uint8Array, localEpoch: Uint8Array, from: string) => void;
-/** Authenticity gate for an inbound gossip arriving over the transport — `false` drops the frame. */
+/** The bus's own gate for an inbound gossip arriving over the transport — `false` drops the frame. */
 export type GossipInboundVerifier = (g: CohortGossipV1) => boolean;
 
 export interface CohortGossipBusDeps {
@@ -50,16 +51,16 @@ export interface CohortGossipBusDeps {
 	localEpoch: () => Uint8Array;
 	/** Wall clock for inbound merges via the transport path; injectable for tests. */
 	now?: () => number;
-	/** Frame ceiling for encode/decode (defaults to the codec default). */
+	/** Frame ceiling for outbound encode (defaults to the codec default); inbound frames arrive decoded. */
 	maxMessageBytes?: number;
 	/**
-	 * Optional authenticity gate run on every gossip arriving over the transport (db-p2p binds it to the
-	 * peer-sig primitive: verify `fromMember`'s signature over the gossip image **and** that `fromMember`
-	 * is a member of this coord's cohort). A `false` verdict drops the frame — no merge, no handler fire —
-	 * so a forged or non-member gossip can neither spoof willingness/load nor replicate fake records.
-	 * Absent → the gate is skipped (unit tests / key-less interim mode); the `coord` routing check below
-	 * still runs regardless. Not applied to direct {@link CohortGossipBus.applyInbound} calls (the trusted
-	 * test/internal merge entry point).
+	 * Optional gate run on every gossip arriving over the transport — the bus's own check, after the transport
+	 * has authenticated the frame. db-p2p binds it to cohort membership: `fromMember` must be a member of this
+	 * coord's cohort, so a frame signed by a peer outside the cohort can neither spoof willingness/load nor
+	 * replicate fake records. A `false` verdict drops the frame — no merge, no handler fire. Absent → the gate
+	 * is skipped (unit tests / key-less interim mode); the `coord` routing check below still runs regardless.
+	 * Not applied to direct {@link CohortGossipBus.applyInbound} calls (the trusted test/internal merge entry
+	 * point).
 	 */
 	verifyInbound?: GossipInboundVerifier;
 	/**
@@ -109,7 +110,7 @@ class TransportCohortGossipBus implements CohortGossipBus {
 
 	constructor(private readonly deps: CohortGossipBusDeps) {
 		this.now = deps.now ?? ((): number => Date.now());
-		this.detach = deps.transport.onMessage((_from: PeerRef, msg: Uint8Array) => this.onInbound(msg));
+		this.detach = deps.transport.onGossip(deps.coord, (g: CohortGossipV1) => this.onInbound(g));
 	}
 
 	broadcast(g: CohortGossipV1): void {
@@ -127,10 +128,9 @@ class TransportCohortGossipBus implements CohortGossipBus {
 	}
 
 	applyInbound(g: CohortGossipV1, now: number): void {
-		// Coord routing: a frame is fanned to every coord engine's bus, but it belongs only to the bus
-		// whose coord it names. Drop any gossip for another cohort so it cannot merge into this store/view
-		// (two coords on one node can even share a member set — and thus an epoch — so epoch alone never
-		// isolates them).
+		// Coord routing: a frame belongs only to the bus whose coord it names. Drop any gossip for another
+		// cohort so it cannot merge into this store/view (two coords on one node can even share a member set —
+		// and thus an epoch — so epoch alone never isolates them).
 		if (!this.isOurCoord(g)) {
 			return;
 		}
@@ -164,14 +164,13 @@ class TransportCohortGossipBus implements CohortGossipBus {
 		this.detach();
 	}
 
-	private onInbound(msg: Uint8Array): void {
-		const g = decodeCohortGossipV1(msg, this.deps.maxMessageBytes);
-		// Cheap routing check first so a non-matching coord skips the (expensive) signature verify.
+	private onInbound(g: CohortGossipV1): void {
+		// The transport routes by coord already; this guard keeps a misrouted frame out of the gate and merge.
 		if (!this.isOurCoord(g)) {
 			return;
 		}
-		// Authenticity gate (db-p2p binds peer-sig + cohort membership); a forged/non-member gossip is
-		// dropped before any merge or handler fire. Absent in key-less/unit composition.
+		// The bus's own gate (db-p2p binds cohort membership); a non-member gossip is dropped before any merge
+		// or handler fire. Absent in key-less/unit composition.
 		if (this.deps.verifyInbound !== undefined && !this.deps.verifyInbound(g)) {
 			return;
 		}

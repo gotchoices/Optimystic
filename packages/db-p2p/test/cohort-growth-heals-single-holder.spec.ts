@@ -37,7 +37,6 @@ import { makeSignedProof } from './support/commit-proof-fixtures.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { pipe } from 'it-pipe';
 import { encode as lpEncode, decode as lpDecode } from 'it-length-prefixed';
-import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import type { BlockArchive } from '../src/storage/struct.js';
@@ -85,7 +84,7 @@ const writeRevision = async (repo: StorageRepo, actionId: ActionId, rev: number,
 	};
 	// 4 approving peers against the 0.75 super-majority the receiving services below run.
 	const { proof } = await makeSignedProof(4, commit);
-	const committed = await repo.commit(commit, undefined, proof);
+	const committed = await repo.commit(commit, undefined, { proof });
 	expect(committed.success, `commit of ${actionId} must succeed`).to.equal(true);
 	expect(await repo.getBlockProof(BLOCK_ID, rev),
 		`the cohort proof for rev ${rev} must be retained, or the push it drives cannot be certified`)
@@ -192,7 +191,7 @@ class MockFret {
  * A duplex-shaped stream whose receive side is computed from what the client sent. `ProtocolClient`
  * writes every length-prefixed request frame via `stream.send(...)` BEFORE it starts reading the
  * stream's async iterator, so by first pull the request is complete: LP-decode it, drive the target
- * node's real `BlockTransferService` push/pull handler, and yield the LP-encoded response.
+ * node's real `BlockTransferService` push handler, and yield the LP-encoded response.
  */
 function createLoopbackStream(
 	handle: (request: BlockTransferRequest) => Promise<BlockTransferResponse>
@@ -221,7 +220,7 @@ function createLoopbackStream(
 	};
 }
 
-/** Routes a dial to the target peer's real BlockTransferService (push/pull handlers driven directly). */
+/** Routes a dial to the target peer's real BlockTransferService (its push handler driven directly). */
 class LoopbackPeerNetwork implements IPeerNetwork {
 	private readonly services = new Map<string, BlockTransferService>();
 	dialed: string[] = [];
@@ -239,10 +238,7 @@ class LoopbackPeerNetwork implements IPeerNetwork {
 		const target = this.services.get(peerId.toString());
 		if (!target) throw new Error(`loopback: no service registered for ${peerId.toString()}`);
 		this.dialed.push(peerId.toString());
-		return createLoopbackStream(async (request) =>
-			request.type === 'push'
-				? await (target as any).handlePush(request)
-				: await (target as any).handlePull(request));
+		return createLoopbackStream(async (request) => await (target as any).handlePush(request));
 	}
 }
 
@@ -258,9 +254,9 @@ describe('cohort growth replicates the founder block and makes it readable', fun
 		const aStorage = new MemoryRawStorage();
 		const bStorage = new MemoryRawStorage();
 		const cStorage = new MemoryRawStorage();
-		const aRepo = new StorageRepo(id => new BlockStorage(id, aStorage));
-		const bRepo = new StorageRepo(id => new BlockStorage(id, bStorage));
-		const cRepo = new StorageRepo(id => new BlockStorage(id, cStorage));
+		const aRepo = new StorageRepo(aStorage);
+		const bRepo = new StorageRepo(bStorage);
+		const cRepo = new StorageRepo(cStorage);
 		await writeRevision(aRepo, 'action-1' as ActionId, 1, 'v1');
 
 		const peerA = await makePeerId();

@@ -71,4 +71,14 @@ export type IKeyNetwork = {
 	 * such configuration omit this, which reads as "not awaiting".
 	 */
 	awaitingBootstrapContact?(): Promise<boolean>;
+
+	/**
+	 * Optionally name the peers this node knows serve this network that belong in `key`'s cohort but
+	 * are missing from the cohort `findCluster` assembles now — typically members that are offline or
+	 * unreachable. Peer-id strings, nearest the key first, never this node. A write made without them
+	 * is owed to them, and naming them lets the writer's answer say so (`WriteDurability.unconfirmed`)
+	 * and lets the copy be pushed to them as soon as they reconnect. Implementations that remember no
+	 * such peers omit this, which reads as "none known".
+	 */
+	absentCohortMembers?(key: RoutingKey): Promise<string[]>;
 }
