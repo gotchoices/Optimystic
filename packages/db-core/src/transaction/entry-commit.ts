@@ -102,10 +102,21 @@ export type EntryCommit = {
 export type RefreshParticipant = {
 	readonly collectionId: CollectionId;
 	/** The refresh itself — `Collection.refreshInFlight` for a transaction's participant, the
-	 * handle's `refresh` for an entry's — with the write's own report. */
-	refresh(report: RefreshReport, lastChance: boolean): Promise<void>;
+	 * handle's `refresh` for an entry's — with the write's own report. `tailFloor` is the highest
+	 * revision a responder confirmed is taken under THIS collection, for the refresh's log-tail read
+	 * (see `Collection.updateInternal`); `undefined` when no refusal of it carried one. */
+	refresh(report: RefreshReport, lastChance: boolean, tailFloor: number | undefined): Promise<void>;
 	/** Called after the refresh finished the write's own entry and the round recorded it as saved. */
 	saved?(): void;
+};
+
+/** What one participant's next attempt would request, for the stall check the coordinator's retry
+ * loop runs per participant (`RevisionStallWatch.check`): the revision it would request and the one
+ * it holds (`Collection.getNextRev` and `committedRevision`, or the handle's `nextRev` and `heldRev`). */
+export type NextRevision = {
+	readonly collectionId: CollectionId;
+	readonly requestedRev: number;
+	readonly heldRev: number | undefined;
 };
 
 /**
@@ -187,8 +198,18 @@ export class EntryParticipants {
 	refreshers(): RefreshParticipant[] {
 		return [...this.handles].map(([collectionId, handle]) => ({
 			collectionId,
-			refresh: (report, lastChance) => handle.refresh(report, lastChance),
+			refresh: (report, lastChance, tailFloor) => handle.refresh(report, lastChance, tailFloor),
 			saved: () => this.drop(collectionId),
+		}));
+	}
+
+	/** What every remaining participant's next attempt would request, in sorted order, for the retry
+	 * loop's stall check. Read under the latches the handles hold, so nothing moves it meanwhile. */
+	nextRevisions(): NextRevision[] {
+		return [...this.handles].map(([collectionId, handle]) => ({
+			collectionId,
+			requestedRev: handle.nextRev(),
+			heldRev: handle.heldRev(),
 		}));
 	}
 

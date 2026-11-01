@@ -19,6 +19,7 @@ import {
 	blockIdsForTransforms,
 	TransactionCoordinator,
 	CoordinatorPartialCommitError,
+	CoordinatorRevisionStalledError,
 	CoordinatorStaleLossError,
 	TransactionExpiredError,
 	TransactionSession,
@@ -50,6 +51,7 @@ import {
 	type PendResult,
 	type CommitRequest,
 	type CommitResult,
+	type StaleFailure,
 	type BlockGets,
 	type GetBlockResults,
 	type ActionBlocks,
@@ -4598,6 +4600,101 @@ describe('Transaction', () => {
 			expect(postsTree.hasUnsyncedChanges(), 'the loser is still staged').to.be.true;
 			// The loser alone was re-driven, once per attempt: 2 (attempt 1) + 1 + 1 = 4 commit calls.
 			expect(transactor.commitCalls, 'the loser re-driven once per attempt').to.equal(4);
+			expect((coordinator as any).stampData.has(transaction.stamp.id), 'the report released the stamp').to.be.false;
+		});
+
+		/** A refusal that CONFIRMS a committed rival: the shape `CoordinatorRepo` returns after reading the
+		 * taken revision out of its own storage (`StaleFailure.staleAt`). The block id is one the refused
+		 * collection never wrote, as the single-collection stall tests use, since a request for one
+		 * collection attributes the number to that collection without looking at the block. */
+		const confirmedLoss = (reason: string): StaleFailure =>
+			({ success: false, conflict: true, reason, staleAt: { blockId: 'hot-block', rev: 42 } });
+
+		/** Refuses the poison collection's PEND forever with `refusal`, counting the pends of it, so a
+		 * test can prove how many attempts the coordinator spends before it stops; every other
+		 * collection pends and commits as usual. The pend-phase counterpart of PartialLossTransactor. */
+		class PendLossTransactor extends DelegatingTransactor {
+			pendCalls = 0;
+			constructor(
+				inner: TestTransactor,
+				private readonly poisonCollectionId: string,
+				private readonly refusal: () => PendResult,
+			) { super(inner); }
+			override async pend(request: PendRequest): Promise<PendResult> {
+				const firstInsert = Object.values(request.transforms.inserts ?? {})[0] as IBlock | undefined;
+				if (firstInsert?.header.collectionId === this.poisonCollectionId) {
+					this.pendCalls++;
+					return this.refusal();
+				}
+				return this.inner.pend(request);
+			}
+		}
+
+		it('a clean loss whose refusal keeps confirming a taken revision stops as CoordinatorRevisionStalledError, not after the whole budget', async () => {
+			const inner = new TestTransactor();
+			// 'posts' is refused forever by a responder that CONFIRMS rev 42 is taken, while the refresh
+			// between attempts moves posts nowhere (nothing is committed under it). The next attempt would
+			// request rev 1 again: byte-identical to the one just refused, so the stall rule ends the
+			// commit after `maxStalledAttempts` (2) strikes rather than spending all ten attempts.
+			const transactor = new PendLossTransactor(inner, 'posts', () => confirmedLoss('forced loss: posts'));
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, { maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err).to.be.instanceOf(CoordinatorRevisionStalledError);
+			expect(err, 'a subclass of the stale loss, so existing catches keep working').to.be.instanceOf(CoordinatorStaleLossError);
+			const stalled = err as CoordinatorRevisionStalledError;
+			expect(stalled.collectionId).to.equal('posts');
+			expect(stalled.staleAt).to.deep.equal({ blockId: 'hot-block', rev: 42 });
+			expect(stalled.requestedRev).to.equal(1);
+			expect(stalled.heldRev, 'posts has committed nothing').to.equal(undefined);
+			expect(stalled.failedCollections, 'every participant still to commit').to.deep.equal(['posts', 'users']);
+			// The message names the disagreement, not ordinary contention.
+			expect(stalled.message).to.include('refreshing did not close the gap');
+			expect(stalled.message).to.not.include('lost a stale race');
+			expect(stalled.message).to.not.include('exhausted');
+			// Two pends of posts against the ten the budget allows: the attempt that took the first strike
+			// and the one that took the second.
+			expect(transactor.pendCalls, 'stopped on the second strike').to.equal(2);
+			// Nothing landed anywhere: a refused pend cancels the sibling's.
+			expect((await logActions(usersTree.getCollection())).length).to.equal(0);
+			expect((await logActions(postsTree.getCollection())).length).to.equal(0);
+			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
+		});
+
+		it('a PARTIAL landing whose loser keeps confirming a taken revision is reported as CoordinatorPartialCommitError within maxStalledAttempts', async () => {
+			const inner = new TestTransactor();
+			// 'users' lands on the first attempt; 'posts' is refused forever by a responder that confirms
+			// rev 42 is taken. The partial-retry branch re-drives posts alone, and the stall rule ends it
+			// on the second strike, so the partial landing is reported with the stall as its reason.
+			const transactor = new PartialLossTransactor(inner, 'posts', Infinity, () => confirmedLoss('forced loss: posts'));
+			const { coordinator, usersTree, postsTree, transaction } = await makeMultiCollection(transactor);
+
+			let err: unknown;
+			try {
+				await coordinator.commit(transaction, { maxAttempts: 10, baseBackoffMs: 1, maxBackoffMs: 5 });
+			} catch (e) {
+				err = e;
+			}
+
+			expect(err).to.be.instanceOf(CoordinatorPartialCommitError);
+			const partial = err as CoordinatorPartialCommitError;
+			expect([...partial.committedCollections]).to.deep.equal(['users']);
+			expect([...partial.failedCollections]).to.deep.equal(['posts']);
+			expect(partial.reason).to.be.instanceOf(CoordinatorRevisionStalledError);
+			expect((partial.reason as CoordinatorRevisionStalledError).collectionId).to.equal('posts');
+			expect((partial.reason as CoordinatorRevisionStalledError).failedCollections, 'the winner is no longer a participant').to.deep.equal(['posts']);
+			// Two commits in attempt 1 (users lands, posts refused), then one more before the second strike.
+			expect(transactor.commitCalls, 'stopped on the second strike').to.equal(3);
+			expect((await logActions(usersTree.getCollection())).length, 'the winner logged exactly once').to.equal(1);
+			expect((await logActions(postsTree.getCollection())).length, 'the loser never landed').to.equal(0);
+			expect(usersTree.hasUnsyncedChanges(), 'nothing left to push on the winner').to.be.false;
+			expect(postsTree.hasUnsyncedChanges(), 'the loser is still staged').to.be.true;
 			expect((coordinator as any).stampData.has(transaction.stamp.id), 'the report released the stamp').to.be.false;
 		});
 

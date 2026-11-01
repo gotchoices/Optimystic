@@ -1,3 +1,4 @@
+import type { BlockId } from "../index.js";
 import type { ActionId, ActionRev } from "../collection/action.js";
 import type { ExpiredFailure, RejectedFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
 
@@ -67,13 +68,12 @@ export function isRejectedFailure(failure: WriteFailure): failure is RejectedFai
  * NOTE: comparing revisions across blocks is meaningful only within one collection, where every
  * candidate comes from the same revision counter. A batch (`IRepo.pendMany` / `commitMany`) spans
  * collections, and `CoordinatorRepo` still picks the highest across them, so its `staleAt` names the
- * block — and so the collection — of one loser among several counters. That is harmless while the
- * multi-collection coordinator, the only writer that sends a batch, does not read the number (backlog
- * `debt-multi-collection-retry-cannot-see-the-taken-revision`). A consumer that compares it against a
- * revision counter, as `Collection.syncAttempts` does against its OWN next revision to decide whether a
- * retry could differ (`SyncRevisionStalledError`), must compare it against the counter of the
- * collection owning `staleAt.blockId` — and once one does for a batch, selection must become
- * per-collection.
+ * block — and so the collection — of one loser among several counters. The multi-collection
+ * coordinator, the only writer that sends a batch, therefore attributes a batched answer's number by
+ * its block id ({@link staleAtOwner}): the collection owning `staleAt.blockId` gets the number, and
+ * every other collection of the batch is treated as refused with no confirmed number. The other
+ * collections' losses are understated by that, never overstated — a number is only ever compared
+ * against the counter it came from.
  */
 export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): StaleFailure['staleAt'] {
 	let best: StaleFailure['staleAt'];
@@ -83,6 +83,30 @@ export function highestStaleAt(candidates: readonly StaleFailure['staleAt'][]): 
 		}
 	}
 	return best;
+}
+
+/**
+ * The single rule for attributing a {@link StaleFailure.staleAt} that answered a request spanning
+ * several collections: the one collection whose blocks include `staleAt.blockId`, or `undefined`
+ * when no candidate owns it (a block none of them sent, or no number at all).
+ *
+ * A revision is a per-collection counter, so the number is meaningful only against the counter of
+ * the collection that owns the block it names. A request for ONE collection needs no attribution —
+ * its number is that collection's whatever block it names — so this is for the batched answer
+ * (`IRepo.pendMany` / `commitMany`), where `CoordinatorRepo` reports one number, the highest across
+ * the batch's collections ({@link highestStaleAt}), and only the owner of the named block may count
+ * it as its own.
+ */
+export function staleAtOwner<Owner>(staleAt: StaleFailure['staleAt'], blocksByOwner: ReadonlyMap<Owner, readonly BlockId[]>): Owner | undefined {
+	if (staleAt === undefined) {
+		return undefined;
+	}
+	for (const [owner, blockIds] of blocksByOwner) {
+		if (blockIds.includes(staleAt.blockId)) {
+			return owner;
+		}
+	}
+	return undefined;
 }
 
 /**

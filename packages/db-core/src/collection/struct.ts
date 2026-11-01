@@ -237,7 +237,12 @@ export interface SyncOptions {
 	 * catching up: the refresh moves the revision forward without yet clearing the confirmed
 	 * number, so the next request differs from the one that just failed. Either resets the counter.
 	 * {@link deadlineMs} is still checked first, so a sync that is both past its deadline and
-	 * stalled reports the deadline (as {@link SyncRetryExhaustedError}), not the stall. */
+	 * stalled reports the deadline (as {@link SyncRetryExhaustedError}), not the stall.
+	 *
+	 * `TransactionCoordinator.commit` and `commitEntry` read it too, applying the same rule to each
+	 * participant on its own counter (`RevisionStallWatch`) and stopping with
+	 * `CoordinatorRevisionStalledError` on the first participant to reach it; the offline queue
+	 * forwards it to `commitEntry` (`OfflineQueueOptions.submit`). */
 	maxStalledAttempts?: number;
 	/** Refuse to let this write be committed by a lone node — a coordinator whose cohort for the
 	 * write is only itself — while that node knows of members of the cohort it could not reach, is

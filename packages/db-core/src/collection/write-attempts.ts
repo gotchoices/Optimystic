@@ -1,5 +1,5 @@
 import type { IBlock, BlockId, Action, ActionId, BlockContentDigests, BlockStore, Transforms, WriteDurability, WriteFailure } from "../index.js";
-import type { BlockBaseRevs } from "../network/struct.js";
+import type { BlockBaseRevs, StaleFailure } from "../network/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
 import type { Lane } from "../lane/lane.js";
 import { Log } from "../log/log.js";
@@ -52,29 +52,174 @@ const DefaultMaxBackoffMs = 5000;
  * loser reads a view that moves nowhere for two consecutive rounds. The check only strikes when the
  * refresh made NO progress at all, so a client merely catching up is already excluded; if a
  * spurious `SyncRevisionStalledError` ever shows up under real contention anyway, raise this. */
-const DefaultMaxStalledAttempts = 2;
+export const DefaultMaxStalledAttempts = 2;
+
+/** A revision a responder CONFIRMED is committed under some other action — `StaleFailure.staleAt`
+ * when it is present. A producer sets it only after reading the revision out of its own storage, so
+ * it is evidence, where an absent `staleAt` is merely "no confirmed number". */
+export type ConfirmedRevision = NonNullable<StaleFailure['staleAt']>;
+
+/** What {@link RevisionStallWatch.check} says about the attempt about to run: `clear` (progress, no
+ * evidence, or no news this round), a `strike` counted toward the limit, or `stalled` — the strike
+ * that reaches it, after which the write path throws its own stalled error. */
+export type StallVerdict =
+	| { kind: 'clear' }
+	| { kind: 'strike'; strike: number; of: number; staleAt: ConfirmedRevision }
+	| { kind: 'stalled'; strike: number; of: number; staleAt: ConfirmedRevision };
 
 /**
- * The sleep before the refresh that follows a write's `failures`-th consecutive loss.
+ * The evidence one collection's write gathers from its refusals, and the two rules that read it: the
+ * stall check ({@link check}) and the slot hold ({@link holdsSlot}). One instance per collection per
+ * write. Both retry loops keep one — {@link AttemptCycle} for `Collection.sync` and `commitHead`,
+ * `TransactionCoordinator.commitAttempts` one per participant — so the rule exists once and the two
+ * loops cannot drift (docs/internals.md, "Monotonicity is also what makes a wedged view detectable").
  *
- * The jittered backoff exists to separate a herd of writers that lost the SAME race, so they do not
- * re-collide on the next tick. A loss to a rival that had already committed (the refusal carried a
- * confirmed `staleAt`) is not a herd, and once this write has taken `SlotHoldAfterLosses` such losses
- * (`confirmedLosses`, counted over the whole write as a member counts its stale refusals of one
- * action) the members that refused it hold the next slot for it — so sleeping only spends that hold.
- * Both sides count the same refusals against the same constant, so the writer stops sleeping on the
- * loss after which a member holds, with nothing said over the wire. A loss the latest refusal did not
- * confirm (`latestConfirmed` false — a race against something still in flight) keeps the jitter.
- *
- * NOTE: against members that do not hold (an earlier release, `slotHoldWindowMs: 0`, or a member the
- * refused pends did not reach) this retries without sleeping and so spends the same attempt budget
- * sooner, at about twice one writer's pend rate (measured in the plan stage of
- * `slot-hold-for-an-aged-writer`). Accepted: the backoff bought that writer nothing either, it only
- * delayed the same give-up.
+ * Revisions are per-collection counters, so a confirmed revision is only ever compared against the
+ * counter of the collection that owns it; a caller holding a refusal that covers several collections
+ * attributes the number before noting it (`staleAtOwner` in network/stale-failure.ts).
  */
-function retryBackoffMs(failures: number, confirmedLosses: number, latestConfirmed: boolean,
-	config: JitteredBackoffConfig, rand?: RandFn): number {
-	if (latestConfirmed && confirmedLosses >= SlotHoldAfterLosses) {
+export class RevisionStallWatch {
+	// Highest confirmed revision any responder has reported holding, accumulated with the
+	// codebase's single rule for picking among several candidates. Reported on the error, and the
+	// evidence the stall check reasons from.
+	private highest: ConfirmedRevision | undefined;
+	// Whether the refusal most recently noted carried its OWN staleAt. A strike needs the responder
+	// to have re-confirmed the number this round, not merely an older observation left standing in
+	// `highest`.
+	private latestRefusalConfirmed = false;
+	// Whether the failure most recently handled — the refusal, or a refresh round refused since —
+	// was a loss to a rival already durably committed. Only the attempt's own refusal can say so; a
+	// round refused for a cause that can clear is a race against something still in flight. Read by
+	// the slot hold alone, where `latestRefusalConfirmed` is the stall check's.
+	private latestLossConfirmed = false;
+	// Refused attempts of this write that carried their own staleAt. Never reset: a member counts
+	// its stale refusals per action for the action's whole life, and this is the writer's view of
+	// that count (see holdsSlot).
+	private confirmedLosses = 0;
+	// Consecutive refreshes that moved the requested revision nowhere at all while a confirmed
+	// revision stood at or above it.
+	private consecutiveStalls = 0;
+	// The revision the PREVIOUS attempt would have requested, so the stall check can tell a refresh
+	// that moved nowhere from one that is still climbing toward the confirmed number.
+	private previousRequestedRev: number | undefined;
+
+	constructor(private readonly maxStalledAttempts: number) {}
+
+	/** The highest confirmed revision noted so far, for the write path's error. */
+	get staleAt(): ConfirmedRevision | undefined {
+		return this.highest;
+	}
+
+	/** A refused attempt of this collection: its own confirmed revision, or `undefined` when the
+	 * refusal carried none — a bare refusal, or a refusal of a sibling's batch whose number belongs
+	 * to another collection. */
+	noteRefusal(staleAt: ConfirmedRevision | undefined): void {
+		// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
+		// responder reporting a LOWER number understates the binding constraint. Same rule the
+		// producers and the transactor's aggregation already use.
+		this.highest = highestStaleAt([this.highest, staleAt]);
+		this.latestRefusalConfirmed = staleAt !== undefined;
+		this.latestLossConfirmed = this.latestRefusalConfirmed;
+		if (this.latestRefusalConfirmed) this.confirmedLosses++;
+	}
+
+	/** A refresh round refused for a cause that can clear (a `completion-refused` `TornActionError`):
+	 * the latest loss no longer confirms a committed rival, so the next round sleeps. The stall
+	 * evidence is unchanged — the attempt's own refusal still said what it said. */
+	noteRefusedRound(): void {
+		this.latestLossConfirmed = false;
+	}
+
+	/** Forward progress — an attempt committed, or a refresh finished the write's own entry: the
+	 * stall evidence starts over. `confirmedLosses` is NOT reset: a member counts per action for the
+	 * action's whole life. */
+	noteCommit(): void {
+		this.highest = undefined;
+		this.latestRefusalConfirmed = false;
+		this.latestLossConfirmed = false;
+		this.consecutiveStalls = 0;
+	}
+
+	/**
+	 * The check before an attempt that would request `requestedRev`. It asks: can the attempt about
+	 * to run possibly differ from the one that just failed? Only when BOTH of these hold is the
+	 * answer provably no:
+	 *
+	 *  - `requestedRev` is at or below one a responder CONFIRMED is taken. A producer sets `staleAt`
+	 *    only after reading that revision as durably held by someone else out of its own storage,
+	 *    revisions are one per-collection counter that every commit touches, and a confirmed
+	 *    revision never becomes un-taken (invalidation takes a NEW slot). So the request is already
+	 *    lost before it is sent.
+	 *  - The refresh in between moved the collection nowhere. `advanceContext` never lowers the
+	 *    held revision, so "nowhere" is exactly `requestedRev` unchanged since the last attempt. A
+	 *    refresh that moved forward WITHOUT clearing the confirmed number is a collection still
+	 *    climbing (it read a replica that lags the holder — the same partial catch-up
+	 *    `reportShortfall` exists to report), and its next attempt is a genuinely different request
+	 *    that may yet win.
+	 *
+	 * This is NOT a second answer to "is this failure retryable?" — `isConflictFailure` remains the
+	 * sole rule for that, untouched. It only ever stops a loop that rule had already decided to
+	 * continue. Called once before EVERY attempt, the first included, so the previous requested
+	 * revision is always the one the attempt just refused asked for.
+	 */
+	check(requestedRev: number): StallVerdict {
+		const refreshMoved = this.previousRequestedRev !== undefined && requestedRev > this.previousRequestedRev;
+		this.previousRequestedRev = requestedRev;
+		if (this.highest === undefined) {
+			return { kind: 'clear' };
+		}
+		if (requestedRev > this.highest.rev || refreshMoved) {
+			// Either the refresh adopted a revision above the confirmed one — ordinary contention,
+			// where the rival's commit is exactly what we just read — or it made partial forward
+			// progress. Both mean the next attempt differs. Not a stall.
+			this.consecutiveStalls = 0;
+			return { kind: 'clear' };
+		}
+		if (!this.latestRefusalConfirmed) {
+			// The responder told us nothing new this round. No strike, and no reset either — the
+			// budget stays bounded by maxAttempts.
+			return { kind: 'clear' };
+		}
+		this.consecutiveStalls++;
+		// Two strikes, not one: a legitimate loser can transiently read a view that has not yet
+		// caught up with the rival's commit, which looks identical for one round.
+		const kind = this.consecutiveStalls >= this.maxStalledAttempts ? 'stalled' : 'strike';
+		return { kind, strike: this.consecutiveStalls, of: this.maxStalledAttempts, staleAt: this.highest };
+	}
+
+	/**
+	 * Whether the members that refused this write hold the next slot for it, so its retry should
+	 * follow with no sleep. The jittered backoff exists to separate a herd of writers that lost the
+	 * SAME race, so they do not re-collide on the next tick. A loss to a rival that had already
+	 * committed (the refusal carried a confirmed `staleAt`) is not a herd, and once this write has
+	 * taken `SlotHoldAfterLosses` such losses (`confirmedLosses`, counted over the whole write as a
+	 * member counts its stale refusals of one action) the members that refused it hold the next slot
+	 * for it — so sleeping only spends that hold. Both sides count the same refusals against the same
+	 * constant, so the writer stops sleeping on the loss after which a member holds, with nothing
+	 * said over the wire. A loss the latest refusal did not confirm (a race against something still
+	 * in flight) keeps the jitter.
+	 *
+	 * NOTE: against members that do not hold (an earlier release, `slotHoldWindowMs: 0`, or a member
+	 * the refused pends did not reach) the write retries without sleeping and so spends the same
+	 * attempt budget sooner, at about twice one writer's pend rate (measured in the plan stage of
+	 * `slot-hold-for-an-aged-writer`). Accepted: the backoff bought that writer nothing either, it
+	 * only delayed the same give-up.
+	 */
+	holdsSlot(): boolean {
+		return this.latestLossConfirmed && this.confirmedLosses >= SlotHoldAfterLosses;
+	}
+
+	/** The highest confirmed revision, as the floor of the refresh's log-tail read, so a machine
+	 * that has not caught up to it is not the last one asked (see `Collection.updateInternal`). */
+	tailFloor(): number | undefined {
+		return this.highest?.rev;
+	}
+}
+
+/** The sleep before the refresh that follows a write's `failures`-th consecutive loss: none while a
+ * member holds the next slot for this write ({@link RevisionStallWatch.holdsSlot}), else jittered. */
+function retryBackoffMs(failures: number, watch: RevisionStallWatch, config: JitteredBackoffConfig, rand?: RandFn): number {
+	if (watch.holdsSlot()) {
 		return 0;
 	}
 	return jitteredBackoffMs(failures - 1, config, rand);
@@ -261,7 +406,6 @@ export type Refresh = (report: RefreshReport, lastChance: boolean, tailFloor: nu
  */
 export class AttemptCycle {
 	private readonly maxAttempts: number;
-	private readonly maxStalledAttempts: number;
 	private readonly backoff: JitteredBackoffConfig;
 	private readonly deadlineMs: number | undefined;
 	private readonly signal: AbortSignal | undefined;
@@ -273,24 +417,8 @@ export class AttemptCycle {
 	// sync (which iterates many times committing progress) never trips it.
 	private consecutiveFailures = 0;
 	private lastReason: string | undefined;
-	// Highest confirmed revision any responder has reported holding, accumulated with the
-	// codebase's single rule for picking among several candidates. Reported on the error, and
-	// the evidence the stall check reasons from.
-	private lastStaleAt: { blockId: BlockId; rev: number } | undefined;
-	// Whether the failure most recently handled carried its OWN staleAt. A strike needs the
-	// responder to have re-confirmed the number this round, not merely an older observation
-	// left standing in `lastStaleAt`.
-	private lastFailureConfirmedStaleAt = false;
-	// Refused attempts of this write that carried their own staleAt. Never reset: a member counts
-	// its stale refusals per action for the action's whole life, and this is the writer's view of
-	// that count (see retryBackoffMs).
-	private confirmedLosses = 0;
-	// Consecutive refreshes that moved the requested revision nowhere at all while a confirmed
-	// revision stood at or above it.
-	private consecutiveStalls = 0;
-	// The revision the PREVIOUS attempt would have requested, so the stall check can tell a
-	// refresh that moved nowhere from one that is still climbing toward the confirmed number.
-	private previousRequestedRev: number | undefined;
+	// What the responders confirmed, and the two rules that read it (the stall check, the slot hold).
+	private readonly watch: RevisionStallWatch;
 
 	/** Who holds what the write has committed so far. Stays `undefined` while nothing has been
 	 * committed, which is also the answer when no attempt runs at all — a write with nothing staged
@@ -307,7 +435,7 @@ export class AttemptCycle {
 		options?: SyncOptions,
 	) {
 		this.maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
-		this.maxStalledAttempts = options?.maxStalledAttempts ?? DefaultMaxStalledAttempts;
+		this.watch = new RevisionStallWatch(options?.maxStalledAttempts ?? DefaultMaxStalledAttempts);
 		this.backoff = {
 			baseMs: options?.baseBackoffMs ?? PendingRetryDelayMs,
 			capMs: options?.maxBackoffMs ?? DefaultMaxBackoffMs,
@@ -327,27 +455,9 @@ export class AttemptCycle {
 
 	/**
 	 * The checks that run before an attempt is built: the abort signal, the wall-clock deadline, and
-	 * the stall check. The deadline comes before the stall check deliberately: it is the documented
-	 * outer bound, so a write that is both past it and stalled reports the deadline.
-	 *
-	 * The stall check asks: can the attempt about to run possibly differ from the one that just
-	 * failed? Only when BOTH of these hold is the answer provably no:
-	 *
-	 *  - `requestedRev` is at or below one a responder CONFIRMED is taken. A producer sets `staleAt`
-	 *    only after reading that revision as durably held by someone else out of its own storage,
-	 *    revisions are one per-collection counter that every commit touches, and a confirmed
-	 *    revision never becomes un-taken (invalidation takes a NEW slot). So the request is already
-	 *    lost before it is sent.
-	 *  - The refresh in between moved the collection nowhere. `advanceContext` never lowers the
-	 *    held revision, so "nowhere" is exactly `requestedRev` unchanged since the last attempt. A
-	 *    refresh that moved forward WITHOUT clearing the confirmed number is a collection still
-	 *    climbing (it read a replica that lags the holder — the same partial catch-up
-	 *    `reportShortfall` exists to report), and its next attempt is a genuinely different request
-	 *    that may yet win.
-	 *
-	 * This is NOT a second answer to "is this failure retryable?" — `isConflictFailure` remains the
-	 * sole rule for that, untouched. It only ever stops a loop that rule had already decided to
-	 * continue.
+	 * the stall check ({@link RevisionStallWatch.check}). The deadline comes before the stall check
+	 * deliberately: it is the documented outer bound, so a write that is both past it and stalled
+	 * reports the deadline.
 	 *
 	 * @param requestedRev the revision the attempt would request (`Collection.getNextRev`).
 	 * @param heldRev the revision the collection holds, for the stall report.
@@ -357,34 +467,21 @@ export class AttemptCycle {
 			throw makeAbortError(this.signal);
 		}
 		if (this.pastDeadline()) {
-			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason ?? 'deadline exceeded', this.lastStaleAt);
+			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason ?? 'deadline exceeded', this.watch.staleAt);
 		}
-		const refreshMoved = this.previousRequestedRev !== undefined && requestedRev > this.previousRequestedRev;
-		this.previousRequestedRev = requestedRev;
-		if (this.lastStaleAt === undefined) {
+		const verdict = this.watch.check(requestedRev);
+		if (verdict.kind === 'clear') {
 			return;
 		}
-		if (requestedRev > this.lastStaleAt.rev || refreshMoved) {
-			// Either the refresh adopted a revision above the confirmed one — ordinary contention,
-			// where the rival's commit is exactly what we just read — or it made partial forward
-			// progress. Both mean the next attempt differs. Not a stall.
-			this.consecutiveStalls = 0;
-		} else if (this.lastFailureConfirmedStaleAt) {
-			this.consecutiveStalls++;
-			if (log.enabled) {
-				log('collection:sync-stalled id=%s tag=%s heldRev=%s requestedRev=%d staleBlock=%s staleRev=%d strike=%d of=%d',
-					this.collectionId, this.instanceTag, heldRev ?? 'none', requestedRev,
-					this.lastStaleAt.blockId, this.lastStaleAt.rev, this.consecutiveStalls, this.maxStalledAttempts);
-			}
-			// Two strikes, not one: a legitimate loser can transiently read a view that has not yet
-			// caught up with the rival's commit, which looks identical for one round.
-			if (this.consecutiveStalls >= this.maxStalledAttempts) {
-				throw new SyncRevisionStalledError(this.collectionId, this.consecutiveFailures, this.lastStaleAt,
-					requestedRev, heldRev, this.lastReason);
-			}
+		if (log.enabled) {
+			log('collection:sync-stalled id=%s tag=%s heldRev=%s requestedRev=%d staleBlock=%s staleRev=%d strike=%d of=%d',
+				this.collectionId, this.instanceTag, heldRev ?? 'none', requestedRev,
+				verdict.staleAt.blockId, verdict.staleAt.rev, verdict.strike, verdict.of);
 		}
-		// Else: the responder told us nothing new this round. No strike, and no reset either — the
-		// budget stays bounded by maxAttempts.
+		if (verdict.kind === 'stalled') {
+			throw new SyncRevisionStalledError(this.collectionId, this.consecutiveFailures, verdict.staleAt,
+				requestedRev, heldRev, this.lastReason);
+		}
 	}
 
 	/**
@@ -427,14 +524,9 @@ export class AttemptCycle {
 		}
 		this.consecutiveFailures++;
 		this.lastReason = refusal.reason ?? this.lastReason;
-		// Highest-wins, not last-wins: the next request has to clear EVERY holder, so a later
-		// responder reporting a LOWER number understates the binding constraint. Same rule the
-		// producers and the transactor's aggregation already use.
-		this.lastStaleAt = highestStaleAt([this.lastStaleAt, refusal.staleAt]);
-		this.lastFailureConfirmedStaleAt = refusal.staleAt !== undefined;
-		if (this.lastFailureConfirmedStaleAt) this.confirmedLosses++;
+		this.watch.noteRefusal(refusal.staleAt);
 		if (this.consecutiveFailures >= this.maxAttempts) {
-			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason, this.lastStaleAt);
+			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason, this.watch.staleAt);
 		}
 	}
 
@@ -445,9 +537,7 @@ export class AttemptCycle {
 		this.durability = this.durability === undefined ? durability : mergeDurability([this.durability, durability]);
 		this.consecutiveFailures = 0;
 		this.lastReason = undefined;
-		this.lastStaleAt = undefined;
-		this.lastFailureConfirmedStaleAt = false;
-		this.consecutiveStalls = 0;
+		this.watch.noteCommit();
 	}
 
 	/**
@@ -484,18 +574,14 @@ export class AttemptCycle {
 	 * @throws TornActionError with any reason but an unsettled `completion-refused`, and that one too
 	 * once the budget or the deadline is spent; whatever else the refresh throws. */
 	async refreshUntilSettled(refresh: Refresh): Promise<boolean> {
-		// Whether the failure just handled was a loss to a rival already durably committed. Only the
-		// attempt's own refusal can say so; a refresh refused for a cause that can clear (below) is a
-		// race against something still in flight, and clears it.
-		let latestConfirmed = this.lastFailureConfirmedStaleAt;
 		for (;;) {
 			const delay = this.consecutiveFailures === 0
 				? 0
-				: retryBackoffMs(this.consecutiveFailures, this.confirmedLosses, latestConfirmed, this.backoff, this.rand);
+				: retryBackoffMs(this.consecutiveFailures, this.watch, this.backoff, this.rand);
 			await abortableDelay(delay, this.signal);
 			try {
 				const report: RefreshReport = {};
-				await refresh(report, this.consecutiveFailures + 1 >= this.maxAttempts, this.lastStaleAt?.rev);
+				await refresh(report, this.consecutiveFailures + 1 >= this.maxAttempts, this.watch.tailFloor());
 				const completed = report.ownEntryFinished?.durability;
 				if (completed !== undefined) {
 					this.recordCommit(completed);
@@ -510,7 +596,7 @@ export class AttemptCycle {
 				// the log holds an entry for a write that was not saved.
 				this.consecutiveFailures++;
 				this.lastReason = err.detail;
-				latestConfirmed = false;
+				this.watch.noteRefusedRound();
 				if (this.consecutiveFailures >= this.maxAttempts || this.pastDeadline()) {
 					throw err;
 				}

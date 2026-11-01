@@ -378,9 +378,11 @@ list. Five rules follow from the split:
   collections — the plugin's open SQL transaction — and the collection latch is what serialises
   them), and no expiry check. It requires `pendValidation: 'none'`, as the coordinator
   `commitBatchLegacy` builds is, since an entry has no statements for a member to re-execute. Its
-  refresh rounds refresh the entry's participants only, never the coordinator's whole map, and pass
-  no tail floor (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision` covers the
-  slice too). `packages/db-core/test/coordinator-entry-commit.spec.ts` pins it.
+  refresh rounds refresh the entry's participants only, never the coordinator's whole map, and each
+  participant's refresh carries as its tail floor the highest revision a refusal of that participant
+  confirmed is taken (`RetryBudget.tailFloor` in `packages/db-core/src/transaction/coordinator.ts`,
+  the same floor `Collection.syncAttempts` passes), so a coordinator behind the rival is not the
+  only machine asked. `packages/db-core/test/coordinator-entry-commit.spec.ts` pins it.
 
 `packages/db-core/test/collection-segments.spec.ts` pins each of the head commit's rules.
 
@@ -552,11 +554,13 @@ with the revision it needed one hop away. Three choices keep it narrow:
   [debugging.md](debugging.md#the-write-paths-report-of-the-same-failure)).
 
 A reader's `update()` and a refresh that follows no refusal carry no tail floor.
-`TransactionCoordinator.commit`'s refresh has none to pass today — its loop loses the number before
-the refresh runs (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision`) — and
-`Collection.refreshInFlight` takes it as an optional argument for when it does. A tail floor helps a
-client that is merely *behind*; on a forked lineage the refused revision exists on the rival's
-history, and the refresh that reaches it reports `collection:lineage-divergence` (backlog
+`TransactionCoordinator.commit`'s refresh between attempts passes each participant its own: the
+highest revision a refusal of THAT collection confirmed, kept per participant by the retry loop
+(`RetryBudget.tailFloor` in `packages/db-core/src/transaction/coordinator.ts`) and handed to
+`Collection.refreshInFlight`, so a registered collection that is not a participant, and a
+participant none of whose refusals carried a number, read their tail unfloored as before. A tail
+floor helps a client that is merely *behind*; on a forked lineage the refused revision exists on the
+rival's history, and the refresh that reaches it reports `collection:lineage-divergence` (backlog
 `feat-replay-mode-collections-merge-divergent-histories`) — in one round now, instead of never.
 
 What this deliberately does not do. When *every* reachable coordinator is below the floor the old
@@ -2984,7 +2988,17 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   the same partial refresh `context-short-of-tail` below reports). The error names the
   disagreement; it does **not** make the write land, and `sync` deliberately never adopts the
   confirmed number to get past it — `staleAt` is a bare revision, not content, so submitting staged
-  transforms at a revision built on unread history would overwrite that history silently.
+  transforms at a revision built on unread history would overwrite that history silently. The rule
+  exists once, as `RevisionStallWatch` in `packages/db-core/src/collection/write-attempts.ts`, and
+  the multi-collection loop (`TransactionCoordinator.commit` and `commitEntry`, through
+  `RetryBudget` in `packages/db-core/src/transaction/coordinator.ts`) applies it per participant on
+  that participant's own counter: a batched refusal's one number is attributed to the collection
+  owning the block it names (`staleAtOwner` in `packages/db-core/src/network/stale-failure.ts`), a
+  refusal that carried no number strikes nobody, and the first participant to reach the limit ends
+  the commit with `CoordinatorRevisionStalledError` (reported as `commit:revision-stalled`) — inside
+  a `CoordinatorPartialCommitError` as its `reason` when a sibling has already landed. The same
+  per-participant evidence is what floors its refresh's tail read and skips the backoff while a
+  member holds the next slot for it.
 - Monotonicity means a refresh can end **below** where it started looking. `updateInternal` reads
   the committed tail's revision (the authoritative "latest committed under this id") before the
   walk, and compares it against where the walk left the collection; landing short means the refresh

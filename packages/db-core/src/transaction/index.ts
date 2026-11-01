@@ -37,7 +37,7 @@ export {
 export { ReadDependencyCollector } from './read-dependency-collector.js';
 export { TransactionCoordinator } from './coordinator.js';
 export type { CoordinatorOptions, PendValidationMode } from './coordinator.js';
-export { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from './errors.js';
+export { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError, CoordinatorRevisionStalledError } from './errors.js';
 export { classifyCommitFailure, isCohortUnreachableRead, refusalReason } from './commit-failure-class.js';
 export type { CommitFailureClass } from './commit-failure-class.js';
 export { transactionDurability, recordCollectionDurability } from './durability.js';

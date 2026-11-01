@@ -169,12 +169,19 @@ This document describes the architecture for multi-collection transactions in Op
 >   **automatically** by `coordinator.commit()`: a bounded, jittered backoff retry
 >   that re-reads each collection to fresh revisions between attempts (the same
 >   default policy as `Collection.sync` — see
->   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts) — save one
->   difference: `Collection.sync` stops sleeping once a write has lost
->   `SlotHoldAfterLosses` attempts to confirmed committed revisions, the latest included,
->   because cohort members then hold the next slot for it (`retryBackoffMs` in
->   `packages/db-core/src/collection/write-attempts.ts`); the coordinator loop cannot
->   see the confirmed revision yet and keeps backing off). Only once
+>   [`utility/backoff.ts`](../packages/db-core/src/utility/backoff.ts), including the
+>   rule that stops sleeping once a write has lost `SlotHoldAfterLosses` attempts to
+>   confirmed committed revisions, the latest included, because cohort members then hold
+>   the next slot for it — `RevisionStallWatch` in
+>   `packages/db-core/src/collection/write-attempts.ts`, which the coordinator keeps per
+>   participant and reads for any participant still to commit). The confirmed revisions
+>   each participant's refusals carried also end the commit early on a wedge: a participant
+>   whose refresh moves it nowhere while a responder keeps confirming a revision at or above
+>   the one it would request next is re-sending a request that is already lost, and after
+>   `maxStalledAttempts` such strikes (default 2) the commit stops with
+>   [`CoordinatorRevisionStalledError`](../packages/db-core/src/transaction/errors.ts), the
+>   coordinator's `SyncRevisionStalledError`, rather than spending the rest of the budget.
+>   Only once
 >   the retry budget (`maxAttempts` / optional `deadlineMs`, tunable via the
 >   `SyncOptions` passed to `commit`/`session.commit`) is exhausted does it throw a
 >   [`CoordinatorStaleLossError`](../packages/db-core/src/transaction/errors.ts),

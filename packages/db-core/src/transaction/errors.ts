@@ -1,4 +1,5 @@
 import type { CollectionId } from "../collection/index.js";
+import type { ConfirmedRevision } from "../collection/write-attempts.js";
 import type { WriteDurability } from "../network/struct.js";
 import { transactionDurability, type TransactionDurability } from "./durability.js";
 
@@ -119,6 +120,13 @@ export class CoordinatorStaleLossError extends Error {
 		public readonly failedCollections: readonly CollectionId[],
 		/** The underlying stale/conflict reason surfaced by the failed pend/commit phase. */
 		public readonly reason?: string,
+		/** Per collection, the revision a responder CONFIRMED is committed under another action
+		 * (`StaleFailure.staleAt`), for every failed collection whose refusal carried one. A collection
+		 * refused with no confirmed number, cancelled because a sibling was refused, or refused in a
+		 * batch whose number belongs to a sibling (see `staleAtOwner`) has no entry. Revisions are
+		 * per-collection counters, which is why this is a map and not one number; the coordinator's
+		 * retry loop reads each entry against its own collection's next revision (`RevisionStallWatch`). */
+		public readonly staleAtByCollection: ReadonlyMap<CollectionId, ConfirmedRevision> = new Map(),
 	) {
 		// Deliberately does not assert that nothing committed: this is also the internal signal a
 		// half-landed attempt retries on, and it then surfaces as a partial error's `reason`.
@@ -127,6 +135,58 @@ export class CoordinatorStaleLossError extends Error {
 			(reason ? ` — ${reason}` : '')
 		);
 		this.name = 'CoordinatorStaleLossError';
+	}
+}
+
+/**
+ * Thrown by {@link TransactionCoordinator.commit} and {@link TransactionCoordinator.commitEntry}
+ * when refreshing repeatedly moved one participant nowhere at all while a responder confirmed a
+ * revision at or above the one that participant's next attempt would request — the client's view
+ * of that collection disagrees with the cluster's, and retrying would re-send the identical taken
+ * number. The multi-collection counterpart of `SyncRevisionStalledError`, decided by the same rule
+ * per participant (`RevisionStallWatch` in `packages/db-core/src/collection/write-attempts.ts`,
+ * `SyncOptions.maxStalledAttempts` strikes), and reported as `commit:revision-stalled`.
+ *
+ * The distinction from plain stale-loss exhaustion matters because the two failures need different
+ * responses: a budget spent on lost races can succeed on a later try, where this one is provably
+ * identical on every remaining attempt, so the caller's view of {@link collectionId} has to be
+ * repaired first. The coordinator deliberately does NOT adopt the confirmed revision to get past
+ * it, for the reason `SyncRevisionStalledError` gives.
+ *
+ * Extends {@link CoordinatorStaleLossError} so existing catches keep working and
+ * `classifyCommitFailure` files it as `contention`, the choice `SyncRevisionStalledError` made by
+ * subclassing exhaustion. Like any error escaping the retry loop after a participant was saved, it
+ * surfaces inside a {@link CoordinatorPartialCommitError} as its `reason`.
+ */
+export class CoordinatorRevisionStalledError extends CoordinatorStaleLossError {
+	constructor(
+		/** The participant whose view is wedged. */
+		public readonly collectionId: CollectionId,
+		/** The confirmed revision the stall is based on: the block a responder named, and the
+		 * revision it reported that block already committed at, under {@link collectionId}'s counter. */
+		public readonly staleAt: ConfirmedRevision,
+		/** The revision the participant's next attempt would have requested. */
+		public readonly requestedRev: number,
+		/** The revision this client holds for the participant; `undefined` for a collection that has
+		 * committed nothing. */
+		public readonly heldRev: number | undefined,
+		/** Losses the commit took before stopping — attempts refused, and refresh rounds refused for a
+		 * cause that can clear. */
+		public readonly attempts: number,
+		/** Every participant still to commit when the commit stopped, the wedged one included. */
+		failedCollections: readonly CollectionId[],
+		/** The last refusal's reason, when one was given. */
+		reason?: string,
+	) {
+		super(failedCollections, reason, new Map([[collectionId, staleAt]]));
+		// The base class's "lost a stale race" wording is deliberately NOT reused: it reads as
+		// ordinary contention, which is exactly the misdiagnosis this class exists to prevent.
+		this.message = `Multi-collection commit stopped after ${attempts} attempts: `
+			+ `this client holds rev ${heldRev ?? 'none'} of collection ${collectionId} and would request rev ${requestedRev}, `
+			+ `but block ${staleAt.blockId} is confirmed committed at rev ${staleAt.rev} and `
+			+ `refreshing did not close the gap`
+			+ (reason ? `: ${reason}` : '');
+		this.name = 'CoordinatorRevisionStalledError';
 	}
 }
 

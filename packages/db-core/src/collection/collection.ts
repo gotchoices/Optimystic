@@ -920,10 +920,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * ask for another (see {@link completeOwnEntry}).
 	 *
 	 * `tailFloor` is optional: a revision a responder confirmed is taken, when the caller has one (see
-	 * {@link updateInternal}). `TransactionCoordinator.commit` has none to pass today — its commit loop
-	 * does not see the confirmed revision (backlog:
-	 * debt-multi-collection-retry-cannot-see-the-taken-revision) — and this is the parameter it will
-	 * pass it through. */
+	 * {@link updateInternal}). `TransactionCoordinator.commit` passes the highest one its refusals of
+	 * THIS collection carried (`RetryBudget.tailFloor`), and nothing for a collection none did. */
 	async refreshInFlight(report: RefreshReport, lastChance: boolean, tailFloor?: number): Promise<void> {
 		const release = await Latches.acquire(this.latchId);
 		try {

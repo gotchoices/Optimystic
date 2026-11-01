@@ -110,6 +110,7 @@ Both reporters on GitHub issue #8 found that turning debug logging on roughly do
 | `batch-coordinator`   | Batch creation, retry paths, excluded peers       |
 | `cache`               | Block cache hit/miss                              |
 | `collection`          | `collection:invented` (`createOrOpen` found no committed header and staged a fresh empty collection), plus the read path's `collection:context-short-of-tail` / `collection:context-not-lowered` / `collection:lineage-divergence` / `collection:block-below-floor` and the write path's `collection:sync-stalled` / `collection:tail-below-floor` / `collection:restage-moved-base`, and the offline-sync segments' `collection:sealed-segment-refused` (a queued entry's segment no longer applies over the committed state; reported once to `onSealedRefused`) / `collection:refusal-callback-threw` / `collection:refresh-deferred-to-head-commit` (a refresh walked into this handle's own head commit while its answer was still on the network, and changed nothing) / `collection:committed-head-tally-missing` (a head segment was committed without a recorded staging, so its `onCommittedHead` hook heard the zero tally; a defect) / `collection:committed-head-callback-threw` |
+| `trx:coordinator`     | The multi-collection commit (`TransactionCoordinator` in `packages/db-core/src/transaction/coordinator.ts`): the phase timings, `commit:partial-retry` / `commitEntry:partial-retry` (a sibling landed while this collection was refused, and the refused one is re-driven alone), `commit:partial-after-refresh` (what a failure after a participant was saved is reported over), and `commit:revision-stalled` — the coordinator's `collection:sync-stalled`, per participant (see [the write path's report of the same failure](#the-write-paths-report-of-the-same-failure)) |
 | `hlc`                 | The node's hybrid logical clock (`HlcClock` in `packages/db-core/src/hlc/clock.ts`): `hlc:load-failed` and `hlc:load-malformed` (the stored high-water mark could not be read, or was not an HLC; the clock started from the local clock alone, so a node restarted with its wall clock behind may issue HLCs below ones it issued before), and `hlc:save-failed` (the store refused a save of the mark; the next save, at least a second of advance later, retries it). What the clock observes and why is in [crdt-sync.md §Stage 1](crdt-sync.md#stage-1--introduce-hlc-on-every-transaction) |
 | `offline`             | The offline-sync queue (`OfflineQueue` in `packages/db-core/src/offline/queue.ts`): `offline:unclassified-failure` (an attempt failed with an error the classifier cannot name; the entry is re-driven under the same action id and the failure counted in `OfflineQueueState.unclassifiedFailures`), `offline:expiry-deferred` (an entry past `expireAfterMs` is in doubt and kept until its outcome is known), `offline:journal-write-failed` (the journal threw at the step named by `step=`: at `queued` the enqueue fails and nothing is queued; at `send` nothing was sent and the entry waits out the backoff; at `partial-commit`, `renewal` and `settled` the drain goes on — the next send rewrites the drive record, and a restart resolves a stale settled record), `offline:partially-committed` (a multi-collection entry landed in part; re-driven under the same id for what is left), `offline:restored-already-committed` (an entry put back after a restart whose every collection already held its attempt committed; settled at once, nothing sent), `offline:restore-rollback-drop-failed` (a restore whose staging threw could not drop a segment it had already put in place; the segment stays, and the stage's own error is what the caller hears), `offline:refusal-for-unknown-entry` (a collection reported a refusal for an entry this queue does not hold — another queue's, or one already removed), `offline:reachability-threw` (the gate threw; read as closed until the next re-check), `offline:listener-threw` (a status or queue-state listener threw; isolated, the drain goes on), and `offline:drain-stopped` (the drain met a defect — a `SealedSegmentsError` out of a submission, a removal that threw — and stopped; `whenDrained` rejects with it and `enqueue` refuses) |
 
@@ -698,6 +699,24 @@ catching up off a lagging replica moves `requestedRev` forward without yet clear
 which is still a different request from the one that failed. Either resets the counter, so a rising
 `requestedRev` across attempts is the signature of a sync that is behind rather than wedged —
 `collection:context-short-of-tail` on the same namespace is the read side of that same story.
+
+A write that spans several collections reports the same finding from the coordinator's loop, once
+per participant and on its own namespace:
+
+```
+optimystic:db-core:trx:coordinator commit:revision-stalled tx=k3Vq…A collection=default/main/Usage/index/by_token heldRev=none requestedRev=1 staleBlock=hot-block staleRev=42 strike=1 of=2
+```
+
+Same rule, same fields, with `tx=` (the transaction's action id) and `collection=` (the participant
+being judged) in place of `id=` and `tag=`. Revisions are per-collection counters, so a refusal that
+answered several collections at once is attributed to the one collection owning the block it names
+(`staleAtOwner` in `packages/db-core/src/network/stale-failure.ts`), and only that participant can
+take the strike; a participant refused with no confirmed number, or cancelled because a sibling was
+refused, never does. At `strike == of` the commit throws `CoordinatorRevisionStalledError` — inside
+a `CoordinatorPartialCommitError` as its `reason` when a sibling collection has already landed (a
+`commit:partial-retry` line will have come first). The multi-collection loop keeps the whole budget
+only when no refusal confirms a revision; see the
+[`optimystic:db-core:trx:coordinator` row](#db-core-sub-namespaces).
 
 **What it does not do.** Sync deliberately does not adopt `staleRev` to get unstuck. That number is
 a bare revision, not content: submitting the writer's staged changes at a revision built on history

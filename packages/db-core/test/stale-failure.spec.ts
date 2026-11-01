@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { isConflictFailure } from '../src/network/stale-failure.js';
+import { isConflictFailure, staleAtOwner } from '../src/network/stale-failure.js';
 import type { ActionPending, ActionTransforms, StaleFailure } from '../src/index.js';
 
 /**
@@ -121,4 +121,41 @@ describe('StaleFailure.staleAt over the wire', () => {
 		// Same retry decision as the version that carried the number: absence is not a signal.
 		expect(isConflictFailure(roundTripped)).to.equal(isConflictFailure(failure));
 	});
+});
+
+/**
+ * Pins `staleAtOwner`, the rule the multi-collection coordinator attributes a batched refusal's one
+ * confirmed revision with. A batch spans collections, each with its own revision counter, so the
+ * number belongs to the collection owning the block it names and to no other — a number of `posts`
+ * must never strike `users`.
+ */
+describe('staleAtOwner', () => {
+	const blocksByCollection = new Map<string, readonly string[]>([
+		['users', ['users/header', 'users/log', 'users/leaf']],
+		['posts', ['posts/header', 'posts/log', 'posts/leaf']],
+	]);
+
+	const cases: { name: string; staleAt: StaleFailure['staleAt']; expected: string | undefined }[] = [
+		{
+			name: 'a block of the second collection maps to the second collection',
+			staleAt: { blockId: 'posts/log', rev: 42 },
+			expected: 'posts'
+		},
+		{
+			name: 'a block no collection of the batch owns maps to nobody',
+			staleAt: { blockId: 'hot-block', rev: 42 },
+			expected: undefined
+		},
+		{
+			name: 'no confirmed number maps to nobody',
+			staleAt: undefined,
+			expected: undefined
+		},
+	];
+
+	for (const { name, staleAt, expected } of cases) {
+		it(name, () => {
+			expect(staleAtOwner(staleAt, blocksByCollection)).to.equal(expected);
+		});
+	}
 });

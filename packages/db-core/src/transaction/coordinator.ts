@@ -3,7 +3,7 @@ import type { BlockBaseRevs } from "../network/struct.js";
 import { clockOf, type HlcClock } from "../hlc/clock.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure, staleAtOwner } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
@@ -14,16 +14,17 @@ import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { InFlightCycle, SyncOptions } from "../collection/index.js";
-import type { StagedAttempt } from "../collection/write-attempts.js";
+import { DefaultMaxStalledAttempts, RevisionStallWatch } from "../collection/write-attempts.js";
+import type { ConfirmedRevision, StagedAttempt } from "../collection/write-attempts.js";
 import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
 import { EntryParticipants, writeContextOf } from "./entry-commit.js";
-import type { EntryCommit, RefreshParticipant, WriteContext } from "./entry-commit.js";
+import type { EntryCommit, NextRevision, RefreshParticipant, WriteContext } from "./entry-commit.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
 import { describeTouchedBlocks, blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { collectOperations, hashOperations } from "./operations-hash.js";
-import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorStaleLossError } from "./errors.js";
+import { CoordinatorConcurrentStampError, CoordinatorPartialCommitError, CoordinatorRevisionStalledError, CoordinatorStaleLossError } from "./errors.js";
 import { recordCollectionDurability, transactionDurability, type TransactionDurability } from "./durability.js";
 import { jitteredBackoffMs, abortableDelay, makeAbortError } from "../utility/backoff.js";
 import { visitEveryThenThrow } from "../utility/visit-every.js";
@@ -55,6 +56,10 @@ class PendRejectedError extends Error {
 		 * message because pendPhase collapses this error to its `.message` string, which is the only
 		 * form that reaches an embedder through the transaction result's `error` field. */
 		staleAt?: { blockId: BlockId; rev: number },
+		/** The same number attributed to the collection whose counter it belongs to (see
+		 * {@link ownStaleAt} and {@link batchStaleAt}), for the retry loop's per-participant stall
+		 * check; empty when the refusal carried none or named a block no collection of it sent. */
+		readonly staleAtByCollection: ReadonlyMap<CollectionId, ConfirmedRevision> = NoStaleAt,
 	) {
 		super(`Pend failed for ${collectionIds.length === 1 ? 'collection' : 'collections'} ${collectionIds.join(', ')}: ${reason ?? (conflict ? 'stale conflict' : 'rejected')}`
 			+ (staleAt ? ` (block ${staleAt.blockId} at rev ${staleAt.rev})` : ''));
@@ -62,24 +67,51 @@ class PendRejectedError extends Error {
 	}
 }
 
+/** The attribution of a refusal that carried no confirmed number, or one no collection owns. */
+const NoStaleAt: ReadonlyMap<CollectionId, ConfirmedRevision> = new Map();
+
+/** A refusal's confirmed revision as the ONE collection's own: a request for one collection
+ * (`pendCollection`, `commitCollection`) gets a number under that collection's counter whatever block
+ * it names, so it is attributed without looking at the block id — as the single-collection loop does. */
+function ownStaleAt(collectionId: CollectionId, staleAt: ConfirmedRevision | undefined): ReadonlyMap<CollectionId, ConfirmedRevision> {
+	return staleAt === undefined ? NoStaleAt : new Map([[collectionId, staleAt]]);
+}
+
+/** A batched answer's confirmed revision (`pendTogether`, `commitTogether`), attributed to the one
+ * collection whose blocks include the block it names (`staleAtOwner`): the batch carries ONE number,
+ * the highest across its collections' counters, and every other collection of the batch was refused
+ * with no confirmed number of its own. Nothing is attributed when no collection of the batch owns the
+ * block. */
+function batchStaleAt(staleAt: ConfirmedRevision | undefined, blocksByCollection: ReadonlyMap<CollectionId, readonly BlockId[]>): ReadonlyMap<CollectionId, ConfirmedRevision> {
+	const owner = staleAtOwner(staleAt, blocksByCollection);
+	return owner === undefined || staleAt === undefined ? NoStaleAt : new Map([[owner, staleAt]]);
+}
+
 /** The error a refused pend of `collectionIds` stands for: its validity rejection — never retried, since
  * a re-drive sends the same content to the same checks — its expiry — never retried, since a re-drive's
  * expiration comes from the same clock — or its promise shortfall — never retried, since a re-drive
- * meets the same silent members — or a rejection carrying whether a re-read can clear it.
+ * meets the same silent members — or a rejection carrying whether a re-read can clear it, with its
+ * confirmed revision attributed per collection (`staleAtByCollection`, which the caller works out:
+ * {@link ownStaleAt} for one collection's pend, {@link batchStaleAt} for a batched one).
  * Retryability comes from the response itself: a producer that classified the failure sets `conflict`,
  * and only where none did is it inferred from `missing`/`pending` (`isConflictFailure`). */
-function pendRefusalError(collectionIds: readonly CollectionId[], refusal: WriteFailure): ValidityRejectedError | TransactionExpiredError | PromiseShortfallError | PendRejectedError {
+function pendRefusalError(
+	collectionIds: readonly CollectionId[],
+	refusal: WriteFailure,
+	staleAtByCollection: ReadonlyMap<CollectionId, ConfirmedRevision>,
+): ValidityRejectedError | TransactionExpiredError | PromiseShortfallError | PendRejectedError {
 	if (isRejectedFailure(refusal)) return new ValidityRejectedError(refusal.rejected);
 	if (isExpiryFailure(refusal)) return new TransactionExpiredError(refusal.expired);
 	if (isShortfallFailure(refusal)) return new PromiseShortfallError(refusal.shortfall);
-	return new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt);
+	return new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt, staleAtByCollection);
 }
 
 /** A transaction refused before anything was sent: its pend, or a block it would leave, too large to send. */
 type TooLargeError = TransactionTooLargeError | BlockTooLargeError;
 
-/** How the pend phase failed. */
-type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; rejected?: ValidityRejectedError; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
+/** How the pend phase failed. `staleAt` is every refused collection's confirmed revision, where its
+ * refusal carried one (see `PendRejectedError.staleAtByCollection`). */
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; staleAt?: ReadonlyMap<CollectionId, ConfirmedRevision>; rejected?: ValidityRejectedError; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
 
 /**
  * One collection's share of an attempt, as the phases send it. For a transaction's attempt it is
@@ -124,15 +156,19 @@ function collectionAttemptOf(staged: StagedAttempt): CollectionAttempt {
  */
 function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const first = reasons[0];
-	const conflicts = reasons.filter(reason => reason instanceof PendRejectedError && reason.conflict);
+	const conflicts = reasons.filter((reason): reason is PendRejectedError => reason instanceof PendRejectedError && reason.conflict);
 	const rejected = reasons.find((reason): reason is ValidityRejectedError => reason instanceof ValidityRejectedError);
 	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
 	const shortfall = reasons.find((reason): reason is PromiseShortfallError => reason instanceof PromiseShortfallError);
 	const tooLarge = reasons.find((reason): reason is TooLargeError => reason instanceof TransactionTooLargeError || reason instanceof BlockTooLargeError);
+	// Each refusal attributed its number to its own collection(s), and no collection is refused twice
+	// in one phase, so the maps are disjoint and merge without a rule.
+	const staleAt = new Map(conflicts.flatMap(conflict => [...conflict.staleAtByCollection]));
 	return {
 		success: false,
 		error: first instanceof Error ? first.message : String(first),
 		staleLoss: conflicts.length > 0 && conflicts.length === reasons.length,
+		staleAt,
 		...(rejected === undefined ? {} : { rejected }),
 		...(expired === undefined ? {} : { expired }),
 		...(shortfall === undefined ? {} : { shortfall }),
@@ -185,14 +221,16 @@ function inFlightCycleOf(options: SyncOptions | undefined, lane: Lane): InFlight
  * a batched commit's one answer). */
 type CollectionCommitOutcome =
 	| { collectionId: CollectionId; committed: true; durability: WriteDurability }
-	| { collectionId: CollectionId; committed: false; error: string; stale?: boolean; expired?: TransactionExpiredError };
+	| { collectionId: CollectionId; committed: false; error: string; stale?: boolean; staleAt?: ConfirmedRevision; expired?: TransactionExpiredError };
 
 /**
  * How `collectionId`'s commit ended when `result` answered its `request` — the answer to its own
  * commit, or, in a batched commit, the batch's one answer for every collection of it. A success is
- * stamped with the collection's own blocks at its own revision (`withBlockRevs`).
+ * stamped with the collection's own blocks at its own revision (`withBlockRevs`). `staleAt` is the
+ * answer's confirmed revision as far as it is THIS collection's: the answer's own for a commit of one
+ * collection, the owner's share of a batched answer (`batchStaleAt`), and `undefined` otherwise.
  */
-function collectionCommitOutcome(collectionId: CollectionId, request: CommitRequest, result: CommitResult): CollectionCommitOutcome {
+function collectionCommitOutcome(collectionId: CollectionId, request: CommitRequest, result: CommitResult, staleAt: ConfirmedRevision | undefined): CollectionCommitOutcome {
 	if (result.success) {
 		return { collectionId, committed: true, durability: withBlockRevs(result.durability, request.blockIds, request.rev) };
 	}
@@ -219,7 +257,8 @@ function collectionCommitOutcome(collectionId: CollectionId, request: CommitRequ
 		collectionId,
 		committed: false,
 		stale: true,
-		error: result.reason ?? `Stale commit for collection ${collectionId}`
+		error: result.reason ?? `Stale commit for collection ${collectionId}`,
+		...(staleAt === undefined ? {} : { staleAt }),
 	};
 }
 
@@ -236,6 +275,9 @@ type CoordinationResult =
 		/** True when the failure was a clean optimistic-concurrency conflict (stale loss / pending
 		 * contention) with nothing durable — i.e. safe to re-drive after a re-read. */
 		staleLoss?: boolean;
+		/** Per failed collection, the revision its refusal confirmed is taken, from whichever phase
+		 * failed (`PendPhaseFailure.staleAt`, or the commit phase's). */
+		staleAt?: ReadonlyMap<CollectionId, ConfirmedRevision>;
 		/** Present when a pend was refused because the members that sank it judged the transaction
 		 * invalid: the error the commit surfaces, never a stale loss. */
 		rejected?: ValidityRejectedError;
@@ -268,7 +310,7 @@ function writtenDurability(written: ReadonlyMap<CollectionId, WriteDurability | 
  */
 function cleanFailureError(result: CoordinationResult & { success: false }, failed: readonly CollectionId[]): Error {
 	if (result.staleLoss) {
-		return new CoordinatorStaleLossError(failed, result.error);
+		return new CoordinatorStaleLossError(failed, result.error, result.staleAt);
 	}
 	return result.rejected ?? result.expired ?? result.shortfall ?? result.tooLarge
 		?? new Error(`Transaction commit failed: ${result.error}`);
@@ -281,6 +323,8 @@ function cleanFailureError(result: CoordinationResult & { success: false }, fail
  * the loop owns the budget, the backoff, and the exit where a refresh saved everything.
  */
 type AttemptDriver = {
+	/** The write's action id, for the loop's log lines. */
+	readonly actionId: ActionId;
 	/** Whether the cycle opens with a refresh round before its first attempt. The per-entry commit
 	 * does, as `Collection.commitHead` does: the queue re-drives an entry under the id of an attempt
 	 * that may have landed, and the opening refresh is what finds and finishes that attempt's entry
@@ -290,11 +334,15 @@ type AttemptDriver = {
 	 * it. Throws {@link CoordinatorStaleLossError} for a clean loss, and for a partial landing retried
 	 * forward, whose committed participants it has already recorded in `cycle.saved`. */
 	attempt(priority: number): Promise<ReadonlyMap<CollectionId, WriteDurability>>;
-	/** The refresh round between attempts — see {@link TransactionCoordinator.refreshBetweenAttempts}. */
-	refresh(lastChance: boolean): Promise<TornActionError | undefined>;
+	/** The refresh round between attempts — see {@link TransactionCoordinator.refreshBetweenAttempts}.
+	 * `tailFloor` answers, per collection, the floor its refresh's log-tail read carries. */
+	refresh(lastChance: boolean, tailFloor: (collectionId: CollectionId) => number | undefined): Promise<TornActionError | undefined>;
 	/** Whether an attempt starting now would have nothing left to commit, so that once a refresh has
 	 * saved a participant the write is finished without going round again. */
 	nothingLeft(): boolean;
+	/** The participants an attempt starting now would commit, with the revision each would request
+	 * and the one it holds, for the stall check ({@link RetryBudget.assertNotStalled}). */
+	nextRevisions(): NextRevision[];
 };
 
 /**
@@ -302,12 +350,17 @@ type AttemptDriver = {
  * refused refresh rounds alike are counted against `maxAttempts`, under the wall-clock `deadlineMs`
  * and the abort `signal`, with the same jittered backoff policy `Collection.sync` uses between
  * rounds. There is no forward-progress notion here (a commit either lands or it does not), so this
- * simply bounds how many times a losing write is re-driven. The single-collection accounting
- * (`AttemptCycle`) also checks for a wedged revision view; this one cannot yet, since the confirmed
- * revision does not reach it (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision`).
+ * simply bounds how many times a losing write is re-driven — except for a participant whose view
+ * is WEDGED: the confirmed revision each refusal carried is kept per participant
+ * (`RevisionStallWatch`, the single-collection accounting's own rule), and a participant whose
+ * next attempt is provably identical to the one that just failed ends the commit after
+ * `maxStalledAttempts` such strikes ({@link assertNotStalled}) rather than spending the rest of the
+ * budget on a decided failure. The same evidence puts a floor on each participant's log-tail read
+ * ({@link tailFloor}) and skips the backoff while a member holds the next slot ({@link pause}).
  */
 class RetryBudget {
 	private readonly maxAttempts: number;
+	private readonly maxStalledAttempts: number;
 	private readonly backoff: { baseMs: number; capMs: number };
 	private readonly deadlineMs: number | undefined;
 	private readonly signal: AbortSignal | undefined;
@@ -316,9 +369,14 @@ class RetryBudget {
 	/** Consecutive clean stale losses: attempts, and refresh rounds refused for a cause that can clear. */
 	private losses = 0;
 	private lastLoss: CoordinatorStaleLossError | undefined;
+	/** One watch per participant of the attempt last checked, created by {@link assertNotStalled}
+	 * and dropped by {@link recordLoss} for a participant the loss did not name (it committed, or a
+	 * refresh saved it), so the set is always the participants still to commit. */
+	private readonly watches = new Map<CollectionId, RevisionStallWatch>();
 
 	constructor(options?: SyncOptions) {
 		this.maxAttempts = options?.maxAttempts ?? DefaultMaxAttempts;
+		this.maxStalledAttempts = options?.maxStalledAttempts ?? DefaultMaxStalledAttempts;
 		this.backoff = {
 			baseMs: options?.baseBackoffMs ?? DefaultBaseBackoffMs,
 			capMs: options?.maxBackoffMs ?? DefaultMaxBackoffMs,
@@ -329,13 +387,43 @@ class RetryBudget {
 	}
 
 	/** The checks before an attempt: the abort signal, and — a progress-agnostic ceiling, once at
-	 * least one loss was taken — the wall-clock deadline, reported as that loss. */
+	 * least one loss was taken — the wall-clock deadline, reported as that loss. Runs ahead of
+	 * {@link assertNotStalled} deliberately: the deadline is the documented outer bound, so a commit
+	 * that is both past it and stalled reports the deadline, as `SyncOptions.maxStalledAttempts` says. */
 	assertOpen(): void {
 		if (this.signal?.aborted) {
 			throw makeAbortError(this.signal);
 		}
 		if (this.lastLoss !== undefined && this.pastDeadline()) {
 			throw this.lastLoss;
+		}
+	}
+
+	/**
+	 * The stall check before an attempt, per participant in sorted collection-id order
+	 * (`RevisionStallWatch.check`): a participant whose refresh moved it nowhere while a responder
+	 * confirmed a revision at or above the one it would request takes a strike, logged as
+	 * `commit:revision-stalled`; the first to reach `maxStalledAttempts` ends the commit with
+	 * {@link CoordinatorRevisionStalledError}. Called before EVERY attempt, the first included, so
+	 * each watch knows the revision the attempt it is judging requested. A participant that joined in
+	 * a later attempt has no evidence yet and gets no strike.
+	 */
+	assertNotStalled(actionId: ActionId, participants: readonly NextRevision[]): void {
+		const sorted = [...participants].sort((a, b) => a.collectionId < b.collectionId ? -1 : a.collectionId > b.collectionId ? 1 : 0);
+		for (const { collectionId, requestedRev, heldRev } of sorted) {
+			const verdict = this.watchOf(collectionId).check(requestedRev);
+			if (verdict.kind === 'clear') {
+				continue;
+			}
+			if (log.enabled) {
+				log('commit:revision-stalled tx=%s collection=%s heldRev=%s requestedRev=%d staleBlock=%s staleRev=%d strike=%d of=%d',
+					actionId, collectionId, heldRev ?? 'none', requestedRev,
+					verdict.staleAt.blockId, verdict.staleAt.rev, verdict.strike, verdict.of);
+			}
+			if (verdict.kind === 'stalled') {
+				throw new CoordinatorRevisionStalledError(collectionId, verdict.staleAt, requestedRev, heldRev,
+					this.losses, sorted.map(participant => participant.collectionId), this.lastLoss?.reason);
+			}
 		}
 	}
 
@@ -347,23 +435,50 @@ class RetryBudget {
 		return clampPriority(this.losses);
 	}
 
-	/** Count a clean stale loss of an attempt; thrown back when that spends the budget. */
+	/** Count a clean stale loss of an attempt; thrown back when that spends the budget. Each failed
+	 * collection's watch notes the refusal with its own confirmed revision — `undefined` for one
+	 * refused without a confirmed number, or cancelled because a sibling was refused, so it takes no
+	 * strike that round. A participant the loss did not name committed (the partial-retry branches)
+	 * or was saved by a refresh, and is done: its watch is dropped. */
 	recordLoss(loss: CoordinatorStaleLossError): void {
 		this.lastLoss = loss;
 		this.losses++;
+		const failed = new Set(loss.failedCollections);
+		for (const collectionId of [...this.watches.keys()]) {
+			if (!failed.has(collectionId)) this.watches.delete(collectionId);
+		}
+		for (const collectionId of failed) {
+			this.watchOf(collectionId).noteRefusal(loss.staleAtByCollection.get(collectionId));
+		}
 		if (this.losses >= this.maxAttempts) {
 			throw loss;
 		}
 	}
 
 	/** The backoff before a refresh round: none ahead of a cycle's opening round, there being no
-	 * race to space out; otherwise jittered and growing with the losses taken, so a herd of writers
-	 * that lost the same race does not re-collide on the next tick. */
+	 * race to space out, and none while a member holds the next slot for a participant still to
+	 * commit (`RevisionStallWatch.holdsSlot`); otherwise jittered and growing with the losses taken,
+	 * so a herd of writers that lost the same race does not re-collide on the next tick.
+	 *
+	 * NOTE: ANY participant's hold skips the sleep, not every participant's. A member's hold lasts
+	 * `slotHoldWindowMs` (3 s by default) against a backoff that grows to 5 s, so sleeping would
+	 * waste a hold that is real now; the herd race another participant may still be in is already
+	 * handled by the aged priority its pend carries. */
 	async pause(): Promise<void> {
 		if (this.losses === 0) {
 			return;
 		}
+		for (const watch of this.watches.values()) {
+			if (watch.holdsSlot()) return;
+		}
 		await abortableDelay(jitteredBackoffMs(this.losses - 1, this.backoff, this.rand), this.signal);
+	}
+
+	/** The floor a participant's refresh puts on its log-tail read: the highest revision a refusal of
+	 * THAT collection confirmed is taken (`RevisionStallWatch.tailFloor`); `undefined` for a
+	 * non-participant and for a participant none of whose refusals carried one. */
+	tailFloor(collectionId: CollectionId): number | undefined {
+		return this.watches.get(collectionId)?.tailFloor();
 	}
 
 	/** Whether the next refresh round spends the last of the budget, so a participant whose
@@ -373,12 +488,25 @@ class RetryBudget {
 	}
 
 	/** Count a refresh round refused for a cause that can clear (a `completion-refused`
-	 * {@link TornActionError}); thrown back when that spends the budget or passes the deadline. */
+	 * {@link TornActionError}); thrown back when that spends the budget or passes the deadline. The
+	 * latest loss then confirms no committed rival for any participant, so the next round sleeps. */
 	recordRefusedRound(refused: TornActionError): void {
 		this.losses++;
+		for (const watch of this.watches.values()) {
+			watch.noteRefusedRound();
+		}
 		if (this.losses >= this.maxAttempts || this.pastDeadline()) {
 			throw refused;
 		}
+	}
+
+	private watchOf(collectionId: CollectionId): RevisionStallWatch {
+		let watch = this.watches.get(collectionId);
+		if (watch === undefined) {
+			watch = new RevisionStallWatch(this.maxStalledAttempts);
+			this.watches.set(collectionId, watch);
+		}
+		return watch;
 	}
 
 	private pastDeadline(): boolean {
@@ -668,6 +796,7 @@ export class TransactionCoordinator {
 			inFlight: inFlightCycleOf(options, transaction.lane),
 		};
 		const driver: AttemptDriver = {
+			actionId: transaction.id as ActionId,
 			opensWithRefresh: false,
 			attempt: priority => {
 				// Age the transaction's advisory priority by the losses taken so far (see
@@ -680,11 +809,19 @@ export class TransactionCoordinator {
 				}
 				return this.commitOnce(transaction, cycle);
 			},
-			refresh: lastChance => this.refreshBetweenAttempts(this.registeredRefreshers(), cycle, lastChance),
+			refresh: (lastChance, tailFloor) => this.refreshBetweenAttempts(this.registeredRefreshers(), cycle, lastChance, tailFloor),
 			// Tested on what is still STAGED, not on "every participant saved": a participant can be
 			// saved and still hold actions staged after the attempt began, and those the next attempt
 			// must commit.
 			nothingLeft: () => this.stagedCollections().length === 0,
+			// Read between attempts with no latch held. A reader's concurrent refresh can only RAISE
+			// `getNextRev()` (`advanceContext` is monotonic), which the stall check reads as progress,
+			// so it can never manufacture a stall; the attempt that follows re-reads under the latch.
+			nextRevisions: () => this.stagedCollections().map(({ collectionId, collection }) => ({
+				collectionId,
+				requestedRev: collection.getNextRev(),
+				heldRev: collection.committedRevision(),
+			})),
 		};
 		try {
 			const written = await this.commitAttempts(driver, cycle, options);
@@ -737,6 +874,8 @@ export class TransactionCoordinator {
 		}
 		for (;;) {
 			budget.assertOpen();
+			// Outside the try below: a stall is the end of the cycle, not a loss to retry.
+			budget.assertNotStalled(driver.actionId, driver.nextRevisions());
 			try {
 				const committed = await driver.attempt(budget.priority());
 				// Merged, not overwritten, should one participant be both saved and committed (see the
@@ -782,7 +921,7 @@ export class TransactionCoordinator {
 	private async refreshRounds(driver: AttemptDriver, budget: RetryBudget): Promise<void> {
 		for (;;) {
 			await budget.pause();
-			const refused = await driver.refresh(budget.lastChance());
+			const refused = await driver.refresh(budget.lastChance(), collectionId => budget.tailFloor(collectionId));
 			if (refused === undefined) {
 				return;
 			}
@@ -802,7 +941,7 @@ export class TransactionCoordinator {
 	private registeredRefreshers(): RefreshParticipant[] {
 		return [...this.collections].map(([collectionId, collection]) => ({
 			collectionId,
-			refresh: (report, lastChance) => collection.refreshInFlight(report, lastChance),
+			refresh: (report, lastChance, tailFloor) => collection.refreshInFlight(report, lastChance, tailFloor),
 		}));
 	}
 
@@ -818,24 +957,29 @@ export class TransactionCoordinator {
 	 * prevent — and unreported. Each refresh is independent (its own latch, its own instance state),
 	 * so one failing says nothing about the next.
 	 *
-	 * NOTE: no `tailFloor` is passed to any refresh — the coordinator's loop loses the confirmed
-	 * revision before the round runs (backlog `debt-multi-collection-retry-cannot-see-the-taken-revision`);
-	 * the per-entry commit has the same gap, through the same round.
-	 *
 	 * @param lastChance - this is the round that spends the last of the retry budget, so a
 	 * participant whose half-landed write is refused again settles it (`Collection.completeOwnEntry`)
 	 * rather than asking for a round it will not get; the error returned then carries `final`.
+	 * @param tailFloor - per collection, the highest revision a refusal of it confirmed is taken
+	 * (`RetryBudget.tailFloor`), as the floor of its refresh's log-tail read, so a coordinator that has
+	 * not caught up to the rival is not the only machine asked; `undefined` for a non-participant and
+	 * for a participant with no confirmed number.
 	 * @returns the first `completion-refused` {@link TornActionError} when that is the only way any
 	 * refresh failed — the round is worth retrying; `undefined` when every refresh succeeded.
 	 * @throws the first other error, once every participant has been visited.
 	 */
-	private async refreshBetweenAttempts(participants: readonly RefreshParticipant[], cycle: CommitCycle, lastChance: boolean): Promise<TornActionError | undefined> {
+	private async refreshBetweenAttempts(
+		participants: readonly RefreshParticipant[],
+		cycle: CommitCycle,
+		lastChance: boolean,
+		tailFloor: (collectionId: CollectionId) => number | undefined,
+	): Promise<TornActionError | undefined> {
 		let terminal: { error: unknown } | undefined;
 		let refused: TornActionError | undefined;
 		for (const participant of participants) {
 			const report: RefreshReport = {};
 			try {
-				await participant.refresh(report, lastChance);
+				await participant.refresh(report, lastChance, tailFloor(participant.collectionId));
 			} catch (err) {
 				if (err instanceof TornActionError && err.reason === 'completion-refused') {
 					refused ??= err;
@@ -1189,7 +1333,7 @@ export class TransactionCoordinator {
 						recordCollectionDurability(cycle.saved, collectionId, durability);
 					}
 					log('commit:partial-retry tx=%s committed=%o failed=%o reason=%s', transaction.id, [...committed.keys()], failed, coordResult.error);
-					throw new CoordinatorStaleLossError(failed, coordResult.error);
+					throw new CoordinatorStaleLossError(failed, coordResult.error, coordResult.staleAt);
 				}
 				// Half-landed on a HARD failure (the transport budget spent on a thrown fault, a
 				// structural rejection): neither cleanly retryable nor cleanly abortable, so drop the
@@ -1297,10 +1441,12 @@ export class TransactionCoordinator {
 			inFlight,
 		};
 		const driver: AttemptDriver = {
+			actionId: entry.actionId,
 			opensWithRefresh: true,
 			attempt: priority => this.commitEntryOnce(entry, participants, cycle, priority),
-			refresh: lastChance => this.refreshBetweenAttempts(participants.refreshers(), cycle, lastChance),
+			refresh: (lastChance, tailFloor) => this.refreshBetweenAttempts(participants.refreshers(), cycle, lastChance, tailFloor),
 			nothingLeft: () => participants.size === 0,
+			nextRevisions: () => participants.nextRevisions(),
 		};
 		try {
 			const written = await this.commitAttempts(driver, cycle, options);
@@ -1382,7 +1528,7 @@ export class TransactionCoordinator {
 		participants.refused(staged, failed);
 		if (coordResult.staleLoss) {
 			log('commitEntry:partial-retry entry=%s action=%s committed=%o failed=%o reason=%s', entry.entryId, entry.actionId, [...committed.keys()], failed, coordResult.error);
-			throw new CoordinatorStaleLossError(failed, coordResult.error);
+			throw new CoordinatorStaleLossError(failed, coordResult.error, coordResult.staleAt);
 		}
 		throw new CoordinatorPartialCommitError(committed, failed, coordResult.expired ?? coordResult.error);
 	}
@@ -2004,6 +2150,7 @@ export class TransactionCoordinator {
 				committedCollections: commitResult.committedCollections,
 				failedCollections: commitResult.failedCollections,
 				staleLoss: commitResult.staleLoss,
+				staleAt: commitResult.staleAt,
 				...(commitResult.expired === undefined ? {} : { expired: commitResult.expired }),
 			};
 		}
@@ -2214,7 +2361,7 @@ export class TransactionCoordinator {
 		if (result === undefined) return undefined;
 		return result.success
 			? { success: true, pendedBlockIds: blockIds }
-			: pendFailure([pendRefusalError(Array.from(attempts.keys()), result)]);
+			: pendFailure([pendRefusalError(Array.from(attempts.keys()), result, batchStaleAt(result.staleAt, blockIds))]);
 	}
 
 	/**
@@ -2238,7 +2385,7 @@ export class TransactionCoordinator {
 			this.pendRequestFor(context, validation, attempt, nominees, sole)
 		);
 		if (!pendResult.success) {
-			throw pendRefusalError([collectionId], pendResult);
+			throw pendRefusalError([collectionId], pendResult, ownStaleAt(collectionId, pendResult.staleAt));
 		}
 
 		return { collectionId, blockIds: pendResult.blockIds };
@@ -2307,6 +2454,8 @@ export class TransactionCoordinator {
 		committedCollections: Map<CollectionId, WriteDurability>;
 		failedCollections: Set<CollectionId>;
 		staleLoss?: boolean;
+		/** Per refused collection, the revision its refusal confirmed is taken, where it carried one. */
+		staleAt: ReadonlyMap<CollectionId, ConfirmedRevision>;
 		expired?: TransactionExpiredError;
 	}> {
 		const together = pendedBlockIds.size > 1 && this.transactor.commitMany
@@ -2326,6 +2475,7 @@ export class TransactionCoordinator {
 
 		const committedCollections = new Map<CollectionId, WriteDurability>();
 		const failedCollections = new Set<CollectionId>();
+		const staleAt = new Map<CollectionId, ConfirmedRevision>();
 		const errors = new Set<string>();
 		// Classify failures: a returned stale loss (someone committed a newer rev) is retryable after
 		// a re-read; a thrown/transient-exhausted or structural failure is not. staleLoss holds only
@@ -2342,6 +2492,7 @@ export class TransactionCoordinator {
 				// A set: a batched refusal answers every collection with the one reason.
 				errors.add(result.error);
 				if (result.stale) anyStale = true; else anyHard = true;
+				if (result.staleAt !== undefined) staleAt.set(result.collectionId, result.staleAt);
 				expired ??= result.expired;
 			}
 		}
@@ -2353,11 +2504,12 @@ export class TransactionCoordinator {
 				committedCollections,
 				failedCollections,
 				staleLoss: anyStale && !anyHard,
+				staleAt,
 				...(expired === undefined ? {} : { expired }),
 			};
 		}
 
-		return { success: true, committedCollections, failedCollections };
+		return { success: true, committedCollections, failedCollections, staleAt };
 	}
 
 	/**
@@ -2394,9 +2546,11 @@ export class TransactionCoordinator {
 			log('commitTogether: batched commit threw; committing each collection on its own actionId=%s: %o', actionId, e);
 			return undefined;
 		}
-		return result === undefined
-			? undefined
-			: requests.map(({ collectionId, request }) => collectionCommitOutcome(collectionId, request, result));
+		if (result === undefined) return undefined;
+		// The batch's one confirmed revision belongs to the collection owning the block it names, and
+		// to no other collection of the batch (see `batchStaleAt`).
+		const attributed = batchStaleAt(result.success ? undefined : result.staleAt, pendedBlockIds);
+		return requests.map(({ collectionId, request }) => collectionCommitOutcome(collectionId, request, result, attributed.get(collectionId)));
 	}
 
 	/** Commits each collection on its own, concurrently ({@link commitCollection}), one outcome per collection. */
@@ -2446,7 +2600,9 @@ export class TransactionCoordinator {
 		let lastTransientError: string | undefined;
 		for (let attempt = 0; attempt < 3; attempt++) {
 			try {
-				return collectionCommitOutcome(collectionId, commitRequest, await this.transactor.commit(commitRequest));
+				const result = await this.transactor.commit(commitRequest);
+				// A commit of one collection: its confirmed revision is this collection's own.
+				return collectionCommitOutcome(collectionId, commitRequest, result, result.success ? undefined : result.staleAt);
 			} catch (e) {
 				lastTransientError = e instanceof Error ? e.message : String(e);
 			}
