@@ -591,7 +591,7 @@ Three things to know when reading it:
   wait for it to repeat. Two cases repeat, or do nothing, by design. A line with a
   `collection:context-not-lowered` beside it on the same `tag=` is a refused read: the handle holds
   a higher revision on the other lineage, keeps it, drops nothing, and reports both lines on every
-  refresh — it has sealed a fork that only reconciliation can resolve (see `docs/transactions.md`).
+  refresh — it has sealed a fork that only reconciliation can resolve (see [transactions.md §Partition Recovery and Reconciliation (Design)](transactions.md#partition-recovery-and-reconciliation-design)).
   And a `forkRev=` below `heldRev=` where the two sides agree at `heldRev=` itself, or name no action
   there, is reported without being acted on, since the handle decides by the held revision alone.
   `site=attach` lines never drop anything: an opening handle has no cache yet.

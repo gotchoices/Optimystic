@@ -98,7 +98,11 @@ export class BlockFloors implements BlockFloorCheck {
 	 * does not hold — a refresh adopting another lineage (`Collection.forgetAndAdopt`). A floor raised
 	 * under the old lineage says nothing about the new one, where the block may legitimately sit below
 	 * it, and a standing floor would then make every read of the block a below-floor answer for the
-	 * life of the handle. The exception to "a floor, once raised, stands". */
+	 * life of the handle. The exception to "a floor, once raised, stands".
+	 *
+	 * Every read source the handle built shares these floors, so a pinned read view created before
+	 * the drop loses its floors too. It reads at the old boundary of the old lineage, which the
+	 * network does not hold either, so the floors it loses bound content no machine will serve it. */
 	clear(): void {
 		this.floors.clear();
 	}

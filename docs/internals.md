@@ -295,7 +295,8 @@ list. Five rules follow from the split:
     attempts, because a rebuild re-runs the handlers and mints fresh ids for the blocks they insert,
     which would send different content under one `(action id, revision)` (the rule
     `logAppendBlockIds` closes); a refresh that adopts a newer revision rebuilds it, the write being
-    genuinely different then. Before each attempt its pins are re-judged exactly as
+    genuinely different then, and so does one that adopts another lineage at the same revision
+    (see [The revision context is monotonic](#the-revision-context-is-monotonic)). Before each attempt its pins are re-judged exactly as
     `restageIfBasesMoved` re-judges the live queue (`Collection.rereadUnretainedBases`, then
     `Tracker.movedBases`), and a moved base rebuilds at the same revision — the same narrow
     exception the `NOTE:` at `syncAttempts`' call records. Staging runs the actions' guards against

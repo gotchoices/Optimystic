@@ -102,10 +102,12 @@ type AttributedReads = Map<BlockId, AttributedRead>;
 type TailReadFields = Pick<BlockGets, 'skipWindowConsult'>;
 
 /** The tracker a head commit's attempts are built from: the head segment's actions staged over the
- * committed state, and the revision the attempt built from it requests (see
+ * committed state, the revision the attempt built from it requests, and the lineage it was staged
+ * over — the action the held context named at its own revision, `undefined` when none (see
  * {@link Collection.headTrackerFor}). */
 type HeadTracker = {
 	rev: number;
+	lineage: ActionId | undefined;
 	tracker: Tracker<IBlock>;
 };
 
@@ -2763,21 +2765,27 @@ export class Collection<TAction> implements ICollection<TAction> {
 	/** The tracker a head attempt is built from (see {@link commitHead}): `current`, while it was
 	 * built for the revision the next attempt requests and no base under it has moved; otherwise a
 	 * fresh one ({@link buildHeadTracker}). A revision that moved is a write that is genuinely
-	 * different. A base that moved at the same revision is re-judged exactly as
-	 * {@link restageIfBasesMoved} re-judges the live queue before an attempt, and rebuilds.
+	 * different, and so is one whose held lineage moved at the same revision: a refresh between
+	 * attempts that adopted another lineage ({@link judgeAdoption}) dropped the read cache the
+	 * tracker was staged over, and an action that inserted a block computed from that content pinned
+	 * no base the re-judge below would see as moved. A base that moved at the same revision is
+	 * re-judged exactly as {@link restageIfBasesMoved} re-judges the live queue before an attempt,
+	 * and rebuilds.
 	 * NOTE: that rebuild is the same exception to the byte-identical retry that {@link syncAttempts}
 	 * records at its `restageIfBasesMoved` call — fresh ids for the blocks the actions insert under
 	 * an unchanged `(action id, revision)` — reached the same narrow way and refused by storage's
 	 * base guard on the same machines; the same answer applies if it is ever seen. */
 	private async headTrackerFor(segment: SealedSegment<TAction>, current: HeadTracker | undefined): Promise<HeadTracker> {
 		const rev = this.getNextRev();
-		if (current?.rev === rev) {
+		const held = this.source.actionContext;
+		const lineage = held === undefined ? undefined : actionIdAt(held, held.rev);
+		if (current?.rev === rev && current.lineage === lineage) {
 			await this.rereadUnretainedBases(current.tracker);
 			if (this.logMovedBases(current.tracker.movedBases()) === 0) {
 				return current;
 			}
 		}
-		return { rev, tracker: await this.buildHeadTracker(segment) };
+		return { rev, lineage, tracker: await this.buildHeadTracker(segment) };
 	}
 
 	/** A tracker over this instance's read cache, with pins of its own, holding `segment`'s actions
