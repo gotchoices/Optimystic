@@ -149,8 +149,11 @@ SELECT cid_decode(Cid) ->> 'codec' AS codec FROM T;
 - **`cid_decode(cid) → JSON`** — parse a CID back to `{ version, codec, hashCode,
   digest }` (digest as base64url). Throws cleanly on malformed input.
 
-Selectable values: `codec` ∈ `raw`, `dag-cbor`; `hash` ∈ `sha2-256`, `sha2-512`,
+Selectable values: `codec` ∈ `raw`, `dag-cbor`, `dag-json`; `hash` ∈ `sha2-256`, `sha2-512`,
 `blake3`; `base` ∈ `base32` (default), `base58btc`, `base64url`, `base16`.
+The codec only labels the content type: `cid()` does not check that the bytes are
+canonical `dag-cbor` or `dag-json`, so a check such as `Cid = cid(Bytes, 'dag-json')`
+proves the bytes match their key, not that they are canonical.
 
 **Why `base32` by default?** A CID's whole purpose is to match what an external
 content-addressed store computes, and IPFS renders CIDv1 canonically in base32 (the

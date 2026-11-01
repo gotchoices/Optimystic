@@ -54,7 +54,7 @@ bespoke byte-pushing or parsing.
 
 | Parameter | Values | Code(s) | Default |
 |-----------|--------|---------|---------|
-| `codec` (content type) | `raw`, `dag-cbor` | `0x55`, `0x71` | `raw` |
+| `codec` (content type) | `raw`, `dag-cbor`, `dag-json` | `0x55`, `0x71`, `0x0129` | `raw` |
 | `hash` (multihash) | `sha2-256`, `sha2-512`, `blake3` | `0x12`, `0x13`, `0x1e` | `sha2-256` |
 | `base` (multibase) | `base32`, `base58btc`, `base64url`, `base16` | `b`, `z`, `u`, `f` | `base32` |
 
