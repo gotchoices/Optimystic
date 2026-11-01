@@ -688,7 +688,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * The slowest round trip, in milliseconds, between any two nodes that will talk to each other,
 	 * relayed hops included. Every network deadline the node applies is derived from it
 	 * (`resolveLinkDeadlines` in `rpc-deadline.ts`): the RPC clients' dial and response deadlines,
-	 * the block pushes', libp2p's connection deadlines, and — when `clusterPolicy.cohortQueryTimeoutMs`
+	 * the block pushes', libp2p's connection deadlines, FRET's maintenance deadlines (its liveness
+	 * ping and announce, neighbour-snapshot fetch, stabilization tick and outbound route budget, which
+	 * FRET derives itself from this value), and — when `clusterPolicy.cohortQueryTimeoutMs`
 	 * is not declared — the read path's per-peer budget. Each derived value floors at the constant it
 	 * replaces, so absent means the LAN deadlines exactly.
 	 *
@@ -1251,6 +1253,8 @@ export async function createLibp2pNodeBase(
 					networkName: options.networkName,
 					// FRET dials with a signal, so libp2p's `dialTimeout` never bounds its redials; this does.
 					dialTimeoutMs: libp2pDialTimeoutMs,
+					// FRET derives its maintenance ping, snapshot, tick and route budgets from this; undefined keeps its constants.
+					linkRoundTripMs: options.linkRoundTripMs,
 					// NOTE: FRET's `seedFromBootstraps` seeds the FIRST `/p2p/` id of each entry, so a partner's circuit
 					// address (`<relay>/p2p/<relay>/p2p-circuit/p2p/<partner>`) seeds the relay, not the partner. Harmless
 					// today: the partner is learned once its connection opens, and the relay is classified foreign. If a
