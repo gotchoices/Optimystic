@@ -1,7 +1,7 @@
 import { peerIdFromString } from '@libp2p/peer-id';
 import { fromString as uint8ArrayFromString } from 'uint8arrays/from-string';
 import type {
-	ActionId, ActionRev, BlockId, IBlock, Log,
+	ActionId, ActionRev, BlockId, IBlock, Log, HlcClock,
 	DisputeResolutionProof, ArbitrationVoteProof, RevertedBlock,
 } from '@optimystic/db-core';
 import { applyTransform, hashString } from '@optimystic/db-core';
@@ -473,7 +473,8 @@ export async function hashBlockContent(block: IBlock): Promise<string> {
 
 // ─── Deterministic apply ───
 
-/** Everything the apply primitive needs from the host: the collection log, per-block storage, and its flush. */
+/** Everything the apply primitive needs from the host: the collection log, per-block storage, its
+ * flush, and the node's clock. */
 export type InvalidationContext = {
 	/** The collection log of the collection `T_inv` wrote (where the compensating entry is appended). */
 	readonly log: Log<unknown>;
@@ -485,6 +486,13 @@ export type InvalidationContext = {
 	 * and before the invalidation entry naming those revisions is appended.
 	 */
 	readonly flush: () => Promise<void>;
+	/**
+	 * The applying node's HLC clock, which mints the compensating entry's `LogEntry.hlc`: every entry
+	 * kind carries one, and the invalidation's comes from the node that applies the dispute ruling. The
+	 * host's node clock (the one its transactor and storage repo share), not a clock of the dispute
+	 * layer's own, so the entry sorts after everything this node has observed.
+	 */
+	readonly clock: HlcClock;
 };
 
 export type ApplyInvalidationParams = {
@@ -735,7 +743,11 @@ export async function applyInvalidation(ctx: InvalidationContext, params: ApplyI
 	// NOTE: the entry's own durability belongs to the store `ctx.log` writes through — flushed by its
 	// group when that is a `StorageRepo`. If a composition root ever backs the log with a store written
 	// directly (no `StorageRepo` in between), flush after this append too before reporting `applied`.
-	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, params.cascadeRoot, params.timestamp);
+	await ctx.log.addInvalidation(invalidatedActionId, invalidatedRev, proof, reverted, rev, {
+		hlc: ctx.clock.now(),
+		...(params.cascadeRoot === undefined ? {} : { cascadeRoot: params.cascadeRoot }),
+		...(params.timestamp === undefined ? {} : { timestamp: params.timestamp }),
+	});
 	log('apply-complete actionId=%s disputeId=%s rev=%d blocks=%d', invalidatedActionId, proof.disputeId, rev, reverted.length);
 
 	return { applied: true, rev, reverted };

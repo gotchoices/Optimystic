@@ -3,6 +3,7 @@ import { toString as uint8ArrayToString } from "uint8arrays/to-string";
 import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
 import type { TransactionDurability } from "./durability.js";
+import type { Hlc } from "../hlc/hlc.js";
 import { hashString } from "../utility/hash-string.js";
 
 /**
@@ -62,14 +63,30 @@ export type Transaction = {
 	/** Read dependencies for optimistic concurrency control */
 	reads: ReadDependency[];
 
-	/** Transaction identifier (hash of stamp.id + statements + reads)
+	/**
+	 * The transaction's hybrid logical clock value (docs/crdt-sync.md §Migration Path, Stage 1):
+	 * minted at COMMIT, after the read set is final, from the committing transactor's clock
+	 * (`clockOf(transactor).now()`), and stamped on every participant's log entry (`LogEntry.hlc`,
+	 * through `WriteContext.hlc`). On the transaction rather than the stamp because the stamp is
+	 * fixed at BEGIN, before any of the transaction's reads, and an HLC minted then could sit below
+	 * one a later read observed — the causal rule the HLC exists to keep. Folded into {@link id} and
+	 * into the client signature ({@link clientSignaturePayload}), so a relaying peer cannot alter
+	 * it; excluded from nothing else. Fixed per transaction: a retry of the same `Transaction` object
+	 * re-sends it, like `stamp.timestamp`.
+	 *
+	 * Required of every transaction this build builds; a validator meeting one from an older build
+	 * on the wire tolerates its absence at that one ingress (`TransactionValidator.validate`).
+	 */
+	hlc: Hlc;
+
+	/** Transaction identifier (hash of stamp.id + statements + reads + hlc)
 	 * Final transaction identity, used in logs
 	 */
 	id: string;
 
 	/**
 	 * Optional client signature (base64url) over {@link clientSignaturePayload}
-	 * `(stamp.id, statements, reads)`, produced at commit by an injected
+	 * `(stamp.id, statements, reads, hlc)`, produced at commit by an injected
 	 * {@link TransactionSigner}.
 	 *
 	 * A node that wires a {@link ClientSignatureVerifier} into its
@@ -226,8 +243,9 @@ export async function createTransactionStamp(
 }
 
 /**
- * Create a transaction id from stamp id, statements, and reads.
- * This is the final transaction identity used in logs.
+ * Create a transaction id from stamp id, statements, reads and the transaction's HLC.
+ * This is the final transaction identity used in logs, and the action id the log records, so two
+ * transactions that differ only in when they committed differ in id.
  *
  * NOTE: reads are serialized in their given order here (non-canonical). This differs
  * from {@link clientSignaturePayload}, which canonicalises reads before hashing. That is
@@ -236,15 +254,16 @@ export async function createTransactionStamp(
  * design-consensus-hygiene-notes), NOT fixed here to avoid changing existing tx ids.
  *
  * NOTE: {@link Transaction.priority} is deliberately absent from this preimage — the id is a pure
- * function of `(stampId, statements, reads)`, so two retry attempts that differ only in aged
+ * function of `(stampId, statements, reads, hlc)`, so two retry attempts that differ only in aged
  * priority produce the SAME id. Do not add priority here.
  */
 export async function createTransactionId(
 	stampId: string,
 	statements: string[],
-	reads: ReadDependency[]
+	reads: ReadDependency[],
+	hlc: Hlc
 ): Promise<string> {
-	const txData = JSON.stringify({ stampId, statements, reads });
+	const txData = JSON.stringify({ stampId, statements, reads, hlc: canonicalHlc(hlc) });
 	return `tx:${await hashString(txData)}`;
 }
 
@@ -252,18 +271,28 @@ export async function createTransactionId(
  * Version prefix for the client-signature payload, so the signed form can evolve
  * without ambiguity. Distinct from (but consistent in spirit with) the operations-hash
  * canonical form — this covers transaction INPUTS, not operations.
+ *
+ * `v2` added the transaction's HLC to the signed bytes. Mixed-version cost: a writer on a `v1`
+ * build signs the old payload, and a verifier on this build reports `Invalid client signature`
+ * against it. Accepted on the precedent the validity marker set (docs/internals.md, *A reject that
+ * judges the transaction itself wrong*), because no deployment wires a `ClientSignatureVerifier`
+ * today (backlog `feat-no-deployment-validates-transactions-at-pend`), and because the question
+ * "can a relaying peer alter the HLC" is best settled while nothing verifies.
  */
-export const CLIENT_SIG_VERSION = 'txsig:v1';
+export const CLIENT_SIG_VERSION = 'txsig:v2';
 
 /**
  * Canonical bytes a client signs and a node verifies. Deterministic: reads are sorted
- * (blockId, then revision); statements keep their sequential order.
+ * (blockId, then revision); statements keep their sequential order; the HLC's three fields are
+ * written in a fixed order.
  *
- * Binds three things at once: the CLIENT IDENTITY (via `stampId`, which hashes peerId +
- * nonce), the EXACT statements, and the OCC read set (blockId + revision — "tail
- * binding" for anti-replay). Both signer and verifier derive the bytes from
- * `transaction.stamp.id` + `transaction.statements` + `transaction.reads` through this
- * one function, so they reproduce identical bytes regardless of read ordering.
+ * Binds four things at once: the CLIENT IDENTITY (via `stampId`, which hashes peerId +
+ * nonce), the EXACT statements, the OCC read set (blockId + revision — "tail
+ * binding" for anti-replay), and the transaction's HLC, which validators order by in a later
+ * stage and a relaying peer must therefore not be able to alter. Both signer and verifier derive
+ * the bytes from `transaction.stamp.id` + `transaction.statements` + `transaction.reads` +
+ * `transaction.hlc` through this one function, so they reproduce identical bytes regardless of
+ * read ordering.
  *
  * NOTE: {@link Transaction.priority} is deliberately absent from the signed bytes — a retry that
  * only bumps priority keeps the same signature, so anti-replay / OCC binding never churns. Do not
@@ -272,14 +301,22 @@ export const CLIENT_SIG_VERSION = 'txsig:v1';
 export function clientSignaturePayload(
 	stampId: string,
 	statements: readonly string[],
-	reads: readonly ReadDependency[]
+	reads: readonly ReadDependency[],
+	hlc: Hlc
 ): Uint8Array {
 	const canonicalReads = [...reads].sort(
 		(a, b) => a.blockId < b.blockId ? -1 : a.blockId > b.blockId ? 1
 			: a.revision - b.revision
 	);
-	const body = JSON.stringify({ stampId, statements, reads: canonicalReads });
+	const body = JSON.stringify({ stampId, statements, reads: canonicalReads, hlc: canonicalHlc(hlc) });
 	return new TextEncoder().encode(`${CLIENT_SIG_VERSION}:${body}`);
+}
+
+/** The HLC's three fields in one fixed key order, so the two preimages above do not depend on the
+ * key order of whatever object carried the value — a JSON round trip preserves order, but a value
+ * rebuilt by hand need not. */
+function canonicalHlc(hlc: Hlc): Hlc {
+	return { wallMs: hlc.wallMs, logical: hlc.logical, nodeId: hlc.nodeId };
 }
 
 /**

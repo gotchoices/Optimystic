@@ -16,6 +16,7 @@ import {
 	CoordinatorPartialCommitError,
 	EntryNotDiscardableError,
 	Log,
+	legacyHlc,
 	OfflineQueue,
 	QueueDisposedError,
 	SyncRetryExhaustedError,
@@ -69,6 +70,8 @@ const ITEMS = 'items';
 const byKey = (e: Entry) => e.key;
 const entry = (key: number, name: string): Entry => ({ key, name });
 const T0 = 1_700_000_000_000;
+// The HLC of an entry a journal record from before the field would restore with (`RestoreInit.hlc`).
+const T0_HLC = legacyHlc(T0);
 
 type QueuedStatus = Extract<EntryStatus, { kind: 'queued' }>;
 type FailedStatus = Extract<EntryStatus, { kind: 'failed' }>;
@@ -890,7 +893,7 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		await gated.commitParked;
 
 		const listedAtStage: string[] = [];
-		const restoring = queue.restore({ id: 'R', seq: 1.5, queuedAt: T0, collections: [users.getCollection()] }, async collection => {
+		const restoring = queue.restore({ id: 'R', seq: 1.5, queuedAt: T0, hlc: T0_HLC, collections: [users.getCollection()] }, async collection => {
 			listedAtStage.push(queue.entries().map(e => `${e.id}:${(e.status as QueuedStatus).waitingFor ?? 'head'}`).join(','));
 			return stagedSegment(await collection.restoreSealed('R', [replaceAction([[3, entry(3, 'restored')]])], { before: 'E2' }));
 		});
@@ -939,7 +942,7 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		const users2 = await openTree(transactor, queue, USERS);
 		const attempt = drive.attempts.get(USERS)!;
 		const restored = await queue.restore(
-			{ id: 'E1', seq: 1, queuedAt: T0, collections: [users2.getCollection()], drive },
+			{ id: 'E1', seq: 1, queuedAt: T0, hlc: T0_HLC, collections: [users2.getCollection()], drive },
 			async collection => collection.holdsCommitted(attempt) ? { kind: 'already-committed' } : { kind: 'staged' });
 
 		expect(restored, 'settled, not queued').to.equal(undefined);
@@ -953,7 +956,7 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		expect(queue.entries()).to.deep.equal([]);
 		await queue.whenDrained();
 
-		const refusedRestore = await queue.restore({ id: 'E2', seq: 2, queuedAt: T0, collections: [users2.getCollection()] },
+		const refusedRestore = await queue.restore({ id: 'E2', seq: 2, queuedAt: T0, hlc: T0_HLC, collections: [users2.getCollection()] },
 			async collection => stagedSegment(await collection.restoreSealed('E2', [replaceAction([[1, entry(1, 'again'), { kind: 'absent' }]])], 'last')));
 		expect(refusedRestore?.id).to.equal('E2');
 		await queue.whenDrained();
@@ -995,7 +998,7 @@ describe('OfflineQueue with a journal (ticket offline-sync-journal-port)', funct
 		const users2 = await openTree(throwing, queue, USERS);
 		const items2 = await openTree(throwing, queue, ITEMS);
 		const restored = await queue.restore(
-			{ id: 'E1', seq: record.seq, queuedAt: record.queuedAt, collections: [users2.getCollection(), items2.getCollection()], drive },
+			{ id: 'E1', seq: record.seq, queuedAt: record.queuedAt, hlc: record.hlc, collections: [users2.getCollection(), items2.getCollection()], drive },
 			async collection => {
 				if (drive.committed.has(collection.id)) return { kind: 'already-committed' };
 				const actions = record.segments.find(segment => segment.collectionId === collection.id)!.actions;

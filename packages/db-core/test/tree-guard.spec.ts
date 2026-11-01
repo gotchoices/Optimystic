@@ -37,6 +37,7 @@ import {
 	createTransactionStamp,
 	createTransactionId,
 	ACTIONS_ENGINE_ID,
+	clockOf,
 	blockIdsForTransforms,
 	type Transaction,
 	type BlockId,
@@ -590,7 +591,7 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			const collection = tree.getCollection();
 			expect(collection.sealPending('E'), 'something was staged').to.equal(true);
 			const reported: AlreadyAppliedTally[] = [];
-			await collection.commitHead('E', { actionId: 'E-action', timestamp: Date.now(), onCommittedHead: applied => { reported.push(applied); } });
+			await collection.commitHead('E', { actionId: 'E-action', timestamp: Date.now(), hlc: clockOf(collection.transactor).now(), onCommittedHead: applied => { reported.push(applied); } });
 			expect(reported, 'the head commit reported its tally exactly once').to.have.length(1);
 			return reported[0]!;
 		}
@@ -865,9 +866,10 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const statements = ['insert users 1 + posts 100'];
+			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
-				stamp, statements, reads: [],
-				id: await createTransactionId(stamp.id, statements, []),
+				stamp, statements, reads: [], hlc,
+				id: await createTransactionId(stamp.id, statements, [], hlc),
 			};
 
 			const err = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));
@@ -918,9 +920,10 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const statements = ['update users 1 + insert posts 100'];
+			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
-				stamp, statements, reads: [],
-				id: await createTransactionId(stamp.id, statements, []),
+				stamp, statements, reads: [], hlc,
+				id: await createTransactionId(stamp.id, statements, [], hlc),
 			};
 
 			const err = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));

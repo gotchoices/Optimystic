@@ -2,6 +2,7 @@ import type { Action, ActionId } from '../collection/action.js';
 import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
+import type { Hlc } from '../hlc/hlc.js';
 import type { EntryStatus } from './status.js';
 
 /**
@@ -21,6 +22,10 @@ export type JournalEntryRecord = {
 	readonly id: EntryId;
 	readonly seq: number;
 	readonly queuedAt: number;
+	/** The entry's local commit time as an HLC, minted at enqueue and carried on every log entry the
+	 * entry's drives append (`HeadCommitOptions.hlc`, `EntryCommit.hlc`), so a restore re-supplies the
+	 * value the first drive used. */
+	readonly hlc: Hlc;
 	readonly expiresAt?: number;
 	/** One per collection the entry sealed a segment in, in sealing order: the segment's actions,
 	 * verbatim — the array the segment holds, which the journal serialises and never mutates. */

@@ -19,10 +19,14 @@ import {
 } from '../dist/index.js';
 import register from '../dist/plugin.js';
 import {
+	HlcClock,
 	createTransactionStamp,
 	createTransactionId,
 	type Transaction,
 } from '@optimystic/db-core';
+
+// The clock the hand-built transactions below mint from; a session-built one mints its own.
+const clock = new HlcClock({ nodeId: 'test' });
 
 type Row = Record<string, SqlValue>;
 
@@ -42,11 +46,13 @@ async function createTestTransaction(statements: string[]): Promise<Transaction>
 		'test-schema-hash',
 		QUEREUS_ENGINE_ID
 	);
+	const hlc = clock.now();
 	return {
 		stamp,
 		statements,
 		reads: [],
-		id: await createTransactionId(stamp.id, statements, []),
+		hlc,
+		id: await createTransactionId(stamp.id, statements, [], hlc),
 	};
 }
 

@@ -88,11 +88,14 @@ export class TransactionSession {
 				actionsToApply = actions;
 			} else {
 				// Create a temporary transaction with just this statement for translation
+				// Temporary, for translation only: neither the id nor the HLC is ever read, since the
+				// engine translates statements here and commits nothing.
 				const tempTransaction: Transaction = {
 					stamp: this.stamp,
 					statements: [statement],
 					reads: [],
-					id: 'temp' // Temporary ID for translation only
+					hlc: this.coordinator.clock.now(),
+					id: 'temp'
 				};
 				const result = await this.engine.execute(tempTransaction);
 				if (!result.success || !result.actions) {
@@ -139,22 +142,27 @@ export class TransactionSession {
 
 		// Collect read dependencies from all participating collections
 		const reads = this.coordinator.getReadDependencies();
+		// The HLC is minted AFTER the read set is final, so it sits above every HLC a read of this
+		// transaction observed (see Transaction.hlc), and once per transaction: the coordinator's
+		// retries re-send this same object.
+		const hlc = this.coordinator.clock.now();
 
 		// Create the complete transaction
 		const transaction: Transaction = {
 			stamp: this.stamp,
 			statements: this.statements,
 			reads,
-			id: await createTransactionId(this.stamp.id, this.statements, reads)
+			hlc,
+			id: await createTransactionId(this.stamp.id, this.statements, reads, hlc)
 		};
 
 		// Sign the canonical client-signature payload if a signer was supplied. The
-		// payload covers stamp.id + statements + reads, which are all final now. A signer failure
+		// payload covers stamp.id + statements + reads + hlc, which are all final now. A signer failure
 		// (e.g. a wrong-key-type libp2p sign) is caught and surfaced as a clean commit failure BEFORE
 		// coordinator.commit runs — the transaction object is local and discarded, so a failed sign can
 		// never leak a partially-built unsigned transaction into consensus.
 		if (this.signer) {
-			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads);
+			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads, hlc);
 			try {
 				transaction.signature = await this.signer(payload);
 			} catch (error) {

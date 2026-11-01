@@ -9,6 +9,7 @@ import { CacheSource } from '../src/transform/cache-source.js'
 import { TransactorSource } from '../src/transactor/transactor-source.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
+import { clockOf } from '../src/hlc/clock.js'
 import type {
 	Action, ActionHandler, BlockStore, IBlock, IRepo, BlockId, CollectionId, ActionId,
 	IKeyNetwork, ClusterPeers, FindCoordinatorOptions, PeerId, DisputeResolutionProof, RevertedBlock,
@@ -102,7 +103,7 @@ async function appendInvalidation(
 	const ctx = await log.getActionContext()
 	const newRev = (ctx?.rev ?? 0) + 1
 	const reverted: RevertedBlock[] = [{ blockId: revertedBlock, fromRev: invalidatedRev, restoredContentHash: 'restored-hash' }]
-	const { tailPath } = await log.addInvalidation(invalidatedActionId, invalidatedRev, makeProof(`d-${invalidatedActionId}`), reverted, newRev)
+	const { tailPath } = await log.addInvalidation(invalidatedActionId, invalidatedRev, makeProof(`d-${invalidatedActionId}`), reverted, newRev, { hlc: clockOf(transactor).now() })
 	const result = await source.transact(tracker.transforms, `inv-${newRev}` as ActionId, newRev, collectionId, tailPath.block.header.id)
 	if (!result.success) {
 		throw new Error(`invalidation commit was stale: ${JSON.stringify(result)}`)

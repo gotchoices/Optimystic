@@ -7,6 +7,7 @@ import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, 
 import { LogDataBlockType, LogHeaderBlockType } from "./struct.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
+import type { Hlc } from '../hlc/hlc.js';
 import { BLOCK_TARGET_BYTES } from '../network/block-size.js';
 
 export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
@@ -43,10 +44,33 @@ export type LogOpenOptions = {
 	newDataBlockId?: () => BlockId;
 };
 
-/** The trailing, mostly-optional inputs to {@link Log.addActions}. An options object rather than
- *  positional parameters because the two most interesting ones are the last two, and a caller that
- *  needs only the timestamp should not have to spell out the two before it. */
-export type AddActionsOptions = {
+/**
+ * The two per-write time values every entry kind carries (`LogEntry.hlc` and `LogEntry.timestamp`),
+ * taken by {@link Log.addActions}, {@link Log.addCheckpoint} and {@link Log.addInvalidation} alike.
+ *
+ * Both belong to the WRITE, not to the attempt. Storage identifies a saved block revision by
+ * `(action id, revision)` and accepts a retry of the same action at the same revision, so a value a
+ * retry minted afresh would store a second, different log block under one `(action, revision)` on
+ * every machine that missed the first attempt (docs/internals.md, "A write's log append is a fixed
+ * function of the write and the revision it is requesting").
+ */
+export type EntryTimes = {
+	/** The HLC the writer minted for the write (`clockOf(transactor).now()`), re-sent verbatim by every
+	 *  retry. No default: the clock is the writer's, and an append has none of its own. */
+	hlc: Hlc;
+	/**
+	 * When the entry was written. Nothing in the tree reads it for logic — it is informational —
+	 * which is what makes it safe for a writer to supply the time of the WRITE rather than of the
+	 * attempt, and arguably the more honest value. A writer whose attempt may be retried MUST supply
+	 * it, for the reason above. Defaults to `Date.now()` for a caller that appends once.
+	 */
+	timestamp?: number;
+};
+
+/** The trailing inputs to {@link Log.addActions}: the write's {@link EntryTimes} plus the two
+ *  optional fields an action entry alone carries. An options object rather than positional
+ *  parameters because a caller that needs only the times should not have to spell out the rest. */
+export type AddActionsOptions = EntryTimes & {
 	/** Every collection participating in the action this entry records. */
 	collectionIds?: CollectionId[];
 	/** The transaction's `(blockId, revision)` read set, persisted on the entry so the invalidation
@@ -54,18 +78,14 @@ export type AddActionsOptions = {
 	 *  Omit it on the low-level direct-commit path that carries no `Transaction`; the cascade then
 	 *  treats the entry as an unknown dependency. */
 	reads?: ReadDependency[];
-	/**
-	 * When the entry was written. Nothing in the tree reads it for logic — it is informational —
-	 * which is what makes it safe for a writer to supply the time of the WRITE rather than of the
-	 * attempt, and arguably the more honest value.
-	 *
-	 * A writer whose attempt may be retried MUST supply it. Storage identifies a saved block
-	 * revision by `(action id, revision)` and accepts a retry of the same action at the same
-	 * revision, so a retry that took a fresh timestamp here would store a second, different log
-	 * block under one `(action, revision)` on every machine that missed the first attempt.
-	 * Defaults to `Date.now()` for a caller that appends once.
-	 */
-	timestamp?: number;
+};
+
+/** The trailing inputs to {@link Log.addInvalidation}: the write's {@link EntryTimes}, and the root
+ *  invalidation when this entry is a cascade step. */
+export type AddInvalidationOptions = EntryTimes & {
+	/** The root invalidation that triggered this cascade step; absent for a root invalidation
+	 *  (see {@link InvalidationEntry.cascadeRoot}). */
+	cascadeRoot?: ActionId;
 };
 
 export class Log<TAction> {
@@ -103,23 +123,25 @@ export class Log<TAction> {
 	 * Adds a new action entry to the log.
 	 *
 	 * See {@link AddActionsOptions} for what the trailing options carry, and in particular why a
-	 * writer that may retry passes its own `timestamp` rather than letting each attempt take one.
+	 * writer that may retry passes its own `hlc` and `timestamp` rather than letting each attempt
+	 * take its own.
 	 */
-	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], options?: AddActionsOptions) {
-		const { collectionIds = [], reads, timestamp = Date.now() } = options ?? {};
+	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], options: AddActionsOptions) {
+		const { collectionIds = [], reads, hlc, timestamp = Date.now() } = options;
 		const action = reads !== undefined
 			? { actionId, actions, blockIds: [], collectionIds, reads }
 			: { actionId, actions, blockIds: [], collectionIds };
-		const entry = { timestamp, rev, action } as LogEntry<TAction>;
+		const entry = { timestamp, hlc, rev, action } as LogEntry<TAction>;
 		const tailPath = await this.chain.add(entry);
 		const entryWithBlockIds = { ...entry, action: { ...entry.action!, blockIds: getBlockIds() } };
 		this.chain.updateAt(tailPath, entryWithBlockIds);
 		return { entry: entryWithBlockIds, tailPath };
 	}
 
-	/** Adds a checkpoint to the log. */
-	async addCheckpoint(pendings: ActionRev[], rev: number, timestamp: number = Date.now()) {
-		const entry = { timestamp, rev, checkpoint: { pendings } };
+	/** Adds a checkpoint to the log, under the write's {@link EntryTimes}. */
+	async addCheckpoint(pendings: ActionRev[], rev: number, times: EntryTimes) {
+		const { hlc, timestamp = Date.now() } = times;
+		const entry = { timestamp, hlc, rev, checkpoint: { pendings } };
 		const tailPath = await this.chain.add(entry);
 		return { entry, tailPath };
 	}
@@ -129,7 +151,8 @@ export class Log<TAction> {
 	 * invalid by dispute. The committed history is never rewritten — this is a new, append-only,
 	 * prior-hash-linked entry, recoverable on sync exactly like a commit. The caller has already
 	 * verified `resolution` is a challenger-wins certificate and computed the per-block `reverted`
-	 * targets (the new revisions restoring the as-if-`T_inv`-absent content).
+	 * targets (the new revisions restoring the as-if-`T_inv`-absent content). The entry carries the
+	 * applying node's {@link EntryTimes} like every other entry kind.
 	 */
 	async addInvalidation(
 		invalidatedActionId: ActionId,
@@ -137,13 +160,13 @@ export class Log<TAction> {
 		resolution: DisputeResolutionProof,
 		reverted: ReadonlyArray<RevertedBlock>,
 		rev: number,
-		cascadeRoot?: ActionId,
-		timestamp: number = Date.now()
+		options: AddInvalidationOptions
 	) {
+		const { hlc, timestamp = Date.now(), cascadeRoot } = options;
 		const invalidation: InvalidationEntry = cascadeRoot !== undefined
 			? { invalidatedActionId, invalidatedRev, resolution, reverted, cascadeRoot }
 			: { invalidatedActionId, invalidatedRev, resolution, reverted };
-		const entry = { timestamp, rev, invalidation } as LogEntry<TAction>;
+		const entry = { timestamp, hlc, rev, invalidation } as LogEntry<TAction>;
 		const tailPath = await this.chain.add(entry);
 		return { entry, tailPath };
 	}

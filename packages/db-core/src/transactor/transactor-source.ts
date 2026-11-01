@@ -4,6 +4,7 @@ import type { IBlock, BlockId, BlockHeader, ITransactor, ActionId, CommitResult,
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
 import type { ReadDependency } from "../transaction/transaction.js";
+import type { Hlc } from "../hlc/hlc.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
@@ -30,6 +31,10 @@ export type TransactOptions = {
 	/** Refuse to be committed by a lone coordinator that knows it is not alone
 	 * (`SyncOptions.refuseSoloCommit`): set on both the pend and the commit as `refuseSolo`. */
 	readonly refuseSolo?: boolean;
+	/** The write's HLC (`WriteIdentity.hlc`), put on the pend (`PendRequest.hlc`) so a storage node
+	 * observes it without parsing the log entry out of the transforms. Left off when the caller has
+	 * none at hand — the re-send of a retained attempt, whose entry carries it inside the transforms. */
+	readonly hlc?: Hlc;
 };
 
 /** The block `entry` answers for `id`, for a read at `context` (`undefined` for an unpinned "give me
@@ -250,10 +255,11 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * by comparing `quorum` (see {@link WriteDurability}).
 	 */
 	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, options: TransactOptions = {}): Promise<CommitResult> {
-		const { priority = 0, blockDigests, baseRevs, refuseSolo } = options;
+		const { priority = 0, blockDigests, baseRevs, refuseSolo, hlc } = options;
 		const pendResult = await this.transactor.pend({
 			transforms: transform, actionId, rev, policy: 'r',
 			...(priority > 0 ? { priority } : {}),
+			...(hlc === undefined ? {} : { hlc }),
 			...baseRevsField(baseRevs),
 			// One collection, pended whole and then committed: the shape `PendRequest.soleReservation` names.
 			soleReservation: true,

@@ -15,6 +15,7 @@ import {
 	CoordinatorPartialCommitError,
 	CoordinatorStaleLossError,
 	Log,
+	HlcClock,
 	TornActionError,
 	TransactionCoordinator,
 	Tree,
@@ -59,6 +60,8 @@ const byKey = (e: Entry) => e.key;
 const entry = (key: number, name: string): Entry => ({ key, name });
 /** The entry's local commit time, as the queue would supply it. */
 const QUEUED_AT = 1_700_000_000_000;
+// The HLC the queue would have minted for the entry at enqueue, re-supplied on every drive.
+const QUEUED_HLC = new HlcClock({ nodeId: 'test' }).now();
 /** Short, bounded backoff: these cases are about WHAT the retry does, not how long it waits. */
 const retryFast: SyncOptions = { maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 };
 
@@ -114,7 +117,7 @@ function coordinatorOver(transactor: ITransactor, ...trees: Tree<number, Entry>[
 
 /** Entry `E1` under action `A1`, over `collectionIds`. */
 function entryOver(collectionIds: CollectionId[], more: Partial<EntryCommit> = {}): EntryCommit {
-	return { entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, collectionIds, ...more };
+	return { entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, hlc: QUEUED_HLC, collectionIds, ...more };
 }
 
 /** The keys each committed log entry of `id` replaced, in log order, read through a fresh handle

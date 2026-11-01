@@ -4,6 +4,7 @@ import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
 import type { AlreadyAppliedTally } from "./action.js";
 import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
+import type { Hlc } from "../hlc/hlc.js";
 
 export type CollectionId = BlockId;
 
@@ -113,8 +114,8 @@ export type InFlightAttempt = {
 };
 
 /** What `Collection.commitHead` commits the head segment under, beside the retry bounds of
- * {@link SyncOptions}. Both fields are the queue's (docs/offline-sync.md §Identity across
- * attempts): the collection mints neither. */
+ * {@link SyncOptions}. The three identity fields are the queue's (docs/offline-sync.md §Identity
+ * across attempts): the collection mints none of them. */
 export type HeadCommitOptions = SyncOptions & {
 	/** The action id the attempt cycle runs under. The queue mints it, and re-supplies the SAME id
 	 * when it re-drives an entry whose earlier attempt may have landed, so the refresh that opens the
@@ -124,8 +125,13 @@ export type HeadCommitOptions = SyncOptions & {
 	/** The entry's local commit time, stamped on the log entry in place of the time
 	 * `Collection.syncInternal` mints for a sync. Fixed per write, so every attempt appends the same
 	 * entry (see "A write's log append is a fixed function of the write and the revision it is
-	 * requesting" in docs/internals.md). */
+	 * requesting" in docs/internals.md). The second per-write value, {@link hlc}, follows the same
+	 * rule. */
 	timestamp: number;
+	/** The entry's local commit time as an HLC (`LogEntry.hlc`): minted by the queue at enqueue from
+	 * the collections' transactor clock, journaled with the entry, and re-supplied on every drive of
+	 * it, first or re-drive, so every attempt appends the same entry. */
+	hlc: Hlc;
 	/** The write-ahead hook: called with each attempt exactly as it is about to be sent — after it is
 	 * built and BEFORE the collection latch is released for the network — and awaited under that
 	 * latch. It is where the queue records the attempt's identity before sending it

@@ -9,6 +9,11 @@ import { TestLogStore } from './test-log-store.js'
 import type { ActionId, ActionRev } from '../src/index.js'
 import { generateNumericActionId } from './generate-numeric-action-id.js'
 import { generateRandomActionId } from './generate-random-action-id.js'
+import { HlcClock } from '../src/hlc/clock.js'
+
+// One fixed HLC for every entry these cases append: the log records what it is given, and nothing
+// here orders by it.
+const hlc = new HlcClock({ nodeId: 'test' }).now()
 
 describe('Log', () => {
   let store: TestLogStore
@@ -31,7 +36,7 @@ describe('Log', () => {
     const actionId = generateRandomActionId()
     const rev = 1
 
-    const result = await log.addActions(actions, actionId, rev, () => [])
+    const result = await log.addActions(actions, actionId, rev, () => [], { hlc })
     expect(result.entry.action?.actions).to.deep.equal(actions)
     expect(result.entry.action?.actionId).to.equal(actionId)
     expect(result.entry.rev).to.equal(rev)
@@ -58,7 +63,7 @@ describe('Log', () => {
     }))
 
     for (const trx of transactions) {
-      await log.addActions(trx.actions, trx.actionId, trx.rev, () => [])
+      await log.addActions(trx.actions, trx.actionId, trx.rev, () => [], { hlc })
     }
 
     // Test forward iteration
@@ -88,9 +93,9 @@ describe('Log', () => {
     const trx2Id = generateNumericActionId(2)
     const trx3Id = generateNumericActionId(3)
 
-    await log.addActions(['action1'], trx1Id, 1, () => [])
-    await log.addActions(['action2'], trx2Id, 2, () => [])
-    await log.addActions(['action3'], trx3Id, 3, () => [])
+    await log.addActions(['action1'], trx1Id, 1, () => [], { hlc })
+    await log.addActions(['action2'], trx2Id, 2, () => [], { hlc })
+    await log.addActions(['action3'], trx3Id, 3, () => [], { hlc })
 
     // Verify implicit commits
     let context = await log.getActionContext()
@@ -102,7 +107,7 @@ describe('Log', () => {
       { actionId: trx2Id, rev: 2 }
     ]
 
-    const result = await log.addCheckpoint(pendings, 4)
+    const result = await log.addCheckpoint(pendings, 4, { hlc })
     expect(result.entry.checkpoint?.pendings).to.deep.equal(pendings)
     expect(result.entry.rev).to.equal(4)
 
@@ -117,9 +122,9 @@ describe('Log', () => {
 
     // Add initial actions
     const trx1 = generateNumericActionId(1)
-    await log.addActions(['action1'], trx1, 1, () => [])
+    await log.addActions(['action1'], trx1, 1, () => [], { hlc })
     const trx2 = generateNumericActionId(2)
-    await log.addActions(['action2'], trx2, 2, () => [])
+    await log.addActions(['action2'], trx2, 2, () => [], { hlc })
 
     // Verify implicit commits
     let context = await log.getActionContext()
@@ -130,11 +135,11 @@ describe('Log', () => {
     const pendings: ActionRev[] = [
       { actionId: trx1, rev: 1 }
     ]
-    await log.addCheckpoint(pendings, 3)
+    await log.addCheckpoint(pendings, 3, { hlc })
 
     // Add more actions
     const trx3 = generateNumericActionId(3)
-    await log.addActions(['action3'], trx3, 4, () => [])
+    await log.addActions(['action3'], trx3, 4, () => [], { hlc })
 
     // Test retrieval and verify commit state
     const fromStart = await log.getFrom(0)
@@ -156,7 +161,7 @@ describe('Log', () => {
     const actions = Array.from({ length: 33 }, (_, i) => `action${i + 1}`)
     const results = []
     for (let i = 0; i < actions.length; i++) {
-      results.push(await log.addActions([actions[i]!], generateNumericActionId(i + 1), i + 1, () => []))
+      results.push(await log.addActions([actions[i]!], generateNumericActionId(i + 1), i + 1, () => [], { hlc }))
     }
 
     // Get the blocks directly from store to check hashes
@@ -183,6 +188,7 @@ describe('Log', () => {
     // 32 entries fill the tail; the next 64 create two new blocks -> three blocks total.
     const entries: LogEntry<string>[] = Array.from({ length: 32 * 3 }, (_, i) => ({
       timestamp: 0,
+      hlc,
       rev: i + 1,
       action: { actionId: generateNumericActionId(i + 1), actions: [`a${i}`], blockIds: [] },
     }))
@@ -226,7 +232,7 @@ describe('Log', () => {
 
     // Add actions
     for (let i = 0; i < actionCount; i++) {
-      await log.addActions([`action${i}`], generateNumericActionId(i), i + 1, () => [])
+      await log.addActions([`action${i}`], generateNumericActionId(i), i + 1, () => [], { hlc })
     }
 
     // Verify retrieval
@@ -243,9 +249,9 @@ describe('Log', () => {
     const log = await Log.create<string>(store)
 
     // Add several actions first - these will be implicitly committed
-    await log.addActions(['action1'], generateNumericActionId(1), 1, () => [])
-    await log.addActions(['action2'], generateNumericActionId(2), 2, () => [])
-    await log.addActions(['action3'], generateNumericActionId(3), 3, () => [])
+    await log.addActions(['action1'], generateNumericActionId(1), 1, () => [], { hlc })
+    await log.addActions(['action2'], generateNumericActionId(2), 2, () => [], { hlc })
+    await log.addActions(['action3'], generateNumericActionId(3), 3, () => [], { hlc })
 
     // Verify implicit commits include all actions
     let context = await log.getActionContext()
@@ -257,7 +263,7 @@ describe('Log', () => {
     await log.addCheckpoint([
       { actionId: generateNumericActionId(1), rev: 1 },
       { actionId: generateNumericActionId(2), rev: 2 }
-    ], 4)
+    ], 4, { hlc })
 
     // Verify the checkpoint reduced the committed set
     context = await log.getActionContext()
@@ -265,8 +271,8 @@ describe('Log', () => {
     expect(context?.rev).to.equal(4)
 
     // Add more actions
-    await log.addActions(['action4'], generateNumericActionId(4), 5, () => [])
-    await log.addActions(['action5'], generateNumericActionId(5), 6, () => [])
+    await log.addActions(['action4'], generateNumericActionId(4), 5, () => [], { hlc })
+    await log.addActions(['action5'], generateNumericActionId(5), 6, () => [], { hlc })
 
     // Without a new checkpoint, these are implicitly added to committed set
     context = await log.getActionContext()
@@ -277,7 +283,7 @@ describe('Log', () => {
     await log.addCheckpoint([
       { actionId: generateNumericActionId(4), rev: 5 },
       { actionId: generateNumericActionId(5), rev: 6 }
-    ], 7)
+    ], 7, { hlc })
 
     // Verify final state only includes explicitly checkpointed actions
     context = await log.getActionContext()
@@ -293,14 +299,14 @@ describe('Log', () => {
     for (let i = 1; i <= 5; i++) {
       const actionId = generateNumericActionId(i)
       actionIds.push(actionId)
-      await log.addActions([`action${i}`], actionId, i, () => [])
+      await log.addActions([`action${i}`], actionId, i, () => [], { hlc })
     }
 
     // Add a checkpoint that only keeps first two actions
     await log.addCheckpoint([
       { actionId: actionIds[0]!, rev: 1 },
       { actionId: actionIds[1]!, rev: 2 }
-    ], 6)
+    ], 6, { hlc })
 
     // Retrieve from different points
     const fromRev2 = await log.getFrom(2)
@@ -311,7 +317,7 @@ describe('Log', () => {
 
 		const actionId6 = generateNumericActionId(6)
     actionIds.push(actionId6)
-    await log.addActions(['action6'], actionId6, 7, () => [])
+    await log.addActions(['action6'], actionId6, 7, () => [], { hlc })
 
     const fromRev4 = await log.getFrom(4)
     expect(fromRev4.entries.length).to.equal(2) // Action 5,6
@@ -336,7 +342,8 @@ describe('Log', () => {
         [actions[i]!],
         generateNumericActionId(i + 1),
         i + 1,
-        () => store.getDirtiedBlockIds()
+        () => store.getDirtiedBlockIds(),
+        { hlc }
       )
 
       // The action entry should list the blocks that were dirtied
@@ -363,7 +370,7 @@ describe('Log', () => {
 
     // Execute transactions concurrently
     await Promise.all(transactions.map(trx =>
-      log.addActions(trx.actions, trx.actionId, trx.rev, () => [])
+      log.addActions(trx.actions, trx.actionId, trx.rev, () => [], { hlc })
     ))
 
     // Verify all actions were added
@@ -393,7 +400,7 @@ describe('Log', () => {
 
     // Verify the log is fully functional
     const actionId = generateRandomActionId();
-    await log.addActions(['action1'], actionId, 1, () => []);
+    await log.addActions(['action1'], actionId, 1, () => [], { hlc });
 
     const result = await log.getFrom(0);
     expect(result.entries).to.have.lengthOf(1);
@@ -411,8 +418,8 @@ describe('Log', () => {
     it('should handle checkpoint with empty pendings', async () => {
       const log = await Log.create<string>(store)
 
-      await log.addActions(['action1'], generateNumericActionId(1), 1, () => [])
-      await log.addCheckpoint([], 2)
+      await log.addActions(['action1'], generateNumericActionId(1), 1, () => [], { hlc })
+      await log.addCheckpoint([], 2, { hlc })
 
       const context = await log.getActionContext()
       expect(context?.committed).to.deep.equal([])
@@ -425,10 +432,10 @@ describe('Log', () => {
       const id2 = generateNumericActionId(2)
       const id3 = generateNumericActionId(3)
 
-      await log.addActions(['action1'], id1, 1, () => [])
-      await log.addActions(['action2'], id2, 2, () => [])
-      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3)
-      await log.addActions(['action3'], id3, 4, () => [])
+      await log.addActions(['action1'], id1, 1, () => [], { hlc })
+      await log.addActions(['action2'], id2, 2, () => [], { hlc })
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3, { hlc })
+      await log.addActions(['action3'], id3, 4, () => [], { hlc })
 
       // getFrom at the checkpoint rev should return only action3
       const result = await log.getFrom(3)
@@ -440,12 +447,12 @@ describe('Log', () => {
       const log = await Log.create<string>(store)
       const ids = Array.from({ length: 5 }, (_, i) => generateNumericActionId(i + 1))
 
-      await log.addActions(['a1'], ids[0]!, 1, () => [])
-      await log.addActions(['a2'], ids[1]!, 2, () => [])
+      await log.addActions(['a1'], ids[0]!, 1, () => [], { hlc })
+      await log.addActions(['a2'], ids[1]!, 2, () => [], { hlc })
       // Checkpoint only keeps action 1
-      await log.addCheckpoint([{ actionId: ids[0]!, rev: 1 }], 3)
-      await log.addActions(['a3'], ids[2]!, 4, () => [])
-      await log.addActions(['a4'], ids[3]!, 5, () => [])
+      await log.addCheckpoint([{ actionId: ids[0]!, rev: 1 }], 3, { hlc })
+      await log.addActions(['a3'], ids[2]!, 4, () => [], { hlc })
+      await log.addActions(['a4'], ids[3]!, 5, () => [], { hlc })
 
       const result = await log.getFrom(0)
       // Should return all actions from rev > 0
@@ -459,16 +466,16 @@ describe('Log', () => {
       const id1 = generateNumericActionId(1)
       const id2 = generateNumericActionId(2)
 
-      await log.addActions(['a1'], id1, 1, () => [])
-      await log.addActions(['a2'], id2, 2, () => [])
+      await log.addActions(['a1'], id1, 1, () => [], { hlc })
+      await log.addActions(['a2'], id2, 2, () => [], { hlc })
 
       // First checkpoint: both committed
-      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3)
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }, { actionId: id2, rev: 2 }], 3, { hlc })
       let context = await log.getActionContext()
       expect(context?.committed).to.have.lengthOf(2)
 
       // Second checkpoint: only id2 remains
-      await log.addCheckpoint([{ actionId: id2, rev: 2 }], 4)
+      await log.addCheckpoint([{ actionId: id2, rev: 2 }], 4, { hlc })
       context = await log.getActionContext()
       expect(context?.committed).to.have.lengthOf(1)
       expect(context?.committed[0]?.actionId).to.equal(id2)
@@ -480,10 +487,10 @@ describe('Log', () => {
       const id2 = generateNumericActionId(2)
       const id3 = generateNumericActionId(3)
 
-      await log.addActions(['before-cp'], id1, 1, () => [])
-      await log.addCheckpoint([{ actionId: id1, rev: 1 }], 2)
-      await log.addActions(['after-cp-1'], id2, 3, () => [])
-      await log.addActions(['after-cp-2'], id3, 4, () => [])
+      await log.addActions(['before-cp'], id1, 1, () => [], { hlc })
+      await log.addCheckpoint([{ actionId: id1, rev: 1 }], 2, { hlc })
+      await log.addActions(['after-cp-1'], id2, 3, () => [], { hlc })
+      await log.addActions(['after-cp-2'], id3, 4, () => [], { hlc })
 
       // From rev 0 should include all actions
       const fromStart = await log.getFrom(0)

@@ -4,6 +4,7 @@ import type { Collection } from '../collection/collection.js';
 import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
+import type { Hlc } from '../hlc/hlc.js';
 import type { CommittedEffect, EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
 import type { JournalDriveState } from './journal.js';
 
@@ -12,6 +13,11 @@ export type Entry = {
 	readonly id: EntryId;
 	readonly seq: number;
 	readonly queuedAt: number;
+	/** The local commit time as an HLC (`JournalEntryRecord.hlc`): minted at enqueue from the sealed
+	 * collections' transactor clock, restored from the journal, and passed to every drive of the entry
+	 * as the write's HLC. Fixed for the entry's whole life, like `queuedAt` — a renewed action id
+	 * does not renew it, since the entry is the same local commit. */
+	readonly hlc: Hlc;
 	readonly expiresAt: number | undefined;
 	/** The collections the entry sealed a segment in — the ones `sealPending` answered `true` for. */
 	readonly collections: readonly Collection<any>[];

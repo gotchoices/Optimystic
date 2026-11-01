@@ -19,9 +19,13 @@
  * path with room in the current history block (where only the entry's timestamp varied), the same
  * path with the history block full (where the id of the new history block varied, taking the
  * `nextId`/`tailId` updates of two PRE-EXISTING blocks with it), the coordinator write path, and the
- * head commit of a sealed segment (`Collection.commitHead`), whose action id and timestamp are the
- * queue's and which reaches the log append through the machinery the collection path shares with
+ * head commit of a sealed segment (`Collection.commitHead`), whose action id, timestamp and HLC are
+ * the queue's and which reaches the log append through the machinery the collection path shares with
  * it (`write-attempts.ts`), so one case covers it.
+ *
+ * Each case also checks that the entry the committing attempt recorded carries an HLC minted from
+ * the transactor's clock (`LogEntry.hlc`): the one fact the whole-set comparison cannot pin, since
+ * two attempts could agree on a MISSING field.
  */
 
 import { expect } from 'chai';
@@ -30,6 +34,7 @@ import {
 	Collection,
 	Log,
 	TransactionCoordinator,
+	clockOf,
 	createActionsStatements,
 	createTransactionId,
 	createTransactionStamp,
@@ -93,6 +98,23 @@ function movedTheLogTail(attempt: RecordedAttempt, collectionId: string): boolea
 	return ops.some(([entity]) => entity === 'tailId');
 }
 
+/** The log's entries as the handle reads them once the write has committed: the committing
+ *  attempt's entry is the last. */
+async function committedEntries(collection: Collection<SpecAction>, collectionId: string): Promise<LogEntry<Action<SpecAction>>[]> {
+	const log = await Log.open<Action<SpecAction>>(collection.tracker, collectionId);
+	const entries: LogEntry<Action<SpecAction>>[] = [];
+	for await (const entry of log!.select()) entries.push(entry);
+	return entries;
+}
+
+/** The committing attempt's entry carries an HLC minted from the transactor's clock — `'test'` is
+ *  `TestTransactor`'s node id, which every transactor these cases wrap forwards. */
+async function expectEntryMintedFromTransactor(collection: Collection<SpecAction>, collectionId: string): Promise<void> {
+	const entries = await committedEntries(collection, collectionId);
+	expect(entries.at(-1)?.hlc, 'the committed entry carries an HLC minted from the transactor\'s clock')
+		.to.deep.include({ nodeId: 'test' });
+}
+
 describe('Retry: a re-sent write is byte-identical to the attempt it repeats', () => {
 	it('collection path: a retry with room in the history block re-sends the same entry', async () => {
 		const collectionId = 'retry-identical-room';
@@ -106,6 +128,7 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		expectAttemptsIdentical(transactor.attempts);
 		expect(movedTheLogTail(transactor.attempts[0]!, collectionId),
 			'the history block had room, so no new one was minted').to.equal(false);
+		await expectEntryMintedFromTransactor(collection, collectionId);
 	});
 
 	it('collection path: a retry that overflows the history block re-mints nothing', async () => {
@@ -130,6 +153,7 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		expect(movedTheLogTail(transactor.attempts[0]!, collectionId),
 			'the case under test ran: the history block was full, so a new one was minted').to.equal(true);
 		expectAttemptsIdentical(transactor.attempts);
+		await expectEntryMintedFromTransactor(collection, collectionId);
 	});
 
 	it('coordinator path: a retry re-sends the same entry', async () => {
@@ -142,18 +166,20 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		const actions: CollectionActions[] = [{ collectionId, actions: [{ type: 'set', data: { value: 'once' } }] }];
 		const statements = createActionsStatements(actions);
 		const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+		const hlc = coordinator.clock.now();
 		const transaction: Transaction = {
-			stamp, statements, reads: [],
-			id: await createTransactionId(stamp.id, statements, []),
+			stamp, statements, reads: [], hlc,
+			id: await createTransactionId(stamp.id, statements, [], hlc),
 		};
 		await coordinator.applyActions(actions, stamp.id);
 
 		await coordinator.commit(transaction, retryFast);
 
 		expectAttemptsIdentical(transactor.attempts);
+		await expectEntryMintedFromTransactor(collection, collectionId);
 	});
 
-	it('head commit path: a retry re-sends the same entry, under the supplied action id and timestamp', async () => {
+	it('head commit path: a retry re-sends the same entry, under the supplied action id, timestamp and HLC', async () => {
 		const collectionId = 'retry-identical-head';
 		const inner = new TestTransactor();
 		const transactor = new RecordsAttemptsRefusesFirstCommit(inner);
@@ -161,15 +187,16 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		await collection.act({ type: 'set', data: { value: 'queued' } });
 		expect(collection.sealPending('E1')).to.equal(true);
 		const timestamp = 1_700_000_000_000;
+		// As the queue would: minted once at enqueue, from the collections' transactor clock.
+		const hlc = clockOf(transactor).now();
 
-		await collection.commitHead('E1', { ...retryFast, actionId: 'queue-attempt-1', timestamp });
+		await collection.commitHead('E1', { ...retryFast, actionId: 'queue-attempt-1', timestamp, hlc });
 
 		expectAttemptsIdentical(transactor.attempts);
 		expect(transactor.attempts[0]!.actionId, 'the action id is the one supplied').to.equal('queue-attempt-1');
-		const log = await Log.open<Action<SpecAction>>(collection.tracker, collectionId);
-		const entries: LogEntry<Action<SpecAction>>[] = [];
-		for await (const entry of log!.select()) entries.push(entry);
+		const entries = await committedEntries(collection, collectionId);
 		expect(entries.map(entry => entry.timestamp), 'the log entry carries the supplied timestamp').to.deep.equal([timestamp]);
+		expect(entries.map(entry => entry.hlc), 'and the supplied HLC').to.deep.equal([hlc]);
 		expect(collection.sealedEntries()).to.deep.equal([]);
 	});
 

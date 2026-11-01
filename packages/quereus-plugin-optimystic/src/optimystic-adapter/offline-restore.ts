@@ -1,4 +1,4 @@
-import { BlockUnavailableError, EntryDiscardedError, EntryNotDiscardableError, QueueDisposedError } from '@optimystic/db-core';
+import { BlockUnavailableError, EntryDiscardedError, EntryNotDiscardableError, QueueDisposedError, legacyHlc } from '@optimystic/db-core';
 import type {
 	Collection, CollectionId, InFlightAttempt, JournalDriveState, JournalSettledStatus, OfflineQueue, RestoreInit, RestoredSegment,
 } from '@optimystic/db-core';
@@ -334,6 +334,8 @@ export class OfflineRestore {
 			id: entry.transactionId,
 			seq: entry.seq,
 			queuedAt: entry.queuedAt,
+			// A record from before the field restores with the legacy shape (see EntryRecordV1.hlc).
+			hlc: entry.hlc ?? legacyHlc(entry.queuedAt),
 			...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
 			collections: resolved.collections,
 			...(drive === undefined ? {} : { drive: driveStateOf(drive) }),

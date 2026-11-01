@@ -4,7 +4,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import type { PeerId, PrivateKey } from '@libp2p/interface';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import type { BlockStore, IBlock, BlockOperation, BlockId, ReadDependency, DisputeResolutionProof } from '@optimystic/db-core';
-import { Log, applyOperation } from '@optimystic/db-core';
+import { Log, HlcClock, applyOperation } from '@optimystic/db-core';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
@@ -25,6 +25,9 @@ import {
 	type CascadeResult,
 } from '../src/dispute/index.js';
 import type { ArbitrationVote, DisputeResolution } from '../src/dispute/types.js';
+
+// The applying node's clock, which mints each compensating entry's HLC (`CollectionEnv.clock`).
+const clock = new HlcClock({ nodeId: 'test' });
 
 // ─── Crypto / proof helpers (mirror invalidation.spec.ts) ───
 
@@ -113,16 +116,16 @@ async function makeCollection(collectionId: string): Promise<Collection> {
 			await repo.commit({ actionId, rev, blockIds: [blockId], tailId: 'log' });
 			committedBlocks.add(blockId);
 		}
-		await log.addActions(['op'], actionId, rev, () => writes.map(w => w.blockId), { reads });
+		await log.addActions(['op'], actionId, rev, () => writes.map(w => w.blockId), { reads, hlc: clock.now() });
 	};
 
-	return { collectionId, log, createBlockStorage, flush: () => raw.flush(), repo, seed };
+	return { collectionId, log, createBlockStorage, flush: () => raw.flush(), clock, repo, seed };
 }
 
 /** Apply the root invalidation through the single-collection primitive and build the cascade seed from it. */
 async function applyRoot(coll: Collection, actionId: string, rev: number, blockIds: BlockId[], proof: DisputeResolutionProof): Promise<CascadeSeed[]> {
 	const result = await applyInvalidation(
-		{ log: coll.log, createBlockStorage: coll.createBlockStorage, flush: coll.flush },
+		{ log: coll.log, createBlockStorage: coll.createBlockStorage, flush: coll.flush, clock: coll.clock },
 		{ invalidatedActionId: actionId, invalidatedRev: rev, blockIds, proof }
 	);
 	expect(result.applied, 'root invalidation applied').to.equal(true);
@@ -345,7 +348,7 @@ describe('Invalidation cascade', () => {
 		const proof = await challengerWinsProof('d1');
 		const seed: CascadeSeed[] = [{ collectionId: 'C', blockId: 'A', rev: 5, restoredContentHash: 'whatever' }];
 
-		await applyInvalidation({ log: c.log, createBlockStorage: c.createBlockStorage, flush: c.flush }, { invalidatedActionId: 'tinv', invalidatedRev: 2, blockIds: ['A'], proof });
+		await applyInvalidation({ log: c.log, createBlockStorage: c.createBlockStorage, flush: c.flush, clock: c.clock }, { invalidatedActionId: 'tinv', invalidatedRev: 2, blockIds: ['A'], proof });
 
 		let threw = false;
 		try {

@@ -4,7 +4,7 @@ import type {
 } from '@optimystic/db-core';
 import {
   TransactionCoordinator, TransactionSession, CoordinatorPartialCommitError, TreeEntryChangedError,
-  TreeKeyTakenError, createTransactionId, createTransactionStamp, recordCollectionDurability, transactionDurability,
+  TreeKeyTakenError, clockOf, createTransactionId, createTransactionStamp, recordCollectionDurability, transactionDurability,
   visitEveryThenThrow,
 } from '@optimystic/db-core';
 import { ConstraintError, QuereusError, StatusCode } from '@quereus/quereus';
@@ -1464,7 +1464,7 @@ export class TransactionBridge {
       { pendValidation: 'none' },
     );
     try {
-      return await coordinator.commit(await this.legacyTransaction());
+      return await coordinator.commit(await this.legacyTransaction(transactor));
     } catch (error) {
       if (error instanceof CoordinatorPartialCommitError) {
         await this.restoreUncommittedTrees(new Set(error.committedCollections));
@@ -1479,12 +1479,15 @@ export class TransactionBridge {
    * reads (the single-tree sync never did either), so the coordinator uses it for three
    * things only: the action id every participant's log entry carries (`id`), the expiry it
    * checks before each attempt (`stamp.expiration`), and its one-open-stamp check
-   * (`stamp.id`). No member ever sees it — the pend carries no validation payload — so its
-   * expiry ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
+   * (`stamp.id`); and it carries the HLC every participant's log entry is stamped with, minted
+   * here from the batch's transactor clock exactly as `TransactionSession.commit` mints one. No
+   * member ever sees it — the pend carries no validation payload — so its expiry
+   * ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
    */
-  private async legacyTransaction(): Promise<Transaction> {
+  private async legacyTransaction(transactor: ITransactor): Promise<Transaction> {
     const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, NetworkCommitBoundMs);
-    return { stamp, statements: [], reads: [], id: await createTransactionId(stamp.id, [], []) };
+    const hlc = clockOf(transactor).now();
+    return { stamp, statements: [], reads: [], hlc, id: await createTransactionId(stamp.id, [], [], hlc) };
   }
 
   /**

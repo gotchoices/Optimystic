@@ -1,6 +1,6 @@
 import { OFFLINE_JOURNAL_KEY_PREFIX, type IKVStore } from '@optimystic/db-p2p';
 import type {
-	Action, ActionId, CollectionId, CommittedEffect, EntryId, InFlightAttempt, IOfflineJournal, JournalDriveState,
+	Action, ActionId, CollectionId, CommittedEffect, EntryId, Hlc, InFlightAttempt, IOfflineJournal, JournalDriveState,
 	JournalEntryRecord, JournalSettledStatus, QueuedFailureReason, WriteDurability,
 } from '@optimystic/db-core';
 import type { QualifiedTableName } from '../schema/table-identity.js';
@@ -69,6 +69,10 @@ export type EntryRecordV1 = {
 	readonly transactionId: string;
 	readonly seq: number;
 	readonly queuedAt: number;
+	/** The entry's local commit time as an HLC (`JournalEntryRecord.hlc`), re-supplied to every drive
+	 * after a restart. Absent in a record written before the field existed, which the restore
+	 * re-supplies as `legacyHlc(queuedAt)` — the one shape a legacy entry already has. */
+	readonly hlc?: Hlc;
 	readonly expiresAt?: number;
 	readonly segments: readonly JournaledSegment[];
 	/** What the transaction's statements' write descriptions said about its elements and decisions, for
@@ -321,6 +325,7 @@ export class OfflineJournal implements IOfflineJournal {
 			transactionId: record.id,
 			seq: record.seq,
 			queuedAt: record.queuedAt,
+			hlc: record.hlc,
 			...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
 			segments: record.segments.map(segment => ({
 				collectionId: segment.collectionId,

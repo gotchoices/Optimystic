@@ -646,7 +646,13 @@ type Transaction = {
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Transaction identifier used in logs (hash of stamp.id + statements + reads)
+  // Hybrid logical clock value, minted at COMMIT after the read set is final (see crdt-sync.md
+  // §Migration Path, Stage 1). On the transaction rather than the stamp because the stamp is fixed at
+  // BEGIN, before any read, and an HLC minted then could sit below one a later read observed. Stamped
+  // on every participant's log entry; observational today (the revision stays the order).
+  hlc: Hlc;
+
+  // Transaction identifier used in logs (hash of stamp.id + statements + reads + hlc)
   id: string;
 };
 
@@ -1336,12 +1342,14 @@ export class TransactionSession {
       return { success: false, error: 'Transaction already rolled back' };
     }
 
-    // Create the complete transaction
+    // Create the complete transaction. The HLC is minted here, after the reads are final.
+    const hlc = clockOf(this.transactor).now();
     const transaction: Transaction = {
       stamp: this.stamp,
       statements: this.statements,
       reads: [], // TODO: Track reads during statement execution
-      id: createTransactionId(this.stamp.id, this.statements, [])
+      hlc,
+      id: createTransactionId(this.stamp.id, this.statements, [], hlc)
     };
 
     // Commit through coordinator (which will orchestrate PEND/COMMIT)
@@ -1800,7 +1808,7 @@ The **operations hash** is the fingerprint a coordinator sends in
 `PendRequest.operationsHash` and every validator independently recomputes and
 compares to agree that a transaction's operations match. It is recomputed fresh
 on both sides and is **never persisted** — distinct from `transaction.id`
-(`createTransactionId`, a hash of `stamp.id + statements + reads`) which IS
+(`createTransactionId`, a hash of `stamp.id + statements + reads + hlc`) which IS
 written into logs and block references. Because the ops-hash is not in history,
 changing its format cannot retroactively invalidate committed transactions.
 
@@ -2322,7 +2330,8 @@ const transaction: Transaction = {
   stamp,
   statements: ["INSERT INTO users (id, name) VALUES (1, 'Alice')"],
   reads: [], // TODO: Track reads
-  id: createTransactionId(stamp.id, statements, [])
+  hlc,  // clockOf(transactor).now(), minted at commit
+  id: createTransactionId(stamp.id, statements, [], hlc)
 };
 
 // - Calls coordinator.commit(transaction)

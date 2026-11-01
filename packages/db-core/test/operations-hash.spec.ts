@@ -8,6 +8,7 @@ import {
 	OPS_HASH_VERSION,
 	OPS_HASH_PREFIX,
 	createTransactionId,
+	type Hlc,
 	type Transforms,
 	type IBlock,
 } from '../src/index.js';
@@ -189,18 +190,21 @@ describe('operations-hash', () => {
 	describe('transaction.id is unaffected by the ops-hash version token', () => {
 		it('createTransactionId is byte-identical for fixed inputs (history identity must not move)', async () => {
 			// The version token lives ONLY inside the ops-hash string; it must not perturb the
-			// PERSISTED transaction identity, which hashes (stampId, statements, reads).
+			// PERSISTED transaction identity, which hashes (stampId, statements, reads, hlc).
+			const hlc: Hlc = { wallMs: 1_700_000_000_000, logical: 0, nodeId: 'peer' };
 			const id = await createTransactionId(
 				'stamp:fixed',
 				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
-				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }]
+				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }],
+				hlc
 			);
 			// Pinned expectation: recomputed here, and locked so a future ops-hash change that
 			// accidentally reached into tx-id inputs would flip this and fail the suite.
 			const idAgain = await createTransactionId(
 				'stamp:fixed',
 				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
-				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }]
+				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }],
+				hlc
 			);
 			expect(id).to.equal(idAgain);
 			expect(id.startsWith('tx:')).to.equal(true);

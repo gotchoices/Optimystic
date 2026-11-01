@@ -1,5 +1,5 @@
 import type {
-	ActionId, BlockId, CollectionId, Log,
+	ActionId, BlockId, CollectionId, Log, HlcClock,
 	DisputeResolutionProof, RevertedBlock, ReadDependency,
 } from '@optimystic/db-core';
 import type { IBlockStorage } from '../storage/i-block-storage.js';
@@ -42,6 +42,8 @@ export type CollectionEnv = {
 	readonly createBlockStorage: (blockId: BlockId) => IBlockStorage;
 	/** Flush of the store `createBlockStorage` writes to; see `InvalidationContext.flush`. */
 	readonly flush: () => Promise<void>;
+	/** The node's clock, which mints each child invalidation entry's HLC; see `InvalidationContext.clock`. */
+	readonly clock: HlcClock;
 };
 
 // ─── Invalidated (blockId, revision) pairs ───
@@ -364,7 +366,7 @@ export async function cascadeInvalidate(input: CascadeInput): Promise<CascadeRes
 
 			const env = cand.env;
 			const result = await applyInvalidation(
-				{ log: env.log, createBlockStorage: env.createBlockStorage, flush: env.flush },
+				{ log: env.log, createBlockStorage: env.createBlockStorage, flush: env.flush, clock: env.clock },
 				{
 					invalidatedActionId: cand.actionId,
 					invalidatedRev: cand.rev,

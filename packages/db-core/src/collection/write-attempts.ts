@@ -1,5 +1,6 @@
 import type { IBlock, BlockId, Action, ActionId, BlockContentDigests, BlockStore, Transforms, WriteDurability, WriteFailure } from "../index.js";
 import type { BlockBaseRevs } from "../network/struct.js";
+import type { Hlc } from "../hlc/hlc.js";
 import { Log } from "../log/log.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
@@ -78,13 +79,24 @@ function retryBackoffMs(failures: number, confirmedLosses: number, latestConfirm
 	return jitteredBackoffMs(failures - 1, config, rand);
 }
 
-/** What a write is identified as on the wire: the action id every attempt of it reuses, and the
- * log entry's timestamp. Both are minted once per WRITE, never per attempt, so a retry at the same
- * revision appends the same entry (docs/internals.md, "A write's log append is a fixed function of
- * the write and the revision it is requesting"). */
+/** What a write is identified as on the wire: the action id every attempt of it reuses, and the two
+ * per-write time values its log entry carries, the HLC and the wall-clock timestamp. All three are
+ * minted once per WRITE, never per attempt, so a retry at the same revision appends the same entry
+ * (docs/internals.md, "A write's log append is a fixed function of the write and the revision it is
+ * requesting"). */
 export type WriteIdentity = {
 	readonly actionId: ActionId;
+	/** The wall-clock time the write was minted at (`LogEntry.timestamp`). */
 	readonly timestamp: number;
+	/** The HLC the write was minted with (`LogEntry.hlc`), from the writer's clock
+	 * (`clockOf(transactor).now()`), and carried on every pend of it (`PendRequest.hlc`).
+	 * NOTE: a write refused as stale is retried over a refresh that may have observed newer HLCs,
+	 * and the retry keeps the HLC it was first minted with — the identity rule above — so its entry
+	 * can carry an HLC below a rival it was re-staged over. Nothing is wrong today: in the strong
+	 * lane the revision is the order and the HLC is observational. The replay stage (backlog
+	 * `feat-replay-mode-collections-merge-divergent-histories`) commits locally without a log-tail
+	 * retry, so it never meets the case. */
+	readonly hlc: Hlc;
 };
 
 /** What one attempt is built from: the actions its log entry records, the transforms they produced
@@ -122,8 +134,8 @@ export type StagedAttempt = {
  * — but if an attempt ever grows a per-attempt footprint beyond the log blocks, reset the abandoned
  * tracker on the stale-failure branch instead of letting the residue ride to the end of the write.
  *
- * The append is a fixed function of the write and `rev`: the timestamp is the identity's, and any
- * data block the append has to mint takes the id `newDataBlockId` hands out — the caller's
+ * The append is a fixed function of the write and `rev`: the HLC and timestamp are the identity's, and
+ * any data block the append has to mint takes the id `newDataBlockId` hands out — the caller's
  * `Collection.logAppendBlockIds`, which replays the ids an earlier attempt at this revision minted.
  *
  * The declarations are computed AFTER the append so the log tail and header transforms the attempt
@@ -150,7 +162,7 @@ export async function stageAttempt<TAction>(
 		throw new Error(`Log not found for collection ${collectionId}`);
 	}
 	const added = await collectionLog.addActions([...target.actions], identity.actionId, rev,
-		() => tracker.transformedBlockIds(), { timestamp: identity.timestamp });
+		() => tracker.transformedBlockIds(), { timestamp: identity.timestamp, hlc: identity.hlc });
 	const touched = await describeTouchedBlocks(tracker, tracker.transformedBlockIds());
 	const tooLarge = oversizedBlock(touched.bytes);
 	if (tooLarge) throw tooLarge;

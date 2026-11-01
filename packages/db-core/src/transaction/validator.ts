@@ -3,6 +3,7 @@ import type { Transaction, ITransactionEngine, ITransactionValidator, Validation
 import type { BlockActionState } from '../network/struct.js';
 import { isTransactionExpired, clientSignaturePayload, computeStampId } from './transaction.js';
 import { collectOperations, hashOperations, opsHashVersion, OPS_HASH_VERSION } from './operations-hash.js';
+import { legacyHlc } from '../hlc/hlc.js';
 
 /**
  * Engine registration for validation.
@@ -92,7 +93,13 @@ export class TransactionValidator implements ITransactionValidator {
 			if (transaction.signature === undefined) {
 				return validityRefusal('Missing client signature');
 			}
-			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads);
+			// The one wire ingress that tolerates a transaction without an HLC: a writer on a build
+			// before the field. Its payload is derived from the stamp's time so the check is
+			// well-typed; such a writer signed the `txsig:v1` bytes, so it is refused here regardless
+			// (see CLIENT_SIG_VERSION for the accepted mixed-version cost). The transaction object itself
+			// is handed on unchanged, so a re-execution stamps exactly what the writer stamped.
+			const hlc = transaction.hlc ?? legacyHlc(stamp.timestamp);
+			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads, hlc);
 			if (!this.verifyClientSignature(stamp.peerId, payload, transaction.signature)) {
 				return validityRefusal('Invalid client signature');
 			}

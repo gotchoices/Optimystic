@@ -1,9 +1,23 @@
 import type { BlockId, CollectionId, ActionContext, ActionId, ActionRev, ReadDependency } from "../index.js";
+import { legacyHlc, type Hlc } from "../hlc/hlc.js";
 
 /** A log entry - an action, a checkpoint, or an invalidation */
 export type LogEntry<TAction> = {
-	/** Linux timestamp of the entry */
+	/** The wall-clock time the writer's clock read when it wrote the entry. Informational: nothing
+	 * orders by it. Kept beside {@link hlc}, which is a second fact, not this one twice — its `wallMs`
+	 * is at or above this and may be a future time after the writer's clock observed a jump. */
 	readonly timestamp: number;
+	/**
+	 * The hybrid logical clock value the writer minted for the write this entry records
+	 * (docs/crdt-sync.md §Migration Path, Stage 1). Minted once per write and re-sent verbatim by
+	 * every retry, like {@link timestamp}; one value for every entry of a multi-collection write.
+	 * Nothing orders by it yet — the revision is the order within a collection — but it is what a
+	 * later merge of divergent histories orders by, and the entry is the unit such a merge orders.
+	 *
+	 * Every entry this build writes carries it. A STORED entry written before the field existed lacks
+	 * it; read an entry's HLC through {@link hlcOf}, never off the field.
+	 */
+	readonly hlc: Hlc;
 	/** Revision number - monotonically increasing from the prior entry's rev.  Starts at 1. */
 	readonly rev: number;
 	readonly action?: ActionEntry<TAction>;
@@ -155,6 +169,16 @@ export type CheckpointEntry = {
 	 * - missing from the set are the implicitly checkpointed ones */
 	readonly pendings: ActionRev[];
 };
+
+/**
+ * The one reader rule for an entry's HLC: the field when the entry carries one, else the legacy
+ * value derived from its timestamp (`legacyHlc`: the wall time, no logical count, the empty node
+ * id). The parameter admits an absent field because a stored entry written before the field existed
+ * has none, whatever {@link LogEntry} declares about the entries this build writes.
+ */
+export function hlcOf(entry: { readonly timestamp: number; readonly hlc?: Hlc }): Hlc {
+	return entry.hlc ?? legacyHlc(entry.timestamp);
+}
 
 export const LogDataBlockType = "LGD";
 export const LogHeaderBlockType = "LGH";

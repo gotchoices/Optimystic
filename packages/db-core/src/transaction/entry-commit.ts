@@ -1,5 +1,6 @@
 import type { ActionId, AlreadyAppliedTally, CollectionId } from "../index.js";
 import type { ReadDependency, Transaction } from "./transaction.js";
+import type { Hlc } from "../hlc/hlc.js";
 import { clampPriority } from "./transaction.js";
 import type { Collection, RefreshReport } from "../collection/collection.js";
 import type { HeadCommitHandle } from "../collection/head-commit.js";
@@ -12,8 +13,8 @@ import { refuseSoloField } from "../network/refuse-solo.js";
 
 /**
  * What the coordinator's phases know about the write they are sending — everything they used to
- * read off a `Transaction`: the action id every pend and commit names, the timestamp its log entries
- * carry, the reads recorded on them, and the aged retry priority an unvalidated pend carries.
+ * read off a `Transaction`: the action id every pend and commit names, the timestamp and HLC its log
+ * entries carry, the reads recorded on them, and the aged retry priority an unvalidated pend carries.
  * `commit` and `execute` derive one from their transaction ({@link writeContextOf}); the per-entry
  * commit (`TransactionCoordinator.commitEntry`) builds its own, since a queued entry has no
  * transaction. A `TransactionStamp` is deliberately NOT fabricated for it: a stamp carries a peer id,
@@ -21,8 +22,12 @@ import { refuseSoloField } from "../network/refuse-solo.js";
  */
 export type WriteContext = {
 	readonly actionId: ActionId;
-	/** Stamped on every log entry of the write; fixed per write, never per attempt. */
+	/** Stamped on every log entry of the write; fixed per write, never per attempt. The second
+	 * per-write value, {@link hlc}, follows the same rule. */
 	readonly timestamp: number;
+	/** Stamped on every log entry of the write (`LogEntry.hlc`) and carried on every pend of it
+	 * (`PendRequest.hlc`): one HLC for every participant, the transaction's own or the queued entry's. */
+	readonly hlc: Hlc;
 	/** Recorded on every log entry of the write (`ActionEntry.reads`). */
 	readonly reads: readonly ReadDependency[];
 	/** Already clamped (`clampPriority`); 0 on a first attempt. */
@@ -40,6 +45,7 @@ export function writeContextOf(transaction: Transaction, cycle: InFlightCycle = 
 	return {
 		actionId: transaction.id as ActionId,
 		timestamp: transaction.stamp.timestamp,
+		hlc: transaction.hlc,
 		reads: transaction.reads,
 		priority: clampPriority(transaction.priority),
 		...refuseSoloField(cycle.refuseSolo),
@@ -60,6 +66,9 @@ export type EntryCommit = {
 	readonly actionId: ActionId;
 	/** The entry's local commit time: every participant's log entry carries it (`WriteIdentity`). */
 	readonly timestamp: number;
+	/** The entry's local commit time as an HLC, minted by the queue at enqueue and re-supplied on every
+	 * drive: every participant's log entry carries it (`WriteIdentity.hlc`). */
+	readonly hlc: Hlc;
 	/** The collections the entry wrote, each of which must hold `entryId` as its HEAD sealed segment. */
 	readonly collectionIds: readonly CollectionId[];
 	/** Attempts an earlier `commitEntry` under this action id recorded through {@link recordAttempt}
@@ -136,7 +145,7 @@ export class EntryParticipants {
 			for (const { collectionId, collection } of participants) {
 				const resume = entry.resume?.get(collectionId);
 				handles.set(collectionId, await collection.openHeadCommit(entry.entryId,
-					{ actionId: entry.actionId, timestamp: entry.timestamp },
+					{ actionId: entry.actionId, timestamp: entry.timestamp, hlc: entry.hlc },
 					{
 						...cycle,
 						...(resume === undefined ? {} : { resume }),

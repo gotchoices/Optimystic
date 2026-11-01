@@ -20,6 +20,7 @@ import {
 	createTransactionId,
 	clientSignaturePayload,
 	hashOperations,
+	HlcClock,
 	bytesToB64url,
 	TransactionValidator,
 	type Transaction,
@@ -38,6 +39,10 @@ import { createPeerClientSignatureVerifier } from '../../src/cluster/client-sign
  * decided, so both halves must read the same constant.
  */
 export const SCHEMA_HASH = 'schema-hash-123';
+
+/** The clock every transaction built here mints its HLC from; the validator checks only that the
+ *  signed bytes fold the value in, so one clock serves every case. */
+const clock = new HlcClock({ nodeId: 'test' });
 
 /** The exact signer closure the collection-factory binds to a node key. */
 export function makeSigner(key: PrivateKey): TransactionSigner {
@@ -103,11 +108,13 @@ export async function buildUnsignedTx(
 	const statements = opts.statements ?? [];
 	const reads = opts.reads ?? [];
 	const stamp = await createTransactionStamp(stampPeerId, Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID);
+	const hlc = clock.now();
 	return {
 		stamp,
 		statements,
 		reads,
-		id: await createTransactionId(stamp.id, statements, reads),
+		hlc,
+		id: await createTransactionId(stamp.id, statements, reads, hlc),
 	};
 }
 
@@ -121,7 +128,7 @@ export async function buildSignedTx(
 	opts: BuildTxOptions = {}
 ): Promise<Transaction> {
 	const tx = await buildUnsignedTx(stampPeerId, opts);
-	const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads);
+	const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc);
 	tx.signature = await makeSigner(signKey)(payload);
 	return tx;
 }

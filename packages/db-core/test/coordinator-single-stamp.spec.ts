@@ -18,6 +18,7 @@
 import { expect } from 'chai';
 import {
 	ACTIONS_ENGINE_ID,
+	HlcClock,
 	ActionsEngine,
 	Collection,
 	CoordinatorConcurrentStampError,
@@ -58,6 +59,9 @@ const init = (): CollectionInitOptions<SpecAction> => ({
 
 type Staged = { stampId: string; transaction: Transaction };
 
+// The clock the hand-built transactions below mint from; a session-built one mints its own.
+const clock = new HlcClock({ nodeId: 'test' });
+
 /** Build the actions + transaction for one `set` per entry under a FRESH stamp, WITHOUT applying
  *  anything — so a case can choose to apply, to commit untracked, or to attempt-and-expect-refusal. */
 async function build(
@@ -69,9 +73,10 @@ async function build(
 	}));
 	const statements = createActionsStatements(actions);
 	const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+	const hlc = clock.now();
 	const transaction: Transaction = {
-		stamp, statements, reads: [],
-		id: await createTransactionId(stamp.id, statements, []),
+		stamp, statements, reads: [], hlc,
+		id: await createTransactionId(stamp.id, statements, [], hlc),
 	};
 	return { stampId: stamp.id, transaction, actions };
 }
@@ -321,9 +326,10 @@ describe('TransactionCoordinator: single open stamp', () => {
 			],
 		}];
 		const statements = createActionsStatements(actions);
+		const hlc = coordinator.clock.now();
 		const transaction: Transaction = {
-			stamp, statements, reads: [],
-			id: await createTransactionId(stamp.id, statements, []),
+			stamp, statements, reads: [], hlc,
+			id: await createTransactionId(stamp.id, statements, [], hlc),
 		};
 		await coordinator.commit(transaction);
 		expect(await durableLogValues(transactor, id), 'one entry carries both batches')

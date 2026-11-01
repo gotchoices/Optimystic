@@ -2,6 +2,7 @@ import { expect } from 'chai';
 import {
 	ActionsEngine,
 	ACTIONS_ENGINE_ID,
+	HlcClock,
 	clientSignaturePayload,
 	createTransactionId,
 	createTransactionStamp,
@@ -24,6 +25,7 @@ import {
  */
 describe('TransactionValidator refusal class', () => {
 	const peer = 'client-peer';
+	const clock = new HlcClock({ nodeId: 'test' });
 	const schema = 'schema-1';
 	const fakeSign = (signer: string, payload: Uint8Array): string => `fakesig:${signer}:${new TextDecoder().decode(payload)}`;
 	const fakeVerify: ClientSignatureVerifier = (peerId, payload, signature) => signature === fakeSign(peerId, payload);
@@ -46,8 +48,9 @@ describe('TransactionValidator refusal class', () => {
 	type TxShape = { engineId?: string; schemaHash?: string; ageMs?: number; ttlMs?: number; reads?: ReadDependency[] };
 	const signedTx = async ({ engineId = ACTIONS_ENGINE_ID, schemaHash = schema, ageMs = 0, ttlMs, reads = [] }: TxShape = {}): Promise<Transaction> => {
 		const stamp = await createTransactionStamp(peer, Date.now() - ageMs, schemaHash, engineId, ttlMs);
-		const tx: Transaction = { stamp, statements: [], reads, id: await createTransactionId(stamp.id, [], reads) };
-		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads));
+		const hlc = clock.now();
+		const tx: Transaction = { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) };
+		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads, hlc));
 		return tx;
 	};
 
@@ -69,7 +72,7 @@ describe('TransactionValidator refusal class', () => {
 			} },
 			{ refusal: 'Invalid client signature', validity: {}, tx: async () => {
 				const tx = await signedTx();
-				tx.signature = fakeSign('someone-else', clientSignaturePayload(tx.stamp.id, [], []));
+				tx.signature = fakeSign('someone-else', clientSignaturePayload(tx.stamp.id, [], [], tx.hlc));
 				return tx;
 			} },
 			{ refusal: 'Unknown engine', validity: undefined, tx: () => signedTx({ engineId: 'nope@1.0.0' }) },

@@ -4,6 +4,7 @@ import { expect } from 'chai'
 // which follows the same barrel-then-testing order).
 import {
 	Tree,
+	HlcClock,
 	KeyRange,
 	KeyBound,
 	ReadDependencyCollector,
@@ -27,6 +28,9 @@ import {
 	type Transforms,
 } from '../src/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
+
+// The clock the hand-built transactions below mint from.
+const clock = new HlcClock({ nodeId: 'test' })
 
 // Optimistic-concurrency structural read exclusion (ticket 4.7). A B-tree point lookup walks
 // interior branch nodes purely to reach the target leaf; those NAVIGATION reads are excluded from
@@ -275,7 +279,8 @@ describe('OCC structural read exclusion', () => {
 
 		async function makeTxn(reads: ReadDependency[]): Promise<Transaction> {
 			const stamp = await createTransactionStamp('peer', Date.now(), 'schema-1', 'actions@1.0.0')
-			return { stamp, statements: [], reads, id: await createTransactionId(stamp.id, [], reads) }
+			const hlc = clock.now()
+			return { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) }
 		}
 
 		const emptyOpsHash = async () => hashOperations(collectOperations(new Map<string, Transforms>()))

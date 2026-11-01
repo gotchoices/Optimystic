@@ -35,11 +35,16 @@ import {
 } from '../dist/index.js';
 import register from '../dist/plugin.js';
 import {
+	HlcClock,
 	TransactionCoordinator,
 	createTransactionStamp,
 	createTransactionId,
 	type Transaction,
 } from '@optimystic/db-core';
+
+// One fixed HLC for the transactions these cases build by hand: the validator reads the engine and
+// schema off the stamp, and nothing here orders by it.
+const hlc = new HlcClock({ nodeId: 'test' }).now();
 
 describe('QuereusEngine', () => {
 	let db: Database;
@@ -408,7 +413,8 @@ describe('QuereusEngine', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				id: await createTransactionId(stamp.id, [], []),
+				hlc,
+				id: await createTransactionId(stamp.id, [], [], hlc),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -437,7 +443,8 @@ describe('QuereusEngine', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				id: await createTransactionId(stamp.id, [], []),
+				hlc,
+				id: await createTransactionId(stamp.id, [], [], hlc),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -470,7 +477,8 @@ describe('QuereusEngine', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				id: await createTransactionId(stamp.id, [], []),
+				hlc,
+				id: await createTransactionId(stamp.id, [], [], hlc),
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;
@@ -490,7 +498,8 @@ describe('QuereusEngine', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				id: await createTransactionId(stamp.id, [], []),
+				hlc,
+				id: await createTransactionId(stamp.id, [], [], hlc),
 				signature: 'AAAA',
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -510,7 +519,8 @@ describe('QuereusEngine', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				id: await createTransactionId(stamp.id, [], []),
+				hlc,
+				id: await createTransactionId(stamp.id, [], [], hlc),
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;

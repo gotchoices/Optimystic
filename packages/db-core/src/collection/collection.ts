@@ -24,6 +24,7 @@ import { driveHeadCommit } from "./head-commit.js";
 import type { HeadCommitHandle } from "./head-commit.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
+import { clockOf } from "../hlc/clock.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
@@ -974,6 +975,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// pair is not obviously right either: a member re-executing the transaction after a sibling
 		// participant has landed no longer sees the state it was staged against. Tracked as an arm
 		// of tickets/backlog/feat-no-deployment-validates-transactions-at-pend.
+		// NOTE: the re-send carries no pend-level `hlc` either: the retained attempt holds the write's
+		// HLC only inside the log entry in its transforms, and the ActionEntry the refresh hands this
+		// method does not carry it. A member that missed the first pend and stores this re-send
+		// therefore observes the write's HLC when it next reads the entry, not at the pend. Fine while
+		// the HLC is observational; if a feed point at the pend ever becomes load-bearing, retain the
+		// HLC on `InFlightAttempt` beside the transforms and put it on this request.
 		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, {
 			blockDigests: attempt.blockDigests,
 			baseRevs: attempt.baseRevs,
@@ -2414,10 +2421,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.assertNoSealedSegments();
 		const identity: WriteIdentity = {
 			actionId: uint8ArrayToString(randomBytes(16), 'base64url'),
-			// One timestamp for the WRITE, minted here beside the action id and for the same reason: an
-			// attempt that takes its own would make the retry's log block differ from the one the
-			// attempt it repeats may already have stored under this `(action id, revision)`.
+			// One timestamp and one HLC for the WRITE, minted here beside the action id and for the same
+			// reason: an attempt that took its own would make the retry's log block differ from the one
+			// the attempt it repeats may already have stored under this `(action id, revision)`.
 			timestamp: Date.now(),
+			hlc: clockOf(this.transactor).now(),
 		};
 
 		const endInFlight = this.beginInFlightAction(identity.actionId, { refuseSolo: options?.refuseSoloCommit });
@@ -2496,6 +2504,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	private send(staged: StagedAttempt, identity: WriteIdentity, priority: number): Promise<CommitResult> {
 		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId, {
 			priority,
+			hlc: identity.hlc,
 			blockDigests: staged.blockDigests,
 			baseRevs: staged.baseRevs,
 			refuseSolo: this.inFlightCycle.refuseSolo
@@ -2542,7 +2551,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * when a refresh or the head tracker's staging refused it during the cycle; whatever
 	 * `options.recordAttempt` throws, before anything is sent; otherwise what {@link sync} throws. */
 	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
-		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp }, {
+		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp, hlc: options.hlc }, {
 			refuseSolo: options.refuseSoloCommit,
 			...(options.resume === undefined ? {} : { resume: options.resume }),
 			...(options.onCommittedHead === undefined ? {} : { onCommittedHead: options.onCommittedHead }),

@@ -6,6 +6,8 @@ import { ActionRefusedError, SealedSegmentsError } from '../collection/struct.js
 import type { CollectionId, InFlightAttempt, SyncOptions } from '../collection/struct.js';
 import type { AlreadyAppliedTally } from '../collection/action.js';
 import type { ITransactor } from '../transactor/transactor.js';
+import { clockOf } from '../hlc/clock.js';
+import type { Hlc } from '../hlc/hlc.js';
 import { TransactionCoordinator } from '../transaction/coordinator.js';
 import { classifyCommitFailure, refusalReason } from '../transaction/commit-failure-class.js';
 import { recordCollectionDurability, transactionDurability } from '../transaction/durability.js';
@@ -73,6 +75,9 @@ export type RestoreInit = {
 	readonly id: EntryId;
 	readonly seq: number;
 	readonly queuedAt: number;
+	/** The record's HLC (`JournalEntryRecord.hlc`); a record written before the field existed is
+	 * restored with `legacyHlc(queuedAt)`, the one shape a legacy entry already has. */
+	readonly hlc: Hlc;
 	readonly expiresAt?: number;
 	/** The collections the entry sealed a segment in, in the record's order — `stage` is called for
 	 * each, in this order. */
@@ -140,11 +145,11 @@ function entryDurability(entry: Entry, written: TransactionDurability | undefine
  * is its own storage); the queue's callers never seal such a set together, so this is a defect that
  * stops the drain rather than a failure of the entry.
  */
-function sharedTransactor(entry: Entry, remaining: readonly Collection<any>[]): ITransactor {
+function sharedTransactor(entryId: EntryId, remaining: readonly Collection<any>[]): ITransactor {
 	const transactor = remaining[0]!.transactor;
 	const stranger = remaining.find(collection => collection.transactor !== transactor);
 	if (stranger !== undefined) {
-		throw new Error(`offline queue: entry ${entry.id} spans collections on different transactors (${remaining[0]!.id} and ${stranger.id}); an entry is one network transaction on one transactor`);
+		throw new Error(`offline queue: entry ${entryId} spans collections on different transactors (${remaining[0]!.id} and ${stranger.id}); an entry is one network transaction on one transactor`);
 	}
 	return transactor;
 }
@@ -155,6 +160,7 @@ function entryRecord(entry: Entry): JournalEntryRecord {
 		id: entry.id,
 		seq: entry.seq,
 		queuedAt: entry.queuedAt,
+		hlc: entry.hlc,
 		...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
 		segments: entry.collections.map(collection => {
 			const actions = collection.sealedActions(entry.id);
@@ -294,7 +300,7 @@ export class OfflineQueue {
 	 *
 	 * @throws QueueDisposedError after {@link dispose}; the drain's defect, as `cause`, once the
 	 * drain has stopped on one (nothing queued then would ever drain); whatever the journal threw. */
-	async enqueue(collections: readonly Collection<any>[], init?: { id?: EntryId; timestamp?: number }): Promise<QueuedEntry | undefined> {
+	async enqueue(collections: readonly Collection<any>[], init?: { id?: EntryId; timestamp?: number; hlc?: Hlc }): Promise<QueuedEntry | undefined> {
 		this.assertAccepting();
 		const id = init?.id ?? mintId();
 		if (this.byId.has(id)) throw new Error(`entry ${id} is already queued`);
@@ -305,6 +311,12 @@ export class OfflineQueue {
 			id,
 			seq: this.nextSeq,
 			queuedAt,
+			// The local commit time in HLC form, from the clock the entry will be sent through. Minted
+			// here, once, so every drive of the entry — first or re-drive, after a restart or not —
+			// appends the same entry. Read off the first sealed collection rather than through
+			// `sharedTransactor`, whose stranger check must not fail an enqueue that has already sealed:
+			// it runs, and throws, at the send.
+			hlc: init?.hlc ?? clockOf(sealed[0]!.transactor).now(),
 			expiresAt: this.expireAfterMs === undefined ? undefined : queuedAt + this.expireAfterMs,
 			collections: sealed,
 			actionId: mintId(),
@@ -732,19 +744,21 @@ export class OfflineQueue {
 				...submit,
 				actionId: entry.actionId,
 				timestamp: entry.queuedAt,
+				hlc: entry.hlc,
 				recordAttempt: attempt => recordAttempt(new Map([[collection.id, attempt]])),
 				onCommittedHead: applied => onCommittedHead(collection.id, applied),
 				...(resume === undefined ? {} : { resume }),
 			});
 			return transactionDurability(new Map([[collection.id, written]]));
 		}
-		const coordinator = new TransactionCoordinator(sharedTransactor(entry, remaining),
+		const coordinator = new TransactionCoordinator(sharedTransactor(entry.id, remaining),
 			new Map(remaining.map(collection => [collection.id, collection])), { pendValidation: 'none' });
 		const resume = new Map([...entry.retained].filter(([collectionId]) => remaining.some(collection => collection.id === collectionId)));
 		return coordinator.commitEntry({
 			entryId: entry.id,
 			actionId: entry.actionId,
 			timestamp: entry.queuedAt,
+			hlc: entry.hlc,
 			collectionIds: remaining.map(collection => collection.id),
 			recordAttempt,
 			onCommittedHead,
@@ -1058,6 +1072,7 @@ export class OfflineQueue {
 			id: init.id,
 			seq: init.seq,
 			queuedAt: init.queuedAt,
+			hlc: init.hlc,
 			expiresAt: init.expiresAt,
 			collections: init.collections,
 			actionId: drive?.actionId ?? mintId(),

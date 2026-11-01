@@ -46,6 +46,7 @@
 import { expect } from 'chai';
 import {
 	ACTIONS_ENGINE_ID,
+	HlcClock,
 	ActionsEngine,
 	Collection,
 	CoordinatorStaleLossError,
@@ -97,6 +98,9 @@ const setAction = (value: string): Action<SpecAction> => ({ type: 'set', data: {
 const actionsFor = (...collectionIds: string[]): CollectionActions[] =>
 	collectionIds.map(collectionId => ({ collectionId, actions: [setAction(collectionId)] }));
 
+// The clock the hand-built transactions below mint from.
+const clock = new HlcClock({ nodeId: 'test' });
+
 /**
  * Build a transaction over `actions` WITHOUT applying them.
  *
@@ -107,9 +111,10 @@ const actionsFor = (...collectionIds: string[]): CollectionActions[] =>
 async function buildTransaction(actions: CollectionActions[]): Promise<Transaction> {
 	const statements = createActionsStatements(actions);
 	const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+	const hlc = clock.now();
 	return {
-		stamp, statements, reads: [],
-		id: await createTransactionId(stamp.id, statements, []),
+		stamp, statements, reads: [], hlc,
+		id: await createTransactionId(stamp.id, statements, [], hlc),
 	};
 }
 

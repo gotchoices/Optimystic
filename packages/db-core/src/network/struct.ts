@@ -2,6 +2,7 @@ import type { CollectionId, BlockId, IBlock, ActionId, Transform, Transforms } f
 import type { ActionContext, ActionRev } from "../collection/action.js";
 import type { Transaction, ValidityRejection } from "../transaction/transaction.js";
 import type { DisputeResolutionProof } from "../log/struct.js";
+import type { Hlc } from "../hlc/hlc.js";
 import type { PeerId } from "./types.js";
 
 export type ActionBlocks = {
@@ -54,6 +55,17 @@ export type PendRequest = ActionTransforms & {
 	};
 	/** For multi-collection transactions: supercluster nominees for consensus */
 	superclusterNominees?: PeerId[];
+	/**
+	 * The HLC of the write this pend carries (`LogEntry.hlc`, `Transaction.hlc`): the same value the
+	 * log entry inside `transforms` carries, put here so a storage node observes the HLC of every
+	 * write it stores without parsing log blocks out of transforms (docs/crdt-sync.md §Migration
+	 * Path, Stage 1). The writer always sets it (`TransactorSource.transact`,
+	 * `TransactionCoordinator.pendRequestFor`); optional on the wire because an older writer sends
+	 * none, and because the re-send of a retained attempt has none at hand. Observational: a member
+	 * reads it into its clock and never judges the pend by it. Omitted rather than `undefined`, for
+	 * the same preimage reason as {@link baseRevs}.
+	 */
+	hlc?: Hlc;
 	/**
 	 * Aged, advisory retry priority for a pend that carries no transaction (default 0 when absent).
 	 * A validated multi-collection pend instead carries priority on the transaction inside

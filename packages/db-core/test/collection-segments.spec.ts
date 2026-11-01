@@ -16,6 +16,7 @@
 import { expect } from 'chai';
 import {
 	Tree,
+	HlcClock,
 	TreeEntryChangedError,
 	TreeKeyTakenError,
 	ActionRefusedError,
@@ -100,9 +101,12 @@ async function rivalWrites(transactor: TestTransactor, key: number, name: string
 	await commitRivalTreeWrite<number, Entry>(transactor, USERS, byKey, [[key, entry(key, name)]]);
 }
 
+// The clock the queue would mint each entry's HLC from.
+const clock = new HlcClock({ nodeId: 'test' });
+
 /** The head commit's identity, as the queue would supply it, with a short retry budget. */
 const headOptions = (actionId: string): HeadCommitOptions =>
-	({ actionId, timestamp: Date.now(), maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+	({ actionId, timestamp: Date.now(), hlc: clock.now(), maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
 
 /** The keys each committed log entry of `id` replaced, in log order, read through a fresh handle
  * over the UNWRAPPED transactor — durable storage, not the handle under test's view. */
@@ -1165,9 +1169,10 @@ describe('Collection sealed segments', function () {
 			]));
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const statements = ['insert users 2 + posts 100'];
+			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
-				stamp, statements, reads: [],
-				id: await createTransactionId(stamp.id, statements, []),
+				stamp, statements, reads: [], hlc,
+				id: await createTransactionId(stamp.id, statements, [], hlc),
 			};
 
 			const commitErr = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));

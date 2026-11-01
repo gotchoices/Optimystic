@@ -3,6 +3,9 @@ import { Log } from '../src/log/index.js'
 import type { ReadDependency } from '../src/index.js'
 import { TestLogStore } from './test-log-store.js'
 import { generateNumericActionId } from './generate-numeric-action-id.js'
+import { HlcClock } from '../src/hlc/clock.js'
+
+const hlc = new HlcClock({ nodeId: 'test' }).now()
 
 /**
  * Read-set persistence (invalidation cascade prerequisite). The committed read set must survive a
@@ -25,7 +28,7 @@ describe('Log action read-set persistence', () => {
 			{ blockId: 'block-B', revision: 7 },
 		]
 
-		const { entry } = await log.addActions(['op'], id, 1, () => ['block-W'], { reads })
+		const { entry } = await log.addActions(['op'], id, 1, () => ['block-W'], { reads, hlc })
 		expect(entry.action?.reads).to.deep.equal(reads)
 
 		// Survives a fresh read back through getFrom.
@@ -46,9 +49,9 @@ describe('Log action read-set persistence', () => {
 		const emptyId = generateNumericActionId(2)
 
 		// Legacy path (no reads argument): undefined — the cascade treats this as an unknown dependency.
-		await log.addActions(['legacy'], legacyId, 1, () => [])
+		await log.addActions(['legacy'], legacyId, 1, () => [], { hlc })
 		// Explicit empty read set: a transaction that genuinely read nothing.
-		await log.addActions(['empty'], emptyId, 2, () => [], { reads: [] })
+		await log.addActions(['empty'], emptyId, 2, () => [], { reads: [], hlc })
 
 		const { entries } = await log.getFrom(0)
 		const legacy = entries.find(e => e.actionId === legacyId)

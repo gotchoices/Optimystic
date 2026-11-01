@@ -93,7 +93,7 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		// Sign with a real key but stamp a peer-id string that is not a valid libp2p identity.
 		// peerIdFromString throws inside verifyPeerSig; the closure catches → false → clean reject.
 		const tx = await buildUnsignedTx('not-a-real-peer-id');
-		tx.signature = await makeSigner(keyA)(clientSignaturePayload(tx.stamp.id, [], []));
+		tx.signature = await makeSigner(keyA)(clientSignaturePayload(tx.stamp.id, [], [], tx.hlc));
 		const validator = makeValidator(verifier);
 		let result: Awaited<ReturnType<TransactionValidator['validate']>> | undefined;
 		let threw = false;
@@ -134,7 +134,7 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 	});
 
 	it('base64url round-trips: the encoded signature decodes back to the raw signPeer bytes', async () => {
-		const payload = clientSignaturePayload('stamp:x', ['stmt'], []);
+		const payload = clientSignaturePayload('stamp:x', ['stmt'], [], { wallMs: 1_700_000_000_000, logical: 0, nodeId: 'test' });
 		const rawSig = await signPeer(keyA, payload);
 		const encoded = bytesToB64url(rawSig);
 		expect(Array.from(b64urlToBytes(encoded))).to.deep.equal(Array.from(rawSig));
@@ -151,7 +151,7 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		});
 		const roundTripped = JSON.parse(JSON.stringify(tx)) as Transaction;
 		expect(roundTripped.signature).to.equal(tx.signature);
-		const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads);
+		const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads, roundTripped.hlc);
 		expect(verifier(roundTripped.stamp.peerId, payload, roundTripped.signature!)).to.be.true;
 	});
 
@@ -193,7 +193,7 @@ describe('Client transaction signatures — real Ed25519 keys (p2p backing)', ()
 		expect(committed).to.have.lengthOf(1);
 		const tx = committed[0]!;
 		expect(tx.signature, 'signer stamped a signature').to.be.a('string');
-		const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads);
+		const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc);
 		expect(verifier(tx.stamp.peerId, payload, tx.signature!), 'committed signature verifies').to.be.true;
 	});
 });

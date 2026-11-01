@@ -4,6 +4,7 @@ import { expect } from 'chai'
 // occ-structural-read-exclusion.spec.ts, which follow the same barrel-then-testing order).
 import {
 	Tree,
+	HlcClock,
 	ActionsEngine,
 	ACTIONS_ENGINE_ID,
 	createTransactionStamp,
@@ -21,6 +22,9 @@ import {
 	type Transforms,
 } from '../src/index.js'
 import { TestTransactor, commitRivalTreeWrite } from '../src/testing/test-transactor.js'
+
+// The clock the hand-built transactions below mint from.
+const clock = new HlcClock({ nodeId: 'test' })
 
 // END-TO-END composition of the `txn-read-dependency-misses-cache-hits` fix.
 //
@@ -88,7 +92,8 @@ describe('read dependencies end to end: cache hit -> superseded -> stale-read re
 
 	async function makeTxn(reads: ReadDependency[]): Promise<Transaction> {
 		const stamp = await createTransactionStamp('peer-reader', Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID)
-		return { stamp, statements: [], reads, id: await createTransactionId(stamp.id, [], reads) }
+		const hlc = clock.now()
+		return { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) }
 	}
 
 	const emptyOpsHash = () => hashOperations(collectOperations(new Map<string, Transforms>()))

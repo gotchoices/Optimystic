@@ -1,5 +1,6 @@
 import type { ITransactor, BlockId, CollectionId, Transforms, PendRequest, PendResult, CommitRequest, CommitResult, WriteFailure, ActionId, WriteDurability, BlockContentDigests } from "../index.js";
 import type { BlockBaseRevs } from "../network/struct.js";
+import { clockOf, type HlcClock } from "../hlc/clock.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
 import { isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
@@ -462,6 +463,13 @@ export class TransactionCoordinator {
 		options: CoordinatorOptions = {}
 	) {
 		this.pendValidation = options.pendValidation ?? 'transaction';
+	}
+
+	/** The clock a transaction committed through this coordinator mints its HLC from
+	 * (`Transaction.hlc`): the transactor's own, or the process-wide fallback (`clockOf`). Exposed so
+	 * `TransactionSession.commit` mints after its read set is final without holding the transactor. */
+	get clock(): HlcClock {
+		return clockOf(this.transactor);
 	}
 
 	/**
@@ -1338,6 +1346,7 @@ export class TransactionCoordinator {
 		const context: WriteContext = {
 			actionId: entry.actionId,
 			timestamp: entry.timestamp,
+			hlc: entry.hlc,
 			reads: [],
 			priority,
 			...refuseSoloField(cycle.inFlight.refuseSolo),
@@ -1816,7 +1825,7 @@ export class TransactionCoordinator {
 	 * Apply actions to a collection.
 	 *
 	 * This runs the action handlers, writes to the log, and collects transforms. The log entry is
-	 * written under `context`: its action id, its timestamp and its reads.
+	 * written under `context`: its action id, its timestamp, its HLC and its reads.
 	 */
 	private async applyActionsToCollection(
 		collectionActions: CollectionActions,
@@ -1856,8 +1865,8 @@ export class TransactionCoordinator {
 		// same revision, and storage keys a saved block revision by `(action id, revision)`. So any
 		// data block the append mints takes the id an earlier attempt at this revision minted
 		// (Collection.logAppendBlockIds), and the entry is stamped with the transaction's own
-		// timestamp, which is fixed at BEGIN and already stable across attempts, rather than with
-		// the time of the attempt.
+		// timestamp and HLC — the timestamp fixed at BEGIN, the HLC minted once at commit, both
+		// stable across attempts — rather than with the time of the attempt.
 		//
 		// NOTE: execute() reaches this method without marking its transaction in flight, so it mints
 		// afresh every time — correct today, because it re-runs the engine and re-stages, so a
@@ -1897,7 +1906,7 @@ export class TransactionCoordinator {
 			actionId,
 			newRev,
 			() => blockIdsForTransforms(transforms),
-			{ collectionIds: allCollectionIds, reads: [...context.reads], timestamp: context.timestamp }
+			{ collectionIds: allCollectionIds, reads: [...context.reads], timestamp: context.timestamp, hlc: context.hlc }
 		);
 
 		// Return the transforms and log tail block ID
@@ -2254,10 +2263,13 @@ export class TransactionCoordinator {
 		// Collection.sync pend.
 		// The bases (`PendRequest.baseRevs`) were read from the same tracker the commit's declaration was
 		// taken from, when the attempt was described; omitted when empty.
+		// The HLC is the write's (`WriteContext.hlc`), the same value the log entry inside `transforms`
+		// carries, so the pend and its validation payload cannot disagree on it.
 		return {
 			actionId: context.actionId,
 			rev: attempt.rev,
 			transforms: attempt.transforms,
+			hlc: context.hlc,
 			policy: 'r', // Return policy: fail but return pending actions
 			...(validation === undefined
 				? (context.priority > 0 ? { priority: context.priority } : {})

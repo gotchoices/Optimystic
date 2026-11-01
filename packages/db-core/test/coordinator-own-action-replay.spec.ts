@@ -129,9 +129,10 @@ async function stage(
 	}));
 	const statements = createActionsStatements(actions);
 	const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
+	const hlc = coordinator.clock.now();
 	const transaction: Transaction = {
-		stamp, statements, reads: [],
-		id: idOverride ?? await createTransactionId(stamp.id, statements, []),
+		stamp, statements, reads: [], hlc,
+		id: idOverride ?? await createTransactionId(stamp.id, statements, [], hlc),
 	};
 	await coordinator.applyActions(actions, stamp.id);
 	return transaction;

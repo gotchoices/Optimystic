@@ -1848,7 +1848,23 @@ saveMaterializedBlock(block): store(structuredClone(block));
     `transaction.stamp.timestamp`, fixed at BEGIN and already stable across attempts, and on a head
     commit (`Collection.commitHead`) it is the entry's local commit time, supplied by the queue as
     `HeadCommitOptions.timestamp`. Nothing in the tree reads `LogEntry.timestamp` for logic — it is
-    informational — so the write's time is a safe value, and arguably the more honest one.
+    informational — so the write's time is a safe value, and arguably the more honest one. The
+    entry's **HLC** (`LogEntry.hlc`, the hybrid logical clock value of
+    [crdt-sync.md §Migration Path](crdt-sync.md#migration-path), Stage 1) is minted and re-sent by
+    the same rule: once per write, beside the action id and timestamp in `WriteIdentity.hlc` on a
+    sync, as `Transaction.hlc` at commit on the coordinator path (minted after the read set is final,
+    so it sits above every HLC a read observed — which is why it lives on the transaction and not on
+    the stamp), and as `HeadCommitOptions.hlc` on a head commit, minted by the queue at enqueue and
+    journaled with the entry. Every retry re-sends the HLC it was first minted with, whatever revision
+    it requests (the `NOTE:` at `WriteIdentity.hlc` records the imprecision that accepts). Nothing
+    orders by it yet. Checkpoint and invalidation entries carry one too (`Log.addCheckpoint`,
+    `Log.addInvalidation`; the invalidation's from the applying node's clock,
+    `InvalidationContext.clock` in `packages/db-p2p/src/dispute/invalidation.ts`), and a stored entry
+    from before the field reads through `hlcOf` in `packages/db-core/src/log/struct.ts` as its
+    timestamp with an empty node id. The transaction's HLC is also folded into its id
+    (`createTransactionId`) and its client signature (`clientSignaturePayload`, `txsig:v2`), and
+    rides on every pend of the write (`PendRequest.hlc`), so a storage node observes it without
+    parsing log blocks.
   - the **id of the data block** the append mints when the current log block is full (32 entries, or
     `BLOCK_TARGET_BYTES` of JSON — see [A transaction's size limit](#a-transactions-size-limit)).
     `Collection.logAppendBlockIds` hands `Log.open` the ids an earlier attempt of this action minted

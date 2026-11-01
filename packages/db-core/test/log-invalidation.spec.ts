@@ -3,6 +3,11 @@ import { Log } from '../src/log/index.js'
 import type { LogBlock, DisputeResolutionProof, RevertedBlock } from '../src/log/index.js'
 import { TestLogStore } from './test-log-store.js'
 import { generateNumericActionId } from './generate-numeric-action-id.js'
+import { HlcClock } from '../src/hlc/clock.js'
+
+// One fixed HLC for every entry these cases append: the log records what it is given, and nothing
+// here orders by it.
+const hlc = new HlcClock({ nodeId: 'test' }).now()
 
 function makeProof(disputeId: string, messageHash: string): DisputeResolutionProof {
 	// A structurally-complete v3 proof (these tests exercise log persistence, not crypto verification —
@@ -33,12 +38,12 @@ describe('Log invalidation entries', () => {
 		const invId = generateNumericActionId(1)
 
 		// Commit the action that will later be invalidated.
-		await log.addActions(['create'], invId, 1, () => [])
+		await log.addActions(['create'], invId, 1, () => [], { hlc })
 
 		const reverted: RevertedBlock[] = [{ blockId: 'block-A', fromRev: 1, restoredContentHash: 'hash-pre-Tinv' }]
 		const proof = makeProof('dispute-1', 'msg-hash-1')
 
-		const { entry } = await log.addInvalidation(invId, 1, proof, reverted, 2)
+		const { entry } = await log.addInvalidation(invId, 1, proof, reverted, 2, { hlc })
 
 		expect(entry.rev).to.equal(2)
 		expect(entry.invalidation?.invalidatedActionId).to.equal(invId)
@@ -65,11 +70,11 @@ describe('Log invalidation entries', () => {
 		// where priorHash linkage is observable.
 		const results = []
 		for (let i = 0; i < 32; i++) {
-			results.push(await log.addActions([`a${i}`], generateNumericActionId(i + 1), i + 1, () => []))
+			results.push(await log.addActions([`a${i}`], generateNumericActionId(i + 1), i + 1, () => [], { hlc }))
 		}
 		const invResult = await log.addInvalidation(
 			generateNumericActionId(1), 1, makeProof('d', 'm'),
-			[{ blockId: 'b', fromRev: 32, restoredContentHash: 'h' }], 33
+			[{ blockId: 'b', fromRev: 32, restoredContentHash: 'h' }], 33, { hlc }
 		)
 
 		const firstBlock = (await store.tryGet(results[0]!.tailPath.block.header.id))! as LogBlock<string>
@@ -84,14 +89,14 @@ describe('Log invalidation entries', () => {
 		const invalidatedId = generateNumericActionId(1)
 		const survivingId = generateNumericActionId(2)
 
-		await log.addActions(['a1'], invalidatedId, 1, () => [])
-		await log.addActions(['a2'], survivingId, 2, () => [])
+		await log.addActions(['a1'], invalidatedId, 1, () => [], { hlc })
+		await log.addActions(['a2'], survivingId, 2, () => [], { hlc })
 
 		// Before the invalidation lands, nothing is reported invalid.
 		expect(await log.findInvalidation(invalidatedId)).to.be.undefined
 
 		const proof = makeProof('dispute-7', 'msg-7')
-		await log.addInvalidation(invalidatedId, 1, proof, [{ blockId: 'b', fromRev: 2, restoredContentHash: 'h' }], 3)
+		await log.addInvalidation(invalidatedId, 1, proof, [{ blockId: 'b', fromRev: 2, restoredContentHash: 'h' }], 3, { hlc })
 
 		const found = await log.findInvalidation(invalidatedId)
 		expect(found?.invalidatedActionId).to.equal(invalidatedId)
@@ -106,11 +111,11 @@ describe('Log invalidation entries', () => {
 		const id2 = generateNumericActionId(2)
 		const id3 = generateNumericActionId(3)
 
-		await log.addActions(['a1'], id1, 1, () => [])
-		await log.addActions(['a2'], id2, 2, () => [])
+		await log.addActions(['a1'], id1, 1, () => [], { hlc })
+		await log.addActions(['a2'], id2, 2, () => [], { hlc })
 		// Invalidate a1 — takes rev slot 3.
-		await log.addInvalidation(id1, 1, makeProof('d', 'm'), [{ blockId: 'b', fromRev: 2, restoredContentHash: 'h' }], 3)
-		await log.addActions(['a3'], id3, 4, () => [])
+		await log.addInvalidation(id1, 1, makeProof('d', 'm'), [{ blockId: 'b', fromRev: 2, restoredContentHash: 'h' }], 3, { hlc })
+		await log.addActions(['a3'], id3, 4, () => [], { hlc })
 
 		// getFrom should return only the three *action* entries, skipping the invalidation.
 		const fromStart = await log.getFrom(0)
@@ -130,11 +135,11 @@ describe('Log invalidation entries', () => {
 		const id1 = generateNumericActionId(1)
 		const id2 = generateNumericActionId(2)
 
-		await log.addActions(['a1'], id1, 1, () => [])
-		await log.addActions(['a2'], id2, 2, () => [])
+		await log.addActions(['a1'], id1, 1, () => [], { hlc })
+		await log.addActions(['a2'], id2, 2, () => [], { hlc })
 		// Two invalidations at rev 3 and 4.
-		await log.addInvalidation(id1, 1, makeProof('d1', 'm'), [{ blockId: 'block-A', fromRev: 2, restoredContentHash: 'h1' }], 3)
-		await log.addInvalidation(id2, 2, makeProof('d2', 'm'), [{ blockId: 'block-B', fromRev: 2, restoredContentHash: 'h2' }], 4)
+		await log.addInvalidation(id1, 1, makeProof('d1', 'm'), [{ blockId: 'block-A', fromRev: 2, restoredContentHash: 'h1' }], 3, { hlc })
+		await log.addInvalidation(id2, 2, makeProof('d2', 'm'), [{ blockId: 'block-B', fromRev: 2, restoredContentHash: 'h2' }], 4, { hlc })
 
 		// A client synced through rev 2 sees both reversals; getFrom (actions only) sees none of them.
 		const sinceRev2 = await log.getInvalidationsFrom(2)
@@ -156,9 +161,9 @@ describe('Log invalidation entries', () => {
 		const log = await Log.create<string>(store)
 		const invalidatedId = generateNumericActionId(1)
 
-		await log.addActions(['a1'], invalidatedId, 1, () => [])
-		await log.addInvalidation(invalidatedId, 1, makeProof('dispute-A', 'm'), [{ blockId: 'b', fromRev: 1, restoredContentHash: 'h1' }], 2)
-		await log.addInvalidation(invalidatedId, 1, makeProof('dispute-B', 'm'), [{ blockId: 'b', fromRev: 1, restoredContentHash: 'h2' }], 3)
+		await log.addActions(['a1'], invalidatedId, 1, () => [], { hlc })
+		await log.addInvalidation(invalidatedId, 1, makeProof('dispute-A', 'm'), [{ blockId: 'b', fromRev: 1, restoredContentHash: 'h1' }], 2, { hlc })
+		await log.addInvalidation(invalidatedId, 1, makeProof('dispute-B', 'm'), [{ blockId: 'b', fromRev: 1, restoredContentHash: 'h2' }], 3, { hlc })
 
 		const found = await log.findInvalidation(invalidatedId)
 		expect(found?.resolution.disputeId).to.equal('dispute-B')
