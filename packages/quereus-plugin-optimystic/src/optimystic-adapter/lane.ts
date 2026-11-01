@@ -100,9 +100,9 @@ export function mergeOf(column: Tagged): ColumnMerge | undefined {
  *   a content key merges as the same write made twice. A `foreign-key-parent` entry is also how a
  *   cascade reaches the rule: the cascade's child writes carry no description of their own (an
  *   `undescribed` fact, serializable by itself), but the parent statement lists the constraint;
- * - the operation is an UPDATE whose rows were chosen by anything but a key equality
- *   (`selection.kind === 'global'`): which rows the statement touches is itself a read of other
- *   writers' state;
+ * - the operation is an UPDATE whose rows were chosen by anything but an equality on the PRIMARY key
+ *   ({@link selectedByPrimaryKey}: a `global` selection, or a `rows` one keyed by a UNIQUE key):
+ *   which rows the statement touches is itself a read of other writers' state;
  * - the operation is a DELETE. NOTE: no tombstone merge is declared in this pass, so a delete of a
  *   row another machine concurrently updated is the quorum's to order; a `'tombstone'` arm of
  *   {@link mergeOf} is the first to add once a replay-mode application needs deletes to merge;
@@ -124,7 +124,7 @@ export function laneCeilingOf(write: TableWrite, table: TableSchema): Lane {
 		case 'delete':
 			return 'serializable';
 		case 'update':
-			if (write.selection.kind === 'global') return 'serializable';
+			if (!selectedByPrimaryKey(write.selection, table)) return 'serializable';
 			if (!write.columns.every(column => mergeOf(columnNamed(table, column.column) ?? {}) !== undefined)) return 'serializable';
 			return 'convergent';
 		case 'insert':
@@ -200,6 +200,22 @@ function decidedAgainstOtherRows(constraint: TableWrite['constraints'][number], 
 		case 'not-null':
 			return false;
 	}
+}
+
+/**
+ * Whether `selection` chose its rows by equality on the table's primary key, the row's identity in the
+ * tree. Quereus keys a `rows` selection on the primary key when the predicate covers it and otherwise
+ * on the first covered UNIQUE key (`chooseRowKey` in
+ * `@quereus/quereus/src/planner/analysis/binding-extractor.ts`), and a unique value names a row only
+ * through other writers' state: a rival moving the value to another row changes which row the
+ * statement means. An empty key (a source proven to yield at most one row) names no row either,
+ * except on a table whose primary key is empty, where it is the key.
+ */
+function selectedByPrimaryKey(selection: TableWrite['selection'], table: TableSchema): boolean {
+	if (selection.kind !== 'rows') return false;
+	const key = new Set(selection.key.map(name => name.toLowerCase()));
+	const primary = table.primaryKeyDefinition.map(pk => table.columns[pk.index]?.name.toLowerCase());
+	return primary.length === key.size && primary.every(name => name !== undefined && key.has(name));
 }
 
 function hasDoUpdateClause(disposition: TableWrite['disposition']): boolean {

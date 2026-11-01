@@ -11,9 +11,10 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { TableSchema, TableWrite } from '@quereus/quereus';
-import { stricterLane, type Lane } from '@optimystic/db-core';
+import type { Lane } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { laneCeilingOf, laneOf } from '../src/optimystic-adapter/lane.js';
+import { laneCeilingOf, laneOf, transactionLaneOf } from '../src/optimystic-adapter/lane.js';
+import type { WriteFact } from '../src/optimystic-adapter/write-description.js';
 
 const REPLAY = `with tags ("optimystic.profile" = 'replay-permitted')`;
 const LWW = `with tags ("optimystic.merge" = 'last-writer-wins')`;
@@ -28,7 +29,7 @@ describe('lane: which lane a described statement takes', () => {
 		// Declared spellings differ from the lowercased names the description carries, on purpose.
 		await db.exec(`
 			create table t (Id text primary key, Title text ${LWW}, n integer ${LWW}, name text, body text) using memory ${REPLAY};
-			create table u (Id text primary key, Email text unique, body text) using memory ${REPLAY};
+			create table u (Id text primary key, Email text unique, body text ${LWW}) using memory ${REPLAY};
 			create table parent (id text primary key) using memory ${REPLAY};
 			create table child (id text primary key, parent_id text references parent(id)) using memory ${REPLAY};
 			create table k (Id text primary key with tags ("optimystic.fresh" = true), body text) using memory ${REPLAY};
@@ -69,6 +70,7 @@ describe('lane: which lane a described statement takes', () => {
 		{ name: 'an increment of a merge-tagged column reads the row: serializable to the writer, convergent at the ceiling', sql: `update t set n = n + 1 where Id = :id`, lane: 'serializable', ceiling: 'convergent' },
 		{ name: 'an update that assigns a key column moves the row', sql: `update t set Id = :new where Id = :id`, lane: 'serializable' },
 		{ name: 'an update choosing its rows by a non-key predicate reads other writers\' state', sql: `update t set Title = :v where name = :n`, lane: 'serializable' },
+		{ name: 'an update choosing its row by a UNIQUE key: which row the value names is other writers\' state to change', sql: `update u set body = :v where Email = :e`, lane: 'serializable' },
 		{ name: 'a delete: no tombstone merge is declared', sql: `delete from t where Id = :id`, lane: 'serializable' },
 		{ name: 'a StampId()-keyed insert into a table with no profile tag: strong is the ceiling', sql: `insert into s (Id, Title) values (StampId(), 'a')`, lane: 'serializable' },
 	];
@@ -81,9 +83,13 @@ describe('lane: which lane a described statement takes', () => {
 		});
 	}
 
-	it('a transaction spanning a strong table and a replay-permitted one is serializable: the stricter lane over its statements', () => {
+	it('a transaction takes the stricter lane over its described statements, and serializable when a write went undescribed', () => {
 		const convergent = described(insertT('StampId()'));
 		const strong = described(`insert into s (Id, Title) values (StampId(), 'a')`);
-		expect(stricterLane([laneOf(convergent.write, convergent.table), laneOf(strong.write, strong.table)])).to.equal('serializable');
+		const lane = (statement: { write: TableWrite; table: TableSchema }): WriteFact => ({ kind: 'lane', lane: laneOf(statement.write, statement.table) });
+		expect(transactionLaneOf([lane(convergent)]), 'one convergent statement').to.equal('convergent');
+		expect(transactionLaneOf([lane(convergent), lane(strong)]), 'a strong table beside a replay-permitted one').to.equal('serializable');
+		expect(transactionLaneOf([lane(convergent), { kind: 'undescribed' }]), 'a cascade child write beside it').to.equal('serializable');
+		expect(transactionLaneOf([]), 'nothing described').to.equal('serializable');
 	});
 });

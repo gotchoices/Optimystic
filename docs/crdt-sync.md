@@ -269,6 +269,8 @@ The two modes coexist. A Tree collection might run in replay mode for a chat app
 
 This layered evolution means no flag day. The current guarantees hold for every collection that stays in strong mode. Opt-in to replay is a deliberate application choice with explicit partition semantics.
 
+**What has landed, as vocabulary.** The declaration and the classification exist ahead of the replay mode they will drive, so that every write already says which lane it takes (`Lane` in `packages/db-core/src/lane/lane.ts`: `serializable`, the strong lane, or `convergent`, the replay lane; the carriers are in [internals.md §Every Write Carries a Lane](internals.md#every-write-carries-a-lane)). A bare collection declares with `CollectionInitOptions.merge` (`ConvergentMerge` in `packages/db-core/src/collection/collection.ts`); a SQL table opts in with `with tags ("optimystic.profile" = 'replay-permitted')` and names the columns that merge with `"optimystic.merge" = 'last-writer-wins'`, and the Quereus plugin classifies each statement from its write description and those declarations — the rule is [transactions.md §Which lane a transaction takes](transactions.md#which-lane-a-transaction-takes). Nothing admits, refuses or merges by the lane yet: the strong guarantees hold for every write, whatever lane it carries, until Stage 2 lands.
+
 ## Relation to Prior Work
 
 This design sits in well-explored territory. Pointers:
