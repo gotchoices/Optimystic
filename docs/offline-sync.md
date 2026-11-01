@@ -1407,6 +1407,9 @@ type JournalEntryRecord = {
   queuedAt: number;
   hlc: Hlc;                     // the local commit time as an HLC, minted at enqueue; every drive of the
                                 // entry stamps it on the log entries it appends (crdt-sync.md §Migration Path)
+  lane: Lane;                   // serializable or convergent, fixed at enqueue (the caller's classification,
+                                // else the stricter of the sealed collections' declarations); every drive
+                                // stamps it on the log entries, pends and commits it makes (crdt-sync.md §Stage 5)
   expiresAt?: number;
   segments: Array<{             // one per collection the entry sealed a segment in, in sealing order
     collectionId: CollectionId;
@@ -1441,7 +1444,7 @@ version, `v: 1`, which a reader that does not know it refuses rather than guesse
 
 | Key | Written | Value |
 |---|---|---|
-| `entries/<seq>` | once, at enqueue (`queued`) | `{ v, transactionId, seq, queuedAt, hlc, expiresAt?, segments: [{ collectionId, table, actions }], outlook? }` — a record written before `hlc` existed restores with its `queuedAt` as a legacy HLC |
+| `entries/<seq>` | once, at enqueue (`queued`) | `{ v, transactionId, seq, queuedAt, hlc, lane, expiresAt?, segments: [{ collectionId, table, actions }], outlook? }` — a record written before `hlc` existed restores with its `queuedAt` as a legacy HLC, and one written before `lane` existed restores as `serializable` |
 | `drives/<seq>` | before each send, after a partial commit, after an identity renewal (`driving`) | `{ v, transactionId, actionId, attempts: [[collectionId, InFlightAttempt]…], committed: [[collectionId, WriteDurability \| null]…] }` |
 | `outcomes/<transactionId>` | at a terminal outcome (`settled`), before the other two are deleted | `{ v, at, status }`, `status` the outcome as [Outcomes after a restart](#outcomes-after-a-restart) describes |
 

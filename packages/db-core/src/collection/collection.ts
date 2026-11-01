@@ -2484,6 +2484,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 			hlc: clockOf(this.transactor).now(),
 			// The caller's classification wins over the declaration, and the declaration over nothing
 			// (`SyncOptions.lane`): the caller knows more about the write than the collection does.
+			// NOTE: judged over the open segment as staged NOW and fixed for the write; a
+			// `merge.filterConflict` hook that answered a replacement of a different lane during an
+			// inter-attempt refresh would leave the entry claiming the lane of the action it replaced. No
+			// hook in this repository replaces an action; if one ever does, the member-side lane check is
+			// what catches the mismatch.
 			lane: options?.lane ?? this.laneOf(this.segments.open),
 		};
 

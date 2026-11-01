@@ -112,7 +112,7 @@ Optimystic transactions are **coordinator-centric**, **log-tail-ordered**, and *
 
 * A `TransactionStamp` is created at BEGIN with `{peerId, timestamp, schemaHash, engineId, expiration}`; its hash is the **stamp ID** — stable for the transaction's lifetime.
 * Actions execute immediately against local trackers, giving snapshot isolation to the initiating process before any network round-trip.
-* At COMMIT, the **transaction ID** is computed from stamp ID + statements + reads and becomes the log-addressable identity.
+* At COMMIT, the **transaction ID** is computed from stamp ID + statements + reads + HLC + lane and becomes the log-addressable identity.
 
 ### Five-phase lifecycle
 
@@ -400,7 +400,7 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 * **Ring Zulu** — the outermost ring; the transaction ring. Inner rings (0, 1, …) partition the keyspace more finely.
 * **Stamp ID** — hash of a `TransactionStamp`; stable from BEGIN to COMMIT. Exposed by `StampId()` in SQL.
 * **Supercluster** — temporary peer set aggregated from multiple critical clusters during a multi-collection transaction.
-* **Transaction** — logical mutation spanning one or more collections; identified by the hash of stamp ID + statements + reads.
+* **Transaction** — logical mutation spanning one or more collections; identified by the hash of stamp ID + statements + reads + HLC + lane.
 * **Transaction ID** — final content-addressed transaction identity, computed at COMMIT.
 * **Transform** — set of inserts/updates/deletes for one block.
 

@@ -2176,7 +2176,7 @@ Actions include `transaction: StampId` field:
 ### 7. Transaction Stamp vs Transaction ID
 Two distinct identifiers serve different purposes:
 - **Stamp ID** (`stamp.id`): Created at BEGIN (hash of peerId + timestamp + schemaHash + engineId + expiration + nonce), stable throughout, exposed to users via `StampId()` UDF; re-derived and integrity-checked by the validator
-- **Transaction ID** (`transaction.id`): Computed at COMMIT (hash of stamp.id + statements + reads), final immutable identity, used in logs
+- **Transaction ID** (`transaction.id`): Computed at COMMIT (hash of stamp.id + statements + reads + hlc + lane), final immutable identity, used in logs
 - Both are hashes, both are internal to their respective structures
 - Stamp contains: peerId, timestamp, schemaHash, engineId, expiration, nonce, id
 - Transaction contains: stamp, statements, reads, id

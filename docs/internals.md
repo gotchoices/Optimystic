@@ -1868,7 +1868,8 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
     `InvalidationContext.clock` in `packages/db-p2p/src/dispute/invalidation.ts`), and a stored entry
     from before the field reads through `hlcOf` in `packages/db-core/src/log/struct.ts` as its
     timestamp with an empty node id. The transaction's HLC is also folded into its id
-    (`createTransactionId`) and its client signature (`clientSignaturePayload`, `txsig:v2`), and
+    (`createTransactionId`) and its client signature (`clientSignaturePayload`, `txsig:v2`; the lane's
+    `v3` bump came after, see *Every Write Carries a Lane*), and
     rides on every pend of the write (`PendRequest.hlc`), so a storage node observes it without
     parsing log blocks.
   - the **id of the data block** the append mints when the current log block is full (32 entries, or
