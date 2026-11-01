@@ -7,6 +7,7 @@ import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../n
 import { assertTransactionFits, transactionBytes, MAX_TRANSACTION_BYTES } from "../network/transaction-size.js";
 import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
+import type { HlcClock } from "../hlc/clock.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
@@ -75,6 +76,12 @@ type NetworkTransactorInit = {
 	 * re-send without waiting on the wall clock.
 	 */
 	owedCancelClock?: OwedCancelClock;
+	/**
+	 * The clock of the node this transactor runs on, exposed as {@link ITransactor.clock}. A node
+	 * builds one per process and hands the same instance to every transactor over it; omit and
+	 * writes mint from the process-wide fallback (`clockOf`).
+	 */
+	clock?: HlcClock;
 }
 
 /**
@@ -87,6 +94,7 @@ type NetworkTransactorInit = {
 const DEFAULT_DIAL_TIMEOUT_MS = 3000;
 
 export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
+	readonly clock: HlcClock | undefined;
 	private readonly keyNetwork: IKeyNetwork;
 	private readonly timeoutMs: number;
 	private readonly abortOrCancelTimeoutMs: number;
@@ -137,6 +145,7 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			: (init.dialTimeoutMs > 0 ? init.dialTimeoutMs : undefined);
 		this.getRepo = init.getRepo;
 		this.localChangeNotifier = init.localChangeNotifier;
+		this.clock = init.clock;
 		this.localPeerId = init.localPeerId?.toString();
 		this.retryBackoff = { baseMs: init.retryBackoffBaseMs ?? 0, localPeerId: init.localPeerId, sleep: init.retrySleep };
 		this.owedCancels = new OwedCancels({

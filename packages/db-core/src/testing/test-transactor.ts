@@ -7,6 +7,7 @@ import { applyTransform, blockIdsForTransforms, transformForBlockId, emptyTransf
 import { Tree } from "../collections/tree/tree.js";
 import type { TreeReplaceAction } from "../collections/tree/struct.js";
 import type { Collection } from "../collection/collection.js";
+import { HlcClock } from "../hlc/clock.js";
 
 type RevisionNumber = number;
 
@@ -23,13 +24,22 @@ type BlockState = {
 	committedActions: Map<ActionId, Transform>;
 }
 
+export type TestTransactorOptions = {
+	/** The clock writes through this transactor mint from. Default: a fresh in-memory clock in the node id `'test'`;
+	 *  inject one to drive a fake local clock, or to have two transactors mint from one sequence. */
+	clock?: HlcClock;
+};
+
 // Simple in-memory transactor for testing that maintains materialized blocks for every revision
 export class TestTransactor implements ITransactor {
   private blocks = new Map<BlockId, BlockState>();
 	available = true;
 	private getLocks = new Map<BlockId, Promise<() => void>>(); // Track lock releases
+	readonly clock: HlcClock;
 
-  constructor() {}
+  constructor(options?: TestTransactorOptions) {
+		this.clock = options?.clock ?? new HlcClock({ nodeId: 'test' });
+	}
 
   async get(blockGets: BlockGets): Promise<GetBlockResults> {
 		this.checkAvailable();
@@ -497,6 +507,8 @@ export class TestTransactor implements ITransactor {
  */
 export abstract class DelegatingTransactor implements ITransactor {
 	protected constructor(protected readonly inner: TestTransactor) {}
+
+	get clock(): HlcClock { return this.inner.clock; }
 
 	get(b: BlockGets): Promise<GetBlockResults> { return this.inner.get(b); }
 	getStatus(a: ActionBlocks[]): Promise<BlockActionStatus[]> { return this.inner.getStatus(a); }

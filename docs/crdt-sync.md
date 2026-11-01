@@ -110,6 +110,8 @@ new_hlc.nodeId  = self.peerId
 
 `last_observed_hlc` is the maximum HLC the node has seen via any means — including transactions received from other nodes. This is the standard Kulkarni-Demirbas HLC construction.
 
+The implementation is `HlcClock` in `packages/db-core/src/hlc/clock.ts`, one per node, carried by the node's transactor (`clockOf` in the same file); its high-water mark survives a restart through the persistence port `HlcClockStore` in `packages/db-core/src/hlc/clock-store.ts`, and a restarted clock resumes a slack above the stored mark (`restartFloor`, same file), so a node whose wall clock is behind at restart does not issue below what it issued before.
+
 Causal dependencies are captured implicitly: a node cannot assign an HLC earlier than any transaction whose effects it has observed. If the node reads a block whose most-recent committed revision was written at `hlc_X`, any new transaction building on that read has `hlc ≥ hlc_X`.
 
 This replaces today's revision-number-per-block as the causality primitive with HLC-per-transaction. Block revisions still exist as the physical versioning mechanism, but their ordering derives from transaction HLC rather than from a cluster-assigned sequence.

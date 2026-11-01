@@ -1,5 +1,6 @@
 import type { GetBlockResults, ActionBlocks, ActionLineage, BlockActionStatus, PendResult, CommitResult, PendRequest, CommitRequest, BlockGets, BlockId } from "../index.js";
 import type { PeerId } from "../network/types.js";
+import type { HlcClock } from "../hlc/clock.js";
 
 export type ClusterNomineesResult = {
 	/** Peer IDs of the cluster members who can participate in consensus */
@@ -7,6 +8,14 @@ export type ClusterNomineesResult = {
 };
 
 export type ITransactor = {
+	/** The clock of the node this transactor runs on, which every write through it mints its HLC from.
+		- The transactor is the one node-scoped object every collection, coordinator and queue already
+		  holds, so it carries the clock rather than an option threaded through each of them.
+		- Optional: a transactor that declares none gets the process-wide fallback, so a writer reads
+		  it through `clockOf` rather than directly.
+	 */
+	readonly clock?: HlcClock;
+
 	/** Get blocks by their IDs and versions or a specific action
 		- Does not update the version of the block, but the action is available for explicit reading, and for committing
 		- If the action targets the correct version, the call succeeds, unless failIfPending and there are any pending actions - the caller may choose to wait for pending actions to clear rather than risk racing with them
