@@ -114,7 +114,8 @@ async function buildTransaction(actions: CollectionActions[]): Promise<Transacti
 	const hlc = clock.now();
 	return {
 		stamp, statements, reads: [], hlc,
-		id: await createTransactionId(stamp.id, statements, [], hlc),
+		lane: 'serializable',
+		id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 	};
 }
 

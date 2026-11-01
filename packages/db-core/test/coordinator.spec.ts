@@ -180,7 +180,7 @@ function attemptsFor(collections: Map<CollectionId, Transforms> | string[]): Map
 	}]));
 }
 
-const context: WriteContext = { actionId: 'txn-1', timestamp: 0, hlc: { wallMs: 0, logical: 0, nodeId: 'test' }, reads: [], priority: 0 };
+const context: WriteContext = { actionId: 'txn-1', timestamp: 0, hlc: { wallMs: 0, logical: 0, nodeId: 'test' }, lane: 'serializable', reads: [], priority: 0 };
 
 /** What the coordinator describes of each collection's staged blocks before the pend
  *  (`declareTouchedBlocks`), for a phase test that calls `commitPhase` directly. */

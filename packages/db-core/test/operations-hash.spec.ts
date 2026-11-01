@@ -196,7 +196,8 @@ describe('operations-hash', () => {
 				'stamp:fixed',
 				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
 				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }],
-				hlc
+				hlc,
+				'serializable'
 			);
 			// Pinned expectation: recomputed here, and locked so a future ops-hash change that
 			// accidentally reached into tx-id inputs would flip this and fail the suite.
@@ -204,7 +205,8 @@ describe('operations-hash', () => {
 				'stamp:fixed',
 				['INSERT INTO t VALUES (1)', 'UPDATE t SET x = 2'],
 				[{ blockId: 'b1', revision: 3 }, { blockId: 'b2', revision: 4 }],
-				hlc
+				hlc,
+				'serializable'
 			);
 			expect(id).to.equal(idAgain);
 			expect(id.startsWith('tx:')).to.equal(true);

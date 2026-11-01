@@ -186,7 +186,7 @@ The full sync lifecycle — block mirroring, when to sync, replay on rejection �
 
 ### Handle conflicts
 
-When PEND or COMMIT is rejected (stale read, concurrent write), the client re-syncs and replays. By default, conflicting local actions are dropped. To customize, provide `filterConflict` on a custom collection:
+When PEND or COMMIT is rejected (stale read, concurrent write), the client re-syncs and replays. By default every local action is kept and replayed over the winning state, and a tree's guards re-make its uniqueness and lost-update decisions on that replay. A custom collection can instead declare which of its actions are **convergent** — safe to merge with other machines' concurrent writes — and how one is rebased, with `merge`:
 
 ```typescript
 import { Collection } from '@optimystic/db-core';
@@ -197,13 +197,18 @@ const counter = await Collection.createOrOpen(transactor, 'counter', {
       /* mutate the counter block */
     },
   },
-  filterConflict: (local, remote) => {
-    // Sum concurrent increments instead of dropping them
-    const remoteSum = remote.reduce((n, r) => n + r.data.value, 0);
-    return { ...local, data: { ...local.data, value: local.data.value + remoteSum } };
+  merge: {
+    laneOf: () => 'convergent',   // an increment merges with concurrent increments
+    filterConflict: (local, remote) => {
+      // Sum concurrent increments instead of replaying the local one as-is
+      const remoteSum = remote.reduce((n, r) => n + r.data.value, 0);
+      return { ...local, data: { ...local.data, value: local.data.value + remoteSum } };
+    },
   },
 });
 ```
+
+Every write carries the resulting lane (`serializable` or `convergent`) on its log entry, its transaction and its pend; nothing admits a write by it yet.
 
 See [`collections.md`](../packages/db-core/docs/collections.md) for the full `CollectionInitOptions` shape.
 
@@ -282,7 +287,7 @@ Build on `Collection` when `Tree` and `Diary` don't fit the access pattern. A cu
 
 - **Action types** specific to the domain
 - **Action handlers** in `modules` that mutate blocks through the provided `BlockStore`
-- A **`filterConflict`** policy for concurrent updates
+- A **`merge`** declaration naming which actions are convergent and how one is rebased over concurrent updates
 - Optionally, composed data structures (chains, B-trees) via `BlockStore`
 
 Counters, append-only queues with metadata, specialized indexes, and CRDT-style mergers all fit here. See [`collections.md`](../packages/db-core/docs/collections.md) for the API, [`btree.md`](../packages/db-core/docs/btree.md) and [`chains.md`](../packages/db-core/docs/chains.md) for the primitives.

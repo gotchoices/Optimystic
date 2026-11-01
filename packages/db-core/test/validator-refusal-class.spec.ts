@@ -49,8 +49,8 @@ describe('TransactionValidator refusal class', () => {
 	const signedTx = async ({ engineId = ACTIONS_ENGINE_ID, schemaHash = schema, ageMs = 0, ttlMs, reads = [] }: TxShape = {}): Promise<Transaction> => {
 		const stamp = await createTransactionStamp(peer, Date.now() - ageMs, schemaHash, engineId, ttlMs);
 		const hlc = clock.now();
-		const tx: Transaction = { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) };
-		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads, hlc));
+		const tx: Transaction = { stamp, statements: [], reads, hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable') };
+		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads, hlc, 'serializable'));
 		return tx;
 	};
 
@@ -72,7 +72,7 @@ describe('TransactionValidator refusal class', () => {
 			} },
 			{ refusal: 'Invalid client signature', validity: {}, tx: async () => {
 				const tx = await signedTx();
-				tx.signature = fakeSign('someone-else', clientSignaturePayload(tx.stamp.id, [], [], tx.hlc));
+				tx.signature = fakeSign('someone-else', clientSignaturePayload(tx.stamp.id, [], [], tx.hlc, tx.lane));
 				return tx;
 			} },
 			{ refusal: 'Unknown engine', validity: undefined, tx: () => signedTx({ engineId: 'nope@1.0.0' }) },

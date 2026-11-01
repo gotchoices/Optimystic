@@ -93,7 +93,7 @@ describe('read dependencies end to end: cache hit -> superseded -> stale-read re
 	async function makeTxn(reads: ReadDependency[]): Promise<Transaction> {
 		const stamp = await createTransactionStamp('peer-reader', Date.now(), SCHEMA_HASH, ACTIONS_ENGINE_ID)
 		const hlc = clock.now()
-		return { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) }
+		return { stamp, statements: [], reads, hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable') }
 	}
 
 	const emptyOpsHash = () => hashOperations(collectOperations(new Map<string, Transforms>()))

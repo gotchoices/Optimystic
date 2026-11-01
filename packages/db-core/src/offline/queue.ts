@@ -8,6 +8,7 @@ import type { AlreadyAppliedTally } from '../collection/action.js';
 import type { ITransactor } from '../transactor/transactor.js';
 import { clockOf } from '../hlc/clock.js';
 import type { Hlc } from '../hlc/hlc.js';
+import { stricterLane, type Lane } from '../lane/lane.js';
 import { TransactionCoordinator } from '../transaction/coordinator.js';
 import { classifyCommitFailure, refusalReason } from '../transaction/commit-failure-class.js';
 import { recordCollectionDurability, transactionDurability } from '../transaction/durability.js';
@@ -78,6 +79,9 @@ export type RestoreInit = {
 	/** The record's HLC (`JournalEntryRecord.hlc`); a record written before the field existed is
 	 * restored with `legacyHlc(queuedAt)`, the one shape a legacy entry already has. */
 	readonly hlc: Hlc;
+	/** The record's lane (`JournalEntryRecord.lane`); a record written before the field existed is
+	 * restored as `serializable`, the lane every entry then took. */
+	readonly lane: Lane;
 	readonly expiresAt?: number;
 	/** The collections the entry sealed a segment in, in the record's order — `stage` is called for
 	 * each, in this order. */
@@ -154,6 +158,12 @@ function sharedTransactor(entryId: EntryId, remaining: readonly Collection<any>[
 	return transactor;
 }
 
+/** The lane of an entry nobody classified: the stricter of each sealed collection's own declaration
+ * over the segment it sealed under `entryId` (`Collection.laneOf`). */
+function sealedLaneOf(sealed: readonly Collection<any>[], entryId: EntryId): Lane {
+	return stricterLane(sealed.map(collection => collection.laneOf(collection.sealedActions(entryId) ?? [])));
+}
+
 /** The journal's entry record for `entry`, built from each sealed collection's segment. */
 function entryRecord(entry: Entry): JournalEntryRecord {
 	return {
@@ -161,6 +171,7 @@ function entryRecord(entry: Entry): JournalEntryRecord {
 		seq: entry.seq,
 		queuedAt: entry.queuedAt,
 		hlc: entry.hlc,
+		lane: entry.lane,
 		...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
 		segments: entry.collections.map(collection => {
 			const actions = collection.sealedActions(entry.id);
@@ -300,7 +311,7 @@ export class OfflineQueue {
 	 *
 	 * @throws QueueDisposedError after {@link dispose}; the drain's defect, as `cause`, once the
 	 * drain has stopped on one (nothing queued then would ever drain); whatever the journal threw. */
-	async enqueue(collections: readonly Collection<any>[], init?: { id?: EntryId; timestamp?: number; hlc?: Hlc }): Promise<QueuedEntry | undefined> {
+	async enqueue(collections: readonly Collection<any>[], init?: { id?: EntryId; timestamp?: number; hlc?: Hlc; lane?: Lane }): Promise<QueuedEntry | undefined> {
 		this.assertAccepting();
 		const id = init?.id ?? mintId();
 		if (this.byId.has(id)) throw new Error(`entry ${id} is already queued`);
@@ -317,6 +328,11 @@ export class OfflineQueue {
 			// `sharedTransactor`, whose stranger check must not fail an enqueue that has already sealed:
 			// it runs, and throws, at the send.
 			hlc: init?.hlc ?? clockOf(sealed[0]!.transactor).now(),
+			// The caller's classification when it gave one (the SQL bridge's, from the statements), else
+			// the stricter of the sealed collections' own declarations over what each sealed. Fixed here
+			// for the entry's life and journaled: a reclassification later would make a re-drive differ
+			// from the attempt it repeats.
+			lane: init?.lane ?? sealedLaneOf(sealed, id),
 			expiresAt: this.expireAfterMs === undefined ? undefined : queuedAt + this.expireAfterMs,
 			collections: sealed,
 			actionId: mintId(),
@@ -745,6 +761,7 @@ export class OfflineQueue {
 				actionId: entry.actionId,
 				timestamp: entry.queuedAt,
 				hlc: entry.hlc,
+				lane: entry.lane,
 				recordAttempt: attempt => recordAttempt(new Map([[collection.id, attempt]])),
 				onCommittedHead: applied => onCommittedHead(collection.id, applied),
 				...(resume === undefined ? {} : { resume }),
@@ -759,6 +776,7 @@ export class OfflineQueue {
 			actionId: entry.actionId,
 			timestamp: entry.queuedAt,
 			hlc: entry.hlc,
+			lane: entry.lane,
 			collectionIds: remaining.map(collection => collection.id),
 			recordAttempt,
 			onCommittedHead,
@@ -1073,6 +1091,7 @@ export class OfflineQueue {
 			seq: init.seq,
 			queuedAt: init.queuedAt,
 			hlc: init.hlc,
+			lane: init.lane,
 			expiresAt: init.expiresAt,
 			collections: init.collections,
 			actionId: drive?.actionId ?? mintId(),

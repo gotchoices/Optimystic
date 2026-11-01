@@ -44,7 +44,7 @@ const QUEUED_AT = 1_700_000_000_000;
 const QUEUED_HLC = new HlcClock({ nodeId: 'test' }).now();
 
 const headOptions = (actionId: string): HeadCommitOptions =>
-	({ actionId, timestamp: QUEUED_AT, hlc: QUEUED_HLC, maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+	({ actionId, timestamp: QUEUED_AT, hlc: QUEUED_HLC, lane: 'serializable', maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
 
 async function openTree(transactor: ITransactor, id: CollectionId): Promise<Tree<number, Entry>> {
 	return Tree.createOrOpen<number, Entry>(transactor, id, byKey);
@@ -130,7 +130,7 @@ describe('An invented collection adopts the one another handle created', functio
 		const coordinator = new TransactionCoordinator(inner,
 			new Map([users, byName].map(tree => [tree.getCollection().id, tree.getCollection()])),
 			{ pendValidation: 'none' });
-		await coordinator.commitEntry({ entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, hlc: QUEUED_HLC, collectionIds: [USERS, BY_NAME] });
+		await coordinator.commitEntry({ entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, hlc: QUEUED_HLC, lane: 'serializable', collectionIds: [USERS, BY_NAME] });
 
 		expect(await committedKeys(inner, BY_NAME), 'the index tree\'s one log: the founder\'s entry, then the joiner\'s').to.deep.equal([[2], [1]]);
 		expect(await committedKeys(inner, USERS), 'and the main collection\'s').to.deep.equal([[5], [2], [1]]);

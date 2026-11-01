@@ -1,4 +1,5 @@
-import type { ActionBlocks, BlockContentDigests, CommitResult, GetBlockResults, PendResult, PendRequest, BlockGets, BlockId, ActionId } from "../index.js";
+import type { ActionBlocks, BlockContentDigests, CommitResult, GetBlockResults, PendResult, PendRequest, BlockGets, BlockId, ActionId, CommitRequest } from "../index.js";
+import type { Lane } from "../lane/lane.js";
 
 export type MessageOptions = {
 	expiration?: number;
@@ -35,6 +36,9 @@ export type RepoCommitRequest = {
 	blockIds: BlockId[];
 	actionId: ActionId;
 	rev: number;
+	/** The write's lane ({@link CommitRequest.lane}), carried onto every per-block commit the
+	 * transactor sends; absent on bare per-block paths and for an older writer. */
+	lane?: Lane;
 	/**
 	 * The collection's chain tail block id (the {@link CommitRequest.tailId}). Optional on the per-block
 	 * repo operation: the transactor threads the committing collection's tail through every per-block

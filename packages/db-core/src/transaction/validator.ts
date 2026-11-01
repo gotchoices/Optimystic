@@ -93,14 +93,16 @@ export class TransactionValidator implements ITransactionValidator {
 			if (transaction.signature === undefined) {
 				return validityRefusal('Missing client signature');
 			}
-			// The one wire ingress that tolerates a transaction without an HLC: a writer on a build
-			// before the field. Its payload is derived from the stamp's time so the check is
-			// well-typed; such a writer signed the `txsig:v1` bytes, so it is refused here regardless
-			// (see CLIENT_SIG_VERSION for the accepted mixed-version cost). The derived value is used
-			// for this check only: the transaction object is handed on unchanged, never rewritten with
-			// a value its writer did not stamp.
+			// The one wire ingress that tolerates a transaction without an HLC or a lane: a writer on
+			// a build before either field. Its payload is derived from the stamp's time and the lane
+			// every write then took (`serializable`) so the check is well-typed; such a writer signed
+			// the `txsig:v1` or `v2` bytes, so it is refused here regardless (see CLIENT_SIG_VERSION
+			// for the accepted mixed-version cost). The derived values are used for this check only:
+			// the transaction object is handed on unchanged, never rewritten with a value its writer
+			// did not stamp.
 			const hlc = transaction.hlc ?? legacyHlc(stamp.timestamp);
-			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads, hlc);
+			const lane = transaction.lane ?? 'serializable';
+			const payload = clientSignaturePayload(stamp.id, transaction.statements, transaction.reads, hlc, lane);
 			if (!this.verifyClientSignature(stamp.peerId, payload, transaction.signature)) {
 				return validityRefusal('Invalid client signature');
 			}

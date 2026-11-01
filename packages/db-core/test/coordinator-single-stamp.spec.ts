@@ -76,7 +76,8 @@ async function build(
 	const hlc = clock.now();
 	const transaction: Transaction = {
 		stamp, statements, reads: [], hlc,
-		id: await createTransactionId(stamp.id, statements, [], hlc),
+		lane: 'serializable',
+		id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 	};
 	return { stampId: stamp.id, transaction, actions };
 }
@@ -329,7 +330,8 @@ describe('TransactionCoordinator: single open stamp', () => {
 		const hlc = coordinator.clock.now();
 		const transaction: Transaction = {
 			stamp, statements, reads: [], hlc,
-			id: await createTransactionId(stamp.id, statements, [], hlc),
+			lane: 'serializable',
+			id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 		};
 		await coordinator.commit(transaction);
 		expect(await durableLogValues(transactor, id), 'one entry carries both batches')

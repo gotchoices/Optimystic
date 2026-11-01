@@ -27,6 +27,7 @@ import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { clockOf, type HlcClock } from "../hlc/clock.js";
 import { maxHlc, type Hlc } from "../hlc/hlc.js";
+import { stricterLane, type Lane } from "../lane/lane.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
@@ -114,20 +115,42 @@ type HeadTracker = {
 	tracker: Tracker<IBlock>;
 };
 
+/**
+ * The convergent lane's conflict rule for a collection (`Lane` in `packages/db-core/src/lane/lane.ts`):
+ * which of its actions may be committed by one machine without first agreeing with the others and
+ * merged into their concurrent writes later, and how such an action is rebased over a stranger's
+ * committed ones. A collection with NO declaration is strong: every action is `serializable`, the
+ * revision order decides every conflict, and nothing merges — today's behaviour, and `Tree`'s. The
+ * declaration is the opt-in; db-core has no notion of a table's profile beyond it.
+ *
+ * Convergence is a property of the OPERATION, never of the collection as a whole (idempotence is not
+ * the criterion — see `Lane`), which is why the declaration classifies per action.
+ */
+export type ConvergentMerge<TAction> = {
+	/** The lane of one of this collection's actions when no engine has classified it: a bare
+	 * `Collection.sync` with no `SyncOptions.lane`, or an offline-queue entry sealed without a
+	 * classification (`OfflineQueue.enqueue`). The stricter answer over several actions is the write's
+	 * (`Collection.laneOf`). */
+	laneOf(action: Action<TAction>): Lane;
+	/** Rebase one of this collection's CONVERGENT actions over a stranger's committed actions, which a
+	 * refresh found in the log after the action was staged. Offered only an action whose
+	 * {@link laneOf} is `convergent`: a serializable action is kept as-is, since its guards decide on
+	 * replay. Return the same instance to keep the action unchanged, a new instance to apply in its
+	 * place (re-staged by the conflict replay), or `undefined` to drop it. Optional, since a convergent
+	 * action that touches no shared block (a diary append) has nothing to rebase. */
+	filterConflict?(action: Action<TAction>, committed: Action<TAction>[]): Action<TAction> | undefined;
+};
+
 export type CollectionInitOptions<TAction> = {
 	/** One handler per action type. A handler may answer what the action accepted as already applied
 	 * ({@link AlreadyAppliedTally}); one that answers nothing counts as the zero tally, so a collection
 	 * type with no such notion returns nothing. */
 	modules: Record<ActionType, ActionHandler<TAction, AlreadyAppliedTally | void>>;
 	createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => IBlock;
-	/** Called for each local action that is potentially in conflict with a remote action.
-	 * @param action - The local action to check
-	 * @param potential - The remote actions that are potentially in conflict
-	 * @returns The original action (return the same instance to keep it as-is), a replacement
-	 * 	action (return a new instance to apply instead of the original — it is re-staged via
-	 * 	the conflict replay), or undefined to discard this action
-	 */
-	filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined;
+	/** The convergent lane's conflict rule for this collection ({@link ConvergentMerge}): which of its
+	 * actions are convergent, and how one is rebased over a stranger's committed actions. Omit for a
+	 * strong collection, whose every action is `serializable` and is kept as-is through a refresh. */
+	merge?: ConvergentMerge<TAction>;
 	/** Called once per refusal of a SEALED segment discovered by a replay (see
 	 * {@link Collection.replayActions}): the segment's entry id and the handler's refusal. Called
 	 * synchronously from inside the replay, under the collection latch, so it MUST NOT call a
@@ -284,7 +307,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * ({@link InFlightCycle}) — read by {@link send} and by the re-send {@link completeOwnEntry} makes
 	 * to finish a torn attempt, so neither needs it threaded through. Set by
 	 * {@link beginInFlightAction} and cleared by its disposer. */
-	private inFlightCycle: InFlightCycle = {};
+	private inFlightCycle: InFlightCycle | undefined;
 
 	/** The head commit running on this instance ({@link openHeadCommit}), for the whole cycle — set and
 	 * cleared beside {@link inFlightActionId}: the sealed segment it is committing, and the hook told
@@ -325,7 +348,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		 * {@link updateInternal}, and shared with every read source this handle builds (see
 		 * {@link BlockFloors}). */
 		private readonly floors: BlockFloors,
-		private readonly filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined,
+		/** See {@link CollectionInitOptions.merge}. */
+		private readonly merge?: ConvergentMerge<TAction>,
 		/** See {@link CollectionInitOptions.onSealedRefused}. */
 		private readonly onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void,
 		/** See {@link CollectionInitOptions.onViewChanged}. */
@@ -380,7 +404,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return undefined;
 		}
 		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends, clockOf(transactor));
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, init.onViewChanged, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, instanceTag);
 		collection.logTailId = ends.header.tailId;
 		return collection;
 	}
@@ -411,7 +435,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			inventedBaseline = copyTransforms(tracker.transforms);
 		}
 
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, init.onViewChanged, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, instanceTag);
 		collection.logTailId = ends?.header.tailId;
 		collection.inventedBaseline = inventedBaseline;
 		return collection;
@@ -1001,11 +1025,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// method does not carry it. A member that missed the first pend and stores this re-send
 		// therefore observes the write's HLC when it next reads the entry, not at the pend. Fine while
 		// the HLC is observational; if a feed point at the pend ever becomes load-bearing, retain the
-		// HLC on `InFlightAttempt` beside the transforms and put it on this request.
+		// HLC on `InFlightAttempt` beside the transforms and put it on this request. The write's LANE
+		// does ride here, from the in-flight cycle (`InFlightCycle.lane`), which every write path marks
+		// with the lane it minted: the same value the retained entry carries.
 		const result = await this.source.transact(attempt.transforms, entry.actionId, rev, this.id, attempt.tailId, {
 			blockDigests: attempt.blockDigests,
 			baseRevs: attempt.baseRevs,
-			refuseSolo: this.inFlightCycle.refuseSolo
+			lane: this.inFlightCycle?.lane,
+			refuseSolo: this.inFlightCycle?.refuseSolo
 		});
 		if (result.success) {
 			return result.durability;
@@ -1248,8 +1275,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * replace => new instance.
 	 *
 	 * A SEALED segment's action list is the queue entry's own and is never rewritten (invariant 3
-	 * of docs/offline-sync.md §The segment model), so the hook is not offered them. `Tree` and
-	 * `Diary` install no hook, so nothing observable changes for them either way.
+	 * of docs/offline-sync.md §The segment model), so the hook is not offered them. The hook is the
+	 * convergent lane's rule ({@link ConvergentMerge.filterConflict}): {@link doFilterConflict} offers
+	 * it only an action the declaration classifies `convergent`, and keeps a serializable one as-is.
+	 * `Tree` declares nothing and `Diary` declares no hook, so nothing observable changes for them
+	 * either way.
 	 *
 	 * NOTE: a filterConflict hook that always allocates a fresh (but equal) instance instead of
 	 * returning the same one forces a replay on every update — if that ever shows up as a hot path,
@@ -2324,7 +2354,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * `cycle` is what every send of the cycle carries ({@link InFlightCycle}); a re-mark replaces it,
 	 * which is harmless because every caller re-marks with what it marked. */
-	beginInFlightAction(actionId: ActionId, cycle: InFlightCycle = {}): () => void {
+	beginInFlightAction(actionId: ActionId, cycle: InFlightCycle): () => void {
 		if (this.inFlightActionId !== actionId) {
 			// A different action's failed attempt cannot finish this one. Re-marking the SAME id (a
 			// coordinator re-marks on every attempt) keeps what the previous attempt retained — that
@@ -2340,7 +2370,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 				this.inFlightActionId = undefined;
 				this.inFlightAttempt = undefined;
 				this.mintedLogBlockIds = undefined;
-				this.inFlightCycle = {};
+				this.inFlightCycle = undefined;
 			}
 		};
 	}
@@ -2447,14 +2477,17 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.assertNoSealedSegments();
 		const identity: WriteIdentity = {
 			actionId: uint8ArrayToString(randomBytes(16), 'base64url'),
-			// One timestamp and one HLC for the WRITE, minted here beside the action id and for the same
-			// reason: an attempt that took its own would make the retry's log block differ from the one
-			// the attempt it repeats may already have stored under this `(action id, revision)`.
+			// One timestamp, one HLC and one lane for the WRITE, minted here beside the action id and for
+			// the same reason: an attempt that took its own would make the retry's log block differ from
+			// the one the attempt it repeats may already have stored under this `(action id, revision)`.
 			timestamp: Date.now(),
 			hlc: clockOf(this.transactor).now(),
+			// The caller's classification wins over the declaration, and the declaration over nothing
+			// (`SyncOptions.lane`): the caller knows more about the write than the collection does.
+			lane: options?.lane ?? this.laneOf(this.segments.open),
 		};
 
-		const endInFlight = this.beginInFlightAction(identity.actionId, { refuseSolo: options?.refuseSoloCommit });
+		const endInFlight = this.beginInFlightAction(identity.actionId, { lane: identity.lane, refuseSolo: options?.refuseSoloCommit });
 		try {
 			return await this.syncAttempts(identity, options);
 		} finally {
@@ -2531,9 +2564,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.source.transact(staged.tracker.transforms, identity.actionId, staged.rev, this.id, staged.tailId, {
 			priority,
 			hlc: identity.hlc,
+			lane: identity.lane,
 			blockDigests: staged.blockDigests,
 			baseRevs: staged.baseRevs,
-			refuseSolo: this.inFlightCycle.refuseSolo
+			refuseSolo: this.inFlightCycle?.refuseSolo
 		});
 	}
 
@@ -2577,7 +2611,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * when a refresh or the head tracker's staging refused it during the cycle; whatever
 	 * `options.recordAttempt` throws, before anything is sent; otherwise what {@link sync} throws. */
 	async commitHead(entryId: EntryId, options: HeadCommitOptions): Promise<WriteDurability | undefined> {
-		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp, hlc: options.hlc }, {
+		const handle = await this.openHeadCommit(entryId, { actionId: options.actionId, timestamp: options.timestamp, hlc: options.hlc, lane: options.lane }, {
 			refuseSolo: options.refuseSoloCommit,
 			...(options.resume === undefined ? {} : { resume: options.resume }),
 			...(options.onCommittedHead === undefined ? {} : { onCommittedHead: options.onCommittedHead }),
@@ -2600,9 +2634,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * segment; and seeds the retained attempt with `options.resume` when one is given, so that the
 	 * opening refresh can finish an earlier cycle's torn attempt from it ({@link completeOwnEntry}) —
 	 * and `stage()` re-sends it verbatim while the next attempt would request its revision
-	 * ({@link resumedAttempt}). The rest of `options` is the cycle's ({@link InFlightCycle}), recorded
-	 * with the in-flight mark, so the handle's `send()` and a refresh's re-send of a torn attempt both
-	 * carry it.
+	 * ({@link resumedAttempt}). The rest of `options` is the cycle's ({@link InFlightCycle}, its lane
+	 * taken from `identity`), recorded with the in-flight mark, so the handle's `send()` and a
+	 * refresh's re-send of a torn attempt both carry it.
 	 *
 	 * **The target.** The live tracker holds every sealed segment and the open one, cumulatively, so
 	 * an attempt cannot run on a copy of it the way a sync's does. It runs on a HEAD TRACKER instead
@@ -2652,7 +2686,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			release();
 			throw err;
 		}
-		const endInFlight = this.beginInFlightAction(identity.actionId, cycle);
+		const endInFlight = this.beginInFlightAction(identity.actionId, { ...cycle, lane: identity.lane });
 		this.headCommit = { entryId, ...(onCommittedHead === undefined ? {} : { onCommitted: onCommittedHead }) };
 		if (resume !== undefined) {
 			this.retainInFlightAttempt(resume);
@@ -2897,10 +2931,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * refresh would have done. */
 	private async unstage(actions: Action<TAction>[], stagedBefore: Transforms, revBefore: number | undefined): Promise<void> {
 		// NOTE: matched by identity, which is what `filterAgainstEntry` promises for a kept action.
-		// A `filterConflict` hook that answers a REPLACEMENT instance for one of these actions would
-		// leave the replacement staged here. No collection installs such a hook today (`Tree` and
-		// `Diary` install none); if one ever does, carry a per-call token on the staged actions and
-		// match on that instead.
+		// A `merge.filterConflict` hook that answers a REPLACEMENT instance for one of these actions
+		// would leave the replacement staged here. No collection installs such a hook today (`Tree`
+		// declares no merge and `Diary` declares no hook); if one ever does, carry a per-call token on
+		// the staged actions and match on that instead.
 		// The actions were staged into the OPEN segment (actAndSync refuses over sealed segments).
 		this.segments.open = this.segments.open.filter(staged => !actions.includes(staged));
 		if (this.source.actionContext?.rev === revBefore) {
@@ -3003,14 +3037,31 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.source.clearReadDependencies();
 	}
 
+	/** The lane of a write made of `actions` under this collection's merge declaration
+	 * ({@link CollectionInitOptions.merge}): the stricter lane over the declaration's answer for each
+	 * (`stricterLane`), `serializable` without a declaration and for an empty list. Pure. The source
+	 * of a sync's lane when its caller gave none (`SyncOptions.lane`), and of a queued entry's
+	 * (`OfflineQueue.enqueue`). */
+	laneOf(actions: readonly Action<TAction>[]): Lane {
+		const merge = this.merge;
+		return merge === undefined ? 'serializable' : stricterLane(actions.map(action => merge.laneOf(action)));
+	}
+
 	/** Called for each local action that may be in conflict with a remote action (always called under latch).
+	 * The merge declaration's hook ({@link ConvergentMerge.filterConflict}) decides only for an action the
+	 * declaration classifies `convergent`; a serializable action is kept as-is, since its guards decide
+	 * on replay, and so is every action of a collection with no declaration or no hook.
 	 * @param action - The local action to check
 	 * @param potential - The remote actions that are potentially in conflict
 	 * @returns The effective action to keep: the original (unchanged), a replacement
 	 * 	instance (applied instead of the original), or undefined to discard it.
 	 */
 	protected doFilterConflict(action: Action<TAction>, potential: Action<TAction>[]): Action<TAction> | undefined {
-		return this.filterConflict ? this.filterConflict(action, potential) : action;
+		const merge = this.merge;
+		if (merge?.filterConflict === undefined || merge.laneOf(action) !== 'convergent') {
+			return action;
+		}
+		return merge.filterConflict(action, potential);
 	}
 
 	/** The two blocks every refresh starts from — the collection header and the log tail block it

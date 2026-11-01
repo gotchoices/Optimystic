@@ -116,8 +116,9 @@ export class CollectionFactory {
     this.sealedRefusedListener = listener;
   }
 
-  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set. */
-  private treeOptions(): TreeCollectionOptions | undefined {
+  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set.
+   * Never a merge declaration: the table classifies per statement and passes the lane on each write. */
+  private treeOptions(): Pick<TreeCollectionOptions, 'onSealedRefused'> | undefined {
     return this.sealedRefusedListener === undefined ? undefined : { onSealedRefused: this.sealedRefusedListener };
   }
 

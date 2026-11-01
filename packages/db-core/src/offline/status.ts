@@ -1,6 +1,7 @@
 import type { CollectionId } from '../collection/struct.js';
 import type { EntryId } from '../collection/segments.js';
 import type { TransactionDurability } from '../transaction/durability.js';
+import type { Lane } from '../lane/lane.js';
 
 /**
  * The status an offline-sync queue reports for each entry (docs/offline-sync.md §Following
@@ -42,6 +43,10 @@ export type EntryStatus =
 		/** The collections the entry sealed a segment in — every collection it changed. */
 		collections: readonly CollectionId[];
 		queuedAt: number;
+		/** The entry's lane (`Lane` in `packages/db-core/src/lane/lane.ts`): whether a later merge
+		 * will handle it (`convergent`) or the cohort must agree to it (`serializable`). Fixed at
+		 * enqueue for the entry's whole life, so it is never announced on its own. */
+		lane: Lane;
 		/** Submissions made so far. */
 		attempts: number;
 		/** Whether an attempt may have landed (see `OfflineQueue`'s in-doubt rule): such an entry can
@@ -115,6 +120,8 @@ export type QueuedEntry = {
 	readonly id: EntryId;
 	readonly seq: number;
 	readonly queuedAt: number;
+	/** As on the `queued` status. */
+	readonly lane: Lane;
 	readonly collections: readonly CollectionId[];
 	/** As on the `queued` status: the collections already committed, once part of the entry is. */
 	readonly committedCollections?: readonly CollectionId[];

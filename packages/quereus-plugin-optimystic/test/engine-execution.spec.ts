@@ -52,7 +52,8 @@ async function createTestTransaction(statements: string[]): Promise<Transaction>
 		statements,
 		reads: [],
 		hlc,
-		id: await createTransactionId(stamp.id, statements, [], hlc),
+		lane: 'serializable',
+		id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 	};
 }
 

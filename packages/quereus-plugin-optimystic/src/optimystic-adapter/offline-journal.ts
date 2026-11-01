@@ -1,7 +1,7 @@
 import { OFFLINE_JOURNAL_KEY_PREFIX, type IKVStore } from '@optimystic/db-p2p';
 import type {
 	Action, ActionId, CollectionId, CommittedEffect, EntryId, Hlc, InFlightAttempt, IOfflineJournal, JournalDriveState,
-	JournalEntryRecord, JournalSettledStatus, QueuedFailureReason, WriteDurability,
+	JournalEntryRecord, JournalSettledStatus, Lane, QueuedFailureReason, WriteDurability,
 } from '@optimystic/db-core';
 import type { QualifiedTableName } from '../schema/table-identity.js';
 import type { EntryFacts } from './commit-outlook.js';
@@ -73,6 +73,11 @@ export type EntryRecordV1 = {
 	 * after a restart. Absent in a record written before the field existed, which the restore
 	 * re-supplies as `legacyHlc(queuedAt)` — the one shape a legacy entry already has. */
 	readonly hlc?: Hlc;
+	/** The entry's lane (`JournalEntryRecord.lane`), re-supplied to every drive after a restart. Absent
+	 * in a record written before the field existed, which the restore re-supplies as `serializable`,
+	 * the lane every entry then took. The record version stays `v: 1`: an older reader ignores the
+	 * field, a newer one fills a missing one. */
+	readonly lane?: Lane;
 	readonly expiresAt?: number;
 	readonly segments: readonly JournaledSegment[];
 	/** What the transaction's statements' write descriptions said about its elements and decisions, for
@@ -326,6 +331,7 @@ export class OfflineJournal implements IOfflineJournal {
 			seq: record.seq,
 			queuedAt: record.queuedAt,
 			hlc: record.hlc,
+			lane: record.lane,
 			...(record.expiresAt === undefined ? {} : { expiresAt: record.expiresAt }),
 			segments: record.segments.map(segment => ({
 				collectionId: segment.collectionId,

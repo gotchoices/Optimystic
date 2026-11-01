@@ -106,7 +106,7 @@ const clock = new HlcClock({ nodeId: 'test' });
 
 /** The head commit's identity, as the queue would supply it, with a short retry budget. */
 const headOptions = (actionId: string): HeadCommitOptions =>
-	({ actionId, timestamp: Date.now(), hlc: clock.now(), maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
+	({ actionId, timestamp: Date.now(), hlc: clock.now(), lane: 'serializable', maxAttempts: 5, baseBackoffMs: 1, maxBackoffMs: 5 });
 
 /** The keys each committed log entry of `id` replaced, in log order, read through a fresh handle
  * over the UNWRAPPED transactor — durable storage, not the handle under test's view. */
@@ -1172,7 +1172,8 @@ describe('Collection sealed segments', function () {
 			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
 				stamp, statements, reads: [], hlc,
-				id: await createTransactionId(stamp.id, statements, [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			const commitErr = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));

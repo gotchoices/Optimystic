@@ -116,7 +116,7 @@ async function makeCollection(collectionId: string): Promise<Collection> {
 			await repo.commit({ actionId, rev, blockIds: [blockId], tailId: 'log' });
 			committedBlocks.add(blockId);
 		}
-		await log.addActions(['op'], actionId, rev, () => writes.map(w => w.blockId), { reads, hlc: clock.now() });
+		await log.addActions(['op'], actionId, rev, () => writes.map(w => w.blockId), { reads, hlc: clock.now(), lane: 'serializable' });
 	};
 
 	return { collectionId, log, createBlockStorage, flush: () => raw.flush(), clock, repo, seed };

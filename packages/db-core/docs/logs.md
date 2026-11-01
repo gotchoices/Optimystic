@@ -30,6 +30,8 @@ type ActionEntry<TAction> = {
   actions: TAction[];
   blockIds: BlockId[];        // Blocks affected by transaction
   collectionIds?: CollectionId[];  // Collections involved
+  lane: Lane;                 // The write's lane, serializable or convergent; a stored entry from before
+                              // the field has none — read it through laneOf (docs/crdt-sync.md §Stage 5)
 };
 
 type CheckpointEntry = {
@@ -99,6 +101,7 @@ const { entry, tailPath } = await log.addActions(
   () => ['block1', 'block2'],   // Block IDs affected
   {                             // AddActionsOptions: the write's EntryTimes plus the action-entry fields
     hlc: clockOf(transactor).now(),  // the write's HLC, minted once per write (required)
+    lane: 'serializable',            // the write's lane, decided once per write (required)
     timestamp: Date.now(),           // the write's wall time (defaults to now)
     collectionIds: ['collection1', 'collection2'],
   }

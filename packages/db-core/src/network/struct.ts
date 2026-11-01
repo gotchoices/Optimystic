@@ -3,6 +3,7 @@ import type { ActionContext, ActionRev } from "../collection/action.js";
 import type { Transaction, ValidityRejection } from "../transaction/transaction.js";
 import type { DisputeResolutionProof } from "../log/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 import type { PeerId } from "./types.js";
 
 export type ActionBlocks = {
@@ -66,6 +67,18 @@ export type PendRequest = ActionTransforms & {
 	 * the same preimage reason as {@link baseRevs}.
 	 */
 	hlc?: Hlc;
+	/**
+	 * The lane of the write this pend carries (`ActionEntry.lane`, `Transaction.lane`): whether its
+	 * conflicts with concurrent writes are the quorum's to decide (`serializable`) or may be merged
+	 * later under the collection's declaration (`convergent`) — see `Lane` in
+	 * `packages/db-core/src/lane/lane.ts`. The same value the log entry inside `transforms` carries,
+	 * put here so a storage node reads it without parsing log blocks. Every writer of this build sets
+	 * it (`TransactorSource.transact`, `TransactionCoordinator.pendRequestFor`); optional on the wire
+	 * because an older writer sends none. A reader treats absence as "not stated", never as a lane.
+	 * Observational: nothing judges the pend by it yet (the member-side check is a later ticket).
+	 * Omitted rather than `undefined`, for the same preimage reason as {@link baseRevs}.
+	 */
+	lane?: Lane;
 	/**
 	 * Aged, advisory retry priority for a pend that carries no transaction (default 0 when absent).
 	 * A validated multi-collection pend instead carries priority on the transaction inside
@@ -486,6 +499,14 @@ export type CommitRequest = ActionBlocks & {
 	 * {@link blockDigests} is.
 	 */
 	refuseSolo?: true;
+	/**
+	 * {@link PendRequest.lane}, on the commit, so a coordinator handling the commit reads the write's
+	 * lane with no memory of the pend. Carried through every per-coordinator rebuild of the commit
+	 * (`repoCommitRequest` in `NetworkTransactor`); optional on the wire for an older writer, and
+	 * absence is "not stated". Omitted rather than `undefined`, for the preimage reason
+	 * {@link blockDigests} is.
+	 */
+	lane?: Lane;
 };
 
 /**

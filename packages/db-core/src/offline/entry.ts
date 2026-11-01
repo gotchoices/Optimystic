@@ -5,6 +5,7 @@ import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
 import type { Hlc } from '../hlc/hlc.js';
+import type { Lane } from '../lane/lane.js';
 import type { CommittedEffect, EntryStatus, EntryWaitingFor, QueuedEntry } from './status.js';
 import type { JournalDriveState } from './journal.js';
 
@@ -18,6 +19,13 @@ export type Entry = {
 	 * as the write's HLC. Fixed for the entry's whole life, like `queuedAt` — a renewed action id
 	 * does not renew it, since the entry is the same local commit. */
 	readonly hlc: Hlc;
+	/** The entry's lane (`JournalEntryRecord.lane`): the caller's classification at enqueue, or the
+	 * stricter of the sealed collections' own declarations over their segments, restored from the
+	 * journal, and passed to every drive as the write's lane. Fixed for the entry's whole life, like
+	 * `hlc`: a later change to a collection's declaration, or to a SQL table's tags, does not
+	 * reclassify an entry already queued — its lane is what was true of its statements when the
+	 * application made them. */
+	readonly lane: Lane;
 	readonly expiresAt: number | undefined;
 	/** The collections the entry sealed a segment in — the ones `sealPending` answered `true` for. */
 	readonly collections: readonly Collection<any>[];
@@ -62,6 +70,7 @@ export function queuedStatus(entry: Entry): QueuedStatus {
 		seq: entry.seq,
 		collections: entry.collections.map(collection => collection.id),
 		queuedAt: entry.queuedAt,
+		lane: entry.lane,
 		attempts: entry.attempts,
 		inDoubt: entry.inDoubt,
 		waitingFor: entry.waitingFor,
@@ -88,6 +97,7 @@ export function snapshot(entry: Entry): QueuedEntry {
 		id: entry.id,
 		seq: entry.seq,
 		queuedAt: entry.queuedAt,
+		lane: entry.lane,
 		collections: entry.collections.map(collection => collection.id),
 		...committedField(entry),
 		status: currentStatus(entry),

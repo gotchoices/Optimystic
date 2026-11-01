@@ -2,6 +2,11 @@ import { use, expect } from 'chai'
 import chaiAsPromised from 'chai-as-promised'
 use(chaiAsPromised)
 import { Collection, SyncRetryExhaustedError, SyncRevisionStalledError, type CollectionInitOptions } from '../src/collection/index.js'
+import { Diary } from '../src/collections/diary/diary.js'
+import { Tree } from '../src/collections/tree/tree.js'
+import { Log } from '../src/log/log.js'
+import { laneOf } from '../src/log/struct.js'
+import type { Lane } from '../src/lane/lane.js'
 import { TestTransactor, FlakyCommitTransactor } from '../src/testing/test-transactor.js'
 import { waitFor } from '../src/testing/async-wait.js'
 import type { Action, ActionHandler, BlockId, BlockStore, IBlock, ITransactor, BlockGets, GetBlockResults, ActionBlocks, BlockActionStatus, PendRequest, PendResult, CommitRequest, CommitResult, StaleFailure } from '../src/index.js'
@@ -591,12 +596,13 @@ describe('Collection', () => {
     expect(actions[0]).to.deep.equal(action)
   })
 
-  // TEST-3.3.1: Collection conflict resolution tests (filterConflict callback behavior)
+  // TEST-3.3.1: Collection conflict resolution tests (the merge declaration's filterConflict hook).
+  // Every fixture declares its actions convergent, since the hook is offered only convergent actions.
   describe('conflict resolution (TEST-3.3.1)', () => {
     it('should discard pending action when filterConflict returns undefined', async () => {
       const optionsWithFilter: CollectionInitOptions<TestAction> = {
         ...initOptions,
-        filterConflict: (_action, _potential) => undefined
+        merge: { laneOf: () => 'convergent', filterConflict: (_action, _potential) => undefined }
       }
 
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
@@ -636,7 +642,7 @@ describe('Collection', () => {
     it('should keep pending action when filterConflict returns original action', async () => {
       const optionsWithFilter: CollectionInitOptions<TestAction> = {
         ...initOptions,
-        filterConflict: (action, _potential) => action
+        merge: { laneOf: () => 'convergent', filterConflict: (action, _potential) => action }
       }
 
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
@@ -677,10 +683,13 @@ describe('Collection', () => {
       // replacing the original — not be silently dropped.
       const optionsWithFilter: CollectionInitOptions<TestAction> = {
         ...initOptions,
-        filterConflict: (action, _potential) =>
-          action.data.value === 'local'
-            ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
-            : action
+        merge: {
+          laneOf: () => 'convergent',
+          filterConflict: (action, _potential) =>
+            action.data.value === 'local'
+              ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
+              : action
+        }
       }
 
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
@@ -738,10 +747,13 @@ describe('Collection', () => {
       const optionsWithFilter: CollectionInitOptions<TestAction> = {
         ...initOptions,
         modules: valueModules,
-        filterConflict: (action, _potential) =>
-          action.data.value === 'local'
-            ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
-            : action
+        merge: {
+          laneOf: () => 'convergent',
+          filterConflict: (action, _potential) =>
+            action.data.value === 'local'
+              ? { type: 'set', data: { value: 'merged', timestamp: action.data.timestamp } }
+              : action
+        }
       }
 
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, optionsWithFilter)
@@ -769,7 +781,7 @@ describe('Collection', () => {
       expect(committedValues.has('local'), 'original block effect must not survive the rewrite').to.equal(false)
     })
 
-    it('should keep pending when no filterConflict provided', async () => {
+    it('should keep pending when no merge declaration is provided', async () => {
       const collection1 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
       const collection2 = await Collection.createOrOpen<TestAction>(transactor, collectionId, initOptions)
 
@@ -787,6 +799,42 @@ describe('Collection', () => {
         actions.push(a)
       }
       expect(actions).to.have.lengthOf(2)
+    })
+  })
+
+  // The lane a write's log entry carries (docs/crdt-sync.md §Stage 5): which source decides it.
+  // One behaviour, three assertions — the caller's classification wins over the collection's
+  // declaration, and the declaration over nothing. The field's wire plumbing is not tested here.
+  describe('the lane a write carries', () => {
+    /** The lane of the newest action entry in `id`'s log, read as a reader must (`laneOf`), through a
+     *  fresh handle so nothing staged on the writer's handle is in the way. */
+    async function lastEntryLane(id: string): Promise<Lane> {
+      const reader = await Collection.open<unknown>(transactor, id, {
+        modules: {},
+        createHeaderBlock: (headerId: string, store: BlockStore<IBlock>) => ({ header: store.createBlockHeader('TEST', headerId) }),
+      })
+      const log = await Log.open<Action<unknown>>(reader!.tracker, id)
+      let last
+      for await (const entry of log!.select()) last = entry
+      return laneOf(last!.action!)
+    }
+
+    it('is the sync option when given, else the collection\'s declaration, else serializable', async () => {
+      // Diary declares append-only convergent, and nobody classified the write: the declaration decides.
+      const diary = await Diary.createOrOpen<string>(transactor, 'lane-diary')
+      await diary.append('one')
+      expect(await lastEntryLane('lane-diary'), 'a diary append is convergent by declaration').to.equal('convergent')
+
+      // Tree declares nothing: a replace is serializable.
+      const tree = await Tree.createOrOpen<number, { key: number }>(transactor, 'lane-tree', entry => entry.key)
+      await tree.replace([[1, { key: 1 }]])
+      expect(await lastEntryLane('lane-tree'), 'a tree write is serializable without a declaration').to.equal('serializable')
+
+      // The caller's classification wins over the declaration's answer.
+      const collection = tree.getCollection()
+      await collection.act({ type: 'replace', data: [[2, { key: 2 }]] })
+      await collection.sync({ lane: 'convergent' })
+      expect(await lastEntryLane('lane-tree'), 'the sync option classifies the write').to.equal('convergent')
     })
   })
 

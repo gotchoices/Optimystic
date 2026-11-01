@@ -5,6 +5,7 @@ import type { EntryId } from "./segments.js";
 import type { AlreadyAppliedTally } from "./action.js";
 import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 
 export type CollectionId = BlockId;
 
@@ -132,6 +133,11 @@ export type HeadCommitOptions = SyncOptions & {
 	 * the collections' transactor clock, journaled with the entry, and re-supplied on every drive of
 	 * it, first or re-drive, so every attempt appends the same entry. */
 	hlc: Hlc;
+	/** The entry's lane (`ActionEntry.lane`): fixed at enqueue — the caller's classification, or the
+	 * stricter of the sealed collections' own declarations — journaled with the entry and re-supplied
+	 * on every drive, so every attempt appends the same entry. Required here, unlike the
+	 * {@link SyncOptions.lane} it narrows: a head commit never classifies for itself. */
+	lane: Lane;
 	/** The write-ahead hook: called with each attempt exactly as it is about to be sent — after it is
 	 * built and BEFORE the collection latch is released for the network — and awaited under that
 	 * latch. It is where the queue records the attempt's identity before sending it
@@ -244,21 +250,34 @@ export interface SyncOptions {
 	 * §When to submit: the reachability gate). A coordinator on a build that predates the field
 	 * ignores it and commits alone as before. */
 	refuseSoloCommit?: boolean;
+	/** The caller's classification of the write: the lane (`Lane` in `packages/db-core/src/lane/lane.ts`)
+	 * its log entry, its pend and its commit carry. Taken at face value — the caller knows more than
+	 * the collection does (the SQL bridge computes it from the statements), and the member-side check
+	 * is a later ticket. Absent, the collection's own merge declaration decides
+	 * (`Collection.laneOf`), which is `serializable` for a collection that declares nothing. Read by
+	 * `Collection.sync`, `updateAndSync` and `actAndSync`, and by `TransactionSession.commit`, which
+	 * folds it into the transaction it builds; `TransactionCoordinator.commit` and `commitEntry` take
+	 * the lane off the transaction and the entry, which carry it already, and do not read this. */
+	lane?: Lane;
 }
 
 /** What a write's attempt cycle carries besides its identity, recorded beside the in-flight mark
  * (`Collection.beginInFlightAction`) so that every send of the cycle carries it: each attempt, and
  * the re-send a refresh makes to finish a torn one (`Collection.completeOwnEntry`). */
 export type InFlightCycle = {
+	/** The write's lane (`WriteIdentity.lane`), on every pend and commit of the cycle — the re-send
+	 * of a torn attempt included, which is why it rides here and not only on the identity the
+	 * attempts are built from. */
+	readonly lane: Lane;
 	/** {@link SyncOptions.refuseSoloCommit}, for this cycle. */
 	readonly refuseSolo?: boolean;
 };
 
 /** What `Collection.openHeadCommit` opens a head commit with besides its identity: the cycle's
- * {@link InFlightCycle}, the attempt an earlier cycle under the same action id recorded and did not
- * resolve ({@link HeadCommitOptions.resume}), and the committed-head hook
- * ({@link HeadCommitOptions.onCommittedHead}). */
-export type OpenHeadCommitOptions = InFlightCycle & {
+ * {@link InFlightCycle} less its lane, which is the identity's; the attempt an earlier cycle under
+ * the same action id recorded and did not resolve ({@link HeadCommitOptions.resume}); and the
+ * committed-head hook ({@link HeadCommitOptions.onCommittedHead}). */
+export type OpenHeadCommitOptions = Omit<InFlightCycle, 'lane'> & {
 	readonly resume?: InFlightAttempt;
 	readonly onCommittedHead?: (applied: AlreadyAppliedTally) => void;
 };

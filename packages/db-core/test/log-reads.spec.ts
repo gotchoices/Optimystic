@@ -28,7 +28,7 @@ describe('Log action read-set persistence', () => {
 			{ blockId: 'block-B', revision: 7 },
 		]
 
-		const { entry } = await log.addActions(['op'], id, 1, () => ['block-W'], { reads, hlc })
+		const { entry } = await log.addActions(['op'], id, 1, () => ['block-W'], { reads, hlc, lane: 'serializable' })
 		expect(entry.action?.reads).to.deep.equal(reads)
 
 		// Survives a fresh read back through getFrom.
@@ -49,9 +49,9 @@ describe('Log action read-set persistence', () => {
 		const emptyId = generateNumericActionId(2)
 
 		// Legacy path (no reads argument): undefined — the cascade treats this as an unknown dependency.
-		await log.addActions(['legacy'], legacyId, 1, () => [], { hlc })
+		await log.addActions(['legacy'], legacyId, 1, () => [], { hlc, lane: 'serializable' })
 		// Explicit empty read set: a transaction that genuinely read nothing.
-		await log.addActions(['empty'], emptyId, 2, () => [], { reads: [], hlc })
+		await log.addActions(['empty'], emptyId, 2, () => [], { reads: [], hlc, lane: 'serializable' })
 
 		const { entries } = await log.getFrom(0)
 		const legacy = entries.find(e => e.actionId === legacyId)

@@ -76,7 +76,8 @@ async function stageAndCommit(coordinator: TransactionCoordinator, actions: Coll
 	const hlc = coordinator.clock.now();
 	const transaction: Transaction = {
 		stamp, statements, reads: [], hlc,
-		id: await createTransactionId(stamp.id, statements, [], hlc),
+		lane: 'serializable',
+		id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 	};
 	await coordinator.applyActions(actions, stamp.id);
 	await coordinator.commit(transaction);

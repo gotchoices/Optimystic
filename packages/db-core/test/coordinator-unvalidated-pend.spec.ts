@@ -75,7 +75,7 @@ async function stagedPair(transactor: RecordingPendTransactor, options: Coordina
 	);
 	const stamp = await createTransactionStamp('peer', Date.now(), '', 'legacy');
 	const hlc = coordinator.clock.now();
-	const transaction: Transaction = { stamp, statements: [], reads: [], hlc, id: await createTransactionId(stamp.id, [], [], hlc) };
+	const transaction: Transaction = { stamp, statements: [], reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable') };
 	return { alpha, beta, coordinator, transaction };
 }
 

@@ -591,7 +591,7 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			const collection = tree.getCollection();
 			expect(collection.sealPending('E'), 'something was staged').to.equal(true);
 			const reported: AlreadyAppliedTally[] = [];
-			await collection.commitHead('E', { actionId: 'E-action', timestamp: Date.now(), hlc: clockOf(collection.transactor).now(), onCommittedHead: applied => { reported.push(applied); } });
+			await collection.commitHead('E', { actionId: 'E-action', timestamp: Date.now(), hlc: clockOf(collection.transactor).now(), lane: 'serializable', onCommittedHead: applied => { reported.push(applied); } });
 			expect(reported, 'the head commit reported its tally exactly once').to.have.length(1);
 			return reported[0]!;
 		}
@@ -869,7 +869,8 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
 				stamp, statements, reads: [], hlc,
-				id: await createTransactionId(stamp.id, statements, [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			const err = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));
@@ -923,7 +924,8 @@ describe('Tree entry guards (concurrent-insert refusal)', function () {
 			const hlc = coordinator.clock.now();
 			const transaction: Transaction = {
 				stamp, statements, reads: [], hlc,
-				id: await createTransactionId(stamp.id, statements, [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			const err = await capture(() => coordinator.commit(transaction, { baseBackoffMs: 1, maxBackoffMs: 5 }));

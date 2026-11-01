@@ -1,5 +1,5 @@
 import type {
-  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Transaction, TransactionDurability,
+  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Lane, Transaction, TransactionDurability,
   TreeGuardRefusedError, WriteDurability,
 } from '@optimystic/db-core';
 import {
@@ -1484,10 +1484,10 @@ export class TransactionBridge {
    * member ever sees it — the pend carries no validation payload — so its expiry
    * ({@link NetworkCommitBoundMs}) is only the coordinator's own ceiling.
    */
-  private async legacyTransaction(transactor: ITransactor): Promise<Transaction> {
+  private async legacyTransaction(transactor: ITransactor, lane: Lane = 'serializable'): Promise<Transaction> {
     const stamp = await createTransactionStamp(this.peerId ?? 'local', Date.now(), '', LegacyCommitEngineId, NetworkCommitBoundMs);
     const hlc = clockOf(transactor).now();
-    return { stamp, statements: [], reads: [], hlc, id: await createTransactionId(stamp.id, [], [], hlc) };
+    return { stamp, statements: [], reads: [], hlc, lane, id: await createTransactionId(stamp.id, [], [], hlc, lane) };
   }
 
   /**

@@ -334,8 +334,10 @@ export class OfflineRestore {
 			id: entry.transactionId,
 			seq: entry.seq,
 			queuedAt: entry.queuedAt,
-			// A record from before the field restores with the legacy shape (see EntryRecordV1.hlc).
+			// A record from before either field restores with the legacy shape (see EntryRecordV1.hlc
+			// and EntryRecordV1.lane).
 			hlc: entry.hlc ?? legacyHlc(entry.queuedAt),
+			lane: entry.lane ?? 'serializable',
 			...(entry.expiresAt === undefined ? {} : { expiresAt: entry.expiresAt }),
 			collections: resolved.collections,
 			...(drive === undefined ? {} : { drive: driveStateOf(drive) }),

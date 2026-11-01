@@ -250,7 +250,7 @@ describe('Collection: finishing a half-landed write can itself be refused', () =
 		// `later` adopts that action as its own in-flight write — but it never made the attempt, so
 		// it holds nothing to finish it with. Consuming on sight here is exactly the old data loss.
 		await later.act({ type: 'set', data: { value: 'local' } })
-		later.beginInFlightAction(tornEntry.actionId)
+		later.beginInFlightAction(tornEntry.actionId, { lane: 'serializable' })
 		let thrown: unknown
 		try {
 			await later.update()

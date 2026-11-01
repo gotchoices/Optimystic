@@ -12,6 +12,7 @@ import { transformForBlockId, concatTransforms, concatTransform, transformsFromT
 import { Tracker } from "../transform/tracker.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
+import { laneField } from "../lane/lane.js";
 import { CacheSource } from "../transform/cache-source.js";
 import { TransactorSource, servedRevision } from "./transactor-source.js";
 import { Log } from "../log/log.js";
@@ -1768,8 +1769,8 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
  * cohort sign for blocks the request is not committing; and `processBatches` re-batches failed blocks
  * onto different coordinators, so only a send-time subset stays correct across retries.
  */
-function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests, refuseSolo }: RepoCommitRequest): RepoCommitRequest {
-	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds), ...refuseSoloField(refuseSolo) };
+function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDigests, refuseSolo, lane }: RepoCommitRequest): RepoCommitRequest {
+	return { actionId, blockIds, rev, tailId, ...digestsFor(blockDigests, blockIds), ...laneField(lane), ...refuseSoloField(refuseSolo) };
 }
 
 /** `request`'s commit of `blockIds` alone, for {@link NetworkTransactor}'s two-step path to hand to its
@@ -1777,7 +1778,7 @@ function repoCommitRequest(blockIds: BlockId[], { actionId, rev, tailId, blockDi
  * through {@link repoCommitRequest}, which narrows them to the blocks that send commits. */
 function commitOf(request: CommitRequest, blockIds: BlockId[]): RepoCommitRequest {
 	return { blockIds, actionId: request.actionId, rev: request.rev, tailId: request.tailId, blockDigests: request.blockDigests,
-		...refuseSoloField(request.refuseSolo) };
+		...laneField(request.lane), ...refuseSoloField(request.refuseSolo) };
 }
 
 /** `request`'s blocks with its log tail first, each once — the order a coordinator commits them in. */
@@ -1820,7 +1821,8 @@ function baseRevsFor(all: BlockBaseRevs | undefined, batchBlockIds: BlockId[]): 
  * coordinators — by `consolidateCoordinators`, or by `processBatches` re-batching a failed batch — is
  * several reservations, which the field must never claim to be. Decided per send, like the bases.
  * Every other field goes on every batch as given — `refuseSolo` included, whose loss on one batch would
- * let that coordinator's share be written by a lone node the write asked not to be written by. */
+ * let that coordinator's share be written by a lone node the write asked not to be written by, and
+ * `lane`, which every share of the write states alike. */
 function pendRequestForBatch(action: PendRequest, payload: Transforms): PendRequest {
 	const { baseRevs, soleReservation, ...rest } = action;
 	const batchBlockIds = blockIdsForTransforms(payload);

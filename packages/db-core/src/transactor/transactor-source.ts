@@ -5,6 +5,7 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import { withBlockRevs } from "../network/durability.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import type { Hlc } from "../hlc/hlc.js";
+import { laneField, type Lane } from "../lane/lane.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
 import { blockDigestsField, baseRevsField } from "../transform/digest.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
@@ -35,6 +36,11 @@ export type TransactOptions = {
 	 * observes it without parsing the log entry out of the transforms. Left off when the caller has
 	 * none at hand — the re-send of a retained attempt, whose entry carries it inside the transforms. */
 	readonly hlc?: Hlc;
+	/** The write's lane (`WriteIdentity.lane`), put on the pend and the commit (`PendRequest.lane`,
+	 * `CommitRequest.lane`) so a storage node reads it off either request. Every send of this build
+	 * sets it, the re-send of a retained attempt included (`InFlightCycle.lane`); left off only by a
+	 * caller that genuinely has none. */
+	readonly lane?: Lane;
 };
 
 /** The block `entry` answers for `id`, for a read at `context` (`undefined` for an unpinned "give me
@@ -255,11 +261,12 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 	 * by comparing `quorum` (see {@link WriteDurability}).
 	 */
 	async transact(transform: Transforms, actionId: ActionId, rev: number, headerId: BlockId, tailId: BlockId, options: TransactOptions = {}): Promise<CommitResult> {
-		const { priority = 0, blockDigests, baseRevs, refuseSolo, hlc } = options;
+		const { priority = 0, blockDigests, baseRevs, refuseSolo, hlc, lane } = options;
 		const pendResult = await this.transactor.pend({
 			transforms: transform, actionId, rev, policy: 'r',
 			...(priority > 0 ? { priority } : {}),
 			...(hlc === undefined ? {} : { hlc }),
+			...laneField(lane),
 			...baseRevsField(baseRevs),
 			// One collection, pended whole and then committed: the shape `PendRequest.soleReservation` names.
 			soleReservation: true,
@@ -277,6 +284,7 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 				actionId,
 				rev,
 				...blockDigestsField(blockDigests),
+				...laneField(lane),
 				...refuseSoloField(refuseSolo)
 			});
 			if (!commitResult.success) {

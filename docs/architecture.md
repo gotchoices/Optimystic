@@ -142,7 +142,7 @@ Determinism is a hard requirement: non-deterministic SQL (`RANDOM`, `now()`) is 
 
 ### Conflict resolution
 
-If PEND detects stale reads or a conflicting concurrent transaction, the coordinator abandons pending work, pulls the winning actions, replays the client's own actions atop the new state, and retries. Collection handlers declare a `filterConflict` policy for merging concurrent updates where possible (see [`Collection`](../packages/db-core/docs/collections.md)).
+If PEND detects stale reads or a conflicting concurrent transaction, the coordinator abandons pending work, pulls the winning actions, replays the client's own actions atop the new state, and retries. A collection declares, with `merge`, which of its actions are convergent and how such an action is rebased over concurrent updates; every write carries the resulting lane, `serializable` or `convergent` (see [`Collection`](../packages/db-core/docs/collections.md)).
 
 ## Network & Consensus Layer
 
@@ -337,7 +337,7 @@ Typical patterns:
 |----------|-------|
 | Append-only event log | `Diary` collection |
 | Indexed key/value or documents | `Tree` collection |
-| Custom merge semantics | `Collection` with a `filterConflict` policy |
+| Custom merge semantics | `Collection` with a `merge` declaration |
 | SQL front-end | Quereus + `quereus-plugin-optimystic` |
 | Multi-collection mutation (atomic-intent) | `TransactionCoordinator` / `TransactionSession` |
 

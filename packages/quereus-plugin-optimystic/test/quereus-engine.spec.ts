@@ -414,7 +414,8 @@ describe('QuereusEngine', () => {
 				statements: [],
 				reads: [],
 				hlc,
-				id: await createTransactionId(stamp.id, [], [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -444,7 +445,8 @@ describe('QuereusEngine', () => {
 				statements: [],
 				reads: [],
 				hlc,
-				id: await createTransactionId(stamp.id, [], [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -478,7 +480,8 @@ describe('QuereusEngine', () => {
 				statements: [],
 				reads: [],
 				hlc,
-				id: await createTransactionId(stamp.id, [], [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;
@@ -499,7 +502,8 @@ describe('QuereusEngine', () => {
 				statements: [],
 				reads: [],
 				hlc,
-				id: await createTransactionId(stamp.id, [], [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 				signature: 'AAAA',
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -520,7 +524,8 @@ describe('QuereusEngine', () => {
 				statements: [],
 				reads: [],
 				hlc,
-				id: await createTransactionId(stamp.id, [], [], hlc),
+				lane: 'serializable',
+				id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 			};
 			const result = await validator.validate(transaction, 'ops:abc');
 			expect(result.valid).to.be.false;

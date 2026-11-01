@@ -3,6 +3,7 @@ import type { EntryId } from '../collection/segments.js';
 import type { CollectionId, InFlightAttempt } from '../collection/struct.js';
 import type { WriteDurability } from '../network/struct.js';
 import type { Hlc } from '../hlc/hlc.js';
+import type { Lane } from '../lane/lane.js';
 import type { EntryStatus } from './status.js';
 
 /**
@@ -26,6 +27,10 @@ export type JournalEntryRecord = {
 	 * entry's drives append (`HeadCommitOptions.hlc`, `EntryCommit.hlc`), so a restore re-supplies the
 	 * value the first drive used. */
 	readonly hlc: Hlc;
+	/** The entry's lane, fixed at enqueue and carried on every log entry, pend and commit the entry's
+	 * drives make (`HeadCommitOptions.lane`, `EntryCommit.lane`), so a restore re-supplies the value the
+	 * first drive used rather than reclassifying the entry under declarations that may have changed. */
+	readonly lane: Lane;
 	readonly expiresAt?: number;
 	/** One per collection the entry sealed a segment in, in sealing order: the segment's actions,
 	 * verbatim — the array the segment holds, which the journal serialises and never mutates. */

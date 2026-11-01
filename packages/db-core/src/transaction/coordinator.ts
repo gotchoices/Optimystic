@@ -9,6 +9,7 @@ import { TransactionExpiredError } from "../network/transaction-expired-error.js
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
 import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
+import type { Lane } from "../lane/lane.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
 import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
@@ -173,9 +174,11 @@ type CommitCycle = {
 	readonly inFlight: InFlightCycle;
 };
 
-/** What a commit's `options` ask of every send of its cycle. */
-function inFlightCycleOf(options: SyncOptions | undefined): InFlightCycle {
-	return options?.refuseSoloCommit === true ? { refuseSolo: true } : {};
+/** What every send of a commit's cycle carries: the write's lane — the transaction's or the queued
+ * entry's, never `options.lane`, which the transaction and the entry already folded in — and what the
+ * commit's `options` ask of every send besides. */
+function inFlightCycleOf(options: SyncOptions | undefined, lane: Lane): InFlightCycle {
+	return { lane, ...refuseSoloField(options?.refuseSoloCommit) };
 }
 
 /** How one collection's commit ended ({@link TransactionCoordinator.commitCollection}, or its share of
@@ -662,7 +665,7 @@ export class TransactionCoordinator {
 			inFlightDisposers: [],
 			participants: new Set(),
 			saved: new Map(),
-			inFlight: inFlightCycleOf(options),
+			inFlight: inFlightCycleOf(options, transaction.lane),
 		};
 		const driver: AttemptDriver = {
 			opensWithRefresh: false,
@@ -1284,7 +1287,7 @@ export class TransactionCoordinator {
 			throw new Error(`commitEntry ${entry.entryId}: a queued entry commits through a coordinator built with `
 				+ `pendValidation: 'none' — it has no statements for a member to re-execute`);
 		}
-		const inFlight = inFlightCycleOf(options);
+		const inFlight = inFlightCycleOf(options, entry.lane);
 		const participants = await EntryParticipants.open(this.collections, entry, inFlight);
 		const cycle: CommitCycle = {
 			// The handles own the in-flight marks (closed with them), so none to dispose here.
@@ -1347,6 +1350,7 @@ export class TransactionCoordinator {
 			actionId: entry.actionId,
 			timestamp: entry.timestamp,
 			hlc: entry.hlc,
+			lane: entry.lane,
 			reads: [],
 			priority,
 			...refuseSoloField(cycle.inFlight.refuseSolo),
@@ -1825,7 +1829,7 @@ export class TransactionCoordinator {
 	 * Apply actions to a collection.
 	 *
 	 * This runs the action handlers, writes to the log, and collects transforms. The log entry is
-	 * written under `context`: its action id, its timestamp, its HLC and its reads.
+	 * written under `context`: its action id, its timestamp, its HLC, its lane and its reads.
 	 */
 	private async applyActionsToCollection(
 		collectionActions: CollectionActions,
@@ -1906,7 +1910,7 @@ export class TransactionCoordinator {
 			actionId,
 			newRev,
 			() => blockIdsForTransforms(transforms),
-			{ collectionIds: allCollectionIds, reads: [...context.reads], timestamp: context.timestamp, hlc: context.hlc }
+			{ collectionIds: allCollectionIds, reads: [...context.reads], timestamp: context.timestamp, hlc: context.hlc, lane: context.lane }
 		);
 
 		// Return the transforms and log tail block ID
@@ -2263,13 +2267,15 @@ export class TransactionCoordinator {
 		// Collection.sync pend.
 		// The bases (`PendRequest.baseRevs`) were read from the same tracker the commit's declaration was
 		// taken from, when the attempt was described; omitted when empty.
-		// The HLC is the write's (`WriteContext.hlc`), the same value the log entry inside `transforms`
-		// carries, so the pend and its validation payload cannot disagree on it.
+		// The HLC and the lane are the write's (`WriteContext.hlc`, `WriteContext.lane`), the same
+		// values the log entry inside `transforms` carries, so the pend and its validation payload
+		// cannot disagree on them.
 		return {
 			actionId: context.actionId,
 			rev: attempt.rev,
 			transforms: attempt.transforms,
 			hlc: context.hlc,
+			lane: context.lane,
 			policy: 'r', // Return policy: fail but return pending actions
 			...(validation === undefined
 				? (context.priority > 0 ? { priority: context.priority } : {})
@@ -2478,6 +2484,7 @@ export class TransactionCoordinator {
 			tailId: attempt.tailId,
 			rev: attempt.rev,
 			...blockDigestsField(attempt.blockDigests),
+			lane: context.lane,
 			...refuseSoloField(context.refuseSolo)
 		};
 	}

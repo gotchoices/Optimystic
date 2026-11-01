@@ -212,7 +212,7 @@ describe('Collection: own committed action on retry', () => {
 		await later.act({ type: 'set', data: { value: 'durable', timestamp: 1 } })
 		await later.act({ type: 'set', data: { value: 'staged-after', timestamp: 2 } })
 
-		later.beginInFlightAction(ownActionId)
+		later.beginInFlightAction(ownActionId, { lane: 'serializable' })
 		await later.update()
 
 		// The entry's single action came off the head; the one queued behind it is still ours to
@@ -238,7 +238,7 @@ describe('Collection: own committed action on retry', () => {
 		// One pending action against a two-action entry: the impossible state the guard names.
 		await short.act({ type: 'set', data: { value: 'only-one', timestamp: 1 } })
 
-		short.beginInFlightAction(ownActionId)
+		short.beginInFlightAction(ownActionId, { lane: 'serializable' })
 		let thrown: unknown
 		try {
 			await short.update()

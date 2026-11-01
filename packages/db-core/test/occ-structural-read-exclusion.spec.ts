@@ -280,7 +280,7 @@ describe('OCC structural read exclusion', () => {
 		async function makeTxn(reads: ReadDependency[]): Promise<Transaction> {
 			const stamp = await createTransactionStamp('peer', Date.now(), 'schema-1', 'actions@1.0.0')
 			const hlc = clock.now()
-			return { stamp, statements: [], reads, hlc, id: await createTransactionId(stamp.id, [], reads, hlc) }
+			return { stamp, statements: [], reads, hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable') }
 		}
 
 		const emptyOpsHash = async () => hashOperations(collectOperations(new Map<string, Transforms>()))

@@ -1,6 +1,7 @@
 import type { IBlock, BlockId, Action, ActionId, BlockContentDigests, BlockStore, Transforms, WriteDurability, WriteFailure } from "../index.js";
 import type { BlockBaseRevs } from "../network/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 import { Log } from "../log/log.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
@@ -79,11 +80,11 @@ function retryBackoffMs(failures: number, confirmedLosses: number, latestConfirm
 	return jitteredBackoffMs(failures - 1, config, rand);
 }
 
-/** What a write is identified as on the wire: the action id every attempt of it reuses, and the two
- * per-write time values its log entry carries, the HLC and the wall-clock timestamp. All three are
- * minted once per WRITE, never per attempt, so a retry at the same revision appends the same entry
- * (docs/internals.md, "A write's log append is a fixed function of the write and the revision it is
- * requesting"). */
+/** What a write is identified as on the wire: the action id every attempt of it reuses, the two
+ * per-write time values its log entry carries, the HLC and the wall-clock timestamp, and its lane.
+ * All four are minted once per WRITE, never per attempt, so a retry at the same revision appends the
+ * same entry (docs/internals.md, "A write's log append is a fixed function of the write and the
+ * revision it is requesting"). */
 export type WriteIdentity = {
 	readonly actionId: ActionId;
 	/** The wall-clock time the write was minted at (`LogEntry.timestamp`). */
@@ -97,6 +98,11 @@ export type WriteIdentity = {
 	 * `feat-replay-mode-collections-merge-divergent-histories`) commits locally without a log-tail
 	 * retry, so it never meets the case. */
 	readonly hlc: Hlc;
+	/** The write's lane (`ActionEntry.lane`, `PendRequest.lane`, `CommitRequest.lane`): the caller's
+	 * classification when it gave one (`SyncOptions.lane`), else the collection's own declaration
+	 * over what the write stages (`Collection.laneOf`); the queue's for a head commit
+	 * (`HeadCommitOptions.lane`). */
+	readonly lane: Lane;
 };
 
 /** What one attempt is built from: the actions its log entry records, the transforms they produced
@@ -134,7 +140,7 @@ export type StagedAttempt = {
  * — but if an attempt ever grows a per-attempt footprint beyond the log blocks, reset the abandoned
  * tracker on the stale-failure branch instead of letting the residue ride to the end of the write.
  *
- * The append is a fixed function of the write and `rev`: the HLC and timestamp are the identity's, and
+ * The append is a fixed function of the write and `rev`: the HLC, timestamp and lane are the identity's, and
  * any data block the append has to mint takes the id `newDataBlockId` hands out — the caller's
  * `Collection.logAppendBlockIds`, which replays the ids an earlier attempt at this revision minted.
  *
@@ -162,7 +168,7 @@ export async function stageAttempt<TAction>(
 		throw new Error(`Log not found for collection ${collectionId}`);
 	}
 	const added = await collectionLog.addActions([...target.actions], identity.actionId, rev,
-		() => tracker.transformedBlockIds(), { timestamp: identity.timestamp, hlc: identity.hlc });
+		() => tracker.transformedBlockIds(), { timestamp: identity.timestamp, hlc: identity.hlc, lane: identity.lane });
 	const touched = await describeTouchedBlocks(tracker, tracker.transformedBlockIds());
 	const tooLarge = oversizedBlock(touched.bytes);
 	if (tooLarge) throw tooLarge;

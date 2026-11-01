@@ -30,6 +30,7 @@ import {
 	type ActionHandler,
 	type BlockStore,
 	type CollectionInitOptions,
+	type ConvergentMerge,
 	type Transaction,
 	type ITransactionEngine,
 	type ExecutionResult,
@@ -116,7 +117,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads,
-				hlc, id: await createTransactionId(stamp.id, statements, reads, hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, reads, hlc, 'serializable')
 			};
 
 			expect(transaction.stamp.engineId).to.equal('actions@1.0.0');
@@ -169,14 +170,14 @@ describe('Transaction', () => {
 				stamp: stamp1,
 				statements: statements1,
 				reads: reads1,
-				hlc, id: await createTransactionId(stamp1.id, statements1, reads1, hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements1, reads1, hlc, 'serializable')
 			};
 
 			const transaction2: Transaction = {
 				stamp: stamp2,
 				statements: statements2,
 				reads: reads2,
-				hlc, id: await createTransactionId(stamp2.id, statements2, reads2, hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp2.id, statements2, reads2, hlc, 'serializable')
 			};
 
 			expect(transaction1.id).to.not.equal(transaction2.id);
@@ -203,15 +204,15 @@ describe('Transaction', () => {
 			const statements = createActionsStatements(collections);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema-hash-123', 'actions@1.0.0');
 			const reads = [{ blockId: 'block1', revision: 1 }];
-			const id = await createTransactionId(stamp.id, statements, reads, hlc);
+			const id = await createTransactionId(stamp.id, statements, reads, hlc, 'serializable');
 
-			// The id is a pure function of (stampId, statements, reads, hlc); priority is deliberately excluded.
-			const fresh: Transaction = { stamp, statements, reads, hlc, id, priority: 0 };
-			const aged: Transaction = { stamp, statements, reads, hlc, id, priority: MaxPriority };
+			// The id is a pure function of (stampId, statements, reads, hlc, lane); priority is deliberately excluded.
+			const fresh: Transaction = { stamp, statements, reads, hlc, lane: 'serializable', id, priority: 0 };
+			const aged: Transaction = { stamp, statements, reads, hlc, lane: 'serializable', id, priority: MaxPriority };
 
 			// Recomputing the id from the same inputs is stable regardless of the priority field's value.
-			expect(await createTransactionId(fresh.stamp.id, fresh.statements, fresh.reads, fresh.hlc))
-				.to.equal(await createTransactionId(aged.stamp.id, aged.statements, aged.reads, aged.hlc));
+			expect(await createTransactionId(fresh.stamp.id, fresh.statements, fresh.reads, fresh.hlc, fresh.lane))
+				.to.equal(await createTransactionId(aged.stamp.id, aged.statements, aged.reads, aged.hlc, aged.lane));
 			expect(fresh.id).to.equal(aged.id);
 		});
 
@@ -224,8 +225,8 @@ describe('Transaction', () => {
 
 			// Both attempts sign the SAME bytes — priority is absent from the payload, so a retry that only
 			// bumps priority keeps the same signature (anti-replay / OCC binding never churns).
-			const payloadFresh = clientSignaturePayload(stamp.id, statements, reads, hlc);
-			const payloadAged = clientSignaturePayload(stamp.id, statements, reads, hlc);
+			const payloadFresh = clientSignaturePayload(stamp.id, statements, reads, hlc, 'serializable');
+			const payloadAged = clientSignaturePayload(stamp.id, statements, reads, hlc, 'serializable');
 			expect(new TextDecoder().decode(payloadFresh)).to.equal(new TextDecoder().decode(payloadAged));
 			expect(new TextDecoder().decode(payloadFresh).startsWith(CLIENT_SIG_VERSION)).to.be.true;
 		});
@@ -268,7 +269,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Pure translation succeeds and returns the parsed actions.
@@ -309,7 +310,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Pure translation succeeds and returns actions for BOTH collections.
@@ -336,7 +337,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: ['invalid json'],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, ['invalid json'], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, ['invalid json'], [], hlc, 'serializable')
 			};
 
 			const result = await engine.execute(transaction);
@@ -405,7 +406,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute transaction through engine
@@ -489,7 +490,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute transaction through engine
@@ -580,7 +581,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full PEND flow
@@ -649,7 +650,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full flow
@@ -729,7 +730,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute transaction through coordinator.execute() which goes through full flow
@@ -801,7 +802,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await applyViaEngine(coordinator, actionsEngine, transaction);
@@ -875,7 +876,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -958,7 +959,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -1039,7 +1040,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -1089,7 +1090,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Engines are pure translators: parsing succeeds, but the missing collection
@@ -1124,7 +1125,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -1217,7 +1218,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(transaction, actionsEngine);
@@ -1284,7 +1285,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute to get operations hash
@@ -1336,7 +1337,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable')
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -1382,7 +1383,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable')
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -1415,7 +1416,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads,
-				hlc, id: await createTransactionId(stamp.id, [], reads, hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable'),
 				priority: MaxPriority
 			};
 
@@ -1469,7 +1470,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await validator.validate(transaction, 'ops:abc');
@@ -1807,7 +1808,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Register the same engine the node already holds (bound to the main coordinator).
@@ -1869,7 +1870,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(transaction, engine);
@@ -1906,7 +1907,7 @@ describe('Transaction', () => {
 			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				hlc, id: await createTransactionId(stamp1.id, statements1, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements1, [], hlc, 'serializable')
 			};
 
 			// Execute and commit tx1
@@ -1920,7 +1921,7 @@ describe('Transaction', () => {
 			const stamp2 = await createTransactionStamp('peer2', Date.now() + 1, 'schema1', 'actions@1.0.0');
 			const tx2: Transaction = {
 				stamp: stamp2, statements: statements2, reads: [],
-				hlc, id: await createTransactionId(stamp2.id, statements2, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp2.id, statements2, [], hlc, 'serializable')
 			};
 
 			// tx2 should encounter the transforms from tx1's committed state
@@ -1964,7 +1965,7 @@ describe('Transaction', () => {
 			const userStamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const userTx: Transaction = {
 				stamp: userStamp, statements: userStatements, reads: [],
-				hlc, id: await createTransactionId(userStamp.id, userStatements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(userStamp.id, userStatements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, userTx);
@@ -2000,7 +2001,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			// Execute locally first (this succeeds)
@@ -2049,7 +2050,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -2098,7 +2099,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -2171,7 +2172,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -2238,7 +2239,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -2305,7 +2306,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -2376,11 +2377,11 @@ describe('Transaction', () => {
 
 			const tx1: Transaction = {
 				stamp: stamp1, statements, reads: [],
-				hlc, id: await createTransactionId(stamp1.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements, [], hlc, 'serializable')
 			};
 			const tx2: Transaction = {
 				stamp: stamp2, statements, reads: [],
-				hlc, id: await createTransactionId(stamp2.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp2.id, statements, [], hlc, 'serializable')
 			};
 
 			const result1 = await coordinator1.execute(tx1, engine1);
@@ -2416,7 +2417,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -2472,7 +2473,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await coordinator.execute(transaction, actionsEngine);
@@ -2779,7 +2780,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: txBReads,
-				hlc, id: await createTransactionId(stamp.id, [], txBReads, hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], txBReads, hlc, 'serializable'),
 			};
 
 			const result = await validator.validate(txB, `ops:${await hashString(JSON.stringify([]))}`);
@@ -2829,7 +2830,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads,
-				hlc, id: await createTransactionId(stamp.id, [], reads, hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable'),
 			};
 
 			const expectedHash = await hashOperations([]);
@@ -2879,7 +2880,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads,
-				hlc, id: await createTransactionId(stamp.id, [], reads, hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable'),
 			};
 
 			const expectedHash = await hashOperations([]);
@@ -2908,7 +2909,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 			};
 
 			const expectedHash = await hashOperations([]);
@@ -2934,7 +2935,7 @@ describe('Transaction', () => {
 
 		async function makeEmptyTx(): Promise<Transaction> {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
-			return { stamp, statements: [], reads: [], hlc, id: await createTransactionId(stamp.id, [], [], hlc) };
+			return { stamp, statements: [], reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable') };
 		}
 
 		it('reports a plain content mismatch when the sender token is the local version but the bytes differ', async () => {
@@ -3038,7 +3039,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -3097,7 +3098,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -3169,7 +3170,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable')
 			};
 
 			await applyViaEngine(coordinator, actionsEngine, tx);
@@ -3214,7 +3215,7 @@ describe('Transaction', () => {
 			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				hlc, id: await createTransactionId(stamp1.id, statements1, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements1, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(tx1, actionsEngine);
@@ -3248,7 +3249,7 @@ describe('Transaction', () => {
 			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				hlc, id: await createTransactionId(stamp1.id, statements1, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements1, [], hlc, 'serializable')
 			};
 
 			const result = await coordinator.execute(tx1, actionsEngine);
@@ -3286,7 +3287,7 @@ describe('Transaction', () => {
 			const stamp1 = await createTransactionStamp('peer1', Date.now(), 'schema1', 'actions@1.0.0');
 			const tx1: Transaction = {
 				stamp: stamp1, statements: statements1, reads: [],
-				hlc, id: await createTransactionId(stamp1.id, statements1, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp1.id, statements1, [], hlc, 'serializable')
 			};
 
 			const result1 = await coordinator.execute(tx1, actionsEngine);
@@ -3300,7 +3301,7 @@ describe('Transaction', () => {
 			const stamp2 = await createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
 			const tx2: Transaction = {
 				stamp: stamp2, statements: statements2, reads: [],
-				hlc, id: await createTransactionId(stamp2.id, statements2, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp2.id, statements2, [], hlc, 'serializable')
 			};
 
 			// FIX VERIFIED: actionContext is updated after tx1, so tx2 computes rev=2.
@@ -3406,7 +3407,7 @@ describe('Transaction', () => {
 			const stamp2 = await createTransactionStamp('peer1', Date.now() + 1, 'schema1', 'actions@1.0.0');
 			const tx2: Transaction = {
 				stamp: stamp2, statements: statements2, reads: [],
-				hlc, id: await createTransactionId(stamp2.id, statements2, [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp2.id, statements2, [], hlc, 'serializable')
 			};
 
 			const result2 = await coordinator.execute(tx2, actionsEngine);
@@ -3488,8 +3489,8 @@ describe('Transaction', () => {
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			];
 			const stmts = createActionsStatements(actions);
-			const txId1 = await createTransactionId(stamp1.id, stmts, [], hlc);
-			const txId2 = await createTransactionId(stamp2.id, stmts, [], hlc);
+			const txId1 = await createTransactionId(stamp1.id, stmts, [], hlc, 'serializable');
+			const txId2 = await createTransactionId(stamp2.id, stmts, [], hlc, 'serializable');
 
 			expect(txId1, 'independent same-input transactions now get distinct ids').to.not.equal(txId2);
 		});
@@ -3509,8 +3510,8 @@ describe('Transaction', () => {
 			const stmts = createActionsStatements([
 				{ collectionId: 'users', actions: [{ type: 'replace', data: [[1, { key: 1, name: 'Alice' }]] }] }
 			]);
-			const txId1 = await createTransactionId(stamp1.id, stmts, [], hlc);
-			const txId2 = await createTransactionId(stamp2.id, stmts, [], hlc);
+			const txId1 = await createTransactionId(stamp1.id, stmts, [], hlc, 'serializable');
+			const txId2 = await createTransactionId(stamp2.id, stmts, [], hlc, 'serializable');
 			expect(txId1, '1ms difference → fully divergent transaction IDs').to.not.equal(txId2);
 		});
 
@@ -3605,7 +3606,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable')
 			};
 
 			const engines = new Map<string, EngineRegistration>();
@@ -3712,7 +3713,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable')
 			};
 
 			// maxAttempts:1 so the always-losing commit surfaces its terminal error immediately
@@ -4058,7 +4059,7 @@ describe('Transaction', () => {
 			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
 				const statements = createActionsStatements(actions);
 				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
-				return { stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc) };
+				return { stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable') };
 			};
 
 			// PRIOR committed state on the winner is what makes the read-cache assertion below bite:
@@ -4149,7 +4150,7 @@ describe('Transaction', () => {
 			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
 				const statements = createActionsStatements(actions);
 				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
-				return { stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc) };
+				return { stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable') };
 			};
 
 			// Same shape as the case above: a PRIOR users-only commit gives the winner durable state,
@@ -4219,7 +4220,7 @@ describe('Transaction', () => {
 			const buildTransaction = async (actions: CollectionActions[]): Promise<Transaction> => {
 				const statements = createActionsStatements(actions);
 				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
-				return { stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc) };
+				return { stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable') };
 			};
 
 			const transaction = await buildTransaction([
@@ -4280,7 +4281,7 @@ describe('Transaction', () => {
 			]);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
-				stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			const prePosts = postsCollection.snapshotPending();
@@ -4325,7 +4326,7 @@ describe('Transaction', () => {
 			]);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
-				stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			const preUsers = usersCollection.snapshotPending();
@@ -4377,7 +4378,7 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 
 			// Stage the actions (mirrors a session), then drive commit() directly.
@@ -4501,7 +4502,7 @@ describe('Transaction', () => {
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
 				stamp, statements, reads: [],
-				hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 			await coordinator.applyActions(actions, stamp.id);
 			return { coordinator, usersTree, postsTree, transaction, extras };
@@ -4675,7 +4676,7 @@ describe('Transaction', () => {
 			const statements = createActionsStatements(actions);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
-				stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 			await coordinator.applyActions(actions, stamp.id);
 
@@ -4705,7 +4706,7 @@ describe('Transaction', () => {
 			const statements = createActionsStatements(actions);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
-				stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 			await coordinator.applyActions(actions, stamp.id);
 
@@ -4738,7 +4739,7 @@ describe('Transaction', () => {
 			const statements = createActionsStatements(actions);
 			const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 			const transaction: Transaction = {
-				stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+				stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 			};
 			await coordinator.applyActions(actions, stamp.id);
 
@@ -5032,12 +5033,13 @@ describe('Transaction', () => {
 			expect(await logActions(usersTree.getCollection()), 'users committed once').to.have.lengthOf(1);
 		});
 
-		// filterConflict is the OTHER half of the rebase: the block-level conflict path above always
-		// replays every pending action verbatim, because Tree supplies no filterConflict hook (nothing
-		// in src/ sets one). These cases build a raw Collection with a recording hook and drive the
-		// same real-rival interception through a coordinator retry, so the hook's three answers —
-		// keep, replace, discard — are each proven to decide what actually commits.
-		describe('filterConflict during a coordinator retry', () => {
+		// The merge declaration's filterConflict hook is the OTHER half of the rebase: the block-level
+		// conflict path above always replays every pending action verbatim, because Tree declares no
+		// merge (nothing in src/ installs a hook). These cases build a raw Collection declaring every
+		// action convergent — the hook is offered only convergent actions — with a recording hook, and
+		// drive the same real-rival interception through a coordinator retry, so the hook's three
+		// answers — keep, replace, discard — are each proven to decide what actually commits.
+		describe('merge.filterConflict during a coordinator retry', () => {
 			type ConflictAction = { value: string };
 			const conflictCollectionId = 'conflicts';
 
@@ -5049,13 +5051,13 @@ describe('Transaction', () => {
 				},
 			};
 			const conflictInit = (
-				filterConflict?: CollectionInitOptions<ConflictAction>['filterConflict'],
+				filterConflict?: ConvergentMerge<ConflictAction>['filterConflict'],
 			): CollectionInitOptions<ConflictAction> => ({
 				modules: conflictHandlers,
 				createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => ({
 					header: store.createBlockHeader('TEST', id),
 				}),
-				...(filterConflict ? { filterConflict } : {}),
+				...(filterConflict ? { merge: { laneOf: () => 'convergent' as const, filterConflict } } : {}),
 			});
 
 			/** A second Collection over the same id, committing 'rival' through the single-collection
@@ -5067,11 +5069,11 @@ describe('Transaction', () => {
 				await rival.updateAndSync();
 			};
 
-			/** Stage one 'local' action into a filterConflict-bearing collection registered in a
+			/** Stage one 'local' action into a merge-declaring collection registered in a
 			 *  coordinator, with a real rival armed to fire on its pend. Single collection, so the
 			 *  default first-pend trigger is unambiguous. */
 			async function makeConflictSetup(
-				filterConflict: CollectionInitOptions<ConflictAction>['filterConflict'],
+				filterConflict: ConvergentMerge<ConflictAction>['filterConflict'],
 			) {
 				const inner = new TestTransactor();
 				const transactor = new CompetingWriterTransactor(inner, rivalCollectionWrite);
@@ -5085,7 +5087,7 @@ describe('Transaction', () => {
 				const statements = createActionsStatements(actions);
 				const stamp = await createTransactionStamp('peer1', Date.now(), 'schema1', ACTIONS_ENGINE_ID);
 				const transaction: Transaction = {
-					stamp, statements, reads: [], hlc, id: await createTransactionId(stamp.id, statements, [], hlc),
+					stamp, statements, reads: [], hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 				};
 				await coordinator.applyActions(actions, stamp.id);
 				return { inner, transactor, collection, coordinator, transaction };
@@ -5183,10 +5185,10 @@ describe('Transaction', () => {
 				stamp,
 				statements,
 				reads,
-				hlc, id: await createTransactionId(stamp.id, statements, reads, hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, statements, reads, hlc, 'serializable')
 			};
 			// Default: sign as the stamp's own peer. `signWith` overrides to forge a mismatch.
-			const payload = clientSignaturePayload(stamp.id, statements, reads, hlc);
+			const payload = clientSignaturePayload(stamp.id, statements, reads, hlc, 'serializable');
 			transaction.signature = await fakeSign(opts.signWith ?? peerId)(payload);
 			return transaction;
 		}
@@ -5263,8 +5265,8 @@ describe('Transaction', () => {
 				{ blockId: 'block-2', revision: 1 },
 				{ blockId: 'block-1', revision: 5 }
 			];
-			const payloadA = clientSignaturePayload('stamp:x', ['stmt'], readsA, hlc);
-			const payloadB = clientSignaturePayload('stamp:x', ['stmt'], readsB, hlc);
+			const payloadA = clientSignaturePayload('stamp:x', ['stmt'], readsA, hlc, 'serializable');
+			const payloadB = clientSignaturePayload('stamp:x', ['stmt'], readsB, hlc, 'serializable');
 			expect(new TextDecoder().decode(payloadA)).to.equal(new TextDecoder().decode(payloadB));
 			expect(new TextDecoder().decode(payloadA)).to.include(CLIENT_SIG_VERSION);
 
@@ -5280,8 +5282,8 @@ describe('Transaction', () => {
 			expect(stamp1.nonce).to.not.equal(stamp2.nonce);
 			expect(stamp1.id).to.not.equal(stamp2.id);
 			// Identical statements + no reads still yield different tx ids (anti-replay).
-			const id1 = await createTransactionId(stamp1.id, ['stmt'], [], hlc);
-			const id2 = await createTransactionId(stamp2.id, ['stmt'], [], hlc);
+			const id1 = await createTransactionId(stamp1.id, ['stmt'], [], hlc, 'serializable');
+			const id2 = await createTransactionId(stamp2.id, ['stmt'], [], hlc, 'serializable');
 			expect(id1).to.not.equal(id2);
 		});
 
@@ -5316,7 +5318,7 @@ describe('Transaction', () => {
 			// Signer ran: each committed transaction carries a signature that verifies.
 			for (const tx of committed) {
 				expect(tx.signature, 'signer stamped a signature').to.be.a('string');
-				const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc);
+				const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc, tx.lane);
 				expect(fakeVerify(tx.stamp.peerId, payload, tx.signature!)).to.be.true;
 			}
 			// Nonce anti-replay: same peer, same statement, no reads → different ids.
@@ -5384,7 +5386,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc)
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable')
 			};
 			// No signature, no verifier port → the signature step is skipped entirely.
 			const validator = makeValidator(undefined);
@@ -5399,7 +5401,7 @@ describe('Transaction', () => {
 				stamp,
 				statements: [],
 				reads: [],
-				hlc, id: await createTransactionId(stamp.id, [], [], hlc),
+				hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], [], hlc, 'serializable'),
 				signature: 'totally-bogus'
 			};
 			const validator = makeValidator(fakeVerify);
@@ -5418,7 +5420,7 @@ describe('Transaction', () => {
 			const roundTripped = JSON.parse(JSON.stringify(tx)) as Transaction;
 			expect(roundTripped.signature).to.equal(tx.signature);
 			// The round-tripped copy still verifies, so a later recovery path can re-check it.
-			const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads, hlc);
+			const payload = clientSignaturePayload(roundTripped.stamp.id, roundTripped.statements, roundTripped.reads, hlc, 'serializable');
 			expect(fakeVerify(roundTripped.stamp.peerId, payload, roundTripped.signature!)).to.be.true;
 		});
 

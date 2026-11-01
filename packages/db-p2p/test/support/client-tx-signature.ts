@@ -114,7 +114,8 @@ export async function buildUnsignedTx(
 		statements,
 		reads,
 		hlc,
-		id: await createTransactionId(stamp.id, statements, reads, hlc),
+		lane: 'serializable',
+		id: await createTransactionId(stamp.id, statements, reads, hlc, 'serializable'),
 	};
 }
 
@@ -128,7 +129,7 @@ export async function buildSignedTx(
 	opts: BuildTxOptions = {}
 ): Promise<Transaction> {
 	const tx = await buildUnsignedTx(stampPeerId, opts);
-	const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc);
+	const payload = clientSignaturePayload(tx.stamp.id, tx.statements, tx.reads, tx.hlc, tx.lane);
 	tx.signature = await makeSigner(signKey)(payload);
 	return tx;
 }

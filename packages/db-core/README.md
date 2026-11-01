@@ -272,10 +272,14 @@ class CounterCollection {
           // Custom increment logic
         }
       },
-      filterConflict: (local, remote) => {
-        // Merge conflicting increments
-        const remoteSum = remote.reduce((sum, r) => sum + r.data.value, 0);
-        return { ...local, data: { ...local.data, value: local.data.value + remoteSum }};
+      // Increments merge, so the collection declares them convergent and says how to rebase one
+      merge: {
+        laneOf: () => 'convergent',
+        filterConflict: (local, remote) => {
+          // Merge conflicting increments
+          const remoteSum = remote.reduce((sum, r) => sum + r.data.value, 0);
+          return { ...local, data: { ...local.data, value: local.data.value + remoteSum }};
+        }
       }
     };
     

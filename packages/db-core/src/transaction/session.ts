@@ -88,13 +88,14 @@ export class TransactionSession {
 				actionsToApply = actions;
 			} else {
 				// Create a temporary transaction with just this statement for translation
-				// Temporary, for translation only: neither the id nor the HLC is ever read, since the
-				// engine translates statements here and commits nothing.
+				// Temporary, for translation only: neither the id, the HLC nor the lane is ever read,
+				// since the engine translates statements here and commits nothing.
 				const tempTransaction: Transaction = {
 					stamp: this.stamp,
 					statements: [statement],
 					reads: [],
 					hlc: this.coordinator.clock.now(),
+					lane: 'serializable',
 					id: 'temp'
 				};
 				const result = await this.engine.execute(tempTransaction);
@@ -146,6 +147,9 @@ export class TransactionSession {
 		// transaction observed (see Transaction.hlc), and once per transaction: the coordinator's
 		// retries re-send this same object.
 		const hlc = this.coordinator.clock.now();
+		// The lane is the caller's classification of the whole transaction (`SyncOptions.lane`, one
+		// lane over every participant), and `serializable` for an engine that declared nothing.
+		const lane = options?.lane ?? 'serializable';
 
 		// Create the complete transaction
 		const transaction: Transaction = {
@@ -153,16 +157,17 @@ export class TransactionSession {
 			statements: this.statements,
 			reads,
 			hlc,
-			id: await createTransactionId(this.stamp.id, this.statements, reads, hlc)
+			lane,
+			id: await createTransactionId(this.stamp.id, this.statements, reads, hlc, lane)
 		};
 
-		// Sign the canonical client-signature payload if a signer was supplied. The
-		// payload covers stamp.id + statements + reads + hlc, which are all final now. A signer failure
+		// Sign the canonical client-signature payload if a signer was supplied. The payload covers
+		// stamp.id + statements + reads + hlc + lane, which are all final now. A signer failure
 		// (e.g. a wrong-key-type libp2p sign) is caught and surfaced as a clean commit failure BEFORE
 		// coordinator.commit runs — the transaction object is local and discarded, so a failed sign can
 		// never leak a partially-built unsigned transaction into consensus.
 		if (this.signer) {
-			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads, hlc);
+			const payload = clientSignaturePayload(this.stamp.id, this.statements, reads, hlc, lane);
 			try {
 				transaction.signature = await this.signer(payload);
 			} catch (error) {

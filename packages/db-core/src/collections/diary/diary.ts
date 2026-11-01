@@ -15,7 +15,11 @@ function diaryInit<TEntry>(): CollectionInitOptions<TEntry> {
 		},
 		createHeaderBlock: (id: BlockId, store: BlockStore<IBlock>) => ({
 			header: store.createBlockHeader(DiaryHeaderBlockType, id)
-		})
+		}),
+		// Append-only is the first natural convergent case: two machines' concurrent appends merge as
+		// their union (docs/partition-healing.md §I-Confluence Classification). The handler touches no
+		// block, so there is nothing to rebase and no `filterConflict`.
+		merge: { laneOf: () => 'convergent' },
 	};
 }
 

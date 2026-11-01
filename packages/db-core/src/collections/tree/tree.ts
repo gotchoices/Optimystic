@@ -186,9 +186,14 @@ interface BTreeHolder<TKey, TEntry> {
 }
 
 /** The collection options a tree's opener may set — the ones that are not the tree's own to
- * decide. Today that is the sealed-segment refusal callback the offline-sync queue installs
- * (see {@link CollectionInitOptions.onSealedRefused}). */
-export type TreeCollectionOptions = Pick<CollectionInitOptions<unknown>, 'onSealedRefused'>;
+ * decide: the sealed-segment refusal callback the offline-sync queue installs (see
+ * {@link CollectionInitOptions.onSealedRefused}), and the convergent-lane merge declaration
+ * ({@link CollectionInitOptions.merge}), which a raw tree user may make. `Tree` itself declares none:
+ * a tree is strong unless its opener says otherwise, and the SQL table over a tree never declares
+ * one here, because it classifies per statement and passes the lane on each write
+ * (`SyncOptions.lane`). */
+export type TreeCollectionOptions<TKey = unknown, TEntry = unknown> =
+	Pick<CollectionInitOptions<TreeReplaceAction<TKey, TEntry>>, 'onSealedRefused' | 'merge'>;
 
 export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 
@@ -213,7 +218,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		/** See {@link Tree.createOrOpen}'s `nodeCapacity`. */
 		nodeCapacity?: number,
 		/** See {@link Tree.createOrOpen}'s `options`. */
-		options?: TreeCollectionOptions,
+		options?: TreeCollectionOptions<TKey, TEntry>,
 	): Promise<Tree<TKey, TEntry> | undefined> {
 		const held: BTreeHolder<TKey, TEntry> = {};
 		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
@@ -239,8 +244,9 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		 *  the header and read it back on reopen rather than trusting the caller to re-supply it. */
 		nodeCapacity?: number,
 		/** Collection options the opener sets rather than the tree: the sealed-segment refusal
-		 *  callback (see {@link TreeCollectionOptions}). Omit for a tree nothing seals. */
-		options?: TreeCollectionOptions,
+		 *  callback and the merge declaration (see {@link TreeCollectionOptions}). Omit for a strong
+		 *  tree nothing seals. */
+		options?: TreeCollectionOptions<TKey, TEntry>,
 	): Promise<Tree<TKey, TEntry>> {
 		const held: BTreeHolder<TKey, TEntry> = {};
 		const init = Tree.buildInit(id, keyFromEntry, compare, nodeCapacity, held, options);
@@ -256,7 +262,7 @@ export class Tree<TKey, TEntry> implements TreeReadView<TKey, TEntry> {
 		compare: (a: TKey, b: TKey) => number,
 		nodeCapacity: number | undefined,
 		held: BTreeHolder<TKey, TEntry>,
-		options: TreeCollectionOptions | undefined,
+		options: TreeCollectionOptions<TKey, TEntry> | undefined,
 	): CollectionInitOptions<TreeReplaceAction<TKey, TEntry>> {
 		return {
 			...options,

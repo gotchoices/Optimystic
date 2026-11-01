@@ -4,6 +4,7 @@ import type { BlockId } from "../blocks/index.js";
 import type { CollectionId } from "../collection/index.js";
 import type { TransactionDurability } from "./durability.js";
 import type { Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 import { hashString } from "../utility/hash-string.js";
 
 /**
@@ -79,14 +80,31 @@ export type Transaction = {
 	 */
 	hlc: Hlc;
 
-	/** Transaction identifier (hash of stamp.id + statements + reads + hlc)
+	/**
+	 * The transaction's lane (`Lane` in `packages/db-core/src/lane/lane.ts`): whether its conflicts
+	 * with other machines' concurrent writes are the quorum's to decide (`serializable`) or may be
+	 * merged later under each collection's declaration (`convergent`). ONE lane for every
+	 * participant: a transaction over several collections takes the stricter of its parts, decided by
+	 * the caller before the transaction is built (`TransactionSession.commit` takes it from
+	 * `SyncOptions.lane`, `serializable` when the engine declared nothing), and stamped on every
+	 * participant's log entry (`ActionEntry.lane`, through `WriteContext.lane`) and on every pend and
+	 * commit of it. Folded into {@link id} and into the client signature
+	 * ({@link clientSignaturePayload}), so a relaying peer cannot alter it. Nothing admits by it yet.
+	 *
+	 * Required of every transaction this build builds; a validator meeting one from an older build
+	 * on the wire tolerates its absence at that one ingress as `serializable`
+	 * (`TransactionValidator.validate`), every write then having been serializable.
+	 */
+	lane: Lane;
+
+	/** Transaction identifier (hash of stamp.id + statements + reads + hlc + lane)
 	 * Final transaction identity, used in logs
 	 */
 	id: string;
 
 	/**
 	 * Optional client signature (base64url) over {@link clientSignaturePayload}
-	 * `(stamp.id, statements, reads, hlc)`, produced at commit by an injected
+	 * `(stamp.id, statements, reads, hlc, lane)`, produced at commit by an injected
 	 * {@link TransactionSigner}.
 	 *
 	 * A node that wires a {@link ClientSignatureVerifier} into its
@@ -243,9 +261,9 @@ export async function createTransactionStamp(
 }
 
 /**
- * Create a transaction id from stamp id, statements, reads and the transaction's HLC.
+ * Create a transaction id from stamp id, statements, reads, the transaction's HLC and its lane.
  * This is the final transaction identity used in logs, and the action id the log records, so two
- * transactions that differ only in when they committed differ in id.
+ * transactions that differ only in when they committed, or in the lane they claim, differ in id.
  *
  * NOTE: reads are serialized in their given order here (non-canonical). This differs
  * from {@link clientSignaturePayload}, which canonicalises reads before hashing. That is
@@ -254,16 +272,17 @@ export async function createTransactionStamp(
  * design-consensus-hygiene-notes), NOT fixed here to avoid changing existing tx ids.
  *
  * NOTE: {@link Transaction.priority} is deliberately absent from this preimage — the id is a pure
- * function of `(stampId, statements, reads, hlc)`, so two retry attempts that differ only in aged
- * priority produce the SAME id. Do not add priority here.
+ * function of `(stampId, statements, reads, hlc, lane)`, so two retry attempts that differ only in
+ * aged priority produce the SAME id. Do not add priority here.
  */
 export async function createTransactionId(
 	stampId: string,
 	statements: string[],
 	reads: ReadDependency[],
-	hlc: Hlc
+	hlc: Hlc,
+	lane: Lane
 ): Promise<string> {
-	const txData = JSON.stringify({ stampId, statements, reads, hlc: canonicalHlc(hlc) });
+	const txData = JSON.stringify({ stampId, statements, reads, hlc: canonicalHlc(hlc), lane });
 	return `tx:${await hashString(txData)}`;
 }
 
@@ -272,26 +291,29 @@ export async function createTransactionId(
  * without ambiguity. Distinct from (but consistent in spirit with) the operations-hash
  * canonical form — this covers transaction INPUTS, not operations.
  *
- * `v2` added the transaction's HLC to the signed bytes. Mixed-version cost: a writer on a `v1`
- * build signs the old payload, and a verifier on this build reports `Invalid client signature`
- * against it. Accepted on the precedent the validity marker set (docs/internals.md, *A reject that
- * judges the transaction itself wrong*), because no deployment wires a `ClientSignatureVerifier`
- * today (backlog `feat-no-deployment-validates-transactions-at-pend`), and because the question
- * "can a relaying peer alter the HLC" is best settled while nothing verifies.
+ * `v2` added the transaction's HLC to the signed bytes, and `v3` its lane. Mixed-version cost, the
+ * same for both bumps: a writer on an earlier build signs the old payload, and a verifier on this
+ * build reports `Invalid client signature` against it. Accepted on the precedent the validity marker
+ * set (docs/internals.md, *A reject that judges the transaction itself wrong*), because no deployment
+ * wires a `ClientSignatureVerifier` today (backlog `feat-no-deployment-validates-transactions-at-pend`),
+ * and because the question "can a relaying peer alter the HLC, or the lane a write claims" is best
+ * settled while nothing verifies.
  */
-export const CLIENT_SIG_VERSION = 'txsig:v2';
+export const CLIENT_SIG_VERSION = 'txsig:v3';
 
 /**
  * Canonical bytes a client signs and a node verifies. Deterministic: reads are sorted
  * (blockId, then revision); statements keep their sequential order; the HLC's three fields are
- * written in a fixed order.
+ * written in a fixed order; the lane is one of two literal strings.
  *
- * Binds four things at once: the CLIENT IDENTITY (via `stampId`, which hashes peerId +
+ * Binds five things at once: the CLIENT IDENTITY (via `stampId`, which hashes peerId +
  * nonce), the EXACT statements, the OCC read set (blockId + revision — "tail
- * binding" for anti-replay), and the transaction's HLC, which validators order by in a later
- * stage and a relaying peer must therefore not be able to alter. Both signer and verifier derive
- * the bytes from `transaction.stamp.id` + `transaction.statements` + `transaction.reads` +
- * `transaction.hlc` through this one function, so they reproduce identical bytes regardless of
+ * binding" for anti-replay), the transaction's HLC, which validators order by in a later
+ * stage and a relaying peer must therefore not be able to alter, and the lane the writer claims,
+ * which a member checks against the collections' declarations in a later stage and a relaying peer
+ * must not be able to loosen. Both signer and verifier derive the bytes from
+ * `transaction.stamp.id` + `transaction.statements` + `transaction.reads` + `transaction.hlc` +
+ * `transaction.lane` through this one function, so they reproduce identical bytes regardless of
  * read ordering.
  *
  * NOTE: {@link Transaction.priority} is deliberately absent from the signed bytes — a retry that
@@ -302,13 +324,14 @@ export function clientSignaturePayload(
 	stampId: string,
 	statements: readonly string[],
 	reads: readonly ReadDependency[],
-	hlc: Hlc
+	hlc: Hlc,
+	lane: Lane
 ): Uint8Array {
 	const canonicalReads = [...reads].sort(
 		(a, b) => a.blockId < b.blockId ? -1 : a.blockId > b.blockId ? 1
 			: a.revision - b.revision
 	);
-	const body = JSON.stringify({ stampId, statements, reads: canonicalReads, hlc: canonicalHlc(hlc) });
+	const body = JSON.stringify({ stampId, statements, reads: canonicalReads, hlc: canonicalHlc(hlc), lane });
 	return new TextEncoder().encode(`${CLIENT_SIG_VERSION}:${body}`);
 }
 

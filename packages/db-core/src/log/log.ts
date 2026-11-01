@@ -8,6 +8,7 @@ import { LogDataBlockType, LogHeaderBlockType, hlcOf } from "./struct.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
 import { maxHlc, type Hlc } from '../hlc/hlc.js';
+import type { Lane } from '../lane/lane.js';
 import { BLOCK_TARGET_BYTES } from '../network/block-size.js';
 
 export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
@@ -71,6 +72,10 @@ export type EntryTimes = {
  *  optional fields an action entry alone carries. An options object rather than positional
  *  parameters because a caller that needs only the times should not have to spell out the rest. */
 export type AddActionsOptions = EntryTimes & {
+	/** The write's lane (`ActionEntry.lane`), minted once per write by the same rule as the times
+	 *  above and re-sent verbatim by every retry. No default: the lane is the write's, decided by the
+	 *  caller's classification or the collection's declaration, and an append has none of its own. */
+	lane: Lane;
 	/** Every collection participating in the action this entry records. */
 	collectionIds?: CollectionId[];
 	/** The transaction's `(blockId, revision)` read set, persisted on the entry so the invalidation
@@ -127,10 +132,10 @@ export class Log<TAction> {
 	 * take its own.
 	 */
 	async addActions(actions: TAction[], actionId: ActionId, rev: number, getBlockIds: () => BlockId[], options: AddActionsOptions) {
-		const { collectionIds = [], reads, hlc, timestamp = Date.now() } = options;
+		const { collectionIds = [], reads, hlc, lane, timestamp = Date.now() } = options;
 		const action = reads !== undefined
-			? { actionId, actions, blockIds: [], collectionIds, reads }
-			: { actionId, actions, blockIds: [], collectionIds };
+			? { actionId, actions, blockIds: [], collectionIds, lane, reads }
+			: { actionId, actions, blockIds: [], collectionIds, lane };
 		const entry = { timestamp, hlc, rev, action } as LogEntry<TAction>;
 		const tailPath = await this.chain.add(entry);
 		const entryWithBlockIds = { ...entry, action: { ...entry.action!, blockIds: getBlockIds() } };

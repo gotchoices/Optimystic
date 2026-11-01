@@ -580,7 +580,7 @@ To support multi-collection transactions, we introduce a clear hierarchy:
 Transactions have two distinct identifiers:
 
 - **Transaction Stamp ID** (`stamp.id`): Created at transaction BEGIN, remains stable throughout the transaction lifecycle. This is a hash of the six stamp fields (peer ID, timestamp, schema hash, engine ID, expiration, nonce), computed by `computeStampId`. Exposed to users via `StampId()` UDF. A validating node re-derives this hash and rejects the transaction (`Tampered transaction stamp`) if `stamp.id` does not match the fields — so a captured signed transaction cannot have a stamp field (e.g. `expiration`) mutated while holding `stamp.id`/`signature` constant.
-- **Transaction ID** (`transaction.id`): Computed at COMMIT as a hash of the stamp.id + statements + reads. This is the final, immutable transaction identity used in logs and block references.
+- **Transaction ID** (`transaction.id`): Computed at COMMIT as a hash of the stamp.id + statements + reads + hlc + lane. This is the final, immutable transaction identity used in logs and block references.
 
 ## Current Architecture (Single-Collection)
 
@@ -652,7 +652,13 @@ type Transaction = {
   // on every participant's log entry; observational today (the revision stays the order).
   hlc: Hlc;
 
-  // Transaction identifier used in logs (hash of stamp.id + statements + reads + hlc)
+  // The transaction's lane: `serializable` (the cohort must agree; the revision order decides every
+  // conflict) or `convergent` (may be committed alone and merged later). One lane for every participant,
+  // the stricter of its parts, decided by the caller before the transaction is built (crdt-sync.md
+  // §Stage 5). Folded into the id and the client signature; nothing admits by it yet.
+  lane: Lane;
+
+  // Transaction identifier used in logs (hash of stamp.id + statements + reads + hlc + lane)
   id: string;
 };
 
@@ -893,11 +899,11 @@ A pre-PEND sync — sometimes called the *Phase 0* optimization — is optional 
 
 1. **Pull new log entries.** Read each affected collection's log tail forward from the client's last known revision.
 2. **Replay new transactions locally.** Starting from the unmodified cached blocks, apply the fetched log entries in order. Capture the resulting changes in fresh block copies — these represent "the world as of now," independent of the client's own pending actions.
-3. **Detect conflicts.** Compare incoming actions against the client's pending actions using the collection's `filterConflict` policy. Drop, merge, or preserve local actions per the policy.
+3. **Detect conflicts.** Compare incoming actions against the client's pending actions under the collection's merge declaration (`CollectionInitOptions.merge`). A convergent action is offered the declaration's `filterConflict` hook, the convergent lane's conflict rule, which drops, merges or preserves it; a serializable action is preserved as-is, its guards re-deciding on replay.
 4. **Replay local actions on top.** Re-apply the surviving local actions to the updated blocks, producing a new set of transforms against current revisions.
 5. **Retry PEND.** Submit the newly computed transforms.
 
-The net effect is a client-side optimistic concurrency loop: the collection acts as a local working copy, the network is the source of truth, and conflicts are reconciled through deterministic replay plus an explicit `filterConflict` policy. The in-process data flow (Tracker / CacheSource / TransactorSource) that implements this is summarized in [internals.md](internals.md#data-flow); the `Collection.updateAndSync()` entry point drives the whole loop.
+The net effect is a client-side optimistic concurrency loop: the collection acts as a local working copy, the network is the source of truth, and conflicts are reconciled through deterministic replay plus the collection's merge declaration. The in-process data flow (Tracker / CacheSource / TransactorSource) that implements this is summarized in [internals.md](internals.md#data-flow); the `Collection.updateAndSync()` entry point drives the whole loop.
 
 ## Read Consistency and Staleness
 
@@ -1052,7 +1058,13 @@ export type Transaction = {
   // Read dependencies for optimistic concurrency control
   reads: ReadDependency[];
 
-  // Transaction identifier (hash of stamp.id + statements + reads)
+  // Hybrid logical clock value, minted at COMMIT after the read set is final
+  hlc: Hlc;
+
+  // The lane the write claims, serializable or convergent (see "Transaction Structure" above)
+  lane: Lane;
+
+  // Transaction identifier (hash of stamp.id + statements + reads + hlc + lane)
   // This is the final transaction identity used in logs and block references
   id: string;
 };
@@ -1342,14 +1354,17 @@ export class TransactionSession {
       return { success: false, error: 'Transaction already rolled back' };
     }
 
-    // Create the complete transaction. The HLC is minted here, after the reads are final.
+    // Create the complete transaction. The HLC is minted here, after the reads are final; the
+    // lane is the caller's (`SyncOptions.lane`), `serializable` when it gave none.
     const hlc = clockOf(this.transactor).now();
+    const lane = options?.lane ?? 'serializable';
     const transaction: Transaction = {
       stamp: this.stamp,
       statements: this.statements,
       reads: [], // TODO: Track reads during statement execution
       hlc,
-      id: createTransactionId(this.stamp.id, this.statements, [], hlc)
+      lane,
+      id: createTransactionId(this.stamp.id, this.statements, [], hlc, lane)
     };
 
     // Commit through coordinator (which will orchestrate PEND/COMMIT)
@@ -1808,7 +1823,7 @@ The **operations hash** is the fingerprint a coordinator sends in
 `PendRequest.operationsHash` and every validator independently recomputes and
 compares to agree that a transaction's operations match. It is recomputed fresh
 on both sides and is **never persisted** — distinct from `transaction.id`
-(`createTransactionId`, a hash of `stamp.id + statements + reads + hlc`) which IS
+(`createTransactionId`, a hash of `stamp.id + statements + reads + hlc + lane`) which IS
 written into logs and block references. Because the ops-hash is not in history,
 changing its format cannot retroactively invalidate committed transactions.
 

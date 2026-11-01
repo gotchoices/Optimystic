@@ -117,7 +117,7 @@ function coordinatorOver(transactor: ITransactor, ...trees: Tree<number, Entry>[
 
 /** Entry `E1` under action `A1`, over `collectionIds`. */
 function entryOver(collectionIds: CollectionId[], more: Partial<EntryCommit> = {}): EntryCommit {
-	return { entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, hlc: QUEUED_HLC, collectionIds, ...more };
+	return { entryId: 'E1', actionId: 'A1', timestamp: QUEUED_AT, hlc: QUEUED_HLC, lane: 'serializable', collectionIds, ...more };
 }
 
 /** The keys each committed log entry of `id` replaced, in log order, read through a fresh handle

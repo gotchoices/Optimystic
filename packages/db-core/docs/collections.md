@@ -129,11 +129,11 @@ async update() {
   // 1. Query remote state from our current revision
   const source = new TransactorSource(this.id, this.transactor, undefined);
   const tracker = new Tracker(source);
-  
+
   // 2. Get latest entries from the log since our last update
   const log = await Log.open<Action<TAction>>(tracker, this.id);
   const latest = log ? await log.getFrom(this.source.actionContext?.rev ?? 0) : undefined;
-  
+
   // 3. Process remote actions and detect conflicts
   let anyConflicts = false;
   for (const entry of latest?.entries ?? []) {
@@ -309,44 +309,63 @@ Key aspects of the sync process:
 
 ## Conflict Resolution
 
-When multiple participants modify the same collection concurrently, conflicts arise. Collections handle this through **action filtering** and **state replay**.
+When multiple participants modify the same collection concurrently, conflicts arise. Collections handle this through **action filtering** and **state replay**, under a declaration of which of the collection's actions may be merged at all.
 
-### Conflict Detection and Resolution
+### The merge declaration and the lane
+
+Every write carries a **lane** (`Lane` in `packages/db-core/src/lane/lane.ts`): `serializable`, where the cohort must agree before the write commits and the revision order decides every conflict, or `convergent`, where one machine may commit the write alone and merge it into other machines' concurrent writes later, because the invariants the write is responsible for survive a merge. A collection declares which of its actions are convergent, and how such an action is rebased over a stranger's committed actions, through `CollectionInitOptions.merge` (`ConvergentMerge` in `packages/db-core/src/collection/collection.ts`):
 
 ```typescript
-// Optional conflict filter function
-filterConflict?: (action: Action<TAction>, potential: Action<TAction>[]) => Action<TAction> | undefined
+// Optional: the convergent lane's conflict rule. A collection with no declaration is strong.
+merge?: {
+  laneOf(action: Action<TAction>): Lane;
+  filterConflict?(action: Action<TAction>, committed: Action<TAction>[]): Action<TAction> | undefined;
+}
 ```
+
+- `laneOf` answers the lane of one action when no caller classified the write: a bare `Collection.sync` with no `SyncOptions.lane`, or an offline-queue entry sealed without a classification. The write's lane is the stricter answer over its actions (`Collection.laneOf`): `serializable` if any action is.
+- `filterConflict` is offered only an action whose lane is `convergent`. A serializable action is kept as-is through a refresh, since its guards re-decide on replay; so is every action of a collection with no declaration or no hook. Return the same instance to keep the action, a new instance to apply in its place (re-staged by the conflict replay), or `undefined` to drop it.
+- A caller's classification wins over the declaration (`collection.sync({ lane: 'convergent' })`), and the declaration wins over nothing.
+
+Convergence is a property of the operation, never of the collection, and idempotence is not the criterion: setting a field to a value is idempotent and still needs a tie-break under concurrency, while an increment is not idempotent and merges fine. `Diary` declares append-only convergent; `Tree` declares nothing, and the SQL table over a tree classifies per statement instead. Nothing admits a write by its lane yet, and gating the hook on the lane changes nothing observable, since no collection in this repository installs a hook.
+
+### Conflict Detection and Resolution
 
 The conflict resolution process:
 
 1. **Local pending actions** are compared against **remote actions** from the updated log
-2. **Conflict filter** determines how to handle each conflict:
-   - Return `undefined` to discard the local action
-   - Return the original action to keep it unchanged
-   - Return a modified action to resolve the conflict
+2. **The merge declaration** determines how to handle each conflict: a serializable action is kept unchanged, and a convergent action is offered to `filterConflict`, which answers
+   - `undefined` to discard the local action
+   - the original action to keep it unchanged
+   - a modified action to resolve the conflict
 3. **Action replay** applies the remaining local actions to the updated snapshot
 
 ### Conflict Resolution Strategies
 
 ```typescript
-// Example: Last-writer-wins for updates
-const filterConflict = (local: UpdateAction, remote: UpdateAction[]) => {
-  const hasConflict = remote.some(r => r.data.key === local.data.key);
-  return hasConflict ? undefined : local;  // Discard if remote updated same key
+// Example: Last-writer-wins for updates — convergent, with a tie-break under concurrency
+const merge: ConvergentMerge<UpdateAction> = {
+  laneOf: () => 'convergent',
+  filterConflict: (local, remote) => {
+    const hasConflict = remote.some(r => r.data.key === local.data.key);
+    return hasConflict ? undefined : local;  // Discard if remote updated same key
+  },
 };
 
-// Example: Merge compatible operations
-const filterConflict = (local: IncrementAction, remote: IncrementAction[]) => {
-  const remoteIncrement = remote
-    .filter(r => r.data.key === local.data.key)
-    .reduce((sum, r) => sum + r.data.value, 0);
-  
-  // Adjust local increment to account for remote changes
-  return {
-    ...local,
-    data: { ...local.data, value: local.data.value + remoteIncrement }
-  };
+// Example: Merge compatible operations — an increment commutes with concurrent increments
+const merge: ConvergentMerge<IncrementAction> = {
+  laneOf: () => 'convergent',
+  filterConflict: (local, remote) => {
+    const remoteIncrement = remote
+      .filter(r => r.data.key === local.data.key)
+      .reduce((sum, r) => sum + r.data.value, 0);
+
+    // Adjust local increment to account for remote changes
+    return {
+      ...local,
+      data: { ...local.data, value: local.data.value + remoteIncrement }
+    };
+  },
 };
 ```
 
@@ -607,7 +626,7 @@ const CustomHeaderBlockType = registerBlockType("CUS", "CustomHeaderBlock");
 // 2. Define the collection wrapper
 class CustomCollection<TData> {
   private collection: Collection<CustomAction<TData>>;
-  
+
   static async create<TData>(network: ITransactor, id: CollectionId) {
     const init: CollectionInitOptions<CustomAction<TData>> = {
       modules: {
@@ -618,9 +637,12 @@ class CustomCollection<TData> {
       createHeaderBlock: (id, store) => ({
         header: store.createBlockHeader(CustomHeaderBlockType, id)
       }),
-      filterConflict: (local, remote) => {
-        // Custom conflict resolution
-        return resolveConflict(local, remote);
+      merge: {
+        laneOf: () => 'convergent',
+        filterConflict: (local, remote) => {
+          // Custom conflict resolution
+          return resolveConflict(local, remote);
+        }
       }
     };
     

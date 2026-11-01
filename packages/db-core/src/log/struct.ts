@@ -1,5 +1,6 @@
 import type { BlockId, CollectionId, ActionContext, ActionId, ActionRev, ReadDependency } from "../index.js";
 import { legacyHlc, type Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 
 /** A log entry - an action, a checkpoint, or an invalidation */
 export type LogEntry<TAction> = {
@@ -36,6 +37,20 @@ export type ActionEntry<TAction> = {
 	blockIds: BlockId[]; // NOTE: this is updated after being generated to include the log-related block transforms
 	/** Other collection ids affected by the action - this action is conditional on successful commit in all of these collections */
 	readonly collectionIds?: CollectionId[];
+	/**
+	 * The write's lane (`Lane` in `packages/db-core/src/lane/lane.ts`): whether its conflicts with
+	 * other machines' concurrent writes are decided by the quorum and the revision order
+	 * (`serializable`) or may be merged later under the collection's declaration (`convergent`).
+	 * Minted once per write beside the action id, timestamp and HLC (`WriteIdentity.lane`,
+	 * `Transaction.lane`), and re-sent verbatim by every retry; one lane for every entry of a
+	 * multi-collection write. On the action entry rather than the log entry because a checkpoint has
+	 * no lane and an invalidation reverses an action under the strong rules. Nothing admits by it yet.
+	 *
+	 * Every entry this build writes carries it. A STORED entry written before the field existed lacks
+	 * it (every write then was serializable); read an entry's lane through {@link laneOf}, never off
+	 * the field.
+	 */
+	readonly lane: Lane;
 	/**
 	 * The `(blockId, revision)` reads this transaction observed during execution — the same
 	 * read set the {@link Transaction} carried in its PEND request (see `Transaction.reads`).
@@ -178,6 +193,21 @@ export type CheckpointEntry = {
  */
 export function hlcOf(entry: { readonly timestamp: number; readonly hlc?: Hlc }): Hlc {
 	return entry.hlc ?? legacyHlc(entry.timestamp);
+}
+
+/**
+ * The one reader rule for an action entry's lane: the field when the entry carries one, else
+ * `serializable`, since every write made before the field existed took the quorum lane. The
+ * parameter admits an absent field because a stored entry written before the field existed has
+ * none, whatever {@link ActionEntry} declares about the entries this build writes.
+ *
+ * NOTE: `ActionEntry.lane` is declared required while a stored legacy entry lacks it, so a reader
+ * that takes the field directly compiles and meets `undefined` on such an entry — the same tripwire
+ * `hlcOf` records for `LogEntry.hlc`. Read through here. Splitting the stored and written shapes
+ * into two types was declined for one reader; if a second direct reader ever appears, split then.
+ */
+export function laneOf(entry: { readonly lane?: Lane }): Lane {
+	return entry.lane ?? 'serializable';
 }
 
 export const LogDataBlockType = "LGD";

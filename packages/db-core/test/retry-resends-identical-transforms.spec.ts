@@ -169,7 +169,8 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		const hlc = coordinator.clock.now();
 		const transaction: Transaction = {
 			stamp, statements, reads: [], hlc,
-			id: await createTransactionId(stamp.id, statements, [], hlc),
+			lane: 'serializable',
+			id: await createTransactionId(stamp.id, statements, [], hlc, 'serializable'),
 		};
 		await coordinator.applyActions(actions, stamp.id);
 
@@ -190,7 +191,7 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 		// As the queue would: minted once at enqueue, from the collections' transactor clock.
 		const hlc = clockOf(transactor).now();
 
-		await collection.commitHead('E1', { ...retryFast, actionId: 'queue-attempt-1', timestamp, hlc });
+		await collection.commitHead('E1', { ...retryFast, actionId: 'queue-attempt-1', timestamp, hlc, lane: 'serializable' });
 
 		expectAttemptsIdentical(transactor.attempts);
 		expect(transactor.attempts[0]!.actionId, 'the action id is the one supplied').to.equal('queue-attempt-1');
@@ -210,7 +211,7 @@ describe('Retry: a re-sent write is byte-identical to the attempt it repeats', (
 			new TestTransactor(), 'retry-identical-memory-scope', init());
 		const store = collection.tracker;
 
-		const endMarked = collection.beginInFlightAction('marked');
+		const endMarked = collection.beginInFlightAction('marked', { lane: 'serializable' });
 		try {
 			const mine = collection.logAppendBlockIds(store, 'marked', 1)();
 			expect(collection.logAppendBlockIds(store, 'marked', 1)(),

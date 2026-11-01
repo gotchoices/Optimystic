@@ -1,6 +1,7 @@
 import type { ActionId, AlreadyAppliedTally, CollectionId } from "../index.js";
 import type { ReadDependency, Transaction } from "./transaction.js";
 import type { Hlc } from "../hlc/hlc.js";
+import type { Lane } from "../lane/lane.js";
 import { clampPriority } from "./transaction.js";
 import type { Collection, RefreshReport } from "../collection/collection.js";
 import type { HeadCommitHandle } from "../collection/head-commit.js";
@@ -13,8 +14,9 @@ import { refuseSoloField } from "../network/refuse-solo.js";
 
 /**
  * What the coordinator's phases know about the write they are sending — everything they used to
- * read off a `Transaction`: the action id every pend and commit names, the timestamp and HLC its log
- * entries carry, the reads recorded on them, and the aged retry priority an unvalidated pend carries.
+ * read off a `Transaction`: the action id every pend and commit names, the timestamp, HLC and lane
+ * its log entries carry, the reads recorded on them, and the aged retry priority an unvalidated pend
+ * carries.
  * `commit` and `execute` derive one from their transaction ({@link writeContextOf}); the per-entry
  * commit (`TransactionCoordinator.commitEntry`) builds its own, since a queued entry has no
  * transaction. A `TransactionStamp` is deliberately NOT fabricated for it: a stamp carries a peer id,
@@ -28,6 +30,10 @@ export type WriteContext = {
 	/** Stamped on every log entry of the write (`LogEntry.hlc`) and carried on every pend of it
 	 * (`PendRequest.hlc`): one HLC for every participant, the transaction's own or the queued entry's. */
 	readonly hlc: Hlc;
+	/** Stamped on every log entry of the write (`ActionEntry.lane`) and carried on every pend and
+	 * commit of it (`PendRequest.lane`, `CommitRequest.lane`): one lane for every participant, the
+	 * transaction's own (`Transaction.lane`) or the queued entry's (`EntryCommit.lane`). */
+	readonly lane: Lane;
 	/** Recorded on every log entry of the write (`ActionEntry.reads`). */
 	readonly reads: readonly ReadDependency[];
 	/** Already clamped (`clampPriority`); 0 on a first attempt. */
@@ -40,12 +46,14 @@ export type WriteContext = {
 
 /** The write context of a transaction's attempt, read when the attempt starts: `commitAttempts` ages
  * the transaction's priority between attempts, so it is read per attempt rather than once. `cycle`
- * is what the commit was asked of every send ({@link InFlightCycle}). */
-export function writeContextOf(transaction: Transaction, cycle: InFlightCycle = {}): WriteContext {
+ * is what the commit was asked of every send ({@link InFlightCycle}) beyond the lane, which is the
+ * transaction's own. */
+export function writeContextOf(transaction: Transaction, cycle: Omit<InFlightCycle, 'lane'> = {}): WriteContext {
 	return {
 		actionId: transaction.id as ActionId,
 		timestamp: transaction.stamp.timestamp,
 		hlc: transaction.hlc,
+		lane: transaction.lane,
 		reads: transaction.reads,
 		priority: clampPriority(transaction.priority),
 		...refuseSoloField(cycle.refuseSolo),
@@ -69,6 +77,9 @@ export type EntryCommit = {
 	/** The entry's local commit time as an HLC, minted by the queue at enqueue and re-supplied on every
 	 * drive: every participant's log entry carries it (`WriteIdentity.hlc`). */
 	readonly hlc: Hlc;
+	/** The entry's lane, fixed at enqueue and re-supplied on every drive: one lane for every
+	 * participant's log entry, pend and commit (`WriteIdentity.lane`, `HeadCommitOptions.lane`). */
+	readonly lane: Lane;
 	/** The collections the entry wrote, each of which must hold `entryId` as its HEAD sealed segment. */
 	readonly collectionIds: readonly CollectionId[];
 	/** Attempts an earlier `commitEntry` under this action id recorded through {@link recordAttempt}
@@ -121,10 +132,10 @@ export class EntryParticipants {
 	 * one twice (opening it twice would deadlock on its own latch) or names one `collections` does
 	 * not hold; and closes the handles already opened when a later `openHeadCommit` throws (a
 	 * `SealedSegmentsError` precondition, say), so no latch is left held. Every handle's cycle carries
-	 * `cycle` ({@link InFlightCycle}), so a refresh that finishes a torn attempt re-sends it on the
-	 * same terms the coordinator's own round sends it.
+	 * `cycle` ({@link InFlightCycle}, whose lane is the entry's), so a refresh that finishes a torn
+	 * attempt re-sends it on the same terms the coordinator's own round sends it.
 	 */
-	static async open(collections: ReadonlyMap<CollectionId, Collection<any>>, entry: EntryCommit, cycle: InFlightCycle = {}): Promise<EntryParticipants> {
+	static async open(collections: ReadonlyMap<CollectionId, Collection<any>>, entry: EntryCommit, cycle: Omit<InFlightCycle, 'lane'> = {}): Promise<EntryParticipants> {
 		if (entry.collectionIds.length === 0) {
 			throw new Error(`commitEntry ${entry.entryId}: an entry commit names at least one collection`);
 		}
@@ -145,7 +156,7 @@ export class EntryParticipants {
 			for (const { collectionId, collection } of participants) {
 				const resume = entry.resume?.get(collectionId);
 				handles.set(collectionId, await collection.openHeadCommit(entry.entryId,
-					{ actionId: entry.actionId, timestamp: entry.timestamp, hlc: entry.hlc },
+					{ actionId: entry.actionId, timestamp: entry.timestamp, hlc: entry.hlc, lane: entry.lane },
 					{
 						...cycle,
 						...(resume === undefined ? {} : { resume }),
