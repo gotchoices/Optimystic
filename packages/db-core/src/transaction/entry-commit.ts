@@ -312,8 +312,9 @@ export class EntryParticipants {
 }
 
 /** The latch-acquisition order of `TransactionCoordinator.commitOnce` and `execute`, spelled the
- * same way: a plain string comparison. Change all three together. */
-function compareCollectionIds(a: CollectionId, b: CollectionId): number {
+ * same way: a plain string comparison. Change all three together. Also the order the retry loop's
+ * stall check visits participants in (`RetryBudget.assertNotStalled`), where only determinism matters. */
+export function compareCollectionIds(a: CollectionId, b: CollectionId): number {
 	return a < b ? -1 : a > b ? 1 : 0;
 }
 

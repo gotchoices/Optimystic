@@ -18,7 +18,7 @@ import { DefaultMaxStalledAttempts, RevisionStallWatch } from "../collection/wri
 import type { ConfirmedRevision, StagedAttempt } from "../collection/write-attempts.js";
 import { TornActionError } from "../collection/struct.js";
 import { isTransactionExpired, clampPriority } from "./transaction.js";
-import { EntryParticipants, writeContextOf } from "./entry-commit.js";
+import { EntryParticipants, compareCollectionIds, writeContextOf } from "./entry-commit.js";
 import type { EntryCommit, NextRevision, RefreshParticipant, WriteContext } from "./entry-commit.js";
 import { Log } from "../log/log.js";
 import { blockIdsForTransforms, copyTransforms } from "../transform/helpers.js";
@@ -409,7 +409,7 @@ class RetryBudget {
 	 * a later attempt has no evidence yet and gets no strike.
 	 */
 	assertNotStalled(actionId: ActionId, participants: readonly NextRevision[]): void {
-		const sorted = [...participants].sort((a, b) => a.collectionId < b.collectionId ? -1 : a.collectionId > b.collectionId ? 1 : 0);
+		const sorted = [...participants].sort((a, b) => compareCollectionIds(a.collectionId, b.collectionId));
 		for (const { collectionId, requestedRev, heldRev } of sorted) {
 			const verdict = this.watchOf(collectionId).check(requestedRev);
 			if (verdict.kind === 'clear') {
