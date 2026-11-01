@@ -49,6 +49,12 @@ export const DEFAULT_HLC_PERSIST_INTERVAL_MS = 1000;
  * issue HLCs at or below ones the lost run issued (a crash loop faster than that window repeats one
  * floor). Harmless while HLCs are observational (Stage 1 of docs/crdt-sync.md); once anything orders
  * by them, the save after a jump must be durable before the clock issues past it.
+ *
+ * NOTE: the floor is saved, so each restart that comes faster than the slack resumes a further
+ * slack above the last one: a crash loop restarting every few seconds moves the node's HLCs ahead
+ * of its wall clock by about the slack less the restart interval, per restart, without bound. Fine
+ * while HLCs are observational; if HLCs start deciding order (Stage 2), a remedy is to wait out the
+ * floor at start rather than resume above it.
  */
 export const DEFAULT_HLC_RESTART_SLACK_MS = 10_000;
 

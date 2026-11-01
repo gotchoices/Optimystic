@@ -36,11 +36,16 @@ export function legacyHlc(timestamp: number): Hlc {
 	return { wallMs: timestamp, logical: 0, nodeId: '' };
 }
 
-/** Whether a value read off the wire has the shape of an {@link Hlc}: two finite numbers and a string node id. */
+/**
+ * Whether a value read off the wire has the shape of an {@link Hlc}: a finite `wallMs`, a `logical`
+ * that is a non-negative safe integer (what a clock issues, and what it can count past without
+ * losing precision), and a string node id. How far `wallMs` may sit from local time is not a shape
+ * question and is not checked here.
+ */
 export function isHlc(value: unknown): value is Hlc {
 	if (typeof value !== 'object' || value === null) return false;
 	const { wallMs, logical, nodeId } = value as Record<string, unknown>;
 	return typeof wallMs === 'number' && Number.isFinite(wallMs)
-		&& typeof logical === 'number' && Number.isFinite(logical)
+		&& Number.isSafeInteger(logical) && (logical as number) >= 0
 		&& typeof nodeId === 'string';
 }

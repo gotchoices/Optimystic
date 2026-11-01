@@ -48,6 +48,11 @@ const cases: readonly Case[] = [
 		issued: [[1_000, 0], [1_000, 1]]
 	},
 	{
+		name: 'an observed logical count at the top of the safe-integer range carries into wallMs',
+		steps: [{ at: 1_000, observe: peer(5_000, Number.MAX_SAFE_INTEGER) }, { at: 1_000, now: true }, { at: 1_000, now: true }],
+		issued: [[5_001, 0], [5_001, 1]]
+	},
+	{
 		name: 'a local clock stepped backwards never lowers wallMs',
 		steps: [{ at: 1_000, now: true }, { at: 400, now: true }],
 		issued: [[1_000, 0], [1_000, 1]]

@@ -62,23 +62,33 @@ export class HlcClock {
 
 	/** Issue an HLC above every one this clock has issued or observed. */
 	now(): Hlc {
-		const prior = this.last;
-		const wallMs = Math.max(this.localClock(), prior?.wallMs ?? -Infinity);
-		const logical = prior !== undefined && wallMs === prior.wallMs ? prior.logical + 1 : 0;
-		const issued: Hlc = { wallMs, logical, nodeId: this.nodeId };
+		const issued = this.next();
 		this.advance(issued);
 		return issued;
 	}
 
 	/**
 	 * Raise the mark to `hlc` when it is above it; otherwise nothing. A value without the shape of an
-	 * HLC (finite numbers, a string node id) is ignored: a wire field is checked, and reported, by the
+	 * HLC ({@link isHlc}) is ignored: a wire field is checked, and reported, by the
 	 * caller that read it.
 	 */
 	observe(hlc: Hlc): void {
 		if (!isHlc(hlc)) return;
 		if (this.last !== undefined && compareHlc(hlc, this.last) <= 0) return;
 		this.advance({ wallMs: hlc.wallMs, logical: hlc.logical, nodeId: hlc.nodeId });
+	}
+
+	/**
+	 * The HLC after the mark at the local clock's reading. A logical count already at the top of the
+	 * safe-integer range carries into `wallMs` instead: past it `logical + 1` stops changing the value,
+	 * and the clock would issue one HLC twice after observing a peer's far-advanced count.
+	 */
+	private next(): Hlc {
+		const prior = this.last;
+		const wallMs = Math.max(this.localClock(), prior?.wallMs ?? -Infinity);
+		if (prior === undefined || wallMs !== prior.wallMs) return { wallMs, logical: 0, nodeId: this.nodeId };
+		if (prior.logical < Number.MAX_SAFE_INTEGER) return { wallMs, logical: prior.logical + 1, nodeId: this.nodeId };
+		return { wallMs: wallMs + 1, logical: 0, nodeId: this.nodeId };
 	}
 
 	private advance(hlc: Hlc): void {
