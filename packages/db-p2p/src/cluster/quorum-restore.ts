@@ -407,12 +407,19 @@ export function soloAheadOfCohort(
 	// changes.
 	if (!cohort || cohort.rev >= selected.rev) return undefined;
 	const atCohort = rest.filter(c => c.rev === cohort.rev && c.actionId === cohort.actionId);
-	const backedByMoreThanOne = cohort.supporters.length >= CORROBORATION_FLOOR || atCohort.some(isMultiSignerCertified);
+	// Every distinct claimant at the pair, not `cohort.supporters`: a certified selection reports its
+	// certified claimants only, while the equal-revision rule above counts the whole corroborated
+	// group — the two must agree on what "more than one machine" means.
+	const backedByMoreThanOne = distinctClaimants(atCohort).length >= CORROBORATION_FLOOR || atCohort.some(isMultiSignerCertified);
 	if (!backedByMoreThanOne) return undefined;
 	return {
-		solo: { rev: selected.rev, actionId: selected.actionId, claimants: [...new Set(atSolo.map(c => c.peerId))] },
+		solo: { rev: selected.rev, actionId: selected.actionId, claimants: distinctClaimants(atSolo) },
 		cohort: { rev: cohort.rev, actionId: cohort.actionId }
 	};
+}
+
+function distinctClaimants(claims: readonly RevClaim[]): string[] {
+	return [...new Set(claims.map(c => c.peerId))];
 }
 
 /** A claim certified by a proof two or more distinct cohort members signed — the cohort's word, not one machine's. */

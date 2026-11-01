@@ -316,6 +316,19 @@ describe('certified claim selection (quorum-restore)', () => {
 			], THRESHOLD, 9)).to.equal(undefined);
 		});
 
+		it('counts every distinct claimant of the pair below, as the equal-revision rule does', () => {
+			// A lone machine certified alone at 5 whose replica a second peer holds: at an equal revision
+			// that group of two displaces a single-signer claim, so one revision below it is a group's
+			// side too — the certified selection's own supporter list names only the certified claimant.
+			const shape = soloAheadOfCohort([
+				claim('soloB', 5, 'b', true, 1), claim('pushedB', 5, 'b'), claim('soloA', 6, 'a', true, 1)
+			], THRESHOLD, 9);
+			expect(shape).to.deep.equal({
+				solo: { rev: 6, actionId: 'a', claimants: ['soloA'] },
+				cohort: { rev: 5, actionId: 'b' }
+			});
+		});
+
 		it('is not a shape on a capacity-one cohort, where the pair below has one supporter', () => {
 			// A quorum-meeting group of ONE is one machine\'s word, not a group\'s side.
 			expect(soloAheadOfCohort([
