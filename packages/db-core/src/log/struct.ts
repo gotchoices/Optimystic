@@ -186,4 +186,11 @@ export const LogHeaderBlockType = "LGH";
 export type GetFromResult<TAction> = {
 	context: ActionContext | undefined;
 	entries: ActionEntry<TAction>[];
+	/**
+	 * The highest HLC ({@link hlcOf}) among every entry the walk read — action, checkpoint and
+	 * invalidation entries alike, the ones below `startRev` it read to find its way included — so the
+	 * reader's clock can observe it (docs/crdt-sync.md §Migration Path, Stage 1). One value rather than
+	 * one per entry, since the clock keeps only a maximum. Absent when the walk read no entry.
+	 */
+	hlcHighWater?: Hlc;
 };

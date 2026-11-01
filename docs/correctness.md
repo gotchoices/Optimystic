@@ -543,6 +543,7 @@ Minimal. Timestamps are used only for:
 - Transaction expiration (requires clocks to be roughly synchronized within the expiration window — typically seconds to minutes).
 - Stamp ID generation (used for identity, not ordering — clock skew produces different IDs but does not affect correctness).
 - Reputation penalty decay (exponential decay over time — clock skew affects decay rate but not safety).
+- HLC issuance (ordering metadata, observational in Stage 1 of [crdt-sync.md §Migration Path](crdt-sync.md#migration-path); a node never issues below an HLC it observed, so a far-ahead peer moves every node that hears it forward, and skew is measured, not refused: a pend whose HLC sits far from local time is logged as `hlc:skew` past a threshold by `PendHlcIntake` in `packages/db-p2p/src/storage/pend-hlc-intake.ts`). The bound below does not depend on it.
 
 **Bound.** Correctness requires only that honest nodes' clocks are within the transaction expiration window of each other. No tight synchronization is needed.
 

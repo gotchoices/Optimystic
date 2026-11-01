@@ -60,6 +60,15 @@ export class HlcClock {
 		return clock;
 	}
 
+	/**
+	 * The local wall clock's reading, the one this clock issues from, without issuing anything. What a
+	 * peer's HLC is measured against (`SkewLedger`): the mark itself is no reference, since it has
+	 * already moved up to whatever far-ahead HLC this clock observed.
+	 */
+	localTime(): number {
+		return this.localClock();
+	}
+
 	/** Issue an HLC above every one this clock has issued or observed. */
 	now(): Hlc {
 		const issued = this.next();

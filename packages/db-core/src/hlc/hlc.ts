@@ -27,6 +27,11 @@ export function compareHlc(a: Hlc, b: Hlc): number {
 	return a.nodeId < b.nodeId ? -1 : 1;
 }
 
+/** The later of `a` and `b` by {@link compareHlc}; `b` when `a` is absent. */
+export function maxHlc(a: Hlc | undefined, b: Hlc): Hlc {
+	return a === undefined || compareHlc(b, a) > 0 ? b : a;
+}
+
 /**
  * The HLC a reader derives for an entry or record written before the field existed: its plain
  * timestamp, no logical count, and the empty node id. The empty id sorts before every real peer id,

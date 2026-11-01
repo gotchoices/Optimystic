@@ -1625,6 +1625,9 @@ saveMaterializedBlock(block): store(structuredClone(block));
   tracker is re-judged the same way before each of its attempts (`Collection.headTrackerFor`), and
   rebuilt rather than replayed, since it holds the head segment alone.
 
+### Every Write Carries an HLC
+Every write carries the hybrid logical clock value its writer minted, in three places: its log entry (`LogEntry.hlc`, read through `hlcOf` in `packages/db-core/src/log/struct.ts` because an entry stored before the field has none), its transaction (`Transaction.hlc`, minted at commit after the read set is final, and folded into the transaction id and client signature), and each pend of the write (`PendRequest.hlc`). It extends the identity rule of *A write's log append is a fixed function of the write and the revision it is requesting*, below: minted once per write beside the action id and timestamp (`WriteIdentity.hlc` in `packages/db-core/src/collection/write-attempts.ts`), and re-sent unchanged by every retry. A node's clock (`HlcClock` in `packages/db-core/src/hlc/clock.ts`, one per node, `node.hlcClock`) never issues below an HLC the node observed, and it observes exactly three things: the highest HLC a refresh's log walk read (`Collection.forgetAndAdopt` in `packages/db-core/src/collection/collection.ts`), the highest in the log tail block an open read (`Collection.attachToLog`, same file), and the HLC of every pend the node stores (`StorageRepo.pend` in `packages/db-p2p/src/storage/storage-repo.ts`, which also measures how far each pend's HLC sat from local time, refusing nothing). Nothing orders, admits or hides a write by it yet; the revision is still the order. See [crdt-sync.md §Stage 1](crdt-sync.md#stage-1--introduce-hlc-on-every-transaction).
+
 ### Consensus Execution
 - `handleConsensus()` executes on ALL cluster peers, not just coordinator
 - `executedTransactions` map prevents duplicate execution (keyed by messageHash)

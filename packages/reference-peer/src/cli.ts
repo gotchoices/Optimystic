@@ -513,7 +513,9 @@ class PeerSession {
 				},
 				// Self is served by the co-located repo above, so a write this node is responsible for
 				// is coordinated here rather than sent to an equally responsible neighbour.
-				localPeerId: node.peerId
+				localPeerId: node.peerId,
+				// The node's HLC clock, which its storage raises to every write it stores.
+				clock: node.hlcClock
 			});
 		}
 

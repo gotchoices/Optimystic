@@ -7,7 +7,7 @@ import { dcutr } from '@libp2p/dcutr';
 import { autoNAT } from '@libp2p/autonat';
 import { bootstrap } from '@libp2p/bootstrap';
 import { circuitRelayServer, type CircuitRelayServerInit } from '@libp2p/circuit-relay-v2';
-import { peerIdFromString } from '@libp2p/peer-id';
+import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { ConnectionGater, PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
@@ -23,6 +23,7 @@ import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindo
 import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
+import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, servableProof, type ArchiveServingRepo } from './storage/block-archive.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
 import { seedOwnedBlocksFromStorage } from './owned-block-seed.js';
@@ -113,7 +114,7 @@ import {
 	type PushStateInit,
 	type NotificationVerifier,
 } from '@optimystic/db-core';
-import { routingKeyForBlock } from '@optimystic/db-core';
+import { HlcClock, routingKeyForBlock } from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js';
 import { createLogger } from './logger.js';
@@ -290,9 +291,10 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Durable key-value store for node-local state that must survive a restart — today, the
 	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
-	 * is still missing each). An instance or a factory, the same shape as {@link NodeOptions.storage}.
-	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger still works, but what it
-	 * records is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
+	 * is still missing each) and the HLC clock's high-water mark (`hlc/high-water`). An instance or a
+	 * factory, the same shape as {@link NodeOptions.storage}.
+	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger and the clock still work,
+	 * but what they record is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
 	 * `FileRawStorage`'s base path; see its README. Like the raw storage, the node never closes it:
 	 * a host that supplies one closes it after `stop()`.
 	 */
@@ -799,7 +801,7 @@ function resolveKvStore(provider: KVStoreProvider | undefined): IKVStore {
 	if (provider !== undefined) {
 		return typeof provider === 'function' ? provider() : provider;
 	}
-	wiringLog('WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep it.');
+	wiringLog('WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent, and neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep both.');
 	return new MemoryKVStore();
 }
 
@@ -904,10 +906,20 @@ export async function createLibp2pNodeBase(
 		return undefined;
 	};
 
+	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
+	// The node's one HLC clock (docs/crdt-sync.md §Migration Path, Stage 1), its mark loaded before
+	// anything can write: the storage repo below raises it to every pend it stores, and a transactor a
+	// host builds over the node mints from it (`node.hlcClock`). Kept in the ledger's key-value store.
+	const hlcClock = await HlcClock.start({
+		nodeId: peerIdFromPrivateKey(nodePrivateKey).toString(),
+		store: new KvHlcClockStore(kvStore),
+	});
+
 	// The factory reads the `restoreCallback` binding each time it builds a block storage, so a block
 	// storage created after the reassignment below restores through the coordinator.
 	const storageRepo = new StorageRepo(rawStorage, {
-		createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback)
+		createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, restoreCallback),
+		clock: hlcClock,
 	});
 
 	let clusterImpl: ICluster | undefined;
@@ -948,8 +960,6 @@ export async function createLibp2pNodeBase(
 			? { authorizeInboundStreamTimeoutMs: options.authorizeInboundStreamTimeoutMs }
 			: {})
 	};
-
-	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 
 	// A listen address naming a relay (`<relay>/p2p/<id>/p2p-circuit`, the only shape a phone or browser
 	// can take) is handed to libp2p as a bare `/p2p-circuit` and the relay is supervised by this node
@@ -2247,6 +2257,7 @@ export async function createLibp2pNodeBase(
 			linkDeadlines,
 			reportBlockHeld,
 			cohortReachability,
+			hlcClock,
 		};
 		Object.assign(node, attachments);
 

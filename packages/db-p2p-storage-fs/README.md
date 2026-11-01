@@ -77,7 +77,7 @@ no block id's first segment (a block id containing `/` nests the same way)
 equals a KV key's first segment; give them separate `basePath`s if
 you cannot guarantee that. The KV keys the node itself writes all start with a
 fixed literal segment (`under-replicated/`, `coordinator/`, `participant/`,
-`executed/`), as do the keys of the Quereus plugin's offline journal when a host
+`executed/`, `hlc/`), as do the keys of the Quereus plugin's offline journal when a host
 hands it the same store (`optimystic-offline/`) — db-p2p's `NODE_KV_NAMESPACES` —
 and `FileRawStorage.listBlockIds` skips those root directories, so a KV key is
 never mistaken for a block. KV bytes do count
@@ -85,7 +85,8 @@ toward `FileRawStorage.getApproximateBytesUsed` when the path is shared. Over
 one `basePath` the two share one log, one lock and one checkpoint.
 
 Without a `kvStore`, the node falls back to an in-memory store and logs a
-`node-wiring` warning: what the ledger records is then lost on restart.
+`node-wiring` warning: what the ledger records, and the HLC clock's
+high-water mark, are then lost on restart.
 
 ## On-disk layout
 

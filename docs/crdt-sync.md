@@ -228,7 +228,23 @@ A full rewrite is unnecessary. The design can evolve in stages, and strong-consi
 
 ### Stage 1 — Introduce HLC on every transaction
 
-The transaction stamp already carries a `timestamp` and `peerId`. Extend it with a logical counter and adopt the HLC construction at issuance. HLC is recorded but ordering authority remains with log-tail clusters. No semantic change yet — HLC is observational.
+Landed. Every write carries an HLC and every node keeps its clock above the HLCs it has observed, but ordering authority remains with log-tail clusters: nothing orders, admits or hides a write by its HLC. HLC is observational.
+
+**The clock.** `HlcClock` in `packages/db-core/src/hlc/clock.ts` is the only thing that mints an HLC. A node built by `createLibp2pNodeBase` (`packages/db-p2p/src/libp2p-node-base.ts`) has one, started before its storage can store anything and exposed as `node.hlcClock`; the Quereus plugin's `network` transactor mints from it. Its high-water mark is kept in the node's key-value store (`KvHlcClockStore` in `packages/db-p2p/src/storage/kv-hlc-clock-store.ts`, key `hlc/high-water`), saved at most once a second and at once on a jump. **The restart rule:** a restarted clock treats `DEFAULT_HLC_RESTART_SLACK_MS` (10 s) above the stored mark as already observed (`restartFloor` in `packages/db-core/src/hlc/clock-store.ts`), which covers the HLCs issued after the last save that the store had not yet made durable, so a node whose wall clock is behind at restart still issues above what it issued before. A transactor that declares no clock mints from one process-wide clock in the node id `'local'` (`clockOf` in `packages/db-core/src/hlc/clock.ts`).
+
+**Where it is carried.** On every log entry (`LogEntry.hlc` in `packages/db-core/src/log/struct.ts`; an entry stored before the field existed reads through `hlcOf` as its timestamp with an empty node id), on every transaction (`Transaction.hlc` in `packages/db-core/src/transaction/transaction.ts`, folded into the transaction id and the client signature) and on every pend (`PendRequest.hlc` in `packages/db-core/src/network/struct.ts`, so a storage node reads it without parsing log blocks). It is minted once per write and re-sent by every retry, like the action id.
+
+**On the transaction, not the stamp.** The stamp is fixed at BEGIN, before the transaction reads anything, so an HLC minted then could sit below the HLC of an entry a later read observed, and a node would have assigned a transaction an HLC earlier than one whose effects it saw. The HLC is minted at commit instead, after the read set is final. The stamp is unchanged, and so is every stamp id (`createTransactionStamp` in `packages/db-core/src/transaction/transaction.ts`).
+
+**What the clock observes.** A node never issues an HLC below one it has observed, and observed means exactly three things, each fed as the single highest value the site saw:
+
+- **A refresh that walks the log.** `Log.getFrom` in `packages/db-core/src/log/log.ts` reports the highest HLC among every entry it read (`GetFromResult.hlcHighWater`), and `Collection.forgetAndAdopt` in `packages/db-core/src/collection/collection.ts` observes it.
+- **An open.** `Collection.attachToLog` (same file) observes the highest HLC in the log tail block it read.
+- **A pend this node stores.** `StorageRepo.pend` observes the pend's HLC once the pend is stored (`PendHlcIntake` in `packages/db-p2p/src/storage/pend-hlc-intake.ts`), as a cohort member applying a consensus record and as a lone coordinator alike. A pend the node refuses is not observed.
+
+Deliberately not observed: blocks that arrive as replicas (a push, a reconcile, a restore — see the `NOTE:` at `StorageRepo.saveReplicatedBlock`), a pinned read view, and the committed-tail reads of the watch service, none of which a write builds on.
+
+**Skew is measured, not refused.** For every pend carrying an HLC, `StorageRepo.pend` records how far its `wallMs` sat from local time, per issuing node, in a bounded `SkewLedger` (`packages/db-core/src/hlc/skew.ts`, read as `storageRepo.hlcSkew`), and logs `hlc:skew` when the gap passes `StorageRepoOptions.skewLogThresholdMs` (1 s by default); see [debugging.md §db-p2p sub-namespaces](debugging.md#db-p2p-sub-namespaces) for how to read it. A gap names no culprit: either clock may be wrong, so it feeds no reputation report. And a node whose HLC jumped forward after observing a far-ahead peer then shows as ahead to everyone, which is the measurement working as intended.
 
 ### Stage 2 — Make replay authoritative for opt-in collections
 
@@ -282,7 +298,7 @@ Optimystic's novel contribution in this design is not in any of these primitives
 * **Replay cost for long histories.** Materializing state at a given HLC requires replaying all prior transactions. Checkpointing (state-at-stable-horizon snapshotted and signed) is the obvious answer; needs a design pass and integration with Arachnode archival.
 * **Tentative read semantics at the application boundary.** What API makes "this is tentative" hard to ignore? SQL naturally resists (a `SELECT` returns rows, not rows + stability level). The Quereus integration likely needs a connection-level `SET read_mode = stable|tentative` plus a per-query hint.
 * **Fence semantics under CRDT sync.** A fenced transaction pulls in the old log-tail-consensus machinery for one operation. Does it block concurrent CRDT-sync transactions at the log tail, or only block transactions with lower HLC? The latter is more available but requires careful proof that causality still holds.
-* **Clock-skew bounds.** HLC tolerates clock skew but doesn't erase it; a node whose wall clock is far ahead can issue transactions that appear causally later than they should. Should clusters reject transactions whose HLC `wallMs` is wildly out of line with cluster-observed real time? Likely yes, with a tolerance window.
+* **Clock-skew bounds.** HLC tolerates clock skew but doesn't erase it; a node whose wall clock is far ahead can issue transactions that appear causally later than they should, and every node that observes one moves its own clock forward to match. Should clusters reject transactions whose HLC `wallMs` is wildly out of line with cluster-observed real time? Stage 1 refuses nothing and measures instead: the `hlc:skew` line and the per-node ledger behind it (`SkewLedger`, see [Stage 1](#stage-1--introduce-hlc-on-every-transaction)) are what Stage 2 decides the tolerance window from.
 
 ## See Also
 

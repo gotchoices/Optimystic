@@ -4,10 +4,10 @@ import { nameof } from "../utility/nameof.js";
 import type { IBlock, BlockId, ActionId, CollectionId, ChainPath, ActionRev, ActionContext, ChainInitOptions, BlockStore, ReadDependency } from "../index.js";
 import type { ChainDataNode } from '../chain/chain-nodes.js';
 import type { LogEntry, ActionEntry, DisputeResolutionProof, InvalidationEntry, RevertedBlock } from "./index.js";
-import { LogDataBlockType, LogHeaderBlockType } from "./struct.js";
+import { LogDataBlockType, LogHeaderBlockType, hlcOf } from "./struct.js";
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { GetFromResult } from './struct.js';
-import type { Hlc } from '../hlc/hlc.js';
+import { maxHlc, type Hlc } from '../hlc/hlc.js';
 import { BLOCK_TARGET_BYTES } from '../network/block-size.js';
 
 export type LogBlock<TAction> = ChainDataNode<LogEntry<TAction>>
@@ -236,9 +236,11 @@ export class Log<TAction> {
 		let checkpointPendings: ActionRev[] = [];
 		let rev: number | undefined;
 		let checkpointPath: ChainPath<LogEntry<TAction>> | undefined;
+		let hlcHighWater: Hlc | undefined;
 		// Step through collecting both pending and entries until a checkpoint is found
 		for await (const path of this.chain.select(undefined, false)) {
 			const entry = entryAt<LogEntry<TAction>>(path)!;
+			hlcHighWater = maxHlc(hlcHighWater, hlcOf(entry));
 			rev = rev ?? entry.rev;
 			if (entry.checkpoint) {
 				checkpointPath = path;
@@ -260,6 +262,7 @@ export class Log<TAction> {
 		if (checkpointPath) {
 			for await (const path of this.chain.select(checkpointPath, false)) {
 				const entry = entryAt<LogEntry<TAction>>(path)!;
+				hlcHighWater = maxHlc(hlcHighWater, hlcOf(entry));
 				if (startRev !== undefined && entry.rev > startRev) {
 					if (entry.action) {
 						entriesFromCheckpoint.push(entry.action);
@@ -271,7 +274,7 @@ export class Log<TAction> {
 		}
 		const pendings = [...checkpointPendings, ...pendingActions.reverse()];
 		const entries = [...entriesFromCheckpoint.reverse(), ...entriesFromTail.reverse()];
-		return { context: rev ? { committed: pendings, rev } : undefined, entries };
+		return { context: rev ? { committed: pendings, rev } : undefined, entries, hlcHighWater };
 	}
 
 	/** Enumerates log entries from the given starting path or end if undefined, in forward (from tail to head) or reverse (from head to tail) order. */

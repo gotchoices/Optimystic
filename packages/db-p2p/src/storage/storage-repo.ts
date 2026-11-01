@@ -5,7 +5,7 @@ import type {
 	PendValidationHook, PendValidationResult, UnvalidatablePendPolicy,
 	CollectionId, IBlockChangeNotifier, CollectionChangeListener, CollectionChangeEvent,
 	IBlockDurabilityNotifier, BlockDurabilityListener, BlockDurabilityReachedEvent,
-	StaleFailure
+	StaleFailure, HlcClock, SkewLedger
 } from "@optimystic/db-core";
 import {
 	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
@@ -27,6 +27,7 @@ import { cloneDecoded } from "./raw-store-codec.js";
 import { checkPendValidation } from "../pend-validation.js";
 import { ActionChangeHold, type PendGroup } from "./action-change-hold.js";
 import { armUnrefTimer } from "../unref-timer.js";
+import { DEFAULT_SKEW_LOG_THRESHOLD_MS, PendHlcIntake } from "./pend-hlc-intake.js";
 
 const log = createLogger('storage-repo');
 
@@ -159,6 +160,20 @@ export type StorageRepoOptions = {
 	 * entirely, and every event fires at the end of the call that landed it, as before the hold.
 	 */
 	changeHoldMs?: number;
+	/**
+	 * The node's hybrid logical clock (docs/crdt-sync.md §Migration Path, Stage 1), the one its
+	 * transactor mints from. Every pend this repo stores raises it to the HLC the pend carries, and
+	 * every pend that carries one is measured against its wall time into {@link StorageRepo.hlcSkew}
+	 * (see `./pend-hlc-intake.ts`). Absent — the Quereus plugin's `local` and `test` transactors, and
+	 * repos built directly in tests — the repo observes, measures and logs nothing.
+	 */
+	clock?: HlcClock;
+	/**
+	 * How far, in milliseconds, a pend's HLC may sit from this node's wall time, either way, before
+	 * the gap is logged as `hlc:skew`. Default {@link DEFAULT_SKEW_LOG_THRESHOLD_MS}. Ignored without a
+	 * {@link clock}.
+	 */
+	skewLogThresholdMs?: number;
 };
 
 /**
@@ -328,6 +343,14 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	private readonly changeHoldMs: number;
 	/** The cancel of the timer bounding each action's hold, armed at its first held event. */
 	private readonly holdTimers = new Map<ActionId, () => void>();
+	/** What this repo does with each pend's HLC; `undefined` without a clock. */
+	private readonly pendHlcs: PendHlcIntake | undefined;
+	/**
+	 * Per issuing node, how far the HLCs of the pends this repo received sat from local time — the
+	 * measurement Stage 2 of docs/crdt-sync.md decides from, for a host or a test to read. Nothing
+	 * acts on it. `undefined` when the repo was built without a clock.
+	 */
+	readonly hlcSkew: SkewLedger | undefined;
 
 	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
 		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
@@ -336,6 +359,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
 		this.changeHoldMs = options?.changeHoldMs ?? DEFAULT_CHANGE_HOLD_MS;
 		this.changeHold = this.changeHoldMs > 0 ? new ActionChangeHold() : undefined;
+		this.pendHlcs = options?.clock === undefined
+			? undefined
+			: new PendHlcIntake(options.clock, options.skewLogThresholdMs ?? DEFAULT_SKEW_LOG_THRESHOLD_MS);
+		this.hlcSkew = this.pendHlcs?.skew;
 	}
 
 	/**
@@ -1015,6 +1042,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	async pend(request: PendRequest, _options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
+		const hlc = this.pendHlcs?.receive(request);
 		// Re-check the transaction when a validation hook is configured — the unvalidatable-pend
 		// policy and the throwing-hook catch both live in the shared `checkPendValidation`, so this
 		// tier and the cluster tier cannot drift apart on what they refuse.
@@ -1034,6 +1062,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));
 		if (result.success) {
 			this.notePendGroup(request.actionId, saved);
+			if (hlc !== undefined) this.pendHlcs?.stored(hlc);
 		}
 		return result;
 	}
@@ -1632,6 +1661,12 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * `certified-claims.ts`, so every receiver would penalize it.
 	 */
 	async saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void> {
+		// NOTE: a replica is not fed to the node's HLC clock, though a log block's entries carry HLCs:
+		// this node stores a replica (a push, a reconcile, a restore) without reading it into a
+		// collection handle, so nothing it writes builds on the replica, and the members that stored
+		// the write observed its HLC when its pend reached them (`pend`). If a node ever builds on a
+		// replica without a handle reading it first (Stage 2 replay of docs/crdt-sync.md), observe the
+		// entries of a replicated log block here.
 		log('saveReplicatedBlock blockId=%s rev=%s', blockId, source?.rev);
 		const storage = this.createBlockStorage(blockId);
 		// Captured under the latch; emitted after release and the group's flush, matching commit's ordering.

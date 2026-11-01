@@ -78,4 +78,5 @@ export * from "./cluster/memory-transaction-state-store.js";
 export * from "./cluster/persistent-transaction-state-store.js";
 export * from "./storage/i-kv-store.js";
 export * from "./storage/memory-kv-store.js";
+export * from "./storage/kv-hlc-clock-store.js";
 export * from "./storage/node-kv-namespaces.js";

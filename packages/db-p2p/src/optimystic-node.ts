@@ -1,5 +1,5 @@
 import type { Libp2p, PrivateKey } from '@libp2p/interface';
-import type { BlockId, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
+import type { BlockId, HlcClock, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import type { NodeCohortReachability } from './network/cohort-reachability.js';
@@ -88,6 +88,15 @@ export interface OptimysticNodeAttachments {
 	 * (a node that has stopped may have closed its store). Reporting this node's own peer id does nothing.
 	 */
 	reportBlockHeld(blockId: BlockId, rev: number, peerId: string): Promise<void>;
+	/**
+	 * The node's hybrid logical clock (docs/crdt-sync.md §Migration Path, Stage 1), started before the
+	 * node's storage could store anything, its high-water mark kept in `NodeOptions.kvStore`. The
+	 * node's storage raises it to the HLC of every write it stores for others. A host that builds a
+	 * transactor over the node passes it as `NetworkTransactorInit.clock`, so the writes it mints and
+	 * the writes the node stores move one clock; a transactor without it mints from a process-wide
+	 * clock that observes nothing the node stores.
+	 */
+	hlcClock: HlcClock;
 }
 
 export type OptimysticNode = Libp2p & OptimysticNodeAttachments;

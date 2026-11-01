@@ -439,6 +439,10 @@ export class CollectionFactory {
       // `getRepo` serves this node from its coordinated repo, so ties among a block's responsible
       // peers go to this node and its own writes skip the network hop.
       localPeerId: node.peerId,
+      // The node's own HLC clock, which its storage raises to every write it stores, so the writes
+      // this transactor mints never sit below one the node holds. A node a host injected without
+      // building it through `createLibp2pNode` carries none; its writes mint from the process-wide clock.
+      clock: node.hlcClock,
     });
   }
 

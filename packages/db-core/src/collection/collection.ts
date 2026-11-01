@@ -2,6 +2,7 @@ import type { IBlock, Action, ActionType, ActionHandler, BlockId, ITransactor, B
 import { Log } from "../log/log.js";
 import type { LogBlock } from "../log/log.js";
 import type { ActionEntry, GetFromResult, LogEntry } from "../log/struct.js";
+import { hlcOf } from "../log/struct.js";
 import { Atomic } from "../transform/atomic.js";
 import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
@@ -24,7 +25,8 @@ import { driveHeadCommit } from "./head-commit.js";
 import type { HeadCommitHandle } from "./head-commit.js";
 import type { ReadDependency } from "../transaction/transaction.js";
 import { ReadDependencyCollector } from "../transaction/read-dependency-collector.js";
-import { clockOf } from "../hlc/clock.js";
+import { clockOf, type HlcClock } from "../hlc/clock.js";
+import { maxHlc, type Hlc } from "../hlc/hlc.js";
 import { randomBytes } from '@noble/hashes/utils.js';
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string';
 import { Latches } from "../utility/latches.js";
@@ -377,7 +379,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// that ignores the undefined cannot later sync a phantom collection into existence.
 			return undefined;
 		}
-		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
+		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends, clockOf(transactor));
 		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.filterConflict, init.onSealedRefused, init.onViewChanged, instanceTag);
 		collection.logTailId = ends.header.tailId;
 		return collection;
@@ -396,7 +398,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 		let inventedBaseline: Transforms | undefined;
 		if (ends) {	// Collection already exists
-			await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends);
+			await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends, clockOf(transactor));
 		} else {	// Collection does not exist
 			log('collection:invented id=%s — no committed header found; staging a fresh empty collection', id);
 			const headerBlock = init.createHeaderBlock(id, tracker);
@@ -545,11 +547,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 		 * diagnostic emitted here carries the same instance name as every post-construction one. */
 		instanceTag: string,
 		ends: LogEnds,
+		/** The clock the handle's writes will mint from, which observes the tail it read. */
+		clock: HlcClock,
 	): Promise<void> {
 		// Bootstrap ActionContext from the committed tail before walking the chain.
 		// This allows the transactor to serve pending non-tail blocks during Log.open.
 		Collection.bootstrapContext(source, ends.tail);
 		Collection.floorTailEntries(floors, ends);
+		Collection.observeTailEntries(clock, ends);
 		// The walk starts from the header and the tail, which the probe just read: keep them, so the
 		// walk reads neither again. Its first read of each through the cache then records the read
 		// dependency the probe's own read of the header used to.
@@ -588,6 +593,20 @@ export class Collection<TAction> implements ICollection<TAction> {
 				floors.raise(entry.action.blockIds, { rev: entry.rev, actionId: entry.action.actionId });
 			}
 		}
+	}
+
+	/** Have `clock` observe the highest HLC among the opened log's tail block entries, which the open
+	 * has read but does not walk — the open's half of what a refresh's walk feeds the clock
+	 * ({@link forgetAndAdopt}), so a write through this handle never mints below a write it has seen.
+	 * Only the tail block, for the reason {@link floorTailEntries} gives: an older log block's entries
+	 * are older still, and the clock keeps only a maximum. */
+	private static observeTailEntries(clock: HlcClock, ends: LogEnds): void {
+		const tail = ends.tail?.block as LogBlock<unknown> | undefined;
+		let highWater: Hlc | undefined;
+		for (const entry of tail?.entries ?? []) {
+			highWater = maxHlc(highWater, hlcOf(entry));
+		}
+		if (highWater !== undefined) clock.observe(highWater);
 	}
 
 	/** Adopt a freshly-read action context WITHOUT ever lowering the revision already held.
@@ -1445,6 +1464,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * kept. The staged actions were computed against the old content, so the verdict is returned for
 	 * {@link mustReplay}.
 	 *
+	 * The handle's clock observes the highest HLC the walk read (`GetFromResult.hlcHighWater`), so a
+	 * write through it never mints below an entry it has seen — whatever the verdict, since a clock
+	 * only rises and the entries were read either way.
+	 *
 	 * @returns what the adoption did, as {@link judgeAdoption} answered it before anything changed. */
 	private forgetAndAdopt(
 		latest: GetFromResult<Action<TAction>> | undefined,
@@ -1453,6 +1476,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		ends: LogEnds,
 	): Adoption {
 		const adoption = Collection.judgeAdoption(this.source.actionContext, latest?.context);
+		if (latest?.hlcHighWater !== undefined) clockOf(this.transactor).observe(latest.hlcHighWater);
 		this.viewChanged();
 		if (adoption === 'adopt-divergent') {
 			this.sourceCache.clear();

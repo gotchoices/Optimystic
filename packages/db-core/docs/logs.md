@@ -120,8 +120,9 @@ const context = await log.getActionContext();
 // Returns: { committed: ActionRev[], rev: number }
 
 // Get actions from specific revision
-const { context, entries } = await log.getFrom(100);
-// Returns all actions after revision 100
+const { context, entries, hlcHighWater } = await log.getFrom(100);
+// Returns all actions after revision 100, and the highest HLC among every entry the walk read
+// (absent for an empty log) — what a refreshing collection's clock observes
 ```
 
 ### Log Traversal
