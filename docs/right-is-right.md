@@ -140,11 +140,11 @@ A dispute is about one record: its id is derived from the record's message hash,
 
 ### Which rejections are disputes
 
-A dispute is expensive and ends in ejection, so only a judgement a third party can check by re-executing the transaction may start one. `TransactionValidator` (`packages/db-core/src/transaction/validator.ts`) and the member's own checks refuse for many reasons; they fall into four classes:
+A dispute is expensive and ends in ejection, so only a judgement a third party can check from the transaction and its schema — by re-executing it, or by re-deriving what it claims about itself — may start one. `TransactionValidator` (`packages/db-core/src/transaction/validator.ts`) and the member's own checks refuse for many reasons; they fall into four classes:
 
 | Refusal | Class | Starts a dispute? |
 |---|---|---|
-| Re-execution failed; operations-hash mismatch; tampered stamp; client-signature failure | **validity** — the transaction is wrong | yes |
+| Re-execution failed; operations-hash mismatch; tampered stamp; client-signature failure; lane mismatch (a `convergent` claim the member's catalog computes as `serializable` — [transactions.md §What a member verifies](transactions.md#what-a-member-verifies)) | **validity** — the transaction is wrong | yes |
 | Stale read, stale revision, lost race (`conflict`), reserved block (`held`) | **transient** — retry can win | no |
 | Expired by the member's clock (`expiredAt`) | **clock** | no |
 | Unknown engine, schema mismatch, unsupported operations-hash format, nothing to re-execute, checker fault, membership-admission refusal, base or content-digest disagreement | **incapacity or structure** — this member cannot judge, or the record is malformed | no |

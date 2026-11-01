@@ -51,11 +51,12 @@ function validityRefusal(reason: string, computedHash?: string): ValidationResul
  * Used by cluster participants when receiving PendRequests.
  *
  * Every refusal is classed, because a writer and the dispute path act on the class and must never
- * read the prose to find it. Five refusals judge the transaction itself wrong and carry
+ * read the prose to find it. Six refusals judge the transaction itself wrong and carry
  * `validity` ({@link validityRefusal}): a tampered stamp, a missing or invalid client signature, a
- * failed re-execution, and an operations-hash mismatch. The rest carry none: an expired stamp (a
- * clock judgement), a stale read (out of date — a re-read can win), and an unknown engine, a schema
- * mismatch or an operations-hash format this node does not produce (this node cannot judge).
+ * lane mismatch, a failed re-execution, and an operations-hash mismatch. The rest carry none: an
+ * expired stamp (a clock judgement), a stale read (out of date — a re-read can win), and an unknown
+ * engine, a schema mismatch or an operations-hash format this node does not produce (this node
+ * cannot judge).
  */
 export class TransactionValidator implements ITransactionValidator {
 	constructor(
@@ -124,6 +125,12 @@ export class TransactionValidator implements ITransactionValidator {
 				valid: false,
 				reason: `Schema mismatch: local=${localSchemaHash}, sender=${stamp.schemaHash}`
 			};
+		}
+
+		// 2.5. Check the lane the transaction claims. Here because the ceiling reads only the
+		// statements and the catalog step 2 just proved equal, and needs no re-execution.
+		if (await this.claimsLaneAboveCeiling(transaction, registration.engine)) {
+			return validityRefusal('Lane mismatch: transaction claims convergent, this node computes serializable');
 		}
 
 		// 3. Verify read dependencies (optimistic concurrency)
@@ -207,6 +214,30 @@ export class TransactionValidator implements ITransactionValidator {
 		} finally {
 			validationCoordinator.dispose();
 		}
+	}
+
+	/**
+	 * Whether `transaction` claims `convergent` where this node's engine computes `serializable`
+	 * (docs/transactions.md §Which lane a transaction takes). The classification is the writer's
+	 * engine's; this node never reclassifies, it only refuses a claim it can disprove. Only a
+	 * `convergent` claim is checked, since `serializable` is always acceptable; an absent lane (a
+	 * writer on a build before the field) is `serializable`; an engine without `laneCeiling` is not
+	 * asked. A throw out of the engine propagates: the node could not judge, which the pend check in
+	 * db-p2p turns into an unmarked `validator-fault` reject.
+	 *
+	 * The bound of the check: the ceiling is what every machine with the writer's schema computes
+	 * from the replicated statements alone, and an honest writer's lane is at or below it. What only
+	 * the writer saw is not in the replicated statements — a key's provenance, a value it read, and
+	 * for Quereus's rebuilt statements which columns an UPDATE assigned — so a writer that lies about
+	 * those passes here; the replay stage's guards are what catch that, at merge time.
+	 *
+	 * NOTE: no deployment validates at pend today (backlog
+	 * `feat-no-deployment-validates-transactions-at-pend`), so this runs only where a validator is
+	 * wired by hand — db-p2p's mesh specs and unit tests.
+	 */
+	private async claimsLaneAboveCeiling(transaction: Transaction, engine: ITransactionEngine): Promise<boolean> {
+		if (transaction.lane !== 'convergent' || engine.laneCeiling === undefined) return false;
+		return await engine.laneCeiling(transaction) === 'serializable';
 	}
 
 	async getSchemaHash(engineId: string): Promise<string | undefined> {

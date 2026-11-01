@@ -12,6 +12,7 @@ import {
 	type ClientSignatureVerifier,
 	type EngineRegistration,
 	type ITransactionEngine,
+	type Lane,
 	type ReadDependency,
 	type Transaction,
 	type ValidityRejection
@@ -30,12 +31,16 @@ describe('TransactionValidator refusal class', () => {
 	const fakeSign = (signer: string, payload: Uint8Array): string => `fakesig:${signer}:${new TextDecoder().decode(payload)}`;
 	const fakeVerify: ClientSignatureVerifier = (peerId, payload, signature) => signature === fakeSign(peerId, payload);
 	const failingEngine: ITransactionEngine = { id: 'failing@1.0.0', execute: async () => ({ success: false, error: 'boom' }) };
+	/** Executes to nothing and computes every transaction's ceiling as serializable, counting the asks. */
+	const strictEngine = { id: 'strict@1.0.0', ceilingAsks: 0, execute: async () => ({ success: true, actions: [] }),
+		async laneCeiling(): Promise<Lane> { this.ceilingAsks++; return 'serializable'; } };
 
 	/** Re-executes over an empty validation world, so an honest empty transaction hashes to ops([]). */
 	const validator = (): TransactionValidator => {
 		const engines = new Map<string, EngineRegistration>([
 			[ACTIONS_ENGINE_ID, { engine: new ActionsEngine(), getSchemaHash: async () => schema }],
-			[failingEngine.id, { engine: failingEngine, getSchemaHash: async () => schema }]
+			[failingEngine.id, { engine: failingEngine, getSchemaHash: async () => schema }],
+			[strictEngine.id, { engine: strictEngine, getSchemaHash: async () => schema }]
 		]);
 		return new TransactionValidator(
 			engines,
@@ -45,12 +50,12 @@ describe('TransactionValidator refusal class', () => {
 		);
 	};
 
-	type TxShape = { engineId?: string; schemaHash?: string; ageMs?: number; ttlMs?: number; reads?: ReadDependency[] };
-	const signedTx = async ({ engineId = ACTIONS_ENGINE_ID, schemaHash = schema, ageMs = 0, ttlMs, reads = [] }: TxShape = {}): Promise<Transaction> => {
+	type TxShape = { engineId?: string; schemaHash?: string; ageMs?: number; ttlMs?: number; reads?: ReadDependency[]; lane?: Lane };
+	const signedTx = async ({ engineId = ACTIONS_ENGINE_ID, schemaHash = schema, ageMs = 0, ttlMs, reads = [], lane = 'serializable' }: TxShape = {}): Promise<Transaction> => {
 		const stamp = await createTransactionStamp(peer, Date.now() - ageMs, schemaHash, engineId, ttlMs);
 		const hlc = clock.now();
-		const tx: Transaction = { stamp, statements: [], reads, hlc, lane: 'serializable', id: await createTransactionId(stamp.id, [], reads, hlc, 'serializable') };
-		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads, hlc, 'serializable'));
+		const tx: Transaction = { stamp, statements: [], reads, hlc, lane, id: await createTransactionId(stamp.id, [], reads, hlc, lane) };
+		tx.signature = fakeSign(peer, clientSignaturePayload(stamp.id, [], reads, hlc, lane));
 		return tx;
 	};
 
@@ -93,5 +98,19 @@ describe('TransactionValidator refusal class', () => {
 		const approved = await validator().validate(await signedTx(), honestHash);
 		expect(approved.valid, 'the honest transaction').to.equal(true);
 		expect(approved.validity, 'an approval is never marked').to.equal(undefined);
+	});
+
+	it('refuses a convergent claim the engine computes as serializable, and never asks about a serializable one', async () => {
+		const honestHash = await hashOperations([]);
+		strictEngine.ceilingAsks = 0;
+
+		const serializable = await validator().validate(await signedTx({ engineId: strictEngine.id }), honestHash);
+		expect(serializable.valid, 'a serializable claim').to.equal(true);
+		expect(strictEngine.ceilingAsks, 'a serializable claim is not checked').to.equal(0);
+
+		const convergent = await validator().validate(await signedTx({ engineId: strictEngine.id, lane: 'convergent' }), honestHash);
+		expect(convergent.valid, 'a convergent claim').to.equal(false);
+		expect(convergent.reason).to.satisfy((reason: string) => reason.startsWith('Lane mismatch'));
+		expect(convergent.validity, 'a lane mismatch judges the transaction itself wrong').to.deep.equal({});
 	});
 });

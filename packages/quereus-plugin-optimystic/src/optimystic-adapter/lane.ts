@@ -21,9 +21,10 @@ import { anyFresh, freshColumnsOf, type WriteFact } from './write-description.js
  * with the same schema hash computes identically is the CEILING ({@link laneCeilingOf}) — the
  * table's profile, the constraints the write is subject to, the merge tags of the assigned columns,
  * the operation and the selection's shape — and the writer's lane ({@link laneOf}) is the ceiling
- * narrowed by what only it can see. A member checks a `convergent` claim against the ceiling and
- * never reclassifies (the next ticket); it cannot catch a writer that lies about freshness or a
- * read, which is the replay stage's guards' business at merge time.
+ * narrowed by what only it can see. A member checks a `convergent` claim against the ceiling of the
+ * statements as replicated ({@link replicatedCeilingOf}) and never reclassifies; it cannot catch a
+ * writer that lies about freshness or a read, which is the replay stage's guards' business at merge
+ * time.
  *
  * The declarations are two tags, read from the vtab's `tableSchema` as `optimystic.content_key` and
  * `optimystic.fresh` are read ({@link profileOf}, {@link mergeOf}), and already part of the schema
@@ -133,6 +134,41 @@ export function laneCeilingOf(write: TableWrite, table: TableSchema): Lane {
 }
 
 /**
+ * The ceiling a member computes for one write site of a REPLICATED statement, which is what it checks
+ * a `convergent` claim against (`QuereusEngine.laneCeiling`; docs/transactions.md §What a member
+ * verifies). `serializable` only where every statement the writer could have run to produce this one
+ * has a `serializable` ceiling, so an honest writer is never refused; a table the catalog does not
+ * hold is `serializable`.
+ *
+ * The statements a member reads are rebuilt from the row (`buildInsertStatement`,
+ * `buildUpdateStatement` and `buildDeleteStatement` in `@quereus/quereus/src/util/mutation-statement.ts`),
+ * and the rebuild keeps some of what {@link laneCeilingOf} reads and not the rest:
+ *
+ * - an INSERT is rebuilt with every column, which its description lists anyway, and is subject to the
+ *   same constraints; only the disposition is lost, and an upsert's `do update` already made the
+ *   writer's ceiling `serializable`. So {@link laneCeilingOf} applies unchanged;
+ * - a DELETE is `serializable` either way;
+ * - an UPDATE is rebuilt to assign EVERY column, the key included, keyed by the row's old key. Which
+ *   columns the writer's statement assigned is gone: an untagged column, and the key column's
+ *   `primary-key` constraint, appear whether or not the writer touched them. What survives is the
+ *   table's profile, the selection, and the table's declarations: an UPDATE assigns at least one
+ *   column, so on a table that declares a merge on no column outside its key, every UPDATE's ceiling
+ *   is `serializable`.
+ *
+ * So a writer that claims `convergent` for an UPDATE of an untagged column, or for one that moves the
+ * row's key, is not caught here; that is the same bound as provenance and reads, the replay stage's
+ * guards' business. NOTE: if the rebuilt UPDATE ever assigns only the columns the statement assigned,
+ * the UPDATE arm can become {@link laneCeilingOf}.
+ */
+export function replicatedCeilingOf(write: TableWrite, table: TableSchema | undefined): Lane {
+	if (table === undefined) return 'serializable';
+	if (write.operation !== 'update') return laneCeilingOf(write, table);
+	if (profileOf(table) !== 'replay-permitted') return 'serializable';
+	if (!selectedByPrimaryKey(write.selection, table)) return 'serializable';
+	return declaresMergeOutsideKey(table) ? 'convergent' : 'serializable';
+}
+
+/**
  * The lane the writer takes: the ceiling ({@link laneCeilingOf}) narrowed by what only the writer
  * sees — clause (b) of the plan, the write must not depend on a read:
  *
@@ -216,6 +252,13 @@ function selectedByPrimaryKey(selection: TableWrite['selection'], table: TableSc
 	const key = new Set(selection.key.map(name => name.toLowerCase()));
 	const primary = table.primaryKeyDefinition.map(pk => table.columns[pk.index]?.name.toLowerCase());
 	return primary.length === key.size && primary.every(name => name !== undefined && key.has(name));
+}
+
+/** Whether any column outside `table`'s primary key declares a merge: what an UPDATE must assign, at the
+ * least, to have a `convergent` ceiling. */
+function declaresMergeOutsideKey(table: TableSchema): boolean {
+	const key = new Set(table.primaryKeyDefinition.map(pk => pk.index));
+	return table.columns.some((column, index) => !key.has(index) && mergeOf(column) !== undefined);
 }
 
 function hasDoUpdateClause(disposition: TableWrite['disposition']): boolean {

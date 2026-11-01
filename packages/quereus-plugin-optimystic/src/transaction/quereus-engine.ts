@@ -4,10 +4,13 @@ import type {
 	Transaction,
 	ExecutionResult,
 	CollectionActions,
-	TransactionCoordinator
+	TransactionCoordinator,
+	Lane
 } from '@optimystic/db-core';
+import { stricterLane } from '@optimystic/db-core';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { QUEREUS_VERSION } from './quereus-version.js';
+import { replicatedCeilingOf } from '../optimystic-adapter/lane.js';
 
 /**
  * Names the Quereus version this plugin was *built* against, not the one installed at runtime.
@@ -98,7 +101,7 @@ export class QuereusEngine implements ITransactionEngine {
 			const allActions: CollectionActions[] = [];
 
 			for (const statementJson of transaction.statements) {
-				const statement = JSON.parse(statementJson) as QuereusStatement;
+				const statement = parseStatement(statementJson);
 
 				// Execute SQL through Quereus
 				// The Optimystic virtual table module will:
@@ -120,6 +123,37 @@ export class QuereusEngine implements ITransactionEngine {
 				success: false,
 				error: `Failed to execute SQL transaction: ${error instanceof Error ? error.message : String(error)}`
 			};
+		}
+	}
+
+	/**
+	 * The strictest lane this node's catalog allows the transaction's statements, as replicated
+	 * (`ITransactionEngine.laneCeiling`; docs/transactions.md §What a member verifies): each
+	 * statement's write description, from Quereus's `Statement.getWriteScope`, judged per write site
+	 * by `replicatedCeilingOf` and folded with `stricterLane`. A statement with no write site
+	 * contributes nothing. Prepares without executing, so it takes no exec lock and touches no
+	 * collection; a statement that does not parse or prepare throws, and the validator's caller turns
+	 * that into an unmarked `validator-fault` reject.
+	 *
+	 * NOTE: one analysis plan per statement of every `convergent` transaction this node validates,
+	 * comparable to the re-execution's own planning; if it ever shows in a profile, memoize the lanes
+	 * per statement text.
+	 */
+	async laneCeiling(transaction: Transaction): Promise<Lane> {
+		const lanes: Lane[] = [];
+		for (const statementJson of transaction.statements) {
+			lanes.push(...await this.statementCeilings(parseStatement(statementJson)));
+		}
+		return stricterLane(lanes);
+	}
+
+	private async statementCeilings({ sql, params }: QuereusStatement): Promise<Lane[]> {
+		const prepared = this.db.prepare(sql);
+		try {
+			return prepared.getWriteScope(params).writes.map(write =>
+				replicatedCeilingOf(write, this.db.schemaManager.findTable(write.table.table, write.table.schema)));
+		} finally {
+			await prepared.finalize();
 		}
 	}
 
@@ -239,6 +273,11 @@ export class QuereusEngine implements ITransactionEngine {
 		const hashBase64 = bytesToBase64url(hashBytes.slice(0, 16));
 		return `schema:${hashBase64}`;
 	}
+}
+
+/** One replicated statement, in the form {@link createQuereusStatement} writes. */
+function parseStatement(statementJson: string): QuereusStatement {
+	return JSON.parse(statementJson) as QuereusStatement;
 }
 
 /**

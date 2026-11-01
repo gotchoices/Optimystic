@@ -13,6 +13,9 @@ export const ACTIONS_ENGINE_ID = "actions@1.0.0";
  * touches a coordinator or mutates any collection state — application is the sole
  * responsibility of the session/coordinator that receives the returned actions.
  *
+ * It omits `laneCeiling`: it has no catalog to classify against, so a validator accepts the lane the
+ * transaction's caller supplied (`SyncOptions.lane`, `serializable` when none) unchecked.
+ *
  * Each statement format:
  * ```json
  * {

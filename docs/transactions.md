@@ -569,7 +569,7 @@ mechanism for future readers who land at the recording site.
 
 ## Which lane a transaction takes
 
-Every write carries a **lane** (`Lane` in `packages/db-core/src/lane/lane.ts`; the carriers are in [internals.md §Every Write Carries a Lane](internals.md#every-write-carries-a-lane)): `serializable`, the cohort must agree before the write commits and the revision order decides every conflict, or `convergent`, one machine may commit the write alone and merge it into other machines' concurrent writes later, because the invariants the write is responsible for survive a merge. A SQL transaction's lane is decided by the Quereus plugin, per statement, from the statement's write description (Quereus's `TableWrite`) and the table's declarations, and the transaction takes the stricter lane over its statements. Nothing admits, refuses or merges by the lane yet; this section records the classification.
+Every write carries a **lane** (`Lane` in `packages/db-core/src/lane/lane.ts`; the carriers are in [internals.md §Every Write Carries a Lane](internals.md#every-write-carries-a-lane)): `serializable`, the cohort must agree before the write commits and the revision order decides every conflict, or `convergent`, one machine may commit the write alone and merge it into other machines' concurrent writes later, because the invariants the write is responsible for survive a merge. A SQL transaction's lane is decided by the Quereus plugin, per statement, from the statement's write description (Quereus's `TableWrite`) and the table's declarations, and the transaction takes the stricter lane over its statements. Nothing admits or merges by the lane yet; this section records the classification and what a validating member checks of it.
 
 **Two declarations.** A table opts in with `with tags ("optimystic.profile" = 'replay-permitted')`. The only other value is `'strong'`, which is also what an absent tag means, so every table that declares nothing behaves exactly as before: the default is `strong` because defaulting to `replay-permitted` would silently change what every application gets. The profile is the application's **ceiling**: a `strong` table's writes are `serializable` whatever the statement looks like. A column declares `"optimystic.merge" = 'last-writer-wins'` to say two concurrent assignments of it merge by the later HLC winning — the only merge kind defined so far; the merge itself is the replay stage's, here it decides the lane. Any other value of either tag is read as absent and logged once (`optimystic:profile-tag-ignored`, `optimystic:merge-tag-ignored`), never refused, since Quereus applies a tag to its own catalog before the plugin hears of it. Both tags are part of the schema hash already (the `sql` column of `schema()` renders every `with tags` clause), so two machines whose declarations differ fail the validator's schema check before any lane is compared.
 
@@ -584,7 +584,21 @@ A write the engine hands no description for (a foreign-key cascade's child write
 
 **A declaration changed while entries are queued** reclassifies nothing: a queued entry keeps the lane it was classified with, which was true of its statements when the application made them and is journaled with the entry, and the next transaction is classified under the new declarations. The change cannot be refused the way a storage-shape change is (`OfflineMode.assertNoQueuedEntries`), since Quereus applies it before the plugin hears of it; the plugin logs `offline:profile-changed-with-entries-queued` naming the transactions. No hazard follows while nothing admits by lane: the replay stage reads an entry's lane under the table's profile at merge time, and a `strong` table never merges whatever an entry says.
 
-What a member verifies of the lane a transaction claims — the ceiling, never the writer-only clauses — is the next ticket's; the two layers are separate exported functions for that reason.
+### What a member verifies
+
+**The classification is the writer's engine's, validated by peers, never inferred by a member.** A member that validates a pend (`TransactionValidator.validate`, step 2.5) and disagrees with a `convergent` claim refuses the pend with a reject marked as a validity judgement (`Lane mismatch: transaction claims convergent, this node computes serializable`) rather than reclassifying it, under the marker rules of the other validity refusals ([internals.md §Key Invariants](internals.md#key-invariants)). Only a `convergent` claim is checked, since `serializable` is always acceptable. `QuereusEngine.laneCeiling` in `packages/quereus-plugin-optimystic/src/transaction/quereus-engine.ts` prepares each replicated statement against the member's own catalog, reads its write description (Quereus's `Statement.getWriteScope`), judges each write site with `replicatedCeilingOf` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/lane.ts`, and takes the stricter lane over them. A statement with no write site contributes nothing; a table the catalog cannot find is `serializable`.
+
+**The member judges the statement it holds, which is not the one the writer ran.** The replicated statements are rebuilt by Quereus from the row (`buildInsertStatement`, `buildUpdateStatement` and `buildDeleteStatement` in `@quereus/quereus/src/util/mutation-statement.ts`), so `replicatedCeilingOf` answers `serializable` only where every statement the writer could have run to produce the rebuilt one has a `serializable` ceiling — which is what keeps an honest writer from ever being refused:
+
+- **An INSERT** is rebuilt with every column, which its write description lists anyway, and is subject to the same constraints; only the disposition is lost, and an upsert's `do update` already made the writer's ceiling `serializable`. The full ceiling, `laneCeilingOf`, applies.
+- **A DELETE** is `serializable` either way, so a `convergent` transaction holding one is refused.
+- **An UPDATE** is rebuilt to assign every column, the key included, selected by the row's old key: `update t set Title = 'b' where Id = 'k'` reaches the member as `update t set Id = 'k', Title = 'b', name = 'x' where Id = 'k'`. Read with `laneCeilingOf`, the assigned key column and the untagged `name` would make every honest `convergent` UPDATE look `serializable`. Which columns the writer assigned is not in the rebuilt statement, so the member checks only what survives: the table's profile, that the selection is by the primary key, and that the table declares a merge on at least one column outside its key (an UPDATE assigns at least one column, so on a table with none every UPDATE is `serializable`).
+
+What the check cannot catch is anything only the writer saw: a key's provenance (`StampId()` reaches the member as a literal), a value the write read (`set n = n + 1` reaches it as `set n = <value>`), and which columns an UPDATE assigned — so a writer that claims `convergent` for an UPDATE of an untagged column, or one that moves the row's key, passes too. The replay stage's guards are what catch those, at merge time. A member whose catalog is behind fails the schema-hash step first and never reaches this one. A member on a build without the method accepts the claim unchecked, as it accepts everything else about the lane.
+
+A bare `Collection.sync` carries no validation payload and no statements, so a member has nothing to check its lane against: the entry's lane, the collection's own declaration (`CollectionInitOptions.merge`), is taken at face value, and the collection-level declaration is the only authority for that shape. The pend check's `unvalidatablePendPolicy` decides whether such a pend is admitted at all (internals.md, *A node that can re-check a transaction never skips the check silently*).
+
+No deployment validates at pend yet (see §7 below), so this check runs only where a validator is wired by hand.
 
 ## Terminology
 
@@ -1752,6 +1766,17 @@ export class TransactionValidator {
       };
     }
 
+    // 3.5. Check a `convergent` lane claim against this node's ceiling — the catalog
+    //      step 3 just proved equal, and no re-execution needed (see the bound below)
+    if (transaction.lane === 'convergent' && engine.laneCeiling
+        && await engine.laneCeiling(transaction) === 'serializable') {
+      return {
+        valid: false,
+        reason: 'Lane mismatch: transaction claims convergent, this node computes serializable',
+        validity: {}
+      };
+    }
+
     // 4. Verify read dependencies (optimistic concurrency control)
     for (const read of transaction.reads) {
       const currentRevision = await this.getBlockRevision(read.blockId);
@@ -1828,6 +1853,8 @@ export class TransactionValidator {
   }
 }
 ```
+
+**The lane step (3.5) checks a ceiling, not the writer's lane.** `TransactionValidator.validate` asks the engine for the strictest lane its own catalog allows the statements (`ITransactionEngine.laneCeiling`, optional) and refuses only a `convergent` claim the engine computes as `serializable`; a `serializable` claim, or an absent one from a writer on an older build, is never checked, and an engine without the method (the `ActionsEngine`) is not asked. The refusal is a validity judgement, marked like the other five, so the writer sees `ValidityRejectedError`, which `classifyCommitFailure` classes as a final `rejected`. A throw out of the engine is an unmarked `validator-fault` reject: the node could not judge. The check is bounded by what a member can see — the replicated statements carry no key's provenance, no value the writer read, and not which columns an UPDATE assigned — so a writer that lies about any of those passes it; see [§What a member verifies](#what-a-member-verifies).
 
 ## Operations Hash — Canonical Serialization
 

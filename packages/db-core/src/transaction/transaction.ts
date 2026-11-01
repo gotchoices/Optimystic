@@ -413,6 +413,18 @@ export interface ITransactionEngine {
 	 * @returns The resulting actions from execution
 	 */
 	execute(transaction: Transaction): Promise<ExecutionResult>;
+
+	/**
+	 * The strictest lane this engine's catalog allows the transaction's statements: `serializable`
+	 * when any statement's write must be ordered by the quorum, else `convergent`. What a
+	 * {@link TransactionValidator} checks a `convergent` claim against (docs/transactions.md §Which
+	 * lane a transaction takes), so it must be computable identically by every machine whose schema
+	 * hash matches the writer's, from the statements as replicated — never from what only the writer
+	 * saw (a key's provenance, a value read). Omitted by an engine with no catalog to classify against
+	 * ({@link ActionsEngine}), whose transactions' lanes a validator then accepts unchecked; a throw
+	 * means this node could not judge.
+	 */
+	laneCeiling?(transaction: Transaction): Promise<Lane>;
 }
 
 /**
@@ -536,6 +548,7 @@ export interface ITransactionValidator {
 	 * 0.5. Verify the client signature (only if a signature verifier is wired)
 	 * 1. Verify stamp.engineId matches a known engine
 	 * 2. Verify stamp.schemaHash matches local schema
+	 * 2.5. Verify a `convergent` lane claim against the engine's ceiling (only if the engine offers one)
 	 * 3. Verify read dependencies (no stale reads)
 	 * 4. Re-execute transaction.statements through engine (isolated state)
 	 * 5. Collect operations from re-execution
