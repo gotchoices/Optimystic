@@ -107,6 +107,19 @@ export const bytesValueCodec: ValueCodec<Uint8Array> = {
 /** Bytes per UTF-16 code unit, what a JavaScript string costs in memory per `length`. */
 const UTF16_UNIT_BYTES = 2;
 
+/** A surrogate pair, or a surrogate on its own; only the second is ill-formed. */
+const SURROGATES = /[\uD800-\uDBFF][\uDC00-\uDFFF]|[\uD800-\uDFFF]/g;
+
+/**
+ * The text `value` reads back as once stored: each lone surrogate replaced by U+FFFD, as
+ * `TextEncoder` does on the way to disk. Without it a text composition's overlay and cache would
+ * serve an ill-formed action id (one is client-chosen and never format-checked) as written, while a
+ * read from disk, and every read in a bytes composition, returns it replaced.
+ */
+function asStored(value: string): string {
+	return value.replace(SURROGATES, match => match.length === 2 ? match : '�');
+}
+
 /**
  * Values as the text their UTF-8 bytes decode to, for a backend whose platform hands stored values
  * back as strings decoded in native code (React Native's LevelDB binding). Never constructs a
@@ -121,7 +134,7 @@ const UTF16_UNIT_BYTES = 2;
 export const textValueCodec: ValueCodec<string> = {
 	encodeJson: value => JSON.stringify(value),
 	decodeJson: <T>(value: string): T => JSON.parse(value) as T,
-	encodeActionId: actionId => actionId,
+	encodeActionId: actionId => asStored(actionId),
 	decodeActionId: value => value as ActionId,
 	storedBytes: value => value.length,
 	residentBytes: value => value.length * UTF16_UNIT_BYTES,

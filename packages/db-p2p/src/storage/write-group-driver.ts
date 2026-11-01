@@ -259,6 +259,9 @@ export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements Raw
  * The write group's sink over `backend`: each sealed group's values converted to bytes on their way
  * to `commit`, since a backend persists bytes whatever the driver holds.
  */
+// NOTE: a bytes composition pays one new array of entry objects per commit here, although its
+// `toBytes` is the identity and its values are shared; if commit cost ever shows up in profiles, hand
+// a bytes group the backend as its sink directly.
 function toBytesSink<V extends StoredValue>(backend: BatchBackend<V>, codec: ValueCodec<V>): WriteGroupSink<StoreKey, V> {
 	return {
 		commit: (entries, options) => backend.commit(entries.map(entry => toBatchEntry(entry, codec)), options),
