@@ -16,7 +16,7 @@ import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionSt
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
@@ -435,6 +435,15 @@ function renameColumnSchemaOnly(tableSchema: TableSchema, oldName: string, newNa
 }
 
 /**
+ * The transactor a table runs on when it names none: the plugin config's `default_transactor`,
+ * else `'network'`. `register` chooses the module's cost profile from the same answer, so a
+ * table's binding and the planner's view of its read cost cannot pick different defaults.
+ */
+export function defaultTransactorOf(aux: Readonly<Record<string, unknown>>): string {
+  return (aux['default_transactor'] as string) || 'network';
+}
+
+/**
  * How a table reaches storage — the transactor and key network it goes through, the
  * network's name and port, and the raw-storage factory — resolved the one way every path
  * resolves it: a `using optimystic(...)` argument (or, for a hydrated table, the session's
@@ -447,7 +456,7 @@ function resolveBinding(
   args: Readonly<Record<string, SqlValue>>,
   aux: Readonly<Record<string, unknown>>,
 ): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'rawStorageFactory'> {
-  const transactor = (args['transactor'] as string) || (aux['default_transactor'] as string) || 'network';
+  const transactor = (args['transactor'] as string) || defaultTransactorOf(aux);
   const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
   const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
   const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
@@ -763,8 +772,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     // NOTE: accepted tradeoff — a table pointed at a genuinely dead cohort re-attempts
     // initialization on every statement rather than caching the failure for a cooldown
     // window; un-damped retry weighed over a window this layer has no basis to pick
-    // (the same reasoning that made this module decline to declare `expectedLatencyMs`
-    // — see that note on OptimysticModule — applies unchanged to a damping window, and
+    // (nothing here measures how long a cohort stays down — the module's `costProfile` is
+    // a storage category, not a measurement, so it supplies no number either — and
     // damping would reintroduce this very bug in miniature, delaying recovery by up to
     // the window). A statement against an unreachable cohort was going to make network
     // calls and fail regardless, and every attempt is user-driven — nothing re-enters
@@ -4517,11 +4526,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * constraint is documented at `TransactionBridge.currentTransaction` and in
    * docs/transactions.md § "One writer at a time on the shared TransactionBridge".
    *
-   * `expectedLatencyMs` is deliberately NOT declared: this module fronts
-   * transactors ranging from in-memory (`test`, microseconds) through local file
-   * storage to libp2p network cohorts (tens to hundreds of ms), and the hint is
-   * static per MODULE — any single number would misestimate most deployments.
-   * Declare it if per-deployment configuration can ever feed a measured value.
+   * The read cost the planner prices these tables at is declared below, at {@link costProfile}.
    *
    * `readCommittedSnapshot` (declared below) routes eligible reads onto Quereus's
    * mutex-free concurrent path, so a committed read answers promptly and from a
@@ -4551,6 +4556,26 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    */
   readonly concurrencyMode = 'reentrant-reads' as const;
   readonly readCommittedSnapshot = true;
+
+  /**
+   * What reading this module's tables costs, as a Quereus storage category (`COST_PRESETS`),
+   * which the planner prices index-nested-loop seeks with and gates its parallel, batched-outer
+   * and eager-prefetch rules on. A cost hint only: no result depends on it. Chosen once, by
+   * `register`, from the plugin config (`moduleCostProfile` in
+   * `optimystic-adapter/cost-profile.ts`): the config's `cost_profile` when present, else the
+   * category of the default transactor's storage — `distributed` for `network`, nothing
+   * (Quereus's in-process `memory`) for the rest. Every `query()` pulls from the log first
+   * (`collection.update()`), so on a remote table each seek pays at least one round trip.
+   *
+   * NOTE: accepted residual — the profile belongs to the module, so a table bound to another
+   * transactor (`using optimystic(…, transactor=…)`, or a session's `default_vtab_args` that
+   * differs from `default_transactor`) is priced as the default transactor's. A production
+   * database runs every table on one transactor: the binding is never persisted and `hydrate`
+   * binds every table alike (README § Warm Restart), so mixing is a test and development
+   * arrangement, where a wrong hint changes no result. Revisit if a deployment genuinely mixes
+   * transactors and plans badly — that needs a per-table cost from Quereus, an upstream request.
+   */
+  readonly costProfile?: ModuleCostProfile;
 
   private tables = new Map<string, OptimysticVirtualTable>();
   // The schema tree (`tree://optimystic/schema`) is plugin-global, so a single
@@ -4603,8 +4628,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
   constructor(
     private collectionFactory: CollectionFactory,
-    private txnBridge: TransactionBridge
-  ) {}
+    private txnBridge: TransactionBridge,
+    costProfile?: ModuleCostProfile,
+  ) {
+    this.costProfile = costProfile;
+  }
 
   /** Quereus registered this module on `db`: listen for its tag changes from the first statement. */
   onRegister(db: Database): void {
@@ -5756,11 +5784,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // join planned as a nested loop issuing one seek per outer row (GitHub #44). 1000 is the
     // last-resort default Quereus's memory and store modules both use.
     //
-    // NOTE: if full scans of a network-backed table should look costlier than local ones, say so
-    // through a per-read cost (`expectedLatencyMs`, whose absence is explained at the
-    // `concurrencyMode` doc on this class) or by sizing the table (backlog
-    // `feat-optimystic-persisted-planner-statistics`) — never by inflating this row count, which
-    // every join and aggregate above the access reads as cardinality.
+    // NOTE: a network-backed table's reads are priced as costlier than local ones through the
+    // per-read cost the module declares (`costProfile`, chosen at registration). Anything more
+    // belongs there or in sizing the table (backlog `feat-optimystic-persisted-planner-statistics`)
+    // — never in inflating this row count, which every join and aggregate above the access reads
+    // as cardinality.
     const tableRowCount = request.estimatedRows ?? UNKNOWN_TABLE_ROWS;
     const tableScanCost = Math.max(1000, tableRowCount);
 

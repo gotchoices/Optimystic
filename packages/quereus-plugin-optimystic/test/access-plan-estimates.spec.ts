@@ -10,7 +10,7 @@
  */
 
 import { expect } from 'chai';
-import { Database, TEXT_TYPE, buildColumnIndexMap } from '@quereus/quereus';
+import { COST_PRESETS, Database, TEXT_TYPE, buildColumnIndexMap } from '@quereus/quereus';
 import type { BestAccessPlanResult, ColumnSchema, ColumnStatistics, PredicateConstraint, SqlValue, TableIndexSchema, TableSchema } from '@quereus/quereus';
 import { OptimysticModule } from '../dist/index.js';
 import register from '../dist/plugin.js';
@@ -112,53 +112,69 @@ const collectRows = async (iter: AsyncIterable<SqlRow>): Promise<SqlRow[]> => {
 	return rows;
 };
 
-describe('Join plan over un-analyzed Optimystic tables (GitHub #44)', () => {
-	let db: Database;
-
-	beforeEach(async () => {
-		db = new Database();
-		const plugin = register(db, {
-			default_transactor: 'test',
-			default_key_network: 'test',
-			enable_cache: false,
-		});
-		for (const vtable of plugin.vtables) {
-			db.registerModule(vtable.name, vtable.module, vtable.auxData);
-		}
-		for (const func of plugin.functions) {
-			db.registerFunction(func.schema);
-		}
+/** A `Database` with the plugin registered over the in-process transactor, plus `config`. */
+function openDatabase(config: Record<string, SqlValue> = {}): { db: Database; module: OptimysticModule } {
+	const db = new Database();
+	const plugin = register(db, {
+		default_transactor: 'test',
+		default_key_network: 'test',
+		enable_cache: false,
+		...config,
 	});
+	for (const vtable of plugin.vtables) {
+		db.registerModule(vtable.name, vtable.module, vtable.auxData);
+	}
+	for (const func of plugin.functions) {
+		db.registerFunction(func.schema);
+	}
+	return { db, module: plugin.vtables[0]!.module };
+}
 
+/** The plan of a join whose filtered side has an index, over two un-analyzed tables. */
+async function planFilteredJoin(db: Database): Promise<{ steps: SqlRow[]; ops: (SqlValue | undefined)[]; described: string }> {
+	await db.exec(`create table bundles (id text primary key, type_id text, name text) using optimystic('tree://test/plan_bundles')`);
+	await db.exec('create index idx_bundles_type on bundles(type_id)');
+	await db.exec(`
+		create table log_entry_items (
+			entry_id text,
+			item_id text,
+			source_bundle_id text null,
+			primary key (entry_id, item_id)
+		) using optimystic('tree://test/plan_items')
+	`);
+	await db.exec('create index idx_lei_source on log_entry_items(source_bundle_id)');
+
+	const bundles = Array.from({ length: 20 }, (_, i) => `('b${i}', 't${i % 4}', 'bundle ${i}')`);
+	await db.exec(`insert into bundles (id, type_id, name) values ${bundles.join(', ')}`);
+	const items = Array.from({ length: 60 }, (_, i) => `('e${i % 6}', 'i${i}', 'b${i % 20}')`);
+	await db.exec(`insert into log_entry_items (entry_id, item_id, source_bundle_id) values ${items.join(', ')}`);
+
+	const query = `
+		select lei.source_bundle_id as id, count(*) as n
+		from log_entry_items lei join bundles b on b.id = lei.source_bundle_id
+		where b.type_id = 't1' group by lei.source_bundle_id`;
+	const steps = await collectRows(db.eval('select op, detail from query_plan(?)', [query]));
+	return { steps, ops: steps.map(s => s.op), described: steps.map(s => `${s.op}: ${s.detail}`).join('\n') };
+}
+
+describe('Join plan over un-analyzed Optimystic tables (GitHub #44)', () => {
 	it('hash-joins the scan to a seek on the filtered side\'s index, as memory tables do', async () => {
-		await db.exec(`create table bundles (id text primary key, type_id text, name text) using optimystic('tree://test/plan_bundles')`);
-		await db.exec('create index idx_bundles_type on bundles(type_id)');
-		await db.exec(`
-			create table log_entry_items (
-				entry_id text,
-				item_id text,
-				source_bundle_id text null,
-				primary key (entry_id, item_id)
-			) using optimystic('tree://test/plan_items')
-		`);
-		await db.exec('create index idx_lei_source on log_entry_items(source_bundle_id)');
-
-		const bundles = Array.from({ length: 20 }, (_, i) => `('b${i}', 't${i % 4}', 'bundle ${i}')`);
-		await db.exec(`insert into bundles (id, type_id, name) values ${bundles.join(', ')}`);
-		const items = Array.from({ length: 60 }, (_, i) => `('e${i % 6}', 'i${i}', 'b${i % 20}')`);
-		await db.exec(`insert into log_entry_items (entry_id, item_id, source_bundle_id) values ${items.join(', ')}`);
-
-		const query = `
-			select lei.source_bundle_id as id, count(*) as n
-			from log_entry_items lei join bundles b on b.id = lei.source_bundle_id
-			where b.type_id = 't1' group by lei.source_bundle_id`;
-		const steps = await collectRows(db.eval('select op, detail from query_plan(?)', [query]));
-		const ops = steps.map(s => s.op);
-		const described = steps.map(s => `${s.op}: ${s.detail}`).join('\n');
+		const { steps, ops, described } = await planFilteredJoin(openDatabase().db);
 
 		expect(ops, described).to.include('HASHJOIN');
 		expect(ops, described).to.not.include('JOIN');
 		expect(steps.some(s => s.op === 'INDEXSEEK' && /bundles/.test(String(s.detail)) && /idx_bundles_type/.test(String(s.detail))), described)
 			.to.equal(true);
+	});
+
+	// A declared read latency prices each nested-loop seek higher and leaves the scan's row count
+	// alone, so it can only push the planner further from one seek per outer row.
+	it('keeps the hash join when the tables declare a distributed read cost', async () => {
+		const { db, module } = openDatabase({ cost_profile: 'distributed' });
+		expect(module.costProfile).to.equal(COST_PRESETS.distributed);
+		const { ops, described } = await planFilteredJoin(db);
+
+		expect(ops, described).to.include('HASHJOIN');
+		expect(ops, described).to.not.include('JOIN');
 	});
 });

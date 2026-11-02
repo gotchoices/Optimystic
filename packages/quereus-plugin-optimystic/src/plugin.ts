@@ -11,8 +11,9 @@ import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OfflineMode } from './optimystic-adapter/offline-mode.js';
 import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
+import { moduleCostProfile } from './optimystic-adapter/cost-profile.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
-import { OptimysticModule } from './optimystic-module.js';
+import { OptimysticModule, defaultTransactorOf } from './optimystic-module.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createLogger } from './logger.js';
@@ -53,6 +54,11 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		log('Optimystic plugin loading with config: %o', config);
 	}
 
+	// The planner's read cost for every table registered here: the config's `cost_profile`, else the
+	// default transactor's storage category (README § Plugin-Level Configuration). A bad value throws
+	// here, before anything is built.
+	const costProfile = moduleCostProfile(defaultTransactorOf(config), config.cost_profile);
+
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
 	const txnBridge = new TransactionBridge(collectionFactory);
@@ -62,7 +68,7 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	const offline = new OfflineMode(txnBridge, db, parseOfflineConfig(config.offline));
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
-	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge);
+	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge, costProfile);
 	// The restore after a restart initializes each journaled transaction's tables through the module.
 	offline.attachTableResolver(optimysticModule);
 
