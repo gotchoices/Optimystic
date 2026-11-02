@@ -18,6 +18,10 @@ describe('moduleCostProfile: the read cost the plugin declares', () => {
 		expect(moduleCostProfile('test', undefined)).to.equal(undefined);
 	});
 
+	it('reads an empty cost_profile as no declaration', () => {
+		expect(moduleCostProfile('network', '')).to.equal(COST_PRESETS.distributed);
+	});
+
 	it('takes a preset named by cost_profile in place of the mapping', () => {
 		expect(moduleCostProfile('network', 'localDisk')).to.equal(COST_PRESETS.localDisk);
 	});

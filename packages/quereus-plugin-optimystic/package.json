@@ -139,6 +139,14 @@
         "help": "Slowest round trip between any two nodes, relayed hops included; every network deadline is derived from it. Unset keeps the LAN deadlines"
       },
       {
+        "key": "cost_profile",
+        "label": "Read Cost Profile",
+        "type": "select",
+        "options": ["", "memory", "localDisk", "browserIdb", "network", "distributed"],
+        "default": "",
+        "help": "How slow these tables are to read, as the query planner prices them. Empty follows the default transactor: distributed for network, memory otherwise"
+      },
+      {
         "key": "enable_cache",
         "label": "Enable Caching",
         "type": "boolean",

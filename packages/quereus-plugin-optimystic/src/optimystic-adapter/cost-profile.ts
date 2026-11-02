@@ -20,8 +20,15 @@ const profileFields: ReadonlySet<string> = new Set<keyof ModuleCostProfile>(['fi
  * as 0 and warn.
  */
 export function moduleCostProfile(defaultTransactor: string, declared: unknown): ModuleCostProfile | undefined {
-	if (declared !== undefined) return declaredCostProfile(declared);
-	return transactorCostProfile(defaultTransactor);
+	return isUnset(declared) ? transactorCostProfile(defaultTransactor) : declaredCostProfile(declared);
+}
+
+/**
+ * No declaration. `null` and `''` count, as they do for `default_transactor`: a plugin loader's
+ * settings form (the `quereus.settings` manifest in package.json) sends an empty field as `''`.
+ */
+function isUnset(declared: unknown): boolean {
+	return declared === undefined || declared === null || declared === '';
 }
 
 /**
@@ -43,7 +50,7 @@ function transactorCostProfile(transactor: string): ModuleCostProfile | undefine
 
 function declaredCostProfile(declared: unknown): ModuleCostProfile {
 	if (typeof declared === 'string') return presetNamed(declared);
-	if (typeof declared === 'object' && declared !== null && !Array.isArray(declared)) {
+	if (typeof declared === 'object' && declared !== null && !Array.isArray(declared) && !ArrayBuffer.isView(declared)) {
 		return profileObject(declared as Record<string, unknown>);
 	}
 	throw new Error(`cost_profile must be a preset name (${presetNames()}) or an object with firstRowLatencyMs and perRowLatencyMs; got ${shown(declared)}`);
@@ -86,5 +93,6 @@ function presetNames(): string {
 function shown(value: unknown): string {
 	if (value === null) return 'null';
 	if (Array.isArray(value)) return 'an array';
+	if (ArrayBuffer.isView(value)) return 'a byte array';
 	return `${typeof value} ${String(value)}`;
 }
