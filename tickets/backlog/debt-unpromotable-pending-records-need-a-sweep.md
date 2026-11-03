@@ -324,3 +324,17 @@ What remains for this ticket from the client side is exactly the writer that exi
 ## Arm, 2026-11-03 — a writer that exits has now wedged a one-machine group (GitHub #54)
 
 Reported by kjeib: a process that exits while `stop()` is still running, with a write between its pend and its commit, leaves a record on a solo node that fails every later write to that collection after ten retries, in 8 of 8 runs. That shape, where the deciding facts are local, is `fix/an-interrupted-write-wedges-a-collection-for-good`. Whatever stays open there comes back here as an arm.
+
+## Arm, 2026-11-03 — the one-machine, in-process-writer shape is being closed; this ticket keeps the rest
+
+Filed from `fix/an-interrupted-write-wedges-a-collection-for-good` (GitHub #54), now `implement/0.1-an-interrupted-write-wedges-a-collection-for-good`. The residual this ticket owns was observed again, this time deterministically and in-repo: a process that exits between a write's pend and its commit (the embedder's bounded `Promise.race([node.stop(), timeout])`, or a phone closing the app) leaves the record on a one-machine group, and every later write to that collection exhausts its ten retries. Reproduced by `packages/db-p2p/test/an-interrupted-write-does-not-wedge-the-collection.spec.ts`.
+
+That ticket closes exactly the shape where the deciding facts are local, with no timing guess: a record the node applied **alone** (the solo pend path, no consensus), for a writer **running in the node's own process** (marked by the transactor on the in-process call, never on the wire), in an **earlier run** of the node (a run id minted when the node's storage repo is built, stamped beside the record's slot). Such a record's writer is provably gone, so the next write to the block judges it abandoned, deletes it under the block latch, and proceeds. It runs opportunistically on the next pend rather than as a start-up pass, which answers the "where it runs" question above for this shape: the pend already reads the block's claims under the latch, so the check is free and needs no enumeration of stored records (which the raw storage does not offer anyway).
+
+What stays here, unchanged by that fix:
+
+- A record of a **coordinated** write on a multi-member cohort. It is applied on every member by the consensus path, which carries no in-process mark, so it is never stamped, and the other members would have to agree to drop it in any case ("whether members must agree", above).
+- A record a **remote writer** pended through this node (a client whose process may still be alive). It arrives through the repo service with no mark and is never stamped.
+- A writer that exits with a cancel still owed on a larger cohort: `OwedCancels` is memory-only, as before.
+
+The design choice worth carrying forward is the direction of the mark: the in-process caller marks itself positively, so a forgotten mark reproduces today's leak rather than deleting a live record. Any general sweep designed here should keep that asymmetry.
