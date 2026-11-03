@@ -218,8 +218,11 @@ against: the pend's `PendRequest.baseRevs` entry for the block, kept as `BlockMe
 and read back as `PendingClaim.baseRev`, so that whatever later applies the record can refuse to
 apply it to a different version of the block. A record whose pend named no base for the block (an
 inserted or deleted block, or a sender that names none) simply has no entry, as does one written
-before the field existed; the two maps are siblings rather than one map of pairs so that older
-metadata reads without a migration. The base is stored as told and never checked at pend time: a
+before the field existed; the maps are siblings rather than one map of tuples so that older
+metadata reads without a migration. A third sibling, `BlockMetadata.pendingRuns`, read back as
+`PendingClaim.localRun`, says which **run of this node** saved the record, and is written only
+when the node applied the pend alone for a writer in its own process — see *A pending record's
+lifetime is bounded by its writer* below for the rule it serves. The base is stored as told and never checked at pend time: a
 member has no grounds to second-guess the author's claim about its own computation, and a pend-time
 refusal on a mismatch would be the wrong tier — a member holding a torn or abandoned higher revision
 would veto every honest retry, whereas the same mismatch at commit is one member's refusal that
@@ -229,8 +232,10 @@ by moving its bytes into the committed store unchanged — a rename on the files
 the record's value has to stay a plain transform.
 
 Both rival scans — `StorageRepo.pend` at apply and `ClusterMember.validatePendOperations` at the
-promise vote — read a record through one rule, `isReservationAgainst` in
-`packages/db-p2p/src/storage/pending-claim.ts`. A record stops reserving once the incoming writer has
+promise vote — first set aside any record whose writer is provably gone (`isAbandonedClaim` in
+`packages/db-p2p/src/storage/pending-claim.ts`, the rule *A pending record's lifetime is bounded by
+its writer* states below), then read every other record through one rule, `isReservationAgainst` in
+the same file. A record stops reserving once the incoming writer has
 **built on** it, meaning its operations were computed against a version of the block that already
 holds the record's change. What the rule is fed decides how precisely it can tell:
 
@@ -304,13 +309,34 @@ reached and whose writer never came back is the half that ticket still owns.
 #### A pending record's lifetime is bounded by its writer
 
 Invariant P constrains which states may coexist on a member; this sibling rule constrains how long
-the pending state may outlive the transaction that created it. Only four things ever remove a
+the pending state may outlive the transaction that created it. Only five things ever remove a
 pending record: the client's `cancel` (routed through consensus, so every member drops it), a
 divergence-shaped commit refusal (`StorageRepo.dropUnpromotablePendings`), a forward write
-carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete), and the
+carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete), the
 dead-claim sweep that runs whenever `latest` advances to or past the revision a record claims
-(`BlockStorage.sweepDeadClaims`, the section above). There is no age bound and no background sweep,
-and the sweep only ever removes a record whose promotion has become impossible. So the writer that pends a block owns its record's fate: when
+(`BlockStorage.sweepDeadClaims`, the section above), and the abandonment judgement the next pend
+of the block makes about a record whose **writer is provably gone**. That last one fires only when
+three facts hold, all of which the node recorded when it saved the record: the node applied the
+pend **alone**, with no consensus (`CoordinatorRepo.pendSolo`, the one path that hands the writer's
+options through to storage); the writer was running in the node's **own process**
+(`MessageOptions.localWriter` in `packages/db-core/src/network/i-repo.ts`, set by
+`NetworkTransactor.pend` and `pendMany` on a pend sent to the transactor's own `localPeerId`, and
+never put on the wire, so a remote writer cannot claim it); and the record was saved in an
+**earlier run** of the node (`StorageRepo.runId`, a random id minted once per `StorageRepo` — once
+per process on a production node — and stamped beside the record's slot as
+`BlockMetadata.pendingRuns`). A record carrying a stamp from another run is abandoned
+(`isAbandonedClaim`): its writer was a transactor in a process of this node that no longer exists,
+and nothing else could ever commit or cancel it. `StorageRepo.pend` sets such records aside ahead
+of the slot rule (logged `pend:abandoned-claim`), deletes each one under the same latch hold in
+which it judged them, before saving the newcomer's record for that block — so a concurrent re-pend
+of the same action, which would overwrite the stamp with the current run, is either seen by the
+judgement or lands after the delete — and proceeds; `ClusterMember.reservingRivals` skips them at
+the vote the same way (logged `cluster-member:validation-pending-abandoned`), and the record is
+deleted when the approved pend applies. The mark is positive on purpose: a path that forgets it
+leaves the record standing, as every record stood before the mark existed, whereas a forgotten
+negative mark would have a live remote writer's record judged dead. There is no age bound and no
+background sweep, and the sweep and the judgement only ever remove a record whose promotion has
+become impossible. So the writer that pends a block owns its record's fate: when
 `NetworkTransactor.commit` returns, every block in the request must be either **committed** or have
 had its pending record **cancelled** — a client that reports success while walking away from a
 pended block strands the record permanently, and the members then reject every later write to that
@@ -352,8 +378,14 @@ action id, whose fresh record a late cancel would delete. So a pend of an owed a
 owed cancel for every block it names and waits out any re-send already in flight. Only a writer that
 exits, or stops its transactor (`NetworkTransactor.stop`, which the Quereus plugin's
 `CollectionFactory.shutdown` calls before it stops its nodes), while a cancel is owed still strands
-the record; the node-side
-backstop for that residual is tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
+the record — and on a **one-machine group** the strand no longer wedges anything: a process that
+exits before `node.stop()` resolves, with a write between its pend and its commit, leaves a record
+the next run judges abandoned and drops on the next write to the block (GitHub #54, pinned by
+`packages/db-p2p/test/an-interrupted-write-does-not-wedge-the-collection.spec.ts`). On a larger
+cohort the same exit still strands the record on the other members, since a coordinated write's
+records carry no stamp, and a remote writer's record through any node is never stamped; the
+node-side backstop for those residuals is tracked in backlog
+`debt-unpromotable-pending-records-need-a-sweep`.
 
 A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is
 reported as an ordinary optimistic-concurrency loss, because that is what a single refusal is

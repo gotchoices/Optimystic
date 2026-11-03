@@ -94,15 +94,19 @@ export function stuckReservationMessage(holders: readonly ActionId[], refusedAct
 		`optimistic-concurrency loss, which is normal and healthy — the repetition is what is not. A ` +
 		`healthy rival holds a block only for its own pend-to-commit window and then releases it by ` +
 		`committing or cancelling; a reservation that keeps refusing NEW writers is holding the block ` +
-		`against every writer on every machine, and each of them loses again identically. EXACTLY TWO ` +
+		`against every writer on every machine, and each of them loses again identically. EXACTLY THREE ` +
 		`THINGS CLEAR IT: a cancel for action(s) ${held} on this block (route it through the cohort so ` +
-		`every member drops the record), or that same action's own commit landing. Nothing on the node ` +
-		`expires it — there is no sweep for abandoned pending records — so until one of those two happens ` +
-		`the block takes NO writes while continuing to serve reads and to look healthy in every other ` +
-		`respect. The usual cause is a writer that went away between a failed or half-applied commit and ` +
-		`the cancel it owed, so check whether whatever ran ${held} still exists before cancelling on its ` +
-		`behalf. This line is a diagnosis and nothing more: this node does not expire, refuse, or delete ` +
-		`the record on the strength of it.`;
+		`every member drops the record), that same action's own commit landing, or — on a one-machine ` +
+		`group only — the next write to the block, when the record is one this node's own earlier run ` +
+		`left for a writer in its own process (that writer is provably gone, and the node drops such a ` +
+		`record by itself; if this line is from a solo node, no cancel by hand is needed). Nothing else ` +
+		`on the node expires it — there is no sweep for a remote writer's record, or for a record of a ` +
+		`write a larger cohort decided — so until one of those happens the block takes NO writes while ` +
+		`continuing to serve reads and to look healthy in every other respect. The usual cause is a ` +
+		`writer that went away between a failed or half-applied commit and the cancel it owed, so check ` +
+		`whether whatever ran ${held} still exists before cancelling on its behalf. This line is a ` +
+		`diagnosis and nothing more: this node does not expire, refuse, or delete the record on the ` +
+		`strength of it.`;
 }
 
 /**

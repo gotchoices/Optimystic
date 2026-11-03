@@ -17,7 +17,9 @@ import type { IBlockStorage } from "./i-block-storage.js";
 import type { IRawStorage } from "./i-raw-storage.js";
 import type { FlushOptions } from "./store-durability.js";
 import { BlockStorage } from "./block-storage.js";
-import { isReservationAgainst, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
+import { randomBytes } from "@noble/hashes/utils.js";
+import { toString as uint8ArrayToString } from "uint8arrays";
+import { isReservationAgainst, isAbandonedClaim, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -174,6 +176,12 @@ export type StorageRepoOptions = {
 	 * {@link clock}.
 	 */
 	skewLogThresholdMs?: number;
+	/**
+	 * The identity of this repo's run — see {@link StorageRepo.runId}. Default: minted at random on
+	 * construction, which is what every production node wants. A test overrides it to build two repos
+	 * over one store that stand for two runs of one node, or one run twice.
+	 */
+	runId?: string;
 };
 
 /**
@@ -291,6 +299,14 @@ export interface IPendingClaimReader {
 	listPendingClaims(blockId: BlockId): Promise<PendingClaim[]>;
 	/** See `IBlockStorage.pendingClaimOf`. Read-only; never takes the block write latch. */
 	pendingClaimOf(blockId: BlockId, actionId: ActionId): Promise<PendingClaim | undefined>;
+	/**
+	 * The identity of this repo's current run — see {@link StorageRepo.runId}. What a claim's
+	 * `localRun` is judged against (`isAbandonedClaim`): a reader that hands out claims has to say
+	 * which run it is, or a claim stamped by an earlier run of this node could never be told from one
+	 * stamped by this run. A reader without it degrades the vote to "no claim is abandoned", never to
+	 * admitting one.
+	 */
+	readonly runId: string;
 }
 
 /**
@@ -351,10 +367,27 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * acts on it. `undefined` when the repo was built without a clock.
 	 */
 	readonly hlcSkew: SkewLedger | undefined;
+	/**
+	 * The identity of this repo's RUN: a random id minted once, here, when the repo is built. A
+	 * production node builds its `StorageRepo` once per process (`createLibp2pNodeBase`), so a run
+	 * is a process run there; the mesh harness builds a new one on `Mesh.restart`, which is what
+	 * makes a harness restart a new run. A pending record the node applies alone for a writer in its
+	 * own process is stamped with it (`BlockMetadata.pendingRuns`, from `MessageOptions.localWriter`),
+	 * and a record stamped with any OTHER run is abandoned — its writer was a transactor in a process
+	 * of this node that no longer exists (`isAbandonedClaim` in `./pending-claim.ts`).
+	 *
+	 * NOTE: per repo rather than per process, so a host that rebuilt its node in one process while
+	 * keeping a transactor from the old one would have that transactor's records judged abandoned by
+	 * a later rival while it may still commit. No host in this repository does this (the Quereus
+	 * plugin's `CollectionFactory.shutdown` stops the transactor before the node); if one ever does,
+	 * mint the id per process instead.
+	 */
+	readonly runId: string;
 
 	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
 		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
 		this.createBlockStorage = blockId => factory(blockId, storage);
+		this.runId = options?.runId ?? uint8ArrayToString(randomBytes(12), 'base64url');
 		this.validatePend = options?.validatePend;
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
 		this.changeHoldMs = options?.changeHoldMs ?? DEFAULT_CHANGE_HOLD_MS;
@@ -1041,8 +1074,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		}
 	}
 
-	async pend(request: PendRequest, _options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
+	async pend(request: PendRequest, options?: MessageOptions, apply?: StorageApplyOptions): Promise<PendResult> {
 		const hlc = this.pendHlcs?.receive(request);
+		// The records of a pend the writer marked as its own (`MessageOptions.localWriter`, set only by
+		// the transactor running in this process, never by a remote writer) are stamped with this run,
+		// so a later run can judge them abandoned. Nothing else is read off the options: this layer
+		// answers for one machine's storage, and the mark is the one fact about the writer it keeps.
+		const localRun = options?.localWriter === true ? this.runId : undefined;
 		// Re-check the transaction when a validation hook is configured — the unvalidatable-pend
 		// policy and the throwing-hook catch both live in the shared `checkPendValidation`, so this
 		// tier and the cluster tier cannot drift apart on what they refuse.
@@ -1059,7 +1097,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			return validationRefusal(validation);
 		}
 
-		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request), alwaysWrote, groupFlush(apply));
+		const { result, saved } = await this.endGroup(() => this.pendUnderLatches(request, localRun), alwaysWrote, groupFlush(apply));
 		if (result.success) {
 			this.notePendGroup(request.actionId, saved);
 			if (hlc !== undefined) this.pendHlcs?.stored(hlc);
@@ -1071,14 +1109,23 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * {@link pend}'s write group: classify every block, then save, under one hold of their write
 	 * latches. Returns the result to report and `saved`, the blocks pass 2 wrote a pending record for —
 	 * the action's pend group here (see {@link notePendGroup}); empty on every refusal.
+	 *
+	 * `localRun` is this repo's {@link runId} when the pend is the in-process writer's own
+	 * (`MessageOptions.localWriter`), stamped on every record pass 2 writes; `undefined` stamps nothing.
 	 */
-	private async pendUnderLatches(request: PendRequest): Promise<{ result: PendResult, saved: BlockId[] }> {
+	private async pendUnderLatches(request: PendRequest, localRun: string | undefined): Promise<{ result: PendResult, saved: BlockId[] }> {
 		// Already deduped: `blockIdsForTransforms` builds its result through a Set. So the pass-2 save
 		// loop below cannot write one block twice, and the echoed `blockIds` carries no duplicate.
 		const blockIds = blockIdsForTransforms(request.transforms);
-		log('pend actionId=%s blockIds=%d rev=%s', request.actionId, blockIds.length, request.rev);
+		log('pend actionId=%s blockIds=%d rev=%s localRun=%s', request.actionId, blockIds.length, request.rev, localRun);
 		const pendings: ActionPending[] = [];
 		const missing: ActionTransforms[] = [];
+		// Pending records on these blocks whose writer is provably gone — stamped with a run of this
+		// node other than the current one (`isAbandonedClaim`). Not reservations, so pass 1 does not
+		// count them; pass 2 deletes them under the same hold, so the judgement cannot be overtaken by
+		// a re-pend of the action (which would overwrite the stamp with the current run, and which
+		// pass 1 read under this hold).
+		const abandoned: ActionPending[] = [];
 		// Highest revision this node confirms holding among the blocks that are at or past the
 		// requested one — reported as StaleFailure.staleAt so a losing writer learns the number
 		// instead of parsing prose. Confirmed-local only: we read it from our own storage below.
@@ -1194,8 +1241,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// (`ClusterMember.reservingRivals`), so this scan is never stricter than the vote — a pend
 				// the cohort approved is not then refused here at apply, and a member that voted `held` on
 				// a stray record but was outvoted still stores the pend, whose commit then sweeps the record.
+				//
+				// Ahead of the slot rule: a record stamped with an earlier run of this node is abandoned
+				// — its writer was a transactor in a process of this node that no longer exists, so
+				// nothing can ever commit or cancel it — whatever slot it claims. It is deleted in pass 2.
 				for (const claim of await blockStorage.listPendingClaims()) {
-					if (isReservationAgainst(claim, { rev: request.rev })) {
+					if (isAbandonedClaim(claim, this.runId)) {
+						abandoned.push({ blockId, actionId: claim.actionId });
+						log('pend:abandoned-claim actionId=%s blockId=%s rival=%s claimedRev=%s run=%s',
+							request.actionId, blockId, claim.actionId, claim.rev, claim.localRun);
+					} else if (isReservationAgainst(claim, { rev: request.rev })) {
 						pendings.push({ blockId, actionId: claim.actionId });
 					} else {
 						log('pend:superseded-claim actionId=%s blockId=%s rival=%s claimedRev=%d requestedRev=%d',
@@ -1253,15 +1308,28 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// method's listPendingTransactions scan, and `ClusterMember.validatePendOperations`) refuse
 			// every future writer against. They still ride in the returned `blockIds` so `cancel`
 			// covers them (deleting an absent pending is a no-op that writes no metadata).
+			//
+			// An abandoned record found in pass 1 is deleted here, under the same hold and before the
+			// newcomer's record for its block: the writer is provably gone, and the record would
+			// otherwise reserve the slot against every later writer for good (GitHub #54). Deleted on a
+			// satisfied block too — the judgement does not depend on what this pend writes there.
 			const saved: BlockId[] = [];
 			for (const blockId of blockIds) {
+				const blockStorage = this.createBlockStorage(blockId);
+				const latch = latches.get(blockId)!;
+				for (const dead of abandoned) {
+					if (dead.blockId === blockId) await blockStorage.deletePendingTransaction(dead.actionId, latch);
+				}
 				if (satisfied.has(blockId)) {
 					continue;
 				}
-				const blockStorage = this.createBlockStorage(blockId);
 				const blockTransform = transformForBlockId(request.transforms, blockId);
-				await blockStorage.savePendingTransaction(request.actionId, blockTransform, request.rev,
-					declaredBaseFor(request.baseRevs, blockId, blockTransform), latches.get(blockId)!);
+				const baseRev = declaredBaseFor(request.baseRevs, blockId, blockTransform);
+				await blockStorage.savePendingTransaction(request.actionId, blockTransform, {
+					...(request.rev === undefined ? {} : { rev: request.rev }),
+					...(baseRev === undefined ? {} : { baseRev }),
+					...(localRun === undefined ? {} : { localRun })
+				}, latch);
 				saved.push(blockId);
 			}
 

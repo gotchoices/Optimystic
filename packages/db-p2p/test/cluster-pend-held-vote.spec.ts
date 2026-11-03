@@ -125,7 +125,8 @@ class StateRepo implements IRepo {
  * from the claims so the two views cannot disagree.
  */
 class ClaimRepo extends StateRepo implements IPendingClaimReader {
-	constructor(private readonly claims: PendingClaim[], latest?: ActionRev) {
+	/** The run this repo says it is, which a claim's `localRun` is judged against; see `isAbandonedClaim`. */
+	constructor(private readonly claims: PendingClaim[], latest?: ActionRev, readonly runId: string = 'run-under-test') {
 		super({ latest, pendings: claims.map(c => c.actionId) });
 	}
 	async listPendingClaims(_blockId: BlockId): Promise<PendingClaim[]> { return this.claims.map(c => ({ ...c })); }
@@ -302,6 +303,27 @@ describe('ClusterMember — a pending record reserves only the slot it claims', 
 		// refusal this member cast before claims were recorded — never an admission.
 		const vote = await voteOnPend(new StateRepo({ latest: LATEST_1, pendings: [RIVAL_ACTION] }), makePend({ rev: 3 }));
 		expect(vote.signature?.type).to.equal('held');
+	});
+
+	// Ticket: an-interrupted-write-wedges-a-collection-for-good (GitHub #54). A record stamped with an
+	// earlier run of this node — left by a writer in a process of this node that no longer exists —
+	// is abandoned, and this member's vote does not hold a newcomer on it even for the slot it
+	// claims; one stamped with THIS run is a live reservation of this run and holds as any other.
+	it('approves over a record an earlier run of this node left, whatever slot it claims', async () => {
+		const vote = await voteOnPend(
+			new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2, localRun: 'run-1' }], LATEST_1, 'run-2'),
+			makePend({ rev: 2 })
+		);
+		expect(vote.signature?.type, 'an abandoned record is nobody\'s reservation').to.equal('approve');
+	});
+
+	it('still holds for a record stamped with the current run', async () => {
+		const vote = await voteOnPend(
+			new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2, localRun: 'run-2' }], LATEST_1, 'run-2'),
+			makePend({ rev: 2 })
+		);
+		expect(vote.signature?.type, 'a live record of this run reserves its slot').to.equal('held');
+		expect(vote.signature).to.have.property('heldBy', RIVAL_ACTION);
 	});
 
 	it('names, once, a same-slot reservation that keeps refusing distinct writers', async () => {

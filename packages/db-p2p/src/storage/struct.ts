@@ -65,12 +65,27 @@ export type BlockMetadata = {
 	 * its own rule — `StorageRepo.internalCommit` falls back to the commit's declaration and then
 	 * abstains; the read-driven promotion in `StorageRepo.get` declines.
 	 *
-	 * NOTE: the two maps are not always co-keyed. A rev-less pend that names a base would leave an
-	 * entry here and none in `pendingRevs`, which the slot-driven dead-claim sweep cannot see, so it
-	 * would live until the record is deleted or promoted. Harmless, and no production caller sends a
-	 * rev-less pend (see the NOTE in `StorageRepo.pend`); if one ever appears, sweep this map too.
+	 * NOTE: the sibling maps are not always co-keyed with `pendingRevs`. A rev-less pend that names a
+	 * base, or that storage stamps with a run, would leave an entry here or in `pendingRuns` and none
+	 * in `pendingRevs`, which the slot-driven dead-claim sweep cannot see, so it would live until the
+	 * record is deleted or promoted. Harmless, and no production caller sends a rev-less pend (see the
+	 * NOTE in `StorageRepo.pend`); if one ever appears, sweep these maps too.
 	 */
 	pendingBases?: Record<ActionId, number>;
+	/**
+	 * The run of this node that saved each pending record, keyed by the record's action id — present
+	 * only for a record the node applied ALONE (no consensus) for a writer in its own process
+	 * (`MessageOptions.localWriter`), and absent for every other record: a remote writer's, a
+	 * coordinated write's, one written before the field existed. Read back as
+	 * `PendingClaim.localRun`; a record stamped with a run other than the current one is abandoned —
+	 * its writer was a transactor in a process of this node that no longer exists — and the next pend
+	 * of the block deletes it (`isAbandonedClaim` in `pending-claim.ts`). A third sibling of
+	 * `pendingRevs` and `pendingBases`, kept beside them for the same reasons (the record's value
+	 * stays a plain transform; metadata the release before the field wrote reads without a
+	 * migration) and written, dropped and swept in the same metadata writes
+	 * (`BlockStorage.recordClaim`), so the three can never describe different records.
+	 */
+	pendingRuns?: Record<ActionId, string>;
 };
 
 export type ArchiveRevisions = Record<number, {

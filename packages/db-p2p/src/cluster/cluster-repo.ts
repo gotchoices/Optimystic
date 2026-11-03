@@ -20,7 +20,7 @@ import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import type { BlockArchive } from "../storage/struct.js";
-import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
 import { batchShapeFault, getAffectedBlockIds } from "./record-operations.js";
@@ -2121,12 +2121,30 @@ export class ClusterMember implements ICluster {
 	 * Of the rival `claims` on `blockId`, the action ids of those that RESERVE the block against
 	 * `pendRequest` — see `isReservationAgainst` for the rule, fed the pend's revision and the base it
 	 * declares for this block (`reservationRequestFor`, the same reading storage applies at apply).
+	 *
+	 * Asked first, ahead of the slot rule: a record an earlier run of this node left for a writer in its
+	 * own process (`isAbandonedClaim`, against the run this member's storage says it is) is nobody's
+	 * reservation, so this member's vote does not hold a newcomer on it. The vote is read-only; the
+	 * record is deleted when the approved pend applies here (`StorageRepo.pend`). A storage seam that
+	 * does not say which run it is judges no claim abandoned, which is the hold this member cast before
+	 * the stamp existed.
 	 */
 	private reservingRivals(record: ClusterRecord, blockId: BlockId, claims: PendingClaim[], pendRequest: PendRequest): ActionId[] {
 		const reservation = this.reservationRequestOf(record, pendRequest, blockId);
+		const currentRun = (this.storageRepo as IRepo & Partial<IPendingClaimReader>).runId;
 		const reserving: ActionId[] = [];
 		for (const claim of claims) {
-			if (isReservationAgainst(claim, reservation)) {
+			if (isAbandonedClaim(claim, currentRun)) {
+				log('cluster-member:validation-pending-abandoned', {
+					messageHash: record.messageHash,
+					blockId,
+					actionId: pendRequest.actionId,
+					requestedRev: pendRequest.rev,
+					rival: claim.actionId,
+					claimedRev: claim.rev,
+					run: claim.localRun
+				});
+			} else if (isReservationAgainst(claim, reservation)) {
 				reserving.push(claim.actionId);
 			} else {
 				log('cluster-member:validation-pending-superseded', {

@@ -24,6 +24,53 @@ export interface PendingClaim {
 	 * rule, {@link isReservationAgainst}, keeps the revision rule for it).
 	 */
 	baseRev?: number;
+	/**
+	 * The identity of the run of this node — `StorageRepo.runId`, minted once per `StorageRepo`, so
+	 * once per process on a production node — that saved the record, kept in
+	 * `BlockMetadata.pendingRuns`. Present only when all three deciding facts held at the save: the
+	 * node applied the pend ALONE (the solo pend path, no consensus), for a writer running in the
+	 * node's own process (`MessageOptions.localWriter`, which never travels on the wire), in that run.
+	 * Absent for every other record — a remote writer's, a coordinated write's on a larger cohort, a
+	 * record written before the field existed — and absence says nothing: such a record is judged by
+	 * the slot rule alone. See {@link isAbandonedClaim}.
+	 */
+	localRun?: string;
+}
+
+/**
+ * What storage keeps for one pending record beside the record itself — a {@link PendingClaim} less
+ * the action id the metadata maps are keyed by. The shape `IBlockStorage.savePendingTransaction`
+ * takes and `BlockStorage.recordClaim` writes.
+ */
+export type PendingClaimFields = Omit<PendingClaim, 'actionId'>;
+
+/**
+ * Whether a pending record is ABANDONED: its writer was a transactor in a process of this node that no
+ * longer exists, so nothing can ever commit or cancel it. Decided from the claim alone, against the
+ * identity of the node's current run: a claim stamped with a run (`localRun`) other than `currentRun`.
+ *
+ * The three facts the stamp stands for (see {@link PendingClaim.localRun}) are what make the verdict
+ * safe without any guess about time. The writer ran in this node's process, and that process is over —
+ * a `StorageRepo` is built once per process on a production node — so the writer is provably gone;
+ * and the pend was applied here alone, so no other member holds a copy that a cohort decision could
+ * still commit. A claim with no stamp is never abandoned under this rule, whatever its age; so an
+ * unknown `currentRun` (a claims reader that does not say which run it is) judges nothing.
+ *
+ * Independent of {@link isReservationAgainst} on purpose: abandonment is a fact about the WRITER, the
+ * slot rule a fact about the SLOT, and both rival scans (`StorageRepo.pend` at apply,
+ * `ClusterMember.reservingRivals` at the vote) ask this first — an abandoned claim is not a reservation
+ * however its slot compares — and the slot rule only of the rest. A claim stamped with the current run
+ * is a live reservation of this run, judged by the slot rule like any other: two handles in one
+ * process racing for one slot must still refuse each other.
+ *
+ * NOTE: a host that rebuilds its node in one process while keeping a transactor from the old one would
+ * have that transactor's records stamped with the old `StorageRepo`'s run, so a later rival judges them
+ * abandoned while the transactor may still commit, and its commit then meets a missing record. No host
+ * in this repository does this (the Quereus plugin's `CollectionFactory.shutdown` stops the transactor
+ * before the node); if one ever does, mint the run id per process rather than per `StorageRepo`.
+ */
+export function isAbandonedClaim(claim: PendingClaim, currentRun: string | undefined): boolean {
+	return claim.localRun !== undefined && currentRun !== undefined && claim.localRun !== currentRun;
 }
 
 /**

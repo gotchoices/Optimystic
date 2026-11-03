@@ -2734,7 +2734,11 @@ export class CoordinatorRepo implements IRepo {
 			// record ran on the cohort, so this apply flushes with that cohort's window, as the
 			// member's own apply would have.
 			if (!localExecuted) {
-				const result = await this.applyPendsInOrder(batch, options, { syncWithinMs: this.syncWindowFor(record) });
+				// Consensus ran on this record, so it is applied WITHOUT the writer's in-process mark:
+				// a record a cohort decided is never stamped with this node's run (only `pendSolo`'s
+				// records are, see `MessageOptions.localWriter`), so no later run of this node judges
+				// it abandoned while the other members still hold it.
+				const result = await this.applyPendsInOrder(batch, withoutLocalWriter(options), { syncWithinMs: this.syncWindowFor(record) });
 				this.log('coordinator-repo:pend-fallback-result', {
 					actionId: batch.actionId,
 					success: result.success,
@@ -4061,6 +4065,19 @@ interface CommitRival {
 
 /** What one commit request's blocks say about who holds its revision — see `CoordinatorRepo.commitRevisionHolder`. */
 type CommitRevisionHolder = 'own-durable' | CommitRival | undefined;
+
+/**
+ * `options` less the writer's in-process mark (`MessageOptions.localWriter`), for applying a record
+ * consensus ran on. The mark is what lets storage stamp a record with this node's run, and only a
+ * record this node applied ALONE (`CoordinatorRepo.pendSolo`) may carry it: a record a cohort decided
+ * is held by the other members too, and must not be judged abandoned here by a later run of this node
+ * on the strength of a stamp.
+ */
+function withoutLocalWriter(options: MessageOptions | undefined): MessageOptions | undefined {
+	if (options?.localWriter === undefined) return options;
+	const { localWriter: _consensusRan, ...rest } = options;
+	return rest;
+}
 
 /**
  * Where the solo short-circuit's cohort put a write (`CoordinatorRepo.soloCohortOf`): nowhere the cohort

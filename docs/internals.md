@@ -2062,8 +2062,13 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   the base the pend declares for the block (`PendRequest.baseRevs`) is at or past that slot
   (`isReservationAgainst` and `cohortCanMissAPend` in `packages/db-p2p/src/storage/pending-claim.ts`,
   applied by `ClusterMember.validatePendOperations` at the vote and, revision rule only, by
-  `StorageRepo.pend` at apply). Without
-  that rule a member that promised a write and missed its commit vetoed every later write to the
+  `StorageRepo.pend` at apply). Ahead of the slot rule, both scans set aside a record whose writer
+  is provably gone: one the node applied alone, for a writer in its own process
+  (`MessageOptions.localWriter`, never on the wire), in an earlier run of the node
+  (`StorageRepo.runId`, stamped as `BlockMetadata.pendingRuns`) — abandoned by `isAbandonedClaim` in
+  the same file, deleted under the latch by the next pend of the block, which is what keeps a
+  process exit between pend and commit from wedging a one-machine group (GitHub #54). Without
+  the slot rule a member that promised a write and missed its commit vetoed every later write to the
   block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
   The coordinator raises `BlocksHeldError` — again never
   `ValidatorRejectionError` — and `CoordinatorRepo.pend` returns it as a `StaleFailure` with

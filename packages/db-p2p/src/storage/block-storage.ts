@@ -6,7 +6,7 @@ import type { IRawStorage } from "./i-raw-storage.js";
 import { mergeRanges } from "./helpers.js";
 import { RevisionNotCoveredError, PendRevisionTakenError, type IBlockStorage } from "./i-block-storage.js";
 import type { BlockWriteLatch } from "./block-latch.js";
-import type { PendingClaim } from "./pending-claim.js";
+import type { PendingClaim, PendingClaimFields } from "./pending-claim.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('block-storage');
@@ -174,21 +174,24 @@ export class BlockStorage implements IBlockStorage {
 		return BlockStorage.claimOf(await this.storage.getMetadata(this.blockId), actionId);
 	}
 
-	/** The claim `meta` describes for `actionId`'s (existing) record: its slot and its base, each
-	 * present only when on file. */
+	/** The claim `meta` describes for `actionId`'s (existing) record: its slot, its base and the run
+	 * that saved it, each present only when on file. */
 	private static claimOf(meta: BlockMetadata | undefined, actionId: ActionId): PendingClaim {
 		const rev = meta?.pendingRevs?.[actionId];
 		const baseRev = meta?.pendingBases?.[actionId];
+		const localRun = meta?.pendingRuns?.[actionId];
 		return {
 			actionId,
 			...(rev === undefined ? {} : { rev }),
-			...(baseRev === undefined ? {} : { baseRev })
+			...(baseRev === undefined ? {} : { baseRev }),
+			...(localRun === undefined ? {} : { localRun })
 		};
 	}
 
-	async savePendingTransaction(actionId: ActionId, transform: Transform, rev: number | undefined, baseRev: number | undefined, latch: BlockWriteLatch): Promise<void> {
+	async savePendingTransaction(actionId: ActionId, transform: Transform, claim: PendingClaimFields, latch: BlockWriteLatch): Promise<void> {
 		this.assertLatch(latch);
-		log('pend blockId=%s actionId=%s rev=%s baseRev=%s', this.blockId, actionId, rev, baseRev);
+		const { rev, baseRev, localRun } = claim;
+		log('pend blockId=%s actionId=%s rev=%s baseRev=%s localRun=%s', this.blockId, actionId, rev, baseRev, localRun);
 		let meta = await this.storage.getMetadata(this.blockId);
 		// Refuse a record that could never be promoted (see IBlockStorage.savePendingTransaction).
 		// The metadata read above is unconditional anyway, so this costs one comparison and no I/O.
@@ -209,13 +212,16 @@ export class BlockStorage implements IBlockStorage {
 			// seed then erased its `latest`); the latch the caller holds is what closes it.
 			meta = { latest: undefined, ranges: [] };
 		}
-		// Record the slot the record claims (see BlockMetadata.pendingRevs) and the base it was computed
-		// against (`pendingBases`) in the same metadata write that seeds a fresh block, BEFORE the record
-		// itself: a crash between the two leaves an inert entry with no record, whereas the other order
-		// would leave a record with no claim — which every reader treats as the strongest kind and would
-		// refuse rivals on more than it should — and with no base, which the read-driven promotion
-		// would then decline to apply. A redelivered pend for the same action overwrites all three.
-		BlockStorage.recordClaim(meta, actionId, { rev, baseRev });
+		// Record the slot the record claims (see BlockMetadata.pendingRevs), the base it was computed
+		// against (`pendingBases`) and the run saving it (`pendingRuns`) in the same metadata write that
+		// seeds a fresh block, BEFORE the record itself: a crash between the two leaves an inert entry
+		// with no record, whereas the other order would leave a record with no claim — which every reader
+		// treats as the strongest kind and would refuse rivals on more than it should — with no base,
+		// which the read-driven promotion would then decline to apply, and with no run, which no later
+		// run could ever judge abandoned. A redelivered pend for the same action overwrites all of them:
+		// a re-pend by the current run stamps its own run over an earlier one's, which is what makes the
+		// record live again (see `StorageRepo.pendUnderLatches`).
+		BlockStorage.recordClaim(meta, actionId, claim);
 		await this.storage.saveMetadata(this.blockId, meta);
 		await this.storage.savePendingTransaction(this.blockId, actionId, transform);
 	}
@@ -227,28 +233,39 @@ export class BlockStorage implements IBlockStorage {
 		// Metadata is written only when the record had a claim to drop: a cancel of an absent or
 		// claim-less record (the common torn-cancel retry) stays a pure no-op on the metadata blob.
 		const meta = await this.storage.getMetadata(this.blockId);
-		if (meta && (meta.pendingRevs?.[actionId] !== undefined || meta.pendingBases?.[actionId] !== undefined)) {
+		if (meta && BlockStorage.hasClaim(meta, actionId)) {
 			BlockStorage.recordClaim(meta, actionId, undefined);
 			await this.storage.saveMetadata(this.blockId, meta);
 		}
 	}
 
+	/** Whether any of the claim maps has an entry for `actionId`. */
+	private static hasClaim(meta: BlockMetadata, actionId: ActionId): boolean {
+		return meta.pendingRevs?.[actionId] !== undefined
+			|| meta.pendingBases?.[actionId] !== undefined
+			|| meta.pendingRuns?.[actionId] !== undefined;
+	}
+
 	/**
 	 * Set (`claim` given) or clear (`undefined`) what `meta` says about `actionId`'s pending record —
-	 * the slot it claims and the base it was computed against — keeping each map absent while it is
-	 * empty. The two are always written together, so no path can drop a record's slot and leave its
-	 * base behind, or the reverse: clearing is what every drop site calls — a delete, a promotion
-	 * (`setLatest`), a same-action forward write (`saveForwardRevision`) and the dead-claim sweep.
+	 * the slot it claims, the base it was computed against and the run that saved it — keeping each
+	 * map absent while it is empty. The three are always written together, so no path can drop a
+	 * record's slot and leave its base or run behind, or the reverse: clearing is what every drop site
+	 * calls — a delete, a promotion (`setLatest`), a same-action forward write (`saveForwardRevision`)
+	 * and the dead-claim sweep.
 	 */
-	private static recordClaim(meta: BlockMetadata, actionId: ActionId, claim: { rev?: number; baseRev?: number } | undefined): void {
+	private static recordClaim(meta: BlockMetadata, actionId: ActionId, claim: PendingClaimFields | undefined): void {
 		BlockStorage.setEntry(meta, 'pendingRevs', actionId, claim?.rev);
 		BlockStorage.setEntry(meta, 'pendingBases', actionId, claim?.baseRev);
+		BlockStorage.setEntry(meta, 'pendingRuns', actionId, claim?.localRun);
 	}
 
 	/** `meta[map][actionId] = value`, or removes the entry when `value` is undefined; the map itself
-	 * is dropped from `meta` once empty, so an idle block's metadata carries neither key. */
-	private static setEntry(meta: BlockMetadata, map: 'pendingRevs' | 'pendingBases', actionId: ActionId, value: number | undefined): void {
-		const entries = { ...meta[map] };
+	 * is dropped from `meta` once empty, so an idle block's metadata carries none of the keys. */
+	private static setEntry<M extends 'pendingRevs' | 'pendingBases' | 'pendingRuns'>(
+		meta: BlockMetadata, map: M, actionId: ActionId, value: NonNullable<BlockMetadata[M]>[ActionId] | undefined
+	): void {
+		const entries = { ...meta[map] } as NonNullable<BlockMetadata[M]>;
 		if (value === undefined) delete entries[actionId];
 		else entries[actionId] = value;
 		if (Object.keys(entries).length === 0) delete meta[map];

@@ -393,6 +393,7 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 	/** A repo that reads one record's claim and its own latest, and nothing else: no preview, so only
 	 *  this check can fire. */
 	class ClaimOfRepo extends MockRepo implements IPendingClaimReader {
+		readonly runId = 'run-under-test';
 		constructor(private readonly claims: Record<string, PendingClaim | undefined>, private readonly latestRev?: number) { super(); }
 		override async get(gets: BlockGets): Promise<GetBlockResults> {
 			if (this.latestRev === undefined) return {};

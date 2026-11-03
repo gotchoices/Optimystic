@@ -36,6 +36,21 @@ export type MessageOptions = {
 	 * peer reports what it holds itself, never what its cohort says. Never sent.
 	 */
 	skipClusterFetch?: boolean;
+	/**
+	 * The writer of this pend runs in the same process as the node it is sent to. Set only by
+	 * `NetworkTransactor.pend` and `pendMany`, on a pend sent to the repo of the transactor's own
+	 * `localPeerId`, and never sent: the repo protocol copies `expiration` alone onto the wire, and
+	 * the service that receives a remote pend builds its options from the message, so a remote writer
+	 * cannot claim it. Storage stamps the pending records of such a pend — when it applies them alone,
+	 * with no consensus — with the identity of the node's current run (`StorageRepo.runId`), and a
+	 * later run judges a record so stamped abandoned: its writer was a transactor in a process of this
+	 * node that no longer exists, so nothing can ever commit or cancel it (`isAbandonedClaim` in
+	 * `packages/db-p2p/src/storage/pending-claim.ts`). The mark is positive on purpose, like
+	 * {@link asker}: a path that forgets it leaves the record standing, as every record stood before
+	 * the mark existed, whereas a forgotten negative mark would have a live remote writer's record
+	 * judged dead.
+	 */
+	localWriter?: true;
 }
 
 export type RepoCommitRequest = {

@@ -5,7 +5,7 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
 import { assertTransactionFits, transactionBytes, MAX_TRANSACTION_BYTES } from "../network/transaction-size.js";
-import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability } from "../index.js";
+import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability, MessageOptions } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import type { HlcClock } from "../hlc/clock.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
@@ -793,7 +793,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					{
 						expiration,
 						dialTimeoutMs: this.dialTimeoutMs,
-						coordinatingBlockIds: batch.coordinatingBlockIds
+						coordinatingBlockIds: batch.coordinatingBlockIds,
+						...this.localWriterMark(batch.peerId)
 					}
 				),
 				batch => blockIdsForTransforms(batch.payload),
@@ -931,7 +932,8 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			answer = await repo.pendMany(requests, {
 				expiration: Date.now() + this.timeoutMs,
 				dialTimeoutMs: this.dialTimeoutMs,
-				coordinatingBlockIds: blockIds
+				coordinatingBlockIds: blockIds,
+				...this.localWriterMark(coordinator)
 			});
 		} catch (e) {
 			log('WARN: batched pend threw; pending each request on its own: actionId=%s peer=%s error=%s',
@@ -948,6 +950,16 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		for (const bid of blockIds) txnCoordinators.set(bid, coordinator);
 		this.recordCoordinatorHints([[blockIds[0]!, coordinator]]);
 		return { success: true, pending: answer.pending, blockIds, durability: mergeDurability([answer.durability]) };
+	}
+
+	/**
+	 * `{ localWriter: true }` when `peerId` is the node this transactor runs on (`localPeerId`), else
+	 * nothing — the mark `MessageOptions.localWriter` describes, set on every pend of this writer that
+	 * the node applies in process. Keyed on the peer each request actually goes to, so a batch re-homed
+	 * by a retry onto another coordinator carries no mark.
+	 */
+	private localWriterMark(peerId: PeerId): Pick<MessageOptions, 'localWriter'> {
+		return this.localPeerId !== undefined && peerId.toString() === this.localPeerId ? { localWriter: true } : {};
 	}
 
 	/**
@@ -1286,7 +1298,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 *
 	 * Residuals: the cancel is retried and checked ({@link dischargeCancel}), and one that outlasts its
 	 * budget is kept and re-sent for this transactor's life ({@link owedCancels}), so only a writer that
-	 * exits first leaves the record wedged until a node-side backstop sweep exists (backlog:
+	 * exits first leaves the record standing. A record the node applied alone for a writer in its own
+	 * process is stamped with that node run (`MessageOptions.localWriter`) and the node's next run drops
+	 * it on the next write to the block; on a larger cohort, or for a remote writer, it stays wedged
+	 * until a node-side backstop sweep exists (backlog:
 	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
@@ -1549,8 +1564,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * from this loop's own outstanding set, is what spares every caller from having to remember to.
 	 *
 	 * NOTE: a writer that exits (or stops this transactor, {@link stop}) while a cancel is still owed
-	 * strands the record, and nothing node-side reclaims it. That residual is the backstop tracked in backlog
-	 * `debt-unpromotable-pending-records-need-a-sweep`.
+	 * strands the record. The node reclaims it in one shape only: a record it applied alone, for a
+	 * writer in its own process (`MessageOptions.localWriter`), is stamped with the node run that
+	 * saved it, and the node's next run drops it on the next write to the block. A record on a larger
+	 * cohort, or a remote writer's, is reclaimed by nothing node-side; that residual is the backstop
+	 * tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
 	 *
 	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
 	 * 0 resolves coordinators live like every later round.
