@@ -14,7 +14,7 @@ import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js"
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
-import { isReservationAgainst, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { foldCommitResults, foldPendResults } from "../cluster/batch-verdicts.js";
 import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives, CohortCommitApplied } from "../cluster/cluster-repo.js";
@@ -2734,11 +2734,13 @@ export class CoordinatorRepo implements IRepo {
 			// record ran on the cohort, so this apply flushes with that cohort's window, as the
 			// member's own apply would have.
 			if (!localExecuted) {
-				// Consensus ran on this record, so it is applied WITHOUT the writer's in-process mark:
-				// a record a cohort decided is never stamped with this node's run (only `pendSolo`'s
-				// records are, see `MessageOptions.localWriter`), so no later run of this node judges
-				// it abandoned while the other members still hold it.
-				const result = await this.applyPendsInOrder(batch, withoutLocalWriter(options), { syncWithinMs: this.syncWindowFor(record) });
+				// Consensus ran on this record, so it is applied with NO writer options, exactly as the
+				// member's own apply is (`ClusterMember`'s `localApply().pend(pend, undefined, …)`): the
+				// only option storage reads is the writer's in-process mark (`MessageOptions.localWriter`),
+				// and a record a cohort decided must never be stamped with this node's run — the other
+				// members hold it too, so no later run of this node may judge it abandoned. `pendSolo` is
+				// the one path that hands the writer's options through.
+				const result = await this.applyPendsInOrder(batch, undefined, { syncWithinMs: this.syncWindowFor(record) });
 				this.log('coordinator-repo:pend-fallback-result', {
 					actionId: batch.actionId,
 					success: result.success,
@@ -3177,15 +3179,18 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * This node's pending records on `blockId`, each with the slot it claims when storage can say
-	 * (`IPendingClaimReader`, which `StorageRepo` implements). A repo without the capability answers
-	 * with `state.pendings` alone, every record read as an unknown claim — which reserves, so the
-	 * corroboration can only over-name, never under-name.
+	 * This node's LIVE pending records on `blockId`, each with the slot it claims when storage can say
+	 * (`IPendingClaimReader`, which `StorageRepo` implements). A record an earlier run of this node left
+	 * for a writer in its own process is left out (`isAbandonedClaim`, against the run the reader says
+	 * it is), as both rival scans leave it out: it is nobody's reservation, the next pend applied here
+	 * deletes it, and naming it would tell an operator to cancel by hand a record the node drops itself.
+	 * A repo without the capability answers with `state.pendings` alone, every record read as an
+	 * unknown claim — which reserves, so the corroboration can only over-name, never under-name.
 	 */
 	private async pendingClaimsOf(blockId: BlockId): Promise<PendingClaim[]> {
 		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
 		if (typeof reader.listPendingClaims === 'function') {
-			return await reader.listPendingClaims(blockId);
+			return (await reader.listPendingClaims(blockId)).filter(claim => !isAbandonedClaim(claim, reader.runId));
 		}
 		const results: GetBlockResults = await this.storageRepo.get({ blockIds: [blockId] });
 		return (results[blockId]?.state?.pendings ?? []).map(actionId => ({ actionId }));
@@ -4065,19 +4070,6 @@ interface CommitRival {
 
 /** What one commit request's blocks say about who holds its revision — see `CoordinatorRepo.commitRevisionHolder`. */
 type CommitRevisionHolder = 'own-durable' | CommitRival | undefined;
-
-/**
- * `options` less the writer's in-process mark (`MessageOptions.localWriter`), for applying a record
- * consensus ran on. The mark is what lets storage stamp a record with this node's run, and only a
- * record this node applied ALONE (`CoordinatorRepo.pendSolo`) may carry it: a record a cohort decided
- * is held by the other members too, and must not be judged abandoned here by a later run of this node
- * on the strength of a stamp.
- */
-function withoutLocalWriter(options: MessageOptions | undefined): MessageOptions | undefined {
-	if (options?.localWriter === undefined) return options;
-	const { localWriter: _consensusRan, ...rest } = options;
-	return rest;
-}
 
 /**
  * Where the solo short-circuit's cohort put a write (`CoordinatorRepo.soloCohortOf`): nowhere the cohort

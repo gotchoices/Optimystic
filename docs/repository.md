@@ -321,9 +321,10 @@ pend **alone**, with no consensus (`CoordinatorRepo.pendSolo`, the one path that
 options through to storage); the writer was running in the node's **own process**
 (`MessageOptions.localWriter` in `packages/db-core/src/network/i-repo.ts`, set by
 `NetworkTransactor.pend` and `pendMany` on a pend sent to the transactor's own `localPeerId`, and
-never put on the wire, so a remote writer cannot claim it); and the record was saved in an
-**earlier run** of the node (`StorageRepo.runId`, a random id minted once per `StorageRepo` — once
-per process on a production node — and stamped beside the record's slot as
+never put on the wire, so a remote writer cannot claim it — the Quereus plugin's `local` transactor, which writes to a `StorageRepo` in its own process with no node at all, sets the same mark on every pend); and the record was saved in an
+**earlier run** of the node (`StorageRepo.runId`, which is `PROCESS_RUN_ID` in
+`packages/db-p2p/src/storage/storage-repo.ts`: one random id per process, so every repo a process
+builds belongs to one run and a run ends exactly when the process does — and stamped beside the record's slot as
 `BlockMetadata.pendingRuns`). A record carrying a stamp from another run is abandoned
 (`isAbandonedClaim`): its writer was a transactor in a process of this node that no longer exists,
 and nothing else could ever commit or cancel it. `StorageRepo.pend` sets such records aside ahead

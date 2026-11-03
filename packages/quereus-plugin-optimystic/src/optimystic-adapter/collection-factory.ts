@@ -503,7 +503,12 @@ export class CollectionFactory {
         throw new Error('getStatus not implemented in local transactor');
       },
       async pend(request) {
-        return await storageRepo.pend(request);
+        // This writer runs in the storage's own process and the storage applies every pend alone,
+        // so each record is stamped with this run (`MessageOptions.localWriter`): a process that
+        // exits between a write's pend and its commit over a persistent `rawStorageFactory` store
+        // would otherwise leave a record the next run reads as a live reservation and refuses every
+        // later write on, exactly as a one-machine networked group did (GitHub #54).
+        return await storageRepo.pend(request, { localWriter: true });
       },
       async commit(request) {
         return await storageRepo.commit(request);

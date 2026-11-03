@@ -37,9 +37,10 @@ export type MessageOptions = {
 	 */
 	skipClusterFetch?: boolean;
 	/**
-	 * The writer of this pend runs in the same process as the node it is sent to. Set only by
+	 * The writer of this pend runs in the same process as the storage it is sent to. Set by
 	 * `NetworkTransactor.pend` and `pendMany`, on a pend sent to the repo of the transactor's own
-	 * `localPeerId`, and never sent: the repo protocol copies `expiration` alone onto the wire, and
+	 * `localPeerId`, and by a transactor that wraps a `StorageRepo` directly in its own process (the
+	 * Quereus plugin's `local` transactor), and never sent: the repo protocol copies `expiration` alone onto the wire, and
 	 * the service that receives a remote pend builds its options from the message, so a remote writer
 	 * cannot claim it. Storage stamps the pending records of such a pend — when it applies them alone,
 	 * with no consensus — with the identity of the node's current run (`StorageRepo.runId`), and a

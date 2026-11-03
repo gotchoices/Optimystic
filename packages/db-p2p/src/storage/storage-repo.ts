@@ -33,6 +33,18 @@ import { DEFAULT_SKEW_LOG_THRESHOLD_MS, PendHlcIntake } from "./pend-hlc-intake.
 
 const log = createLogger('storage-repo');
 
+/** A fresh run identity (12 random bytes, base64url) — see {@link StorageRepo.runId}. */
+export function mintRunId(): string {
+	return uint8ArrayToString(randomBytes(12), 'base64url');
+}
+
+/**
+ * The run identity of this process: minted once when this module loads, so every `StorageRepo`
+ * built in the process without `StorageRepoOptions.runId` shares it, and a new process is a new run.
+ * What `StorageRepo.runId` defaults to.
+ */
+export const PROCESS_RUN_ID = mintRunId();
+
 /**
  * Default for {@link StorageRepoOptions.changeHoldMs}: long enough to cover the relayed links on which
  * one action's collections were seen landing a few hundred milliseconds apart, with margin, and under
@@ -177,9 +189,11 @@ export type StorageRepoOptions = {
 	 */
 	skewLogThresholdMs?: number;
 	/**
-	 * The identity of this repo's run — see {@link StorageRepo.runId}. Default: minted at random on
-	 * construction, which is what every production node wants. A test overrides it to build two repos
-	 * over one store that stand for two runs of one node, or one run twice.
+	 * The identity of the run this repo belongs to — see {@link StorageRepo.runId}. Default:
+	 * {@link PROCESS_RUN_ID}, the one id of this process, which is what every production node and
+	 * every in-process transactor wants. The mesh harness overrides it with a fresh {@link mintRunId}
+	 * per node it builds or restarts, and a test overrides it to build two repos over one store that
+	 * stand for two runs of one node.
 	 */
 	runId?: string;
 };
@@ -368,26 +382,25 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 */
 	readonly hlcSkew: SkewLedger | undefined;
 	/**
-	 * The identity of this repo's RUN: a random id minted once, here, when the repo is built. A
-	 * production node builds its `StorageRepo` once per process (`createLibp2pNodeBase`), so a run
-	 * is a process run there; the mesh harness builds a new one on `Mesh.restart`, which is what
-	 * makes a harness restart a new run. A pending record the node applies alone for a writer in its
-	 * own process is stamped with it (`BlockMetadata.pendingRuns`, from `MessageOptions.localWriter`),
-	 * and a record stamped with any OTHER run is abandoned — its writer was a transactor in a process
-	 * of this node that no longer exists (`isAbandonedClaim` in `./pending-claim.ts`).
-	 *
-	 * NOTE: per repo rather than per process, so a host that rebuilt its node in one process while
-	 * keeping a transactor from the old one would have that transactor's records judged abandoned by
-	 * a later rival while it may still commit. No host in this repository does this (the Quereus
-	 * plugin's `CollectionFactory.shutdown` stops the transactor before the node); if one ever does,
-	 * mint the id per process instead.
+	 * The identity of the RUN this repo belongs to: by default {@link PROCESS_RUN_ID}, one random id
+	 * for the whole process, so every `StorageRepo` a process builds — one node's, two nodes', or two
+	 * `Database` handles' `local` transactors over one directory — is the same run, and a run ends
+	 * exactly when the process does. `StorageRepoOptions.runId` overrides it: the mesh harness mints a
+	 * fresh one for each node it builds or restarts (`Mesh.restart` stands for a process restart), and
+	 * a test builds two repos over one store as two runs. A pending record the node applies alone for
+	 * a writer in its own process is stamped with it (`BlockMetadata.pendingRuns`, from
+	 * `MessageOptions.localWriter`), and a record stamped with any OTHER run is abandoned — its writer
+	 * was a transactor in a process that no longer exists (`isAbandonedClaim` in `./pending-claim.ts`).
+	 * Per process rather than per repo on purpose: with one id per repo, two handles in one process
+	 * over one store each judged the other's LIVE record abandoned and deleted it from under its
+	 * commit (`packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`).
 	 */
 	readonly runId: string;
 
 	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
 		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
 		this.createBlockStorage = blockId => factory(blockId, storage);
-		this.runId = options?.runId ?? uint8ArrayToString(randomBytes(12), 'base64url');
+		this.runId = options?.runId ?? PROCESS_RUN_ID;
 		this.validatePend = options?.validatePend;
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
 		this.changeHoldMs = options?.changeHoldMs ?? DEFAULT_CHANGE_HOLD_MS;

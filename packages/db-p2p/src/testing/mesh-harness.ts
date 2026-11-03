@@ -11,7 +11,7 @@ import { createReconcileBlock } from '../cluster/reconcile-block.js';
 import { applyCarriedRecords, readCarriedOutcomes } from '../cluster/carried-records.js';
 import { createLogger } from '../logger.js';
 import { resolveClusterPolicy, type ClusterPolicyOptions, type ResolvedClusterPolicy } from '../cluster/cluster-policy.js';
-import { StorageRepo } from '../storage/storage-repo.js';
+import { StorageRepo, mintRunId } from '../storage/storage-repo.js';
 import { MemoryRawStorage } from '../storage/memory-storage.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { DurabilityWindowFor } from '../storage/durability-window.js';
@@ -554,7 +554,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	const buildMember = (meshNode: MeshNode, lifetime: NodeLifetime): void => {
 		const { peerId, privateKey } = meshNode;
 		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
-		const storageRepo = new StorageRepo(rawStorage, options.changeHoldMs === undefined ? undefined : { changeHoldMs: options.changeHoldMs });
+		// A fresh run per build: a restart stands for a new process, whose pending records the old run
+		// stamped (`MessageOptions.localWriter`) are abandoned (`StorageRepo.runId`).
+		const storageRepo = new StorageRepo(rawStorage, { runId: mintRunId(), ...(options.changeHoldMs === undefined ? {} : { changeHoldMs: options.changeHoldMs }) });
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
 		// reader holds a corroborated revision it cannot promote locally, pull the committed revision
