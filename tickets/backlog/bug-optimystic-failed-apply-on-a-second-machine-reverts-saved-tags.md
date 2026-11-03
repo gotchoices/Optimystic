@@ -23,3 +23,7 @@ The same path reverts the tags of other objects too: the undo of a dropped CHECK
 ## Expected
 
 The rule the catalog-only `ALTER` arms follow (`catalog-only-drop-check-constraint`): a change a machine finds already saved is adopted, and the undo of an adopted change touches only that machine's catalog, never the record. For tags this needs the save to know which tags an event changed (the event carries `oldObject` and `newObject`) rather than overlaying all of them, so an unwind event can be recognised as undoing an adopted tag change.
+
+## Since Quereus 4.25
+
+A refused `endSchemaBatch` now unwinds the apply as well, in a second batch, so a failed catalog commit reaches this path too. `AdoptedChanges` is carried into that batch for the catalog-only `ALTER` arms (`adoptedByRefusedBatch` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`); whatever fixes this ticket should read adopted tag changes from the same place.

@@ -525,6 +525,35 @@ describe('ALTER TABLE on an Optimystic table', function () {
 				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'b']);
 			});
 
+			it('a second machine whose commit is refused after adopting an ADD COLUMN leaves that column in the record', async () => {
+				const store = buildSharedLocalTransactor(new MemoryRawStorage());
+				const a = await openSession(store);
+				await a.db.exec(V1);
+				let refusals = 0;
+				const b = await openSession({
+					...store,
+					get: request => store.get(request),
+					pend: request => store.pend(request),
+					cancel: request => store.cancel(request),
+					getStatus: request => store.getStatus(request),
+					commit: request => refusals-- > 0 ? Promise.reject(new Error('injected refusal')) : store.commit(request),
+				} as ITransactor);
+				await b.plugin.hydrate(b.db);
+				await a.db.exec(`declare schema main { table t { id integer primary key, a integer null, c text null, b text null } } apply schema main;`);
+
+				// `b` adopts ADD COLUMN `b` and owns ADD COLUMN `d`, whose commit is refused. The undo arrives in
+				// a second batch, which has to know `b` was adopted or it would remove it from the record.
+				refusals = 1;
+				const error = await thrownBy(() => b.db.exec(`declare schema main { table t { id integer primary key, a integer null, c text null, b text null, d text null } } apply schema main;`)) as Error;
+				expect(error.message).to.include('injected refusal');
+				expect(b.db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'c']);
+				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'c', 'b']);
+
+				// The retry re-sends the DDL, and this time it lands.
+				await b.db.exec(`declare schema main { table t { id integer primary key, a integer null, c text null, b text null, d text null } } apply schema main;`);
+				expect((await savedColumns(store)).names).to.deep.equal(['id', 'a', 'c', 'b', 'd']);
+			});
+
 			it('two machines applying the same column upgrade at once both succeed, and the record holds it once', async () => {
 				const { store, a, b } = await twoMachines();
 

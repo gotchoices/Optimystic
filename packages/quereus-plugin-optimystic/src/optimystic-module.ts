@@ -4606,6 +4606,20 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     adopted: AdoptedChanges;
   };
 
+  /**
+   * The adopted changes of a batch whose commit {@link endSchemaBatch} just refused, for the batch
+   * Quereus opens next to run the undo DDL. The undo of an adopted change has to be recognised
+   * there too, or it would remove from the record what another machine committed. The next
+   * {@link beginSchemaBatch} takes it.
+   *
+   * NOTE: when a data-destroying step ran, Quereus opens no second batch, so these reach the next
+   * apply instead. A change there that exactly reverses one of them then skips the record, and the
+   * next hydrate brings the change back. That takes an adopted change, a refused commit and a
+   * data-destroying step in one apply, then the reversal in the next. The hook is told nothing that
+   * separates the two batches; if Quereus ever says which batch is an unwind, take these only then.
+   */
+  private adoptedByRefusedBatch?: AdoptedChanges;
+
   /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
   private readonly followedDatabases = new WeakSet<Database>();
 
@@ -4829,7 +4843,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       manager.beginBatch();
       managers.add(manager);
     }
-    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted: new AdoptedChanges() };
+    const adopted = this.adoptedByRefusedBatch ?? new AdoptedChanges();
+    this.adoptedByRefusedBatch = undefined;
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted };
   }
 
   /**
@@ -4868,8 +4884,23 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * ({@link OptimysticVirtualTable.markSchemaUnpersisted}) so its next touch re-persists it —
    * WITHOUT any index whose tree did not land, since listing that index is the very failure the
    * ordering prevents. The remaining managers still land and commit, and the first failure is
-   * rethrown — the engine rethrows it when there was no loop error and logs and swallows it when
-   * there was. A table DROPPED inside the batch has no instance left to re-persist anything: its
+   * rethrown. The engine logs and swallows it when there was a loop error. With no loop error it
+   * is a refusal (Quereus 4.25): the apply fails and, unless a data-destroying step ran, the engine
+   * opens a second batch and runs the undo DDL through this module's ordinary hooks, so a retry
+   * re-sends the DDL. Those hooks accept the undo of a change the store never received: a drop of a
+   * table with no record stages a gravestone, an index subtraction finds nothing to subtract, and a
+   * catalog-only undo finds the record already agreeing. The marks above serve the data-destroying
+   * case, where the engine keeps what landed.
+   *
+   * NOTE: Quereus requires that a refusal mean nothing from the batch reached the store. Across
+   * several managers (tables over different transactors) that does not hold: a manager earlier in
+   * the loop has committed when a later one refuses. The second batch's undo DDL takes that manager
+   * back too, unless its own commit then fails, which leaves it holding the migration under a
+   * restored engine catalog with only a log line, since the engine tolerates a second refusal from
+   * a module that refused the first. Closing this needs one atomic commit across managers
+   * (`feat-cross-collection-atomic-commit`, backlog).
+   *
+   * A table DROPPED inside the batch has no instance left to re-persist anything: its
    * gravestone is lost with the commit, the catalog keeps its live record past the DROP (the next
    * hydrate resurrects it, and a later CREATE over the same URI is not checked against it — the
    * same failure direction as the unbatched, best-effort {@link destroy}), so the log names those
@@ -4878,7 +4909,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * builds one from the engine's catalog entry, which carries the new tags, and its initialization
    * writes them. A restart before that loses the change; the next `apply schema` then re-emits it.
    */
-  async endSchemaBatch(_db: Database, _schemaName: string, _error?: unknown): Promise<void> {
+  async endSchemaBatch(_db: Database, _schemaName: string, error?: unknown): Promise<void> {
     // The apply's tag changes stage into the batch, so they commit in its one catalog commit.
     await this.whenCatalogPersisted();
     const batch = this.schemaBatch;
@@ -4915,7 +4946,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         }
         step = 'catalog commit';
         await manager.commitBatch();
-      } catch (error) {
+      } catch (failure) {
         // Closes the batch when a tree flush threw before commitBatch ran; a no-op otherwise.
         manager.discardBatch();
         const withheld = new Map<string, Set<string>>();
@@ -4932,17 +4963,20 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
           'their schema on next touch (%s), without the %d index(es) whose tree did not land (%s); %d dropped ' +
           'table(s) keep a live catalog record past their DROP — the next hydrate resurrects them and a later ' +
           'CREATE over the same URI is not checked against them (%s)',
-          step, error, unpersisted.length, unpersisted.join(', '), unlanded.size,
+          step, failure, unpersisted.length, unpersisted.join(', '), unlanded.size,
           [...unlanded.values()].map(({ tableKey, indexName }) => `${tableKey}.${indexName}`).join(', '),
           dropped.length, dropped.join(', ')
         );
         if (!failed) {
           failed = true;
-          firstFailure = error;
+          firstFailure = failure;
         }
       }
     }
     if (failed) {
+      if (error === undefined) {
+        this.adoptedByRefusedBatch = batch.adopted;
+      }
       throw firstFailure;
     }
   }

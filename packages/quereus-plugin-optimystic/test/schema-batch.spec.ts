@@ -17,7 +17,8 @@
  * batch, so the overlay then holds the pre-apply state and the one commit lands it. A per-statement
  * checkpoint withdraws the failed statement's own catalog changes; the exception to the unwind is a
  * step the differ marks irreversible (`drop table`), after which the engine keeps what landed and
- * reports the schema as partially migrated. Every failure-shape case below asserts BOTH catalogs —
+ * reports the schema as partially migrated. A refused commit is unwound the same way, in a second
+ * begin/end pair (Quereus 4.25), so a retry re-sends the DDL. Every failure-shape case below asserts BOTH catalogs —
  * the live Database's and a fresh, hydrated one's — because checking storage alone is what let a
  * `DROP INDEX` that never reached the plugin's record go unnoticed.
  *
@@ -541,27 +542,61 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 		await expectCatalogsAgree(h, h.db, { new: [] });
 	});
 
-	it('a failed end-of-batch commit is recovered by the next touch of each batch-created table', async () => {
+	it('a refused end-of-batch commit fails the apply, the engine unwinds it in a second batch, and a retry lands it', async () => {
 		const h = harness();
 		await h.db.exec(`pragma default_vtab_module='optimystic'`);
 		// Cold database: the batch's one catalog commit is the catalog's CREATING commit, so its
 		// block ids carry the catalog header. (t0 is empty, so its index tree is not flushed at all.)
-		h.gate.failCommit = ids => ids.includes(CATALOG_ID);
+		// Only the first is refused, so the undo batch's commit lands.
+		let refusals = 1;
+		h.gate.failCommit = ids => ids.includes(CATALOG_ID) && refusals-- > 0;
 
 		await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
-		expect(h.hooks.end, 'endSchemaBatch ran').to.equal(1);
-		expect(h.hooks.endErrors, 'no loop error — the end-commit failure is what propagated').to.deep.equal([undefined]);
-
-		// Nothing reached the catalog.
 		h.gate.failCommit = undefined;
-		expect((await h.reopen()).hydrated.tables).to.equal(0);
+		expect(h.hooks.end, 'the refused batch, then the batch holding the undo DDL').to.equal(2);
+		expect(h.hooks.endErrors, 'the refusal, then the undo batch, which always ends clean').to.deep.equal([undefined, undefined]);
+		await expectCatalogsAgree(h, h.db, {});
 
-		// The engine still has t0 and its index. The next statement re-initializes the table,
-		// finds no persisted record, and persists the schema INCLUDING the index it maintains.
+		await h.db.exec(declaration(1, ['t0']));
 		await h.db.exec(`insert into t0 values (1, 'x')`);
-		const { db: db2, hydrated } = await h.reopen();
-		expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
-		expect(await queryAll(db2, `select id from t0 where name = 'x'`)).to.deep.equal([{ id: 1 }]);
+		const fresh = await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
+		expect(await queryAll(fresh, `select id from t0 where name = 'x'`)).to.deep.equal([{ id: 1 }]);
+	});
+
+	it('refusing the undo batch too is tolerated: the store never held the migration, and a retry lands it', async () => {
+		const h = harness();
+		await h.db.exec(`pragma default_vtab_module='optimystic'`);
+		h.gate.failCommit = ids => ids.includes(CATALOG_ID);
+
+		const error = await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
+		h.gate.failCommit = undefined;
+		expect(error.message, 'a verified restore rethrows the refusal unchanged').to.not.match(/not restored|could not be restored/i);
+		expect(h.hooks.end).to.equal(2);
+		await expectCatalogsAgree(h, h.db, {});
+
+		await h.db.exec(declaration(1, ['t0']));
+		await h.db.exec(`insert into t0 values (1, 'x')`);
+		await expectCatalogsAgree(h, h.db, { t0: ['t0_by_name'] });
+	});
+
+	it('a refused commit after a data-destroying step is not unwound; each table the batch wrote heals on its next touch', async () => {
+		const h = harness();
+		await h.db.exec(`pragma default_vtab_module='optimystic'`);
+		await h.db.exec(declaration(1));
+
+		// Declaring only t1 plans `drop table t0`, which poisons the undo journal, then `create table t1`.
+		const declared = `declare schema main {\ntable t1 { ${tableBody} }\nindex t1_by_name on t1 (name)\n}\napply schema main;`;
+		h.gate.failCatalogSync = true;
+		await expectRejects(h.db.exec(declared), /injected failure/);
+		h.gate.failCatalogSync = false;
+		expect(engineCatalog(h.db), 'the engine keeps what landed').to.deep.equal({ t1: ['t1_by_name'] });
+
+		// The next statement re-initializes t1, finds no persisted record, and persists the schema
+		// INCLUDING the index it maintains.
+		await h.db.exec(`insert into t1 values (1, 'x')`);
+		const { db: db2 } = await h.reopen();
+		expect(engineCatalog(db2).t1).to.deep.equal(['t1_by_name']);
+		expect(await queryAll(db2, `select id from t1 where name = 'x'`)).to.deep.equal([{ id: 1 }]);
 	});
 
 	it('a failed end-of-batch commit loses the gravestone of a table dropped inside it; the next hydrate resurrects it', async () => {
@@ -720,38 +755,32 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			expect(fresh.seeks).to.include('t0_by_name');
 		});
 
-		it('a deferred index tree that fails to land cancels the catalog commit; nothing ever lists the index over missing entries', async () => {
+		it('a deferred index tree that fails to land cancels the catalog commit; the engine unwinds the index, and a retry builds it', async () => {
 			const h = harness();
 			await seedT0(h, `(1, 'alice'), (2, 'bob')`);
-			const catalogCommits = h.catalog.commits();
+			h.hooks.endErrors.length = 0;
+			resetTrail(h);
 			h.gate.failCommit = ids => ids.some(id => id.includes('/index/'));
 
 			await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
-			expect(h.hooks.endErrors, 'the loop succeeded; endSchemaBatch is what failed').to.deep.equal([undefined, undefined]);
-			expect(h.catalog.commits(), 'the catalog commit was never attempted').to.equal(catalogCommits);
+			expect(h.hooks.endErrors, 'the refusal, then the batch holding the undo DDL').to.deep.equal([undefined, undefined]);
+			expect(commitsCarrying(h.trail, '/index/t0_by_name'), 'the unwind withdrew the tree from its deferred flush').to.equal(1);
 			h.gate.failCommit = undefined;
 
-			// Storage: the table and its rows, and no index.
+			// Both catalogs hold the table and no index, so nothing lists it over missing entries.
 			const stale = await h.reopen();
 			expect(stale.hydrated).to.deep.equal({ tables: 1, indexes: 0 });
-
-			// This Database: t0 re-initializes on its next touch WITHOUT the index whose tree did not
-			// land, so a read routed through it refuses loudly instead of returning too few rows,
-			// and the re-persist lists nothing new.
-			await expectRejects(queryAll(h.db, `select id from t0 where name = 'bob'`), /does not maintain index 't0_by_name'/);
+			expect(engineCatalog(h.db)).to.deep.equal({ t0: [] });
 			expect(await queryAll(h.db, 'select count(*) as n from t0')).to.deep.equal([{ n: 2 }]);
-			expect((await h.reopen()).hydrated, 'the recovery did not list the index').to.deep.equal({ tables: 1, indexes: 0 });
 
-			// A corrected re-apply from the Database that hydrated the index-less record builds it
-			// complete. Its plan is a lone CREATE INDEX on a table no statement there has touched yet.
-			await stale.db.exec(`pragma default_vtab_module='optimystic'`);
-			await stale.db.exec(declaration(1, ['t0']));
-			const rebuilt = await queryWithSeeks(stale.db, `select id from t0 where name = 'bob'`);
+			// A retry from this Database builds the index complete.
+			await h.db.exec(declaration(1, ['t0']));
+			const rebuilt = await queryWithSeeks(h.db, `select id from t0 where name = 'bob'`);
 			expect(rebuilt.rows).to.deep.equal([{ id: 2 }]);
 			expect(rebuilt.seeks).to.include('t0_by_name');
-			const { db: db3, hydrated } = await h.reopen();
+			const { db: db2, hydrated } = await h.reopen();
 			expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
-			const fresh = await queryWithSeeks(db3, `select id from t0 where name = 'bob'`);
+			const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
 			expect(fresh.rows).to.deep.equal([{ id: 2 }]);
 			expect(fresh.seeks).to.include('t0_by_name');
 		});
@@ -853,9 +882,13 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			}
 		});
 
-		it('after a deferred index tree fails to land, DROP INDEX then CREATE INDEX recovers it in the same Database', async () => {
+		it('when a data-destroying step keeps the index in the engine, a read refuses until DROP INDEX then CREATE INDEX recovers it', async () => {
 			const h = harness();
-			await seedT0(h, `(1, 'alice'), (2, 'bob')`);
+			await h.db.exec(`pragma default_vtab_module='optimystic'`);
+			await h.db.exec(declaration(2));
+			await h.db.exec(`insert into t0 values (1, 'alice'), (2, 'bob')`);
+			// Declaring only t0 plans `drop table t1`, which poisons the undo journal, so the refused
+			// commit is not unwound.
 			h.gate.failCommit = ids => ids.some(id => id.includes('/index/'));
 			await expectRejects(h.db.exec(declaration(1, ['t0'])), /injected failure/);
 			h.gate.failCommit = undefined;
@@ -872,7 +905,7 @@ describe('APPLY SCHEMA coalesces catalog writes into one commit', function () {
 			expect(live.rows).to.deep.equal([{ id: 2 }]);
 			expect(live.seeks).to.include('t0_by_name');
 			const { db: db2, hydrated } = await h.reopen();
-			expect(hydrated).to.deep.equal({ tables: 1, indexes: 1 });
+			expect(hydrated.indexes).to.equal(1);
 			const fresh = await queryWithSeeks(db2, `select id from t0 where name = 'bob'`);
 			expect(fresh.rows).to.deep.equal([{ id: 2 }]);
 			expect(fresh.seeks).to.include('t0_by_name');

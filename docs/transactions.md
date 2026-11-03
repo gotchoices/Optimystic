@@ -462,12 +462,30 @@ stops maintaining the index at the same time (its tree leaves the
 nothing lists.
 
 **End-commit failure.** If the one catalog commit itself fails, `endSchemaBatch`
-throws (the engine rethrows it when there was no loop error, and logs and
-swallows it when there was — by which point it has normally already unwound
-the apply, so the tables below are those of a loop that succeeded or of one
-left partially migrated). The tables created or given an index inside the
-batch are then in the engine's catalog and cached as initialized, but
-unpersisted. The module marks each of them unpersisted
+throws. When there was a loop error the engine logs and swallows that, having
+normally already unwound the apply. With no loop error it is a **refusal**, and
+since Quereus 4.25 a refusal fails the apply: the engine opens a second
+`beginSchemaBatch`/`endSchemaBatch` pair, runs the undo DDL inside it through the
+module's ordinary hooks, and rethrows the refusal, so a retry re-sends the DDL. A
+refusal means nothing of that manager's batch reached the catalog, so the undo DDL
+arrives for changes the store never received, and the hooks accept it: dropping a
+table with no record stages a gravestone, an index subtraction finds nothing to
+subtract, and a catalog-only undo finds the record already agreeing. Changes this
+machine adopted from another machine's commit stay off the record in the second
+batch too (`adoptedByRefusedBatch` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`). If the second
+commit also fails, the engine tolerates it, since the store still holds the
+pre-apply state.
+
+With tables over more than one transactor there is one `SchemaManager` each, so
+one can have committed when a later one refuses. The undo DDL takes the first back
+in the second batch, unless its second commit fails too, which leaves it holding
+the migration under a restored engine catalog with only a log line
+(`feat-cross-collection-atomic-commit`, backlog).
+
+A step marked irreversible poisons the journal and nothing is unwound, so the
+tables created or given an index inside the batch stay in the engine's catalog,
+cached as initialized, but unpersisted. The module marks each of them unpersisted
 (`markSchemaUnpersisted` in
 `packages/quereus-plugin-optimystic/src/optimystic-module.ts`); its next touch
 re-runs initialization, finds no persisted record, and writes the schema —
@@ -493,13 +511,21 @@ no record ever lists an index over missing entries; the opposite order (the
 unbatched one) lets the planner seek through an index whose entries never
 landed, which returns silently wrong results. What the failed tree did receive
 is harmless: a later `CREATE INDEX` of the same name adopts it and re-stages
-every row. The tables are then recovered as for an end-commit failure, except
-that an index whose tree did not land is withheld from the re-persist. In the
-running process a read routed through that index refuses loudly
-(`assertIndexMaintained`) until the index is dropped and re-created (`DROP
-INDEX`, then `CREATE INDEX`). The engine still lists it, so a re-apply plans
-nothing and a bare `CREATE INDEX` is refused as a duplicate. A fresh
-`Database`'s `apply schema` rebuilds it too.
+every row. It is a refusal like any other, so the engine normally unwinds the
+index and a retry builds it. After a data-destroying step the engine keeps it
+instead, and the tables are recovered as above, except that an index whose tree
+did not land is withheld from the re-persist. In the running process a read
+routed through that index then refuses loudly (`assertIndexMaintained`) until
+the index is dropped and re-created (`DROP INDEX`, then `CREATE INDEX`). The
+engine still lists it, so a re-apply plans nothing and a bare `CREATE INDEX` is
+refused as a duplicate. A fresh `Database`'s `apply schema` rebuilds it too.
+
+**A primary-key change in `apply schema` is refused.** Quereus 4.25 refuses a
+primary-key rebuild inside an apply while any registered module defines
+`endSchemaBatch`, and this one does, so it applies to every table in a `Database`
+with this plugin registered, whichever module owns the table. Run `alter table …
+alter primary key (…)` alone in autocommit, then re-apply; on an Optimystic table
+that statement is itself refused, since the module cannot re-key in place.
 
 **What the batch does not change.**
 
