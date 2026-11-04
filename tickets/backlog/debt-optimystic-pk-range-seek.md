@@ -66,6 +66,10 @@ full PK. `rule-select` picks the single constrained `rangeCol`, but the module's
 `bestSeekColumnIndexes = [...pkColumns]` currently reports all PK columns; check
 this does not misframe a composite-PK range.
 
+## Arm: the TEXT primary key need not wait for the key-ordering work
+
+`an-index-walk-serves-order-by` and `a-secondary-index-serves-range-predicates` establish the rules for a secondary index on a BINARY text column, and the primary-key tree uses the same framing and comparator. So a text primary key could get an ordering-only walk and a range seek under those same rules without `debt-optimystic-true-key-ordering`, using `schema/index-walk.ts`: its column rule, its bound table, and `inEngineOrder`. Those rules include the code-unit against code-point difference, which also applies here and is not covered by the numeric notes above. Numeric, DESC-declared and collated keys remain gated.
+
 ## Acceptance
 
 - Range predicate on an integer PK returns exactly the in-range rows, in correct

@@ -43,6 +43,10 @@ ascending iteration alone — they need reverse iteration and/or a collation-awa
 comparator. Decide per-case whether to support them at the tree level or keep
 letting the engine re-sort (the guard already makes the latter correct).
 
+Whichever is chosen must also settle text order. The trees compare UTF-16 code units while Quereus's BINARY collation compares code points (`compareCodePoints` in `@quereus/quereus/src/util/comparison.ts`), so even BINARY text differs for an astral character against U+E000–U+FFFF. `an-index-walk-serves-order-by` corrects this at read time (`inEngineOrder`), and a stored order equal to the engine's would retire that.
+
+`an-index-walk-serves-order-by` also serves descending order through a reverse walk, so the "Reverse iteration" question below is answered for text. The same walk would serve numeric columns once their encoding preserves order.
+
 ## Downstream
 
 `debt-optimystic-pk-range-seek` depends on this: a correct range seek needs tree
