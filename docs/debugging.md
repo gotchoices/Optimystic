@@ -394,22 +394,26 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   line therefore names both collections the scan read, and joins to `commit:collections` and
   `index:tree-open`, which print the same ids.
 - `seek=` — the framed index key the descent bracketed on, percent-escaped (the framing carries
-  control bytes, so a raw key would break whitespace-separated parsing). Two nodes seeking the same
+  control bytes, so a raw key would break whitespace-separated parsing). An `in (…)` list seeks one
+  key per distinct listed value on this one line: the keys are joined with commas in the order
+  sought, which is the tree's ascending order rather than the order the statement wrote them, so
+  `where token in ('tok-b', 'tok-a')` prints `seek=%01tok-a%00,%01tok-b%00`. Two nodes seeking the same
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than
   the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
-  `seek=unset` means the scan returned before framing a key at all — in practice a seek value that
-  arrived NULL, which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0 rejected=0
+  `seek=unset` means the scan sought nothing at all — in practice every seek value arrived NULL,
+  which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0 rejected=0
   seek=unset` is a correct empty answer and not an index fault. **Compare it, do not decode
   it** — un-escaping yields the raw tuple framing (element tags, escaped NULs), not the SQL value
   that was sought; and only `A-Za-z0-9._-` survive verbatim, every other code unit becoming `%XX`
   or, above U+00FF, `%uXXXX` — which is not valid percent-encoding, so a decoder would reject or
   mangle a key carrying non-Latin-1 text.
-- `matched=` — how many **index entries** the seek produced, counted before the row fetch. Entries
-  dropped later still count here. It is a **floor**: a scan the caller abandons early (a satisfied
-  `LIMIT`, an error mid-scan) reports what it had produced when it stopped, so `matched=0` still
-  means the descent found nothing.
+- `matched=` — how many **index entries** the seek produced across all its keys, counted before the
+  row fetch. Entries dropped later still count here. It is a **floor**: a scan the caller abandons
+  early (a satisfied `LIMIT`, an error mid-scan) reports what it had produced when it stopped, so
+  `matched=0` still means the descent found nothing.
 - `rejected=` — how many of those entries the scan then dropped, because the row their primary key
-  names is gone or does not imply the entry. `matched - rejected` is what the scan returned. Any
+  names is gone, does not imply the entry, or was already returned under an earlier key of the same
+  list (a row that moved between the two seeks). `matched - rejected` is what the scan returned. Any
   nonzero value means **the index tree and the main table disagreed as this scan read them**, which
   has two causes — read `rev=`, `main_rev=` and `arm=` on the same line to tell them apart:
   - **The tree is damaged** — it holds an entry no row accounts for. Run

@@ -26,6 +26,9 @@ import { LateBoundCohortReachability } from './late-bound-reachability.js';
 
 const log = createLogger('collection-factory');
 
+/** The total order every tree this factory opens keeps its keys in: raw string comparison. */
+export const compareTreeKeys = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
+
 /**
  * A libp2p node this factory holds. Nodes it builds itself (`createLibp2pNode`) carry the full
  * {@link OptimysticNodeAttachments} surface; nodes a host injects through `registerLibp2pNode`
@@ -195,14 +198,12 @@ export class CollectionFactory {
     const transactor = await this.getOrCreateTransactor(options);
     const collectionId = this.parseCollectionId(options.collectionUri);
 
-    const compare = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
-
     // Both tree flavours key on the first tuple element: data trees hold
     // `[primaryKey, encodedRow]`, the schema catalog holds `[catalogKey, PersistedTableSchema]`
     // (whose second element is an object, not a string — it rides through as RowData).
     const keyExtractor = (entry: RowData) => this.extractKeyFromEntry(entry);
 
-    return { transactor, collectionId, keyExtractor, compare };
+    return { transactor, collectionId, keyExtractor, compare: compareTreeKeys };
   }
 
   /** Transaction-scoped cache lookup; collections are never cached beyond a transaction

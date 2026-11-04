@@ -5,7 +5,7 @@
  * virtual tables backed by Optimystic distributed tree collections.
  */
 
-import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
+import { CollectionFactory, compareTreeKeys } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
@@ -15,8 +15,8 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, shiftSchemaIndicesForDrop } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
@@ -105,25 +105,26 @@ interface IndexScanSource extends IndexScanTarget {
  * `index:seek` trace can report what the seek actually did, without the trace having to
  * rebuild the seek key or re-walk the entries:
  *
- * - `matched` — how many INDEX ENTRIES the seek produced, not how many rows the caller
- *   ended up keeping. The distinction is the point of the field: zero entries means the
- *   descent found nothing in the index tree, which is a different failure from "entries
- *   found, rows resolved, verification rejected them later".
+ * - `matched` — how many INDEX ENTRIES the seek produced across every key it sought, not how
+ *   many rows the caller ended up keeping. The distinction is the point of the field: zero
+ *   entries means the descent found nothing in the index tree, which is a different failure
+ *   from "entries found, rows resolved, verification rejected them later".
  * - `rejected` — how many of those entries the scan did NOT yield: the row their primary
- *   key names is gone, or it is there but does not imply the entry (see the verification in
- *   {@link OptimysticVirtualTable.executeIndexScan}). It is otherwise invisible from the read
- *   path, which now answers correctly over a broken tree instead of visibly wrongly.
- *   `matched - rejected` is what the scan yielded. A rejection means the index tree and the
- *   main table DISAGREED AS THIS SCAN READ THEM, which has two causes and the same line carries
- *   the fields that separate them: index damage (`rev`/`main_rev` consistent — confirm with
- *   `plugin.verifyIndexes`), or the two views sitting at different moments, which rejects a
- *   perfectly healthy entry whose row the main view has not caught up to yet (see `main_rev=`
- *   in docs/debugging.md, and prefer `arm=committed`, where both views come from one moment).
- * - `key` — the framed index key the scan bracketed on, filled in once it is built.
- *   Stays `undefined` if the scan returned before framing one — in practice the NULL-arg
- *   refusal, which is a correct empty answer, not a fault — and prints as `unset` rather
- *   than as an empty seek (the empty PREFIX is a legitimate key meaning "the whole index",
- *   and the two must not read alike).
+ *   key names is gone, it is there but does not imply the entry (see the verification in
+ *   {@link OptimysticVirtualTable.executeIndexScan}), or a multi-seek already yielded it under
+ *   an earlier key. It is otherwise invisible from the read path, which now answers correctly
+ *   over a broken tree instead of visibly wrongly. `matched - rejected` is what the scan
+ *   yielded. A rejection means the index tree and the main table DISAGREED AS THIS SCAN READ
+ *   THEM, which has two causes and the same line carries the fields that separate them: index
+ *   damage (`rev`/`main_rev` consistent — confirm with `plugin.verifyIndexes`), or the views
+ *   sitting at different moments, which rejects a perfectly healthy entry whose row the main
+ *   view has not caught up to yet (see `main_rev=` in docs/debugging.md, and prefer
+ *   `arm=committed`, where both views come from one moment).
+ * - `keys` — the framed index keys the scan bracketed on, in the order sought, each added as
+ *   its descent starts. Stays empty if the scan sought nothing — in practice every listed value
+ *   was NULL, which is a correct empty answer, not a fault — and prints as `unset` rather than
+ *   as an empty seek (the empty PREFIX is a legitimate key meaning "the whole index", and the
+ *   two must not read alike).
  *
  * Passed only when the trace namespace is enabled; `undefined` otherwise, so a disabled
  * namespace costs one property read per scan.
@@ -131,7 +132,67 @@ interface IndexScanSource extends IndexScanTarget {
 interface IndexSeekProbe {
   matched: number;
   rejected: number;
-  key?: string;
+  keys: string[];
+}
+
+/** The `plan=` code of a multi-seek: one seek per argument, in `FilterInfo.args`. */
+const MULTI_SEEK_PLAN = 5;
+
+/** One seek's values, in the column order of the index or primary key it seeks. */
+type SeekTuple = readonly unknown[];
+
+/**
+ * The seeks a plan asks for: one single-value seek per argument of a multi-seek, otherwise the
+ * one tuple `args`.
+ *
+ * A wider multi-seek flattens its tuples into `args` and names their width in `idxStr`. This
+ * module never claims one (`matchEqualitySeek`), and reading one as width 1 would seek on wrong
+ * values and drop a predicate the engine no longer enforces, so it is refused.
+ */
+function seekTuplesOf(filterInfo: FilterInfo, planType: number | undefined): readonly SeekTuple[] {
+  if (planType !== MULTI_SEEK_PLAN) return [filterInfo.args];
+  const seekWidth = decodeIdxStr(filterInfo.idxStr)?.params.get('seekWidth');
+  if (seekWidth !== undefined && seekWidth !== '1') {
+    throw new QuereusError(`Multi-seek of width ${seekWidth} is not supported: ${filterInfo.idxStr}`, StatusCode.INTERNAL);
+  }
+  return filterInfo.args.map(arg => [arg]);
+}
+
+/**
+ * The distinct keys to visit for a list of seeks, in the order to visit them.
+ *
+ * A seek with a NULL value is dropped: it makes the equality UNKNOWN under SQL three-valued logic,
+ * so no row matches, even though key EQUALITY is NULL-self-equal and a NULL-keyed row really is
+ * stored under the NULL tag (key-encoding.ts), where a seek would find it. The engine cannot
+ * cover this for us: it folds only a *literal* NULL to an empty result at plan time
+ * (`isLiteralNullEquality` in `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts`),
+ * and leaves a dynamic value — parameter, correlated binding — to a per-module runtime guard (the
+ * memory backend's `seekKeyHasNull`). getBestAccessPlan claims these filters as
+ * handledFilters=true, and the engine drops the residual FILTER for every constraint a module
+ * claims, so nothing above the seek would catch a leaked row. Reachable since Quereus 4.14:
+ * PRIMARY KEY no longer implies NOT NULL, so `x integer null primary key` stores a NULL-keyed row
+ * (quereus test/logic/43.3-nullable-primary-key.sqllogic pins `where x = null` → []).
+ *
+ * A key is visited once however many listed values frame to it, since the engine passes a list
+ * with bound parameters through unreduced.
+ *
+ * NOTE: the order is the tree's byte order, which is the index's declared order only for ascending
+ * BINARY text (`treeDeliversOrdering`). Quereus requires a multi-seek to emit in the index's key
+ * order because its isolation layer merges overlay rows by that order
+ * (`docs/module-authoring.md` in the Quereus repository). This module is not wrapped by that layer,
+ * so tree order is what it can offer and nothing here relies on more. If a table of this module is
+ * ever wrapped in `using isolated`, a numeric or DESC multi-seek would be mis-merged: that needs
+ * `debt-optimystic-true-key-ordering` first.
+ */
+function seekKeysInTreeOrder<TKey extends string>(
+  seeks: readonly SeekTuple[],
+  keyOf: (seek: SeekTuple) => TKey,
+): TKey[] {
+  const keys = new Set<TKey>();
+  for (const seek of seeks) {
+    if (!seek.some(value => value === null || value === undefined)) keys.add(keyOf(seek));
+  }
+  return [...keys].sort(compareTreeKeys);
 }
 
 /** Code units a framed index key may print verbatim: everything else is escaped, so
@@ -1772,6 +1833,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // or 'idx=idx_category(0);plan=2' for secondary index seeks.
       const planType = this.parsePlanType(filterInfo.idxStr);
       const indexName = this.parseIndexName(filterInfo.idxStr);
+      const seeks = seekTuplesOf(filterInfo, planType);
 
       // Determine if this is a secondary index (not primary key)
       const isSecondaryIndex = indexName != null && indexName !== '_primary_';
@@ -1829,23 +1891,27 @@ export class OptimysticVirtualTable extends VirtualTable {
         // is filled in by the scan as it produces entries; the line is emitted in a
         // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
         // still reports what the seek had produced by then.
-        const seek: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0 } : undefined;
+        const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, keys: [] } : undefined;
         try {
-          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, filterInfo.args, seek);
+          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, seeks, probe);
         } finally {
-          if (seek !== undefined) {
-            this.logIndexSeek(indexScan, mainTree, committed, seek);
+          if (probe !== undefined) {
+            this.logIndexSeek(indexScan, mainTree, committed, probe);
           }
         }
+      } else if (planType === MULTI_SEEK_PLAN) {
+        // Primary key multi-seek (plan=5). Never falls through to a scan, even with no arguments:
+        // the engine has dropped the filter, so a scan would return every row.
+        yield* this.executePointLookup(mainRead, rowCodec, seeks);
       } else if (planType === 2 && filterInfo.args.length > 0) {
         // Primary key equality seek (plan=2)
-        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, seeks);
       } else if (planType === 3) {
         // Range query on primary key (plan=3)
         yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
       } else if (filterInfo.idxNum === 1) {
         // Legacy: Point lookup on primary key
-        yield* this.executePointLookup(mainRead, rowCodec, filterInfo.args);
+        yield* this.executePointLookup(mainRead, rowCodec, seeks);
       } else if (filterInfo.idxNum === 2) {
         // Legacy: Range query on primary key
         yield* this.executeRangeQuery(mainRead, rowCodec, filterInfo);
@@ -1995,19 +2061,20 @@ export class OptimysticVirtualTable extends VirtualTable {
    * - `node=` — which node emitted the line ({@link CollectionFactory.nodeTag}). Two nodes
    *   writing one collection at the same instant used to emit byte-identical lines, so an
    *   operator could only attribute them positionally.
-   * - `seek=` — the framed index key the descent bracketed on, escaped by
-   *   {@link printableSeekKey} so the line stays one whitespace-free token per field.
-   *   Empty is the whole-index prefix; `unset` means the scan returned before framing a
-   *   key at all, and the two must not be collapsed.
-   * - `matched=` — index entries the seek produced, counted before the row fetch, so
-   *   "descended a stale index" is distinguishable from "descended a current index that
-   *   genuinely has no entry".
+   * - `seek=` — the framed index keys the descent bracketed on, in the order sought, each
+   *   escaped by {@link printableSeekKey} and joined with commas (which the escaping leaves
+   *   no key containing), so the line stays one whitespace-free token per field. Empty is
+   *   the whole-index prefix; `unset` means the scan sought nothing at all, and the two
+   *   must not be collapsed.
+   * - `matched=` — index entries the seek produced across those keys, counted before the
+   *   row fetch, so "descended a stale index" is distinguishable from "descended a current
+   *   index that genuinely has no entry".
    * - `rejected=` — how many of those entries the scan then dropped because the row they
-   *   name is gone or does not imply them. Nonzero means the index and the main table
-   *   disagreed as this scan read them: either the tree is damaged — run
-   *   `plugin.verifyIndexes` on this node to see which entries (docs/debugging.md, "Does an
-   *   index agree with its table?") — or the two views are at different moments, which
-   *   `rev=`/`main_rev=` and `arm=` above are what distinguish.
+   *   name is gone, does not imply them, or was already returned under an earlier key.
+   *   Nonzero means the index and the main table disagreed as this scan read them: either
+   *   the tree is damaged — run `plugin.verifyIndexes` on this node to see which entries
+   *   (docs/debugging.md, "Does an index agree with its table?") — or the views are at
+   *   different moments, which `rev=`/`main_rev=` and `arm=` above are what distinguish.
    *
    * `collection=` and `main=` are the same id strings `index:tree-open` and
    * `commit:collections` print, so all three lines join on them — and they name BOTH
@@ -2038,7 +2105,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     index: IndexScanSource,
     mainTree: Tree<string, RowData>,
     committed: boolean,
-    seek: IndexSeekProbe,
+    probe: IndexSeekProbe,
   ): void {
     const rev = (tree: {
       committedRevision(): number | undefined;
@@ -2053,9 +2120,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       committed ? 'committed' : 'live',
       rev(index.tree),
       rev(mainTree),
-      seek.key === undefined ? 'unset' : printableSeekKey(seek.key),
-      seek.matched,
-      seek.rejected,
+      probe.keys.length === 0 ? 'unset' : probe.keys.map(printableSeekKey).join(','),
+      probe.matched,
+      probe.rejected,
       this.collectionFactory.nodeTag(),
     );
   }
@@ -2122,48 +2189,31 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute a point lookup query against the supplied read source (live collection
-   * or a committed view). The read source is already network-refreshed (live) or a
-   * static snapshot (committed); this method never refreshes it.
+   * Read the row at each primary key the seeks name, against the supplied read source (live
+   * collection or a committed view): one for a point lookup, one per listed value for a
+   * multi-seek on a single-column key, the two ways getBestAccessPlan claims the key's
+   * `=` and `in` filters. The read source is already network-refreshed (live) or a static
+   * snapshot (committed); this method never refreshes it.
    */
   private async* executePointLookup(
     read: TreeReadView<string, RowData>,
     rowCodec: RowCodec,
-    args: readonly unknown[],
+    seeks: readonly SeekTuple[],
   ): AsyncIterable<Row> {
-    // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no
-    // row matches — even though key EQUALITY is NULL-self-equal and a NULL-keyed row
-    // really is stored under the NULL tag (key-encoding.ts). Without this guard the
-    // seek finds that row and returns it for `where pk = ?` bound to NULL.
-    //
-    // The engine cannot cover this for us: it folds only a *literal* NULL equality to
-    // an empty result at plan time (`isLiteralNullEquality` in
-    // rule-select-access-path.ts), and leaves a dynamic value — parameter, correlated
-    // binding — to a per-module runtime guard (the memory backend's `seekKeyHasNull`).
-    // getBestAccessPlan reports the PK equality filters as handledFilters=true, and the
-    // engine drops the residual FILTER for every constraint a module claims, so nothing
-    // above this seek would catch a leaked row. The secondary-index seek carries the
-    // same guard for the same reason (see executeIndexScan).
-    //
-    // Reachable since Quereus 4.14: PRIMARY KEY no longer implies NOT NULL, so
-    // `x integer null primary key` stores a NULL-keyed row (quereus
-    // test/logic/43.3-nullable-primary-key.sqllogic pins `where x = null` → []).
-    if (args.some(arg => arg === null || arg === undefined)) {
-      return;
-    }
-
-    // Assemble the full (possibly composite) primary key from ALL seek args using
+    // Assemble the full (possibly composite) primary key from ALL of a seek's values using
     // the SAME encoding the row codec uses to store keys (extractPrimaryKey).
-    // Using only args[0] silently drops every PK column past the first, so a
+    // Using only the first silently drops every PK column past it, so a
     // composite-PK point lookup builds a key that can never match a stored row.
-    // Seek args are the key-ordered tuple shape, not a row — see schema/key-tuples.ts.
-    const key = rowCodec.createPrimaryKey(
-      rowCodec.asPrimaryKeyTuple(args as readonly SqlValue[]),
-    );
+    // Seek values are the key-ordered tuple shape, not a row — see schema/key-tuples.ts.
+    const keys = seekKeysInTreeOrder(seeks, seek => rowCodec.createPrimaryKey(
+      rowCodec.asPrimaryKeyTuple(seek as readonly SqlValue[]),
+    ));
 
-    const row = await readRowAt(read, rowCodec, key);
-    if (row !== undefined) {
-      yield row;
+    for (const key of keys) {
+      const row = await readRowAt(read, rowCodec, key);
+      if (row !== undefined) {
+        yield row;
+      }
     }
   }
 
@@ -2185,67 +2235,40 @@ export class OptimysticVirtualTable extends VirtualTable {
    * BEFORE this is called — for a committed read, in the same synchronous block as
    * the main view, so the index entries and the rows they resolve to come from one
    * committed moment. This method never builds or refreshes a view itself.
+   *
+   * A multi-seek runs the same entry loop once per key over those same views: every seek reads
+   * one refreshed or pinned moment, never a refresh per value.
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
     rowCodec: RowCodec,
     indexManager: IndexManager,
     index: IndexScanSource,
-    args: readonly unknown[],
-    seek?: IndexSeekProbe,
+    seeks: readonly SeekTuple[],
+    probe?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    // A NULL seek arg makes the equality UNKNOWN under SQL three-valued logic, so no row
-    // matches — the same guard, for the same reason, that executePointLookup carries; read
-    // its comment for why the engine leaves a dynamic NULL to the module (it folds only a
-    // literal one, and quereus's own memory backend guards every seek path with
-    // `seekKeyHasNull`). getBestAccessPlan claims the matched equality filters as
-    // handledFilters=true, so the engine drops the residual predicate and nothing above
-    // this seek would catch a leaked row.
-    //
-    // ABOVE the key framing on purpose: indexKeyFromValues frames a NULL into a perfectly
-    // valid key — NULL has its own bare tag (key-encoding.ts) — which really does find the
-    // NULL-keyed row an INSERT stored. The verification below would not reject it either:
-    // the entry genuinely belongs to that row. Only refusing to seek at all is correct.
-    if (args.some(arg => arg === null || arg === undefined)) {
-      return;
-    }
+    // NULL-bearing seeks go ABOVE the key framing on purpose: indexKeyFromValues frames a NULL
+    // into a perfectly valid key — NULL has its own bare tag (key-encoding.ts) — which really
+    // does find the NULL-keyed row an INSERT stored. The verification below would not reject it
+    // either: the entry genuinely belongs to that row. Only refusing to seek at all is correct.
+    const indexKeys = seekKeysInTreeOrder(seeks, seek => this.indexSeekKey(indexManager, index.schema, seek));
 
-    // Build the (possibly partial) framed index key from constraint values. Both this
-    // and IndexManager.createIndexKey route through indexKeyFromValues, so the prefix
-    // range in findEntriesIn brackets exactly the tuple an insert stored. A partial key
-    // (fewer args than index columns) frames only the provided leading columns and
-    // prefix-matches the rest; the planner may also hand over MORE constraint values
-    // than the index covers, so the excess is truncated rather than rejected.
-    const width = Math.min(args.length, index.schema.columns.length);
-    // Zero constraint values would mean the plan wants the whole index: frame the empty
-    // prefix directly, since asIndexColumnTuple deliberately rejects an empty tuple and
-    // this case must bypass it rather than weaken that guard.
-    //
-    // NOTE: no planner path reaches this branch today. The secondary-index arm of
-    // getBestAccessPlan names an index only once at least one equality filter matched, and
-    // runQuery sets `scanIndexName` on that path only for `args.length > 0`; the other way
-    // in is the legacy `filterInfo.idxNum >= 10` arm, and `idxNum` is hard-coded to `0` at
-    // every construction site in `@quereus/quereus/src/vtab/filter-info.ts`, so that arm is
-    // dead. Kept because it is the correct framing the day an index-served ORDER BY or a
-    // whole-index plan does arrive — not because something currently uses it.
-    const indexKey = width === 0
-      ? indexKeyFromValues([])
-      : indexManager.createIndexKeyFromTuple(
-          indexManager.asIndexColumnTuple(
-            index.schema,
-            args.slice(0, width) as readonly SqlValue[],
-          ),
-        );
-    // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
-    // part-way still names the key it was seeking rather than reporting `unset`.
-    if (seek !== undefined) seek.key = String(indexKey);
+    // Each listed value's key is distinct, but a row can still have a valid entry under two of
+    // them: on a live read, a row whose value moves from one listed value to a later one in the
+    // gap between the two seeks has an entry under each and passes verification under the second.
+    // A scan that has yielded throws for a change between its steps, so that gap is narrow.
+    // `update t set c = 'b' where c in ('a', 'b')` is the same shape if a statement's staged
+    // entries are ever visible to its later seek; today the engine finishes reading first. So a
+    // row is tracked by primary key to be yielded, and so updated, once, at a memory cost
+    // proportional to the rows returned.
+    const yielded = indexKeys.length > 1 ? new Set<string>() : undefined;
 
     // Each entry is checked against the row it resolves to before that row is yielded, and
     // the check is the FULL one — `rowImpliesEntry`, the same predicate the integrity check
     // diffs on — not a prefix match against the seek key. Two things make it necessary:
     //
     //  - The engine is entitled to trust the seek. getBestAccessPlan claims the matched
-    //    equality filters as handledFilters=true, and `reattachUnconsumedConstraints` in
+    //    `=` and `in` filters as handledFilters=true, and `reattachUnconsumedConstraints` in
     //    `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts` reattaches a
     //    residual FILTER only for a claimed constraint the seek did NOT consume. A consumed
     //    one gets none, so whatever this yields is the answer.
@@ -2274,22 +2297,59 @@ export class OptimysticVirtualTable extends VirtualTable {
     // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
     // the fetch: a healthy entry's own tree key already carries the answer.
     const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
-    for await (const entry of indexManager.findEntriesIn(index.read, indexKey)) {
-      // Counted HERE, before the row fetch: `matched` must mean "entries the index
-      // descent produced", not "rows that survived". An entry whose row is missing or
-      // that the verification rejects still proves the index held something.
-      if (seek !== undefined) seek.matched++;
-      const row = await readRowAt(mainRead, rowCodec, entry[1]);
-      if (row === undefined || !rowImpliesEntry(row, entry, indexKeyOf)) {
-        // Both halves are index damage the read path can otherwise only correct silently:
-        // the row is gone (a `no-row` orphan), or it no longer implies this entry (a
-        // `stale-value` or `malformed` one). Counted so a seek quietly compensating for a
-        // broken tree can be SEEN on the `index:seek` line rather than inferred.
-        if (seek !== undefined) seek.rejected++;
-        continue;
+    for (const indexKey of indexKeys) {
+      // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
+      // part-way still names the key it was seeking rather than reporting `unset`.
+      probe?.keys.push(indexKey);
+      for await (const entry of indexManager.findEntriesIn(index.read, indexKey)) {
+        // Counted HERE, before the row fetch: `matched` must mean "entries the index
+        // descent produced", not "rows that survived". An entry whose row is missing or
+        // that the verification rejects still proves the index held something.
+        if (probe !== undefined) probe.matched++;
+        if (yielded?.has(entry[1])) {
+          if (probe !== undefined) probe.rejected++;
+          continue;
+        }
+        const row = await readRowAt(mainRead, rowCodec, entry[1]);
+        if (row === undefined || !rowImpliesEntry(row, entry, indexKeyOf)) {
+          // Both halves are index damage the read path can otherwise only correct silently:
+          // the row is gone (a `no-row` orphan), or it no longer implies this entry (a
+          // `stale-value` or `malformed` one). Counted so a seek quietly compensating for a
+          // broken tree can be SEEN on the `index:seek` line rather than inferred.
+          if (probe !== undefined) probe.rejected++;
+          continue;
+        }
+        yielded?.add(entry[1]);
+        yield row;
       }
-      yield row;
     }
+  }
+
+  /**
+   * The framed index key one seek brackets. Both this and IndexManager.createIndexKey route
+   * through indexKeyFromValues, so the prefix range in findEntriesIn brackets exactly the tuple
+   * an insert stored. A partial key (fewer values than index columns) frames only the provided
+   * leading columns and prefix-matches the rest; the planner may also hand over MORE constraint
+   * values than the index covers, so the excess is truncated rather than rejected.
+   */
+  private indexSeekKey(indexManager: IndexManager, schema: StoredIndexSchema, seek: SeekTuple): IndexKey {
+    const width = Math.min(seek.length, schema.columns.length);
+    // Zero constraint values would mean the plan wants the whole index: frame the empty
+    // prefix directly, since asIndexColumnTuple deliberately rejects an empty tuple and
+    // this case must bypass it rather than weaken that guard.
+    //
+    // NOTE: no planner path reaches this branch today. The secondary-index arm of
+    // getBestAccessPlan names an index only once at least one equality filter matched, and
+    // runQuery sets `scanIndexName` on that path only for `args.length > 0`; the other way
+    // in is the legacy `filterInfo.idxNum >= 10` arm, and `idxNum` is hard-coded to `0` at
+    // every construction site in `@quereus/quereus/src/vtab/filter-info.ts`, so that arm is
+    // dead. Kept because it is the correct framing the day an index-served ORDER BY or a
+    // whole-index plan does arrive — not because something currently uses it.
+    return width === 0
+      ? indexKeyFromValues([])
+      : indexManager.createIndexKeyFromTuple(
+          indexManager.asIndexColumnTuple(schema, seek.slice(0, width) as readonly SqlValue[]),
+        );
   }
 
   /**
@@ -4601,6 +4661,110 @@ const UNKNOWN_TABLE_ROWS = 1000;
 const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
 
 /**
+ * Whether a seek on a key column finds every row a predicate on it would. The index and
+ * primary-key trees compare raw bytes, so a seek finds only values whose stored bytes equal the
+ * sought bytes, and a claimed filter is not re-checked by the engine. On a column where equal
+ * values can have different bytes, a seek loses rows: a non-BINARY key collation, or a type that
+ * compares by meaning (`hasSemanticOrdering`: `timespan`'s `'PT60M'` equals a stored `'PT1H'`).
+ * Such a column stays a residual filter over a scan: slower, and correct.
+ *
+ * `keyCollation` is the same one `indexColumnCollationLookup` in
+ * `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts` reads, so the module and
+ * the engine judge one thing: the index column's for a secondary index, the table column's for the
+ * primary key. The engine reads a `nocase` predicate over a `nocase` key as a full match, which is
+ * a promise that the seek honours the collation; this module's cannot. The cost is that a
+ * `collate binary` predicate over a `nocase` index, which a byte seek would answer correctly, scans.
+ */
+function seekCanBeTrusted(column: ColumnSchema | undefined, keyCollation: string | undefined): boolean {
+  return column !== undefined
+    && normalizeCollationName(keyCollation ?? 'BINARY') === 'BINARY'
+    && !hasSemanticOrdering(column.logicalType);
+}
+
+/**
+ * The position of the filter a seek claims for one column: the first that fills the equality role,
+ * since the engine seeks on the first and leaves a claim of any other unenforced (see
+ * `findEqualityMatches` in `@quereus/quereus/src/vtab/memory/module.ts`). `-1` when there is none.
+ *
+ * A `runtimeSet` (`in (select …)`) is not claimed, which the contract allows; backlog
+ * `feat-optimystic-in-subquery-seeks-the-index`.
+ */
+function firstEqualityRoleFilter(filters: readonly PredicateConstraint[], columnIndex: number): number {
+  return filters.findIndex(f =>
+    f.usable && f.columnIndex === columnIndex && !f.runtimeSet && equalitySeekKeyCount(f) !== null,
+  );
+}
+
+/** What a seek of a key's leading columns would claim. */
+interface EqualitySeekMatch {
+  /** Positions in the request's filters of the claimed filters, in key-column order. */
+  readonly filterIndexes: readonly number[];
+  /** How many keys the seek visits; more than one is a multi-seek. */
+  readonly keyCount: number;
+}
+
+/**
+ * The longest run of a key's leading columns a seek can serve: each must be trustworthy
+ * ({@link seekCanBeTrusted}) and carry an equality-role filter ({@link firstEqualityRoleFilter}).
+ *
+ * A multi-value `in` is only ever the sole seek column: on the first column it is claimed and the
+ * match stops there, and on a later one it ends the match before it, staying a residual while the
+ * columns before it seek as they would alone. A single-element `in (?)` is not multi-value: the
+ * engine emits an ordinary equality seek for it.
+ *
+ * NOTE: the limit exists because of an engine defect. With a composite seek, Quereus turns a bound
+ * `=` beside an `in` into a NULL key and the seek returns nothing, so claiming one here would turn
+ * a correct prefix seek plus residual into an empty result. `blocked/` ticket
+ * `quereus-composite-in-seek-drops-a-bound-equality` carries the fix and what lifting this takes.
+ */
+function matchEqualitySeek(
+  keyColumns: readonly { readonly index: number; readonly collation?: string }[],
+  tableInfo: TableSchema,
+  filters: readonly PredicateConstraint[],
+): EqualitySeekMatch {
+  const filterIndexes: number[] = [];
+  let keyCount = 1;
+  for (const keyColumn of keyColumns) {
+    if (!seekCanBeTrusted(tableInfo.columns[keyColumn.index], keyColumn.collation)) break;
+    const filterIndex = firstEqualityRoleFilter(filters, keyColumn.index);
+    if (filterIndex < 0) break;
+    const filter = filters[filterIndex]!;
+    const multiValue = isMultiValueEquality(filter);
+    if (multiValue && filterIndexes.length > 0) break;
+    filterIndexes.push(filterIndex);
+    keyCount *= equalitySeekKeyCount(filter)!;
+    if (multiValue) break;
+  }
+  return { filterIndexes, keyCount };
+}
+
+/**
+ * The fraction of the table one equality tuple over `eqColumns` is measured to match, by the
+ * rule Quereus's memory and store modules use, so the backends agree and a seek's `rows`
+ * matches what the engine would estimate for the same predicate: `1 / max(distinctCount, 1)`
+ * per column, combined by the engine's own `combineConjunctive`.
+ *
+ * `undefined` without `analyze` statistics for every column, never a measured factor mixed with
+ * a constant; the caller then takes {@link EQ_SELECTIVITY_WITHOUT_STATS}. A snapshot with
+ * `rowCount` 0 (taken while the table was empty) counts as none: its `distinctCount`s of 0 would
+ * read as "every row matches". `columnStats` is keyed by the lowercase current column name, so a
+ * column added since the snapshot simply has no entry.
+ */
+function measuredEqualityTupleSelectivity(tableInfo: TableSchema, eqColumns: readonly number[]): number | undefined {
+  const stats = tableInfo.statistics;
+  if (!stats || stats.rowCount <= 0) return undefined;
+
+  const factors: number[] = [];
+  for (const colIdx of eqColumns) {
+    const name = tableInfo.columns[colIdx]?.name;
+    const colStats = name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
+    if (!colStats) return undefined;
+    factors.push(1 / Math.max(colStats.distinctCount, 1));
+  }
+  return factors.length > 0 ? combineConjunctive(factors) : undefined;
+}
+
+/**
  * Optimystic Virtual Table Module
  */
 export class OptimysticModule implements VirtualTableModule<VirtualTable, OptimysticModuleConfig> {
@@ -6052,6 +6216,37 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // as cardinality.
     const tableRowCount = request.estimatedRows ?? UNKNOWN_TABLE_ROWS;
     const tableScanCost = Math.max(1000, tableRowCount);
+    // One descent of a key's tree.
+    const seekCost = Math.log2(Math.max(2, tableRowCount)) * 2;
+
+    const claiming = (match: EqualitySeekMatch): boolean[] =>
+      request.filters.map((_, idx) => match.filterIndexes.includes(idx));
+
+    const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
+    const pkMatch = matchEqualitySeek(
+      tableInfo.primaryKeyDefinition.map(pk => ({ index: pk.index, collation: tableInfo.columns[pk.index]?.collation })),
+      tableInfo,
+      request.filters,
+    );
+    const pkFullyMatched = pkColumns.length > 0 && pkMatch.filterIndexes.length === pkColumns.length;
+
+    // One value for every primary key column: a point lookup, O(log n). Nothing beats it, and a
+    // fully matched unique index prices within a fraction of it, so secondary indexes never compete.
+    if (pkFullyMatched && pkMatch.keyCount === 1) {
+      return {
+        handledFilters: claiming(pkMatch),
+        cost: seekCost,
+        rows: 1,
+        // Point lookup always satisfies any ORDER BY (single row)
+        providesOrdering: request.requiredOrdering && request.requiredOrdering.length > 0
+          ? [...request.requiredOrdering]
+          : undefined,
+        indexName: '_primary_',
+        seekColumnIndexes: [...pkColumns],
+        isSet: true, // PK lookup guarantees unique row
+        explains: `Primary key equality seek (cost: ${seekCost.toFixed(2)})`,
+      };
+    }
 
     // Track best plan found
     let bestCost = tableScanCost;
@@ -6063,14 +6258,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     let bestIndexName: string | undefined = undefined;
     let bestSeekColumnIndexes: number[] | undefined = undefined;
 
-    // Check primary key constraints first
-    const pkColumns = tableInfo.primaryKeyDefinition.map(pk => pk.index);
-
-    // Check if ALL primary key columns have equality constraints (required for point lookup)
-    const fullPkEquality = pkColumns.length > 0 && pkColumns.every(pkCol =>
-      request.filters.some(f => f && f.usable && f.op === '=' && f.columnIndex === pkCol)
-    );
-
     for (let i = 0; i < request.filters.length; i++) {
       const filter = request.filters[i];
       if (!filter || !filter.usable) continue;
@@ -6078,26 +6265,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // Check if this is a primary key column
       const isPkColumn = pkColumns.includes(filter.columnIndex);
 
-      if (isPkColumn && filter.op === '=' && fullPkEquality) {
-        // Full primary key equality - best case: O(log n)
-        const pkCost = Math.log2(Math.max(2, tableRowCount)) * 2;
-        bestCost = pkCost;
-        bestRows = 1;
-        // Mark ALL PK equality filters as handled
-        bestHandledFilters = request.filters.map((f) =>
-          f != null && f.usable && f.op === '=' && pkColumns.includes(f.columnIndex)
-        );
-        bestIsSet = true; // PK lookup guarantees unique row
-        bestIndexName = '_primary_';
-        bestSeekColumnIndexes = [...pkColumns];
-        bestExplains = `Primary key equality seek (cost: ${pkCost.toFixed(2)})`;
-
-        // Point lookup always satisfies any ORDER BY (single row)
-        if (request.requiredOrdering && request.requiredOrdering.length > 0) {
-          bestOrdering = [...request.requiredOrdering];
-        }
-        break; // Can't get better than this
-      } else if (isPkColumn && filter.op === '=' && !fullPkEquality) {
+      if (isPkColumn && filter.op === '=') {
+        // A column no seek can serve is a plain scan with a residual, not a cheaper partial match.
+        const column = tableInfo.columns[filter.columnIndex];
+        if (!seekCanBeTrusted(column, column?.collation)) continue;
         // Partial PK match - don't mark as handled, let Quereus apply the filter
         // but still estimate reduced selectivity for cost calculation
         const partialPkCost = tableRowCount * 0.3;
@@ -6115,7 +6286,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // full scan instead. Revisit when debt-optimystic-pk-range-seek lands (prereq:
         // optimystic-tree-comparator-lexicographic-missort).
         const selectivity = 0.25;
-        const rangeCost = Math.log2(Math.max(2, tableRowCount)) * 2 + tableRowCount * selectivity;
+        const rangeCost = seekCost + tableRowCount * selectivity;
         const rangeRows = Math.max(1, Math.floor(tableRowCount * selectivity));
 
         if (rangeCost < bestCost) {
@@ -6128,70 +6299,73 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       }
     }
 
-    // Secondary indexes only when no full primary-key equality made this a point seek. A fully
-    // matched unique index prices within a fraction of that seek, and the primary key must win
-    // regardless of how close the two costs come.
-    if (!fullPkEquality && tableInfo.indexes && tableInfo.indexes.length > 0) {
+    // A list of primary keys: a long one may lose to a scan or a secondary index, so it competes on
+    // cost. A multi-seek reports no set and no ordering, as both Quereus backends do.
+    if (pkFullyMatched) {
+      const multiSeekCost = pkMatch.keyCount * seekCost;
+      if (multiSeekCost < bestCost) {
+        bestCost = multiSeekCost;
+        bestRows = Math.max(1, Math.min(tableRowCount, pkMatch.keyCount));
+        bestHandledFilters = claiming(pkMatch);
+        bestIsSet = false;
+        bestIndexName = '_primary_';
+        bestSeekColumnIndexes = [...pkColumns];
+        bestExplains = `Primary key multi-seek of ${pkMatch.keyCount} keys (cost: ${multiSeekCost.toFixed(2)})`;
+      }
+    }
+
+    if (tableInfo.indexes && tableInfo.indexes.length > 0) {
       for (const index of tableInfo.indexes) {
         // A partial index holds only the rows its predicate admits, so a seek through it drops
         // matching rows outside the predicate. Never planned through, as Quereus's memory module
         // (`gatherAvailableIndexes` in `@quereus/quereus/src/vtab/memory/module.ts`) does; backlog
         // `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
         if (index.predicate !== undefined) continue;
-        // Try to match constraints to this index
-        const indexColumns = index.columns.map(col => col.index);
-        const matchedFilterIndices: number[] = [];
 
-        // Check if we have equality constraints on the index columns
-        for (let colIdx = 0; colIdx < indexColumns.length; colIdx++) {
-          const indexCol = indexColumns[colIdx];
-          let foundEq = false;
+        const match = matchEqualitySeek(index.columns, tableInfo, request.filters);
+        if (match.filterIndexes.length === 0) continue;
 
-          for (let i = 0; i < request.filters.length; i++) {
-            const filter = request.filters[i];
-            if (!filter || !filter.usable) continue;
+        const seekColumns = match.filterIndexes.map(fi => request.filters[fi]!.columnIndex);
+        const multiSeek = match.keyCount > 1;
+        // A prefix of a unique index is not unique.
+        const uniqueSeek = seekColumns.length === index.columns.length && (index.unique ?? false);
+        const measured = uniqueSeek ? undefined : measuredEqualityTupleSelectivity(tableInfo, seekColumns);
+        const rowsPerKey = uniqueSeek ? 1 : tableRowCount * (measured ?? EQ_SELECTIVITY_WITHOUT_STATS);
+        // The row count saturates at the table size: that is what makes a long list plan hash joins
+        // above it, as it does over a memory table.
+        const seekRows = Math.min(tableRowCount, match.keyCount * rowsPerKey);
+        // The no-statistics constant is charged once rather than per key. It reaches the whole table
+        // at ten values, so per key it would price every list of ten or more above a scan on an
+        // un-analyzed table, and it would rank `a in (x, y)` below `b = ?` for no measured reason.
+        // A measured figure reaches the table only as the list nears the column's distinct count,
+        // which is where a scan really is cheaper.
+        //
+        // NOTE: at the un-analyzed default of 1000 rows this makes a list of 46 or more values cost
+        // out as a scan, and under the in-process cost profile that goes back to a nested loop over
+        // it. If pages of more than about 45 values show up slow on un-analyzed tables, the
+        // no-statistics default is what to look at; `analyze` raises the crossover with the row count.
+        const indexCost = match.keyCount * seekCost + (uniqueSeek || measured !== undefined ? seekRows : rowsPerKey);
+        const indexRows = Math.max(1, Math.floor(seekRows));
 
-            if (filter.columnIndex === indexCol && filter.op === '=') {
-              matchedFilterIndices.push(i);
-              foundEq = true;
-              break;
-            }
-          }
+        // On a cost tie the longer match wins: without statistics every equality tuple
+        // estimates the same rows, but the longer seek reads fewer and leaves less residual.
+        const longerMatch = seekColumns.length > (bestSeekColumnIndexes?.length ?? 0);
+        if (indexCost < bestCost || (indexCost === bestCost && longerMatch)) {
+          bestCost = indexCost;
+          bestRows = indexRows;
+          bestHandledFilters = claiming(match);
+          bestIsSet = uniqueSeek && !multiSeek;
+          bestIndexName = index.name;
+          bestSeekColumnIndexes = seekColumns;
+          bestExplains = `${uniqueSeek ? 'Unique index' : 'Index'} ${multiSeek ? `multi-seek of ${match.keyCount} keys` : 'seek'} on ${index.name} ` +
+            `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`;
 
-          // If we didn't find an equality constraint for this column, stop matching
-          if (!foundEq) {
-            break;
-          }
-        }
-
-        // Calculate cost and rows for this index
-        if (matchedFilterIndices.length > 0) {
-          const seekColumns = matchedFilterIndices.map(fi => request.filters[fi]!.columnIndex);
-          // A prefix of a unique index is not unique.
-          const uniqueSeek = matchedFilterIndices.length === indexColumns.length && (index.unique ?? false);
-          const matchedRows = uniqueSeek ? 1 : tableRowCount * this.equalityTupleSelectivity(tableInfo, seekColumns);
-          const indexCost = Math.log2(Math.max(2, tableRowCount)) * 2 + matchedRows;
-          const indexRows = Math.max(1, Math.floor(matchedRows));
-
-          // On a cost tie the longer match wins: without statistics every equality tuple
-          // estimates the same rows, but the longer seek reads fewer and leaves less residual.
-          const longerMatch = matchedFilterIndices.length > (bestSeekColumnIndexes?.length ?? 0);
-          if (indexCost < bestCost || (indexCost === bestCost && longerMatch)) {
-            bestCost = indexCost;
-            bestRows = indexRows;
-            bestHandledFilters = request.filters.map((_, idx) => matchedFilterIndices.includes(idx));
-            bestIsSet = uniqueSeek;
-            bestIndexName = index.name;
-            bestSeekColumnIndexes = seekColumns;
-            bestExplains = `${uniqueSeek ? 'Unique index' : 'Index'} seek on ${index.name} ` +
-              `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`;
-
-            // Cleared when this index cannot deliver it, so an ordering an earlier,
-            // costlier index could deliver is never promised for this one.
-            bestOrdering = request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)
-              ? [...request.requiredOrdering]
-              : undefined;
-          }
+          // Cleared when this index cannot deliver it, so an ordering an earlier,
+          // costlier index could deliver is never promised for this one. A multi-seek walks
+          // the index key by key, so it delivers none.
+          bestOrdering = !multiSeek && request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)
+            ? [...request.requiredOrdering]
+            : undefined;
         }
       }
     }
@@ -6250,32 +6424,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         StatusCode.ERROR,
       );
     }
-  }
-
-  /**
-   * The fraction of the table one equality tuple over `eqColumns` is expected to match, by the
-   * rule Quereus's memory and store modules use, so the backends agree and a seek's `rows`
-   * matches what the engine would estimate for the same predicate: `1 / max(distinctCount, 1)`
-   * per column, combined by the engine's own `combineConjunctive`.
-   *
-   * Without `analyze` statistics for every column the whole tuple takes
-   * {@link EQ_SELECTIVITY_WITHOUT_STATS} — never a measured factor mixed with the constant. A
-   * snapshot with `rowCount` 0 (taken while the table was empty) counts as none: its
-   * `distinctCount`s of 0 would read as "every row matches". `columnStats` is keyed by the
-   * lowercase current column name, so a column added since the snapshot simply has no entry.
-   */
-  private equalityTupleSelectivity(tableInfo: TableSchema, eqColumns: readonly number[]): number {
-    const stats = tableInfo.statistics;
-    if (!stats || stats.rowCount <= 0) return EQ_SELECTIVITY_WITHOUT_STATS;
-
-    const factors: number[] = [];
-    for (const colIdx of eqColumns) {
-      const name = tableInfo.columns[colIdx]?.name;
-      const colStats = name === undefined ? undefined : stats.columnStats.get(name.toLowerCase());
-      if (!colStats) return EQ_SELECTIVITY_WITHOUT_STATS;
-      factors.push(1 / Math.max(colStats.distinctCount, 1));
-    }
-    return factors.length > 0 ? combineConjunctive(factors) : EQ_SELECTIVITY_WITHOUT_STATS;
   }
 
   /**
