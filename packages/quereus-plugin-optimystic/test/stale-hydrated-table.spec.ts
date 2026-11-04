@@ -16,7 +16,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { buildSharedLocalTransactor } from './shared-local-transactor.js';
+import { buildSharedLocalTransactor, refusingCommits } from './shared-local-transactor.js';
 import { captureThrowMessage, queryAll } from './query-helpers.js';
 
 type PluginHandle = ReturnType<typeof register>;
@@ -55,21 +55,6 @@ async function saved(store: ITransactor, table = 't'): Promise<{
 		checks: schema.checkConstraints.map(check => check.name),
 		indexes: Object.fromEntries((schema.indexes ?? []).map(idx => [idx.name, idx.columns.map(col => schema.columns[col.index]!.name)])),
 		tags: schema.tags,
-	};
-}
-
-/** `store`, with `refuse(n)` making its next `n` commits fail. */
-function refusingCommits(store: ITransactor): { transactor: ITransactor; refuse(times: number): void } {
-	let refusals = 0;
-	return {
-		transactor: {
-			get: request => store.get(request),
-			getStatus: request => store.getStatus(request),
-			pend: request => store.pend(request),
-			cancel: request => store.cancel(request),
-			commit: request => refusals-- > 0 ? Promise.reject(new Error('injected refusal')) : store.commit(request),
-		} as ITransactor,
-		refuse(times) { refusals = times; },
 	};
 }
 

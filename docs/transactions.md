@@ -471,8 +471,8 @@ refusal means nothing of that manager's batch reached the catalog, so the undo D
 arrives for changes the store never received, and the hooks accept it: dropping a
 table with no record stages a gravestone, an index subtraction finds nothing to
 subtract, and a catalog-only undo finds the record already agreeing. Changes this
-machine adopted from another machine's commit stay off the record in the second
-batch too (`adoptedByRefusedBatch` in
+machine adopted from another machine's commit, tag changes included, stay off the
+record in the second batch too (`adoptedByRefusedBatch` in
 `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). If the second
 commit also fails, the engine tolerates it, since the store still holds the
 pre-apply state.

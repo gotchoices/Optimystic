@@ -53,3 +53,18 @@ export function countingTransactor(inner: ITransactor): { transactor: ITransacto
 	} as ITransactor;
 	return { transactor, counts };
 }
+
+/** `store`, with `refuse(n)` making its next `n` commits fail. */
+export function refusingCommits(store: ITransactor): { transactor: ITransactor; refuse(times: number): void } {
+	let refusals = 0;
+	return {
+		transactor: {
+			get: request => store.get(request),
+			getStatus: request => store.getStatus(request),
+			pend: request => store.pend(request),
+			cancel: request => store.cancel(request),
+			commit: request => refusals-- > 0 ? Promise.reject(new Error('injected refusal')) : store.commit(request),
+		} as ITransactor,
+		refuse(times) { refusals = times; },
+	};
+}

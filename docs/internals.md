@@ -813,10 +813,23 @@ until the machine restarts or re-applies the schema (backlog
 A `create index` works from the same view for its maintenance, and names its columns in the
 record by column name, since the record's column list can differ from this machine's.
 
+A tag change follows the same rule. Quereus only announces one (`table_modified`), and a
+machine's view of the tags can be older than the record, so the listener saves the tags the
+event changed and nothing else: one tag location at a time (the table, or a column, named
+constraint or index), for a location both the old and new schema have (`tagChangesBetween` in
+`packages/quereus-plugin-optimystic/src/schema/tag-overlay.ts`), judged against the record
+(`tagsToSave` in `packages/quereus-plugin-optimystic/src/schema/catalog-only-change.ts`). A
+change the record already holds is adopted, and its undo in a failed `apply schema` stays off
+the record, the way a catalog-only `ALTER` arm treats a CHECK or a column. So a structural
+event such as `analyze`, or the undo of one, writes no tags and reads no catalog.
+
 What this gives up is the first touch as a repair. A record that differs from the engine's
 entry only in form (out of canonical order, or written before uniqueness metadata existed)
-is rewritten on the next re-declaration rather than on the next open, and a failed tag save
-outside a batch waits for the next DDL.
+is rewritten on the next re-declaration rather than on the next open. A failed tag save is
+not retried: it stays out of the record until the next change to those tags, or until
+`apply schema` after a restart re-emits a declared tag, so an imperative tag edit whose save
+failed is lost at restart (the `NOTE:` in `saveTableTags` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts`).
 
 ### Write Path (Local Changes)
 ```
@@ -1446,12 +1459,13 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   of the table wakes too. The tag is read `=== true`, from the declaration and then
   from every `table_modified` the module hears (`OptimysticModule.followTagChanges`
   → `OptimysticVirtualTable.followSchemaTags`), so `alter table … set tags` starts or stops
-  the watch on a running table. The same listener also saves the table's tags — table,
-  column, named constraint and index — to its catalog record
+  the watch on a running table. The same listener also saves the tags each event changed —
+  table, column, named constraint and index — to the table's catalog record
   (`SchemaManager.persistTags` in
   `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`), since Quereus applies
   a tag change to its own catalog without calling the module, and `hydrate` rebuilds tags
-  from that record. The vtab opens and closes the watch through one
+  from that record; see [A first touch writes only what the table owes](#a-first-touch-writes-only-what-the-table-owes)
+  for why it saves no more than that. The vtab opens and closes the watch through one
   serial queue, so a tag flipped while an open is in flight is applied after it. It
   needs a node built with `cohortTopic.enabled` (the plugin-level `cohort_topic` for
   a node the plugin builds); without one — or on a non-`network` transactor — the

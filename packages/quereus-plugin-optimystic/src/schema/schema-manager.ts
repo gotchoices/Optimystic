@@ -18,7 +18,8 @@ import type { PredicateExpression } from './index-predicate.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
-import { copyTags, withTagsOf } from './tag-overlay.js';
+import { copyTags, withTagsAt } from './tag-overlay.js';
+import type { TagSlots } from './tag-overlay.js';
 
 // IndexSchema type from TableSchema.indexes
 export type IndexSchema = NonNullable<TableSchema['indexes']>[number];
@@ -488,7 +489,7 @@ function canonicalizeRecordOrder<T extends StoredTableSchema | PersistedTableSch
  * {@link SchemaManager.tableSchemaToStored} emits after it (keep the two in step), then those a
  * later write appends (`orphanedIndexes`, {@link mergePersistedSchemas}; a gravestone's
  * `droppedAt`). Every other tag lives on a list element, where the converters put it last, which
- * is where `withTagsOf` (`./tag-overlay.ts`) puts it.
+ * is where `withTagsAt` (`./tag-overlay.ts`) puts it.
  */
 function withTableTagsPlaced(record: PersistedTableSchema): PersistedTableSchema {
 	if (record.tags === undefined) {
@@ -1451,29 +1452,30 @@ export class SchemaManager {
 	}
 
 	/**
-	 * The tag-change write: the table's live record with every tag `source` can address replaced by
-	 * `source`'s ({@link withTagsOf}) — the save of an edit Quereus made to its own catalog alone
+	 * The tag-change write: the table's live record with the tags of the slots `slotsFor` names
+	 * replaced ({@link withTagsAt}) — the save of an edit Quereus made to its own catalog alone
 	 * (`OptimysticModule`'s `table_modified` listener). Nothing but tags changes, so this neither
 	 * goes through the index union of {@link storeStoredSchema} nor needs it. Read and written the
 	 * way that method reads and writes (fresh from the catalog, or through the open batch's overlay,
-	 * staged there), and open-only on the catalog like {@link removeIndex}.
+	 * staged there), and open-only on the catalog like {@link removeIndex}. `slotsFor` decides what
+	 * to save from the record this read found, so the decision and the write are about one record.
 	 *
-	 * `'unchanged'` when the record already carries those tags — the answer for every structural
-	 * `table_modified`, and for a second machine saving the same edit — and nothing is written.
-	 * `'no-record'` when the catalog holds no live record for the table (a gravestone, or a record
-	 * that never landed — `OptimysticVirtualTable.markSchemaUnpersisted`); nothing is written then
-	 * either, since a record's whole content cannot be made from tags.
+	 * `'unchanged'` when `slotsFor` names no slot — a second machine saving the same edit, or the undo
+	 * of a change the record already held — and nothing is written. `'no-record'` when the catalog
+	 * holds no live record for the table (a gravestone, or a record that never landed —
+	 * `OptimysticVirtualTable.markSchemaUnpersisted`); nothing is written then either, since a
+	 * record's whole content cannot be made from tags.
 	 */
 	async persistTags(
 		schemaName: string,
 		tableName: string,
-		source: TableSchema,
+		slotsFor: (record: PersistedTableSchema) => TagSlots,
 		transactor?: ITransactor
 	): Promise<'saved' | 'unchanged' | 'no-record'> {
 		const key = catalogKey(schemaName, tableName);
 		if (this.batch) {
 			const record = this.livePersistedEntry(await this.batch.readEntry(key, transactor));
-			const tagged = record && this.retagged(record, source);
+			const tagged = record && this.retagged(record, slotsFor(record));
 			if (tagged) {
 				this.batch.write(key, [key, tagged]);
 			}
@@ -1489,7 +1491,7 @@ export class SchemaManager {
 		if (!record) {
 			return 'no-record';
 		}
-		const tagged = this.retagged(record, source);
+		const tagged = this.retagged(record, slotsFor(record));
 		if (!tagged) {
 			return 'unchanged';
 		}
@@ -1499,10 +1501,9 @@ export class SchemaManager {
 		return 'saved';
 	}
 
-	/** `record` carrying `source`'s tags, or undefined when it already does. */
-	private retagged(record: PersistedTableSchema, source: TableSchema): PersistedTableSchema | undefined {
-		const tagged = withTableTagsPlaced(withTagsOf(record, source));
-		return structuralEquals(tagged, record) ? undefined : tagged;
+	/** `record` carrying the tags `slots` gives, or undefined when `slots` is empty. */
+	private retagged(record: PersistedTableSchema, slots: TagSlots): PersistedTableSchema | undefined {
+		return slots.size > 0 ? withTableTagsPlaced(withTagsAt(record, slots)) : undefined;
 	}
 
 	/**

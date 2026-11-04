@@ -21,12 +21,13 @@ import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
-import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
-import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, positionOfNamed, withoutNamed } from './schema/catalog-only-change.js';
+import type { PersistedIndexSchema, PersistedTableSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, positionOfNamed, tagsToSave, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
-import { withTagsOf } from './schema/tag-overlay.js';
+import { tagChangesBetween, withTagsOf } from './schema/tag-overlay.js';
+import type { TagSlots } from './schema/tag-overlay.js';
 import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged } from './schema/declared-tags.js';
 import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
 import { PhysicalType } from '@quereus/quereus';
@@ -4695,8 +4696,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * them; `deferred` the populated index trees of each manager's tables whose flush was
    * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
    * it was deferred), with the table and index each belongs to; `adopted` the catalog-only
-   * changes the apply found already in a record, so their undo stays off it (see
-   * {@link alterCatalogOnly}); `owed` what a refused batch before this one left owing, with the
+   * and tag changes the apply found already in a record, so their undo stays off it (see
+   * {@link alterCatalogOnly} and {@link followTableTags}); `owed` what a refused batch before this one left owing, with the
    * engine's catalog as it stood before that apply, or before this one when none was refused.
    */
   private schemaBatch?: {
@@ -4715,10 +4716,12 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * {@link beginSchemaBatch} takes it.
    *
    * NOTE: when a data-destroying step ran, Quereus opens no second batch, so these reach the next
-   * apply instead. A change there that exactly reverses one of them then skips the record, and the
-   * next hydrate brings the change back. That takes an adopted change, a refused commit and a
-   * data-destroying step in one apply, then the reversal in the next. The hook is told nothing that
-   * separates the two batches; if Quereus ever says which batch is an unwind, take these only then.
+   * apply instead. A change there that exactly reverses one of them, a tag change included, then
+   * skips the record, and the next hydrate brings the change back. That takes an adopted change, a
+   * refused commit and a data-destroying step in one apply, then the reversal in the next. The hook
+   * is told nothing that separates the two batches; if Quereus ever says which batch is an unwind,
+   * take these only then. The undo batch's own refusal reaches the same state:
+   * `bug-optimystic-a-retry-after-two-refused-commits-leaves-the-change-out-of-the-record` (backlog).
    */
   private adoptedByRefusedBatch?: AdoptedChanges;
 
@@ -4772,8 +4775,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
-   * Listen, once per `Database`, for `table_modified` of this module's tables, and save the new
-   * tags. A tag change never reaches the module otherwise: Quereus swaps its own catalog entry
+   * Listen, once per `Database`, for `table_modified` of this module's tables, and save the tags
+   * each changed. A tag change never reaches the module otherwise: Quereus swaps its own catalog entry
    * and announces the swap (`commitTagUpdate` in `@quereus/quereus/src/schema/manager.ts`).
    * Subscribed from {@link onRegister}, so a session that has only hydrated — no table
    * instantiated yet — hears its first `alter table … set tags` too.
@@ -4785,7 +4788,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     this.followedDatabases.add(db);
     db.schemaManager.getChangeNotifier().addListener(event => {
       if (event.type === 'table_modified' && this.ownsTable(db, event.newObject)) {
-        this.followTableTags(event.newObject);
+        this.followTableTags(event.oldObject, event.newObject);
       }
     });
   }
@@ -4797,52 +4800,62 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
   /**
    * One `table_modified` of this module's table: the instance (when one exists) takes the new
-   * tags, and a save of them onto the table's catalog record joins {@link catalogTagWrites}.
-   * Synchronous, as Quereus's listeners are: nothing is awaited here. A table no statement has
-   * touched since hydrate has no instance and is saved through the manager it would be built
-   * with. Every structural `table_modified` (a renamed column, the engine's follow-up after
-   * CREATE INDEX or ADD CONSTRAINT) arrives here too, and its save finds the tags already
-   * saved and writes nothing. (A table rename, the one `table_modified` that changes the
-   * name, is refused for this module's tables, so the schema's name is the key the table is
-   * held under.)
+   * tags, and a save of the tags the event changed joins {@link catalogTagWrites}. Only what the
+   * event changed, judged against the record ({@link tagsToSave}) when the save runs: this machine's
+   * whole view of the tags can be older than the record, and writing it would undo another machine's
+   * change. So a structural `table_modified` (`ANALYZE`, a renamed column, the engine's follow-up
+   * after CREATE INDEX or ADD CONSTRAINT, or any undo step of those) saves nothing and reads nothing.
    *
-   * NOTE: each such structural event still costs one catalog read outside a batch (`ANALYZE`
-   * fires one per table). If that ever shows up, skip the save when the event's `oldObject`
-   * carries the same tags as `newObject` — giving up the re-save, on the next DDL, of tags an
-   * earlier failed save left out of the record.
+   * Synchronous, as Quereus's listeners are: nothing is awaited here. The open batch's adopted
+   * changes are taken here too: after a refused commit they are that batch's, carried over by
+   * {@link beginSchemaBatch}. A table no statement has touched since hydrate has no instance and
+   * is saved through the manager it would be built with, created here so that a manager created
+   * mid-apply joins the batch. (A table rename, the one `table_modified` that changes the name, is
+   * refused for this module's tables, so the schema's name is the key the table is held under.)
    */
-  private followTableTags(schema: TableSchema): void {
+  private followTableTags(oldSchema: TableSchema, schema: TableSchema): void {
     const tableKey = `${schema.schemaName}.${schema.name}`.toLowerCase();
     try {
       const table = this.tables.get(tableKey);
       table?.followSchemaTags(schema);
+      const changes = tagChangesBetween(oldSchema, schema);
+      if (changes.length === 0) {
+        return;
+      }
       const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(schema));
-      // Inside `apply schema` the save stages into the batch, so a failed batch commit must
-      // mark the table unpersisted like any other table the batch altered.
-      this.recordBatchEffect(manager, 'written', tableKey);
+      const adopted = this.schemaBatch?.adopted;
       const transactor = this.txnBridge.getCurrentTransaction()?.transactor;
-      this.catalogTagWrites = this.catalogTagWrites.then(() => this.saveTableTags(manager, tableKey, schema, transactor));
+      const slotsFor = (record: PersistedTableSchema) => tagsToSave(record, tableKey, changes, adopted);
+      this.catalogTagWrites = this.catalogTagWrites.then(() => this.saveTableTags(manager, tableKey, schema, slotsFor, transactor));
     } catch (error) {
       log(`WARN: tag change on '${tableKey}' not saved: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 
-  /** One step of {@link catalogTagWrites}: save `schema`'s tags onto the table's catalog record. */
+  /** One step of {@link catalogTagWrites}: save the tags `slotsFor` picks onto the table's catalog record. */
   private async saveTableTags(
     manager: SchemaManager,
     tableKey: string,
     schema: TableSchema,
+    slotsFor: (record: PersistedTableSchema) => TagSlots,
     transactor: ITransactor | undefined
   ): Promise<void> {
     try {
-      const outcome = await manager.persistTags(schema.schemaName, schema.name, schema, transactor);
-      if (outcome === 'no-record') {
+      const outcome = await manager.persistTags(schema.schemaName, schema.name, slotsFor, transactor);
+      if (outcome === 'saved') {
+        // Inside `apply schema` the save staged into the batch, which is still open: endSchemaBatch
+        // drains these saves before it closes it. A failed batch commit must mark the table
+        // unpersisted like any other table the batch altered. An adopted or undone change staged
+        // nothing and must not: that would re-persist this machine's older description.
+        this.recordBatchEffect(manager, 'written', tableKey);
+      } else if (outcome === 'no-record') {
         // An instance whose record never landed re-persists it, tags included, from its own
         // `tableSchema` on its next touch (see markSchemaUnpersisted).
         log(`tag change on '${tableKey}' not saved: the catalog holds no live record for the table`);
       }
     } catch (error) {
       // NOTE: accepted tradeoff — a failed tag save is logged, not reported: Quereus has no channel back from a schema-change listener, the same as the store module; revisit if Quereus gives listeners an async or error-reporting seam.
+      // NOTE: accepted tradeoff — a failed tag save is not retried: it stays out of the record until the next change to those tags, or until `apply schema` after a restart re-emits a declared tag, so an imperative tag edit is lost at restart. Re-saving on the next event is what wrote one machine's older tags over another's. Revisit if hosts report lost tag saves: keep the failed changes per table and re-judge them on the next event.
       log(`WARN: failed to save tag change on '${tableKey}': ${error instanceof Error ? error.message : String(error)}`);
     }
   }

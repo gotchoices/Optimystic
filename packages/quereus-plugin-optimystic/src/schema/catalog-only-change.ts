@@ -16,6 +16,9 @@
  *   recognised and kept off the record: undoing a change this machine did not make would remove
  *   what another machine committed.
  *
+ * {@link tagsToSave} applies both rules to a tag change, which also changes only the record but
+ * reaches the module as an announcement rather than through the `ALTER TABLE` hook.
+ *
  * Objects are compared by their persisted form ignoring their tags and the case of their name.
  * Tags converge through the `set tags` statements the same apply emits, so counting them would
  * make an honest second machine rewrite the record; names compare as Quereus compares them.
@@ -24,15 +27,20 @@
 import { structuralEquals } from '@optimystic/db-core';
 import { StatusCode } from '@quereus/quereus';
 import type { StoredCheckConstraint, StoredColumnSchema, StoredTableSchema } from './schema-manager.js';
+import { sameTags, tagSlots } from './tag-overlay.js';
+import type { TagBearingSchema, TagChange, Tags } from './tag-overlay.js';
 
-/** A named, possibly tagged object of a catalog record: a CHECK constraint or a column. */
+/**
+ * A named, possibly tagged object of a catalog record: a CHECK constraint or a column. A tag slot's
+ * tag set is filed as one too ({@link tagSet}).
+ */
 export interface CatalogObject {
 	readonly name?: string;
 	readonly tags?: unknown;
 }
 
-/** The kinds of record object a catalog-only arm changes. */
-export type CatalogObjectKind = 'check' | 'column';
+/** The kinds of record object {@link AdoptedChanges} files a change under; `tags` is one tag slot of the table. */
+export type CatalogObjectKind = 'check' | 'column' | 'tags';
 
 /**
  * What a catalog-only arm does to the record: write its edit (`owned`), write nothing because the
@@ -257,6 +265,10 @@ export function adoptedChangeKey(tableKey: string, kind: CatalogObjectKind, name
  * column absent, which is what the engine held before the add. A DROP COLUMN has no undo (Quereus
  * marks it irreversible), so an adopted one is recorded and never matched.
  *
+ * A tag slot takes the same rule ({@link tagsToSave}). Quereus's undo of a tag step restores the
+ * whole set the slot held before it, so it always matches, and the differ emits one tag step per slot
+ * per apply, so a forward step never does.
+ *
  * Changes this machine made itself are not recorded: their undo is judged against the record like
  * any change, and finds the record holding exactly what this machine wrote.
  */
@@ -284,4 +296,54 @@ export class AdoptedChanges {
 			this.adopted.delete(key);
 		}
 	}
+}
+
+/**
+ * A tag slot's tags as {@link AdoptedChanges} compares them: under a key of their own, since
+ * {@link sameCatalogObject} ignores `tags`, under which every tag set would match every other.
+ */
+function tagSet(tags: Tags | undefined): CatalogObject & { readonly tagSet: Tags | undefined } {
+	return { tagSet: tags };
+}
+
+/**
+ * Which of `changes`, the tag slots one `table_modified` of `tableKey` replaced, to save onto `record`,
+ * the slots' new tags by slot. Empty when there is nothing to write. Each change is judged on its own:
+ *
+ * | change | record holds | verdict |
+ * | --- | --- | --- |
+ * | undoes the newest change adopted for the slot | anything | not saved: this machine's catalog only |
+ * | any other | no such object | not saved: there is nothing to address |
+ * | any other | the same tags | not saved, and adopted when `adopted` is given |
+ * | any other | different tags | saved |
+ *
+ * `adopted` is the open `apply schema`'s; outside one no undo follows, so nothing is recorded. This
+ * updates it, so call once per change, with the record the write will be made over.
+ *
+ * NOTE: the last row writes a change the record does not hold, so a machine applying an older
+ * declaration overwrites a newer tag, and its undo writes its pre-apply tags. This matches a CHECK's
+ * "local DDL wins" row in {@link classifyCheckChange}, and the plugin's README already tells hosts not
+ * to apply an older declaration.
+ */
+export function tagsToSave(
+	record: TagBearingSchema,
+	tableKey: string,
+	changes: readonly TagChange[],
+	adopted: AdoptedChanges | undefined,
+): Map<string, Tags | undefined> {
+	const held = tagSlots(record);
+	const save = new Map<string, Tags | undefined>();
+	for (const { slot, before, after } of changes) {
+		const key = adoptedChangeKey(tableKey, 'tags', slot);
+		if (adopted?.undoes(key, tagSet(after))) {
+			adopted.release(key);
+		} else if (held.has(slot)) {
+			if (!sameTags(held.get(slot), after)) {
+				save.set(slot, after);
+			} else {
+				adopted?.adopt(key, tagSet(before));
+			}
+		}
+	}
+	return save;
 }

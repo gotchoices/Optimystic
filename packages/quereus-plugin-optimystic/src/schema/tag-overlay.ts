@@ -1,17 +1,26 @@
 /**
- * Carrying one schema's TAGS onto another, and nothing else.
+ * A schema's TAGS, one tag location at a time, and carrying them onto another schema.
  *
  * Quereus applies a tag edit (`alter table … set|add|drop tags`, the column, named-constraint and
  * index forms, and the `set tags` an `apply schema` emits for a tag-only change) by swapping its own
  * in-memory `TableSchema` and announcing the swap as `table_modified`; it never calls the module's
- * `alterTable`. The module recovers the edit from that announcement and overlays the new schema's
- * tags onto two targets: its own copy of the table's `TableSchema`, and the table's catalog record.
- * Both have the same tag-bearing parts, so one function serves both ({@link withTagsOf}).
+ * `alterTable`. The module recovers the edit from that announcement and applies it to two targets
+ * with the same tag-bearing parts:
+ *
+ * - its own copy of the table's `TableSchema`, which mirrors this machine's engine and so takes
+ *   every tag of the new schema ({@link withTagsOf});
+ * - the table's catalog record, which other machines write too and can be newer than this machine's
+ *   view, so it takes only what the announcement changed ({@link tagChangesBetween},
+ *   {@link withTagsAt}), once judged against the record (`tagsToSave` in `./catalog-only-change.ts`).
+ *
+ * The unit is the *slot*: one place an edit can address tags ({@link tagSlots}). Quereus replaces a
+ * slot's tags as a whole set, so a slot is compared and written whole.
  */
 
+import { structuralEquals } from '@optimystic/db-core';
 import type { SqlValue } from '@quereus/quereus';
 
-type Tags = Readonly<Record<string, SqlValue>>;
+export type Tags = Readonly<Record<string, SqlValue>>;
 
 interface Tagged {
 	readonly tags?: Tags;
@@ -34,63 +43,121 @@ export interface TagBearingSchema extends Tagged {
 	readonly indexes?: readonly NamedTagged[];
 }
 
+/** Each slot's tags; absent or empty tags are undefined. See {@link tagSlots}. */
+export type TagSlots = ReadonlyMap<string, Tags | undefined>;
+
+/** One slot whose tags a schema change replaced. */
+export interface TagChange {
+	readonly slot: string;
+	readonly before: Tags | undefined;
+	readonly after: Tags | undefined;
+}
+
+const TABLE_SLOT = 'table';
+
+const TAGGED_LISTS = ['columns', 'checkConstraints', 'foreignKeys', 'uniqueConstraints', 'indexes'] as const;
+
+type TaggedList = typeof TAGGED_LISTS[number];
+
 /** A copy of `tags` when it has any, else undefined — so tag-free objects carry no key. */
 export function copyTags(tags: Tags | undefined): Record<string, SqlValue> | undefined {
 	return tags && Object.keys(tags).length > 0 ? { ...tags } : undefined;
 }
 
+/** Whether two tag sets are the same, an empty one being the same as none. */
+export function sameTags(a: Tags | undefined, b: Tags | undefined): boolean {
+	return structuralEquals(copyTags(a), copyTags(b));
+}
+
 /**
- * `target` with every tag `source` can address replaced by `source`'s: the table's own tags, each
- * column's (matched by name), each NAMED CHECK, foreign key and non-derived UNIQUE constraint's
- * (matched by name within its class), and each index's (matched by name). Names are compared
- * case-insensitively, as Quereus compares them. Anything `source` has no counterpart for — an
- * unnamed constraint, which no ALTER can address, or a column `source` does not list — keeps its
- * tags. Absent or empty tags are OMITTED, so a tag-free object stays byte-identical with a record
- * written before. Produces new objects throughout and mutates neither argument (Quereus freezes
- * its arrays); every other field of `target` is carried over as it is.
+ * The slot `item` of `list` is, or undefined when no edit can address it: an unnamed constraint.
+ * Names are lowercased, as Quereus compares them case-insensitively.
+ *
+ * NOTE: a UNIQUE constraint derived from a `CREATE UNIQUE INDEX` (`derivedFromIndex` set) is not a
+ * slot: the catalog record has no place for it (hydrate rebuilds it from its index), so a tag edit
+ * addressed to one through `alter constraint` cannot be saved — tags on the index itself are. If the
+ * record ever stores derived constraints, make them slots here.
  */
-export function withTagsOf<T extends TagBearingSchema>(target: T, source: TagBearingSchema): T {
+function slotOf(list: TaggedList, item: UniqueTagged): string | undefined {
+	if (item.name === undefined || (list === 'uniqueConstraints' && item.derivedFromIndex !== undefined)) {
+		return undefined;
+	}
+	return `${list}:${item.name.toLowerCase()}`;
+}
+
+/**
+ * Every slot of `schema` with its tags: the table's own, each column's, each NAMED CHECK, foreign
+ * key and non-derived UNIQUE constraint's, and each index's.
+ */
+export function tagSlots(schema: TagBearingSchema): Map<string, Tags | undefined> {
+	const slots = new Map<string, Tags | undefined>([[TABLE_SLOT, copyTags(schema.tags)]]);
+	for (const list of TAGGED_LISTS) {
+		for (const item of schema[list] ?? []) {
+			const slot = slotOf(list, item);
+			if (slot !== undefined) {
+				slots.set(slot, copyTags(item.tags));
+			}
+		}
+	}
+	return slots;
+}
+
+/**
+ * The slots whose tags differ between the schema a `table_modified` replaced and the one it installed.
+ * Only a slot both schemas have counts. A slot only `newObject` has is an object that appeared, and
+ * its tags reached the record through the hook that added the object (`alterCatalogOnly`,
+ * `createIndex`). Treating them as a tag change would save, over the record, the tags of a CHECK that
+ * Quereus's unwind re-added to this machine's catalog alone.
+ *
+ * NOTE: so an adopted added CHECK or column keeps the record's tags even when this machine's
+ * declaration gives it different ones. That takes two machines applying different schema versions,
+ * and the machine's next apply emits a `set tags` once it has hydrated the record; revisit if hosts
+ * apply differing versions at once.
+ */
+export function tagChangesBetween(oldObject: TagBearingSchema, newObject: TagBearingSchema): TagChange[] {
+	const held = tagSlots(oldObject);
+	const changes: TagChange[] = [];
+	for (const [slot, after] of tagSlots(newObject)) {
+		if (held.has(slot) && !sameTags(held.get(slot), after)) {
+			changes.push({ slot, before: held.get(slot), after });
+		}
+	}
+	return changes;
+}
+
+/**
+ * `target` with the tags of each slot `slots` names replaced by the tags given for it; every other
+ * part keeps its tags. Absent or empty tags are OMITTED, so a tag-free object stays byte-identical
+ * with a record written before. Produces new objects throughout and mutates neither argument (Quereus
+ * freezes its arrays); every other field of `target` is carried over as it is.
+ */
+export function withTagsAt<T extends TagBearingSchema>(target: T, slots: TagSlots): T {
 	const result: TagBearingSchema = {
-		...withTags(target, source.tags),
-		columns: overlayByName(target.columns, source.columns, isNamed),
-		...(target.checkConstraints && { checkConstraints: overlayByName(target.checkConstraints, source.checkConstraints, isNamed) }),
-		...(target.foreignKeys && { foreignKeys: overlayByName(target.foreignKeys, source.foreignKeys, isNamed) }),
-		// NOTE: a UNIQUE constraint derived from a `CREATE UNIQUE INDEX` (`derivedFromIndex` set) is
-		// not overlaid: the catalog record has no slot for it (hydrate rebuilds it from its index), so
-		// a tag edit addressed to one through `alter constraint` cannot be saved — tags on the index
-		// itself are. If the record ever stores derived constraints, overlay them here.
-		...(target.uniqueConstraints && {
-			uniqueConstraints: overlayByName(target.uniqueConstraints, source.uniqueConstraints, isNamedNonDerived),
-		}),
-		...(target.indexes && { indexes: overlayByName(target.indexes, source.indexes, isNamed) }),
+		...(slots.has(TABLE_SLOT) ? withTags(target, slots.get(TABLE_SLOT)) : target),
+		columns: retagged(target.columns, 'columns', slots),
+		...(target.checkConstraints && { checkConstraints: retagged(target.checkConstraints, 'checkConstraints', slots) }),
+		...(target.foreignKeys && { foreignKeys: retagged(target.foreignKeys, 'foreignKeys', slots) }),
+		...(target.uniqueConstraints && { uniqueConstraints: retagged(target.uniqueConstraints, 'uniqueConstraints', slots) }),
+		...(target.indexes && { indexes: retagged(target.indexes, 'indexes', slots) }),
 	};
 	// Sound: `result` is `target` with only the `tags` of `target` and of its list elements replaced.
 	return result as T;
 }
 
-function isNamed(item: NamedTagged): boolean {
-	return item.name !== undefined;
+/**
+ * `target` with every tag `source` can address replaced by `source`'s. Anything `source` has no
+ * counterpart for — an unnamed constraint, which no ALTER can address, or a column `source` does not
+ * list — keeps its tags.
+ */
+export function withTagsOf<T extends TagBearingSchema>(target: T, source: TagBearingSchema): T {
+	return withTagsAt(target, tagSlots(source));
 }
 
-function isNamedNonDerived(item: UniqueTagged): boolean {
-	return item.name !== undefined && item.derivedFromIndex === undefined;
-}
-
-/** `items`, each addressable one carrying the tags of the addressable `sources` entry of the same name. */
-function overlayByName<E extends NamedTagged>(
-	items: readonly E[],
-	sources: readonly UniqueTagged[] | undefined,
-	addressable: (item: UniqueTagged) => boolean,
-): E[] {
-	const byName = new Map<string, Tagged>();
-	for (const source of sources ?? []) {
-		if (addressable(source)) {
-			byName.set(source.name!.toLowerCase(), source);
-		}
-	}
+/** `items`, each one `slots` names carrying the tags given for it. */
+function retagged<E extends UniqueTagged>(items: readonly E[], list: TaggedList, slots: TagSlots): E[] {
 	return items.map(item => {
-		const source = addressable(item) ? byName.get(item.name!.toLowerCase()) : undefined;
-		return source ? withTags(item, source.tags) : item;
+		const slot = slotOf(list, item);
+		return slot !== undefined && slots.has(slot) ? withTags(item, slots.get(slot)) : item;
 	});
 }
 

@@ -13,7 +13,8 @@
  *
  * Several machines run the same upgrade, each from the catalog it hydrated, so a machine can meet a
  * record another machine already upgraded: the change is then adopted (nothing written), and if the
- * apply later fails, Quereus's undo of it stays off the record.
+ * apply later fails, Quereus's undo of it stays off the record. A tag change never reaches the hook
+ * (Quereus only announces it), and takes the same rule one tag location at a time.
  *
  * Harness: fresh `Database`s over one shared `MemoryRawStorage` through the `local` transactor
  * (see `shared-local-transactor.ts`), so a second session plus `hydrate` shows what reached storage.
@@ -25,7 +26,7 @@ import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { buildSharedLocalTransactor, countingTransactor, type TransactorCallCounts } from './shared-local-transactor.js';
+import { buildSharedLocalTransactor, countingTransactor, refusingCommits, type TransactorCallCounts } from './shared-local-transactor.js';
 import { captureThrowMessage, queryAll } from './query-helpers.js';
 
 type PluginHandle = ReturnType<typeof register>;
@@ -64,6 +65,13 @@ async function thrownBy(fn: () => Promise<unknown>): Promise<unknown> {
 		return error;
 	}
 	throw new Error('expected operation to throw, but it resolved');
+}
+
+/** `apply` fails on the UNIQUE constraint the module refuses, and Quereus restores what its earlier steps did. */
+async function expectRestored(apply: () => Promise<unknown>): Promise<void> {
+	const error = (await thrownBy(apply)) as Error;
+	expect(error.message).to.include(`does not support ADD CONSTRAINT`);
+	expect(error.message, `a verified restore rethrows the step's own error`).to.not.match(/partially migrated|could not be restored/);
 }
 
 describe('ALTER TABLE on an Optimystic table', function () {
@@ -270,12 +278,6 @@ describe('ALTER TABLE on an Optimystic table', function () {
 		/** Declared last, so its step runs after every CHECK step; the module refuses it, and the apply fails there. */
 		const FAILING = ', constraint one_c unique (c)';
 
-		async function expectRestored(apply: () => Promise<unknown>): Promise<void> {
-			const error = (await thrownBy(apply)) as Error;
-			expect(error.message).to.include(`does not support ADD CONSTRAINT`);
-			expect(error.message, `a verified restore rethrows the step's own error`).to.not.match(/partially migrated|could not be restored/);
-		}
-
 		/** The CHECK names a session that only hydrates finds in the record. */
 		async function savedChecks(store: ITransactor): Promise<{ db: Database; names: (string | undefined)[] }> {
 			const { db, plugin } = await openSession(store);
@@ -356,6 +358,96 @@ describe('ALTER TABLE on an Optimystic table', function () {
 		});
 	});
 
+	describe('tag changes, on one machine and on two', () => {
+		/**
+		 * `t`, then `u`, whose steps Quereus runs after every step on `t`. `tags` are `t`'s, `pos` its
+		 * CHECK and `uExtra` what `u` declares beyond its columns.
+		 */
+		const declared = (tags: string, { pos = 'check (a > 0)', uExtra = '' } = {}) => `declare schema main {
+			table t { id integer primary key, a integer null, constraint pos ${pos} } with tags (${tags})
+			table u { id integer primary key, c text null${uExtra} }
+		} apply schema main;`;
+		/** The module refuses it, so an apply declaring it fails after every step on `t`. */
+		const FAILING = ', constraint one_c unique (c)';
+
+		/** `t` as a session that only hydrates finds it in the record. */
+		async function savedT(store: ITransactor) {
+			const { db, plugin } = await openSession(store);
+			await plugin.hydrate(db);
+			return db.schemaManager.findTable('t', 'main')!;
+		}
+
+		/** Machine `a` declared `first` and `b` hydrated that, then `a` declared `second`, which `b` has not seen. */
+		async function bBehindA(first: string, second: string, store: ITransactor, bStore = store) {
+			const a = await openSession(store);
+			await a.db.exec(first);
+			const b = await openSession(bStore);
+			await b.plugin.hydrate(b.db);
+			await a.db.exec(second);
+			return b;
+		}
+
+		it('a second machine adopts a table tag already saved, and its failed apply leaves it in the record', async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const b = await bBehindA(declared('version = 1'), declared('version = 2'), store);
+
+			await expectRestored(() => b.db.exec(declared('version = 2', { uExtra: FAILING })));
+			expect(b.db.schemaManager.findTable('t', 'main')!.tags, 'its own catalog goes back').to.deep.equal({ version: 1 });
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+		});
+
+		it("a machine's own tag change in a failed apply is taken back out of the record", async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const { db } = await openSession(store);
+			await db.exec(declared('version = 1'));
+
+			await expectRestored(() => db.exec(declared('version = 2', { uExtra: FAILING })));
+			expect((await savedT(store)).tags).to.deep.equal({ version: 1 });
+		});
+
+		it("a structural event on a machine holding older tags leaves the record's tags alone", async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const b = await bBehindA(declared('version = 1'), declared('version = 2'), store);
+
+			await b.db.exec('analyze main.t');
+			await b.plugin.whenCatalogPersisted();
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+		});
+
+		it('a second machine whose commit is refused after adopting a tag leaves it in the record, and its retry keeps it', async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const refusing = refusingCommits(store);
+			const b = await bBehindA(declared('version = 1'), declared('version = 2'), store, refusing.transactor);
+			const upgrade = declared('version = 2', { uExtra: ', d text null' });
+
+			// `b` adopts the tag and owns ADD COLUMN `d`, whose commit is refused. The undo arrives in a
+			// second batch, which has to know the tag was adopted or it would save the old one.
+			refusing.refuse(1);
+			expect(await captureThrowMessage(() => b.db.exec(upgrade))).to.include('injected refusal');
+			refusing.refuse(0);
+			expect(b.db.schemaManager.findTable('t', 'main')!.tags, 'its own catalog goes back').to.deep.equal({ version: 1 });
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+
+			await b.db.exec(upgrade);
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+		});
+
+		it("the undo of a dropped CHECK leaves the tags of the record's newer CHECK alone", async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const newer = 'check (a >= 0) with tags (v = 2)';
+			const b = await bBehindA(
+				declared('version = 1', { pos: 'check (a > 0) with tags (v = 1)' }),
+				declared('version = 1', { pos: newer }),
+				store,
+			);
+
+			// The unwind drops the CHECK `b` adopted and re-adds the one it held, tags and all, on `b` alone.
+			await expectRestored(() => b.db.exec(declared('version = 1', { pos: newer, uExtra: FAILING })));
+			const pos = (await savedT(store)).checkConstraints.find(check => check.name === 'pos')!;
+			expect(pos.tags).to.deep.equal({ v: 2 });
+		});
+	});
+
 	describe('ADD COLUMN and DROP COLUMN, which rewrite no row', () => {
 		/** What a session that only hydrates finds: the table's column names. */
 		async function savedColumns(store: ITransactor): Promise<{ db: Database; plugin: PluginHandle; names: string[] }> {
@@ -430,12 +522,6 @@ describe('ALTER TABLE on an Optimystic table', function () {
 			const V2 = declared(', b text null');
 			/** Its step (ADD CONSTRAINT) runs after ADD COLUMN and before DROP COLUMN; the module refuses it, and the apply fails there. */
 			const FAILING = ', constraint one_a unique (a)';
-
-			async function expectRestored(apply: () => Promise<unknown>): Promise<void> {
-				const error = (await thrownBy(apply)) as Error;
-				expect(error.message).to.include(`does not support ADD CONSTRAINT`);
-				expect(error.message, `a verified restore rethrows the step's own error`).to.not.match(/partially migrated|could not be restored/);
-			}
 
 			/** Machine `a` declared V1 and wrote a row; machine `b` hydrated that and read it, so its table instance exists. */
 			async function twoMachines(): Promise<{ store: ITransactor; a: Database; b: Database; bCounts: TransactorCallCounts }> {
@@ -522,21 +608,14 @@ describe('ALTER TABLE on an Optimystic table', function () {
 				const store = buildSharedLocalTransactor(new MemoryRawStorage());
 				const a = await openSession(store);
 				await a.db.exec(V1);
-				let refusals = 0;
-				const b = await openSession({
-					...store,
-					get: request => store.get(request),
-					pend: request => store.pend(request),
-					cancel: request => store.cancel(request),
-					getStatus: request => store.getStatus(request),
-					commit: request => refusals-- > 0 ? Promise.reject(new Error('injected refusal')) : store.commit(request),
-				} as ITransactor);
+				const refusing = refusingCommits(store);
+				const b = await openSession(refusing.transactor);
 				await b.plugin.hydrate(b.db);
 				await a.db.exec(`declare schema main { table t { id integer primary key, a integer null, c text null, b text null } } apply schema main;`);
 
 				// `b` adopts ADD COLUMN `b` and owns ADD COLUMN `d`, whose commit is refused. The undo arrives in
 				// a second batch, which has to know `b` was adopted or it would remove it from the record.
-				refusals = 1;
+				refusing.refuse(1);
 				const error = await thrownBy(() => b.db.exec(`declare schema main { table t { id integer primary key, a integer null, c text null, b text null, d text null } } apply schema main;`)) as Error;
 				expect(error.message).to.include('injected refusal');
 				expect(b.db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'c']);
