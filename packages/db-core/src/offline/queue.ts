@@ -462,6 +462,26 @@ export class OfflineQueue {
 		return this.list.map(entry => snapshot(entry));
 	}
 
+	/** One queued entry as {@link entries} lists it, with how many are queued ahead of it and whether
+	 * it is the newest; `undefined` for an id not queued. For a caller handling one entry's status,
+	 * which {@link entries}' copy of the whole list would make grow with the queue: constant time for
+	 * the newest entry, as every enqueued one is, and a scan only for one a {@link restore} inserted
+	 * ahead of others. */
+	queuedEntry(entryId: EntryId): { readonly entry: QueuedEntry; readonly ahead: number; readonly newest: boolean } | undefined {
+		const entry = this.byId.get(entryId);
+		if (entry === undefined) return undefined;
+		const last = this.list.length - 1;
+		const newest = this.list[last] === entry;
+		return { entry: snapshot(entry), ahead: newest ? last : this.list.indexOf(entry), newest };
+	}
+
+	/** Whether a collection has recorded a refusal of a segment of the queued entry `entryId`: it is
+	 * about to fail. `false` for an id not queued. */
+	segmentRefused(entryId: EntryId): boolean {
+		const entry = this.byId.get(entryId);
+		return entry !== undefined && this.recordedRefusal(entry) !== undefined;
+	}
+
 	/** The current status of a queued entry, or `undefined` for an id not queued — never queued, or
 	 * already committed or failed (a settled entry leaves the queue with its terminal status event). */
 	status(entryId: EntryId): EntryStatus | undefined {
@@ -697,7 +717,7 @@ export class OfflineQueue {
 	/** The collections in which `entry` is still a sealed segment: every collection it wrote, until a
 	 * partial commit consumes some. */
 	private remainingCollections(entry: Entry): Collection<any>[] {
-		return entry.collections.filter(collection => collection.sealedEntries().includes(entry.id));
+		return entry.collections.filter(collection => collection.holdsSealed(entry.id));
 	}
 
 	/** The gate, asked with each of the head's remaining collections' header id and known log tail id.
@@ -1151,7 +1171,7 @@ export class OfflineQueue {
 		this.claimRemoval(entry);
 		this.pendingRefusals.delete(entry.id);
 		for (const collection of entry.collections) {
-			if (outcomes.get(collection.id)?.kind !== 'staged' || !collection.sealedEntries().includes(entry.id)) continue;
+			if (outcomes.get(collection.id)?.kind !== 'staged' || !collection.holdsSealed(entry.id)) continue;
 			try {
 				await collection.dropSealed(entry.id);
 			} catch (err) {
@@ -1237,7 +1257,7 @@ export class OfflineQueue {
 		this.removing = entry;
 		try {
 			for (const collection of entry.collections) {
-				if (!collection.sealedEntries().includes(entry.id)) continue;
+				if (!collection.holdsSealed(entry.id)) continue;
 				changedCollections.push(collection.id);
 				await collection.dropSealed(entry.id);
 			}

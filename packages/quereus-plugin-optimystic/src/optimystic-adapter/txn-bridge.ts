@@ -1054,7 +1054,7 @@ export class TransactionBridge {
     const trees = [...this.dirtyTrees.keys()].filter(isStaged);
     const local = this.currentTransaction!.acknowledgement === 'local';
     const behindQueue = offline.hasQueuedEntries()
-      || trees.some(tree => (tree.getCollection?.()?.sealedEntries().length ?? 0) > 0);
+      || trees.some(tree => tree.getCollection?.()?.hasSealed() ?? false);
     if (!local && !behindQueue) {
       return undefined;
     }

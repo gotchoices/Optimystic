@@ -38,6 +38,9 @@ export class SegmentList<TAction> {
 	 * through a method that bumps `version`; read it through {@link replayable}, {@link find},
 	 * {@link head} and {@link entryIds}. */
 	private readonly sealed: SealedSegment<TAction>[] = [];
+	/** The same segments by owner, so a lookup costs the same at any queue depth. Every method that
+	 * changes {@link sealed} changes this too. */
+	private readonly byEntry = new Map<EntryId, SealedSegment<TAction>>();
 	/** The open segment: what the current transaction has staged. */
 	open: Action<TAction>[] = [];
 	/** Bumped on every change to the sealed list — a seal, an unseal, an insert, a drop, a refusal
@@ -56,7 +59,9 @@ export class SegmentList<TAction> {
 		if (this.open.length === 0) {
 			return false;
 		}
-		this.sealed.push({ entryId, actions: this.open });
+		const segment: SealedSegment<TAction> = { entryId, actions: this.open };
+		this.sealed.push(segment);
+		this.byEntry.set(entryId, segment);
 		this.open = [];
 		this.version++;
 		return true;
@@ -78,6 +83,7 @@ export class SegmentList<TAction> {
 			throw new Error(`entry ${entryId} cannot be unsealed over a non-empty open segment`);
 		}
 		this.sealed.pop();
+		this.byEntry.delete(entryId);
 		this.open = [...newest.actions];
 		this.version++;
 	}
@@ -94,7 +100,9 @@ export class SegmentList<TAction> {
 		if (index < 0) {
 			throw new Error(`entry ${before} is not sealed in this collection; cannot insert ${entryId} before it`);
 		}
-		this.sealed.splice(index, 0, { entryId, actions: [...actions] });
+		const segment: SealedSegment<TAction> = { entryId, actions: [...actions] };
+		this.sealed.splice(index, 0, segment);
+		this.byEntry.set(entryId, segment);
 		this.version++;
 	}
 
@@ -105,6 +113,7 @@ export class SegmentList<TAction> {
 			throw new Error(`entry ${entryId} is not sealed in this collection`);
 		}
 		const [dropped] = this.sealed.splice(index, 1);
+		this.byEntry.delete(entryId);
 		this.version++;
 		return dropped!;
 	}
@@ -120,7 +129,7 @@ export class SegmentList<TAction> {
 	}
 
 	find(entryId: EntryId): SealedSegment<TAction> | undefined {
-		return this.sealed.find(segment => segment.entryId === entryId);
+		return this.byEntry.get(entryId);
 	}
 
 	/** The oldest sealed segment, if any. */

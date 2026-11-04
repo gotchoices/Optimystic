@@ -2061,6 +2061,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return this.segments.entryIds();
 	}
 
+	/** Whether `entryId` owns a sealed segment here, refused or not: asked of one entry at a time, at
+	 * any queue depth, so it builds no list. Synchronous and latch-free, like {@link sealedEntries}. */
+	holdsSealed(entryId: EntryId): boolean {
+		return this.segments.find(entryId) !== undefined;
+	}
+
+	/** Whether any segment is sealed here, refused ones included. Synchronous and latch-free, like
+	 * {@link sealedEntries}. */
+	hasSealed(): boolean {
+		return this.segments.hasSealed();
+	}
+
 	/** The log tail block id the most recent header read named ({@link logTailId}), for a caller that
 	 * resolves this collection's cohorts from routing keys without a read — the offline queue's
 	 * reachability gate (docs/offline-sync.md §When to submit). `undefined` before the first header

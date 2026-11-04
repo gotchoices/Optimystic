@@ -405,8 +405,7 @@ export class OfflineRestore {
 	/** Where the segment goes in `collection`'s sealed list: ahead of the first entry queued after
 	 * `seq` whose segment the collection still holds, or last. */
 	private positionOf(seq: number, collection: Collection<any>): { before: string } | 'last' {
-		const sealed = new Set(collection.sealedEntries());
-		const later = this.host.queue.entries().find(queued => queued.seq > seq && sealed.has(queued.id));
+		const later = this.host.queue.entries().find(queued => queued.seq > seq && collection.holdsSealed(queued.id));
 		return later === undefined ? 'last' : { before: later.id };
 	}
 

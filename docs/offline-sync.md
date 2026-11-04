@@ -396,7 +396,8 @@ The `Collection` additions (the list itself is `SegmentList` in
 - `sealPending(entryId)` — closes the open segment into a sealed segment owned by `entryId`. Answers
   `false` and changes nothing for a collection the transaction staged nothing into.
 - `sealedEntries()` — the entry ids of the sealed segments, in order, refused ones included until
-  they are dropped.
+  they are dropped. `holdsSealed(entryId)` and `hasSealed()` answer the two questions asked of that
+  list per entry, in constant time and without building it.
 - `sealedRefusal(entryId)` — the refusal a replay recorded for a segment it excluded, if any (see
   [Replay with a per-segment refusal](#replay-with-a-per-segment-refusal)).
 - `dropSealed(entryId)` — removes a segment, wherever it sits, and rebuilds the tracker by replaying
@@ -945,18 +946,30 @@ restored entry again from those, against the entries restored before it, and so 
 it had, with one widening: a `row` read comes back without the rows it pinned, and is matched by its
 table.
 
-The rest follows the queue. After every status that changes what is queued — an entry committed,
-partly committed or failed, or one a restore put back ahead of others — the controller walks the
-queue in order (`followOutlooks` in
-`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`). For each entry it
-drops the exposures and guards in collections a partial commit has committed, since those have
-passed; computes `dependsOn` again, by the rule in [Dependencies between
-entries](#dependencies-between-entries), against the entries ahead of it as they are now and the
-deferred records numbered below it; and derives `kind` from both, each dependency's kind being the
-one computed earlier in the same walk. An entry whose segment a replay has already refused keeps its
-outlook: it is about to fail, and the failure reports it. The walk waits while an entry that has left
-the queue has not had its terminal status yet, since its segments may still be dropping, and runs at
-that status.
+The rest follows the queue, at a cost that does not grow with it. The controller holds one index of
+what the queue writes (`WriteIndex` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/commit-outlook.ts`), which an entry joins
+when it is judged and leaves when it commits, so judging an entry behind the queue costs its own
+guards. Beside the judgements it holds a reverse map from each dependency to the entries that list it.
+
+When an entry commits, only what lists it changes (`followCommit`, same file). Each entry listing it
+loses it, in queue order; its `kind` is derived again, by the rule in [Dependencies between
+entries](#dependencies-between-entries), from what it still depends on; and an entry whose `kind`
+changes passes that on to the entries depending on it. Nothing else is read, because a committed
+entry's leaving can only shrink what the others depend on.
+
+After any other status that changes what is queued — an entry partly committed or failed, or one a
+restore put back ahead of others — the controller walks the whole queue in order instead
+(`followOutlooks`, same file) and rebuilds the index and the reverse map, since each of these can
+change other entries' dependencies in other ways. A commit takes the walk too while a queued entry
+has no judgement or another entry is on its way out. For each entry the walk drops the exposures and
+guards in collections a partial commit has committed, since those have passed; computes `dependsOn`
+again against the entries ahead of it as they are now and the deferred records numbered below it; and
+derives `kind` from both, each dependency's kind being the one computed earlier in the same walk. Both
+paths leave an entry whose segment a replay has already refused with the outlook it had: it is about
+to fail, and the failure reports it. The walk waits while an entry that has left the queue has not had
+its terminal status yet, since its segments may still be dropping, and runs at that status. An entry
+judged in that interval still counts the one leaving as ahead of it, until the status arrives.
 
 So the outlook changes in one direction only while the entry is queued: an entry that was exposed
 only through `dependsOn` becomes assured when those entries commit, and gets an `outlook-changed`

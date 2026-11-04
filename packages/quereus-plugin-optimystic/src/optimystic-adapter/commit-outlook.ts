@@ -161,7 +161,8 @@ export type EarlierEntry = {
 	readonly writes: StagedWrites;
 	/** `schema.table` of every table behind those segments. */
 	readonly tables: readonly string[];
-	/** Its own outlook's kind. */
+	/** Its own outlook's kind, read when a transaction's dependency on it is worked out: an entry kept in
+	 * an index for the queue's life supplies a getter, since its kind can change after it was added. */
 	readonly assured: boolean;
 	/** What its statements' write descriptions said about its elements. */
 	readonly facts: EntryFacts | undefined;
@@ -178,9 +179,6 @@ export type DeferredTransaction = {
 /** The transaction being judged: its staged writes, `schema.table` of every table it wrote, and what
  * its statements' write descriptions said about its elements. */
 export type JudgedTransaction = { readonly writes: StagedWrites; readonly tables: readonly string[]; readonly facts: EntryFacts | undefined };
-
-/** What is queued ahead of the transaction being judged, in queue order. */
-export type QueueAhead = { readonly earlier: readonly EarlierEntry[]; readonly deferred: readonly DeferredTransaction[] };
 
 /** What one check covers: the exact key for `absent` and `unchanged` and their already-applied
  * variants, the range for `absentRange`, everything the collection holds for a check the analysis
@@ -221,6 +219,9 @@ export type OwnJudgement = {
 /** A queued transaction's outlook beside the own judgement it was computed from, which is what
  * {@link followOutlooks} recomputes the outlook from as the queue changes. */
 export type QueuedJudgement = { readonly own: OwnJudgement; readonly outlook: CommitOutlook };
+
+/** A queued transaction's judgement with its place in the queue, as {@link followCommit} reads it. */
+export type SequencedJudgement = QueuedJudgement & { readonly seq: number };
 
 /** One queued transaction as {@link followOutlooks} reads it, in queue order. */
 export type FollowedEntry = {
@@ -316,66 +317,113 @@ function writtenKeysIn(actions: readonly Action<unknown>[]): { written: Set<stri
 	return { written, insertedAbsent };
 }
 
+/** Entries by transaction id: each once, in the order they were indexed, which is queue order. */
+type EntriesById = Map<string, EarlierEntry>;
+
 /** What the entries indexed so far write in one collection. */
 type CollectionWrites = {
-	/** Each key written, with the entries that wrote it, each once, in queue order. */
-	readonly byKey: Map<string, EarlierEntry[]>;
-	/** Every entry with a segment here, in queue order: what a check over the whole collection depends on. */
-	readonly writers: EarlierEntry[];
+	/** Each key written, with the entries that wrote it. */
+	readonly byKey: Map<string, EntriesById>;
+	/** Every entry with a segment here: what a check over the whole collection depends on. */
+	readonly writers: EntriesById;
 	/** The entries whose segment here cannot be read, which count as writing every key. */
-	readonly unreadable: EarlierEntry[];
+	readonly unreadable: EntriesById;
 	/** Keys an entry inserted under an `absent` or `absentOrEqual` check, from the segments that can
-	 * be read, each with whether the facts of an entry that inserted it say the key is fresh. */
-	readonly insertedAbsent: Map<string, boolean>;
+	 * be read: per key, each inserter with whether its facts say the key is fresh. Per inserter because
+	 * one flag OR'ed across them could not be undone when an inserter leaves the index, and a stale `true`
+	 * would judge a later `unchanged` safe because of a fresh inserter that has since committed and is no
+	 * longer fresh: a false `assured`. */
+	readonly insertedAbsent: Map<string, Map<string, boolean>>;
 };
+
+function addToGroup<K, V>(groups: Map<K, Map<string, V>>, group: K, member: string, value: V): void {
+	const members = groups.get(group);
+	if (members === undefined) groups.set(group, new Map([[member, value]]));
+	else members.set(member, value);
+}
+
+/** Take `member` out of `group`, and the group out of `groups` when it is left empty, so that an entry
+ * leaves nothing behind for a range scan to walk or for the index to go on holding. */
+function removeFromGroup<K, V>(groups: Map<K, Map<string, V>>, group: K, member: string): void {
+	const members = groups.get(group);
+	if (members?.delete(member) && members.size === 0) groups.delete(group);
+}
 
 /**
  * What the entries ahead of a transaction write, per collection, added one entry at a time in queue
  * order: matching a check against everything ahead of it is a lookup rather than a pass over the
- * queue, so judging a whole queue in order ({@link followOutlooks}) indexes each segment once.
+ * queue. Judging a whole queue in order ({@link followOutlooks}) builds one and indexes each segment
+ * once; the offline-mode controller keeps one for the queue's life, adding each entry as it is judged
+ * and removing each as it commits, so that judging the next one costs the same at any queue depth.
  */
-class WriteIndex {
+export class WriteIndex {
+	/** Every indexed entry, by transaction id. */
+	private readonly entries: EntriesById = new Map();
 	private readonly collections = new Map<CollectionId, CollectionWrites>();
-	/** Every entry with a segment in any collection of a table, by its `schema.table`, in queue order:
-	 * what an unchecked decision matched by table depends on. */
-	private readonly tables = new Map<string, EarlierEntry[]>();
+	/** Every entry with a segment in any collection of a table, by its `schema.table`: what an unchecked
+	 * decision matched by table depends on. */
+	private readonly tables = new Map<string, EntriesById>();
 
+	/** How many entries are indexed. */
+	get size(): number {
+		return this.entries.size;
+	}
+
+	holds(transactionId: string): boolean {
+		return this.entries.has(transactionId);
+	}
+
+	/** Index `entry`, at a cost of its own keys. Throws when it is already indexed: the index keeps one
+	 * record per transaction, so a second add would overwrite the first and {@link remove} would then
+	 * read only the second's keys. */
 	add(entry: EarlierEntry): void {
-		for (const table of entry.tables) {
-			const writers = this.tables.get(table);
-			if (writers === undefined) this.tables.set(table, [entry]);
-			else writers.push(entry);
-		}
+		const { transactionId } = entry;
+		if (this.entries.has(transactionId)) throw new Error(`transaction ${transactionId} is already in the write index`);
+		this.entries.set(transactionId, entry);
+		for (const table of entry.tables) addToGroup(this.tables, table, transactionId, entry);
 		for (const [collectionId, actions] of entry.writes) {
 			const writes = this.writesIn(collectionId);
-			writes.writers.push(entry);
+			writes.writers.set(transactionId, entry);
 			const keys = actions === undefined ? undefined : writtenKeysIn(actions);
 			if (keys === undefined) {
-				writes.unreadable.push(entry);
+				writes.unreadable.set(transactionId, entry);
 				continue;
 			}
-			for (const key of keys.written) {
-				const writers = writes.byKey.get(key);
-				if (writers === undefined) writes.byKey.set(key, [entry]);
-				else writers.push(entry);
-			}
-			// OR across the entries that inserted the key: once a fresh inserter is queued the key counts fresh
-			// while a later literal re-inserter of it (insert, delete, insert again) is queued too. That
-			// changes no verdict: the re-inserter is exposed on its own `absent`, and every later writer of
-			// the key depends on it.
+			for (const key of keys.written) addToGroup(writes.byKey, key, transactionId, entry);
 			const freshHere = entry.facts?.fresh.get(collectionId);
-			for (const key of keys.insertedAbsent) {
-				writes.insertedAbsent.set(key, (freshHere?.has(key) ?? false) || (writes.insertedAbsent.get(key) ?? false));
-			}
+			for (const key of keys.insertedAbsent) addToGroup(writes.insertedAbsent, key, transactionId, freshHere?.has(key) ?? false);
+		}
+	}
+
+	/** Take an entry out, at a cost of its own keys, read again from the segments it was added with,
+	 * whose actions are never rewritten. An entry not indexed is ignored: one a restore found already
+	 * committed settles without ever having been judged. */
+	remove(transactionId: string): void {
+		const entry = this.entries.get(transactionId);
+		if (entry === undefined) return;
+		this.entries.delete(transactionId);
+		for (const table of entry.tables) removeFromGroup(this.tables, table, transactionId);
+		for (const [collectionId, actions] of entry.writes) {
+			const writes = this.collections.get(collectionId);
+			if (writes === undefined) continue;
+			writes.writers.delete(transactionId);
+			writes.unreadable.delete(transactionId);
+			const keys = actions === undefined ? undefined : writtenKeysIn(actions);
+			for (const key of keys?.written ?? []) removeFromGroup(writes.byKey, key, transactionId);
+			for (const key of keys?.insertedAbsent ?? []) removeFromGroup(writes.insertedAbsent, key, transactionId);
+			if (writes.writers.size === 0) this.collections.delete(collectionId);
 		}
 	}
 
 	/** Whether an indexed entry inserted `key` in `collectionId` under an `absent` or `absentOrEqual`
 	 * check AND under a fresh key — the table's key is tagged fresh, or the facts of an entry that inserted it list the
-	 * key — so that no other machine can know the row yet (docs/offline-sync.md §Judging each guard). */
+	 * key — so that no other machine can know the row yet (docs/offline-sync.md §Judging each guard).
+	 * Any fresh inserter will do: while one is indexed the key counts fresh, even beside a later literal
+	 * re-inserter of it (insert, delete, insert again). That changes no verdict: the re-inserter is
+	 * exposed on its own `absent`, and every later writer of the key depends on it. */
 	insertedFresh(collectionId: CollectionId, key: string, description: MainTreeDescription): boolean {
-		const byFacts = this.collections.get(collectionId)?.insertedAbsent.get(key);
-		return byFacts !== undefined && (description.freshKey || byFacts);
+		const inserters = this.collections.get(collectionId)?.insertedAbsent.get(key);
+		return inserters !== undefined && (description.freshKey || [...inserters.values()].includes(true));
 	}
 
 	/** Every indexed entry that writes inside `span` in `collectionId`, an entry possibly more than once.
@@ -386,28 +434,28 @@ class WriteIndex {
 		const writes = this.collections.get(collectionId);
 		if (writes === undefined) return;
 		if (span.kind === 'whole') {
-			yield* writes.writers;
+			yield* writes.writers.values();
 			return;
 		}
-		yield* writes.unreadable;
+		yield* writes.unreadable.values();
 		if (span.kind === 'key') {
-			yield* writes.byKey.get(span.key) ?? [];
+			yield* writes.byKey.get(span.key)?.values() ?? [];
 			return;
 		}
 		for (const [key, writers] of writes.byKey) {
-			if (withinRange(key, span.range)) yield* writers;
+			if (withinRange(key, span.range)) yield* writers.values();
 		}
 	}
 
 	/** Every indexed entry with a segment in a collection of the table named `table`, each once. */
 	writersOfTable(table: string): Iterable<EarlierEntry> {
-		return this.tables.get(table) ?? [];
+		return this.tables.get(table)?.values() ?? [];
 	}
 
 	private writesIn(collectionId: CollectionId): CollectionWrites {
 		let writes = this.collections.get(collectionId);
 		if (writes === undefined) {
-			writes = { byKey: new Map(), writers: [], unreadable: [], insertedAbsent: new Map() };
+			writes = { byKey: new Map(), writers: new Map(), unreadable: new Map(), insertedAbsent: new Map() };
 			this.collections.set(collectionId, writes);
 		}
 		return writes;
@@ -417,23 +465,20 @@ class WriteIndex {
 // ── the judgement ────────────────────────────────────────────────────────────────────────────
 
 /**
- * The outlook of `transaction` were it queued behind `ahead` (docs/offline-sync.md §Predicting
- * whether an entry will commit): its own exposures ({@link ownJudgement}) and what it depends on
- * ({@link outlookFrom}), with the own judgement beside it for {@link followOutlooks}. Holds no state:
- * everything it reads comes through its arguments.
- * NOTE: indexes every earlier entry's segments on each call, so an enqueue behind a long queue is
- * linear in the queue's staged elements. If enqueue ever shows up slow there, keep one index of the
- * queue in the controller, add each entry as it is judged, and rebuild it only when an entry settles.
+ * The outlook of `transaction` were it queued behind the entries `earlier` indexes and the `deferred`
+ * journaled transactions (docs/offline-sync.md §Predicting whether an entry will commit): its own
+ * exposures ({@link ownJudgement}) and what it depends on ({@link outlookFrom}), with the own judgement
+ * beside it for {@link followOutlooks}. Holds no state, and costs the transaction's own checks at any
+ * queue depth: everything else it reads is a lookup in `earlier`.
  */
 export function judgeTransaction(
 	transaction: JudgedTransaction,
 	schema: OutlookSchema,
-	ahead: QueueAhead,
+	earlier: WriteIndex,
+	deferred: readonly DeferredTransaction[],
 ): QueuedJudgement {
-	const index = new WriteIndex();
-	for (const entry of ahead.earlier) index.add(entry);
-	const own = ownJudgement(transaction.writes, transaction.facts, schema, index);
-	return { own, outlook: outlookFrom(own, transaction.tables, index, ahead.deferred) };
+	const own = ownJudgement(transaction.writes, transaction.facts, schema, earlier);
+	return { own, outlook: outlookFrom(own, transaction.tables, earlier, deferred) };
 }
 
 /**
@@ -464,6 +509,63 @@ export function followOutlooks(queue: readonly FollowedEntry[], deferred: readon
 		});
 	}
 	return followed;
+}
+
+/**
+ * What {@link followOutlooks} would answer after the head transaction `committed` left the queue,
+ * without reading the queue (docs/offline-sync.md §The outlook): a committed transaction's writes are
+ * now the state everything behind it was staged over, so what remains depends on what it depended on,
+ * less that one. Each transaction listing it loses it, in queue order; its kind is worked out again;
+ * and one whose kind changes passes that on to the transactions depending on it, found in `dependents`
+ * (dependency → dependents), which sit behind it, so that in queue order each is reached with its
+ * dependencies final and is worked out once. A kind can only move towards `assured` here.
+ *
+ * Answers only what changed, in queue order. `judgements` must be what the walk would answer before
+ * `committed` left. A transaction never judged, or already `refused`, is not recomputed, and counts
+ * with the kind it has (none for one never judged). A failure, a partial commit or a restore takes the
+ * walk instead, since each can change other transactions' dependencies in other ways.
+ */
+export function followCommit(
+	committed: string,
+	judgements: ReadonlyMap<string, SequencedJudgement>,
+	dependents: ReadonlyMap<string, ReadonlySet<string>>,
+	refused: (transactionId: string) => boolean,
+): Map<string, QueuedJudgement> {
+	const followed = new Map<string, QueuedJudgement>();
+	const pending: string[] = [];
+	const seen = new Set<string>();
+	const seqOf = (transactionId: string): number => judgements.get(transactionId)?.seq ?? Number.POSITIVE_INFINITY;
+	const passOn = (transactionId: string, from: number): void => {
+		for (const dependent of dependents.get(transactionId) ?? []) {
+			if (seen.has(dependent)) continue;
+			seen.add(dependent);
+			insertInOrder(pending, dependent, seqOf, from);
+		}
+	};
+	passOn(committed, 0);
+	for (let next = 0; next < pending.length; next++) {
+		const transactionId = pending[next]!;
+		const held = judgements.get(transactionId);
+		if (held === undefined || refused(transactionId)) continue;
+		const dependsOn = held.outlook.dependsOn.filter(dependency => dependency.transactionId !== committed);
+		const kind = outlookKind(held.own, dependsOn, id => (followed.get(id) ?? judgements.get(id))?.outlook.kind === 'assured');
+		if (kind === held.outlook.kind && dependsOn.length === held.outlook.dependsOn.length) continue;
+		followed.set(transactionId, { own: held.own, outlook: { ...held.outlook, kind, dependsOn } });
+		if (kind !== held.outlook.kind) passOn(transactionId, next + 1);
+	}
+	return followed;
+}
+
+/** Insert `item` into `ordered`, ascending by `rank`, at or after index `from`. */
+function insertInOrder(ordered: string[], item: string, rank: (item: string) => number, from: number): void {
+	let low = from;
+	let high = ordered.length;
+	while (low < high) {
+		const middle = (low + high) >>> 1;
+		if (rank(ordered[middle]!) < rank(item)) low = middle + 1;
+		else high = middle;
+	}
+	ordered.splice(low, 0, item);
 }
 
 /** `own` without what it judged in `collections`; its decisions stay, being a statement's. */
@@ -667,10 +769,7 @@ class CollectionJudge {
  * of the keys a `row` read pinned (unreadable segments included), or, for a decision matched by table,
  * that holds a segment in any collection of the table — and, either way, on every deferred transaction
  * that wrote the table, whose writes cannot be matched by key. A transaction listed for both reasons is
- * listed as `'guard'`. It is assured exactly when
- * it has no exposure and every transaction it depends on through a guard is assured; a deferred one
- * never is. The decisions do not bear on its kind: an earlier failure leaves them resting on rows that
- * are gone, it does not refuse the transaction.
+ * listed as `'guard'`. Its kind is {@link outlookKind}'s, and a deferred transaction is never assured.
  */
 function outlookFrom(
 	own: OwnJudgement,
@@ -698,13 +797,20 @@ function outlookFrom(
 		}
 	}
 	const ordered = [...dependencies].sort(([, a], [, b]) => a.seq - b.seq);
-	const assured = own.exposures.length === 0 && ordered.every(([, dependency]) => dependency.via === 'unchecked' || dependency.assured);
+	const dependsOn = ordered.map(([transactionId, { via }]): OutlookDependency => ({ transactionId, via }));
 	return {
-		kind: assured ? 'assured' : 'exposed',
+		kind: outlookKind(own, dependsOn, transactionId => dependencies.get(transactionId)!.assured),
 		exposures: own.exposures.map(({ exposure }) => exposure),
-		dependsOn: ordered.map(([transactionId, { via }]) => ({ transactionId, via })),
+		dependsOn,
 		unchecked: own.unchecked === 'not-computed' ? 'not-computed' : own.unchecked.map(({ decision }) => decision),
 	};
+}
+
+/** Assured exactly when the transaction has no exposure and every transaction it depends on through a
+ * guard is assured. The decisions do not bear on its kind: an earlier failure leaves them resting on
+ * rows that are gone, it does not refuse the transaction. */
+function outlookKind(own: OwnJudgement, dependsOn: readonly OutlookDependency[], assured: (transactionId: string) => boolean): CommitOutlook['kind'] {
+	return own.exposures.length === 0 && dependsOn.every(({ transactionId, via }) => via === 'unchecked' || assured(transactionId)) ? 'assured' : 'exposed';
 }
 
 /** The indexed entries whose writes `span` read: by key where the span has keys, else every writer of its table. */

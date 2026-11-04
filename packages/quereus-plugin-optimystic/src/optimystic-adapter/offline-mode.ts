@@ -10,9 +10,9 @@ import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-confi
 import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
 import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
-import { followOutlooks, judgeTransaction, outlookContradicted, refusedCheck, renderKey } from './commit-outlook.js';
+import { followCommit, followOutlooks, judgeTransaction, outlookContradicted, refusedCheck, renderKey, WriteIndex } from './commit-outlook.js';
 import type {
-	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, EntryFacts, FollowedEntry, OutlookSchema, QueueAhead, QueuedJudgement, StagedWrites, TableOutlookSource,
+	CollectionDescription, CommitOutlook, DeferredTransaction, EarlierEntry, EntryFacts, FollowedEntry, OutlookSchema, QueuedJudgement, SequencedJudgement, StagedWrites, TableOutlookSource,
 } from './commit-outlook.js';
 import { guardRefusalIn } from './guard-refusal.js';
 import { addListener, notifyListeners } from './listeners.js';
@@ -125,11 +125,13 @@ type StateListener = (state: OfflineModeState) => void;
 type FailedEntryStatus = Extract<EntryStatus, { kind: 'failed' }>;
 
 /** A queued transaction's judgement, held from its first `queued` status until it settles. */
-type HeldJudgement = QueuedJudgement & {
+type HeldJudgement = SequencedJudgement & {
 	/** A transaction its outlook lists in `dependsOn` has failed since the outlook was last computed,
 	 * so a failure of this one through that failure is one the outlook allowed for. */
 	readonly dependencyFailed: boolean;
 };
+/** A queued transaction whose outlook changed `kind`, to announce once every held outlook is current. */
+type OutlookChange = { readonly transactionId: string; readonly outlook: CommitOutlook };
 /** Called with a transaction's terminal outcome, or `undefined` when the controller was disposed first. */
 type SettleWaiter = (outcome: TransactionOutcome | undefined) => void;
 
@@ -192,10 +194,21 @@ export class OfflineMode {
 	/** Who waits for each transaction to settle ({@link whenSettled}), keyed by transaction id. */
 	private readonly settleWaiters = new Map<string, SettleWaiter[]>();
 	/** Each queued transaction's judgement, made when the queue first reported it `queued`
-	 * ({@link judgeQueued}), kept current as the queue changes ({@link followQueue}) and held until it
+	 * ({@link judgeQueued}), kept current as the queue changes ({@link followStatus}) and held until it
 	 * settles. The judgement is not journaled, its inputs are — the segments and {@link entryFacts} — so
 	 * a restart judges a restored transaction again, as it was judged, when the restore puts it back. */
 	private readonly judgements = new Map<string, HeldJudgement>();
+	/** For each transaction some queued transaction's outlook lists in `dependsOn`, those that list it:
+	 * what lets a commit reach only the transactions it affects ({@link followCommitted}). Changed with
+	 * {@link judgements}, and rebuilt with it by {@link followQueue}. */
+	private readonly dependents = new Map<string, Set<string>>();
+	/** What the queue writes, so judging a transaction costs the same at any queue depth: each entry is
+	 * added when it is judged, removed when it commits, and the whole index rebuilt by {@link followQueue}.
+	 * It can hold an entry that has left the queue and not had its terminal status yet, which a
+	 * transaction judged meanwhile lists as a dependency until that status arrives.
+	 * NOTE: holds a small map per key the queue writes for as long as the key is queued; if bulk offline
+	 * writes ever make that heavy, hold a key's one writer inline until a second appears. */
+	private queueWrites = new WriteIndex();
 	/** What each queued transaction's statements' write descriptions said about its elements, handed in
 	 * ahead of the `queued` status that judges it — by {@link enqueue} ahead of the enqueue, where the
 	 * journal also writes them into the entry record, and by the restore ahead of `queue.restore`, read
@@ -756,7 +769,10 @@ export class OfflineMode {
 	openTransactionOutlook(): CommitOutlook {
 		const collections = this.bridge.stagedCollections().filter(collection => collection.openActions().length > 0);
 		const writes: StagedWrites = new Map(collections.map(collection => [collection.id, collection.openActions()]));
-		return this.judge(writes, collections.map(collection => collection.id), this.queueAhead(this.queue.entries(), Infinity), this.bridge.openWriteFacts()).outlook;
+		const tables = this.tablesOf(collections.map(collection => collection.id));
+		const covered = this.queueWrites.size >= this.queue.queueState().depth;
+		const earlier = covered ? this.queueWrites : this.indexOver(this.queue.entries());
+		return judgeTransaction({ writes, tables, facts: this.bridge.openWriteFacts() }, this.schema, earlier, this.deferredBelow(Infinity)).outlook;
 	}
 
 	/** {@link judgeQueued}, isolated: it runs ahead of the status's translation and delivery, and a
@@ -778,40 +794,64 @@ export class OfflineMode {
 	 * journaled transactions numbered below it that are still deferred. Its own judgement is not made
 	 * again, so a tag changed later changes nothing here; its dependencies follow the queue
 	 * ({@link followQueue}).
+	 *
+	 * A transaction judged behind everything queued, as an enqueued one always is, goes straight against
+	 * {@link queueWrites} and joins it. Its judgement throwing changes nothing there: it is still queued
+	 * ahead of whatever is judged next, and is judged again on its next `queued` status. One a restore
+	 * inserted ahead of others, or judged again after a throw, is judged against a temporary index of the
+	 * entries ahead of it.
 	 */
 	private judgeQueued(entryId: string): void {
-		const entries = this.queue.entries();
-		const position = entries.findIndex(entry => entry.id === entryId);
-		const entry = entries[position];
-		if (entry === undefined) {
+		const listed = this.queue.queuedEntry(entryId);
+		if (listed === undefined) {
 			log('offline:outlook-unjudged transaction=%s: the queue reported it queued without listing it', entryId);
 			return;
 		}
+		const { entry, ahead, newest } = listed;
+		const earlier = this.earlierEntry(entry);
+		const behindTheIndex = newest && !this.queueWrites.holds(entryId);
+		try {
+			// A count, not a check of who: fewer than are listed ahead means one is not indexed yet (a restore
+			// is putting it back). A listed entry missing beside an unsettled one indexed goes unseen here,
+			// and the restored entry's own `queued` status corrects it through the walk.
+			const covered = behindTheIndex && this.queueWrites.size >= ahead;
+			const index = covered ? this.queueWrites : this.indexOver(this.queue.entries().slice(0, ahead));
+			const judgement = judgeTransaction(earlier, this.schema, index, this.deferredBelow(entry.seq));
+			this.judgements.set(entryId, { ...judgement, seq: entry.seq, dependencyFailed: false });
+			this.noteDependencies(entryId, judgement.outlook);
+		} finally {
+			if (behindTheIndex) this.queueWrites.add(earlier);
+		}
+	}
+
+	/** `entry` as a judgement reads it: the segments it still holds and their tables, its facts, and its
+	 * outlook's kind as it is whenever that is read, since a kept entry's kind can change. */
+	private earlierEntry(entry: QueuedEntry): EarlierEntry {
+		const { judgements } = this;
+		const { id: transactionId, seq } = entry;
 		const collections = this.heldCollections(entry);
-		const ahead = this.queueAhead(entries.slice(0, position), entry.seq);
-		const judgement = this.judge(this.sealedWrites(entryId, collections), collections, ahead, this.entryFacts.get(entryId));
-		this.judgements.set(entryId, { ...judgement, dependencyFailed: false });
+		return {
+			transactionId,
+			seq,
+			writes: this.sealedWrites(transactionId, collections),
+			tables: this.tablesOf(collections),
+			facts: this.entryFacts.get(transactionId),
+			get assured() { return judgements.get(transactionId)?.outlook.kind === 'assured'; },
+		};
 	}
 
-	private judge(writes: StagedWrites, collections: readonly CollectionId[], ahead: QueueAhead, facts: EntryFacts | undefined): QueuedJudgement {
-		return judgeTransaction({ writes, tables: this.tablesOf(collections), facts }, this.schema, ahead);
+	private indexOver(entries: readonly QueuedEntry[]): WriteIndex {
+		const index = new WriteIndex();
+		for (const entry of entries) index.add(this.earlierEntry(entry));
+		return index;
 	}
 
-	/** `entries`, each with the segments it still holds and their tables, its outlook's kind and its
-	 * facts, beside the deferred journaled transactions numbered below `seq`. */
-	private queueAhead(entries: readonly QueuedEntry[], seq: number): QueueAhead {
-		const earlier = entries.map((entry): EarlierEntry => {
-			const collections = this.heldCollections(entry);
-			return {
-				transactionId: entry.id,
-				seq: entry.seq,
-				writes: this.sealedWrites(entry.id, collections),
-				tables: this.tablesOf(collections),
-				assured: this.judgements.get(entry.id)?.outlook.kind === 'assured',
-				facts: this.entryFacts.get(entry.id),
-			};
-		});
-		return { earlier, deferred: this.deferredBelow(seq) };
+	private noteDependencies(transactionId: string, outlook: CommitOutlook): void {
+		for (const dependency of outlook.dependsOn) {
+			const listing = this.dependents.get(dependency.transactionId);
+			if (listing === undefined) this.dependents.set(dependency.transactionId, new Set([transactionId]));
+			else listing.add(transactionId);
+		}
 	}
 
 	/** The journaled transactions numbered below `seq` the restore still defers — a record a pass has
@@ -824,10 +864,10 @@ export class OfflineMode {
 
 	/**
 	 * Bring every queued transaction's outlook up to date with the queue as it is now
-	 * ({@link followOutlooks}), after a status that changed what is queued, and deliver
-	 * `outlook-changed` for each whose `kind` changed — once every held outlook is current, so a
-	 * listener reading `status` or `entries` meanwhile sees them all. A narrower `dependsOn` alone is
-	 * held and not announced.
+	 * ({@link followOutlooks}), and {@link queueWrites} and {@link dependents} with it, after a status
+	 * that changed what is queued in a way {@link followCommitted} does not cover. Then deliver
+	 * `outlook-changed` for each whose `kind` changed ({@link deliverOutlookChanges}). A narrower
+	 * `dependsOn` alone is held and not announced.
 	 *
 	 * Deferred while a transaction that left the queue has not yet had its terminal status (its
 	 * judgement is still held): a failed one may still be dropping its segments, and a transaction
@@ -840,24 +880,46 @@ export class OfflineMode {
 	 *
 	 * Isolated as the judgement is ({@link tryJudgeQueued}): it runs inside the queue's status
 	 * delivery, so a throw is logged and leaves every outlook as it was.
-	 *
-	 * NOTE: one pass per settle, each over every queued transaction — and each segment it reads is
-	 * found by scanning its collection's sealed list — so draining N transactions costs N passes,
-	 * quadratic in the queue length: the shape of the replay after every head commit, whose `NOTE:` at
-	 * the `replay` step of `Collection.openHeadCommit` names its remedy. If the pass ever shows up in a
-	 * long drain, recompute only the transactions behind the settled one that list it in `dependsOn`.
 	 */
 	private followQueue(): void {
-		let changed: { transactionId: string; outlook: CommitOutlook }[];
+		let changed: OutlookChange[];
 		try {
 			const entries = this.queue.entries();
 			const queued = new Set(entries.map(entry => entry.id));
 			if ([...this.judgements.keys()].some(transactionId => !queued.has(transactionId))) return;
-			changed = this.holdFollowed(followOutlooks(entries.map(entry => this.followedEntry(entry)), this.deferredBelow(Infinity)));
+			this.queueWrites = this.indexOver(entries);
+			// Recomputed only while no removal is in progress, so each survived every failure it depended on.
+			changed = this.holdFollowed(followOutlooks(entries.map(entry => this.followedEntry(entry)), this.deferredBelow(Infinity)), true);
+			this.dependents.clear();
+			for (const [transactionId, { outlook }] of this.judgements) this.noteDependencies(transactionId, outlook);
 		} catch (error) {
 			log('offline:outlook-unfollowed: the recomputation threw: %o', error);
 			return;
 		}
+		this.deliverOutlookChanges(changed);
+	}
+
+	/**
+	 * Bring the outlooks up to date after `transactionId` committed: only those depending on it, directly
+	 * or through a kind it changes ({@link followCommit}), so a commit costs what it affects however
+	 * long the queue is. Isolated as {@link followQueue} is.
+	 */
+	private followCommitted(transactionId: string): void {
+		let changed: OutlookChange[];
+		try {
+			this.queueWrites.remove(transactionId);
+			changed = this.holdFollowed(followCommit(transactionId, this.judgements, this.dependents, id => this.queue.segmentRefused(id)), false);
+			this.dependents.delete(transactionId);
+		} catch (error) {
+			log('offline:outlook-unfollowed: the recomputation threw: %o', error);
+			return;
+		}
+		this.deliverOutlookChanges(changed);
+	}
+
+	/** Announce each change once every held outlook is current, so a listener reading `status` or
+	 * `entries` meanwhile sees them all. */
+	private deliverOutlookChanges(changed: readonly OutlookChange[]): void {
 		for (const { transactionId, outlook } of changed) {
 			const status: QueuedTransactionStatus = { kind: 'outlook-changed', transactionId, outlook };
 			notifyListeners(this.statusListeners, status,
@@ -865,14 +927,14 @@ export class OfflineMode {
 		}
 	}
 
-	/** Hold each recomputed judgement, answering the transactions whose outlook changed `kind`. */
-	private holdFollowed(followed: ReadonlyMap<string, QueuedJudgement>): { transactionId: string; outlook: CommitOutlook }[] {
-		const changed: { transactionId: string; outlook: CommitOutlook }[] = [];
+	/** Hold each recomputed judgement, answering the transactions whose outlook changed `kind`.
+	 * `survivedFailures`: the recomputation establishes that each outlived the failures it depended on. */
+	private holdFollowed(followed: ReadonlyMap<string, QueuedJudgement>, survivedFailures: boolean): OutlookChange[] {
+		const changed: OutlookChange[] = [];
 		for (const [transactionId, judgement] of followed) {
 			const held = this.judgements.get(transactionId);
 			if (held === undefined) continue;
-			// Recomputed only while no removal is in progress, so it survived every failure it depended on.
-			this.judgements.set(transactionId, { ...judgement, dependencyFailed: false });
+			this.judgements.set(transactionId, { ...judgement, seq: held.seq, dependencyFailed: held.dependencyFailed && !survivedFailures });
 			if (held.outlook.kind === judgement.outlook.kind) continue;
 			if (judgement.outlook.kind === 'exposed') {
 				log('offline:outlook-regressed transaction=%s dependsOn=%o', transactionId,
@@ -887,7 +949,6 @@ export class OfflineMode {
 	 * judgement, its facts, and whether a replay has refused one of them. */
 	private followedEntry(entry: QueuedEntry): FollowedEntry {
 		const collections = this.heldCollections(entry);
-		const registry = this.bridge.getCollectionRegistry();
 		return {
 			transactionId: entry.id,
 			seq: entry.seq,
@@ -896,7 +957,7 @@ export class OfflineMode {
 			committedCollections: entry.committedCollections ?? [],
 			facts: this.entryFacts.get(entry.id),
 			judgement: this.judgements.get(entry.id),
-			refused: collections.some(id => registry.get(id)?.sealedRefusal(entry.id) !== undefined),
+			refused: this.queue.segmentRefused(entry.id),
 		};
 	}
 
@@ -908,14 +969,24 @@ export class OfflineMode {
 			case 'failed':
 			case 'partially-committed':
 				return true;
-			case 'queued': {
-				if (!firstQueued) return false;
-				const entries = this.queue.entries();
-				const position = entries.findIndex(entry => entry.id === status.entryId);
-				return position >= 0 && position < entries.length - 1;
-			}
+			case 'queued':
+				return firstQueued && this.queue.queuedEntry(status.entryId)?.newest === false;
 			case 'submitting':
 				return false;
+		}
+	}
+
+	/**
+	 * Follow `status` if it changes what is queued. A commit with every queued transaction judged and
+	 * no other on its way out takes {@link followCommitted}; everything else takes {@link followQueue}:
+	 * a failure, a partial commit and a restore can each change other transactions' dependencies in
+	 * ways a commit cannot, and the walk knows to wait for a removal in progress.
+	 */
+	private followStatus(status: EntryStatus, firstQueued: boolean): void {
+		if (status.kind === 'committed' && this.judgements.size === this.queue.queueState().depth) {
+			this.followCommitted(status.entryId);
+		} else if (this.changesTheQueue(status, firstQueued)) {
+			this.followQueue();
 		}
 	}
 
@@ -1019,7 +1090,7 @@ export class OfflineMode {
 		notifyListeners(this.statusListeners, translated,
 			error => log('offline:status-listener-threw transaction=%s kind=%s: %o', translated.transactionId, translated.kind, error));
 		if (status.kind === 'failed') this.announceChanged(status.entryId, status.changedCollections);
-		if (this.changesTheQueue(status, firstQueued)) this.followQueue();
+		this.followStatus(status, firstQueued);
 		if (outcome !== undefined) this.settle(outcome.status);
 	}
 
