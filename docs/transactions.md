@@ -477,6 +477,18 @@ batch too (`adoptedByRefusedBatch` in
 commit also fails, the engine tolerates it, since the store still holds the
 pre-apply state.
 
+A refused commit leaves each table it wrote owing its record, because after a
+data-destroying step nothing is unwound and nothing else would ever save those
+changes. `beginSchemaBatch` forgives that for the length of the next batch: the
+undo DDL's first touch of such a table would otherwise write this machine's
+description, which can be older than the record, into the overlay that batch
+commits. When a batch ends, `settleOwedRecords` (same file) compares each such
+table's entry in the engine's catalog with its entry when the apply began. The
+same description means the apply was taken back, so nothing is owed. A different
+one means the engine kept something the record lacks, so the table still owes it.
+A second refusal, and a failed step unwound inside a batch whose commit is then
+refused, are settled by the same comparison.
+
 With tables over more than one transactor there is one `SchemaManager` each, so
 one can have committed when a later one refuses. The undo DDL takes the first back
 in the second batch, unless its second commit fails too, which leaves it holding
@@ -488,12 +500,15 @@ tables created or given an index inside the batch stay in the engine's catalog,
 cached as initialized, but unpersisted. The module marks each of them unpersisted
 (`markSchemaUnpersisted` in
 `packages/quereus-plugin-optimystic/src/optimystic-module.ts`); its next touch
-re-runs initialization, finds no persisted record, and writes the schema —
+re-runs initialization and writes the schema —
 including the indexes it maintains, refreshed from its `IndexManager`, since
 Quereus's `CREATE INDEX` replaces the engine's `TableSchema` rather than
 mutating the copy the table holds. Nothing was cached for those tables (a batch
 seeds the schema cache only after its commit lands), so no stale hit masks the
-gap. A table **dropped** inside the batch — by the plan, or by the unwind of its
+gap. A table the batch changed with no instance in this process is remembered by
+key, and the instance its next touch builds writes the schema the same way. On a
+machine that hydrated before another machine's change, that write puts its older
+description over the record (the `NOTE:` at `settleOwedRecords`). A table **dropped** inside the batch — by the plan, or by the unwind of its
 own create — has no instance left to heal anything: its gravestone is lost with
 the commit and the catalog keeps its live record past the DROP, so the next
 hydrate resurrects it and a later CREATE over the same URI is not checked

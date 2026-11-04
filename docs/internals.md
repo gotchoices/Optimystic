@@ -792,6 +792,32 @@ Two consequences are deliberate:
   (which `assertIndexMaintained` would then read as 'unmaintained' and refuse every
   index-driven plan against the table, at plan time, for the rest of the session).
 
+#### A first touch writes only what the table owes
+
+`hydrate` copies each catalog record into the engine's catalog, and the first statement
+that touches a table builds its instance from that entry. A copy of a record is not a
+declaration: on a machine that hydrated before another machine's change it is older than
+the record, and writing it back would undo that change, or bring back a dropped table.
+So an instance writes its description on initialization only when it owes one
+(`owesCatalogRecord` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`): it
+was built by `create table`, or a failed `apply schema` left its table without the record.
+
+Every other instance with a record or a gravestone in the catalog works from a view
+(`viewOverRecord` in `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`) and
+writes nothing. The view has the engine's columns, because Quereus plans column positions
+from its own catalog entry and the statement causing the first touch is already planned, so
+any other layout would have rows misread. It takes the record's indexes over those columns.
+An index over a column this machine does not know is left out, and goes unmaintained here
+until the machine restarts or re-applies the schema (backlog
+`bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced`).
+A `create index` works from the same view for its maintenance, and names its columns in the
+record by column name, since the record's column list can differ from this machine's.
+
+What this gives up is the first touch as a repair. A record that differs from the engine's
+entry only in form (out of canonical order, or written before uniqueness metadata existed)
+is rewritten on the next re-declaration rather than on the next open, and a failed tag save
+outside a batch waits for the next DDL.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

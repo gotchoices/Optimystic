@@ -215,8 +215,6 @@ describe('ALTER TABLE on an Optimystic table', function () {
 		// Quereus checks the stored rows against an added CHECK with a `select`, which does build one.
 		await second.db.exec('alter table main.t add constraint small check (a < 100)');
 
-		// Checked before `second` touches the table again: a later first touch would re-persist
-		// the engine's shape on its own, which is not the ALTER saving it.
 		const third = await openSession(store);
 		await third.plugin.hydrate(third.db);
 		expect(third.db.schemaManager.findTable('t', 'main')!.checkConstraints.map(check => check.name)).to.deep.equal(['small']);
@@ -345,11 +343,6 @@ describe('ALTER TABLE on an Optimystic table', function () {
 
 		it('a second machine adopts both halves of a changed CHECK body, and its failed apply leaves the new body in the record', async () => {
 			const { store, a, b } = await twoMachines();
-			// `b` reads first, so its table instance exists before the upgrade. One built mid-apply —
-			// by Quereus's check of the stored rows against the re-added CHECK — would write `b`'s older
-			// description over the record on its first initialize
-			// (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
-			expect(await queryAll(b, 'select id from t')).to.deep.equal([{ id: 1 }]);
 			const changed = `, constraint pos check (a >= 0)`;
 			await a.exec(declared(changed));
 

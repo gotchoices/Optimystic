@@ -22,7 +22,7 @@ import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { PersistedIndexSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
-import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, withoutNamed } from './schema/catalog-only-change.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, positionOfNamed, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
 import { defaultCollectionUri, qualifiedTableName, type QualifiedTableName } from './schema/table-identity.js';
@@ -349,6 +349,14 @@ type ColumnLayoutChange = { readonly kind: 'append' } | { readonly kind: 'remove
  */
 const CATALOG_ONLY_COLUMN_CONSTRAINTS: ReadonlySet<string> = new Set(['null', 'notNull', 'collate']);
 
+/** The tables a refused `APPLY SCHEMA` commit left owing their catalog records. */
+interface OwedRecords {
+  /** Their table keys. */
+  readonly tables: ReadonlySet<string>;
+  /** The engine's catalog entries when that apply began, which say whether it was taken back. */
+  readonly engineAtStart: ReadonlyMap<string, TableSchema>;
+}
+
 /**
  * One catalog-only ALTER as `OptimysticModule.alterCatalogOnly` carries it out: the record object
  * it changes (`kind` and `name`, which key the open batch's adopted changes), that object as this
@@ -639,8 +647,21 @@ export class OptimysticVirtualTable extends VirtualTable {
    * failed attempt, or the provisional→full upgrade) take a different branch than the
    * first pass — specifically the DDL-wins arm, which can WRITE the schema where the
    * first pass intended a read-only load.
+   *
+   * It says only that the engine's entry carries columns, which is just as true of a copy
+   * `hydrate` made of the record as of a `CREATE TABLE`; whether this instance may write that
+   * description is {@link owesCatalogRecord}.
    */
   private readonly declaredColumns: boolean;
+  /**
+   * Whether this instance owes the catalog its description, so that its next initialization may
+   * write it: a `CREATE TABLE`, whose declaration is meant to win, or a table a failed
+   * `APPLY SCHEMA` left without its record ({@link markSchemaUnpersisted}). Cleared once a full
+   * initialization has written it. Every other instance was built from the engine's copy of the
+   * record, and on a machine that hydrated before another machine's change that copy is older than
+   * the record, so it leaves any record or gravestone it finds alone; see {@link viewOfCatalogEntry}.
+   */
+  private owesRecord = false;
   private txnBridge: TransactionBridge;
   private collectionFactory: CollectionFactory;
   private options: ParsedOptimysticOptions;
@@ -906,12 +927,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       ]);
 
       // Resolve which schema to honour as the table's effective shape:
-      //   - xCreate (DDL provided columns): keep the local DDL schema and
-      //     (re-)write it to storage so this node's view is what's persisted.
-      //     Multi-node hosts that intentionally re-CREATE the same table with
+      //   - Built from the engine's catalog entry (a hydrated table's first touch), with a
+      //     record or a gravestone in the catalog: keep the entry's columns and write nothing
+      //     (viewOfCatalogEntry).
+      //   - xCreate (DDL provided columns), or anything else with no catalog entry: keep the
+      //     local DDL schema and (re-)write it to storage so this node's view is what's
+      //     persisted. Multi-node hosts that intentionally re-CREATE the same table with
       //     a different shape rely on the local DDL winning over what a peer
       //     last wrote.
-      //   - xConnect / hydrated (no local columns): load the persisted schema
+      //   - xConnect (no local columns): load the persisted schema
       //     and stamp it onto the placeholder tableSchema so query planning
       //     can see the real columns.
       //
@@ -920,13 +944,14 @@ export class OptimysticVirtualTable extends VirtualTable {
       // reading it here would send a re-run (a retry after a failed attempt, or the
       // provisional→full upgrade) down the DDL-wins arm instead.
       let storedSchema: StoredTableSchema;
+      const view = await this.viewOfCatalogEntry(persistedSchema, txnState?.transactor);
 
-      if (this.declaredColumns) {
+      if (view) {
+        storedSchema = view;
+      } else if (this.declaredColumns) {
         // Build the would-be-persisted form of the local DDL and short-circuit
-        // when it matches what's already on disk. Without this, every cold-start
-        // `connect()` after `hydrate()` re-writes a byte-identical schema and
-        // re-reads it back — one transaction per table+index, which dominates
-        // post-hydrate cold-start time (see tickets/fix/hydrated-vtab-...md).
+        // when it matches what's already on disk, so a declaration that changes
+        // nothing writes nothing.
         //
         // `CREATE TABLE` / `xConnect` arrives without its `CREATE INDEX`
         // siblings — those dispatch later as separate `addIndex()` calls. So
@@ -1106,6 +1131,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // under a committed read the same way (republishColumnLayout).
       this.isProvisionallyInitialized = false;
       this.isInitialized = true;
+      this.owesRecord = false;
 
       // Bridge optimystic collection-change notifications to Quereus watch
       // invalidation so reactive consumers wake on commits without polling.
@@ -1116,6 +1142,34 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(wrapped.message);
       throw wrapped;
     }
+  }
+
+  /**
+   * The schema of an instance built from the engine's catalog entry that owes the catalog nothing
+   * ({@link owesCatalogRecord}): the entry's columns plus the record's indexes
+   * ({@link SchemaManager.viewOverRecord}), written nowhere. Undefined when the existing arms apply:
+   * the instance owes its record, its declaration carried no columns, or the catalog holds neither
+   * a live record nor a gravestone, which leaves the storage-adoption guard and the write.
+   *
+   * A gravestone says another machine dropped the table, so writing this machine's copy would bring
+   * it back. It is read only when no live record was found, so the common path pays no extra read.
+   */
+  private async viewOfCatalogEntry(
+    persisted: StoredTableSchema | undefined,
+    transactor?: ITransactor
+  ): Promise<StoredTableSchema | undefined> {
+    if (!this.declaredColumns || this.owesRecord) {
+      return undefined;
+    }
+    if (!persisted && !(await this.schemaManager.getDroppedSchemaRecord(this.schemaName, this.tableName, transactor))) {
+      return undefined;
+    }
+    return this.viewOverRecord(persisted);
+  }
+
+  /** {@link SchemaManager.viewOverRecord} over this instance's own schema. */
+  private viewOverRecord(record: StoredTableSchema | undefined): StoredTableSchema {
+    return this.schemaManager.viewOverRecord(this.schemaManager.tableSchemaToStored(this.tableSchema), record);
   }
 
   /**
@@ -3586,7 +3640,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // first read be silently dropped (or rebuilt from scratch).
     const storedSchema = await this.schemaManager.getSchemaFresh(this.schemaName, this.tableName);
     if (!storedSchema) {
-      throw new Error('Schema not found');
+      throw new Error(`Schema not found for Optimystic table '${this.schemaName}.${this.tableName}'. Cannot create index '${indexSchema.name}'.`);
     }
 
     // A partial index whose predicate maintenance cannot evaluate is refused before anything is
@@ -3599,22 +3653,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     const txnState = this.txnBridge.getCurrentTransaction();
     const existing = storedSchema.indexes.find(idx => idx.name === indexSchema.name);
 
-    if (!existing) {
-      // Build path: `<uri>/index/<name>` is adopted create-on-missing, so a tree a
-      // DROPPED table (or a URI-sharing declaration) left behind under this name is
-      // silently reused. Refuse when the record that described that storage says the
-      // tree was built over DIFFERENT columns — before anything is written or
-      // mirrored, so a refusal leaves no trace.
-      await this.guardIndexAdoption(indexSchema, storedSchema, txnState?.transactor);
-    }
-
-    // Mirror the derived UNIQUE constraint BEFORE the already-persisted dedupe
-    // below: a re-declared CREATE UNIQUE INDEX on a warm start hits that dedupe
-    // and returns early, but this cached vtab still needs the constraint in
-    // memory for the uniqueness probe (see mirrorDerivedUniqueConstraint).
-    this.mirrorDerivedUniqueConstraint(indexSchema);
-
     if (existing) {
+      // A re-declared CREATE UNIQUE INDEX on a warm start writes no index, but this
+      // cached vtab still needs the constraint in memory for the uniqueness probe
+      // (see mirrorDerivedUniqueConstraint).
+      this.mirrorDerivedUniqueConstraint(indexSchema);
+
       // Upgrade path: a schema persisted before `unique`/`predicate` were wired
       // through has the index but not its uniqueness metadata. Re-declaring the
       // index is the documented way to restore it, so persist the flags (one
@@ -3648,12 +3692,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       // tree while the planner keeps routing seeks into it. Reconcile the
       // maintained set with the persisted one — idempotent, so the common warm
       // re-declare stays cheap.
-      const attached = await this.reconcileMaintainedIndexes(effective, txnState?.transactor);
+      const maintained = this.viewOverRecord(effective);
+      const attached = await this.reconcileMaintainedIndexes(maintained, txnState?.transactor);
       // With every tree in `effective` now open and registered, fold in the
       // upgraded descriptors (reconcile only re-sets the schema when an index
       // was missing entirely, which the unique-flag upgrade is not).
       if (effective !== storedSchema) {
-        this.indexManager.setSchema(effective);
+        this.indexManager.setSchema(maintained);
       }
       // Rows this connection committed WHILE detached from a now-attached index
       // have no entry in it. Attaching alone would leave them invisible to every
@@ -3668,11 +3713,20 @@ export class OptimysticVirtualTable extends VirtualTable {
       return;
     }
 
+    // Build path. Each refusal below comes before anything is written or mirrored, so it
+    // leaves no trace. The record may have lost a column this machine still has. And
+    // `<uri>/index/<name>` is adopted create-on-missing, so a tree a DROPPED table (or a
+    // URI-sharing declaration) left behind under this name is silently reused: refuse when
+    // the record that described that storage says the tree was built over DIFFERENT columns.
+    const indexInRecord = this.indexOverRecord(indexSchema, storedSchema);
+    await this.guardIndexAdoption(indexSchema, storedSchema, txnState?.transactor);
+    this.mirrorDerivedUniqueConstraint(indexSchema);
+
     // Add the index to the stored schema, carrying its uniqueness metadata so a
     // later hydrate-only open can reconstruct the derived UNIQUE constraint.
     const updatedSchema: StoredTableSchema = {
       ...storedSchema,
-      indexes: [...storedSchema.indexes, this.schemaManager.indexSchemaToStored(indexSchema)],
+      indexes: [...storedSchema.indexes, indexInRecord],
     };
 
     // Save the updated schema. Persist the merged stored form directly — the old
@@ -3700,7 +3754,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // an `APPLY SCHEMA` batch, hands them to the batch's end-of-apply flush) instead
     // of leaving those entries staged for the enclosing transaction's commit.
     this.indexManager.registerIndexTree(indexSchema.name, indexTree);
-    const attached = await this.reconcileMaintainedIndexes(writtenSchema, txnState?.transactor);
+    const attached = await this.reconcileMaintainedIndexes(this.viewOverRecord(writtenSchema), txnState?.transactor);
 
     // Populate the index with existing data. Reconcile reports the index just built
     // as newly attached (the manager carried no descriptor for it until the setSchema
@@ -3710,6 +3764,30 @@ export class OptimysticVirtualTable extends VirtualTable {
     // A brand-new CREATE UNIQUE INDEX: register its tree's refusal message now that the
     // tree is open and its derived constraint is mirrored onto this.tableSchema.
     this.registerUniqueKeyTakenMessages();
+  }
+
+  /**
+   * `indexSchema` as `record` will list it. Quereus numbers an index's columns by this machine's
+   * column list, and another machine may have added or dropped a column in the record since, so
+   * each column goes through its name. A column the record no longer has refuses the statement.
+   */
+  private indexOverRecord(indexSchema: IndexSchema, record: StoredTableSchema): StoredIndexSchema {
+    const stored = this.schemaManager.indexSchemaToStored(indexSchema);
+    return {
+      ...stored,
+      columns: stored.columns.map(col => {
+        const name = this.tableSchema.columns[col.index]?.name ?? `#${col.index}`;
+        const index = positionOfNamed(record.columns, name);
+        if (index === undefined) {
+          throw new QuereusError(
+            `Cannot create index '${indexSchema.name}' on Optimystic table '${this.tableName}': column '${name}' is not ` +
+            `in the table's stored description, so another machine has dropped it.`,
+            StatusCode.ERROR,
+          );
+        }
+        return { ...col, index };
+      }),
+    };
   }
 
   /**
@@ -3820,11 +3898,11 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Carry a catalog-only ALTER on this instance's own schema ({@link OptimysticModule.alterTable}
    * hands over the same edit it makes to the engine's catalog entry). Needed even though the
-   * statement changed no row: this instance compares its own `tableSchema` against the record
-   * whenever it (re-)initializes and rewrites the record from it on a mismatch, so an instance
-   * that never learned of the change would undo it in the record on its next re-open (after a
-   * failed `APPLY SCHEMA` batch commit, say). A change that moves the columns (`layout`) also
-   * rebuilds what the instance derived from them ({@link republishColumnLayout}).
+   * statement changed no row: an instance owing its record ({@link owesCatalogRecord}) rewrites it
+   * from its own `tableSchema` when it re-initializes, so one that never learned of the change
+   * would undo it in the record (after a failed `APPLY SCHEMA` batch commit, say). A change that
+   * moves the columns (`layout`) also rebuilds what the instance derived from them
+   * ({@link republishColumnLayout}).
    */
   applyCatalogOnlyEdit(edit: (schema: TableSchema) => TableSchema, layout?: ColumnLayoutChange): void {
     const tableSchema = edit(this.tableSchema);
@@ -3845,7 +3923,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    *
    * Built from this instance's own schema, not from the catalog record: rows reach this instance
    * positioned by this machine's engine, whose column list the instance mirrors, and the record can
-   * hold columns this engine has not seen (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
+   * hold columns this engine has not seen ({@link SchemaManager.viewOverRecord}).
    * An uninitialized instance has nothing derived yet; its first initialize builds from `tableSchema`.
    */
   private republishColumnLayout(tableSchema: TableSchema, layout: ColumnLayoutChange): void {
@@ -4370,20 +4448,43 @@ export class OptimysticVirtualTable extends VirtualTable {
     return this.schemaManager;
   }
 
-  /** Whether the full initialization ({@link initialize}) has completed. */
-  get initialized(): boolean {
-    return this.isInitialized;
+  /**
+   * Whether this instance owes the catalog its description, and so whether its next initialization
+   * writes it. Cleared once a full initialization has; see {@link forgiveCatalogRecord} for the
+   * other way out.
+   */
+  get owesCatalogRecord(): boolean {
+    return this.owesRecord;
+  }
+
+  /**
+   * Owe the catalog this instance's description: its next touch re-runs {@link doInitialize}, whose
+   * declared-columns arm compares it with the record and writes it on any difference.
+   */
+  oweCatalogRecord(): void {
+    this.owesRecord = true;
+    this.isInitialized = false;
+    this.isProvisionallyInitialized = false;
+  }
+
+  /**
+   * Stop owing the catalog this instance's description: what it owed is no longer there to save,
+   * or may not be written yet ({@link OptimysticModule.beginSchemaBatch}). A re-initialization still
+   * pending stays pending, and views the record.
+   */
+  forgiveCatalogRecord(): void {
+    this.owesRecord = false;
   }
 
   /**
    * Forget that this table's schema is persisted. Called by the module when the end-of-batch
    * catalog commit of an `APPLY SCHEMA` failed after this table was created or gained an
    * index inside it: the table is in Quereus's catalog and cached here as initialized, but
-   * has no persisted record. The next touch re-runs {@link doInitialize}, whose
-   * declared-columns arm finds no persisted record and writes the schema — retrying the
-   * commit that failed, with the same storage-adoption guard in front of it. Nothing was
-   * cached in the SchemaManager for this table (a batch seeds its cache only after its
-   * commit lands), so no stale hit can mask the gap.
+   * the record lacks what this machine's engine holds. The next touch re-runs {@link doInitialize},
+   * whose declared-columns arm writes the schema — retrying the commit that failed, with the same
+   * storage-adoption guard in front of it when no record exists. Nothing was cached in the
+   * SchemaManager for this table (a batch seeds its cache only after its commit lands), so no stale
+   * hit can mask the gap.
    *
    * The index list is refreshed from what the IndexManager maintains first: `tableSchema`
    * is the object CREATE TABLE handed over, and Quereus's CREATE INDEX REPLACES the engine's
@@ -4424,8 +4525,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.tableSchema = withTagsOf(this.tableSchema, current);
       }
     }
-    this.isInitialized = false;
-    this.isProvisionallyInitialized = false;
+    this.oweCatalogRecord();
   }
 }
 
@@ -4596,7 +4696,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
    * it was deferred), with the table and index each belongs to; `adopted` the catalog-only
    * changes the apply found already in a record, so their undo stays off it (see
-   * {@link alterCatalogOnly}).
+   * {@link alterCatalogOnly}); `owed` what a refused batch before this one left owing, with the
+   * engine's catalog as it stood before that apply, or before this one when none was refused.
    */
   private schemaBatch?: {
     managers: Set<SchemaManager>;
@@ -4604,6 +4705,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     dropped: Map<SchemaManager, Set<string>>;
     deferred: Map<SchemaManager, Map<Tree<string, IndexEntry>, { tableKey: string; indexName: string }>>;
     adopted: AdoptedChanges;
+    owed: OwedRecords;
   };
 
   /**
@@ -4620,6 +4722,22 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    */
   private adoptedByRefusedBatch?: AdoptedChanges;
 
+  /**
+   * The tables a refused commit left owing their records, for the batch {@link beginSchemaBatch}
+   * opens next. That batch is the unwind or, after a data-destroying step, the next apply, and the
+   * hooks cannot tell which. {@link settleOwedRecords} does not need to: it compares the engine's
+   * catalog with how it stood when the refused apply began.
+   */
+  private recordsOwedByRefusedBatch?: OwedRecords;
+
+  /**
+   * Tables a failed batch owes a record but which had no instance then: a tag change on a hydrated
+   * table no statement has touched. The first statement that touches one builds an instance that
+   * owes it ({@link instantiateTable}). Held in memory, so a restart loses the change; the next
+   * `apply schema` then re-emits it.
+   */
+  private readonly tablesOwingRecords = new Set<string>();
+
   /** Databases whose schema changes this module listens to ({@link followTagChanges}). */
   private readonly followedDatabases = new WeakSet<Database>();
 
@@ -4634,9 +4752,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * batch checkpoint ({@link underBatchCheckpoint}), so a later statement that fails cannot
    * withdraw an earlier one's save. Quereus runs statements one at a time and the listener fires
    * during the statement that made the change, so draining at the next hook is enough. The lazy
-   * first-touch initialize does not drain: its record is built from the instance's `tableSchema`,
-   * which already carries the new tags, so whichever of the two writes lands second writes them.
-   * `beginSchemaBatch` and `endSchemaBatch` drain too.
+   * first-touch initialize does not drain: it writes only for a table owing its record, built from
+   * the instance's `tableSchema`, which already carries the new tags, so whichever of the two writes
+   * lands second writes them. `beginSchemaBatch` and `endSchemaBatch` drain too.
    */
   private catalogTagWrites: Promise<void> = Promise.resolve();
 
@@ -4830,8 +4948,12 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * name (`catalogKey`) — so the batch covers the whole catalog whichever schema is being
    * applied, and needs no per-schema scoping of its own. Batches never nest — the engine's lock
    * makes an overlapping apply impossible, so a second begin is a wiring bug and throws.
+   *
+   * What a refused batch left owing is forgiven for the length of this one, or the undo DDL's first
+   * touch of such a table would write this machine's description, which can be older than the record,
+   * into the overlay this batch commits. {@link endSchemaBatch} settles those tables again.
    */
-  async beginSchemaBatch(_db: Database, _schemaName: string): Promise<void> {
+  async beginSchemaBatch(db: Database, schemaName: string): Promise<void> {
     // A tag save already running reads and writes the catalog directly; let it land first, so
     // the batch reads the record it wrote rather than putting the old tags back at commit.
     await this.whenCatalogPersisted();
@@ -4845,7 +4967,79 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     const adopted = this.adoptedByRefusedBatch ?? new AdoptedChanges();
     this.adoptedByRefusedBatch = undefined;
-    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted };
+    const owed = this.recordsOwedByRefusedBatch ?? { tables: new Set<string>(), engineAtStart: this.engineEntries(db, schemaName) };
+    this.recordsOwedByRefusedBatch = undefined;
+    for (const tableKey of owed.tables) {
+      this.tables.get(tableKey)?.forgiveCatalogRecord();
+      this.tablesOwingRecords.delete(tableKey);
+    }
+    this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted, owed };
+  }
+
+  /** The engine's catalog entries of `schemaName`, by table key: what {@link settleOwedRecords} compares against. */
+  private engineEntries(db: Database, schemaName: string): Map<string, TableSchema> {
+    const entries = new Map<string, TableSchema>();
+    for (const table of db.schemaManager.getSchema(schemaName)?.getAllTables() ?? []) {
+      entries.set(`${table.schemaName}.${table.name}`.toLowerCase(), table);
+    }
+    return entries;
+  }
+
+  /**
+   * Decide, for `tableKeys`, what is still owed once a batch has ended, and return the tables that
+   * still owe. A table owes its record only while the engine's catalog holds what a refused commit
+   * kept from the record. When the engine's entry describes the table as it did when the apply began
+   * ({@link SchemaManager.describesSameTable}), the unwind has taken the apply back, and this
+   * machine's description, possibly older than the record, must stay off it. Quereus's unwind of a
+   * refused commit, its unwind of a failed step inside the same batch and a second refusal all arrive
+   * here that way; a data-destroying step leaves the engine's entry changed, and the table owes.
+   *
+   * NOTE: accepted tradeoff — on a machine that hydrated before another machine's change, that owed
+   * write still puts its older description over the record. It takes a data-destroying step and a
+   * refused commit in one apply on a stale machine; revisit if the module ever learns which change a
+   * refused commit kept from the record, so that only that change need be written.
+   *
+   * NOTE: accepted tradeoff — only the batch right after a refusal is compared with the entries from
+   * before that refused apply. A table still owing later is compared with the entries from before
+   * the apply being settled, so a later apply that touches it, is refused and is unwound forgives it,
+   * and the record lacks the data-destroying apply's change until a restart's `apply schema` re-emits
+   * it. Keeping an entry per owing table would close that; revisit if a host ever sees it.
+   */
+  private settleOwedRecords(db: Database, tableKeys: Iterable<string>, engineAtStart: ReadonlyMap<string, TableSchema>): Set<string> {
+    const stillOwed = new Set<string>();
+    for (const tableKey of tableKeys) {
+      const table = this.tables.get(tableKey);
+      if (this.engineKeptChanges(db, tableKey, engineAtStart.get(tableKey))) {
+        stillOwed.add(tableKey);
+        if (table) {
+          table.oweCatalogRecord();
+        } else {
+          this.tablesOwingRecords.add(tableKey);
+        }
+      } else {
+        table?.forgiveCatalogRecord();
+        this.tablesOwingRecords.delete(tableKey);
+      }
+    }
+    return stillOwed;
+  }
+
+  /**
+   * Whether the engine's entry for `tableKey` differs from `atStart`, its entry when the apply began.
+   * A table with no such entry was created by the apply, or sits in another schema than the one being
+   * applied: it counts as changed while it exists, which only an instance can show here.
+   */
+  private engineKeptChanges(db: Database, tableKey: string, atStart: TableSchema | undefined): boolean {
+    const table = this.tables.get(tableKey);
+    if (!atStart) {
+      return table !== undefined;
+    }
+    const now = db.schemaManager.findTable(atStart.name, atStart.schemaName);
+    if (!now) {
+      return false;
+    }
+    const manager = table?.catalogManager ?? this.createSchemaManager(this.parseTableSchema(now));
+    return !manager.describesSameTable(atStart, now);
   }
 
   /**
@@ -4883,14 +5077,16 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * altered its schema through that manager is marked unpersisted
    * ({@link OptimysticVirtualTable.markSchemaUnpersisted}) so its next touch re-persists it —
    * WITHOUT any index whose tree did not land, since listing that index is the very failure the
-   * ordering prevents. The remaining managers still land and commit, and the first failure is
+   * ordering prevents — as long as the engine still holds what the record lacks
+   * ({@link settleOwedRecords}). The remaining managers still land and commit, and the first failure is
    * rethrown. The engine logs and swallows it when there was a loop error. With no loop error it
    * is a refusal (Quereus 4.25): the apply fails and, unless a data-destroying step ran, the engine
    * opens a second batch and runs the undo DDL through this module's ordinary hooks, so a retry
    * re-sends the DDL. Those hooks accept the undo of a change the store never received: a drop of a
    * table with no record stages a gravestone, an index subtraction finds nothing to subtract, and a
    * catalog-only undo finds the record already agreeing. The marks above serve the data-destroying
-   * case, where the engine keeps what landed.
+   * case, where the engine keeps what landed; {@link beginSchemaBatch} forgives them while the undo
+   * runs, and the end of that batch settles them against the engine's catalog.
    *
    * NOTE: Quereus requires that a refusal mean nothing from the batch reached the store. Across
    * several managers (tables over different transactors) that does not hold: a manager earlier in
@@ -4905,11 +5101,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * hydrate resurrects it, and a later CREATE over the same URI is not checked against it — the
    * same failure direction as the unbatched, best-effort {@link destroy}), so the log names those
    * tables too. A tag change on a hydrated table no statement has touched is listed with the
-   * re-persisting tables but has no instance to mark: the first statement that touches the table
-   * builds one from the engine's catalog entry, which carries the new tags, and its initialization
-   * writes them. A restart before that loses the change; the next `apply schema` then re-emits it.
+   * re-persisting tables but has no instance to mark, so it joins {@link tablesOwingRecords}: the
+   * first statement that touches the table builds an instance from the engine's catalog entry, which
+   * carries the new tags, and its initialization writes them.
    */
-  async endSchemaBatch(_db: Database, _schemaName: string, error?: unknown): Promise<void> {
+  async endSchemaBatch(db: Database, _schemaName: string, error?: unknown): Promise<void> {
     // The apply's tag changes stage into the batch, so they commit in its one catalog commit.
     await this.whenCatalogPersisted();
     const batch = this.schemaBatch;
@@ -4919,6 +5115,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     this.schemaBatch = undefined;
     let failed = false;
     let firstFailure: unknown;
+    const owed = new Set(batch.owed.tables);
     for (const manager of batch.managers) {
       // The deferred trees of this manager's tables that have not landed yet: each is removed as
       // it lands, so whatever remains when something throws is what the recovery must withhold.
@@ -4957,6 +5154,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         const dropped = [...(batch.dropped.get(manager) ?? [])];
         for (const tableKey of unpersisted) {
           this.tables.get(tableKey)?.markSchemaUnpersisted(withheld.get(tableKey));
+          owed.add(tableKey);
         }
         log(
           'endSchemaBatch: %s failed: %s. The catalog batch was not committed. %d table(s) will re-persist ' +
@@ -4973,9 +5171,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         }
       }
     }
+    const stillOwed = this.settleOwedRecords(db, owed, batch.owed.engineAtStart);
     if (failed) {
       if (error === undefined) {
         this.adoptedByRefusedBatch = batch.adopted;
+        this.recordsOwedByRefusedBatch = stillOwed.size > 0 ? { tables: stillOwed, engineAtStart: batch.owed.engineAtStart } : undefined;
       }
       throw firstFailure;
     }
@@ -5082,6 +5282,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       this.txnBridge,
       schemaManager
     );
+    if (this.tablesOwingRecords.delete(tableKey)) {
+      table.oweCatalogRecord();
+    }
 
     this.tables.set(tableKey, table);
     return table;
@@ -5104,6 +5307,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     this.assertRedeclarationKeepsShape(tableSchema);
 
     const table = await this.instantiateTable(db, tableSchema);
+    table.oweCatalogRecord();
 
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
@@ -5200,14 +5404,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * NOTE: a connect is not run under the open `APPLY SCHEMA` batch's per-statement
    * checkpoint ({@link underBatchCheckpoint} wraps create, createIndex, dropIndex, alterTable's
    * catalog-only arms and destroy — and the first-touch initialize of createIndex and dropIndex
-   * runs inside it — but not plain connects). A first touch of a hydrated table mid-apply whose
-   * persisted record differs from the hydrated shape re-persists it from here, and that write
-   * stays in the overlay if the statement then throws. Two statements reach this today, both
-   * reading rows before alterTable runs: an ADD COLUMN of a NOT NULL column with no default
-   * (refused after the read), and ADD CONSTRAINT … CHECK, whose stored rows Quereus checks
-   * against the new CHECK (see the NOTE on `addCheckConstraint`). Fine while a failure after
-   * the connect stays rare — before the batch that write was committed before the throw anyway.
-   * If a mid-apply statement that commonly fails after its connect appears, wrap it too.
+   * runs inside it — but not plain connects). A first touch mid-apply writes nothing unless the
+   * table owes its record ({@link OptimysticVirtualTable.owesCatalogRecord}); one that does
+   * re-persists it from here, and that write stays in the overlay if the statement then throws.
+   * Two statements reach this today, both reading rows before alterTable runs: an ADD COLUMN of a
+   * NOT NULL column with no default (refused after the read), and ADD CONSTRAINT … CHECK, whose
+   * stored rows Quereus checks against the new CHECK (see `addCheckConstraint`). Fine while a
+   * failure after the connect stays rare — before the batch that write was committed before the
+   * throw anyway. If a mid-apply statement that commonly fails after its connect appears, wrap it too.
    */
   private async resolveConnectedTable(
     db: Database,
@@ -5377,8 +5581,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * instantiated from the engine's catalog entry exactly as {@link connect} would. That entry
    * is still the PRE-index shape here — Quereus calls this hook before it appends the new
    * index to the table schema — so the first-touch initialize cannot persist the index before
-   * its tree is built. The initialize runs inside the statement's batch checkpoint, so a
-   * record it re-persists is withdrawn with the rest of the statement if the statement throws.
+   * its tree is built. It writes nothing unless the table owes its record, and it runs inside the
+   * statement's batch checkpoint, so a record it re-persists is withdrawn with the rest of the
+   * statement if the statement throws.
    */
   async createIndex(
     db: Database,
@@ -5565,11 +5770,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * Reaching it takes two different upgrades of one table racing; revisit if hosts ever apply
    * schema versions out of order.
    *
-   * NOTE: Quereus's check of the stored rows is a `select` over the table, so on a hydrated table
-   * no statement has touched it builds the table instance before this arm runs — the first touch
-   * {@link alterCatalogOnly} itself avoids — and that instance's first initialize writes this
-   * machine's description of the table over a record another machine upgraded since this one
-   * hydrated (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record).
+   * Quereus's check of the stored rows is a `select` over the table, so on a hydrated table no
+   * statement has touched it builds the table instance before this arm runs. That instance owes the
+   * record nothing, so it writes nothing, even over a record another machine upgraded since this one
+   * hydrated.
    */
   private addCheckConstraint(tableSchema: TableSchema, constraint: AddedConstraint): Promise<TableSchema> {
     const check = buildCheckConstraintSchema(
@@ -5719,14 +5923,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * instance. No row is read or written.
    *
    * The table's catalog manager is its instance's when one exists, else the one it would be built
-   * with, as {@link followTableTags} resolves it. A table with no instance is NOT instantiated: an
-   * instance built from this machine's catalog entry compares that entry with the record on its
-   * first initialize and rewrites the record on any difference, so on a machine that hydrated
-   * before another machine upgraded the table it would put the old description back
-   * (tickets/backlog/bug-optimystic-stale-hydrated-table-rewrites-the-shared-catalog-record). An
-   * instance that exists but is not initialized is initialized first, inside the statement's batch
-   * checkpoint, so a record that never landed (`markSchemaUnpersisted`) is re-persisted before it
-   * is extended.
+   * with, as {@link followTableTags} resolves it. A table with no instance is not instantiated:
+   * nothing here reads a row. An instance that exists but is not initialized is initialized first,
+   * inside the statement's batch checkpoint, so a record that never landed
+   * (`markSchemaUnpersisted`) is re-persisted before it is extended.
    *
    * The record is read fresh and judged ({@link CatalogOnlyAlter.classify}). An owned change is
    * written under the batch checkpoint, so a throw withdraws it and a failed batch commit marks
@@ -5751,8 +5951,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
     // An adopted or undone change stages nothing, so it must not mark the table `written`: a failed
     // batch commit would then re-persist this machine's description, which after an undo kept off
-    // the record is older than the record. The first-touch initialize can stage a write of its own.
-    const initializesHere = table !== undefined && !table.initialized;
+    // the record is older than the record. An initialization stages a write only for a table owing its record.
+    const initializeWrites = table?.owesCatalogRecord ?? false;
     const outcome = await this.underBatchCheckpoint(manager, 'written', tableKey, async () => {
       await table?.initialize();
       if (undoesAdopted) {
@@ -5760,7 +5960,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         return 'undone';
       }
       return await this.saveCatalogOnly(manager, tableSchema, change);
-    }, outcome => outcome === 'owned' || initializesHere);
+    }, outcome => outcome === 'owned' || initializeWrites);
     table?.applyCatalogOnlyEdit(change.editSchema, change.layout);
     if (adopted) {
       if (outcome === 'undone') {

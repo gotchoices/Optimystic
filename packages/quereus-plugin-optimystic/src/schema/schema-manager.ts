@@ -10,7 +10,7 @@
 import type { Tree } from '@optimystic/db-core';
 import { structuralEquals } from '@optimystic/db-core';
 import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution, ForeignKeyConstraintSchema, SqlValue } from '@quereus/quereus';
-import { buildColumnIndexMap, getTypeOrDefault, inferType } from '@quereus/quereus';
+import { buildColumnIndexMap, compilePredicate, getTypeOrDefault, inferType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
@@ -840,6 +840,20 @@ export function withoutColumn(stored: StoredTableSchema, name: string): StoredTa
 }
 
 /**
+ * The names of the columns of `record` a partial index's WHERE clause reads; none for a full index.
+ * A clause Quereus's compiler cannot evaluate throws here, as it does when the index manager compiles
+ * it (`compileIndexPredicates` in `./index-manager.ts`).
+ */
+function predicateColumnNames(predicate: unknown, record: StoredTableSchema): string[] {
+	if (predicate === undefined) {
+		return [];
+	}
+	const expression = predicate as Parameters<typeof compilePredicate>[0];
+	const { referencedColumns } = compilePredicate(expression, record.columns.map(storedToColumnSchema), record.name);
+	return [...referencedColumns].map(position => record.columns[position]!.name);
+}
+
+/**
  * The record a schema write produces: `incoming` (the caller's declaration, already in
  * persisted form) with its index list unioned against what the catalog holds
  * ({@link mergeIndexLists}), validated so that every surviving index column exists in
@@ -1098,6 +1112,41 @@ export class SchemaManager {
 	}
 
 	/**
+	 * What a table instance built from this machine's catalog entry works from: `candidate`'s
+	 * columns, which is how the engine positions every row it hands over or plans, plus the indexes
+	 * `persisted` lists. Never written. Quereus plans column positions from its own catalog entry, so
+	 * an instance that took the record's columns would hand back rows a planned statement misreads.
+	 * `persisted` is undefined when the catalog holds a gravestone rather than a live record.
+	 *
+	 * An index the record lists over a column `candidate` lacks, in its key or in its WHERE clause, is
+	 * left out, since it can be neither resolved nor evaluated against these columns.
+	 *
+	 * NOTE: such an index is unmaintained on this machine, so a row this machine writes has no entry
+	 * in it; `bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced`
+	 * owns following the newer description.
+	 */
+	viewOverRecord(candidate: StoredTableSchema, persisted: StoredTableSchema | undefined): StoredTableSchema {
+		if (!persisted) {
+			return candidate;
+		}
+		const known = new Set(candidate.columns.map(col => col.name.toLowerCase()));
+		const isKnown = (name: string) => known.has(name.toLowerCase());
+		const record = toPersistedSchema(persisted);
+		const indexes = record.indexes.filter(idx =>
+			idx.columns.every(col => isKnown(col.name)) && predicateColumnNames(idx.predicate, persisted).every(isKnown));
+		return toStoredSchema(mergePersistedSchemas(toPersistedSchema(candidate), { ...record, indexes }));
+	}
+
+	/**
+	 * Whether two of the engine's catalog entries describe a table alike: whether saving either would
+	 * write the same record. A CHECK dropped and re-added lands last in the engine's list, which a
+	 * record's canonical order ignores.
+	 */
+	describesSameTable(a: TableSchema, b: TableSchema): boolean {
+		return structuralEquals(this.tableSchemaToStored(a), this.tableSchemaToStored(b));
+	}
+
+	/**
 	 * The record inside a catalog entry whether live OR gravestone, or undefined for a
 	 * bare tombstone (`entry[1] === undefined`, written by builds before gravestones
 	 * or as {@link deleteSchema}'s degraded fallback). Internal building block for the
@@ -1210,7 +1259,9 @@ export class SchemaManager {
 	 * unreadable catalog (see {@link getSchema} for the residual ambiguity) —
 	 * reporting the table gone would be inventing certainty. The write-time union
 	 * in {@link storeStoredSchema} still guards whatever is written after such a
-	 * fallback.
+	 * fallback. A gravestone is not "nothing": the catalog says another machine dropped
+	 * the table, so the answer is undefined and the cached copy is forgotten. Falling back
+	 * there would let the caller's write put a live record over the gravestone.
 	 */
 	async getSchemaFresh(schemaName: string, tableName: string, transactor?: ITransactor): Promise<StoredTableSchema | undefined> {
 		const key = catalogKey(schemaName, tableName);
@@ -1219,6 +1270,10 @@ export class SchemaManager {
 			: await this.readSchemaFromCatalog(key, transactor);
 		if (fresh) {
 			return fresh;
+		}
+		if (await this.getDroppedSchemaRecord(schemaName, tableName, transactor)) {
+			this.schemaCache.delete(key);
+			return undefined;
 		}
 		return this.schemaCache.get(key);
 	}
@@ -1578,7 +1633,8 @@ export class SchemaManager {
 
 	/**
 	 * The gravestone under `schemaName`.`tableName`, or undefined when the entry is absent,
-	 * live, or a bare (pre-gravestone) tombstone. Read by the storage-adoption guards only.
+	 * live, or a bare (pre-gravestone) tombstone. Read by the storage-adoption guards, by
+	 * {@link getSchemaFresh}, and by a table instance deciding whether it may write its record.
 	 */
 	async getDroppedSchemaRecord(
 		schemaName: string,
