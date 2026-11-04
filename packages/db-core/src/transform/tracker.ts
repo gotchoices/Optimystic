@@ -321,11 +321,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 		this.materialized.delete(block.header.id);
 		// An insert makes the materialized result base-independent, so any pinned base is moot.
 		this.pins.delete(block.header.id);
-		const deletes = this.transforms.deletes;
-		const deleteIndex = deletes?.indexOf(block.header.id) ?? -1;
-		if (deleteIndex >= 0) {
-			deletes!.splice(deleteIndex, 1);
-		}
+		this.unlistDelete(block.header.id);
 	}
 
 	update(blockId: BlockId, op: BlockOperation) {
@@ -341,8 +337,11 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	 * the block at a newer revision), and probing would put the newer revision on operations built
 	 * for the older one — the wrong base the storage-side guard cannot catch. An adopted pin the
 	 * source no longer describes at its revision is judged moved on its next use, like any pin. An
-	 * update the child did NOT pin (a blind one) is pinned here exactly as a direct update would be. */
-	absorb(child: Tracker<T>): void {
+	 * update the child did NOT pin (a blind one) is pinned here exactly as a direct update would be.
+	 *
+	 * @returns the child's transforms, as they were. Everything kept here was copied from them, so
+	 * the caller may keep them: `Collection.stageInto` records them as what the actions staged. */
+	absorb(child: Tracker<T>): Transforms {
 		this.pins.adopt(child.pins);
 		const adopted = new Set(child.pins.ids());
 		const transform = child.reset();
@@ -354,6 +353,56 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 				else this.recheckPin(blockId);
 			}
 		}
+		return transform;
+	}
+
+	/** Stage the ids in `touched` again from `deltas` alone — the transforms of the units still
+	 * staged, in staging order — leaving every other id as it is. For taking a committed head
+	 * segment out of a collection's live tracker (`Collection.subtractCommittedHead`): the source
+	 * now holds what the head staged over those ids, so each is forgotten here ({@link forget}) and
+	 * then re-folded from the remaining deltas exactly as {@link absorb} folds a child — deletes,
+	 * inserts, then updates, one delta after another — over the source as it is now. An id left
+	 * update-only pins its base from the source now ({@link pinBase}). That is not a re-pin of
+	 * operations built for another base: the remaining operations were computed against content
+	 * that included the head's effect, and that content is what the source holds since the head
+	 * committed. The deltas are left as they are; what is kept here is copied, as {@link absorb}
+	 * copies. Synchronous, with nothing between the forgetting and the re-folding.
+	 *
+	 * NOTE: every touched id is looked up in every delta, so a head commit over a queue of n
+	 * segments costs O(touched × n) lookups here — the small quadratic term left in a drain. If it
+	 * ever shows up, keep an id-to-segments index beside the deltas and visit only the deltas that
+	 * touch the id. */
+	refold(touched: Iterable<BlockId>, deltas: readonly Transforms[]): void {
+		const ids = [...new Set(touched)];
+		for (const id of ids) this.forget(id);
+		for (const delta of deltas) {
+			for (const id of ids) {
+				if (delta.deletes?.includes(id)) this.delete(id);
+				if (delta.inserts && Object.hasOwn(delta.inserts, id)) this.insert(delta.inserts[id] as T);
+				for (const op of delta.updates?.[id] ?? []) {
+					if (this.stageUpdate(id, op)) this.pinBase(id);
+					else this.recheckPin(id);
+				}
+			}
+		}
+	}
+
+	/** Drop everything this tracker holds for `id` — its staged insert, update list or delete, the
+	 * memo, the ownership and the pin — as if nothing had been staged for it. */
+	private forget(id: BlockId): void {
+		if (this.transforms.inserts) delete this.transforms.inserts[id];
+		if (this.transforms.updates) delete this.transforms.updates[id];
+		this.unlistDelete(id);
+		this.owned.delete(id);
+		this.materialized.delete(id);
+		this.pins.delete(id);
+	}
+
+	/** Take `id` off the staged deletes, if it is there. */
+	private unlistDelete(id: BlockId): void {
+		const deletes = this.transforms.deletes;
+		const index = deletes?.indexOf(id) ?? -1;
+		if (index >= 0) deletes!.splice(index, 1);
 	}
 
 	/** Stage `op` for `blockId` — folded into a staged insert if there is one, else appended to the

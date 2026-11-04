@@ -227,21 +227,26 @@ list. Five rules follow from the split:
   (`Collection.snapshotPending`) captures the WHOLE tracker's transforms — the sealed segments'
   effects included, which is what `Tree.readView` builds a committed read view from, so a
   `committed.<Table>` read inside a transaction sees every queued entry the SQL layer was told had
-  committed — but as actions only the OPEN segment's, and it records `SegmentList.version` as
-  `sealedVersion`. The capture copies no staged value: it takes new maps over the ones the tracker
+  committed — but as actions only the OPEN segment's, each with the delta its staging produced
+  (`StagedUnit` in `packages/db-core/src/collection/segments.ts`, shared, since a unit is never
+  changed), and it records `SegmentList.version` as `sealedVersion` and the collection's replay
+  epoch as `replayEpoch`. The capture copies no staged value: it takes new maps over the ones the tracker
   holds (`Tracker.shareTransforms`), and the tracker copies a value before its next change to it
   ([Functions That Share](#functions-that-share)), so a snapshot stays as captured at a cost of one
   map entry per staged block. The Quereus bridge takes one per statement per written collection and
   the tracker holds every queued entry's blocks, so a deep copy here made each offline commit grow
   with the queue, for snapshots a successful commit never restores (GitHub #53).
   `Collection.restorePending` is async, because one of its arms replays, and it
-  chooses from three facts: whether the sealed list has changed since the capture, whether the
-  committed boundary has moved, and whether any segment is sealed now. Nothing changed and nothing
+  chooses from four facts: whether the sealed list has changed since the capture, whether the
+  committed boundary has moved, whether a replay has run since (the epoch), and whether any segment
+  is sealed now. Nothing changed and nothing
   moved: the tracker is reset to new maps over the captured transforms, so one snapshot can be
   restored again, the captured pins are restored and the
-  open segment is set to the captured actions — the **verbatim** arm, the restore as it always was,
+  open segment is set to the captured units — the **verbatim** arm, the restore as it always was,
   which keeps an invented collection's header. The sealed list changed (a segment sealed, dropped
-  or refused while the snapshot was outstanding), or the boundary moved while a segment is sealed:
+  or refused while the snapshot was outstanding), or the boundary moved or a replay ran while a
+  segment is sealed (a replay records fresh block ids on the sealed segments, which the captured
+  transforms do not hold, and the next head commit would take the wrong blocks out of the tracker):
   the open segment is set to the captured actions and the tracker is rebuilt by
   `Collection.replayActions` — the sealed segments as they are NOW, refused ones skipped, a newly
   refused one recorded and reported, then the restored open actions — the **replay** arm, because
@@ -296,15 +301,29 @@ list. Five rules follow from the split:
   of it aborts the cycle with nothing sent; `resume` hands back an attempt an earlier cycle under the
   same action id recorded, seeded as the retained attempt so the opening refresh finishes a torn
   attempt from it instead of refusing it as `transforms-not-held`. Four things differ:
-  - **The attempt runs on a head tracker, built once per revision.** The live tracker holds every
-    sealed segment and the open one cumulatively, so an attempt cannot run on a copy of it the way a
-    sync's does. `Collection.headTrackerFor` stages the head segment's actions alone, atomically
-    (`Collection.stageInto`, the path `act` uses), over the committed state — from the invented
-    baseline while the collection has no committed revision, so an invented collection's header,
-    log block and root ride in the head's commit — into a `Tracker` over the handle's read cache
-    with pins of its own. It is built once per revision the attempt requests and reused across
-    attempts, because a rebuild re-runs the handlers and mints fresh ids for the blocks they insert,
-    which would send different content under one `(action id, revision)` (the rule
+  - **The attempt runs on a head tracker, built once per revision, from what the head staged.** The
+    live tracker holds every sealed segment and the open one cumulatively, so an attempt cannot run
+    on a copy of it the way a sync's does. Each segment keeps the transforms its own actions staged
+    into the live tracker (`SealedSegment.delta` in `packages/db-core/src/collection/segments.ts`):
+    `Collection.stageInto` returns the atomic's transforms beside the tally, `Collection.actInternal`
+    records them on the open segment's unit for the action (`StagedUnit`), `SegmentList.seal` folds
+    the units' deltas into one (`foldTransforms` in `packages/db-core/src/transform/helpers.ts`,
+    under the tracker's own semantics), and `Collection.replayActions` records every delta again
+    under the ids it mints. `Collection.headTrackerFor` builds the attempt's tracker from the head's
+    delta (`Collection.headTrackerFromDelta`): a `Tracker` over the handle's read cache with a copy
+    of the delta and the live tracker's pins for the blocks the delta updates. Correct because the
+    head's actions were staged over the committed state plus the segments ahead of it, and once
+    those have committed with nothing from another writer in between, the committed state is that
+    base, so running the handlers again would make every decision the same way; their only
+    different output is fresh ids for the blocks they insert, which is why a head built by running
+    them has to be replayed out of the live tracker afterwards (next bullet). It stages the actions
+    instead (`Collection.buildHeadTracker`, atomically, the path `act` uses) when the delta is not
+    on record — a segment put back by `restoreSealed` before its replay — when a pin under the
+    delta has moved, and while the collection holds no committed revision: an invented collection's
+    header, log block and root then exist nowhere but the tracker, and the head's commit has to
+    carry them from the invented baseline. It is built once per revision the attempt requests and
+    reused across attempts, because a rebuild by the handlers mints fresh ids for the blocks they
+    insert, which would send different content under one `(action id, revision)` (the rule
     `logAppendBlockIds` closes); a refresh that adopts a newer revision rebuilds it, the write being
     genuinely different then, and so does one that adopts another lineage at the same revision
     (see [The revision context is monotonic](#the-revision-context-is-monotonic)). Before each attempt its pins are re-judged exactly as
@@ -341,13 +360,26 @@ list. Five rules follow from the split:
     in-flight head throws (`in-flight`). A refresh that finds a rival's entry instead proceeds as
     any refresh does, and may refuse the head in its replay, so `commitHead` re-checks the head's
     recorded refusal before every attempt and after every retake, and throws it in place of a retry.
-  - **On success the fold precedes the replay.** Under the retaken latch: the head segment is
-    removed (asserted still first — nothing may remove it while in flight — and the version bumped),
-    the ATTEMPT's transforms — the head's over committed state, plus the log append — are folded
-    into the cache and the revision adopted (`Collection.foldOwnCommit`, shared with the sync), and
-    only then are the remaining sealed segments and the open segment replayed over the committed
-    state that now holds the head. The replay after every head commit is what makes a drain
-    quadratic in the queue length; the tripwire `NOTE:` at that call names the remedy.
+  - **On success the fold precedes the subtraction, or the replay.** Under the retaken latch: the
+    head segment is removed (asserted still first — nothing may remove it while in flight — and the
+    version bumped), the ATTEMPT's transforms — the head's over committed state, plus the log
+    append — are folded into the cache and the revision adopted (`Collection.foldOwnCommit`, shared
+    with the sync), and only then is the head taken out of the live tracker. An attempt built from
+    the head's delta is **subtracted** (`Collection.subtractCommittedHead`, logged
+    `collection:committed-head-subtracted`): the blocks the delta touched are forgotten by the live
+    tracker and staged again from the remaining segments' and the open units' deltas alone, in
+    order (`Tracker.refold`), over the cache that now holds the head; a block left update-only pins
+    the cache's revision, which is the content its operations were computed against, so no pin is
+    a rebase of operations built for another base. Each touched block a remaining delta updates
+    and the cache no longer retains is read first, since the fold applies the head's operations
+    into a cached block only. Blocks the head did not touch are not visited, and `onViewChanged` is
+    told once, for the same reason a replay tells it. Otherwise — the attempt was built by running
+    the handlers or re-sent from a recorded attempt, a replay ran between the build and the fold
+    (the collection's replay epoch moved, so the attempt's ids are not the live tracker's), or a
+    later segment's delta is not on record — the remaining segments and the open segment are
+    **replayed** as before (`collection:committed-head-replayed`, with the reason). What a drain
+    still pays per entry is one lookup per touched block per remaining segment (the `NOTE:` at
+    `Tracker.refold`), and the replays a refresh adopting a rival's revision costs.
   - **A torn head attempt is finished and consumed as the head.** The refresh between attempts
     finishes a half-landed attempt from the retained one exactly as a sync's does, and
     `consumeOwnEntry` then takes its head arm (`Collection.consumeHead`, keyed on
@@ -665,7 +697,7 @@ A guard is plain serialized data that rides in the log beside its action, and th
 
 **An absent entry counts as changed** for `unchanged`, on upserts and deletes alike. The staged effect was computed from an image that no longer exists, so re-applying it is never right: an upsert would resurrect a row a rival deleted, and a delete would be the second of two racing deletes. Refusing both is the optimistic-concurrency answer — the writer read a row that is now gone — and an application-level retry then affects zero rows sequentially. `expected` holds a full copy of the entry rather than a digest, so it round-trips through the log under the same encoding entries already use and no digest scheme has to be invented or versioned; the cost is roughly double the row bytes on every guarded log entry, noted at the type for whenever log volume becomes the binding constraint.
 
-**Three variants accept a change a rival already made** (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`; the design is [offline-sync.md §Guards that make idempotent writes assured](offline-sync.md#guards-that-make-idempotent-writes-assured)), for the offline queue's rebase of a queued entry: two machines marking one task done, or deleting one row, both intended the final state the second one finds. Each has the outcome its base kind lacks — the element is *skipped as already applied* — beside writing and refusing. `absentOrEqual` (upsert) writes when the key is absent, skips when the present entry is structurally equal to the element's own entry, and otherwise refuses with `TreeKeyTakenError`. `unchangedOrEqual` (upsert, with `expected`) writes when the present entry equals `expected`, skips when it equals the element's own entry — checked second, so a no-op update whose `expected` equals its entry writes — and refuses with `TreeEntryChangedError` on an absent or any other entry; absent is still changed for every upsert kind. `unchangedOrAbsent` (delete, with `expected`) deletes when the present entry equals `expected`, skips when the key is absent, and refuses with `TreeEntryChangedError` on any other entry. The post-image an upsert variant compares against is the element's own entry, not a second copy on the guard, so the guard stays the size its base kind is; a kind on the wrong element is malformed, as above. The handler reports what it accepted as an `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`): for each element carrying one of the three kinds, `alreadyApplied` when it was skipped and `applied` when it was written or deleted; and `applied` for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever they do not refuse and that the SQL layer stages on every main-table element, so an entry of a plain insert beside an already-applied update tallies as `applied`, which is what a host reading `already-applied` as "none of my changes landed" needs. Elements with no guard, `keepExisting` or `absentRange` are not counted — a `keepExisting` skip says nothing about equality, and the other two are the shapes an index tree's entries take, whose writes under an already-applied entry restate what the rival's row already implies and must not make the entry read as `applied`. `Collection.stageInto` sums the handlers' tallies, and `Collection.replayActions` and `Collection.buildHeadTracker` record the sum on the sealed segment they staged (`SealedSegment.applied`, set directly, no version bump), which is how the queue hears it (*The offline queue*, above). A whole-collection `sync` discards the open segment's tally.
+**Three variants accept a change a rival already made** (`TreeAlreadyAppliedGuard` in `packages/db-core/src/collections/tree/struct.ts`; the design is [offline-sync.md §Guards that make idempotent writes assured](offline-sync.md#guards-that-make-idempotent-writes-assured)), for the offline queue's rebase of a queued entry: two machines marking one task done, or deleting one row, both intended the final state the second one finds. Each has the outcome its base kind lacks — the element is *skipped as already applied* — beside writing and refusing. `absentOrEqual` (upsert) writes when the key is absent, skips when the present entry is structurally equal to the element's own entry, and otherwise refuses with `TreeKeyTakenError`. `unchangedOrEqual` (upsert, with `expected`) writes when the present entry equals `expected`, skips when it equals the element's own entry — checked second, so a no-op update whose `expected` equals its entry writes — and refuses with `TreeEntryChangedError` on an absent or any other entry; absent is still changed for every upsert kind. `unchangedOrAbsent` (delete, with `expected`) deletes when the present entry equals `expected`, skips when the key is absent, and refuses with `TreeEntryChangedError` on any other entry. The post-image an upsert variant compares against is the element's own entry, not a second copy on the guard, so the guard stays the size its base kind is; a kind on the wrong element is malformed, as above. The handler reports what it accepted as an `AlreadyAppliedTally` (`packages/db-core/src/collection/action.ts`): for each element carrying one of the three kinds, `alreadyApplied` when it was skipped and `applied` when it was written or deleted; and `applied` for each element written under `absent` or `unchanged`, the exact-key base kinds that write whenever they do not refuse and that the SQL layer stages on every main-table element, so an entry of a plain insert beside an already-applied update tallies as `applied`, which is what a host reading `already-applied` as "none of my changes landed" needs. Elements with no guard, `keepExisting` or `absentRange` are not counted — a `keepExisting` skip says nothing about equality, and the other two are the shapes an index tree's entries take, whose writes under an already-applied entry restate what the rival's row already implies and must not make the entry read as `applied`. `Collection.stageInto` sums the handlers' tallies; `Collection.actInternal` records the sum on the open segment's unit for the action and `SegmentList.seal` sums the units' onto the segment it seals, and `Collection.replayActions` and `Collection.buildHeadTracker` record the sum on the sealed segment they staged (`SealedSegment.applied`, set directly, no version bump), which is how the queue hears it (*The offline queue*, above). A whole-collection `sync` discards the open segment's tally.
 
 **Which guard each statement carries.** Every main-table element a statement stages carries a guard, chosen at staging from the statement's write description (`TableWrite`, which Quereus hands the vtab on `UpdateArgs.writeScope`) and the table's tags. The gates are pure over the description and the arm — `insertAcceptsEqualRow` and `rewriteAcceptsEqualRow` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/write-description.ts` — and the image an `expected` field carries comes from `requirePreWriteRow`, from the INSERT arm's pre-stage probe, or from the secondary-UNIQUE collision and primary-key displacement probes, each of which hands back the stored entry beside the decoded row; the guard carries the entry AS READ, never a re-encoding (`unchanged` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`). Site by site, in `update()` of the same file:
 
@@ -1655,7 +1687,8 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
 | `Tracker.peekMaterialized()` | structuredClone | Clones the staged insert, and the pinned base, before `applyTransform` mutates either |
 | `Tracker.update()` → `BasePins` | structuredClone (via `CacheSource.peek`) | The pinned committed base is a clone, and stays pristine: every use re-clones it |
 | `Tracker.update()` on a staged value it does not own | structuredClone of the inserted block, array copy of the update list | Copied once, before the first change, so a snapshot sharing the value keeps it as captured. A plain array copy is enough because a staged operation is never changed once pushed |
-| `copyTransforms(transforms)` | deep copy | For anything that is not a staged-state snapshot: a per-attempt tracker, the invented baseline |
+| `Tracker.absorb()`, `Tracker.refold()` | structuredClone of each inserted block and operation it keeps | The child's transforms and the deltas handed in stay the caller's: `absorb` returns the child's, which `Collection.stageInto` keeps as the record of what an action staged |
+| `copyTransforms(transforms)` | deep copy | For anything that is not a staged-state snapshot: a per-attempt tracker, the invented baseline, a head attempt from a segment's delta |
 
 ### Functions That Share
 | Function | Returns | Notes |

@@ -650,8 +650,9 @@ can take seconds, that would block every SQL write in offline mode behind the dr
 the point of the mode.
 
 So the head commit (`Collection.commitHead`) runs its attempts on a **head tracker** — the head
-segment's actions alone, staged over the committed state, built once per revision the attempt
-requests and reused across retries — and releases the live latch for exactly the one `await` on the
+segment's actions alone over the committed state, built from the transforms the segment recorded
+when its actions were staged (`SealedSegment.delta`), once per revision the attempt requests and
+reused across retries — and releases the live latch for exactly the one `await` on the
 network, the pend-and-commit round trip (the `release` and `retake` steps of `HeadCommitHandle` in
 `packages/db-core/src/collection/head-commit.ts`, which every driver brackets the round trip with).
 Both drivers do: `Collection.commitHead` for an entry over one collection, and
@@ -659,11 +660,13 @@ Both drivers do: `Collection.commitHead` for an entry over one collection, and
 Everything else runs under the latch: the refresh that
 opens the cycle, building the head tracker and the attempt, the refresh and backoff between
 attempts, and applying the outcome (remove the head segment, fold the attempt's transforms into the
-cache, adopt the revision, replay what remains). This makes live the case the `NOTE` after a
-successful attempt in `Collection.syncAttempts` describes as dormant — staging that happens while a
-transact is in flight — and that note's precondition holds here: the fold and the revision adoption
-run **before** the replay of the remaining segments, which is the order `updateInternal` already
-requires.
+cache, adopt the revision, take the head out of the live tracker by staging the blocks it touched
+again from what the remaining segments recorded — `Collection.subtractCommittedHead` — or, when the
+attempt was not built from the head's record, replay what remains). This makes live the case the
+`NOTE` after a successful attempt in `Collection.syncAttempts` describes as dormant — staging that
+happens while a transact is in flight — and that note's precondition holds here: the fold and the
+revision adoption run **before** the subtraction or replay of the remaining segments, which is the
+order `updateInternal` already requires.
 
 While the latch is released, a refresh of the same handle can walk into the head commit's own log
 entry, already stored while the answer is still on its way back. Such a refresh changes nothing and
@@ -1889,11 +1892,13 @@ session mode is configured, until a later stage designs those points.
 - **Cascades keep entries that read a removed entry but wrote nothing its guards protect** (legacy
   mode has no read dependencies).
 - **Head-of-line blocking.** One entry whose cohort is unreachable holds back the rest.
-- **Replay cost grows with the queue.** Every refresh that adopts a new revision replays every
-  sealed segment, and draining `n` entries replays the remainder after each, which is quadratic in
-  the queue length. Negligible for tens of entries; a device that queues thousands while offline will
-  pay it on reconnect. The remedy, if it shows up, is per-segment transforms that let a drained head
-  be subtracted rather than replayed; it is not proposed now.
+- **A refresh that adopts another writer's revision replays every sealed segment.** Draining `n`
+  entries no longer does: each segment keeps the transforms its actions staged (`SealedSegment.delta`
+  in `packages/db-core/src/collection/segments.ts`), so a committed head is subtracted from the
+  staged view rather than the remainder replayed (`Collection.subtractCommittedHead`; GitHub #53).
+  What a drain still pays per entry grows with the queue only as one lookup per block the head
+  touched per remaining segment, and a rival's commit landing mid-drain costs one replay of what is
+  queued then.
 - **Without persistence, a crash loses every acknowledged entry.** That is what choosing no journal
   means, and each `queued` status says `persisted: false`.
 - **Expiry fails an entry the network might still have accepted.** `expireAfterMs` is the

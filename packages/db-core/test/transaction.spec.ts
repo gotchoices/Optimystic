@@ -3731,13 +3731,13 @@ describe('Transaction', () => {
 			// The restore already left the tracker at its pre-commit staged state — no
 			// poisoned appended log entry — even though rollback(stampId) will no-op.
 			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms);
-			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending);
+			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending.map((unit: { action: unknown }) => unit.action));
 
 			// rollback(stampId) no-ops (the stamp was never tracked via applyActions, so
 			// there is no stampData entry); the tracker stays clean regardless.
 			await coordinator.rollback(stamp.id);
 			expect(usersCollection.tracker.transforms).to.deep.equal(pre.transforms);
-			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending);
+			expect(usersCollection.getPendingActions()).to.deep.equal(pre.pending.map((unit: { action: unknown }) => unit.action));
 		});
 
 		it('multi-collection: a failed commit restores EVERY appended tracker, not just one', async () => {
@@ -3782,11 +3782,11 @@ describe('Transaction', () => {
 			// must be restored to their pre-append snapshots.
 			expect(usersCollection.tracker.transforms).to.deep.equal(preUsers.transforms,
 				'users tracker transforms should be restored');
-			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending,
+			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending.map((unit: { action: unknown }) => unit.action),
 				'users pending queue should be restored');
 			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms,
 				'posts tracker transforms should be restored');
-			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending,
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending.map((unit: { action: unknown }) => unit.action),
 				'posts pending queue should be restored');
 
 			// Nothing committed on either collection.
@@ -3944,13 +3944,13 @@ describe('Transaction', () => {
 			//    reads back through the folded cache after the tracker reset.
 			expect(usersCollection.getPendingActions(), 'committed collection pending should be cleared').to.deep.equal([]);
 			expect(usersCollection.getPendingActions(), 'committed collection must NOT be restored to pending')
-				.to.not.deep.equal(preUsers.pending);
+				.to.not.deep.equal(preUsers.pending.map((unit: { action: unknown }) => unit.action));
 			expect(await usersTree.get(1)).to.deep.equal({ key: 1, name: 'Alice' });
 
 			// 3. The failed collection was RESTORED to its pre-append snapshot for a clean retry.
 			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms,
 				'failed collection tracker should be restored to pre-append state');
-			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending,
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending.map((unit: { action: unknown }) => unit.action),
 				'failed collection pending queue should be restored');
 
 			// 4. stampData for the half-committed transaction was cleared — by the report, once the
@@ -4035,9 +4035,9 @@ describe('Transaction', () => {
 
 			// Every tracker restored to its pre-append snapshot; nothing durably committed.
 			expect(usersCollection.tracker.transforms).to.deep.equal(preUsers.transforms);
-			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending);
+			expect(usersCollection.getPendingActions()).to.deep.equal(preUsers.pending.map((unit: { action: unknown }) => unit.action));
 			expect(postsCollection.tracker.transforms).to.deep.equal(prePosts.transforms);
-			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending);
+			expect(postsCollection.getPendingActions()).to.deep.equal(prePosts.pending.map((unit: { action: unknown }) => unit.action));
 			expect(inner.getCommittedActions().size, 'nothing durably committed').to.equal(0);
 		});
 
@@ -4245,7 +4245,7 @@ describe('Transaction', () => {
 				.to.deep.equal(prePosts.transforms);
 			// ...and its pending queue too, so a re-drive cannot stage the same actions twice.
 			expect(postsCollection.getPendingActions(), 'failed collection pending queue restored to pre-staging')
-				.to.deep.equal(prePosts.pending);
+				.to.deep.equal(prePosts.pending.map((unit: { action: unknown }) => unit.action));
 
 			// The loser's row is neither stored nor staged.
 			expect(await postsTree.get(100), 'the failed row is gone from local state').to.be.undefined;
@@ -4298,7 +4298,7 @@ describe('Transaction', () => {
 			expect(postsCollection.tracker.transforms, 'duplicated loser restored to before EITHER batch')
 				.to.deep.equal(prePosts.transforms);
 			expect(postsCollection.getPendingActions(), 'duplicated loser pending queue restored to before EITHER batch')
-				.to.deep.equal(prePosts.pending);
+				.to.deep.equal(prePosts.pending.map((unit: { action: unknown }) => unit.action));
 			expect(await postsTree.get(100), "the duplicated loser's FIRST batch row is gone").to.be.undefined;
 			expect(await postsTree.get(200), "the duplicated loser's SECOND batch row is gone").to.be.undefined;
 

@@ -8,15 +8,15 @@ import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
 import type { BlockGets } from "../network/struct.js";
-import { copyTransforms, emptyTransforms, isTransformsEmpty, shallowCopyTransforms } from "../transform/helpers.js";
+import { blockIdsForTransforms, copyTransforms, emptyTransforms, isTransformsEmpty, shallowCopyTransforms } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
 import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, CommittedTailReadOptions, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
-import { SegmentList } from "./segments.js";
-import type { EntryId, SealedSegment } from "./segments.js";
+import { SegmentList, unitsOf } from "./segments.js";
+import type { EntryId, SealedSegment, StagedUnit } from "./segments.js";
 import type { ActionContext, ActionRev, AlreadyAppliedTally } from "./action.js";
 import { actionIdAt, addTallies, ZeroTally } from "./action.js";
 import { AttemptCycle, resumedAttempt, retainedAttempt, stageAttempt } from "./write-attempts.js";
@@ -108,11 +108,29 @@ type TailReadFields = Pick<BlockGets, 'skipWindowConsult'>;
 /** The tracker a head commit's attempts are built from: the head segment's actions staged over the
  * committed state, the revision the attempt built from it requests, and the lineage it was staged
  * over — the action the held context named at its own revision, `undefined` when none (see
- * {@link Collection.headTrackerFor}). */
+ * {@link Collection.headTrackerFor}). `subtract` is set when the tracker was built from the head
+ * segment's recorded delta rather than by running its handlers, so the committed head can be taken
+ * out of the live tracker instead of replayed ({@link Collection.subtractCommittedHead}): the ids the
+ * delta touches, and the replay epoch the delta's ids belong to. */
 type HeadTracker = {
 	rev: number;
 	lineage: ActionId | undefined;
 	tracker: Tracker<IBlock>;
+	subtract?: HeadSubtraction;
+};
+
+/** What taking a committed head out of the live tracker needs to know about the attempt that
+ * committed it (see {@link HeadTracker}). */
+type HeadSubtraction = {
+	readonly epoch: number;
+	readonly touched: readonly BlockId[];
+};
+
+/** What staging actions into a tracker produced ({@link Collection.stageInto}): the transforms the
+ * handlers staged, and what they accepted as already applied. */
+type Staging = {
+	readonly transforms: Transforms;
+	readonly applied: AlreadyAppliedTally;
 };
 
 /**
@@ -206,17 +224,25 @@ export interface CollectionSnapshot<TAction> {
 	 *  were not built on. Absent on a snapshot built by hand; such a restore keeps whatever pins
 	 *  the tracker holds for the restored ids. */
 	pins?: BasePins;
-	/** The OPEN segment's actions at snapshot time (see {@link SegmentList}). Sealed segments are
-	 * not captured as actions — their effects are in `transforms`, which is what a committed read
-	 * view built from this snapshot must include — and a restore never puts one back: whether it
-	 * reinstates `transforms` verbatim or rebuilds the tracker from the sealed segments as they are
-	 * then is decided by {@link sealedVersion} (see {@link Collection.restorePending}). */
-	pending: Action<TAction>[];
+	/** The OPEN segment's units at snapshot time (see {@link SegmentList}): each action with the
+	 * delta and tally its staging produced, shared with the segment list, which never changes a unit.
+	 * Sealed segments are not captured as actions — their effects are in `transforms`, which is what
+	 * a committed read view built from this snapshot must include — and a restore never puts one
+	 * back: whether it reinstates `transforms` verbatim or rebuilds the tracker from the sealed
+	 * segments as they are then is decided by {@link sealedVersion} and {@link replayEpoch} (see
+	 * {@link Collection.restorePending}). */
+	pending: readonly StagedUnit<TAction>[];
 	/** {@link SegmentList.version} at capture: a restore that finds the sealed list changed since —
 	 * a segment sealed, dropped or refused while the snapshot was outstanding — replays rather than
 	 * reinstating `transforms`, which would put a dropped segment's effects back. Absent on a
 	 * snapshot built by hand, which reads as "unchanged". */
 	sealedVersion?: number;
+	/** The collection's replay epoch at capture — bumped by every replay, which stages every segment
+	 * again under fresh block ids and records those ids on the segments. A restore over sealed
+	 * segments that finds it moved replays rather than reinstating `transforms`, whose ids the
+	 * segments' records no longer name. Absent on a snapshot built by hand, which reads as
+	 * "unchanged". */
+	replayEpoch?: number;
 	/** The committed boundary (action context) the staged state sat on when captured.
 	 *  `undefined` for a collection with no committed revision yet (an invented
 	 *  collection whose header/root still live in the tracker). A read view built
@@ -232,6 +258,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * exactly the one pending list it replaced, and every path behaves as it did then. */
 	private readonly segments = new SegmentList<TAction>();
 	private readonly latchId: string;
+
+	/** Bumped at the start of every replay ({@link replayActions}): a replay stages every segment
+	 * again, so the blocks the staged actions insert take fresh ids, and the deltas recorded on the
+	 * segments name those. A head attempt built from the head's delta carries the epoch it was built
+	 * in, and the committed head is taken out of the live tracker only while the epoch is unchanged —
+	 * otherwise the attempt's ids are not the ones the live tracker holds, and the head is replayed
+	 * out as before ({@link subtractCommittedHead}). A snapshot captures it for the same reason
+	 * ({@link CollectionSnapshot.replayEpoch}). */
+	private replayEpoch = 0;
 
 	/** The transforms an INVENTED collection starts from — its header, its empty log block and (for
 	 * a tree) its empty root, as {@link createOrOpen}'s create branch staged them. A replay resets
@@ -847,12 +882,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	private async actInternal(...actions: Action<TAction>[]) {
-		await this.internalTransact(...actions);
-		// Staging appends to the OPEN segment: a sealed segment is closed to further staging.
-		this.segments.open.push(...actions);
+		const { transforms, applied } = await this.internalTransact(...actions);
+		// Staging appends to the OPEN segment: a sealed segment is closed to further staging. What
+		// the staging produced is recorded with the actions, so the segment they are sealed into
+		// knows what it staged without staging it again (SealedSegment.delta).
+		this.segments.pushOpen(actions, transforms, applied);
 	}
 
-	private internalTransact(...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
+	private internalTransact(...actions: Action<TAction>[]): Promise<Staging> {
 		return this.stageInto(this.tracker, ...actions);
 	}
 
@@ -862,9 +899,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * commit changes what this collection's reads see ({@link viewChanged}); a head commit's tracker
 	 * is private to the commit.
 	 *
-	 * @returns the sum of what the handlers accepted as already applied ({@link AlreadyAppliedTally});
-	 * a handler that answers nothing adds the zero tally. */
-	private async stageInto(tracker: Tracker<IBlock>, ...actions: Action<TAction>[]): Promise<AlreadyAppliedTally> {
+	 * @returns what the staging produced ({@link Staging}): the transforms the handlers staged — the
+	 * atomic's own, which `tracker` copied what it kept of, so the caller may keep them as the record
+	 * of this staging — and the sum of what the handlers accepted as already applied
+	 * ({@link AlreadyAppliedTally}); a handler that answers nothing adds the zero tally. */
+	private async stageInto(tracker: Tracker<IBlock>, ...actions: Action<TAction>[]): Promise<Staging> {
 		const atomic = new Atomic(tracker);
 		let applied = ZeroTally;
 
@@ -882,8 +921,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (tracker === this.tracker) {
 			this.viewChanged();
 		}
-		atomic.commit();
-		return applied;
+		return { transforms: atomic.commit(), applied };
 	}
 
 	/** Tell {@link CollectionInitOptions.onViewChanged} that what this collection's reads see is
@@ -1204,7 +1242,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (this.headCommit !== undefined) {
 			this.consumeHead(entry, this.headCommit.entryId);
 		} else {
-			this.segments.open = this.consumedFromOpen(entry);
+			this.segments.setOpen(this.consumedFromOpen(entry));
 		}
 		return true;
 	}
@@ -1258,8 +1296,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** The open segment with the leading actions `entry` made durable dropped off it. */
-	private consumedFromOpen(entry: ActionEntry<Action<TAction>>): Action<TAction>[] {
-		const open = this.segments.open;
+	private consumedFromOpen(entry: ActionEntry<Action<TAction>>): StagedUnit<TAction>[] {
+		const open = this.segments.openUnits();
 		if (entry.actions.length > open.length) {
 			throw new Error(
 				`Collection ${this.id}: own committed entry for action ${entry.actionId} holds `
@@ -1288,12 +1326,21 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * @returns whether the open segment changed. */
 	private filterAgainstEntry(entry: ActionEntry<Action<TAction>>): boolean {
-		const before = this.segments.open;
-		const after = before
-			.map(p => this.doFilterConflict(p, entry.actions))
-			.filter((a): a is Action<TAction> => a !== undefined);
-		this.segments.open = after;
-		return after.length !== before.length || after.some((a, i) => a !== before[i]);
+		const before = this.segments.openUnits();
+		let changed = false;
+		const after: StagedUnit<TAction>[] = [];
+		for (const unit of before) {
+			const effective = this.doFilterConflict(unit.action, entry.actions);
+			if (effective === unit.action) {
+				after.push(unit);
+			} else {
+				// A replacement's staging is not on record; the replay this forces records it.
+				changed = true;
+				if (effective !== undefined) after.push({ action: effective });
+			}
+		}
+		this.segments.setOpen(after);
+		return changed;
 	}
 
 	/** Refresh this instance against the stored log: adopt the latest committed revision, resolve
@@ -1844,8 +1891,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return {
 			transforms: this.tracker.shareTransforms(),
 			pins: this.tracker.pins.copy(),
-			pending: [...this.segments.open],
+			pending: [...this.segments.openUnits()],
 			sealedVersion: this.segments.version,
+			replayEpoch: this.replayEpoch,
 			context: structuredClone(this.source.actionContext),
 		};
 	}
@@ -1870,13 +1918,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *   reset. It is the arm every restore took before segments existed, so while nothing is ever
 	 *   sealed nothing behaves differently.
 	 * - **Replay**, when the sealed list has changed — a segment sealed, dropped or refused while
-	 *   the snapshot was outstanding — or when the boundary has moved while a segment is sealed:
-	 *   the open segment is set to the captured actions and the tracker is rebuilt by
-	 *   {@link replayActions}, the sealed segments as they are NOW (refused ones skipped, a newly
-	 *   refused one recorded and reported) and then the restored open actions. Reinstating the
-	 *   captured transforms would put a dropped segment's effects back — the drain removes the
-	 *   head segment after committing it, and the next head commit would commit it a second time
-	 *   — and a reset would drop the sealed segments' effects.
+	 *   the snapshot was outstanding — or when the boundary has moved, or a replay has run
+	 *   ({@link CollectionSnapshot.replayEpoch}), while a segment is sealed: the open segment is
+	 *   set to the captured actions and the tracker is rebuilt by {@link replayActions}, the sealed
+	 *   segments as they are NOW (refused ones skipped, a newly refused one recorded and reported)
+	 *   and then the restored open actions. Reinstating the captured transforms would put a dropped
+	 *   segment's effects back — the drain removes the head segment after committing it, and the
+	 *   next head commit would commit it a second time — and a reset would drop the sealed
+	 *   segments' effects. After a replay, reinstating them would put back block ids the sealed
+	 *   segments' recorded deltas no longer name, and the next head commit would take the wrong
+	 *   blocks out of the tracker.
 	 * - A moved boundary with NOTHING sealed keeps the two arms it had before segments. An empty
 	 *   captured open segment (the transaction-rollback shape: the capture predates the
 	 *   transaction's first stage) resets the tracker empty, because the captured transforms
@@ -1913,23 +1964,24 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * pre-pend re-validation (restageIfBasesMoved) finds those bases moved and re-stages. */
 	async restorePending(snapshot: CollectionSnapshot<TAction>): Promise<void> {
 		const sealedChanged = snapshot.sealedVersion !== undefined && snapshot.sealedVersion !== this.segments.version;
+		const replayed = snapshot.replayEpoch !== undefined && snapshot.replayEpoch !== this.replayEpoch;
 		const capturedRev = snapshot.context?.rev;
 		const currentRev = this.source.actionContext?.rev;
 		const boundaryMoved = currentRev !== undefined && (capturedRev === undefined || currentRev > capturedRev);
-		if (sealedChanged || (boundaryMoved && this.segments.hasSealed())) {
-			this.segments.open = [...snapshot.pending];
+		if (sealedChanged || ((boundaryMoved || replayed) && this.segments.hasSealed())) {
+			this.segments.setOpen([...snapshot.pending]);
 			await this.replayActions();
 			return;
 		}
 		this.viewChanged();
 		if (boundaryMoved && snapshot.pending.length === 0) {
 			this.tracker.reset();
-			this.segments.open = [];
+			this.segments.setOpen([]);
 			return;
 		}
 		this.tracker.reset(shallowCopyTransforms(snapshot.transforms));
 		if (snapshot.pins) this.tracker.pins.replaceWith(snapshot.pins);
-		this.segments.open = [...snapshot.pending];
+		this.segments.setOpen([...snapshot.pending]);
 	}
 
 	/** A read-only {@link Tracker} pinned to this collection's committed state AS OF the
@@ -2010,7 +2062,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * existing catch, which restores every participant. */
 	getPendingActions(): Action<TAction>[] {
 		this.assertNoSealedSegments();
-		return this.segments.open;
+		return this.segments.openActions();
 	}
 
 	/** Drop the OPEN segment after it has been committed through a coordinator. Counterpart to
@@ -2018,7 +2070,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * so only the open segment is ever cleared here; {@link sync} clears its own inline, so this
 	 * is only needed when commit was orchestrated externally. */
 	clearPendingActions(): void {
-		this.segments.open = [];
+		this.segments.setOpen([]);
 	}
 
 	/** Whether {@link sync} has anything to push: staged actions in the open segment, or tracker
@@ -2042,7 +2094,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * holds), so over an otherwise empty tracker this reads `false` while {@link sealedEntries} is
 	 * non-empty. The queue drives off {@link sealedEntries}, never off this predicate. */
 	hasUnsyncedChanges(): boolean {
-		return this.segments.open.length > 0 || !isTransformsEmpty(this.tracker.transforms);
+		return this.segments.openCount() > 0 || !isTransformsEmpty(this.tracker.transforms);
 	}
 
 	/** Close the open segment into a sealed segment owned by `entryId` (see {@link SegmentList}).
@@ -2096,12 +2148,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 	}
 
 	/** The OPEN segment's actions — what the current transaction has staged since the last seal — as
-	 * the array the segment holds (never mutated by a caller). Unlike {@link getPendingActions} it
-	 * answers while segments are sealed, for a reader that judges the open transaction beside the
-	 * queued ones (the Quereus plugin's `CommitOutlook()`). Synchronous and latch-free, like
-	 * {@link sealedActions}. */
+	 * a new array. Unlike {@link getPendingActions} it answers while segments are sealed, for a
+	 * reader that judges the open transaction beside the queued ones (the Quereus plugin's
+	 * `CommitOutlook()`). Synchronous and latch-free, like {@link sealedActions}. */
 	openActions(): readonly Action<TAction>[] {
-		return this.segments.open;
+		return this.segments.openActions();
 	}
 
 	/** The exact inverse of {@link sealPending}, list-only and latch-free by the same contract: move
@@ -2164,9 +2215,9 @@ export class Collection<TAction> implements ICollection<TAction> {
 	async restoreSealed(entryId: EntryId, actions: readonly Action<TAction>[], position: { before: EntryId } | 'last'): Promise<ActionRefusedError | undefined> {
 		const release = await Latches.acquire(this.latchId);
 		try {
-			if (this.segments.open.length > 0) {
+			if (this.segments.openCount() > 0) {
 				throw new Error(`Collection ${this.id}: cannot restore sealed segment ${entryId} while a transaction has `
-					+ `${this.segments.open.length} action(s) staged in the open segment`);
+					+ `${this.segments.openCount()} action(s) staged in the open segment`);
 			}
 			if (this.headInFlight !== undefined) {
 				throw new SealedSegmentsError(this.id, this.segments.entryIds(), 'in-flight', this.headInFlight.entryId);
@@ -2511,7 +2562,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			// inter-attempt refresh would leave the entry claiming the lane of the action it replaced. No
 			// hook in this repository replaces an action; if one ever does, the member-side lane check is
 			// what catches the mismatch.
-			lane: options?.lane ?? this.laneOf(this.segments.open),
+			lane: options?.lane ?? this.laneOf(this.segments.openActions()),
 		};
 
 		const endInFlight = this.beginInFlightAction(identity.actionId, { lane: identity.lane, refuseSolo: options?.refuseSoloCommit });
@@ -2548,7 +2599,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 			// Snapshot the open segment so that any new actions aren't assumed to be part of this action
 			// (no segment is sealed here — syncInternal refused if one was).
-			const pending = [...this.segments.open];
+			const pending = this.segments.openActions();
 			const staged = await this.buildAttempt({ actions: pending, transforms: this.tracker.transforms, pins: this.tracker.pins }, identity);
 			const attempt = await this.send(staged, identity, cycle.priority());
 			if (!attempt.success) {
@@ -2558,7 +2609,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			} else {
 				cycle.recordCommit(attempt.durability);
 				// Clear the open-segment actions that were part of this action
-				this.segments.open = this.segments.open.slice(pending.length);
+				this.segments.setOpen(this.segments.openUnits().slice(pending.length));
 				// Fold the committed transforms into the read cache and adopt the revision BEFORE
 				// replaying whatever is still staged — the order `updateInternal` and
 				// `TransactionCoordinator.commitOnceLatched` require, where the newly committed state
@@ -2732,6 +2783,10 @@ export class Collection<TAction> implements ICollection<TAction> {
 		let held = true;
 		let closed = false;
 		let head: HeadTracker | undefined;
+		// How the attempt `stage()` last built relates to the live tracker ({@link HeadSubtraction}),
+		// read by `replay()`: set when it was built from the head's recorded delta, cleared when it
+		// was a recorded attempt re-sent verbatim.
+		let subtraction: HeadSubtraction | undefined;
 		const assertUsable = (step: string, needsLatch: boolean) => {
 			if (closed) {
 				throw new Error(`Collection ${this.id}: head commit of ${entryId} is closed; ${step}() is a defect`);
@@ -2756,9 +2811,12 @@ export class Collection<TAction> implements ICollection<TAction> {
 				const segment = this.committableHead(entryId);
 				const resumed = resumedAttempt(this.sourceCache, resume, this.getNextRev());
 				if (resumed !== undefined) {
+					// A recorded attempt's ids are an earlier cycle's, not the live tracker's.
+					subtraction = undefined;
 					return resumed;
 				}
 				head = await this.headTrackerFor(segment, head);
+				subtraction = head.subtract;
 				return this.buildAttempt({ actions: segment.actions, transforms: head.tracker.transforms, pins: head.tracker.pins }, identity);
 			},
 			send: (staged, priority) => {
@@ -2791,14 +2849,19 @@ export class Collection<TAction> implements ICollection<TAction> {
 				this.foldOwnCommit(staged, identity.actionId);
 				this.reportCommittedHead(dropped);
 			},
-			replay: () => {
+			replay: async () => {
 				assertUsable('replay', true);
-				// NOTE: the remaining sealed segments and the open segment are replayed after EVERY head
-				// commit, so draining a queue of n entries is quadratic in n (docs/offline-sync.md
-				// §Failure modes and accepted tradeoffs). Negligible for tens of entries; if it shows up
-				// for a device that queued thousands, keep per-segment trackers chained over the cache,
-				// so a committed head is popped and folded instead of replayed.
-				return this.replayActions();
+				if (subtraction !== undefined && subtraction.epoch === this.replayEpoch
+					&& await this.subtractCommittedHead(entryId, subtraction.touched)) {
+					return;
+				}
+				// The attempt's ids are not the live tracker's — it was built by running the handlers
+				// (an invented collection's first head, a delta not on record, a moved base), re-sent
+				// from a recorded attempt, or a replay has run since it was built — or a later
+				// segment's staging is not on record: the remaining segments are staged again.
+				log('collection:committed-head-replayed id=%s tag=%s entry=%s reason=%s', this.id, this.instanceTag, entryId,
+					subtraction === undefined ? 'attempt-not-from-delta' : subtraction.epoch !== this.replayEpoch ? 'replayed-since' : 'deltas-missing');
+				await this.replayActions();
 			},
 			refused: (staged) => {
 				assertUsable('refused', true);
@@ -2860,13 +2923,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 
 	/** The tracker a head attempt is built from (see {@link commitHead}): `current`, while it was
 	 * built for the revision the next attempt requests and no base under it has moved; otherwise a
-	 * fresh one ({@link buildHeadTracker}). A revision that moved is a write that is genuinely
-	 * different, and so is one whose held lineage moved at the same revision: a refresh between
-	 * attempts that adopted another lineage ({@link judgeAdoption}) dropped the read cache the
-	 * tracker was staged over, and an action that inserted a block computed from that content pinned
-	 * no base the re-judge below would see as moved. A base that moved at the same revision is
-	 * re-judged exactly as {@link restageIfBasesMoved} re-judges the live queue before an attempt,
-	 * and rebuilds.
+	 * fresh one — from the head's recorded delta where that is possible
+	 * ({@link headTrackerFromDelta}), else by running its handlers ({@link buildHeadTracker}). A
+	 * revision that moved is a write that is genuinely different, and so is one whose held lineage
+	 * moved at the same revision: a refresh between attempts that adopted another lineage
+	 * ({@link judgeAdoption}) dropped the read cache the tracker was staged over, and an action that
+	 * inserted a block computed from that content pinned no base the re-judge below would see as
+	 * moved. A base that moved at the same revision is re-judged exactly as
+	 * {@link restageIfBasesMoved} re-judges the live queue before an attempt, and rebuilds.
 	 * NOTE: that rebuild is the same exception to the byte-identical retry that {@link syncAttempts}
 	 * records at its `restageIfBasesMoved` call — fresh ids for the blocks the actions insert under
 	 * an unchanged `(action id, revision)` — reached the same narrow way and refused by storage's
@@ -2881,7 +2945,83 @@ export class Collection<TAction> implements ICollection<TAction> {
 				return current;
 			}
 		}
+		const fromDelta = held === undefined ? undefined : await this.headTrackerFromDelta(segment);
+		if (fromDelta !== undefined) {
+			return { rev, lineage, ...fromDelta };
+		}
 		return { rev, lineage, tracker: await this.buildHeadTracker(segment) };
+	}
+
+	/** A head tracker built from what `segment`'s actions staged into the live tracker
+	 * ({@link SealedSegment.delta}) rather than by running them again: a tracker over the read cache
+	 * holding a copy of the delta, with the live tracker's pins for the blocks the delta updates — the
+	 * bases those operations were computed against, which the live tracker has judged exactly as this
+	 * tracker's will be (the operations are the same). Correct because the segment's actions were
+	 * staged over the committed state plus the segments ahead of it, and once those have committed
+	 * with nothing from any other writer in between, the committed state IS that base, so running the
+	 * handlers again would make every decision the same way; their only different output would be
+	 * fresh ids for the blocks they insert, which the live tracker does not hold, and which is why a
+	 * rebuilt head has to be replayed out of the tracker afterwards. A refresh that adopts another
+	 * writer's revision replays, which records every delta again. `undefined` — build by running the
+	 * handlers — when the delta is not on record, or when a pin under it has moved: the delta was
+	 * computed on content the cache no longer describes. The caller keeps this for a collection that
+	 * holds a committed revision only: an invented collection's first commit has to carry the baseline,
+	 * which the delta does not. */
+	private async headTrackerFromDelta(segment: SealedSegment<TAction>): Promise<Pick<HeadTracker, 'tracker' | 'subtract'> | undefined> {
+		const delta = segment.delta;
+		if (delta === undefined) {
+			return undefined;
+		}
+		const tracker = new Tracker<IBlock>(this.sourceCache, copyTransforms(delta));
+		for (const id of Object.keys(delta.updates ?? {}) as BlockId[]) {
+			const pin = this.tracker.pins.get(id);
+			if (pin !== undefined) tracker.pins.set(id, pin);
+		}
+		await this.rereadUnretainedBases(tracker);
+		if (this.logMovedBases(tracker.movedBases()) > 0) {
+			return undefined;
+		}
+		return { tracker, subtract: { epoch: this.replayEpoch, touched: blockIdsForTransforms(delta) } };
+	}
+
+	/** Take a committed head segment out of the live tracker without running a handler, the
+	 * counterpart of {@link headTrackerFromDelta}: the attempt's transforms are in the read cache and
+	 * its revision adopted (`fold`), so the live tracker's state for the blocks the head touched
+	 * (`touched`) is rebuilt from the remaining segments' and the open units' recorded deltas alone
+	 * (`Tracker.refold`), and nothing else is visited. Two steps. First, each touched block that a
+	 * remaining delta updates and the read cache no longer retains is read through the cache now:
+	 * the fold applies the head's operations into a cached block only, so an evicted one would be
+	 * pinned at the revision last served, which the remaining operations were not computed on. Then,
+	 * in one synchronous step, {@link viewChanged} and the re-fold — told even though no id changes,
+	 * because a read that fetched its base before the fold and applied the remaining operations
+	 * after it would otherwise see content missing the head; the signal readers already handle
+	 * (docs/internals.md, "The drain changes a tree beneath its readers"), once per commit instead of
+	 * once per unit re-staged.
+	 *
+	 * NOTE: `touched` is what the head's delta touched, not what its attempt touched: a block the
+	 * attempt's log append changed and the delta did not — the collection header, when the log tail
+	 * rolled over in this commit — is not visited, so a later segment's pin on it is judged moved
+	 * and the next refresh or head commit replays what is staged. At most once per roll-over, which
+	 * is every 32 entries; if it ever shows in a drain profile, visit the attempt's touched ids too,
+	 * on the ground that the append changes only the header's tail id, which no handler reads.
+	 *
+	 * @returns `false`, with nothing changed, when a remaining segment's or open unit's delta is not
+	 * on record: the caller replays instead. */
+	private async subtractCommittedHead(entryId: EntryId, touched: readonly BlockId[]): Promise<boolean> {
+		const deltas = this.segments.stagedDeltas();
+		if (deltas === undefined) {
+			return false;
+		}
+		for (const id of touched) {
+			if (!this.sourceCache.retains(id) && deltas.some(delta => (delta.updates?.[id]?.length ?? 0) > 0)) {
+				await this.sourceCache.tryGet(id, 'navigation');
+			}
+		}
+		this.viewChanged();
+		this.tracker.refold(touched, deltas);
+		log('collection:committed-head-subtracted id=%s tag=%s entry=%s touched=%d remaining=%d',
+			this.id, this.instanceTag, entryId, touched.length, deltas.length);
+		return true;
 	}
 
 	/** A tracker over this instance's read cache, with pins of its own, holding `segment`'s actions
@@ -2889,11 +3029,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * has no committed revision ({@link replayBaseline}): its header, log block and root then exist
 	 * nowhere else, and the head's commit has to carry them. A refusal is the segment's own,
 	 * recorded and reported ({@link recordSealedRefusal}) and thrown; a live replay that found it
-	 * first has already done the recording, and the caller never gets here. */
+	 * first has already done the recording, and the caller never gets here. Records the tally this
+	 * staging produced on the segment, never the transforms: their ids are this tracker's, not the
+	 * live tracker's, which `SealedSegment.delta` names. */
 	private async buildHeadTracker(segment: SealedSegment<TAction>): Promise<Tracker<IBlock>> {
 		const tracker = new Tracker<IBlock>(this.sourceCache, this.replayBaseline());
 		try {
-			segment.applied = await this.stageInto(tracker, ...segment.actions);
+			segment.applied = (await this.stageInto(tracker, ...segment.actions)).applied;
 		} catch (err) {
 			if (err instanceof ActionRefusedError) {
 				// NOTE: the live tracker still holds this segment's effects from its last replay, which
@@ -2963,7 +3105,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// declares no merge and `Diary` declares no hook); if one ever does, carry a per-call token on
 		// the staged actions and match on that instead.
 		// The actions were staged into the OPEN segment (actAndSync refuses over sealed segments).
-		this.segments.open = this.segments.open.filter(staged => !actions.includes(staged));
+		this.segments.setOpen(this.segments.openUnits().filter(unit => !actions.includes(unit.action)));
 		if (this.source.actionContext?.rev === revBefore) {
 			this.viewChanged();
 			this.tracker.reset(stagedBefore);
@@ -3001,23 +3143,37 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 *
 	 * Each re-staged update pins its base through `Atomic.commit` → `Tracker.absorb`, the path
 	 * {@link act} uses, so the pend declares the bases the re-staged operations were computed on. Each
-	 * sealed segment that staged records what its actions accepted as already applied
-	 * (`SealedSegment.applied`), the tally the head commit reports when the segment is committed.
+	 * sealed segment that staged records what its actions staged (`SealedSegment.delta`, under the ids
+	 * this replay minted — the ones the live tracker now holds, which is what lets the next head
+	 * commit take the head out of the tracker without a replay) and what they accepted as already
+	 * applied (`SealedSegment.applied`), the tally the head commit reports when the segment is
+	 * committed; each open unit records the same for its action. The replay epoch moves first
+	 * ({@link replayEpoch}), so a head attempt built before this replay is known to hold other ids.
 	 *
 	 * A replay changes the tree beneath unlatched readers twice over: the reset drops every block a
 	 * staged action inserted, and the re-staging inserts them again under fresh ids. Both are told
 	 * through {@link viewChanged} — the reset here, each re-staged unit in {@link stageInto} — so a
 	 * reader part-way through a descent knows to read again rather than follow an id that is gone.
 	 *
+	 * NOTE: a throw out of the open segment's staging leaves the units behind it with no staging on
+	 * record (every record is cleared first, since the ids it named are gone), on top of the
+	 * half-restaged tracker the callers' note on this method already accepts; the next replay
+	 * records them again, and a seal over them meanwhile carries no delta, which the head commit
+	 * takes as "stage it again".
+	 *
 	 * @param unreported - a segment whose refusal is recorded but NOT reported through
 	 * `onSealedRefused`: the one {@link restoreSealed} is inserting, whose caller reads the recorded
 	 * refusal off the segment itself. */
 	private async replayActions(unreported?: EntryId): Promise<void> {
+		this.replayEpoch++;
 		this.viewChanged();
 		this.tracker.reset(this.replayBaseline());
 		for (const segment of this.segments.replayable()) {
+			segment.delta = undefined;
 			try {
-				segment.applied = await this.internalTransact(...segment.actions);
+				const { transforms, applied } = await this.internalTransact(...segment.actions);
+				segment.delta = transforms;
+				segment.applied = applied;
 			} catch (err) {
 				if (!(err instanceof ActionRefusedError)) {
 					throw err;
@@ -3025,8 +3181,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 				this.recordSealedRefusal(segment, err, segment.entryId !== unreported);
 			}
 		}
-		for (const action of this.segments.open) {
-			await this.internalTransact(action);
+		const open = this.segments.openActions();
+		this.segments.setOpen(unitsOf(open));
+		const restaged: StagedUnit<TAction>[] = [];
+		for (const action of open) {
+			const { transforms, applied } = await this.internalTransact(action);
+			restaged.push({ action, delta: transforms, applied });
+			this.segments.setOpen([...restaged, ...unitsOf(open.slice(restaged.length))]);
 		}
 	}
 

@@ -203,16 +203,29 @@ describe('Collection sealed segments', function () {
 			expect(list.seal('E0'), 'nothing to seal').to.be.false;
 			expect(list.version, 'a refused seal is not a change').to.equal(0);
 
-			list.open.push({ type: 'a', data: 1 }, { type: 'a', data: 2 });
+			// One `act` call over two actions stages them as one unit: the group's delta and tally sit
+			// on its last action. A later unit updates the block the first inserted.
+			const block = { header: { id: 'b1', type: 'TEST', collectionId: 'c' }, items: [] as string[] };
+			list.pushOpen([{ type: 'a', data: 1 }, { type: 'a', data: 2 }], { inserts: { b1: structuredClone(block) }, updates: {}, deletes: [] }, { applied: 1, alreadyApplied: 0 });
+			list.pushOpen([{ type: 'a', data: 3 }], { inserts: {}, updates: { b1: [['items', 0, 0, ['x']]], b2: [['items', 1, 0, ['y']]] }, deletes: ['b3'] }, { applied: 0, alreadyApplied: 1 });
+			expect(list.openUnits().map(unit => unit.delta?.inserts), 'the group records its delta on its last action').to.deep.equal([{}, { b1: block }, {}]);
 			expect(list.seal('E1')).to.be.true;
-			expect(list.open, 'the open segment starts afresh').to.deep.equal([]);
+			expect(list.openActions(), 'the open segment starts afresh').to.deep.equal([]);
 			expect(list.entryIds()).to.deep.equal(['E1']);
 			expect(list.version).to.equal(1);
 			expect(() => list.seal('E1'), 'an id seals once').to.throw(/already sealed/);
+			const sealed = list.find('E1')!;
+			expect(sealed.delta, 'the deltas of the units folded as a tracker would hold them: the update of the inserted block applied into it').to.deep.equal({
+				inserts: { b1: { ...block, items: ['x'] } }, updates: { b2: [['items', 1, 0, ['y']]] }, deletes: ['b3'],
+			});
+			expect(sealed.applied, 'and their tallies summed').to.deep.equal({ applied: 1, alreadyApplied: 1 });
+			expect(list.stagedDeltas(), 'what a committed head is taken out against').to.deep.equal([sealed.delta]);
 
-			list.open.push({ type: 'a', data: 3 });
+			list.setOpen([{ action: { type: 'a', data: 3 } }]);
 			list.seal('E2');
-			expect(list.replayableCount(), 'both segments, no open action').to.equal(3);
+			expect(list.find('E2')!.delta, 'a unit whose staging is not on record seals a segment with none').to.be.undefined;
+			expect(list.stagedDeltas(), 'and the subtraction then has nothing to go on').to.be.undefined;
+			expect(list.replayableCount(), 'both segments, no open action').to.equal(4);
 
 			list.refuse('E1', new ActionRefusedError('c', 'refused'));
 			expect(list.version).to.equal(3);
@@ -228,23 +241,25 @@ describe('Collection sealed segments', function () {
 
 		it('unseals only the newest segment over an empty open segment, and inserts before a named segment or last (ticket offline-sync-journal-port)', () => {
 			const list = new SegmentList<number>();
-			list.open.push({ type: 'a', data: 1 });
+			const staged = (data: number) => list.pushOpen([{ type: 'a', data }], { inserts: {}, updates: {}, deletes: [] }, { applied: 0, alreadyApplied: 0 });
+			staged(1);
 			list.seal('E1');
-			list.open.push({ type: 'a', data: 2 });
+			staged(2);
 			list.seal('E2');
 			expect(() => list.unseal('E1'), 'an older segment cannot be unsealed').to.throw(/newest/);
-			list.open.push({ type: 'a', data: 3 });
+			staged(3);
 			expect(() => list.unseal('E2'), 'nor the newest over a staged action').to.throw(/open segment/);
-			list.open = [];
+			list.setOpen([]);
 			const version = list.version;
 
 			list.unseal('E2');
 
-			expect(list.open, 'its actions are the open segment again').to.deep.equal([{ type: 'a', data: 2 }]);
+			expect(list.openActions(), 'its actions are the open segment again').to.deep.equal([{ type: 'a', data: 2 }]);
+			expect(list.openUnits()[0]!.delta, 'with no staging on record: the rollback that follows records it').to.be.undefined;
 			expect(list.entryIds()).to.deep.equal(['E1']);
 			expect(list.version, 'the sealed list changed').to.equal(version + 1);
 
-			list.open = [];
+			list.setOpen([]);
 			list.insert('R', [{ type: 'a', data: 9 }], 'E1');
 			expect(list.entryIds(), 'ahead of the named segment').to.deep.equal(['R', 'E1']);
 			list.insert('L', [{ type: 'a', data: 10 }], undefined);

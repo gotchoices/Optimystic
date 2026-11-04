@@ -99,6 +99,50 @@ export function mergeTransforms(a: Transforms, b: Transforms): Transforms {
 	};
 }
 
+/**
+ * Fold `delta` into `target` under `Tracker`'s semantics — what `target` would hold had a tracker
+ * holding it absorbed `delta` (`Tracker.absorb`): a delete removes the id's insert and updates and
+ * lists it deleted; an insert replaces the id's block and takes it off the deletes; an update of a
+ * block `target` inserts is applied into that block, and otherwise appended to the id's update list.
+ * Changes `target`'s maps in place but never a value in them: a value the delta changes is replaced
+ * by a changed copy, so a snapshot sharing `target`'s values ({@link shallowCopyTransforms}) stays as
+ * captured. `delta`'s values are taken by reference and never changed, so a delta folded here can be
+ * folded again elsewhere.
+ *
+ * `SegmentList.seal` folds the open segment's per-action deltas into one with it.
+ * {@link mergeTransforms} is the other combination, for transforms that are not one tracker's: it
+ * keeps an insert and a later update of it apart and never takes anything off the deletes.
+ *
+ * NOTE: an update of a block `target` inserts copies that block once per delta that updates it — at
+ * the seal, one copy per later action of a transaction that writes a node an earlier action of it
+ * created. If a long transaction ever shows it, fold a second update into the copy the first made.
+ */
+export function foldTransforms(target: Transforms, delta: Transforms): void {
+	const inserts = target.inserts ??= {};
+	const updates = target.updates ??= {};
+	const deletes = target.deletes ??= [];
+	for (const id of delta.deletes ?? []) {
+		delete inserts[id];
+		delete updates[id];
+		if (!deletes.includes(id)) deletes.push(id);
+	}
+	for (const [id, block] of Object.entries(delta.inserts ?? {})) {
+		inserts[id] = block;
+		const index = deletes.indexOf(id);
+		if (index >= 0) deletes.splice(index, 1);
+	}
+	for (const [id, ops] of Object.entries(delta.updates ?? {})) {
+		if (Object.hasOwn(inserts, id)) {
+			const block = structuredClone(inserts[id]!);
+			applyOperations(block, ops);
+			inserts[id] = block;
+		} else {
+			const held = updates[id];
+			updates[id] = held === undefined ? ops : [...held, ...ops];
+		}
+	}
+}
+
 export function isTransformsEmpty(transform: Transforms): boolean {
 	return Object.keys(transform.inserts ?? {}).length === 0
 		&& Object.keys(transform.updates ?? {}).length === 0
