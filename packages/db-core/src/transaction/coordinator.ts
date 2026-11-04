@@ -1327,8 +1327,7 @@ export class TransactionCoordinator {
 					// above advanced each one's held revision to the entry's own, and Log.getFrom
 					// returns only entries ABOVE the held revision. Collection.consumeOwnEntry is
 					// therefore unreachable for a sibling committed here, and this attempt was not
-					// retained for it (the loop above skips committed participants) — the refresh is a
-					// reader's, at a cost of one walk only if an earlier attempt of the cycle was retained.
+					// retained for it (the loop above skips committed participants) — the refresh is a reader's.
 					for (const [collectionId, durability] of committed) {
 						recordCollectionDurability(cycle.saved, collectionId, durability);
 					}
