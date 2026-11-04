@@ -11,6 +11,10 @@
  *
  * Inbound `RegisterV1` decision pipeline (§Registration mechanics, §Willingness, §Cold-start):
  *
+ * The engine checks no signatures. A live-signer host authenticates a frame before handing it over, with the
+ * platform's own verifier, because that check may have to wait and every decision here reads current state
+ * synchronously; a key-less host hands frames over unchecked.
+ *
  * 1. **Anti-DoS** — freshness/replay guard, per-(peer,topic) rate limit, and cold-root bootstrap
  *    evidence. A failure short-circuits to `unwilling_cohort` (temporal back-off) or, for a replay,
  *    a silent `no_state` (no state is served and nothing is recorded).
@@ -132,14 +136,6 @@ export interface CohortMemberEngineDeps {
 	readonly topicBudget?: TopicBudget;
 	readonly bootstrapEvidence?: BootstrapEvidence;
 	/**
-	 * Optional participant peer-key signature verifier (db-p2p binds it to the peer-sig primitive over
-	 * {@link import("./wire/payloads.js").registerSigningPayload}). A `RegisterV1` whose signature does
-	 * not verify against the claimed `participantCoord` is answered `no_state` (serve nothing, record
-	 * nothing) — a cohort member cannot trust an unsigned/forged `participantCoord`. Verified first so a
-	 * forged frame never reaches (or pollutes) the replay/rate guards. Absent → the gate is skipped.
-	 */
-	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
-	/**
 	 * Sink for a freshly threshold-signed promotion/demotion notice produced on an arrival (the `accept`
 	 * path's promotion trigger). db-p2p's host wires this to broadcast the notice over the `promote`
 	 * protocol to the cohort (and, for a demotion, the parent coord). Absent → notices are produced and
@@ -165,10 +161,21 @@ export interface CohortMemberEngineDeps {
 
 /** Cohort-side register/renew handler — the body of the FRET activity callback. */
 export interface CohortMemberEngine {
-	/** Classify and admit (or decline) an inbound `RegisterV1`, returning the reply to serialize. */
+	/**
+	 * Classify and admit (or decline) an inbound `RegisterV1`, returning the reply to serialize. **The caller has
+	 * authenticated `reg`** — `participantCoord` is taken as true, and rate limits and records are keyed by it. A
+	 * forged frame reaching here would spend that peer's budget and could hold its registration.
+	 */
 	handleRegister(reg: RegisterV1, ctx: RegisterContext, now: number): Promise<RegisterReplyV1>;
-	/** Handle an inbound `RenewV1` (ping / re-attach), delegating to the renewal cohort side. */
+	/**
+	 * Handle an inbound `RenewV1` (ping / re-attach / withdraw), delegating to the renewal cohort side. **The caller
+	 * has authenticated a privileged `msg`**: see {@link RenewalCohortSide.onRenew}.
+	 */
 	handleRenew(msg: RenewV1, now: number): RenewReplyV1;
+	/** {@link RenewalCohortSide.refusalBeforeSignature} for this engine's records. */
+	refusalBeforeSignature(msg: RenewV1, now: number): RenewReplyV1 | undefined;
+	/** {@link RenewalCohortSide.refuseUnauthenticated} for this engine's records. */
+	refuseUnauthenticated(msg: RenewV1): RenewReplyV1;
 	/** Evict stale records and gossip each eviction; returns the evicted set. */
 	sweepStale(now: number): readonly RegistrationRecord[];
 }
@@ -185,7 +192,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		//    Branches before the admission pipeline (and the durable-state anti-DoS guards), so even a
 		//    hand-crafted `probe: true, bootstrap: true` frame can never instantiate — defense in depth.
 		if (reg.probe === true) {
-			return this.handleProbe(reg, topicId, participantId, ctx, now);
+			return this.handleProbe(topicId, participantId, ctx, now);
 		}
 
 		// 1. Anti-DoS gates. A replay/stale frame is answered with NoState (serve nothing, record
@@ -222,22 +229,17 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 	 * classify, never an admission: it persists **no** record, counts **no** arrival, fires **no**
 	 * promotion trigger, touches **no** topic budget, and **never** instantiates a cold-start forwarder.
 	 *
-	 * DoS posture (`docs/cohort-topic.md` §Anti-DoS): a probe still runs the stateless participant-sig gate
-	 * (forged → `no_state`) and a dedicated probe rate limiter (over-rate → `unwilling_cohort`), but skips
-	 * the replay guard, the bootstrap-evidence gate, and the topic budget — an idempotent read records
-	 * nothing, so it is strictly cheaper than the register it replaces.
+	 * DoS posture (`docs/cohort-topic.md` §Anti-DoS): a probe arrives authenticated, as a register does, and runs
+	 * a dedicated probe rate limiter (over-rate → `unwilling_cohort`), but skips the replay guard, the
+	 * bootstrap-evidence gate, and the topic budget — an idempotent read records nothing, so it is strictly
+	 * cheaper than the register it replaces.
 	 *
 	 * Classification mirrors a register's terminal cases so the walk's existing branches drive a probe
 	 * unchanged: a served-and-promoted topic answers `promoted(treeTier + 1)` (the walk follows it), a
 	 * served topic answers `accepted` with the participant-specific slot assignment + read-only traffic
 	 * snapshot, and a topic this cohort does not serve answers `no_state` (the walk steps inward).
 	 */
-	private handleProbe(reg: RegisterV1, topicId: Uint8Array, participantId: Uint8Array, ctx: RegisterContext, now: number): RegisterReplyV1 {
-		if (this.deps.verifyRegisterSig?.(reg) === false) {
-			// Unsigned / forged participant signature: serve nothing, exactly like the register path — a
-			// cohort member never resolves a cohort snapshot for an untrusted `participantCoord`.
-			return { v: 1, result: "no_state" };
-		}
+	private handleProbe(topicId: Uint8Array, participantId: Uint8Array, ctx: RegisterContext, now: number): RegisterReplyV1 {
 		const rate = this.deps.probeRateLimiter?.check(participantId, topicId, now);
 		if (rate !== undefined && rate.ok === false) {
 			return { v: 1, result: "unwilling_cohort", retryAfterMs: rate.retryAfterMs };
@@ -274,6 +276,14 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 			this.deps.topicBudget?.touch(topicId, this.deps.store.directParticipants(topicId));
 		}
 		return reply;
+	}
+
+	refusalBeforeSignature(msg: RenewV1, now: number): RenewReplyV1 | undefined {
+		return this.deps.renewal.refusalBeforeSignature(msg, now);
+	}
+
+	refuseUnauthenticated(msg: RenewV1): RenewReplyV1 {
+		return this.deps.renewal.refuseUnauthenticated(msg);
 	}
 
 	sweepStale(now: number): readonly RegistrationRecord[] {
@@ -449,12 +459,9 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		tier: Tier,
 		now: number,
 	): RegisterReplyV1 | undefined {
-		if (this.deps.verifyRegisterSig?.(reg) === false) {
-			// Unsigned / forged participant signature: serve nothing and record nothing (the cohort
-			// cannot trust this participantCoord). Cheap + stateless, so checked first — a forged frame
-			// cannot consume any downstream guard state.
-			return { v: 1, result: "no_state" };
-		}
+		// The caller authenticated `reg` before this ran, and the rate limiter must stay behind that check even
+		// though it is the cheaper of the two: ahead of it, a forged frame would spend the budget of whichever peer
+		// it claims to be, and a stranger could grow the limiter's memory with invented identities.
 		// Rate-check BEFORE the replay guard records anything: a fresh-correlationId spam frame that the
 		// rate limiter would reject must not first insert a `seen` entry (which would let an attacker grow
 		// the replay guard's memory at full attack speed regardless of the rate limit). Running it before
@@ -470,7 +477,7 @@ class StoreCohortMemberEngine implements CohortMemberEngine {
 		if (this.deps.bootstrapEvidence?.verify(reg, tier) === false) {
 			return this.unwillingCohort(reg, now);
 		}
-		// Replay guard records LAST, so only frames that passed signature + rate + bootstrap ever insert a
+		// Replay guard records LAST, so only frames that passed the caller's signature check + rate + bootstrap ever insert a
 		// `seen` entry. An *accepted* frame is still always recorded here, so a genuine replay of a served
 		// correlationId is still caught; only rate-rejected frames (never served, never recorded) skip it.
 		const correlationId = b64urlToBytes(reg.correlationId);

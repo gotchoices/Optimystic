@@ -3,6 +3,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { signPeer, verifyPeerSig, verifyPeerSigAsync } from '../../src/cohort-topic/peer-sig.js';
 import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
+import { nobleOnlySignature } from './inbound-frame-helpers.js';
 
 /**
  * The shared Ed25519 sign/verify primitive: `signPeer` (async, libp2p key), `verifyPeerSig`
@@ -86,6 +87,20 @@ describe('cohort-topic: peer-key sign/verify primitive', () => {
 			const secpKey = await generateKeyPair('secp256k1');
 			const secpPeerId = peerIdFromPrivateKey(secpKey);
 			expect(await verifyPeerSigAsync(secpPeerId.toString(), msg, await signPeer(secpKey, msg)), 'secp256k1 id is rejected').to.equal(false);
+		});
+
+		// The control behind `inbound-signature-gate.spec.ts`: if the two verifiers ever converge, that spec's
+		// "fails if a path uses the synchronous verifier" row stops meaning anything, and this fails first.
+		it('separates from the synchronous verifier on a signature with an order-8 nonce, and agrees on an honest one', async () => {
+			const key = await generateKeyPair('Ed25519');
+			const peerId = peerIdFromPrivateKey(key);
+			const msg = payload('two verifiers');
+			const crafted = nobleOnlySignature(key, msg);
+			expect(verifyPeerSig(peerId.toString(), msg, crafted), 'noble accepts the crafted signature').to.equal(true);
+			expect(await verifyPeerSigAsync(peerId.toString(), msg, crafted), 'the platform refuses it').to.equal(false);
+			const honest = await signPeer(key, msg);
+			expect(verifyPeerSig(peerId.toString(), msg, honest), 'noble accepts an honest signature').to.equal(true);
+			expect(await verifyPeerSigAsync(peerId.toString(), msg, honest), 'the platform accepts an honest signature').to.equal(true);
 		});
 	});
 });

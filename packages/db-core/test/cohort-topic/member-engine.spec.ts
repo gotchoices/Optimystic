@@ -505,7 +505,6 @@ describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 	function makeProbeEngine(opts?: {
 		isPromoted?: boolean;
 		served?: boolean;
-		verifyRegisterSig?: (reg: RegisterV1) => boolean;
 		probeRateLimiter?: { check: () => { ok: true } | { ok: false; retryAfterMs: number } };
 	}): { engine: ReturnType<typeof createCohortMemberEngine>; store: ReturnType<typeof createRegistrationStore>; spies: ProbeSpies } {
 		const store = createRegistrationStore();
@@ -542,7 +541,6 @@ describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 			renewal: unused('renewal'),
 			cohort,
 			quorumWilling: (): boolean => true,
-			verifyRegisterSig: opts?.verifyRegisterSig,
 			probeRateLimiter: opts?.probeRateLimiter as never,
 		});
 		return { engine, store, spies };
@@ -631,14 +629,6 @@ describe('cohort-topic / member-engine: handleProbe (read-only lookup)', () => {
 		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-rate'), { followOn: false, treeTier: 0 }, 2_000);
 		expect(reply.result).to.equal('unwilling_cohort');
 		expect(reply.retryAfterMs).to.equal(4_321);
-	});
-
-	it('forged participant signature → no_state (serve nothing), even for a served topic', async () => {
-		const { engine, store } = makeProbeEngine({ verifyRegisterSig: () => false });
-		const TOPIC = bytes('probe-forged');
-		seed(store, TOPIC, bytes('seed-forged', 16));
-		const reply = await engine.handleRegister(mkProbe(TOPIC, bytes('p', 16), 'cid-forged'), { followOn: false, treeTier: 0 }, 2_000);
-		expect(reply.result, 'a forged-sig probe never resolves a cohort snapshot').to.equal('no_state');
 	});
 
 	it('an independent probe rate-limit budget: over-rate probe does not consume the engine register path', async () => {

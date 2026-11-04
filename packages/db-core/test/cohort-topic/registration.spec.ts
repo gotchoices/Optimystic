@@ -666,22 +666,7 @@ describe('cohort-topic / renewal cohort side', () => {
 
 	// --- withdraw tombstone (remote half) ---
 
-	/** A cohort side with an explicit participant-sig gate (the privileged-path verifier). */
-	function sideWithGate(self: Uint8Array, gossip: RecordingGossip, verifyParticipantSig: (renew: RenewV1) => boolean, store = createRegistrationStore()) {
-		return {
-			store,
-			side: createRenewalCohortSide({
-				store,
-				self,
-				slots,
-				cohort: () => ({ members: cohortMembers, cohortEpoch: epoch }),
-				gossip,
-				verifyParticipantSig,
-			}),
-		};
-	}
-
-	it('evicts a held record on a withdraw and gossips the eviction (gate absent → unit mode)', () => {
+	it('evicts a held record on a withdraw and gossips the eviction', () => {
 		const t = topic('W');
 		const p = bytes('wp1');
 		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
@@ -694,33 +679,6 @@ describe('cohort-topic / renewal cohort side', () => {
 		expect(reply.result, 'withdraw accepted').to.equal('withdrawn');
 		expect(store.getByParticipant(t, p), 'record removed from the store').to.equal(undefined);
 		expect(gossip.evictedKeys, 'eviction gossiped exactly once').to.deep.equal([bytesKey(p)]);
-	});
-
-	it('a withdraw whose signature fails verification reveals nothing and never evicts', () => {
-		const t = topic('W');
-		const p = bytes('wp2');
-		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
-		const gossip = new RecordingGossip();
-		const { store, side } = sideWithGate(backups[0]!, gossip, () => false);
-		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
-
-		const reply = side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true), 5_000);
-		expect(reply.result, 'forged withdraw is opaque').to.equal('unknown_registration');
-		expect(store.getByParticipant(t, p), 'record still present').to.not.equal(undefined);
-		expect(gossip.evictedKeys, 'no eviction gossiped').to.deep.equal([]);
-	});
-
-	it('a withdraw whose signature verifies (gate present) evicts', () => {
-		const t = topic('W');
-		const p = bytes('wp3');
-		const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
-		const gossip = new RecordingGossip();
-		const { store, side } = sideWithGate(backups[0]!, gossip, () => true);
-		store.put(record({ topicId: t, participantId: p, primary, backups, lastPing: 1_000 }));
-
-		expect(side.onRenew(renewMsg(record({ topicId: t, participantId: p }), false, true, 4_990), 5_000).result).to.equal('withdrawn');
-		expect(store.getByParticipant(t, p)).to.equal(undefined);
-		expect(gossip.evictedKeys).to.deep.equal([bytesKey(p)]);
 	});
 
 	it('a double withdraw is idempotent: the second finds no record (unknown_registration), no second gossip', () => {
@@ -821,6 +779,61 @@ describe('cohort-topic / renewal cohort side', () => {
 		const replay = side.onRenew(frame, 2_100);
 		expect(replay.result, 'replayed reattach is redirected, not re-stamped').to.equal('primary_moved');
 		expect(gossip.touched, 'no second touch gossiped for the replay').to.deep.equal([bytesKey(p)]);
+	});
+
+	// What the host asks before spending a verification: the answer a privileged frame gets whatever its signature
+	// says. It has to be the answer `onRenew` gives the same frame, or checking first would tell a sender something.
+	describe('refusalBeforeSignature', () => {
+		const now = DEFAULT_REPLAY_MAX_AGE_MS * 2;
+		const recent = now - 100;
+		const longAgo = 1_000;
+		const kinds = [
+			{ kind: 'a withdraw', reattach: false, withdraw: true, refused: 'unknown_registration' },
+			{ kind: 'a re-attach', reattach: true, withdraw: false, refused: 'primary_moved' },
+			{ kind: 'a withdraw with reattach also set', reattach: true, withdraw: true, refused: 'unknown_registration' },
+		] as const;
+		const refusedFrames = [
+			{ why: 'stale', lastPing: longAgo, timestamp: now - DEFAULT_REPLAY_MAX_AGE_MS - 1 },
+			{ why: 'implausibly future', lastPing: longAgo, timestamp: now + DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS + 1 },
+			{ why: 'not newer than lastPing', lastPing: recent, timestamp: recent },
+		];
+
+		function sideHolding(p: Uint8Array, t: Uint8Array, lastPing: number) {
+			const { primary, backups } = slots.assignSlots(p, epoch, cohortMembers);
+			const { store, side } = sideAt(backups[0]!, new RecordingGossip());
+			store.put(record({ topicId: t, participantId: p, primary, backups, lastPing }));
+			return { side, store };
+		}
+
+		for (const { kind, reattach, withdraw, refused } of kinds) {
+			for (const { why, lastPing, timestamp } of refusedFrames) {
+				it(`refuses ${kind} that is ${why}, with the answer onRenew gives it`, () => {
+					const t = topic('RBS');
+					const p = bytes('rbs');
+					const { side, store } = sideHolding(p, t, lastPing);
+					const msg = renewMsg(record({ topicId: t, participantId: p }), reattach, withdraw, timestamp);
+					const answer = side.refusalBeforeSignature(msg, now);
+					expect(answer?.result).to.equal(refused);
+					expect(answer).to.deep.equal(side.onRenew(msg, now));
+					expect(store.getByParticipant(t, p), 'the record is untouched').to.not.equal(undefined);
+				});
+			}
+
+			it(`answers ${kind} with no record unknown_registration`, () => {
+				const t = topic('RBS');
+				const { side } = sideAt(cohortMembers[0]!, new RecordingGossip());
+				const msg = renewMsg(record({ topicId: t, participantId: bytes('absent') }), reattach, withdraw, now);
+				expect(side.refusalBeforeSignature(msg, now)?.result).to.equal('unknown_registration');
+			});
+
+			it(`leaves a fresh ${kind} to its signature`, () => {
+				const t = topic('RBS');
+				const p = bytes('rbs-fresh');
+				const { side } = sideHolding(p, t, recent);
+				const msg = renewMsg(record({ topicId: t, participantId: p }), reattach, withdraw, recent + 50);
+				expect(side.refusalBeforeSignature(msg, now)).to.equal(undefined);
+			});
+		}
 	});
 
 	it('a fresh privileged frame inside the window still acts: withdraw evicts, reattach promotes', () => {

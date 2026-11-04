@@ -726,6 +726,7 @@ before any other imports).
 |-----|-------------|-------|
 | `crypto.getRandomValues()` | @noble/hashes, @libp2p/crypto | RN 0.76+ New Architecture provides natively; fallback via e.g. `react-native-get-random-values` |
 | `crypto.subtle.digest()` | multiformats/hashes/sha2-browser | Async SHA-256/SHA-512 — implement via @noble/hashes |
+| `crypto.subtle` with Ed25519 (`generateKey`, `importKey`, `sign`, `verify`) | @libp2p/crypto | Optional, and what makes signature checks native. @libp2p/crypto probes for it once, when it is first imported, by calling `subtle.generateKey({ name: 'Ed25519' }, true, ['sign', 'verify'])`, so install it **before** that import and include `generateKey`: a later install, or a polyfill with `verify` alone, is not seen. Without it every peer signature is checked by @noble/curves in pure JavaScript, which blocks the JS thread for each one. Inbound cohort-topic gossip, registers, re-attaches and withdraws are verified through it, so on a runtime without it they cost the same per check as the synchronous path |
 | `structuredClone()` | @optimystic/db-core | JSON round-trip is sufficient. Still required: db-core calls it on ordinary read and write paths (applying an update to a block, for one), though never while a module loads |
 | `Promise.withResolvers()` | @libp2p/utils, @chainsafe/libp2p-yamux, it-queue | ES2024 — simple shim |
 | `AbortSignal.prototype.throwIfAborted()` | libp2p, @libp2p/circuit-relay-v2, it-pushable | DOM spec addition — simple shim |

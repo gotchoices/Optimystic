@@ -9,12 +9,14 @@
  *   path) and is the seam the threshold-assembly ticket reuses for per-member partial signatures.
  * - **Verification comes in two forms.** {@link verifyPeerSigAsync} is the platform's own verifier (libp2p's
  *   `PublicKey.verify`: native in Node, WebCrypto where the runtime provides Ed25519) and is the one to use
- *   wherever the caller can await — the inbound cohort-gossip handler, the threshold-assembly collection.
- *   {@link verifyPeerSig} is synchronous, for the db-core verify ports that are (the participant-signature
- *   predicates, `ICohortThresholdCrypto.verify`): libp2p's verify may answer with a promise, so it verifies
- *   with `@noble/curves/ed25519` directly over the raw 32-byte key — pure JavaScript, and much slower on a
- *   phone. noble's `ed25519.verify` (ZIP215) is a strict superset of the RFC8032 signatures the libp2p
- *   signer (Node/WebCrypto Ed25519) produces, so it accepts them.
+ *   wherever the caller can await — the inbound cohort-gossip, register and renew handlers, the
+ *   threshold-assembly collection. {@link verifyPeerSig} is synchronous, for the ports that are:
+ *   `ICohortThresholdCrypto.verify` (so `verifyCollectedMultisig`), bootstrap evidence and parent references,
+ *   and the callers outside this path (the client signature verifier, the arrival push receiver, the matchmaking
+ *   entry verifier, the recover transport). libp2p's verify may answer with a promise, so it verifies with
+ *   `@noble/curves/ed25519` directly over the raw 32-byte key — pure JavaScript, and much slower on a phone.
+ *   noble's `ed25519.verify` (ZIP215) is a strict superset of the RFC8032 signatures the libp2p signer
+ *   (Node/WebCrypto Ed25519) produces, so it accepts them.
  *
  * The signer id on the cohort wire is the UTF-8 bytes of the peer-id string (see `peer-codec.ts`).
  * For an Ed25519 identity the public key is embedded in the identity multihash, so no network lookup
@@ -104,6 +106,12 @@ export function verifyPeerSig(signer: string | Uint8Array, payload: Uint8Array, 
  * Node and WebCrypto verify strict RFC 8032, while noble accepts the wider ZIP215 set, so a crafted
  * non-canonical signature {@link verifyPeerSig} would take is refused here. Every signer in this codebase
  * (libp2p `PrivateKey.sign`, {@link signPeerSig}) produces RFC 8032 signatures, so no honest one is.
+ *
+ * Nothing re-checks a register, re-attach or withdraw once accepted, so the two verifiers can never disagree about
+ * one frame: a registration record carries no participant signature, gossip replicates records without re-verifying,
+ * and a re-attach is judged once by the member it reaches. Across runtimes or builds, one member could accept what
+ * another refuses only for a signature crafted by the key's own holder, and all that affects is that holder's own
+ * soft-state registration.
  */
 export async function verifyPeerSigAsync(signer: string | Uint8Array, payload: Uint8Array, sig: Uint8Array): Promise<boolean> {
 	try {

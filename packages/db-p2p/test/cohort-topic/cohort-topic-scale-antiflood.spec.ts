@@ -87,10 +87,12 @@ describe('cohort-topic: scale anti-flood + anti-DoS (mock-tier e2e)', function (
 			const TOPIC = topic(1);
 			// size_estimate = 70000 → d_max = ⌊log₁₆(70000)⌋ − 1 = 4 − 1 = 3, so each walk starts deep and steps
 			// inward. cap_promote kept high so every walk attaches at the root (the sparse regime) — the root is
-			// under-loaded by definition, so absorbing the storm is exactly the design's claim.
+			// under-loaded by definition, so absorbing the storm is exactly the design's claim. The slope lookahead is
+			// off for the same reason: walks in one process arrive about a millisecond apart, a rate no real network
+			// sends, and extrapolating it would predict crossing even this cap.
 			const dMax = 3;
 			const members = await makeMembers(N);
-			const mesh = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS, sizeEstimate: 70_000, capPromote: 10_000 });
+			const mesh = await buildMesh(members, { wantK: WANT_K, minSigs: MIN_SIGS, sizeEstimate: 70_000, capPromote: 10_000, promotion: { tPromoteLookaheadMs: 0 } });
 			try {
 				await setupTopic(mesh, TOPIC);
 				const walkers = mesh.nodes.slice(0, 36);

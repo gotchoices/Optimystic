@@ -370,16 +370,6 @@ export interface RenewalCohortSideDeps {
 	 */
 	isServing?: (topicId: Uint8Array, participantId: Uint8Array) => boolean;
 	/**
-	 * Optional participant peer-key signature verifier (db-p2p binds it to the peer-sig primitive over
-	 * {@link import("../wire/payloads.js").renewSigningPayload}). It gates the two privileged
-	 * participant-attested paths: a `reattach` promotion and a `withdraw` eviction. A renew on either path
-	 * whose signature does not verify against the claimed `participantId` must never act — a stray/MITM'd
-	 * ping cannot usurp a live primary or evict someone else's registration (§TTL and renewal). Absent →
-	 * the gate is skipped (unit tests run without peer crypto); plain pings are never verified here (they
-	 * only touch `lastPing`).
-	 */
-	verifyParticipantSig?: (renew: RenewV1) => boolean;
-	/**
 	 * Optional freshness window for the two privileged, participant-attested paths (`withdraw` eviction and
 	 * `reattach` promotion). The renew signature already binds `timestamp` (see
 	 * {@link import("../wire/payloads.js").renewSigningPayload}), so an attacker cannot forge a fresher
@@ -389,17 +379,37 @@ export interface RenewalCohortSideDeps {
 	 * using state already on the record. Defaults to the register-path skew constants
 	 * ({@link DEFAULT_REPLAY_MAX_AGE_MS} / {@link DEFAULT_REPLAY_MAX_FUTURE_SKEW_MS}); db-p2p wires the same
 	 * `{ maxAgeMs, maxFutureSkewMs }` config the register path's replay guard consumes so an operator tuning
-	 * the skew window moves both paths together. Absent → defaults (key-less unit tests and callers work
-	 * unchanged, matching how {@link verifyParticipantSig} is optional). Plain pings are NOT gated (a
-	 * replayed ping is low-harm — it only re-touches `lastPing`).
+	 * the skew window moves both paths together. Absent → defaults. Plain pings are NOT gated (a replayed
+	 * ping is low-harm — it only re-touches `lastPing`).
 	 */
 	freshness?: { maxAgeMs?: number; maxFutureSkewMs?: number };
 }
 
+/** A withdraw or re-attach, the two renews whose signature matters. */
+export function isPrivilegedRenew(msg: RenewV1): boolean {
+	return msg.withdraw === true || msg.reattach === true;
+}
+
 /** Cohort-side TTL handling: touch on renew, redirect on rotation, sweep stale records. */
 export interface RenewalCohortSide {
-	/** Handle an inbound renew. Touches the record, or replies `primary_moved` if this member is no longer primary. */
+	/**
+	 * Handle an inbound renew. Touches the record, or replies `primary_moved` if this member is no longer primary.
+	 *
+	 * **The caller has authenticated `msg`.** This side checks no signature, so a withdraw or re-attach reaching
+	 * here acts if it is fresh: a live-signer host verifies a remote one first and asks
+	 * {@link refusalBeforeSignature} and {@link refuseUnauthenticated} for the answers around that wait, and a
+	 * key-less host hands every frame over unchecked. A plain ping has no signature check anywhere: it only
+	 * touches `lastPing`.
+	 */
 	onRenew(msg: RenewV1, now: number): RenewReplyV1;
+	/**
+	 * The answer the privileged `msg` gets whatever its signature says: no record, or it fails the freshness gate.
+	 * Undefined: the signature decides. A stale frame and a forged one get the same answer, so asking first tells
+	 * a sender nothing it could not already learn.
+	 */
+	refusalBeforeSignature(msg: RenewV1, now: number): RenewReplyV1 | undefined;
+	/** The opaque answer to a privileged renew whose signature failed. */
+	refuseUnauthenticated(msg: RenewV1): RenewReplyV1;
 	/** Evict every stale record and gossip each eviction; returns the evicted set. */
 	sweepStale(now: number): readonly RegistrationRecord[];
 }
@@ -459,27 +469,20 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		const participantId = b64(msg.participantId);
 		const rec = this.deps.store.getByParticipant(topicId, participantId);
 		if (rec === undefined) {
-			return { v: 1, result: "unknown_registration" };
+			return this.refusalFor(msg, rec);
+		}
+		// Freshness gate: a signed withdraw or re-attach is valid forever without this, so a captured one could be
+		// replayed to evict a *fresh* record (after the victim's expired and it re-registered) or to force bogus
+		// primary re-stamps. A stale or replayed frame gets the answer a forged one gets, and never acts.
+		if (isPrivilegedRenew(msg) && !this.isFreshPrivileged(msg, rec, now)) {
+			return this.refusalFor(msg, rec);
 		}
 		const key = recordKey(topicId, participantId);
 
 		if (msg.withdraw === true) {
-			// Signed leave attestation. A forged/missing signature must never evict someone else's
-			// registration → ignore, revealing nothing (`unknown_registration`, the same opaque answer a
-			// non-existent record gets). The gate is absent in key-less unit mode, matching reattach.
-			// `withdraw` is checked before the slot/primary computation: a withdraw needs no slot or
-			// primary check (any holder evicts its replica), and it takes precedence over a (malformed)
+			// Signed leave attestation. `withdraw` is checked before the slot/primary computation: a withdraw needs
+			// no slot or primary check (any holder evicts its replica), and it takes precedence over a (malformed)
 			// co-set `reattach` — a record being withdrawn is gone regardless of a promotion request.
-			if (this.deps.verifyParticipantSig?.(msg) === false) {
-				return { v: 1, result: "unknown_registration" };
-			}
-			// Freshness gate: a signed withdraw is valid forever without this, so a captured one could be
-			// replayed after the victim's record TTL-expires and re-registers, evicting the *fresh* record.
-			// Reject a stale/replayed frame with the same opaque `unknown_registration` the forged-sig branch
-			// returns above — indistinguishable from an untrusted frame — and never delete.
-			if (!this.isFreshPrivileged(msg, rec, now)) {
-				return { v: 1, result: "unknown_registration" };
-			}
 			this.deps.store.delete(topicId, participantId);
 			this.failoverServing.delete(key); // mirror sweepStale: drop any crash-failover override
 			this.deps.gossip.evicted(rec);
@@ -491,18 +494,8 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		const self = this.deps.self;
 
 		if (msg.reattach === true) {
-			// Crash-failover promotion request (participant attests primary unreachable). The signed
-			// `reattach` flag is what a backup trusts to promote itself, so a missing/forged signature
-			// must never escalate: fall through to a plain redirect (never promote).
-			if (this.deps.verifyParticipantSig?.(msg) === false) {
-				return this.primaryMoved(primary, backups, cohortEpoch);
-			}
-			// Freshness gate: a signed reattach is valid forever without this, so a captured one could be
-			// replayed to force bogus primary re-stamps. Reject a stale/replayed frame with the same redirect
-			// the forged-sig branch returns above — revealing nothing — and never promote.
-			if (!this.isFreshPrivileged(msg, rec, now)) {
-				return this.primaryMoved(primary, backups, cohortEpoch);
-			}
+			// Crash-failover promotion request (participant attests primary unreachable). The signed `reattach`
+			// flag is what a backup trusts to promote itself, which is why the caller authenticates it first.
 			if (bytesEqual(primary, self)) {
 				// A rotation already made this member the computed primary; serve, no override needed.
 				return this.touchAndServe(rec, now);
@@ -547,6 +540,33 @@ class StoreRenewalCohortSide implements RenewalCohortSide {
 		if (serving) {
 			return this.touchAndServe(rec, now);
 		}
+		return this.primaryMoved(primary, backups, cohortEpoch);
+	}
+
+	refusalBeforeSignature(msg: RenewV1, now: number): RenewReplyV1 | undefined {
+		const rec = this.heldRecordFor(msg);
+		return rec !== undefined && this.isFreshPrivileged(msg, rec, now) ? undefined : this.refusalFor(msg, rec);
+	}
+
+	refuseUnauthenticated(msg: RenewV1): RenewReplyV1 {
+		return this.refusalFor(msg, this.heldRecordFor(msg));
+	}
+
+	private heldRecordFor(msg: RenewV1): RegistrationRecord | undefined {
+		return this.deps.store.getByParticipant(b64(msg.topicId), b64(msg.participantId));
+	}
+
+	/**
+	 * What a renew that may not act is told, revealing nothing about why. No record or a withdraw (judged before a
+	 * co-set `reattach`) gets `unknown_registration`, the answer a non-existent record gets. A re-attach gets a plain
+	 * redirect to the current assignment, and the participant carries on with its failover.
+	 */
+	private refusalFor(msg: RenewV1, rec: RegistrationRecord | undefined): RenewReplyV1 {
+		if (rec === undefined || msg.withdraw === true) {
+			return { v: 1, result: "unknown_registration" };
+		}
+		const { members, cohortEpoch } = this.deps.cohort();
+		const { primary, backups } = this.deps.slots.assignSlots(rec.participantId, cohortEpoch, members);
 		return this.primaryMoved(primary, backups, cohortEpoch);
 	}
 

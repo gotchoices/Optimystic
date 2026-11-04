@@ -117,6 +117,7 @@ import {
 	decodeCohortMessage,
 	decodeCohortGossipV1,
 	decodeRenewBatchV1,
+	isPrivilegedRenew,
 	membershipCertSignable,
 	membershipCertSigningPayload,
 	toCohortTopicSummary,
@@ -204,7 +205,7 @@ import { FretTrustAnchor } from "./fret-trust-anchor.js";
 import { FretSizeEstimator } from "./size-estimator.js";
 import { peerIdToBytes, bytesToPeerIdString } from "./peer-codec.js";
 import { registerProtocolHandler } from "../network/register-protocol-handler.js";
-import { signPeer, verifyPeerSig, verifyPeerSigAsync } from "./peer-sig.js";
+import { signPeer, verifyPeerSigAsync } from "./peer-sig.js";
 import { createPoWVerifier, createReputationVerifier, type BootstrapReputationView } from "./bootstrap-evidence-verifiers.js";
 import { createParentReferenceVerifier, createDefaultParentTopicView, type BootstrapParentTopicView } from "./bootstrap-parent-reference.js";
 import { createBootstrapEvidenceBuilder, powTimeBudgetFor } from "./bootstrap-evidence-builder.js";
@@ -268,8 +269,9 @@ export interface CohortTopicHostOptions {
 	readonly coldQuorumWaitMs?: number;
 	/**
 	 * The node's libp2p Ed25519 private key. Required for the live participant signer: register/renew
-	 * bodies are peer-key-signed over their canonical image, and inbound register/`reattach` signatures
-	 * are verified against the participant's claimed peer id. libp2p does not expose the key off
+	 * bodies are peer-key-signed over their canonical image, and the signatures on inbound registers,
+	 * re-attaches and withdraws from other machines are verified against the participant's claimed peer id,
+	 * with the platform's own verifier, before the engine sees the frame. libp2p does not expose the key off
 	 * `node.peerId`, so it is threaded explicitly (mirrors `clusterMember` / `DisputeService`, sourced
 	 * from `options.privateKey ?? generateKeyPair('Ed25519')` in `libp2p-node-base.ts`). When omitted,
 	 * the host falls back to the interim empty-string signer (one-time warn) and does **not** enforce
@@ -849,6 +851,15 @@ export interface CohortTopicHost {
 /** A {@link CohortTopicHost.onRecordAdded} subscriber: the engine whose store gained `rec`, and the record. */
 export type CoordRecordAddedListener = (engine: CoordEngine, rec: RegistrationRecord) => void;
 
+/**
+ * Where a register or renew frame came from. `"self"` is a frame this process just built and signed, handed back
+ * in process because libp2p refuses a self-dial (the router's `handleLocally`), so its signature is not checked.
+ * `"remote"` is every other arrival, including a frame FRET routes here through the activity handler: FRET does
+ * not say who sent a frame, and a `participantCoord` matching this node proves nothing, since that claim is what
+ * the signature exists to check.
+ */
+type FrameOrigin = "self" | "remote";
+
 /** Node-wide collaborators injected into every {@link CoordEngine} (shared singletons). */
 interface CoordEngineContext {
 	readonly hash: RingHash;
@@ -897,11 +908,6 @@ interface CoordEngineContext {
 	 * the registry then never creates a root-placed engine.
 	 */
 	readonly rootGroup?: RootGroupSupport;
-	/** Verify an inbound `RegisterV1`'s participant peer-key signature (live-signer mode only). */
-	readonly verifyRegisterSig?: (reg: RegisterV1) => boolean;
-	/** Verify a privileged `RenewV1`'s participant peer-key signature — gates both the `reattach`
-	 * promotion and the `withdraw` eviction (live-signer mode only). */
-	readonly verifyParticipantSig?: (renew: RenewV1) => boolean;
 	/**
 	 * Sign an outbound `CohortGossipV1` envelope with the node peer key over its canonical image
 	 * ({@link cohortGossipSigningPayload}). Live-signer mode only; absent → gossip ships unsigned (interim,
@@ -1033,7 +1039,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		maxBytes,
 		streamOpen,
 		selfPeerId: selfPeerStr,
-		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity),
+		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity, "self"),
 		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => handleRenewBatchFrame(frame),
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
@@ -1054,8 +1060,9 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	});
 	// NOTE: deliberately NOT fed into `membershipSource`. That cache backs the T2/T3 parent-reference existence
 	// view (`membershipSource.has`), and an engine — which publishes on every gossip tick — is created by any
-	// register frame before the anti-DoS gate judges it, so self-caching would let a refused register make its
-	// topic "exist" here as a parent. If a self-served parent should ever count, gate it on admitted records.
+	// validly signed register frame (any register frame at all on a key-less host) before the anti-DoS gate judges
+	// it, so self-caching would let a refused register make its topic "exist" here as a parent. If a self-served
+	// parent should ever count, gate it on admitted records.
 	const publishSink = new FretMembershipPublishSink();
 
 	const slots = createSlotAssigner(hash);
@@ -1088,16 +1095,6 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// the participant's wire identity (`participantCoord` / `participantId`), which IS its dialable
 	// peer-id bytes (db-core threads `self = selfMemberBytes`), so it round-trips to a verifiable key.
 	const participantSigner = createParticipantSigner(options.privateKey, log);
-	const verifyRegisterSig = options.privateKey === undefined
-		? undefined
-		: (reg: RegisterV1): boolean =>
-			reg.signature.length > 0 &&
-			verifyPeerSig(b64urlToBytes(reg.participantCoord), registerSigningPayload(reg), b64urlToBytes(reg.signature));
-	const verifyParticipantSig = options.privateKey === undefined
-		? undefined
-		: (renew: RenewV1): boolean =>
-			renew.signature.length > 0 &&
-			verifyPeerSig(b64urlToBytes(renew.participantId), renewSigningPayload(renew), b64urlToBytes(renew.signature));
 
 	// --- intra-cohort gossip authenticity seam (gap 5) ---
 	// Same peer-key signing pattern as register/renew, applied to the gossip envelope: the originator
@@ -1110,7 +1107,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		? undefined
 		: async (g: CohortGossipSignable): Promise<string> => bytesToB64url(await signPeer(nodeKey, cohortGossipSigningPayload(g)));
 	// The two halves of the gate run in different places. The signature is checked once per frame, in the
-	// `/cohort-gossip` handler, with the platform verifier (`gossipSignatureVerifies`); membership is checked
+	// `/cohort-gossip` handler, with the platform verifier (`peerSignatureVerifies`); membership is checked
 	// by each bus the frame reaches, and by the cold-sibling path, against whichever cohort the frame's rule names.
 	const gossipFromMember = nodeKey === undefined
 		? undefined
@@ -1235,8 +1232,6 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		dialSign,
 		cohortAround,
 		...(rootGroup === undefined ? {} : { rootGroup }),
-		verifyRegisterSig,
-		verifyParticipantSig,
 		signGossip,
 		gossipFromMember,
 		broadcastNotice,
@@ -1371,7 +1366,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		if (!gossipTransport.hasSubscriber(coord) && !mayWakeColdSibling) {
 			return; // nothing here would read it
 		}
-		if (nodeKey !== undefined && !(await gossipSignatureVerifies(g))) {
+		if (nodeKey !== undefined && !(await peerSignatureVerifies(`a gossip frame at ${g.coord}`, g.fromMember, g.signature, cohortGossipSigningPayload(g)))) {
 			return;
 		}
 		// Subscribers are looked up only now, after the verify: an engine created while the frame verified receives
@@ -1570,10 +1565,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		return undefined;
 	};
 
-	// --- register dispatch: recompute the served coord and run the cohort decision on its engine ---
-	const dispatchRegister = async (reg: RegisterV1, fretCohort: readonly string[] | undefined, now: number): Promise<RegisterReplyV1> => {
-		const topicId = b64urlToBytes(reg.topicId);
-		const participantCoord = b64urlToBytes(reg.participantCoord);
+	// --- register dispatch: authenticate, recompute the served coord and run the cohort decision on its engine ---
+	const dispatchRegister = async (reg: RegisterV1, fretCohort: readonly string[] | undefined, origin: FrameOrigin): Promise<RegisterReplyV1> => {
 		// NOTE: accepted — nothing ties a frame's `rootKey` to its `topicId`. A participant that names a wrong
 		// root key places its own registration at a root group that never announces to it; the other effects
 		// are choosing which storage group serves a registration, which grinding a topic id already allowed,
@@ -1583,6 +1576,15 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		if (rootKey !== undefined && rootGroup === undefined) {
 			return refusalReply(new RootPlacementRefusedError("not-served"))!;
 		}
+		// Ahead of root-group reads and engine creation, so a forged frame reads no group and creates no engine,
+		// and after every refusal that needs no crypto. Probes take this path too.
+		if (origin === "remote" && nodeKey !== undefined && !(await peerSignatureVerifies("a register frame", reg.participantCoord, reg.signature, registerSigningPayload(reg)))) {
+			return { v: 1, result: "no_state" };
+		}
+		// Taken after the wait: the anti-DoS guards and the record stamps judge the clock the decision is made at.
+		const now = Date.now();
+		const topicId = b64urlToBytes(reg.topicId);
+		const participantCoord = b64urlToBytes(reg.participantCoord);
 		// FRET's ActivityHandler does not carry the routed key, so recompute the coordinate from the frame. For
 		// tier `d` this is the hash of the participant's route key for that tier by construction, i.e. the
 		// coordinate FRET routed to (§Tier addressing) — or, at the root of a root-placed topic, `H(rootKey)`.
@@ -1620,8 +1622,8 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- child-link dispatch: verify + record a child cohort (parent side) ---
 	// A routed `ChildLinkV1` reaches this node's parent engine through the SAME two entry points a register
 	// uses (the FRET activity handler + the direct-dial `register` handler). Live-key mode verifies the child
-	// cohort's threshold signature against the child cohort's cert; key-less mode is permissive (mirrors the
-	// `verifyRegisterSig` fallback) so unit/mock flows still link + record.
+	// cohort's threshold signature against the child cohort's cert; key-less mode is permissive (as it is for a
+	// register) so unit/mock flows still link + record.
 	const verifyChildLinkSig = options.privateKey === undefined
 		? undefined
 		: async (link: ChildLinkV1, at: number): Promise<boolean> => {
@@ -1650,6 +1652,21 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 			);
 			return result === "verified";
 		};
+	/**
+	 * The answer to an inbound `RenewV1`. Only a withdraw or re-attach from another machine on a live-signer host
+	 * has a signature checked, so every other renew is decided synchronously. A privileged frame leaves a log
+	 * line, whichever path it took: it is how an operator learns why an idle group is doing signature work.
+	 */
+	const resolveInboundRenew = async (renew: RenewV1, origin: FrameOrigin): Promise<RenewReplyV1> => {
+		if (!isPrivilegedRenew(renew)) {
+			return resolveRenew(registry, renew, Date.now());
+		}
+		const reply = origin === "remote" && nodeKey !== undefined
+			? await resolveAuthenticatedRenew(registry, renew)
+			: resolveRenew(registry, renew, Date.now());
+		log("privileged-renew kind=%s origin=%s answer=%s", renew.withdraw === true ? "withdraw" : "reattach", origin, reply.result);
+		return reply;
+	};
 	const childLinkDeps: DispatchChildLinkDeps = {
 		coord: (tier: number, pc: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord => addressing.coord(tier, pc, topicId, rootKey),
 		// A tier-1 child of a root-placed topic links to the root group: the parent engine is created
@@ -1668,11 +1685,11 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// A direct dial carries a RenewV1 (ping), a ChildLinkV1 (a child cohort registering with this parent), or
 	// a RegisterV1 (re-attach walk fallback, or the root step of a root-placed topic). The three shapes are
 	// disjoint, so try each in turn.
-	const handleRegisterFrame = async (frame: Uint8Array): Promise<Uint8Array> => {
+	const handleRegisterFrame = async (frame: Uint8Array, origin: FrameOrigin): Promise<Uint8Array> => {
 		const decoded = decodeCohortMessage(frame, maxBytes);
 		const renew = tryValidate(() => validateRenewV1(decoded));
 		if (renew !== undefined) {
-			return encodeCohortMessage(resolveRenew(registry, renew, Date.now()), maxBytes);
+			return encodeCohortMessage(await resolveInboundRenew(renew, origin), maxBytes);
 		}
 		const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
 		if (link !== undefined) {
@@ -1680,13 +1697,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}
 		const reg = validateRegisterV1(decoded);
 		// Direct dial (not FRET-routed): no cohort member list to cross-check against.
-		const reply = await dispatchRegister(reg, undefined, Date.now());
+		const reply = await dispatchRegister(reg, undefined, origin);
 		return encodeCohortMessage(reply, maxBytes);
 	};
 
 	// --- the `/renew-batch` protocol body, shared by the inbound handler and the router's in-process self-dials ---
 	// Each entry gets exactly the answer the same RenewV1 gets on `/register`; the validator has already refused a
-	// frame carrying a re-attach or a withdraw, which stay per-record and single.
+	// frame carrying a re-attach or a withdraw, which stay per-record and single, so no entry has a signature to check.
 	// Async (with nothing to await) so a malformed frame rejects, as `handleRegisterFrame`'s does, rather than throws.
 	const handleRenewBatchFrame = async (frame: Uint8Array): Promise<Uint8Array> => {
 		const { renews } = decodeRenewBatchV1(frame, maxBytes);
@@ -1698,7 +1715,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 	// --- protocol handlers + activity callback ---
 	// Await registration so the host is not returned (and dialed) before the six handlers are live —
 	// and, crucially, before the gossip driver below starts ticking (no tick may run on a half-wired node).
-	await registerCohortTopicProtocols(node, protocols, registry, handleRegisterFrame, handleRenewBatchFrame, signEndorse, verifier, promoteGate, handleGossipFrame, publishSink, maxBytes);
+	await registerCohortTopicProtocols(node, protocols, registry, (frame) => handleRegisterFrame(frame, "remote"), handleRenewBatchFrame, signEndorse, verifier, promoteGate, handleGossipFrame, publishSink, maxBytes);
 	fret.setActivityHandler(async (activity: string, cohort: string[]): Promise<{ commitCertificate: string }> => {
 		const decoded = decodeCohortMessage(b64urlToBytes(activity), maxBytes);
 		// Decode-and-branch: a `ChildLinkV1` (a child cohort registering with this parent) runs the child-link
@@ -1707,7 +1724,7 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		const link = tryValidate(() => validateChildLinkV1(decoded, minSigs));
 		const reply = link !== undefined
 			? await dispatchChildLink(link, childLinkDeps, Date.now())
-			: await dispatchRegister(validateRegisterV1(decoded), cohort, Date.now());
+			: await dispatchRegister(validateRegisterV1(decoded), cohort, "remote");
 		return { commitCertificate: bytesToB64url(encodeCohortMessage(reply, maxBytes)) };
 	});
 
@@ -2876,7 +2893,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 			// A TTL sweep eviction is gossiped so siblings drop the dead record (convergence on eviction).
 			evicted: (rec): void => pending.evicted(rec),
 		},
-		verifyParticipantSig: ctx.verifyParticipantSig,
 		// Freshness gate for the privileged withdraw/reattach paths. Share the register path's skew config
 		// (`ctx.antiDos.replayGuard`, the same `{ maxAgeMs, maxFutureSkewMs }` `createCorrelationReplayGuard`
 		// consumes above) so an operator tuning the window moves the register and renew paths together.
@@ -3003,7 +3019,6 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		replayGuard,
 		topicBudget,
 		bootstrapEvidence: ctx.bootstrapEvidence,
-		verifyRegisterSig: ctx.verifyRegisterSig,
 		// Admission-time replication: enqueue the just-admitted record so siblings hold a replica before the
 		// participant's first renewal touch (closes the accept→first-touch durability window). Same queue +
 		// last-writer-wins as the renewal `gossip.touch`.
@@ -3219,6 +3234,9 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
  * on this host holds it (cross-node renewal, post-restart eviction, or replication lag), reply
  * `unknown_registration`, which the participant counts as a failed ping: three in a row run its failover,
  * which re-attaches its backups and then re-runs the `d_max` lookup (§TTL and renewal) — never throw.
+ *
+ * This checks no signature, so a withdraw or re-attach must only reach it from a key-less host, as a frame this
+ * node built itself, or after {@link resolveAuthenticatedRenew} has checked it: the engine acts on what it is given.
  */
 export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: number): RenewReplyV1 {
 	const topicId = b64urlToBytes(renew.topicId);
@@ -3228,6 +3246,37 @@ export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: numbe
 		return { v: 1, result: "unknown_registration" };
 	}
 	return holder.engine.handleRenew(renew, now);
+}
+
+/**
+ * Resolve a withdraw or re-attach from another machine, checking its signature with the platform verifier only
+ * once the frame would act. No record and a frame the freshness gate refuses are answered without crypto; both
+ * answers are what a forged frame gets, so answering early tells a sender nothing it could not already learn.
+ *
+ * The verification can outlast the engine or the record, so the holder is looked up again after it, and the renew
+ * then runs with a clock taken after the wait, which re-runs the freshness gate against current state.
+ */
+async function resolveAuthenticatedRenew(registry: CoordRegistry, renew: RenewV1): Promise<RenewReplyV1> {
+	const topicId = b64urlToBytes(renew.topicId);
+	const participantId = b64urlToBytes(renew.participantId);
+	const before = registry.findHolder(topicId, participantId);
+	if (before === undefined) {
+		return { v: 1, result: "unknown_registration" };
+	}
+	const refused = before.engine.refusalBeforeSignature(renew, Date.now());
+	if (refused !== undefined) {
+		return refused;
+	}
+	const verified = await peerSignatureVerifies("a renew frame", renew.participantId, renew.signature, renewSigningPayload(renew));
+	const holder = registry.findHolder(topicId, participantId);
+	if (holder === undefined) {
+		return { v: 1, result: "unknown_registration" };
+	}
+	// NOTE: accepted — a plain ping overtaking this frame sets `lastPing` to the member's clock, so a privileged
+	// frame can fail the freshness gate here for being older than the ping: a withdraw then answers
+	// `unknown_registration` and the record expires by TTL, and a re-attach answers `primary_moved` and the
+	// participant carries on. This already happens on network reordering; the wait widens the window by one verify.
+	return verified ? holder.engine.handleRenew(renew, Date.now()) : holder.engine.refuseUnauthenticated(renew);
 }
 
 // --- parent-side child-link dispatch (record a verified child cohort) ---
@@ -4111,23 +4160,29 @@ function makeFrameHandler(
 }
 
 /**
- * True iff `g` carries a signature that verifies, with the platform verifier, as `fromMember`'s over the frame's
- * canonical image. A signer or signature that does not decode is logged and fails.
+ * True iff `signature` (base64url) verifies, with the platform verifier, as `signer`'s (base64url peer id) over
+ * `payload`. An empty signature fails, and a signer or signature that does not decode is logged and fails. `what`
+ * names the frame in that log line.
+ *
+ * NOTE: with a native verifier a flood no longer blocks the thread, so more frames can wait here at once, each
+ * holding one inbound stream under libp2p's per-protocol limit, and a forged register or a forged fresh withdraw
+ * still costs one verification, unrated. If that shows up in profiles, add a limiter here keyed by the connection's
+ * peer, never by the frame's claim, so a stranger cannot spend someone else's budget.
  */
-async function gossipSignatureVerifies(g: CohortGossipV1): Promise<boolean> {
-	if (g.signature.length === 0) {
+async function peerSignatureVerifies(what: string, signer: string, signature: string, payload: Uint8Array): Promise<boolean> {
+	if (signature.length === 0) {
 		return false;
 	}
-	let signer: Uint8Array;
-	let signature: Uint8Array;
+	let signerBytes: Uint8Array;
+	let signatureBytes: Uint8Array;
 	try {
-		signer = b64urlToBytes(g.fromMember);
-		signature = b64urlToBytes(g.signature);
+		signerBytes = b64urlToBytes(signer);
+		signatureBytes = b64urlToBytes(signature);
 	} catch (err) {
-		log("cohort-topic: gossip frame at %s carries an undecodable signer or signature: %o", g.coord, err);
+		log("cohort-topic: %s carries an undecodable signer or signature: %o", what, err);
 		return false;
 	}
-	return verifyPeerSigAsync(signer, cohortGossipSigningPayload(g), signature);
+	return verifyPeerSigAsync(signerBytes, payload, signatureBytes);
 }
 
 /** Run `fn`, returning `undefined` if it throws (used to try one validator then fall through). */
