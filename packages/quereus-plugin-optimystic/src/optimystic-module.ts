@@ -3627,7 +3627,8 @@ export class OptimysticVirtualTable extends VirtualTable {
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
 
-            return { status: 'ok' };
+            // The engine skips its post-delete steps when `row` is absent.
+            return { status: 'ok', row: oldRow };
           }
 
         default:
@@ -3645,10 +3646,13 @@ export class OptimysticVirtualTable extends VirtualTable {
       // rival's commit that the pre-stage probe's view had not (observed on a two-node
       // mesh, never on one node). Same message a commit-time refusal carries; the
       // statement-level savepoint discards whatever this statement staged before it.
-      // The already-applied guard kinds can meet their ACCEPTANCE at initial staging the
-      // same way: a DELETE whose row such a fetched commit already removed is skipped as
-      // already applied and the statement returns ok for a row the sequential execution
-      // would not have found. Acceptable, since the final state is the statement's intent.
+      // NOTE: accepted tradeoff — the already-applied guard kinds can meet their ACCEPTANCE at
+      // initial staging the same way: a DELETE whose row such a fetched commit already removed
+      // is skipped as already applied, yet the statement still reports the row and the engine's
+      // post-delete steps run. This statement did see the row, the same acceptance at commit-time
+      // replay has already reported it by then, and the rival's commit says nothing about the
+      // children (it may have run with foreign keys off). Revisit if a client needs to know that
+      // its own delete removed the row.
       const refusal = this.txnBridge.mapCommitRefusal(error);
       if (refusal !== error && refusal instanceof Error) {
         this.setErrorMessage(refusal.message);
