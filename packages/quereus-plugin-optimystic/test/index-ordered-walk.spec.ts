@@ -79,7 +79,7 @@ const COLUMNS = '(id text primary key, t text, g text, u text null, n integer)';
 const TEXTS: readonly string[] = [
 	'a', 'ab', 'a\x00', 'a\x00b', 'a\x01', '', 'b', '中', 'z',
 	'😀', '～', '', 'a😀', 'a～', 'a', 'a😀b', 'a～b',
-	'\uD83D', '\uDC00', 'x\uD83D', 'x￿',
+	'\uD83D', '\uDC00', 'x\uD83D', 'x\uFFFF',
 ];
 
 /** Every text twice, under two primary keys, so equal index values are ordered by the key. */
@@ -154,7 +154,7 @@ describe('An index walk serves order by', () => {
 	 */
 	const TOP_RUN_ENTRIES = (() => {
 		const byCodeUnitsDescending = [...TEXTS].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
-		const runLength = byCodeUnitsDescending.findIndex(t => !/[\uD800-￿]/.test(t));
+		const runLength = byCodeUnitsDescending.findIndex(t => !/[\uD800-\uFFFF]/.test(t));
 		return runLength * 2 + 1;
 	})();
 

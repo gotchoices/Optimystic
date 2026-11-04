@@ -16,7 +16,7 @@ import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionSt
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, isMultiValueEquality, shiftSchemaIndicesForDrop } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
@@ -407,7 +407,6 @@ type DeferIndexFlush = (indexName: string, tree: Tree<string, IndexEntry>) => vo
 type RowConstraintSchema = TableSchema['checkConstraints'][number];
 type AddedConstraint = Extract<SchemaChangeInfo, { type: 'addConstraint' }>['constraint'];
 type AddColumnChange = Extract<SchemaChangeInfo, { type: 'addColumn' }>;
-type ColumnSchema = TableSchema['columns'][number];
 
 /**
  * How a catalog-only ALTER moves the table's columns: one appended, or the one at `position`

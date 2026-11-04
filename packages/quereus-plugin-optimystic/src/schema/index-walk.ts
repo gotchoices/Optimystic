@@ -100,6 +100,13 @@ export function walkKeyPositions(
  * columns after `a` are ordered only within each group. The filter need not be one the plan
  * claims — an unclaimed one is enforced by the engine as a residual, which removes the other rows
  * just as well.
+ * NOTE: a filter's comparison collation is not on `PredicateConstraint`, so `b = 'x' collate
+ * nocase` on a BINARY column pins `b` here as a plain `=` would, and a walk ordered by the key
+ * columns after it interleaves its 'X' and 'x' groups. The engine's own memory module pins the
+ * same way, and the engine also keeps a plan's ordering claim after declining its seek for that
+ * mismatch; both are the blocked ticket
+ * `quereus-a-collate-nocase-equality-keeps-an-ordering-claim-the-plan-cannot-serve`. Once the
+ * constraint carries its collation, pin only when it is at least as fine as BINARY.
  */
 function pinnedColumns(filters: readonly PredicateConstraint[], tableInfo: TableSchema): Set<number> {
 	const pinned = new Set<number>();
@@ -196,7 +203,7 @@ export function walkDelivering(
  * holds a unit in this range is a PIVOT: at its first differing unit against any other row, its own
  * unit is below U+D800, where the two orders agree, so the row compares the same way under both.
  */
-const NOT_A_PIVOT = /[\uD800-￿]/;
+const NOT_A_PIVOT = /[\uD800-\uFFFF]/;
 
 /**
  * The rows of a walk in the engine's order.
