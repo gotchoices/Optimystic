@@ -15,7 +15,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, isMultiValueEquality, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, isMultiValueEquality, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
@@ -31,7 +31,8 @@ import type { TagSlots } from './schema/tag-overlay.js';
 import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged } from './schema/declared-tags.js';
 import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
 import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, indexValueRange, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
-import { inEngineOrder, indexSeekCanBeTrusted, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
+import { bytesOrderAsValues, inEngineOrder, indexRangeScan, indexSeekCanBeTrusted, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
+import type { RangeBound } from './schema/index-walk.js';
 import { IndexPredicate } from './schema/index-predicate.js';
 import { splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
@@ -101,6 +102,29 @@ interface IndexScanSource extends IndexScanTarget {
 }
 
 /**
+ * How the `index:seek` trace names one range an index scan walked: the framed prefix it sought
+ * (`''` for the whole index), or a range predicate's two tree keys, printed `low:high`
+ * ({@link printableSeekTrace}). Raw keys; escaped only when the line is printed.
+ */
+type SeekTrace = { readonly prefix: IndexKey } | { readonly low: string; readonly high: string };
+
+/** One tree-key range an index scan walks, with what the trace prints for it. */
+interface ScanRange {
+  readonly range: KeyRange<string>;
+  readonly sought: SeekTrace;
+}
+
+/**
+ * What an index scan reads: its ranges, in walk order, and the test rows must pass beyond what
+ * the tree applied — a range bound the tree key could not bracket (`indexRangeScan`), checked on
+ * every verified row. An equality seek, a multi-seek and a walk have none.
+ */
+interface IndexScanPlan {
+  readonly ranges: readonly ScanRange[];
+  readonly rowTest?: (row: Row) => boolean;
+}
+
+/**
  * Mutable scratch threaded into {@link OptimysticVirtualTable.executeIndexScan} so the
  * `index:seek` trace can report what the seek actually did, without the trace having to
  * rebuild the seek key or re-walk the entries:
@@ -111,20 +135,22 @@ interface IndexScanSource extends IndexScanTarget {
  *   from "entries found, rows resolved, verification rejected them later".
  * - `rejected` — how many of those entries the scan did NOT yield: the row their primary
  *   key names is gone, it is there but does not imply the entry (see the verification in
- *   {@link OptimysticVirtualTable.executeIndexScan}), or a multi-seek already yielded it under
- *   an earlier key. It is otherwise invisible from the read path, which now answers correctly
- *   over a broken tree instead of visibly wrongly. `matched - rejected` is what the scan
- *   yielded. A rejection means the index tree and the main table DISAGREED AS THIS SCAN READ
- *   THEM, which has two causes and the same line carries the fields that separate them: index
- *   damage (`rev`/`main_rev` consistent — confirm with `plugin.verifyIndexes`), or the views
- *   sitting at different moments, which rejects a perfectly healthy entry whose row the main
- *   view has not caught up to yet (see `main_rev=` in docs/debugging.md, and prefer
- *   `arm=committed`, where both views come from one moment).
- * - `keys` — the framed index keys the scan bracketed on, in the order sought, each added as
- *   its descent starts. Stays empty if the scan sought nothing — in practice every listed value
- *   was NULL, which is a correct empty answer, not a fault — and prints as `unset` rather than
- *   as an empty seek (the empty PREFIX is a legitimate key meaning "the whole index", and the
- *   two must not read alike).
+ *   {@link OptimysticVirtualTable.executeIndexScan}), a multi-seek already yielded it under
+ *   an earlier key, or the row failed a range bound the tree could not apply
+ *   ({@link IndexScanPlan.rowTest}, a bound the `seek=` field prints as the open end of a
+ *   `low:high` range). It is otherwise invisible from the read path, which now answers
+ *   correctly over a broken tree instead of visibly wrongly. `matched - rejected` is what the
+ *   scan yielded. Apart from that last cause, a rejection means the index tree and the main
+ *   table DISAGREED AS THIS SCAN READ THEM, which has two causes and the same line carries the
+ *   fields that separate them: index damage (`rev`/`main_rev` consistent — confirm with
+ *   `plugin.verifyIndexes`), or the views sitting at different moments, which rejects a
+ *   perfectly healthy entry whose row the main view has not caught up to yet (see `main_rev=`
+ *   in docs/debugging.md, and prefer `arm=committed`, where both views come from one moment).
+ * - `sought` — what the scan bracketed on, one entry per range in the order sought, each added
+ *   as its descent starts ({@link SeekTrace}). Stays empty if the scan sought nothing — every
+ *   listed value, or a range bound, was NULL, which is a correct empty answer, not a fault —
+ *   and prints as `unset` rather than as an empty seek (the empty PREFIX is a legitimate key
+ *   meaning "the whole index", and the two must not read alike).
  *
  * Passed only when the trace namespace is enabled; `undefined` otherwise, so a disabled
  * namespace costs one property read per scan.
@@ -132,7 +158,7 @@ interface IndexScanSource extends IndexScanTarget {
 interface IndexSeekProbe {
   matched: number;
   rejected: number;
-  keys: string[];
+  sought: SeekTrace[];
 }
 
 /** The `plan=` code of a multi-seek: one seek per argument, in `FilterInfo.args`. */
@@ -144,6 +170,18 @@ const MULTI_SEEK_PLAN = 5;
  * through `orderingIndexName` alone. Its direction travels on the access path's descriptor.
  */
 const INDEX_WALK_PLAN = 0;
+
+/**
+ * The `plan=` codes of a range seek (`'rangeSeek'`: bounds on the index's first column) and a
+ * prefix-range seek (`'prefixRangeSeek'`: equalities on the leading columns, then bounds on the
+ * next, with the prefix's width as the `prefixLen` parameter of `idxStr`). Both carry their
+ * values in `FilterInfo.args`, named by `FilterInfo.constraints`; {@link rangeSeekOf} reads them.
+ */
+const RANGE_SEEK_PLAN = 3;
+const PREFIX_RANGE_SEEK_PLAN = 7;
+
+const isRangeSeekPlan = (planType: number | undefined): boolean =>
+  planType === RANGE_SEEK_PLAN || planType === PREFIX_RANGE_SEEK_PLAN;
 
 /** One seek's values, in the column order of the index or primary key it seeks. */
 type SeekTuple = readonly unknown[];
@@ -239,6 +277,73 @@ const printableSeekKey = (key: string): string =>
       ? `%${code.toString(16).toUpperCase().padStart(2, '0')}`
       : `%u${code.toString(16).toUpperCase().padStart(4, '0')}`;
   });
+
+/**
+ * Render one {@link SeekTrace} for the `index:seek` line: the sought prefix as
+ * {@link printableSeekKey} prints it, or a range's two keys as `low:high`. The escaping leaves no
+ * key containing `:`, so the form is unambiguous.
+ */
+const printableSeekTrace = (sought: SeekTrace): string =>
+  'prefix' in sought
+    ? printableSeekKey(sought.prefix)
+    : `${printableSeekKey(sought.low)}:${printableSeekKey(sought.high)}`;
+
+/**
+ * A range plan's seek, read off its `FilterInfo` by {@link rangeSeekOf}: the equality values of
+ * the key columns before the range column (in key order, empty for `plan=3`), the table column the
+ * bounds apply to, and the bounds themselves.
+ */
+interface RangeSeek {
+  readonly prefix: SeekTuple;
+  readonly column: number;
+  readonly lower?: RangeBound;
+  readonly upper?: RangeBound;
+}
+
+/**
+ * Read a range plan's seek off its `FilterInfo`. The engine lists the prefix equalities first and
+ * then the bounds, the lower before the upper, each with an `IndexConstraintOp` and an `argvIndex`
+ * into `args` (`selectPhysicalNodeFromPlan` in
+ * `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts`), and names the prefix's
+ * width as the `prefixLen` parameter of `idxStr` on a prefix-range seek. A plan carries at most one
+ * bound per side, both on the key column after the prefix, so any other shape is refused as
+ * malformed rather than read as some narrower seek that drops a predicate.
+ */
+function rangeSeekOf(filterInfo: FilterInfo, schema: StoredIndexSchema): RangeSeek {
+  const malformed = (what: string): QuereusError =>
+    new QuereusError(`Range seek plan is malformed (${what}): ${filterInfo.idxStr}`, StatusCode.INTERNAL);
+  const prefixLen = Number(decodeIdxStr(filterInfo.idxStr)?.params.get('prefixLen') ?? '0');
+  if (!Number.isInteger(prefixLen) || prefixLen < 0) throw malformed('prefixLen is not a count');
+  const column = schema.columns[prefixLen]?.index;
+  if (column === undefined) throw malformed(`the index has no column after a prefix of ${prefixLen}`);
+
+  const prefix: SqlValue[] = [];
+  let lower: RangeBound | undefined;
+  let upper: RangeBound | undefined;
+  for (const { constraint, argvIndex } of filterInfo.constraints) {
+    const value = filterInfo.args[argvIndex - 1];
+    switch (constraint.op) {
+      case IndexConstraintOp.EQ:
+        prefix.push(value ?? null);
+        break;
+      case IndexConstraintOp.GT:
+      case IndexConstraintOp.GE:
+        if (lower !== undefined || constraint.iColumn !== column) throw malformed('a second lower bound, or one off the range column');
+        lower = { op: constraint.op, value };
+        break;
+      case IndexConstraintOp.LT:
+      case IndexConstraintOp.LE:
+        if (upper !== undefined || constraint.iColumn !== column) throw malformed('a second upper bound, or one off the range column');
+        upper = { op: constraint.op, value };
+        break;
+      default:
+        throw malformed(`constraint op ${constraint.op}`);
+    }
+  }
+  if (prefix.length !== prefixLen) throw malformed(`${prefix.length} equalities under prefixLen ${prefixLen}`);
+  if (lower === undefined && upper === undefined) throw malformed('no bound');
+  return { prefix, column, lower, upper };
+}
 
 /**
  * Every row a main-table collection's CURRENT view holds, decoded, with its framed primary
@@ -1854,11 +1959,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       const isSecondaryIndex = indexName != null && indexName !== '_primary_';
 
       // The secondary index this scan reads through, if any: a modern index seek
-      // (idx=<name> with args), an ordered walk of the whole index (idx=<name>;plan=0 with
-      // no args, which the engine emits for a plan that named the index through
-      // `orderingIndexName` alone — without this arm it would fall through to a table scan
-      // and the promised order would be lost without a word), or a legacy index scan
-      // (idxNum >= 10, idxStr is the bare index name). Mirrors the dispatch order below —
+      // (idx=<name> with args — an equality seek or multi-seek, or a range seek whose args
+      // are its bounds, plan=3 and plan=7), an ordered walk of the whole index
+      // (idx=<name>;plan=0 with no args, which the engine emits for a plan that named the
+      // index through `orderingIndexName` alone — without this arm it would fall through to a
+      // table scan and the promised order would be lost without a word), or a legacy index
+      // scan (idxNum >= 10, idxStr is the bare index name). Mirrors the dispatch order below —
       // the legacy arm applies only when no modern plan matched first.
       let scanIndexName: string | undefined;
       if (isSecondaryIndex && (filterInfo.args.length > 0 || planType === INDEX_WALK_PLAN)) {
@@ -1909,14 +2015,17 @@ export class OptimysticVirtualTable extends VirtualTable {
         // descriptor the planner marked `reverse` (walkDescriptor). A hand-built FilterInfo
         // with no access path walks forward.
         const reverse = filterInfo.accessPath?.kind === 'index' && filterInfo.accessPath.index.reverse === true;
-        const ranges = this.indexScanRanges(indexManager, indexScan.schema, seeks, reverse);
+        // A range plan's args are its bounds, not a key to seek: read the bounds, never `seeks`.
+        const scan = isRangeSeekPlan(planType)
+          ? this.indexRangeScanOf(indexManager, indexScan.schema, filterInfo, reverse)
+          : { ranges: this.indexScanRanges(indexManager, indexScan.schema, seeks, reverse) };
         // ONE site covers both arms, and neither view is rebuilt to trace it. The counter
         // is filled in by the scan as it produces entries; the line is emitted in a
         // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
         // still reports what the seek had produced by then.
-        const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, keys: [] } : undefined;
+        const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, sought: [] } : undefined;
         try {
-          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, ranges, reverse, probe);
+          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, scan, reverse, probe);
         } finally {
           if (probe !== undefined) {
             this.logIndexSeek(indexScan, mainTree, committed, reverse, probe);
@@ -2090,7 +2199,8 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   escaped by {@link printableSeekKey} and joined with commas (which the escaping leaves
    *   no key containing), so the line stays one whitespace-free token per field. Empty is
    *   the whole-index prefix — an ordered walk of every entry; `unset` means the scan sought
-   *   nothing at all, and the two must not be collapsed.
+   *   nothing at all, and the two must not be collapsed. A range predicate prints the two
+   *   tree keys it walked between as `low:high` ({@link printableSeekTrace}).
    * - `matched=` — index entries the seek produced across those keys, counted before the
    *   row fetch, so "descended a stale index" is distinguishable from "descended a current
    *   index that genuinely has no entry".
@@ -2147,7 +2257,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       rev(index.tree),
       rev(mainTree),
       reverse ? 'desc' : 'asc',
-      probe.keys.length === 0 ? 'unset' : probe.keys.map(printableSeekKey).join(','),
+      probe.sought.length === 0 ? 'unset' : probe.sought.map(printableSeekTrace).join(','),
       probe.matched,
       probe.rejected,
       this.collectionFactory.nodeTag(),
@@ -2274,10 +2384,37 @@ export class OptimysticVirtualTable extends VirtualTable {
     schema: StoredIndexSchema,
     seeks: readonly SeekTuple[],
     reverse: boolean,
-  ): KeyRange<string>[] {
+  ): ScanRange[] {
     const indexKeys = seekKeysInTreeOrder(seeks, seek => this.indexSeekKey(indexManager, schema, seek));
     if (reverse) indexKeys.reverse();
-    return indexKeys.map(indexKey => indexValueRange(indexKey, !reverse));
+    return indexKeys.map(indexKey => ({ range: indexValueRange(indexKey, !reverse), sought: { prefix: indexKey } }));
+  }
+
+  /**
+   * What a range plan reads ({@link RANGE_SEEK_PLAN}, {@link PREFIX_RANGE_SEEK_PLAN}): the one
+   * tree-key range `indexRangeScan` builds from the plan's bounds under the framed prefix of its
+   * equality values, in the scan's direction, with the row test for a bound the tree cannot apply.
+   * No range at all when a prefix value or a bound is NULL: the comparison is UNKNOWN, so no row
+   * matches, and nothing is sought — as an equality seek with a NULL value seeks nothing.
+   *
+   * A prefix value is an exact-byte equality, so it is framed exactly as an equality seek frames
+   * it ({@link indexSeekKey}, under the NULL rule of {@link seekKeysInTreeOrder}).
+   */
+  private indexRangeScanOf(
+    indexManager: IndexManager,
+    schema: StoredIndexSchema,
+    filterInfo: FilterInfo,
+    reverse: boolean,
+  ): IndexScanPlan {
+    const seek = rangeSeekOf(filterInfo, schema);
+    const [prefix] = seekKeysInTreeOrder([seek.prefix], tuple => this.indexSeekKey(indexManager, schema, tuple));
+    if (prefix === undefined) return { ranges: [] };
+    const scan = indexRangeScan(prefix, seek.column, seek.lower, seek.upper, reverse);
+    if (scan === undefined) return { ranges: [] };
+    return {
+      ranges: [{ range: scan.range, sought: { low: scan.low, high: scan.high } }],
+      rowTest: scan.rowTest,
+    };
   }
 
   /**
@@ -2289,23 +2426,23 @@ export class OptimysticVirtualTable extends VirtualTable {
    * A multi-seek runs the same entry loop once per range over those same views: every seek reads
    * one refreshed or pinned moment, never a refresh per value.
    *
-   * A single range — one sought key, or the whole index — is the shape whose order the engine
-   * may trust (`getBestAccessPlan` claims an ordering for no other), so its verified rows pass
-   * through {@link inEngineOrder}, which repairs the one text on which the tree's order and the
-   * engine's differ. The rows of a multi-seek, which claims no ordering, pass through as the
-   * tree yields them: in key order, as the engine asks of a multi-seek.
+   * A single range — one sought key, a range predicate's span, or the whole index — is the shape
+   * whose order the engine may trust (`getBestAccessPlan` claims an ordering for no other), so its
+   * verified rows pass through {@link inEngineOrder}, which repairs the one text on which the
+   * tree's order and the engine's differ. The rows of a multi-seek, which claims no ordering, pass
+   * through as the tree yields them: in key order, as the engine asks of a multi-seek.
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
     rowCodec: RowCodec,
     indexManager: IndexManager,
     index: IndexScanSource,
-    ranges: readonly KeyRange<string>[],
+    scan: IndexScanPlan,
     reverse: boolean,
     probe?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    const rows = this.verifiedIndexRows(mainRead, rowCodec, indexManager, index, ranges, probe);
-    if (ranges.length !== 1) {
+    const rows = this.verifiedIndexRows(mainRead, rowCodec, indexManager, index, scan, probe);
+    if (scan.ranges.length !== 1) {
       yield* rows;
       return;
     }
@@ -2321,7 +2458,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     rowCodec: RowCodec,
     indexManager: IndexManager,
     index: IndexScanSource,
-    ranges: readonly KeyRange<string>[],
+    scan: IndexScanPlan,
     probe?: IndexSeekProbe,
   ): AsyncIterable<Row> {
     // Each sought key's range is distinct, but a row can still have a valid entry under two of
@@ -2332,7 +2469,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // entries are ever visible to its later seek; today the engine finishes reading first. So a
     // row is tracked by primary key to be yielded, and so updated, once, at a memory cost
     // proportional to the rows returned.
-    const yielded = ranges.length > 1 ? new Set<string>() : undefined;
+    const yielded = scan.ranges.length > 1 ? new Set<string>() : undefined;
 
     // Each entry is checked against the row it resolves to before that row is yielded, and
     // the check is the FULL one — `rowImpliesEntry`, the same predicate the integrity check
@@ -2368,11 +2505,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
     // the fetch: a healthy entry's own tree key already carries the answer.
     const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
-    for (const range of ranges) {
+    for (const { range, sought } of scan.ranges) {
       // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
-      // part-way still names the key it was seeking rather than reporting `unset`. The range's
-      // lower bound is the framed prefix sought, whichever way the range is walked.
-      probe?.keys.push((range.isAscending ? range.first : range.last)?.key ?? '');
+      // part-way still names the key it was seeking rather than reporting `unset`.
+      probe?.sought.push(sought);
       for await (const entry of indexManager.walkEntriesIn(index.read, range)) {
         // Counted HERE, before the row fetch: `matched` must mean "entries the index
         // descent produced", not "rows that survived". An entry whose row is missing or
@@ -2388,6 +2524,13 @@ export class OptimysticVirtualTable extends VirtualTable {
           // the row is gone (a `no-row` orphan), or it no longer implies this entry (a
           // `stale-value` or `malformed` one). Counted so a seek quietly compensating for a
           // broken tree can be SEEN on the `index:seek` line rather than inferred.
+          if (probe !== undefined) probe.rejected++;
+          continue;
+        }
+        if (scan.rowTest !== undefined && !scan.rowTest(row)) {
+          // A sound entry whose row the predicate excludes: a range bound the tree could not
+          // apply (`indexRangeScan`), tested on the row, and counted so the trace's arithmetic
+          // (`matched - rejected` is what the scan yielded) still holds.
           if (probe !== undefined) probe.rejected++;
           continue;
         }
@@ -4969,6 +5112,100 @@ function equalitySeekCandidate(
 }
 
 /**
+ * The fraction of the rows a seek's prefix admits that one range bound is assumed to keep. An
+ * assumption, not a measurement — the one the primary-key range branch has always made — and
+ * `a-long-index-walk-finishes-by-scanning-the-table` bounds what a bad guess costs a read.
+ */
+const RANGE_BOUND_SELECTIVITY = 0.25;
+
+/** The operators that bound a column from below, and the ones that bound it from above. */
+const LOWER_BOUND_OPS: ReadonlySet<PredicateConstraint['op']> = new Set(['>', '>=']);
+const UPPER_BOUND_OPS: ReadonlySet<PredicateConstraint['op']> = new Set(['<', '<=']);
+
+/**
+ * The position of the first filter on `columnIndex` whose operator is in `ops`, or -1. The first
+ * whatever its value, because the engine seeks on the first lower and the first upper filter of a
+ * column it is told is handled (`findLower` and `findUpper` in
+ * `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts`), so a claim of any other
+ * would have the engine seek on a bound this module never judged.
+ */
+function firstBoundFilter(filters: readonly PredicateConstraint[], columnIndex: number, ops: ReadonlySet<PredicateConstraint['op']>): number {
+  return filters.findIndex(f => f.columnIndex === columnIndex && ops.has(f.op));
+}
+
+/**
+ * Whether a range filter can be claimed: usable, not a runtime set, and with a plan-time value
+ * that is a string, NULL, or unknown until bound. A literal of another type — `t > 5` on a text
+ * column — stays with the engine over a scan: the tree cannot bracket it, and a plan that walked
+ * the whole index to test every row would cost a scan while reporting a fraction of one. A
+ * backstop today: the engine plans such a comparison as a cast of the column, which is no
+ * constraint, so no filter of that shape reaches this module (docs/internals.md, the three kinds
+ * of bound).
+ */
+function claimableBound(filter: PredicateConstraint): boolean {
+  return filter.usable && !filter.runtimeSet
+    && (filter.value === undefined || filter.value === null || typeof filter.value === 'string');
+}
+
+/**
+ * A range seek of `index`: the one-key equality seek `match` describes on its leading columns
+ * ({@link matchEqualitySeek}; none for a range on the first column), then the first lower and the
+ * first upper bound on the key column after them — the engine's `plan=3` or, with a prefix,
+ * `plan=7`, told by `seekColumnIndexes` of the prefix columns followed by the range column.
+ *
+ * Undefined when the match is a multi-seek or already covers the whole index; when the range
+ * column's bytes do not order as its values ({@link bytesOrderAsValues}); when it carries an `=`
+ * or `in`, since the engine's equality arm would then seek on a filter this module did not claim;
+ * when it carries no bound; or when either first bound is not claimable ({@link claimableBound}),
+ * since the engine would seek on it whether or not it was claimed. A further bound on the same
+ * side stays unclaimed, and the engine keeps it as a residual.
+ *
+ * Priced as one descent plus the rows the bounds are assumed to keep of what the prefix admits —
+ * the prefix's measured or default equality selectivity, 1 with no prefix, times
+ * {@link RANGE_BOUND_SELECTIVITY} per bound. It delivers the required ordering when a walk of the
+ * index does (`walkDelivering`): a range filter on the column satisfies that function's NULL rule.
+ * At read time the bounds become tree keys, or a test on each row (`indexRangeScan`).
+ */
+function rangeSeekCandidate(
+  index: IndexSchema,
+  match: EqualitySeekMatch,
+  tableInfo: TableSchema,
+  request: BestAccessPlanRequest,
+  pricing: PlanPricing,
+): PlanCandidate | undefined {
+  if (match.keyCount !== 1) return undefined;
+  const rangeColumn = index.columns[match.filterIndexes.length];
+  if (rangeColumn === undefined || !bytesOrderAsValues(rangeColumn, tableInfo)) return undefined;
+  const filters = request.filters;
+  if (filters.some(f => f.columnIndex === rangeColumn.index && (f.op === '=' || f.op === 'IN'))) return undefined;
+  const bounds = [LOWER_BOUND_OPS, UPPER_BOUND_OPS]
+    .map(ops => firstBoundFilter(filters, rangeColumn.index, ops))
+    .filter(position => position >= 0);
+  if (bounds.length === 0 || !bounds.every(position => claimableBound(filters[position]!))) return undefined;
+
+  const { tableRowCount, seekCost } = pricing;
+  const prefixColumns = match.filterIndexes.map(fi => filters[fi]!.columnIndex);
+  const prefixSelectivity = prefixColumns.length === 0
+    ? 1
+    : measuredEqualityTupleSelectivity(tableInfo, prefixColumns) ?? EQ_SELECTIVITY_WITHOUT_STATS;
+  const rows = Math.max(1, Math.floor(tableRowCount * prefixSelectivity * RANGE_BOUND_SELECTIVITY ** bounds.length));
+  const cost = seekCost + rows;
+  const claimed = new Set([...match.filterIndexes, ...bounds]);
+  const required = request.requiredOrdering ?? [];
+  const delivery = required.length > 0 ? walkDelivering(required, index, tableInfo, request) : undefined;
+  return {
+    cost,
+    rows,
+    handledFilters: filters.map((_, idx) => claimed.has(idx)),
+    isSet: false,
+    indexName: index.name,
+    seekColumnIndexes: [...prefixColumns, rangeColumn.index],
+    explains: `Index range seek on ${index.name} (prefix: ${prefixColumns.length}, bounds: ${bounds.length}, rows: ${rows}, cost: ${cost.toFixed(2)})`,
+    ordering: delivery !== undefined ? { index, reverse: delivery.reverse } : undefined,
+  };
+}
+
+/**
  * Optimystic Virtual Table Module
  */
 export class OptimysticModule implements VirtualTableModule<VirtualTable, OptimysticModuleConfig> {
@@ -6502,7 +6739,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // would return wrong results for numeric/DESC keys. Let Quereus apply the predicate over a
         // full scan instead. Revisit when debt-optimystic-pk-range-seek lands (prereq:
         // optimystic-tree-comparator-lexicographic-missort).
-        const selectivity = 0.25;
+        const selectivity = RANGE_BOUND_SELECTIVITY;
         const rangeCost = seekCost + tableRowCount * selectivity;
         consider({
           cost: rangeCost,
@@ -6541,6 +6778,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       if (match.filterIndexes.length > 0) {
         consider(equalitySeekCandidate(index, match, tableInfo, request, pricing));
       }
+      // Skipped, like a walk, for an index this instance does not maintain: the range used to
+      // scan correctly, and a plan chosen only to be refused would be a regression.
+      const range = rangeSeekCandidate(index, match, tableInfo, request, pricing);
+      if (range !== undefined && this.indexMaintenanceStateOf(tableInfo, index.name) !== 'unmaintained') consider(range);
       const walk = this.orderedWalkCandidate(index, tableInfo, request, pricing);
       if (walk !== undefined) consider(walk);
     }

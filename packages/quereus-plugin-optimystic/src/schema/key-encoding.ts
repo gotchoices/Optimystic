@@ -37,8 +37,16 @@
 
 /** Tag for a SQL NULL element. A bare `\x00`; sorts before any present value. */
 const NULL_TAG = '\x00';
-/** Tag preceding a present (non-null) payload. */
-const PRESENT_TAG = '\x02';
+/**
+ * Tag preceding a present (non-null) payload, and so the lowest code unit a present element's
+ * frame can begin with: the NULL tag sorts below it, every present element starts with exactly it.
+ * A range over a complete framed prefix P that wants every PRESENT value under P and no NULL
+ * therefore starts at `P + KEY_PRESENT_START` inclusive. An index range predicate with no lower
+ * bound starts there (`indexRangeScan` in index-walk.ts), because NULL-keyed entries sort first
+ * and `t < x` must not return them.
+ */
+export const KEY_PRESENT_START = '\x02';
+const PRESENT_TAG = KEY_PRESENT_START;
 /** Terminates a present element. Same code unit as NULL_TAG; disambiguated by position. */
 const TERMINATOR = '\x00';
 /** Second code unit of an escaped `\x00` (`\x00` -> `\x00\xff`). */

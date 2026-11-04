@@ -1,6 +1,8 @@
 /**
  * The ordering-claim contract of `getBestAccessPlan` (`providesOrdering`, `orderingIndexName`,
- * `indexDescriptor.reverse`), decided by `walkDelivering` in `src/schema/index-walk.ts`.
+ * `indexDescriptor.reverse`), decided by `walkDelivering` in `src/schema/index-walk.ts` — and,
+ * over the same fixture, which range predicates it claims as a seek of a secondary index
+ * (`rangeSeekCandidate` in `src/optimystic-module.ts`), since both rest on one column rule.
  *
  * An index tree is ordered by the raw code units of `frame(indexValues) ‖ frame(primaryKey)` and
  * can be walked either way, so it delivers an `order by` over a prefix of that key — the index
@@ -373,6 +375,91 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 		walkOf('idx_name', desc(NAME), true, one, 'a bounded walk is still the walk');
 		expect(one.cost, 'one entry read is priced far below the whole index').to.be.below(whole.cost / 1000);
 		expect(one.rows, 'rows stays the table size: the engine applies the limit').to.equal(whole.rows);
+	});
+});
+
+describe('Range claims of a secondary index (getBestAccessPlan)', () => {
+	const bound = (op: '>' | '>=' | '<' | '<=', columnIndex: number, value?: SqlValue): any =>
+		({ columnIndex, op, usable: true, value });
+
+	/** Assert the plan seeks `indexName` on `seekColumns`, claiming exactly the filters `handled` marks. */
+	const rangeOf = (result: BestAccessPlanResult, indexName: string, seekColumns: number[], handled: boolean[], why: string): void => {
+		expect(result.indexName, `${why}: the seek names its index`).to.equal(indexName);
+		expect(result.seekColumnIndexes, `${why}: the prefix columns then the range column`).to.deep.equal(seekColumns);
+		expect(result.handledFilters, `${why}: what is claimed`).to.deep.equal(handled);
+	};
+
+	/** Assert the plan is a scan claiming nothing. */
+	const scanOf = (result: BestAccessPlanResult, why: string): void => {
+		expect(result.indexName, `${why}: no index`).to.be.undefined;
+		expect(result.handledFilters.some(handled => handled), `${why}: nothing claimed`).to.equal(false);
+	};
+
+	const nameIndex = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
+
+	it('claims a bound on a TEXT index column as a range seek of that column', () => {
+		rangeOf(plan(nameIndex, [bound('>', NAME, 't001990')], []), 'idx_name', [NAME], [true], 'the issue\'s predicate');
+		rangeOf(plan(nameIndex, [bound('<=', NAME)], []), 'idx_name', [NAME], [true], 'a parameter, unknown at plan time');
+		rangeOf(plan(nameIndex, [bound('>', NAME, null)], []), 'idx_name', [NAME], [true], 'a NULL, which seeks nothing');
+		rangeOf(plan(nameIndex, [bound('>=', NAME, 'a'), bound('<', NAME, 'b')], []), 'idx_name', [NAME], [true, true], 'both bounds');
+	});
+
+	it('sizes the range as a quarter of the table per bound, and prices it as one descent plus those rows', () => {
+		const one = plan(nameIndex, [bound('>', NAME, 'a')], []);
+		expect(one.rows).to.equal(TABLE_ROWS / 4);
+		const two = plan(nameIndex, [bound('>', NAME, 'a'), bound('<', NAME, 'b')], []);
+		expect(two.rows).to.equal(TABLE_ROWS / 16);
+		expect(two.cost).to.be.below(one.cost);
+		expect(one.cost, 'well below the scan').to.be.below(TABLE_ROWS / 2);
+	});
+
+	it('does NOT claim a bound of another type, and declines the whole range when the first bound is one', () => {
+		scanOf(plan(nameIndex, [bound('>', NAME, 5)], []), 'a number literal');
+		scanOf(plan(nameIndex, [bound('>', NAME, 5), bound('>', NAME, 'a')], []), 'the first lower bound is the one the engine seeks on');
+		scanOf(plan(nameIndex, [bound('>', NAME, 'a'), bound('<', NAME, 5)], []), 'an unclaimable first upper bound declines the range too');
+	});
+
+	it('claims the first bound of each side and leaves a second as a residual', () => {
+		rangeOf(plan(nameIndex, [bound('>', NAME, 'a'), bound('>', NAME, 'b')], []), 'idx_name', [NAME], [true, false], 'two lower bounds');
+		rangeOf(plan(nameIndex, [bound('<', NAME, 'b'), bound('>', NAME, 'a'), bound('<=', NAME, 'c')], []), 'idx_name', [NAME], [true, true, false], 'the upper first');
+	});
+
+	it('does NOT claim a range on a column whose bytes do not order as its values, or through a partial index', () => {
+		for (const [column, why] of [[PRICE, 'numeric'], [CITY, 'nocase column'], [SPAN, 'timespan'], [DATA, 'blob']] as const) {
+			scanOf(plan(makeTableInfo([{ name: 'idx_c', columns: [{ index: column }] }]), [bound('>', column, 'x')], []), why);
+		}
+		scanOf(plan(makeTableInfo([{ name: 'idx_name_nocase', columns: [{ index: NAME, collation: 'NOCASE' }] }]), [bound('>', NAME, 'x')], []), 'nocase on the index column');
+		scanOf(plan(makeTableInfo([{ name: 'idx_name_part', columns: [{ index: NAME }], predicate: { type: 'literal' } }]), [bound('>', NAME, 'x')], []), 'a partial index');
+	});
+
+	it('seeks a list on the column instead, leaving the range as a residual', () => {
+		const result = plan(nameIndex, [inFilter(NAME, ['x', 'y']), bound('>', NAME, 'a')], []);
+		rangeOf(result, 'idx_name', [NAME], [true, false], 'the multi-seek claims the list alone');
+		const equal = plan(nameIndex, [bound('>', NAME, 'a'), eqFilter(NAME)], []);
+		rangeOf(equal, 'idx_name', [NAME], [false, true], 'the equality seek claims the = alone');
+	});
+
+	it('seeks the range after an equality prefix, and delivers an ordering on the range column', () => {
+		const tableInfo = makeTableInfo([{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] }]);
+		const result = plan(tableInfo, [eqFilter(CATEGORY), bound('>', NAME)], desc(NAME));
+		rangeOf(result, 'idx_cat_name', [CATEGORY, NAME], [true, true], 'prefix then range');
+		expectWalk(result, 'idx_cat_name', desc(NAME), true, 'the newest-page query walks backwards');
+		expect(result.rows, 'a tenth of the table for the prefix without statistics, a quarter of that for the bound').to.equal(TABLE_ROWS / 40);
+
+		const listed = plan(tableInfo, [inFilter(CATEGORY, ['x', 'y']), bound('>', NAME)], []);
+		rangeOf(listed, 'idx_cat_name', [CATEGORY], [true, false], 'a list on the prefix is a multi-seek, the range a residual');
+	});
+
+	it('beats the equality seek on the same prefix and the walk that delivers the same ordering', () => {
+		const two = makeTableInfo([
+			{ name: 'idx_cat', columns: [{ index: CATEGORY }] },
+			{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] },
+		]);
+		rangeOf(plan(two, [eqFilter(CATEGORY), bound('>', NAME)], []), 'idx_cat_name', [CATEGORY, NAME], [true, true], 'over the prefix seek on idx_cat');
+
+		const ordered = plan(nameIndex, [bound('>', NAME)], asc(NAME));
+		rangeOf(ordered, 'idx_name', [NAME], [true], 'over the walk');
+		expectWalk(ordered, 'idx_name', asc(NAME), false, 'and still in order');
 	});
 });
 

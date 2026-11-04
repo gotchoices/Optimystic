@@ -206,8 +206,9 @@ export interface IndexSeekTrace {
 	/** `asc` or `desc`: the direction the index tree was walked in. */
 	dir: string;
 	/** The framed seek key, percent-escaped by the emitter. `''` is the whole-index prefix;
-	 *  `unset` means the scan returned before framing a key. Compare between nodes for
-	 *  equality only — decoding it yields raw framing bytes, not the SQL value. */
+	 *  `unset` means the scan returned before framing a key; a range predicate's two tree keys
+	 *  print as `low:high`. Compare between nodes for equality only — decoding it yields raw
+	 *  framing bytes, not the SQL value. */
 	seek: string;
 	/** Index entries the seek produced, counted before the row fetch. A floor: an
 	 *  abandoned iteration reports what it had produced when it stopped. */

@@ -730,52 +730,6 @@ export class IndexManager {
 	}
 
 	/**
-	 * Scan index range.
-	 *
-	 * NOTE: no production caller today (query planning goes through findEntriesIn, and the
-	 * unique probe through findByIndexIn); its framed-prefix brackets are kept consistent
-	 * with those but are not covered by a direct test. If this becomes live, add start/end
-	 * range coverage.
-	 */
-	async* scanIndexRange(
-		indexName: string,
-		startKey?: IndexKey,
-		endKey?: IndexKey,
-		ascending = true
-	): AsyncIterable<PrimaryKey> {
-		const tree = this.indexTrees.get(indexName);
-		if (!tree) {
-			throw new Error(`Index tree not found: ${indexName}`);
-		}
-
-		await tree.update();
-
-		// Build range over the framed composite keys. `startKey`/`endKey` are framed
-		// index tuples; the lower bound is inclusive from the framed prefix, and the
-		// upper bound uses the framed-prefix successor so entries whose tuple equals
-		// `endKey` are included (see KEY_PREFIX_END).
-		const rangeStart = startKey !== undefined
-			? { key: startKey, inclusive: true }
-			: undefined;
-		const rangeEnd = endKey !== undefined
-			? { key: endKey + KEY_PREFIX_END, inclusive: false }
-			: undefined;
-
-		const range = new KeyRange<string>(rangeStart, rangeEnd, ascending);
-
-		for await (const path of tree.range(range)) {
-			if (!tree.isValid(path)) {
-				continue;
-			}
-
-			const entry = tree.at(path);
-			if (entry != null) {
-				yield entry[1];
-			}
-		}
-	}
-
-	/**
 	 * Get index schema by name
 	 */
 	getIndexSchema(indexName: string): StoredIndexSchema | undefined {

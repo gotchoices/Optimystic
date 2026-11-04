@@ -1,17 +1,23 @@
 /**
- * index-walk — what an ordered walk of a secondary index's tree delivers, and how the walk's
- * rows are put into the engine's order.
+ * index-walk — what an ordered walk of a secondary index's tree delivers, how the walk's rows are
+ * put into the engine's order, and where a range predicate on a key column starts and ends it.
  *
  * An index tree's key is `frame(indexValues) ‖ frame(primaryKey)` (see index-manager.ts), compared
  * as raw UTF-16 code units (`compareTreeKeys` in optimystic-adapter/collection-factory.ts). A
  * walk of the tree, forwards or backwards, therefore delivers rows ordered by the index columns
  * and then the primary key — but only where the stored bytes order as the engine orders the
  * values. {@link walkDelivering} decides at plan time which required orderings that is, and
- * {@link inEngineOrder} repairs, at read time, the one place the two orders still differ.
+ * {@link inEngineOrder} repairs, at read time, the one place the two orders still differ. On
+ * such a column the same bytes bracket a range predicate: {@link indexRangeScan} turns its bounds
+ * into the tree keys the walk starts and ends at, and into a test on each row for a bound the
+ * tree cannot apply.
  */
 
-import { ANY_TYPE, BOOLEAN_TYPE, PhysicalType, compareSqlValues, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
-import type { BestAccessPlanRequest, ColumnSchema, OrderingSpec, PredicateConstraint, Row, TableSchema, TableIndexSchema } from '@quereus/quereus';
+import { ANY_TYPE, BOOLEAN_TYPE, IndexConstraintOp, PhysicalType, compareSqlValues, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
+import type { BestAccessPlanRequest, ColumnSchema, OrderingSpec, PredicateConstraint, Row, SqlValue, TableSchema, TableIndexSchema } from '@quereus/quereus';
+import { KeyRange } from '@optimystic/db-core';
+import { KEY_PREFIX_END, KEY_PRESENT_START } from './key-encoding.js';
+import { indexKeyFromValues, type IndexKey } from './index-manager.js';
 
 /** One key column of an index or primary key: its table column position and declared collation. */
 export interface KeyColumn {
@@ -124,14 +130,15 @@ function pinnedColumns(filters: readonly PredicateConstraint[], tableInfo: Table
  * order-preserving), compared by value rather than meaning (`timespan` is TEXT but compares by
  * elapsed time), under BINARY for both the table column and the key column (the tree compares code
  * units, which is BINARY up to the surrogate rule {@link inEngineOrder} repairs; any other collation
- * orders differently).
+ * orders differently). The rule for a column a walk may order by, and for one a range predicate
+ * may bracket ({@link indexRangeScan}).
  *
  * NOTE: this gates on the DECLARED physical type, while the stored payload is chosen by the runtime
  * JS value type (`serializeIndexValue`). They agree because Quereus coerces a TEXT column's values
  * to strings before they reach this module; if a number ever reached a TEXT column un-coerced, the
  * claim here would over-order.
  */
-function bytesOrderAsValues(keyColumn: KeyColumn, tableInfo: TableSchema): boolean {
+export function bytesOrderAsValues(keyColumn: KeyColumn, tableInfo: TableSchema): boolean {
 	const column = tableInfo.columns[keyColumn.index];
 	if (!column || column.logicalType.physicalType !== PhysicalType.TEXT) return false;
 	if (hasSemanticOrdering(column.logicalType)) return false;
@@ -249,4 +256,136 @@ export async function* inEngineOrder(
 		yield row;
 	}
 	yield* run.sort(compareRows);
+}
+
+/** The operators a range bound carries, as the engine's `FilterInfo.constraints` name them. */
+export type RangeBoundOp = IndexConstraintOp.GT | IndexConstraintOp.GE | IndexConstraintOp.LT | IndexConstraintOp.LE;
+
+/** One bound of a range predicate on an index column: its operator and the value bound at runtime. */
+export interface RangeBound {
+	readonly op: RangeBoundOp;
+	readonly value: SqlValue | undefined;
+}
+
+/** What an index scan reads for a range predicate on one key column; see {@link indexRangeScan}. */
+export interface IndexRangeScan {
+	/** The tree-key range to walk, in walk order: `[low, high)` forwards, the same two keys swapped backwards. */
+	readonly range: KeyRange<string>;
+	/** The range's inclusive lower tree key, for the `index:seek` trace. */
+	readonly low: string;
+	/** The range's exclusive upper tree key, for the trace. */
+	readonly high: string;
+	/**
+	 * The test every row the scan verifies must also pass, for a bound the tree could not apply
+	 * ({@link boundInTree}); `undefined` when the tree applied both.
+	 */
+	readonly rowTest?: (row: Row) => boolean;
+}
+
+/**
+ * The value of a bound the tree key can apply, or `undefined` for one it cannot.
+ *
+ * A bound reaches the rows in one of three ways. NULL — or undefined, a parameter bound to NULL —
+ * makes the comparison UNKNOWN, so no row matches; {@link indexRangeScan} then builds no range, as
+ * an equality seek with a NULL value seeks nothing. A string with no code unit at or above U+D800
+ * is a PIVOT ({@link NOT_A_PIVOT}): every stored value compares the same way against it under the
+ * tree's code-unit order and the engine's code-point order, so the tree's own bracketing of it
+ * admits exactly the rows the predicate admits, and it goes in the tree key. Anything else — a
+ * string holding such a unit, or a parameter bound to a value of another type, such as a number
+ * against a text column — is left out of the tree key, which then brackets every present value on
+ * that side, and is tested on each row instead ({@link boundTest}).
+ */
+function boundInTree(bound: RangeBound): string | undefined {
+	return typeof bound.value === 'string' && !NOT_A_PIVOT.test(bound.value) ? bound.value : undefined;
+}
+
+/** Whether `bound` compares against NULL, which no row satisfies. */
+const isNullBound = (bound: RangeBound | undefined): boolean =>
+	bound !== undefined && (bound.value === null || bound.value === undefined);
+
+/**
+ * The per-row test of a bound the tree could not apply: the column's value against the bound's,
+ * compared as the engine's own residual filter compares them for a BINARY, non-semantic column
+ * (`compareSqlValuesFast` under BINARY in `@quereus/quereus/src/runtime/emit/binary.ts`), which
+ * ranks a number below any text and compares two strings by code point. A NULL column value
+ * fails: the comparison is UNKNOWN.
+ */
+function boundTest(column: number, bound: RangeBound): (row: Row) => boolean {
+	const value = bound.value ?? null;
+	const admits = (order: number): boolean => {
+		switch (bound.op) {
+			case IndexConstraintOp.GT: return order > 0;
+			case IndexConstraintOp.GE: return order >= 0;
+			case IndexConstraintOp.LT: return order < 0;
+			case IndexConstraintOp.LE: return order <= 0;
+		}
+	};
+	return row => {
+		const stored = row[column];
+		return stored !== null && stored !== undefined && admits(compareSqlValues(stored, value));
+	};
+}
+
+/** `P ‖ frame(x)`: the tree key every entry of value `x` under the framed prefix `P` begins with. */
+const framedUnder = (prefix: IndexKey, value: string): string => prefix + indexKeyFromValues([value]);
+
+/** The inclusive lower tree key of {@link indexRangeScan}'s table. */
+function lowKey(prefix: IndexKey, lower: RangeBound | undefined): string {
+	const value = lower === undefined ? undefined : boundInTree(lower);
+	if (lower === undefined || value === undefined) return prefix + KEY_PRESENT_START;
+	return framedUnder(prefix, value) + (lower.op === IndexConstraintOp.GT ? KEY_PREFIX_END : '');
+}
+
+/** The exclusive upper tree key of {@link indexRangeScan}'s table. */
+function highKey(prefix: IndexKey, upper: RangeBound | undefined): string {
+	const value = upper === undefined ? undefined : boundInTree(upper);
+	if (upper === undefined || value === undefined) return prefix + KEY_PREFIX_END;
+	return framedUnder(prefix, value) + (upper.op === IndexConstraintOp.LE ? KEY_PREFIX_END : '');
+}
+
+/**
+ * The tree-key range an index scan walks for a range predicate on the key column after the framed
+ * prefix `prefix` (`P`, empty with no prefix), and the test on each row for whatever the tree
+ * cannot apply. `undefined` when a bound is NULL: no row matches, so nothing is sought.
+ *
+ * With `f(x)` = `P ‖ frame(x)`, every lower key inclusive and every upper key exclusive:
+ *
+ * | bound    | tree key                      |
+ * |----------|-------------------------------|
+ * | `>= x`   | lower `f(x)`                  |
+ * | `> x`    | lower `f(x) + KEY_PREFIX_END` |
+ * | `< x`    | upper `f(x)`                  |
+ * | `<= x`   | upper `f(x) + KEY_PREFIX_END` |
+ * | no lower | lower `P + KEY_PRESENT_START` |
+ * | no upper | upper `P + KEY_PREFIX_END`    |
+ *
+ * `f(x)` ends in the element terminator and every entry of value `x` continues it with the framed
+ * primary key, whose first unit is a tag below `KEY_PREFIX_END`, so `f(x) + KEY_PREFIX_END` sits
+ * above every entry of `x` and below every entry of a longer value — `x + '\x00'` included, whose
+ * escape puts `\xff` there (the reasoning at `KEY_PREFIX_END` in key-encoding.ts). "No lower" is
+ * not left open: NULL-keyed entries sort first, under the NULL tag, and `t < x` must not return
+ * them. A bound the tree cannot apply ({@link boundInTree}) takes the open key on its side and is
+ * tested on each row. `reverse` swaps the two ends, so the walk runs from the high key down.
+ */
+export function indexRangeScan(
+	prefix: IndexKey,
+	column: number,
+	lower: RangeBound | undefined,
+	upper: RangeBound | undefined,
+	reverse: boolean,
+): IndexRangeScan | undefined {
+	if (isNullBound(lower) || isNullBound(upper)) return undefined;
+	const low = lowKey(prefix, lower);
+	const high = highKey(prefix, upper);
+	const tests = [lower, upper]
+		.filter((bound): bound is RangeBound => bound !== undefined && boundInTree(bound) === undefined)
+		.map(bound => boundTest(column, bound));
+	const first = { key: low, inclusive: true };
+	const last = { key: high, inclusive: false };
+	return {
+		range: reverse ? new KeyRange<string>(last, first, false) : new KeyRange<string>(first, last, true),
+		low,
+		high,
+		rowTest: tests.length === 0 ? undefined : row => tests.every(test => test(row)),
+	};
 }

@@ -405,9 +405,14 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than
   the tree. An empty `seek=` is the whole-index prefix: an ordered walk of every entry, serving an
   `order by` with no equality on the index's leading columns, in the direction `dir=` says;
-  `seek=unset` means the scan sought nothing at all — in practice every seek value arrived NULL,
-  which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0 rejected=0
-  seek=unset` is a correct empty answer and not an index fault. **Compare it, do not decode
+  `seek=unset` means the scan sought nothing at all — in practice every seek value, or a range
+  bound, arrived NULL, which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0
+  rejected=0 seek=unset` is a correct empty answer and not an index fault. A range predicate
+  prints the two tree keys the scan walked between as `low:high`, each escaped the same way:
+  `t > 'a' and t < 'b'` prints `seek=%02a%00%03:%02b%00`, where the `%03` past the framed `'a'` is
+  what skips every entry of `'a'` itself. An end the statement does not bound — or bounds with a
+  value the tree cannot apply, one holding a UTF-16 unit at or above U+D800, which is then tested
+  on each row — prints as the prefix's open end, `%02` below and `%03` above. **Compare it, do not decode
   it** — un-escaping yields the raw tuple framing (element tags, escaped NULs), not the SQL value
   that was sought; and only `A-Za-z0-9._-` survive verbatim, every other code unit becoming `%XX`
   or, above U+00FF, `%uXXXX` — which is not valid percent-encoding, so a decoder would reject or
@@ -417,10 +422,11 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   early (a satisfied `LIMIT`, an error mid-scan) reports what it had produced when it stopped, so
   `matched=0` still means the descent found nothing.
 - `rejected=` — how many of those entries the scan then dropped, because the row their primary key
-  names is gone, does not imply the entry, or was already returned under an earlier key of the same
-  list (a row that moved between the two seeks). `matched - rejected` is what the scan returned. Any
-  nonzero value means **the index tree and the main table disagreed as this scan read them**, which
-  has two causes — read `rev=`, `main_rev=` and `arm=` on the same line to tell them apart:
+  names is gone, does not imply the entry, was already returned under an earlier key of the same
+  list (a row that moved between the two seeks), or failed a range bound the tree could not apply.
+  `matched - rejected` is what the scan returned. Apart from that last cause, any nonzero value
+  means **the index tree and the main table disagreed as this scan read them**, which has two
+  causes — read `rev=`, `main_rev=` and `arm=` on the same line to tell them apart:
   - **The tree is damaged** — it holds an entry no row accounts for. Run
     `plugin.verifyIndexes(db, table)` on *this* node to see which entries — see [§Does an index
     agree with its table?](#does-an-index-agree-with-its-table) below.
@@ -429,6 +435,10 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
     whose row the main view has not caught up to, and the scan rejects it. The tree is fine; the
     read is skewed (see `main_rev=` above). `arm=committed` cannot do this — both views are taken
     from one committed moment.
+  - **A range bound was tested on the row** — the scan walked a range one of whose ends the tree
+    could not apply (that end prints open in `seek=`, above), and the row the entry led to lies
+    outside the predicate. The tree and the table agree; nothing is wrong. A `where t < ?` bound
+    to a value of that kind reads every entry under the prefix and rejects most of them.
 
   It is a floor for the same reason `matched=` is. One more thing can make `matched=` exceed the
   rows a `limit` asked for: text at or above U+D800 (an emoji, `～`, a private-use character) is
