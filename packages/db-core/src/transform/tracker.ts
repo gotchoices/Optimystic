@@ -452,8 +452,11 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	 *
 	 * NOTE: a capture costs one map entry per staged block, across every queued transaction, and the
 	 * Quereus bridge takes one per statement per written collection. Staged blocks are tree nodes
-	 * shared by many rows, so their count grows far more slowly than the queue; if the copy ever shows
-	 * in a profile, capture only what the open segment touched. */
+	 * shared by many rows, so their count grows far more slowly than the queue. The first change to a
+	 * shared update list after a capture also copies that list, whose length grows with the writes
+	 * staged to the block. If either ever shows in a profile, keep what the sealed segments staged in
+	 * a layer the captures share; a capture cannot simply leave it out, because `Tree.readView` reads
+	 * those blocks through the snapshot. */
 	shareTransforms(): Transforms {
 		this.owned.clear();
 		return shallowCopyTransforms(this.transforms);

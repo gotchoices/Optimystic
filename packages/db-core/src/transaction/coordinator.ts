@@ -692,7 +692,7 @@ export class TransactionCoordinator {
 	 * this call and the staging it guards.
 	 *
 	 * NOTE: this runs per applyActions call rather than once per transaction. Per-call cost for an
-	 * already-captured collection is one Map.has; snapshotPending (which deep-copies the transforms)
+	 * already-captured collection is one Map.has; snapshotPending (one map entry per staged block)
 	 * still runs at most once per collection per stamp. Unmeasured. If the registered-collection
 	 * count ever grows large enough for the scan itself to matter, track a per-stamp "collections
 	 * map size at last capture" rather than dropping the reconcile.
@@ -1568,8 +1568,8 @@ export class TransactionCoordinator {
 
 		// Restore each captured collection — transforms AND pending queue together, so the
 		// rolled-back stamp's actions leave the queue instead of being written into the next
-		// transaction's durable log entry. `restorePending` deep-copies the transforms itself,
-		// so no structuredClone here. Restoring through the CAPTURED instance (rather than
+		// transaction's durable log entry. `restorePending` takes its own maps over the captured
+		// values, so no copy here. Restoring through the CAPTURED instance (rather than
 		// re-looking-up by id) is what keeps a mid-transaction instance swap under one id from
 		// pushing the old instance's staged state onto the new one.
 		// NOTE: this also discards actions staged OUTSIDE any tracked stamp (the Tree.stage /
@@ -1729,16 +1729,16 @@ export class TransactionCoordinator {
 		// between this loop and the applyActions() call below, or an interleaved stage would be
 		// captured inside the snapshot. Because the whole loop runs before ANY staging, an engine
 		// naming one collection in two batches yields the state before EITHER batch whichever
-		// batch wins the key — so the dedupe is a COST guard (snapshotPending deep-copies the
-		// transforms and structuredClones the action context), not a correctness one. An
+		// batch wins the key — so the dedupe is a COST guard (snapshotPending copies the transforms'
+		// maps and structuredClones the action context), not a correctness one. An
 		// unregistered collection is skipped; applyActions throws on it moments later and the
 		// catch below converts that to a failure result, so the map is never read.
 		//
 		// NOTE: this runs unconditionally, so the overwhelmingly common all-succeed execute() pays
-		// one deep transforms copy + one structuredClone of the action context per participant to
-		// serve a rare branch. Unmeasured, and symmetric with commitOnceLatched, which pays the
-		// same on every commit. If execute() ever shows up hot in a profile, the way out is a
-		// copy-on-first-stage snapshot, not dropping the restore.
+		// one capture per participant to serve a rare branch. Unmeasured, and symmetric with
+		// commitOnceLatched, which pays the same on every commit. If execute() ever shows up hot in a
+		// profile, the remedy is the one the `NOTE:` at `Tracker.shareTransforms` names, not dropping
+		// the restore.
 		const preStageSnapshots = new Map<CollectionId, CollectionSnapshot<any>>();
 		for (const { collectionId } of result.actions) {
 			if (preStageSnapshots.has(collectionId)) continue;
