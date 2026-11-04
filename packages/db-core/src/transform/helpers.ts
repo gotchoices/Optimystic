@@ -56,9 +56,8 @@ export function emptyTransforms(): Transforms {
  *
  * @pitfall Both `inserts` and `updates` MUST be deep cloned. A shallow copy like
  * `{ ...transform.updates }` or `{ ...transform.inserts }` shares references, causing
- * mutations in one consumer to affect others. Specifically, `Tracker.update` mutates
- * inserted block objects in place via `applyOperation`, so a shallow-cloned snapshot
- * tracker will leak ops back into the original `Transforms.inserts`.
+ * mutations in one consumer to affect others. {@link shallowCopyTransforms} is the one
+ * exception, and only for values that `Tracker` alone changes.
  * @see docs/internals.md "Shallow Copy of Transforms" pitfall
  */
 export function copyTransforms(transform: Transforms): Transforms {
@@ -69,6 +68,21 @@ export function copyTransforms(transform: Transforms): Transforms {
 		? Object.fromEntries(Object.entries(transform.updates).map(([k, v]) => [k, structuredClone(v)]))
 		: undefined;
 	return { inserts, updates, deletes: transform.deletes ? [...transform.deletes] : undefined };
+}
+
+/**
+ * New outer maps and a new `deletes` over the SAME inserted blocks and update lists, for a staged-state
+ * snapshot and whatever is built from it. Safe only because `Tracker` is the sole thing that changes
+ * those values and copies one before it first changes it, so anything that changes staged values
+ * outside `Tracker` needs {@link copyTransforms}.
+ * @see docs/internals.md "Shallow Copy of Transforms" pitfall
+ */
+export function shallowCopyTransforms(transform: Transforms): Transforms {
+	return {
+		inserts: { ...transform.inserts },
+		updates: transform.updates ? { ...transform.updates } : undefined,
+		deletes: transform.deletes ? [...transform.deletes] : undefined,
+	};
 }
 
 export function mergeTransforms(a: Transforms, b: Transforms): Transforms {

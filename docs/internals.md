@@ -228,10 +228,17 @@ list. Five rules follow from the split:
   effects included, which is what `Tree.readView` builds a committed read view from, so a
   `committed.<Table>` read inside a transaction sees every queued entry the SQL layer was told had
   committed — but as actions only the OPEN segment's, and it records `SegmentList.version` as
-  `sealedVersion`. `Collection.restorePending` is async, because one of its arms replays, and it
+  `sealedVersion`. The capture copies no staged value: it takes new maps over the ones the tracker
+  holds (`Tracker.shareTransforms`), and the tracker copies a value before its next change to it
+  ([Functions That Share](#functions-that-share)), so a snapshot stays as captured at a cost of one
+  map entry per staged block. The Quereus bridge takes one per statement per written collection and
+  the tracker holds every queued entry's blocks, so a deep copy here made each offline commit grow
+  with the queue, for snapshots a successful commit never restores (GitHub #53).
+  `Collection.restorePending` is async, because one of its arms replays, and it
   chooses from three facts: whether the sealed list has changed since the capture, whether the
   committed boundary has moved, and whether any segment is sealed now. Nothing changed and nothing
-  moved: the tracker is reset to the captured transforms, the captured pins are restored and the
+  moved: the tracker is reset to new maps over the captured transforms, so one snapshot can be
+  restored again, the captured pins are restored and the
   open segment is set to the captured actions — the **verbatim** arm, the restore as it always was,
   which keeps an invented collection's header. The sealed list changed (a segment sealed, dropped
   or refused while the snapshot was outstanding), or the boundary moved while a segment is sealed:
@@ -1647,6 +1654,14 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
 | `Tracker.tryGet()` for inserts | structuredClone | Inserts are cloned on retrieval |
 | `Tracker.peekMaterialized()` | structuredClone | Clones the staged insert, and the pinned base, before `applyTransform` mutates either |
 | `Tracker.update()` → `BasePins` | structuredClone (via `CacheSource.peek`) | The pinned committed base is a clone, and stays pristine: every use re-clones it |
+| `Tracker.update()` on a staged value it does not own | structuredClone of the inserted block, array copy of the update list | Copied once, before the first change, so a snapshot sharing the value keeps it as captured. A plain array copy is enough because a staged operation is never changed once pushed |
+| `copyTransforms(transforms)` | deep copy | For anything that is not a staged-state snapshot: a per-attempt tracker, the invented baseline |
+
+### Functions That Share
+| Function | Returns | Notes |
+|----------|---------|-------|
+| `Tracker.shareTransforms()` | new outer maps and `deletes` over the same staged values | The capture behind `Collection.snapshotPending`. The tracker gives up owning every value, so it copies each before changing it again |
+| `shallowCopyTransforms(transforms)` | the same, without touching any tracker | `Collection.restorePending`'s verbatim arm and `Collection.createReadTracker`, over a snapshot's values. The new maps are what let one snapshot be restored twice; a tracker handed them owns none of the values |
 
 ### Storage Clone Requirements
 **Memory storage MUST clone on get/save** to prevent cross-revision contamination:
@@ -1665,7 +1680,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `rev` = revision number, monotonically increasing per block
 
 ### Transform Ownership
-- `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers
+- `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers. The one exception is a staged-state snapshot and what is built from it ([Functions That Share](#functions-that-share)), safe because `Tracker` is the only thing that changes those values and it copies one before changing it
 - `copyTransforms()` and `transformForBlockId()` must deep-clone both `insert` and `updates`
 - JSON serialization over network creates implicit deep copies
 
@@ -3519,6 +3534,7 @@ Transaction metrics are instrumented with `debug` logging and optional verbose t
 )}
 { insert: structuredClone(transform.inserts[blockId]) }
 ```
+This holds for anything outside `Tracker`. A staged-state snapshot is the one sharing that is safe (`Tracker.shareTransforms` in `packages/db-core/src/transform/tracker.ts`), because `Tracker` is the only thing that changes those values and it copies a value before its first change to one it does not own. Anything else that changes a staged value needs a deep copy.
 
 ### 2. Storage Returns References
 **Bug**: In-memory storage returns stored objects directly; mutations corrupt storage.

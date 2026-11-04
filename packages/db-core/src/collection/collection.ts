@@ -8,7 +8,7 @@ import { Tracker } from "../transform/tracker.js";
 import type { BasePins } from "../transform/base-pins.js";
 import { CacheSource } from "../transform/cache-source.js";
 import type { BlockGets } from "../network/struct.js";
-import { copyTransforms, emptyTransforms, isTransformsEmpty } from "../transform/helpers.js";
+import { copyTransforms, emptyTransforms, isTransformsEmpty, shallowCopyTransforms } from "../transform/helpers.js";
 import { TransactorSource, answeredBlock, servedRevision } from "../transactor/transactor-source.js";
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
@@ -195,7 +195,10 @@ export interface ReadViewOptions {
 /** A point-in-time copy of a collection's staged (un-synced) state, produced by
  * {@link Collection.snapshotPending} and consumed by {@link Collection.restorePending}. */
 export interface CollectionSnapshot<TAction> {
-	/** Deep-cloned tracker transforms at snapshot time. */
+	/** The tracker's transforms at snapshot time, as {@link Tracker.shareTransforms} hands them out:
+	 *  the maps are this snapshot's own, the staged values inside them are shared with the tracker,
+	 *  which copies a value before changing it. Stays as captured under later staging. Read it; do not
+	 *  change it, since nothing here would copy first. */
 	transforms: Transforms;
 	/** The bases the transforms' update operations were computed against (see {@link BasePins}),
 	 *  copied at snapshot time. Restored with the transforms, so a restore never pairs operations
@@ -1830,12 +1833,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * until the first sync. Resetting such a collection to empty would leave it
 	 * unreadable; restoring the snapshot returns it to its prior (readable) state.
 	 *
-	 * The returned snapshot is deep-cloned and independent of subsequent mutations.
+	 * The returned snapshot stays as captured under subsequent staging, without copying what is
+	 * staged: it shares the staged values with the tracker, which copies one before changing it
+	 * ({@link Tracker.shareTransforms}). A successful commit restores none of its snapshots, and the
+	 * Quereus bridge takes one per statement per written collection, so a deep copy here cost every
+	 * statement in proportion to the whole offline queue.
 	 * Synchronous and latch-free: intended to bracket transaction-scoped staging,
 	 * when no concurrent act/sync is in flight. */
 	snapshotPending(): CollectionSnapshot<TAction> {
 		return {
-			transforms: copyTransforms(this.tracker.transforms),
+			transforms: this.tracker.shareTransforms(),
 			pins: this.tracker.pins.copy(),
 			pending: [...this.segments.open],
 			sealedVersion: this.segments.version,
@@ -1856,7 +1863,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * revision), and whether any segment is sealed now:
 	 *
 	 * - **Verbatim**, when the sealed list is unchanged and the boundary has not moved: the tracker
-	 *   is reset to a copy of the captured transforms, the captured pins are restored, and the open
+	 *   is reset to new maps over the captured transforms' values, so one snapshot can be restored
+	 *   again (a repeated `rollback to`), the captured pins are restored, and the open
 	 *   segment is set to the captured actions. This keeps an INVENTED collection's header, log
 	 *   block and root, which live in the tracker until the first sync and would be lost by a
 	 *   reset. It is the arm every restore took before segments existed, so while nothing is ever
@@ -1919,13 +1927,15 @@ export class Collection<TAction> implements ICollection<TAction> {
 			this.segments.open = [];
 			return;
 		}
-		this.tracker.reset(copyTransforms(snapshot.transforms));
+		this.tracker.reset(shallowCopyTransforms(snapshot.transforms));
 		if (snapshot.pins) this.tracker.pins.replaceWith(snapshot.pins);
 		this.segments.open = [...snapshot.pending];
 	}
 
 	/** A read-only {@link Tracker} pinned to this collection's committed state AS OF the
-	 * moment of this call, seeded with a (deep-copied) set of pre-transaction transforms.
+	 * moment of this call, seeded with a snapshot's transforms ({@link CollectionSnapshot.transforms}).
+	 * It shares their values, so pass a snapshot's and not a live tracker's, which would go on changing
+	 * the values it owns; a view does not write, and if one did it would copy first.
 	 * Reads through it observe exactly that revision plus exactly those transforms — NOT
 	 * the mutations staged into this collection's live tracker afterward, and NOT commits
 	 * that fold into (or clear) the live read cache while the view is being walked. Used
@@ -1983,7 +1993,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			this.id, this.transactor, structuredClone(pinContext), collector, this.floors);
 		const pinnedCache = new CacheSource<IBlock>(
 			pinnedSource, undefined, collector, seed);
-		return new Tracker(pinnedCache, copyTransforms(transforms));
+		return new Tracker(pinnedCache, shallowCopyTransforms(transforms));
 	}
 
 	/** The OPEN segment: the staged (not-yet-synced) actions queued by {@link act} that no

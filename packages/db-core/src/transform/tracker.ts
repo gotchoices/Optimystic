@@ -1,8 +1,8 @@
 import type { IBlock, BlockId, BlockStore as IBlockStore, BlockHeader, BlockOperation, BlockType, BlockSource as IBlockSource, ReadPurpose } from "../index.js";
-import { applyOperation, applyOperations, applyTransform, emptyTransforms, blockIdsForTransforms, transformForBlockId } from "./helpers.js";
+import { applyOperation, applyOperations, applyTransform, emptyTransforms, blockIdsForTransforms, shallowCopyTransforms, transformForBlockId } from "./helpers.js";
+import type { Transforms } from "./struct.js";
 import { BasePins } from "./base-pins.js";
 import type { PinnedBase } from "./base-pins.js";
-import { ensured } from "../utility/ensured.js";
 
 /** The two base probes a source may offer, duck-typed because Tracker layers over test doubles as
  * well as CacheSource. `peek` must return a clone (CacheSource's does). */
@@ -36,6 +36,14 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	 * detect source changes, so those fall back to always-replay. `gen` is the source generation of
 	 * the base block content the memo was built from. */
 	private materialized = new Map<BlockId, { block: T; gen: number }>();
+
+	/** The ids whose staged value (the inserted block, or the update list) only this tracker
+	 * references, so it may change that value in place. Any other value is shared with a snapshot
+	 * ({@link shareTransforms}) or was handed in (the constructor, {@link reset}), and
+	 * {@link stageUpdate} copies it before its first change. One set covers both shapes because
+	 * {@link stageUpdate} reaches an id's update list only while the id has no staged insert, and
+	 * only {@link delete}, which removes both, takes an insert away. */
+	private readonly owned = new Set<BlockId>();
 
 	constructor(
 		private readonly source: IBlockSource<T>,
@@ -308,6 +316,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	insert(block: T) {
 		const inserts = this.transforms.inserts ??= {};
 		inserts[block.header.id] = structuredClone(block);
+		this.owned.add(block.header.id);
 		// Served from `inserts` now, not source+updates — the materialized memo no longer applies.
 		this.materialized.delete(block.header.id);
 		// An insert makes the materialized result base-independent, so any pinned base is moot.
@@ -353,11 +362,10 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	private stageUpdate(blockId: BlockId, op: BlockOperation): boolean {
 		const inserted = this.transforms.inserts?.[blockId];
 		if (inserted) {
-			applyOperation(inserted, op);
+			applyOperation(this.ownedInsert(blockId, inserted), op);
 			return false;
 		}
-		const updates = this.transforms.updates ??= {};
-		const ops = ensured(updates, blockId, () => []);
+		const ops = this.ownedUpdates(blockId);
 		const first = ops.length === 0;
 		ops.push(structuredClone(op));
 		// The memo already equals (base source content + prior ops); applying just the new op
@@ -369,6 +377,28 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 			applyOperation(memo.block, op);
 		}
 		return first;
+	}
+
+	/** `id`'s staged insert, safe to change in place: `applyOperation` mutates it, so a block this
+	 * tracker does not own is replaced by a clone first. */
+	private ownedInsert(id: BlockId, inserted: IBlock): IBlock {
+		if (this.owned.has(id)) return inserted;
+		const copy = structuredClone(inserted);
+		this.transforms.inserts![id] = copy;
+		this.owned.add(id);
+		return copy;
+	}
+
+	/** `id`'s staged update list, safe to append to. A list this tracker does not own is replaced by
+	 * a plain array copy, which is enough because a staged operation is never changed once pushed. */
+	private ownedUpdates(id: BlockId): BlockOperation[] {
+		const updates = this.transforms.updates ??= {};
+		const held = updates[id];
+		if (held && this.owned.has(id)) return held;
+		const list: BlockOperation[] = held ? [...held] : [];
+		updates[id] = list;
+		this.owned.add(id);
+		return list;
 	}
 
 	/** Fix the base of `id`'s staged operations at the moment the FIRST of them is staged in this
@@ -395,6 +425,7 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	delete(blockId: BlockId) {
 		if (this.transforms.inserts) delete this.transforms.inserts[blockId];
 		if (this.transforms.updates) delete this.transforms.updates[blockId];
+		this.owned.delete(blockId);
 		this.materialized.delete(blockId);
 		// A delete materializes to nothing (delete-last-wins), so the pinned base is moot.
 		this.pins.delete(blockId);
@@ -405,12 +436,27 @@ export class Tracker<T extends IBlock> implements IBlockStore<T> {
 	reset(newTransform = emptyTransforms()) {
 		const oldTransform = this.transforms;
 		this.transforms = newTransform;
+		this.owned.clear();
 		this.materialized.clear();
 		// The single reclamation point for pins: a plain reset clears them (empty updates), a
 		// rollback-style reset(transforms) keeps exactly the pins — moved marks included — for ids
 		// still staged as updates.
 		this.pins.retainOnly(Object.keys(newTransform.updates ?? {}));
 		return oldTransform;
+	}
+
+	/** The staged transforms for a snapshot to keep: new outer maps over the same values, plus a copy
+	 * of `deletes`. The maps must be new because {@link insert}, {@link update} and {@link delete}
+	 * write to them; the values can be shared because this tracker gives up owning them here, so it
+	 * copies each one before changing it again.
+	 *
+	 * NOTE: a capture costs one map entry per staged block, across every queued transaction, and the
+	 * Quereus bridge takes one per statement per written collection. Staged blocks are tree nodes
+	 * shared by many rows, so their count grows far more slowly than the queue; if the copy ever shows
+	 * in a profile, capture only what the open segment touched. */
+	shareTransforms(): Transforms {
+		this.owned.clear();
+		return shallowCopyTransforms(this.transforms);
 	}
 
 	transformedBlockIds(): BlockId[] {
