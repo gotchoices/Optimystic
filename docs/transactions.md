@@ -487,7 +487,8 @@ table's entry in the engine's catalog with its entry when the apply began. The
 same description means the apply was taken back, so nothing is owed. A different
 one means the engine kept something the record lacks, so the table still owes it.
 A second refusal, and a failed step unwound inside a batch whose commit is then
-refused, are settled by the same comparison.
+refused, are settled by the same comparison. A table that has written its record
+since the refusal owes nothing, and the next batch leaves it out.
 
 With tables over more than one transactor there is one `SchemaManager` each, so
 one can have committed when a later one refuses. The undo DDL takes the first back
@@ -508,7 +509,8 @@ seeds the schema cache only after its commit lands), so no stale hit masks the
 gap. A table the batch changed with no instance in this process is remembered by
 key, and the instance its next touch builds writes the schema the same way. On a
 machine that hydrated before another machine's change, that write puts its older
-description over the record (the `NOTE:` at `settleOwedRecords`). A table **dropped** inside the batch — by the plan, or by the unwind of its
+description over the record (the `NOTE:` at `settleOwedRecords`). A table
+**dropped** inside the batch — by the plan, or by the unwind of its
 own create — has no instance left to heal anything: its gravestone is lost with
 the commit and the catalog keeps its live record past the DROP, so the next
 hydrate resurrects it and a later CREATE over the same URI is not checked

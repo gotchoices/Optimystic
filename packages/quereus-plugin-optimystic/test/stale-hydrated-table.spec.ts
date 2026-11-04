@@ -220,23 +220,40 @@ describe('a machine holding an older copy of a table description', function () {
 			expect((await saved(store)).checks).to.have.members(['pos', 'small']);
 		});
 
-		it('writes the record a data-destroying apply still owes on the first touch of a table with no instance', async () => {
+		/** `b` had a data-destroying apply refused, which left `t` owing the tag it changed, with no instance of `t` in this session. */
+		async function owingAfterADataDestroyingRefusal() {
 			const store = buildSharedLocalTransactor(new MemoryRawStorage());
 			const a = await openSession(store);
 			await a.db.exec(`declare schema main { table t { ${TABLE} } table u { id integer primary key } } apply schema main;`);
 			const refusing = refusingCommits(store);
 			const b = await hydratedSession(refusing.transactor);
 
-			// Declaring only `t` plans `drop table u`, which stops Quereus unwinding anything, and the
-			// tag change on `t` happens with no instance of `t` in this session.
+			// Declaring only `t` plans `drop table u`, which stops Quereus unwinding anything.
 			refusing.refuse(1);
 			const apply = `declare schema main { table t { ${TABLE} } with tags (version = 2) } apply schema main;`;
 			expect(await captureThrowMessage(() => b.db.exec(apply))).to.include('injected refusal');
 			refusing.refuse(0);
+			return { store, a, b };
+		}
+
+		it('writes the record a data-destroying apply still owes on the first touch of a table with no instance', async () => {
+			const { store, b } = await owingAfterADataDestroyingRefusal();
 			expect((await saved(store)).tags, 'the refused commit carried the tag').to.equal(undefined);
 
 			expect(await queryAll(b.db, 'select id from t')).to.deep.equal([]);
 			expect((await saved(store)).tags).to.deep.equal({ version: 2 });
+		});
+
+		it('does not owe the record again after that write, when the next apply ends', async () => {
+			const { store, a, b } = await owingAfterADataDestroyingRefusal();
+			await queryAll(b.db, 'select id from t');
+
+			await a.db.exec('alter table main.t add constraint small check (a < 100)');
+			await b.db.exec(`declare schema main { table t { ${TABLE} } with tags (version = 2) table v { id integer primary key } } apply schema main;`);
+			await refreshCache(b);
+			await queryAll(b.db, 'select id from t');
+
+			expect((await saved(store)).checks).to.have.members(['pos', 'small']);
 		});
 	});
 });

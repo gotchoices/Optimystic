@@ -4967,13 +4967,26 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     const adopted = this.adoptedByRefusedBatch ?? new AdoptedChanges();
     this.adoptedByRefusedBatch = undefined;
-    const owed = this.recordsOwedByRefusedBatch ?? { tables: new Set<string>(), engineAtStart: this.engineEntries(db, schemaName) };
-    this.recordsOwedByRefusedBatch = undefined;
+    const owed = this.takeOwedRecords(db, schemaName);
     for (const tableKey of owed.tables) {
       this.tables.get(tableKey)?.forgiveCatalogRecord();
       this.tablesOwingRecords.delete(tableKey);
     }
     this.schemaBatch = { managers, written: new Map(), dropped: new Map(), deferred: new Map(), adopted, owed };
+  }
+
+  /**
+   * What the batch now opening must settle. A table that wrote its record since the refusal has paid,
+   * or {@link settleOwedRecords} would see the engine still differing from before the refused apply
+   * and have it write this machine's description again, over whatever the record has gained since.
+   * With nothing left owing, the batch compares against the engine's catalog as it stands now.
+   */
+  private takeOwedRecords(db: Database, schemaName: string): OwedRecords {
+    const refused = this.recordsOwedByRefusedBatch;
+    this.recordsOwedByRefusedBatch = undefined;
+    const tables = new Set([...(refused?.tables ?? [])].filter(tableKey =>
+      this.tables.get(tableKey)?.owesCatalogRecord ?? this.tablesOwingRecords.has(tableKey)));
+    return { tables, engineAtStart: tables.size > 0 ? refused!.engineAtStart : this.engineEntries(db, schemaName) };
   }
 
   /** The engine's catalog entries of `schemaName`, by table key: what {@link settleOwedRecords} compares against. */

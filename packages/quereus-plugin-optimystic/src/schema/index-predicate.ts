@@ -16,7 +16,7 @@ import type { CompiledPredicate, Row, SqlValue } from '@quereus/quereus';
 import { storedToColumnSchema, type StoredColumnSchema } from './schema-manager.js';
 
 /** The parser `Expression` `compilePredicate` takes; a persisted predicate is one (`persistExpression` in schema-manager.ts). */
-type PredicateExpression = Parameters<typeof compilePredicate>[0];
+export type PredicateExpression = Parameters<typeof compilePredicate>[0];
 
 export class IndexPredicate {
 	private constructor(

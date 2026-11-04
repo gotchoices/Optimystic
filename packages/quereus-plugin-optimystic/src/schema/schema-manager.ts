@@ -14,6 +14,7 @@ import { buildColumnIndexMap, compilePredicate, getTypeOrDefault, inferType } fr
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
+import type { PredicateExpression } from './index-predicate.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
 import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
@@ -848,8 +849,7 @@ function predicateColumnNames(predicate: unknown, record: StoredTableSchema): st
 	if (predicate === undefined) {
 		return [];
 	}
-	const expression = predicate as Parameters<typeof compilePredicate>[0];
-	const { referencedColumns } = compilePredicate(expression, record.columns.map(storedToColumnSchema), record.name);
+	const { referencedColumns } = compilePredicate(predicate as PredicateExpression, record.columns.map(storedToColumnSchema), record.name);
 	return [...referencedColumns].map(position => record.columns[position]!.name);
 }
 
