@@ -27,8 +27,9 @@ inspection; this ticket buys confidence, not a bug fix.
 
 ## What to build
 
-A test (under `packages/db-p2p-storage-ns/test/`, runs against the existing
-`node:sqlite` mirror driver `openTestDb()` — no NativeScript host needed) that:
+A test (under `packages/db-p2p-storage-ns/test/`, runs through `openTestDb()`,
+which runs the production wrapper over a stand-in plugin on `node:sqlite` — no
+NativeScript host needed) that:
 
 - seeds N blocks with pending transforms,
 - fires a large randomized batch (`Promise.allSettled`) of mixed operations

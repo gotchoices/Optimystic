@@ -3,9 +3,10 @@
  *
  * The storage classes (`SqliteRawStorage`, `SqliteKVStore`) and the identity
  * helper (`loadOrCreateNSPeerKey`) only depend on the `SqliteDb` interface
- * defined here — never on `@nativescript-community/sqlite` directly. That lets
- * the suite run under Node mocha against a `node:sqlite` or `better-sqlite3`
- * driver, matching the pattern `db-p2p-storage-web` uses with `fake-indexeddb`.
+ * defined here — never on `@nativescript-community/sqlite` directly.
+ * `ns-opener.ts` implements it over the plugin, and the suite runs that same
+ * wrapper under Node mocha over a stand-in for the plugin built on `node:sqlite`,
+ * matching the pattern `db-p2p-storage-web` uses with `fake-indexeddb`.
  *
  * The wrapper is **package-private**: only `openOptimysticNSDb` is exported to
  * consumers; the `SqliteDb` interface is an internal seam for tests.
@@ -22,11 +23,8 @@ export type SqliteParam = string | number | Uint8Array | null;
 export type SqliteRow = Record<string, SqliteParam>;
 
 /**
- * A prepared statement bound to a single SQL string.
- *
- * Both `node:sqlite` and `@nativescript-community/sqlite` cache parsed SQL
- * internally, so re-binding a prepared statement is cheaper than re-parsing a
- * raw `execute`. The storage classes prepare each query once per instance.
+ * A statement bound to a single SQL string. The storage classes prepare each
+ * query once per instance.
  */
 export interface SqliteStatement {
 	/** Execute with the given bind parameters, ignoring any returned rows. */
@@ -68,9 +66,9 @@ export interface SqliteTransactionOptions {
 /**
  * Minimal SQLite driver surface used by this package.
  *
- * Wraps either the NativeScript plugin (in production) or a Node SQLite
- * driver (in tests). Async on every method so the NS plugin's I/O can be
- * Promised — even where the underlying call is synchronous.
+ * Implemented once, over the NativeScript plugin (`wrapNSPluginDb`); in tests the
+ * plugin is a stand-in over `node:sqlite`. Async on every method because every
+ * plugin call runs on the database's native thread and resolves later.
  *
  * A single connection is shared across the storage classes, so every mutating
  * operation (`exec`, statement `run`, and `transaction` bodies) is serialized on
@@ -104,12 +102,11 @@ export interface SqliteDb {
 
 /** The raw connection surface {@link runTransaction} drives: one statement at a time, no rows back. */
 export interface TransactionConnection {
-	execute(sql: string): Promise<void> | void;
+	execute(sql: string): Promise<void>;
 }
 
 /**
- * The transaction protocol both `SqliteDb` implementations run inside their mutex slot: with
- * `synced`, `PRAGMA synchronous = FULL` first; then `BEGIN IMMEDIATE`, the body, and `COMMIT`, or
+ * The transaction protocol `SqliteDb.transaction` runs inside its mutex slot: with `synced`, `PRAGMA synchronous = FULL` first; then `BEGIN IMMEDIATE`, the body, and `COMMIT`, or
  * `ROLLBACK` when the body or the commit throws; then, synced, `PRAGMA synchronous = NORMAL`
  * whichever way the transaction ended, so the connection's default is restored before the slot is
  * released. `BEGIN IMMEDIATE` takes the write lock up front rather than deferring it to the first
@@ -266,11 +263,9 @@ PRAGMA foreign_keys = OFF;
  * migrations can branch on it. Idempotent — safe to call on every open.
  */
 export async function applySchema(db: SqliteDb, version: number = DEFAULT_DB_VERSION): Promise<void> {
-	// `PRAGMA journal_mode = WAL` returns the resulting mode as a row. The NS
-	// Android plugin maps exec()→execSQL, which rejects row-returning statements
-	// ("Queries can be performed using ... query or rawQuery methods only"), so
-	// this pragma must run through a query method. prepare().get() does that on
-	// every driver (NS plugin → get()/rawQuery; node:sqlite/better-sqlite3 → get()).
+	// `PRAGMA journal_mode = WAL` returns the resulting mode as a row, so it goes through a
+	// query method. It stays although the plugin turns WAL on by default on Android: iOS has
+	// no such default and relies on this pragma.
 	await db.prepare('PRAGMA journal_mode = WAL').get();
 	await db.exec(PRAGMAS_SQL);
 	await db.exec(SCHEMA_SQL);

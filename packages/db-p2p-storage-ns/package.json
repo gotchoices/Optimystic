@@ -60,7 +60,7 @@
   "peerDependencies": {
     "@libp2p/crypto": "^5.1.23",
     "@libp2p/interface": "^3.3.0",
-    "@nativescript-community/sqlite": "^3.5.0"
+    "@nativescript-community/sqlite": "^4.1.0"
   },
   "peerDependenciesMeta": {
     "@nativescript-community/sqlite": {

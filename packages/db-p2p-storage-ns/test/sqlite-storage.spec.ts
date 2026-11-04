@@ -15,8 +15,8 @@ import { StoreFailedError, type BlockMetadata, type SetTimer } from '@optimystic
 // backend — round-trips, listRevisions ordering, promote atomicity + the exact
 // missing-pend error, clone-on-store/read (structural via the byte boundary),
 // drain-before-yield iteration, the BlockStorage parity slice, and the
-// flush-then-reopen case. Runs against `node:sqlite`; production is
-// NativeScript SQLite, both satisfy `SqliteDb`. Each case gets a fresh
+// flush-then-reopen case. Runs the production wrapper over a stand-in for the
+// NativeScript plugin on `node:sqlite`. Each case gets a fresh
 // file-backed db in its own temp dir, so reopen can close it and open the same
 // file again; cleanup closes the storage (which flushes what it still holds and
 // disarms its timers, which must not fire on a closed handle), then the handle,

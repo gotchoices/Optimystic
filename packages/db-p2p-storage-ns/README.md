@@ -32,8 +32,12 @@ yarn add @optimystic/db-p2p-storage-ns @optimystic/db-p2p @optimystic/db-core \
          @nativescript-community/sqlite
 ```
 
-`@nativescript-community/sqlite` is a peer dependency — the host app pins the
-version it needs (same approach as `react-native-mmkv` for the RN package).
+`@nativescript-community/sqlite` is a peer dependency at `^4.1.0` — the host app
+pins the version it needs (same approach as `react-native-mmkv` for the RN
+package). It brings `sqlite-core`, both bindings (`sqlite-napi` for NativeScript
+9.1+, `sqlite-bridge` for any version) and `sqlite-default-engine`, so NativeScript
+8 needs nothing extra. This package does not use the plugin's `*Sync` methods,
+which throw on the bridge.
 
 Use the Node-free `/rn` entry point of `@optimystic/db-p2p` so the Node-only
 TCP transport doesn't get bundled into the NativeScript app:
@@ -65,13 +69,18 @@ const libp2p = await createLibp2pNode({
 });
 ```
 
-The same handle is shared by all three consumers. SQLite allows at most one
-open transaction per connection, so the wrapper serializes every mutating
+The same handle is shared by all three consumers. The plugin runs every call on
+one native thread per database, in the order made, which orders single calls
+but does not keep a sequence of calls together, and SQLite allows at most one
+open transaction per connection. So the wrapper serializes every mutating
 operation — `exec`, statement `run`, and whole `transaction` bodies — on a
 per-connection FIFO mutex. Without it, two concurrent `transaction` bodies
-would each `BEGIN` on the shared connection; the second nests, throws, and its
-rollback discards the first's still-open writes. Reads (`get`/`all`) stay off
-the mutex to preserve read concurrency.
+would each `BEGIN` on the shared connection; the second fails, and its rollback
+discards the first's still-open writes. A plain write between another body's
+`BEGIN` and `COMMIT` would land inside that transaction and share its fate.
+Reads (`get`/`all`) stay off the mutex: a read waits for the statements queued
+ahead of it, not for a whole transaction body, so it can land between a body's
+statements and see its uncommitted rows.
 
 Close the storage before the handle, and the handle last:
 
@@ -87,8 +96,10 @@ still has armed would fire on a closed connection.
 
 ## Persistence model
 
-The package opens a single SQLite database (`optimystic.sqlite` by default
-in the NativeScript app's documents directory) with eight tables. The six
+The package opens a single SQLite database (`optimystic.sqlite` by default; a
+bare name goes in the app's databases folder on Android and its documents folder
+on iOS, and a full path is used as given) with eight tables. On Android the
+engine is the SQLite the plugin bundles; on iOS it is the process's. The six
 block-storage tables keep their original columns and keys, but their value
 columns are **BLOB**: `SqliteBatchBackend` binds/reads the kernel's raw
 `Uint8Array` bytes and the shared `KvRawStorage` kernel owns the JSON/UTF-8
@@ -182,10 +193,33 @@ underlying SQLite file.
 
 ## Tests
 
-`yarn test` runs the spec suite under Node's built-in `node:sqlite` driver
-(Node 22+ — default-enabled on Node 23+). Production code only depends on
-the package-private `SqliteDb` interface, so the Node driver is a faithful
-behavioural surrogate for the NativeScript plugin. The suite never imports
-`@nativescript-community/sqlite`, so the plugin's native bindings don't need
-to be installed to run tests. No test cuts the power: that a committed group
-survives one rests on SQLite's write-ahead log, as stated above.
+`yarn test` runs the spec suite through the production wrapper, its mutex and
+its transaction protocol, over a stand-in for the plugin built on Node's built-in
+`node:sqlite` (Node 22+ — default-enabled on Node 23+;
+`packages/db-p2p-storage-ns/test/node-sqlite-driver.ts`). As on the plugin's
+native thread, every call of the stand-in resolves later, strictly in the order
+made, so other callers run between a transaction body's statements. The suite
+never imports `@nativescript-community/sqlite`, so the plugin's native bindings
+don't need to be installed to run tests, and it says nothing about how the plugin
+behaves on a device. No test cuts the power: that a committed group survives one
+rests on SQLite's write-ahead log, as stated above.
+
+## What has run on a device
+
+Nothing in this repository runs NativeScript on a device. The evidence for this
+package on the plugin is one reporter's run (GitHub #38): this package at 1.20.1,
+unmodified, with the plugin forced to 4.1.0, on a Galaxy S7 with Android 8.0 and
+NativeScript 8.9, so the plugin's JNI bridge.
+
+| Check | Result |
+|---|---|
+| Opens through `openOptimysticNSDb` | works, `journal_mode` = `wal`, SQLite 3.50.1 (bundled by the plugin) |
+| `ON CONFLICT … DO UPDATE` | works |
+| `SqliteRawStorage` save, `flush()`, read back | works |
+| Write, then `am force-stop` within milliseconds of the commit resolving | 10 of 10 marker rows survived 5 kills: one autocommit row and one `synced: true` row per cycle |
+| 2,003 point reads interleaved with a 2,000-row transaction | no errors; the reads see the transaction's uncommitted rows |
+| App boot on databases written by 3.5.9 | opened and ran |
+
+Not run by anyone yet: a long session with real network traffic; iOS; the
+Node-API binding NativeScript 9.1+ selects; a power cut (a force-stop kills the
+process only).
