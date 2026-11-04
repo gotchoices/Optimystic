@@ -10,14 +10,16 @@
  * {@link inEngineOrder} repairs, at read time, the one place the two orders still differ. On
  * such a column the same bytes bracket a range predicate: {@link indexRangeScan} turns its bounds
  * into the tree keys the walk starts and ends at, and into a test on each row for a bound the
- * tree cannot apply.
+ * tree cannot apply. A walk or range that goes on long enough stops and finishes by scanning the
+ * table ({@link WALK_ROWS_BEFORE_SCAN}, {@link restOfWalk}).
  */
 
 import { ANY_TYPE, BOOLEAN_TYPE, IndexConstraintOp, PhysicalType, compareSqlValues, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
 import type { BestAccessPlanRequest, ColumnSchema, OrderingSpec, PredicateConstraint, Row, SqlValue, TableSchema, TableIndexSchema } from '@quereus/quereus';
 import { KeyRange } from '@optimystic/db-core';
+import { compareTreeKeys } from '../optimystic-adapter/collection-factory.js';
 import { KEY_PREFIX_END, KEY_PRESENT_START } from './key-encoding.js';
-import { indexKeyFromValues, type IndexKey } from './index-manager.js';
+import { indexKeyFromValues, type IndexEntry, type IndexKey } from './index-manager.js';
 
 /** One key column of an index or primary key: its table column position and declared collation. */
 export interface KeyColumn {
@@ -388,4 +390,77 @@ export function indexRangeScan(
 		high,
 		rowTest: tests.length === 0 ? undefined : row => tests.every(test => test(row)),
 	};
+}
+
+/**
+ * How many index entries a walk or a range reads before it finishes by scanning the table instead
+ * ({@link restOfWalk}). A walk descends the main tree once per row, about five times what a scan
+ * costs per row when the read wants most of the table, and nothing can tell the planner in advance
+ * that it will: a statement's LIMIT never reaches the module (Quereus backlog
+ * `feat-sort-absorb-blind-to-limit-general`), a bound `limit ?` would be unknown at plan time
+ * anyway, and a range's selectivity is an assumption. Only the walk finds out, because its consumer
+ * stops pulling.
+ *
+ * 256 is above the 100-row page GitHub #52 measures, and in that measurement (Node,
+ * `transactor='test'`, 31 to 38 µs a row) it costs about 8 ms, which is what any longer read pays on
+ * top of the scan and sort it would otherwise have cost. It counts entries rather than rows
+ * returned, so a walk under a selective residual filter moves on too.
+ *
+ * NOTE: a page larger than this on a very large table gets the cost of a scan and sort rather than
+ * the walk's. If pages over 256 rows on large tables show up slow, scale this by `analyze`'s row
+ * count.
+ */
+export const WALK_ROWS_BEFORE_SCAN = 256;
+
+/** Where a walk stopped in order to finish by scanning; see {@link restOfWalk}. */
+export interface StoppedWalk {
+	/** The tree-key range the walk was reading, in walk order. */
+	readonly range: KeyRange<string>;
+	/** The tree key of the last entry it fetched, whether it yielded that entry's row or rejected it. */
+	readonly lastKey: string;
+	/** The framed primary keys of the rows it yielded. */
+	readonly yielded: ReadonlySet<string>;
+	/** The test of a bound the tree could not apply ({@link IndexRangeScan.rowTest}). */
+	readonly rowTest?: (row: Row) => boolean;
+}
+
+/**
+ * Whether `treeKey` is at or before the end of `range`, in walk order. The range's start needs no
+ * such test here: a stopped walk's last key came from the range, so a key past that one is past
+ * the start.
+ */
+function withinRangeEnd(treeKey: string, range: KeyRange<string>): boolean {
+	if (range.last === undefined) return true;
+	const order = compareTreeKeys(treeKey, range.last.key) * (range.isAscending ? 1 : -1);
+	return range.last.inclusive ? order <= 0 : order < 0;
+}
+
+/**
+ * The rows a stopped walk had not reached, out of `scanned` (every row of the table, in any order),
+ * in the order the walk would have reached them. `entryOf` gives the index entry a row implies.
+ *
+ * A row is kept when its tree key lies past the walk's last key in walk order and inside the range,
+ * when it passes the test of any bound the tree could not apply, and when the walk did not already
+ * yield it: on a live read, a row can move past the last key after it was yielded.
+ *
+ * Sorting by tree key gives exactly the order the entries would have come in, so the caller feeds
+ * these rows on to the same {@link inEngineOrder} the walked rows passed through, and a run it is
+ * holding when the walk stops flushes in order with them. The first of them therefore waits for the
+ * whole scan, and the rest are held in memory, as the engine's Sort holds them.
+ */
+export async function* restOfWalk(
+	scanned: AsyncIterable<Row>,
+	entryOf: (row: Row) => IndexEntry,
+	{ range, lastKey, yielded, rowTest }: StoppedWalk,
+): AsyncIterable<Row> {
+	const direction = range.isAscending ? 1 : -1;
+	const kept: { treeKey: string; row: Row }[] = [];
+	for await (const row of scanned) {
+		const [treeKey, primaryKey] = entryOf(row);
+		if (compareTreeKeys(treeKey, lastKey) * direction <= 0 || !withinRangeEnd(treeKey, range)) continue;
+		if (yielded.has(primaryKey) || (rowTest !== undefined && !rowTest(row))) continue;
+		kept.push({ treeKey, row });
+	}
+	kept.sort((a, b) => compareTreeKeys(a.treeKey, b.treeKey) * direction);
+	for (const { row } of kept) yield row;
 }

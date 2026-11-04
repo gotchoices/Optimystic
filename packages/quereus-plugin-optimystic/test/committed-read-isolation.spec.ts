@@ -366,6 +366,55 @@ describe('Committed-read connection isolation', function () {
 		});
 	});
 
+	describe('a walk that finishes by scanning the table', () => {
+		it('reads both phases from the one pinned view when a commit lands during the walk', async () => {
+			const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+			const dbA = new Database();
+			const pluginA = registerWithSharedTransactor(dbA, shared);
+			await dbA.exec(`create table Ledger (id text primary key, t text) using optimystic('tree://iso/long-walk')`);
+			await dbA.exec('create index idx_ledger_t on Ledger (t)');
+			const ids = Array.from({ length: 300 }, (_, i) => `r${String(i).padStart(3, '0')}`);
+			await dbA.exec(`insert into Ledger (id, t) values ${ids.map(id => `('${id}', 't${id}')`).join(', ')}`);
+
+			const dbB = new Database();
+			const pluginB = registerWithSharedTransactor(dbB, shared);
+			await pluginB.hydrate(dbB);
+
+			try {
+				await dbA.exec('begin');
+				await dbA.exec(`insert into Ledger (id, t) values ('r299x', 'tr299x')`);
+
+				const committedTable = await connectCommitted(dbA, pluginA, 'Ledger');
+				const rows: VtabRow[] = [];
+				const lines = await captureTrace(async () => {
+					// The arguments and plan the engine emits for an ordered walk of the whole index.
+					const walk = committedTable.query(filterInfo('idx=idx_ledger_t(0);plan=0'))[Symbol.asyncIterator]();
+					const first = await walk.next();
+					expect(first.done, 'the walk yields before the commit lands').to.equal(false);
+					rows.push(first.value as VtabRow);
+
+					// Both changes lie past the switch, and the live read brings them into the live
+					// tree, so a phase reading that rather than the pinned view would return the new
+					// row and lose the deleted one.
+					await dbB.exec(`insert into Ledger (id, t) values ('r295x', 'tr295x')`);
+					await dbB.exec(`delete from Ledger where id = 'r280'`);
+					await scalar(dbA, 'select count(*) as v from Ledger');
+
+					for (let next = await walk.next(); !next.done; next = await walk.next()) rows.push(next.value as VtabRow);
+				});
+				await dbA.exec('rollback');
+
+				expect(rows.map(row => row[0])).to.deep.equal(ids);
+				const [trace] = indexSeekTraces(lines).filter(t => t.index === 'idx_ledger_t' && t.arm === 'committed');
+				expect(trace, 'the committed read walked the index').to.not.equal(undefined);
+				expect(trace!.scan, 'and finished by scanning').to.equal(true);
+			} finally {
+				dbA.close();
+				dbB.close();
+			}
+		});
+	});
+
 	describe('legacy index-scan dispatch (idxNum >= 10)', () => {
 		it('routes a bare-index-name plan to the committed index view', async () => {
 			const { db, plugin } = createTestDb();

@@ -14,8 +14,10 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
-import type { SqlValue } from '@quereus/quereus';
+import type { Row, SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
+import { indexEntryKey, indexKeyFromValues, indexValueRange, type IndexEntry } from '../src/schema/index-manager.js';
+import { restOfWalk } from '../src/schema/index-walk.js';
 import { stageNewEntryOnly, withIndexStagingPatched } from './index-staging-patch.js';
 import { captureTrace, indexSeekTraces } from './trace-helpers.js';
 
@@ -259,6 +261,133 @@ describe('An index walk serves order by', () => {
 		expect(rows.filter(r => r.id === 'r06a')).to.have.length(1);
 		const [trace] = indexSeekTraces(lines).filter(t => t.index === 'idx_t');
 		expect(trace!.rejected, 'the stale entry is rejected rather than returned').to.equal(1);
+	});
+});
+
+const pad = (i: number): string => String(i).padStart(3, '0');
+const longRow = (id: string, t: string, i: number): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y'];
+
+/**
+ * Rows for a walk that crosses `WALK_ROWS_BEFORE_SCAN` (256 entries). The low values come three to
+ * a value, so forwards the switch falls among the entries of one value (256 = 3 · 85 + 1). Above
+ * them sit 260 rows on which the tree's code-unit order and the engine's code-point order disagree,
+ * so backwards the switch falls inside the run `inEngineOrder` is holding, as it does forwards for
+ * a range that starts 250 entries below that text.
+ */
+const LONG_ROWS: readonly (readonly SqlValue[])[] = [
+	...Array.from({ length: 300 }, (_, i) => longRow(`l${pad(i)}`, `a${pad(Math.floor(i / 3))}`, i)),
+	...Array.from({ length: 130 }, (_, i) => longRow(`e${pad(i)}`, `😀${pad(i)}`, i)),
+	...Array.from({ length: 65 }, (_, i) => longRow(`p${pad(i)}`, `\uE000${pad(i)}`, i)),
+	...Array.from({ length: 65 }, (_, i) => longRow(`w${pad(i)}`, `～${pad(i)}`, i)),
+];
+
+describe('A long index walk finishes by scanning the table', () => {
+	let db: Database;
+
+	/** The rows both tables give for `clause`, and the `index:seek` line the Optimystic read emits. */
+	const readBoth = async (clause: string, index = 'idx_t') => {
+		let walked: SqlRow[] = [];
+		const lines = await captureTrace(async () => {
+			walked = await collectRows(db.eval(`select id, t from walked ${clause}`));
+		});
+		const model = await collectRows(db.eval(`select id, t from model ${clause}`));
+		const [trace] = indexSeekTraces(lines).filter(t => t.index === index);
+		expect(trace, `${clause} reads through ${index}`).to.not.equal(undefined);
+		return { walked, model, trace: trace! };
+	};
+
+	const byId = (rows: readonly SqlRow[]): SqlRow[] =>
+		[...rows].sort((a, b) => (a.id! < b.id! ? -1 : a.id! > b.id! ? 1 : 0));
+
+	before(async () => {
+		({ db } = openDatabase());
+		const columns = '(id text primary key, t text, g text)';
+		await db.exec(`create table walked ${columns} using optimystic('tree://test/long_walk_main')`);
+		await db.exec('create index idx_t on walked(t)');
+		await db.exec('create index idx_gt on walked(g, t)');
+		await db.exec(`create table model ${columns} using memory`);
+		await db.exec('begin');
+		for (const row of LONG_ROWS) {
+			await db.exec('insert into walked (id, t, g) values (?, ?, ?)', [...row]);
+			await db.exec('insert into model (id, t, g) values (?, ?, ?)', [...row]);
+		}
+		await db.exec('commit');
+	});
+
+	for (const [shape, clause] of [
+		['a forward walk', 'order by t, id'],
+		['a backward walk, stopping inside a held run', 'order by t desc, id desc'],
+		['a limit past the threshold', 'order by t, id limit 300'],
+		['a limit met from a held run longer than the threshold', 'order by t desc, id desc limit 10'],
+		['a forward range, stopping inside a held run', `where t >= 'a017' order by t, id`],
+		['a forward range ending at <=', `where t > 'a010' and t <= 'a099' order by t, id`],
+		['a forward range ending at <', `where t >= 'a000' and t < 'a099' order by t, id`],
+		['a backward range ending at >=', `where t >= 'a005' and t < 'a099' order by t desc, id desc`],
+		['a backward range ending at >', `where t > 'a005' and t < 'b' order by t desc, id desc`],
+		['a forward range whose end only the row test applies', `where t < '😀050' order by t, id`],
+		['a backward range whose end only the row test applies', `where t > '😀050' order by t desc, id desc`],
+	] as const) {
+		it(`returns the engine's rows in the engine's order for ${shape}`, async () => {
+			await expectOrderFromIndex(db, `select id, t from walked ${clause}`);
+			const { walked, model, trace } = await readBoth(clause);
+			expect(walked).to.deep.equal(model);
+			expect(trace.scan, 'the read crossed the threshold').to.equal(true);
+			expect(trace.matched, 'and stopped reading the index there').to.equal(256);
+		});
+	}
+
+	it('returns the same rows for a range that claims no ordering', async () => {
+		const clause = `where t >= 'a017'`;
+		const plan = await planOf(db, `select id, t from walked ${clause}`);
+		expect(plan.ops, plan.described).to.include('INDEXSEEK');
+		const { walked, model, trace } = await readBoth(clause);
+		expect(byId(walked)).to.deep.equal(byId(model));
+		expect(trace.scan).to.equal(true);
+	});
+
+	it('scans nothing for a read the threshold covers', async () => {
+		for (const [clause, entries] of [
+			['order by t, id limit 10', 10],
+			['order by t, id limit 256', 256],
+			[`where t < 'a085' order by t, id`, 255],
+		] as const) {
+			const { walked, model, trace } = await readBoth(clause);
+			expect(walked, clause).to.deep.equal(model);
+			expect(trace.scan, clause).to.equal(false);
+			expect(trace.matched, clause).to.equal(entries);
+		}
+	});
+
+	it('never moves an equality seek or a multi-seek to a scan', async () => {
+		const seek = await readBoth(`where g = 'x' order by t, id`, 'idx_gt');
+		expect(seek.walked).to.deep.equal(seek.model);
+		expect(seek.trace.scan).to.equal(false);
+		expect(seek.trace.matched).to.equal(LONG_ROWS.filter(row => row[2] === 'x').length);
+
+		const multiSeek = await readBoth(`where g in ('x', 'y')`, 'idx_gt');
+		expect(byId(multiSeek.walked)).to.deep.equal(byId(multiSeek.model));
+		expect(multiSeek.trace.scan).to.equal(false);
+		expect(multiSeek.trace.matched).to.equal(LONG_ROWS.length);
+	});
+});
+
+describe('restOfWalk', () => {
+	it('does not return again a row the walk yielded and that has since moved past where it stopped', async () => {
+		const entryOf = (row: Row): IndexEntry => {
+			const primaryKey = String(row[0]);
+			return [indexEntryKey(indexKeyFromValues([row[1]!]), primaryKey), primaryKey];
+		};
+		const scanned = async function* (): AsyncIterable<Row> {
+			yield ['moved', 'z'];
+			yield ['unreached', 'y'];
+		};
+		const rest: Row[] = [];
+		for await (const row of restOfWalk(scanned(), entryOf, {
+			range: indexValueRange(indexKeyFromValues([])),
+			lastKey: entryOf(['stop', 'm'])[0],
+			yielded: new Set(['moved']),
+		})) rest.push(row);
+		expect(rest).to.deep.equal([['unreached', 'y']]);
 	});
 });
 

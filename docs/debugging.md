@@ -365,7 +365,7 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/main/Usage/index/by_token main=default/main/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa dir=asc seek=%01tok-a%00 matched=0 rejected=0 node=A
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/main/Usage/index/by_token main=default/main/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa dir=asc seek=%01tok-a%00 matched=0 rejected=0 scan=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
@@ -424,7 +424,7 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
 - `rejected=` — how many of those entries the scan then dropped, because the row their primary key
   names is gone, does not imply the entry, was already returned under an earlier key of the same
   list (a row that moved between the two seeks), or failed a range bound the tree could not apply.
-  `matched - rejected` is what the scan returned. Apart from that last cause, any nonzero value
+  `matched - rejected` is what the scan returned through the index. Apart from that last cause, any nonzero value
   means **the index tree and the main table disagreed as this scan read them**, which has two
   causes — read `rev=`, `main_rev=` and `arm=` on the same line to tell them apart:
   - **The tree is damaged** — it holds an entry no row accounts for. Run
@@ -446,6 +446,14 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   engine's code-point order differ on it (`inEngineOrder` in
   `packages/quereus-plugin-optimystic/src/schema/index-walk.ts`), so a walk whose first rows are
   such text reads the whole run before it yields the first of them.
+- `scan=` — `1` when a walk or range stopped reading the index and finished by scanning the table,
+  which it does after 256 entries (`WALK_ROWS_BEFORE_SCAN` in
+  `packages/quereus-plugin-optimystic/src/schema/index-walk.ts`); `0` otherwise, and always for an
+  equality seek or an `in (…)` list. `matched=` and `rejected=` stay counts of index entries, so on
+  a `scan=1` line `matched=256` is where the walk stopped, not how many rows the statement returned,
+  and the rows the scan supplied are in neither count. A long ordered read reporting `scan=1` costs a
+  scan and sort; one that fills a page reports `scan=0`. A `limit` smaller than 256 can still report
+  `scan=1` when the first rows are text held back as above and the run outlasts the 256 entries.
 
 **Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
 query, and a full table scan all read without descending an index tree, so they emit nothing here.

@@ -159,8 +159,7 @@ the module (Quereus backlog `feat-sort-absorb-blind-to-limit-general`; only
 `rule-minmax-index-boundary` sends `request.limit`), so `order by T limit 10` and `order by T` are
 priced alike and the walk is claimed for both: a page reads about as many entries and rows as it
 returns, where the engine used to sort the whole table, and an ordered read of the whole table
-fetches one row per entry, about five times a scan, until
-`a-long-index-walk-finishes-by-scanning-the-table` lands.
+finishes by scanning it (*Finishing by scanning*, below).
 
 **Reading.** The engine's ordering-only arm emits `idx=<name>(0);plan=0` with no arguments;
 `runQuery` routes that through the index (`scanIndexName`), inside the same synchronous block that
@@ -188,6 +187,8 @@ columns needs no record of what was claimed: rows that tie on the claimed column
 either order. `packages/quereus-plugin-optimystic/test/ordering-claim-guard.spec.ts` pins the
 claim and `packages/quereus-plugin-optimystic/test/index-ordered-walk.spec.ts` the walk, against a
 memory table holding the same rows.
+
+**Finishing by scanning.** A walk fetches each row with its own descent of the main tree, about five times what a scan costs per row when most of the table is wanted, and only the walk finds out how many rows that is, because its consumer stops pulling: a `LIMIT` never reaches the module, a `limit ?` would not be known at plan time, and a range's selectivity is an assumption. So a walk, or a range seek (next section), that has fetched `WALK_ROWS_BEFORE_SCAN` entries (256, rejected ones included, so one under a selective residual moves on too) stops, and gets the rest from the table (`verifiedIndexRows` in `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, `restOfWalk` in `packages/quereus-plugin-optimystic/src/schema/index-walk.ts`). An equality seek or multi-seek never does: its row count is the statement's own. The scan is `executeTableScan` over the same refreshed or pinned main view the walk read, so a committed read stays at its one moment and a live one gets the table scan's resume-on-change. Each scanned row's tree key is built as maintenance builds it (`indexEntryKey`), and the row is kept when that key lies past the last key the walk fetched, in walk order, and inside the range, when it passes the row test of any bound the tree could not apply, and when the walk did not already yield it, since on a live read a row can move past the last key after it was yielded. The kept rows are sorted by tree key in walk direction and go on through the same `inEngineOrder` the walked rows passed through, so a run held at the switch flushes in order with them. A read within 256 entries therefore costs what the walk costs, and a longer one costs a scan and sort plus those fetches: about 8 ms at the 31 to 38 µs a row GitHub #52 measured (Node, `transactor='test'`), and 10 to 13 ms when timed against a scan and sort at 2,000 and 5,000 rows on a machine running other work. The first row after the switch waits for the whole scan, and the rest are held in memory, as the engine's Sort holds them. A page larger than 256 rows on a very large table gets the scan and sort's cost rather than the walk's, and the same goes for a range holding more than 256 entries of a much larger table: the revisit condition is the `NOTE:` at the constant. The answer depends on where a row sits only on a damaged tree: a row the index is missing comes back after the switch and not before it, and `plugin.verifyIndexes` reports that damage. The `index:seek` line reports the switch as `scan=1` ([debugging.md §Which revision did a read descend?](debugging.md#which-revision-did-a-read-descend)).
 
 #### A range predicate seeks a secondary index
 

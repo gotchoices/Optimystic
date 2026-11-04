@@ -214,10 +214,13 @@ export interface IndexSeekTrace {
 	 *  abandoned iteration reports what it had produced when it stopped. */
 	matched: number;
 	/** How many of those entries the scan dropped because the row they name is gone or does
-	 *  not imply them. `matched - rejected` is what the scan returned; nonzero means the index
-	 *  and the main table disagreed as this scan read them — a damaged tree, or an `arm=live`
-	 *  read whose two views sat at different revisions. A floor, like {@link matched}. */
+	 *  not imply them. `matched - rejected` is what the scan returned through the index; nonzero
+	 *  means the index and the main table disagreed as this scan read them — a damaged tree, or an
+	 *  `arm=live` read whose two views sat at different revisions. A floor, like {@link matched}. */
 	rejected: number;
+	/** Whether the scan stopped reading the index and finished by scanning the table. {@link matched}
+	 *  and {@link rejected} stay counts of index entries, so the scan's rows are in neither. */
+	scan: boolean;
 }
 
 /** Parse every `index:seek` line out of a capture.
@@ -234,13 +237,13 @@ export interface IndexSeekTrace {
 export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
 	const traces: IndexSeekTrace[] = [];
 	for (const raw of lines) {
-		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) dir=(\S+) seek=(\S*) matched=(\d+) rejected=(\d+) node=(\S+)/
+		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) dir=(\S+) seek=(\S*) matched=(\d+) rejected=(\d+) scan=([01]) node=(\S+)/
 			.exec(plain(raw));
 		if (m) {
 			traces.push({
 				table: m[1]!, index: m[2]!, collection: m[3]!, main: m[4]!, arm: m[5]!,
 				rev: m[6]!, action: m[7]!, mainRev: m[8]!, mainAction: m[9]!, dir: m[10]!,
-				seek: m[11]!, matched: Number(m[12]), rejected: Number(m[13]), node: m[14]!,
+				seek: m[11]!, matched: Number(m[12]), rejected: Number(m[13]), scan: m[14] === '1', node: m[15]!,
 			});
 		}
 	}

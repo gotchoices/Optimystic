@@ -31,7 +31,7 @@ import type { TagSlots } from './schema/tag-overlay.js';
 import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged } from './schema/declared-tags.js';
 import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
 import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, indexValueRange, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
-import { bytesOrderAsValues, inEngineOrder, indexRangeScan, indexSeekCanBeTrusted, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
+import { WALK_ROWS_BEFORE_SCAN, bytesOrderAsValues, inEngineOrder, indexRangeScan, indexSeekCanBeTrusted, restOfWalk, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
 import type { RangeBound } from './schema/index-walk.js';
 import { IndexPredicate } from './schema/index-predicate.js';
 import { splitKeyTuple } from './schema/key-encoding.js';
@@ -122,6 +122,14 @@ interface ScanRange {
 interface IndexScanPlan {
   readonly ranges: readonly ScanRange[];
   readonly rowTest?: (row: Row) => boolean;
+  /**
+   * Whether the scan finishes by scanning the table once it has read {@link WALK_ROWS_BEFORE_SCAN}
+   * entries: a walk of the whole index or a range predicate's span, one range at most, whose row
+   * count nothing knows in advance. An equality seek or multi-seek reads the statement's own rows
+   * and never does. Neither shape this is set on runs over a partial index, which
+   * `getBestAccessPlan` never plans through, so every row of the table has an entry to compare.
+   */
+  readonly mayFinishByScanning?: boolean;
 }
 
 /**
@@ -140,8 +148,8 @@ interface IndexScanPlan {
  *   ({@link IndexScanPlan.rowTest}, a bound the `seek=` field prints as the open end of a
  *   `low:high` range). It is otherwise invisible from the read path, which now answers
  *   correctly over a broken tree instead of visibly wrongly. `matched - rejected` is what the
- *   scan yielded. Apart from that last cause, a rejection means the index tree and the main
- *   table DISAGREED AS THIS SCAN READ THEM, which has two causes and the same line carries the
+ *   scan yielded through the index. Apart from that last cause, a rejection means the index tree
+ *   and the main table DISAGREED AS THIS SCAN READ THEM, which has two causes and the same line carries the
  *   fields that separate them: index damage (`rev`/`main_rev` consistent — confirm with
  *   `plugin.verifyIndexes`), or the views sitting at different moments, which rejects a
  *   perfectly healthy entry whose row the main view has not caught up to yet (see `main_rev=`
@@ -151,6 +159,9 @@ interface IndexScanPlan {
  *   listed value, or a range bound, was NULL, which is a correct empty answer, not a fault —
  *   and prints as `unset` rather than as an empty seek (the empty PREFIX is a legitimate key
  *   meaning "the whole index", and the two must not read alike).
+ * - `scanned` — whether the scan stopped reading the index and finished by scanning the table
+ *   ({@link IndexScanPlan.mayFinishByScanning}). `matched` and `rejected` stay counts of index
+ *   entries, so the rows the table scan then supplied are in neither.
  *
  * Passed only when the trace namespace is enabled; `undefined` otherwise, so a disabled
  * namespace costs one property read per scan.
@@ -159,6 +170,7 @@ interface IndexSeekProbe {
   matched: number;
   rejected: number;
   sought: SeekTrace[];
+  scanned: boolean;
 }
 
 /** The `plan=` code of a multi-seek: one seek per argument, in `FilterInfo.args`. */
@@ -2017,14 +2029,17 @@ export class OptimysticVirtualTable extends VirtualTable {
         // with no access path walks forward.
         const reverse = filterInfo.accessPath?.kind === 'index' && filterInfo.accessPath.index.reverse === true;
         // A range plan's args are its bounds, not a key to seek: read the bounds, never `seeks`.
-        const scan = isRangeSeekPlan(planType)
+        const scan: IndexScanPlan = isRangeSeekPlan(planType)
           ? this.indexRangeScanOf(indexManager, indexScan.schema, filterInfo, reverse)
-          : { ranges: this.indexScanRanges(indexManager, indexScan.schema, seeks, reverse) };
+          : {
+              ranges: this.indexScanRanges(indexManager, indexScan.schema, seeks, reverse),
+              mayFinishByScanning: planType === INDEX_WALK_PLAN && filterInfo.args.length === 0,
+            };
         // ONE site covers both arms, and neither view is rebuilt to trace it. The counter
         // is filled in by the scan as it produces entries; the line is emitted in a
         // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
         // still reports what the seek had produced by then.
-        const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, sought: [] } : undefined;
+        const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, sought: [], scanned: false } : undefined;
         try {
           yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, scan, reverse, probe);
         } finally {
@@ -2235,7 +2250,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * ENDED, which for an abandoned scan (a LIMIT satisfied early, an error mid-scan) is short
    * of what the index holds. Both are floors, never overcounts — so `matched=0` still proves
    * the descent found nothing, which is the reading the two-worlds decision rule turns on,
-   * and `rejected>0` still proves the tree disagrees with the table.
+   * and `rejected>0` still proves the tree disagrees with the table. `scan=1` says the scan
+   * stopped reading the index and finished by scanning the table, so `matched=` is then the
+   * entries read before that and says nothing about how many rows the statement returned.
    */
   private logIndexSeek(
     index: IndexScanSource,
@@ -2249,7 +2266,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       committedActionId(): string | undefined;
     }): string => revisionToken(tree.committedRevision() ?? 'none', tree.committedActionId() ?? 'none');
     log(
-      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s dir=%s seek=%s matched=%d rejected=%d node=%s',
+      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s dir=%s seek=%s matched=%d rejected=%d scan=%d node=%s',
       this.tableName,
       index.schema.name,
       String(index.tree.getCollection().id),
@@ -2261,6 +2278,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       probe.sought.length === 0 ? 'unset' : probe.sought.map(printableSeekTrace).join(','),
       probe.matched,
       probe.rejected,
+      probe.scanned ? 1 : 0,
       this.collectionFactory.nodeTag(),
     );
   }
@@ -2415,6 +2433,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     return {
       ranges: [{ range: scan.range, sought: { low: scan.low, high: scan.high } }],
       rowTest: scan.rowTest,
+      mayFinishByScanning: true,
     };
   }
 
@@ -2432,6 +2451,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * verified rows pass through {@link inEngineOrder}, which repairs the one text on which the
    * tree's order and the engine's differ. The rows of a multi-seek, which claims no ordering, pass
    * through as the tree yields them: in key order, as the engine asks of a multi-seek.
+   *
+   * A walk or range that moves on to scanning the table does so inside {@link verifiedIndexRows},
+   * so its later rows reach the same `inEngineOrder`: a run it is holding at the switch flushes in
+   * order with them, which a second one could not do.
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
@@ -2452,7 +2475,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Every row an index scan's entries resolve to and imply, range by range, in the order the tree
-   * yields the entries — the scan's loop proper, which {@link executeIndexScan} orders.
+   * yields the entries — the scan's loop proper, which {@link executeIndexScan} orders. A scan that
+   * may finish by scanning stops after {@link WALK_ROWS_BEFORE_SCAN} entries and gets the rest from
+   * the table, through the same main view, so a committed read stays at its one moment.
    */
   private async* verifiedIndexRows(
     mainRead: TreeReadView<string, RowData>,
@@ -2469,8 +2494,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     // `update t set c = 'b' where c in ('a', 'b')` is the same shape if a statement's staged
     // entries are ever visible to its later seek; today the engine finishes reading first. So a
     // row is tracked by primary key to be yielded, and so updated, once, at a memory cost
-    // proportional to the rows returned.
-    const yielded = scan.ranges.length > 1 ? new Set<string>() : undefined;
+    // proportional to the rows returned. A scan that may finish by scanning tracks them for the same
+    // reason, at a cost of at most WALK_ROWS_BEFORE_SCAN keys. An equality seek keeps nothing.
+    const tracksYielded = scan.ranges.length > 1 || scan.mayFinishByScanning === true;
+    const yielded = new Set<string>();
 
     // Each entry is checked against the row it resolves to before that row is yielded, and
     // the check is the FULL one — `rowImpliesEntry`, the same predicate the integrity check
@@ -2506,16 +2533,28 @@ export class OptimysticVirtualTable extends VirtualTable {
     // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
     // the fetch: a healthy entry's own tree key already carries the answer.
     const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
+    const entriesBeforeScan = scan.mayFinishByScanning === true ? WALK_ROWS_BEFORE_SCAN : Infinity;
     for (const { range, sought } of scan.ranges) {
       // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
       // part-way still names the key it was seeking rather than reporting `unset`.
       probe?.sought.push(sought);
+      let entries = 0;
+      let lastKey: string | undefined;
+      let stoppedAfter: string | undefined;
       for await (const entry of indexManager.walkEntriesIn(index.read, range)) {
+        // Checked on the entry past the limit, not the one that reaches it, so a read that ends
+        // exactly there has nothing left to scan for. Leaving the loop stops the entry iterator.
+        if (entries === entriesBeforeScan) {
+          stoppedAfter = lastKey;
+          break;
+        }
+        entries++;
+        lastKey = entry[0];
         // Counted HERE, before the row fetch: `matched` must mean "entries the index
         // descent produced", not "rows that survived". An entry whose row is missing or
         // that the verification rejects still proves the index held something.
         if (probe !== undefined) probe.matched++;
-        if (yielded?.has(entry[1])) {
+        if (yielded.has(entry[1])) {
           if (probe !== undefined) probe.rejected++;
           continue;
         }
@@ -2535,8 +2574,23 @@ export class OptimysticVirtualTable extends VirtualTable {
           if (probe !== undefined) probe.rejected++;
           continue;
         }
-        yielded?.add(entry[1]);
+        if (tracksYielded) yielded.add(entry[1]);
         yield row;
+      }
+      if (stoppedAfter !== undefined) {
+        if (probe !== undefined) probe.scanned = true;
+        // NOTE: this reads rows, not entries, so a row the index is missing (a damaged tree) comes
+        // back from here and not from before the switch, and a stale entry is only ever rejected
+        // before it. On such a tree the answer depends on where the row sits; `plugin.verifyIndexes`
+        // reports the damage. A healthy tree answers alike on both sides.
+        yield* restOfWalk(
+          this.executeTableScan(mainRead, rowCodec),
+          row => {
+            const primaryKey = rowCodec.extractPrimaryKey(row);
+            return [indexEntryKey(indexKeyOf(row), primaryKey), primaryKey];
+          },
+          { range, lastKey: stoppedAfter, yielded, rowTest: scan.rowTest },
+        );
       }
     }
   }
@@ -5114,8 +5168,9 @@ function equalitySeekCandidate(
 
 /**
  * The fraction of the rows a seek's prefix admits that one range bound is assumed to keep. An
- * assumption, not a measurement — the one the primary-key range branch has always made — and
- * `a-long-index-walk-finishes-by-scanning-the-table` bounds what a bad guess costs a read.
+ * assumption, not a measurement — the one the primary-key range branch has always made — and a
+ * read that outruns it finishes by scanning the table ({@link WALK_ROWS_BEFORE_SCAN}), which bounds
+ * what a bad guess costs.
  */
 const RANGE_BOUND_SELECTIVITY = 0.25;
 
@@ -6822,9 +6877,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * looks only downward, so it never reaches a module (Quereus backlog
    * `feat-sort-absorb-blind-to-limit-general`); only `rule-minmax-index-boundary` sends one. So
    * `order by T limit 10` and `order by T` are priced alike, and the walk is claimed for both: a
-   * page is far cheaper than a scan and sort, and an unbounded ordered read, which fetches one row
-   * per entry, costs about five times a scan until `a-long-index-walk-finishes-by-scanning-the-table`
-   * lands.
+   * page is far cheaper than a scan and sort, and an unbounded ordered read finishes by scanning
+   * the table ({@link WALK_ROWS_BEFORE_SCAN}), so it costs a scan and sort plus that many fetches.
    */
   private orderedWalkCandidate(
     index: IndexSchema,
