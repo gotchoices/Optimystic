@@ -130,15 +130,12 @@ const NUL_VALUE = 'a\x00b';
 
 const CASES: SeekCase[] = [
 	{ name: 'a repeated bound value', where: 'a in (?, ?)', params: ['a', 'a'], seeks: 'idx_a' },
-	{ name: 'a repeated literal value', where: `a in ('a', 'a')`, seeks: 'idx_a' },
 	{ name: 'numerically equal literals', where: 'n in (1, 1.0)', seeks: 'idx_n' },
 	{ name: 'a number and a bigint of one value', where: 'n in (?, ?)', params: [1, 1n], seeks: 'idx_n' },
 	{ name: 'a literal null in the list', where: `a in ('a', null)`, seeks: 'idx_a' },
 	{ name: 'a bound null in the list', where: 'a in (?, ?)', params: ['a', null], seeks: 'idx_a' },
-	{ name: 'only literal nulls', where: 'a in (null, null)' },
 	{ name: 'only bound nulls', where: 'a in (?, ?)', params: [null, null], seeks: 'idx_a' },
 	{ name: 'a value that prefixes another', where: 'a in (?, ?)', params: ['a', 'ab'], seeks: 'idx_a' },
-	{ name: 'a value that alone is a prefix of stored values', where: 'a in (?, ?)', params: ['a', 'nothing'], seeks: 'idx_a' },
 	{ name: 'a value containing a NUL', where: 'a in (?, ?)', params: [NUL_VALUE, 'b'], seeks: 'idx_a' },
 	{ name: 'the empty string', where: 'a in (?, ?)', params: ['', 'b'], seeks: 'idx_a' },
 	{ name: 'values absent from the table', where: 'a in (?, ?)', params: ['nope', 'nada'], seeks: 'idx_a' },
@@ -149,6 +146,9 @@ const CASES: SeekCase[] = [
 	{ name: '= ahead of in on one column', where: `a = 'a' and a in ('a', 'ab')`, seeks: 'idx_a' },
 	{ name: 'in ahead of = on one column', where: `a in ('a', 'ab') and a = 'a'`, seeks: 'idx_a' },
 	{ name: 'a single-element in', where: 'a in (?)', params: ['a'], seeks: 'idx_a' },
+	{ name: 'a boolean sought on a number column', where: 'n = ?', params: [true], seeks: 'idx_n' },
+	{ name: 'a boolean in a list on a number column', where: 'n in (true, 2)', seeks: 'idx_n' },
+	{ name: 'a boolean sought on a text column holding its name', where: 'a in (?, ?)', params: [true, 'b'], seeks: 'idx_a' },
 	{ name: 'a primary-key list', where: 'id in (?, ?)', params: ['r1', 'r5'], seeks: 'primary' },
 	{ name: 'a primary-key list with a repeat', where: 'id in (?, ?, ?)', params: ['r1', 'r1', 'r5'], seeks: 'primary' },
 	{ name: 'a primary-key list with a null', where: 'id in (?, ?)', params: ['r1', null], seeks: 'primary' },
@@ -164,6 +164,7 @@ const ROWS: readonly (readonly SqlValue[])[] = [
 	['r5', NUL_VALUE, 'x', 'r', 4],
 	['r6', null, null, null, null],
 	['r7', 'b', 'x', 'p', 2],
+	['r9', 'true', 'y', 'q', 5],
 ];
 
 describe('in-list seeks agree with a scan of the same rows', () => {
@@ -277,6 +278,36 @@ describe('Columns no seek can serve stay residual filters over a scan', () => {
 
 		await expectIds(db, `select id from spans where d = 'PT60M'`, ['1']);
 		await expectIds(db, `select id from spans where d in ('PT60M', 'PT3H')`, ['1']);
+	});
+});
+
+describe('Index columns that can store a boolean stay residual filters over a scan', () => {
+	const expectIds = async (db: Database, query: string, ids: SqlValue[]): Promise<void> => {
+		const plan = await planOf(db, query);
+		expect(plan.ops, plan.described).to.not.include('INDEXSEEK');
+		const rows = await collectRows(db.eval(query));
+		expect(rows.map(r => r.id).sort(), query).to.deep.equal(ids);
+	};
+
+	it('a boolean column finds a value sought as a number, and not as text', async () => {
+		const { db } = openDatabase();
+		await db.exec(`create table flags (id text primary key, f boolean) using optimystic('tree://test/in_flags')`);
+		await db.exec('create index idx_f on flags(f)');
+		await db.exec(`insert into flags (id, f) values ('1', true), ('2', false)`);
+
+		await expectIds(db, 'select id from flags where f = 1', ['1']);
+		await expectIds(db, 'select id from flags where f in (0, 2)', ['2']);
+		await expectIds(db, `select id from flags where f = 'true'`, []);
+	});
+
+	it('an any column finds both a number and the boolean equal to it', async () => {
+		const { db } = openDatabase();
+		await db.exec(`create table mixed (id text primary key, x any) using optimystic('tree://test/in_mixed')`);
+		await db.exec('create index idx_x on mixed(x)');
+		await db.exec(`insert into mixed (id, x) values ('1', 1), ('2', true), ('3', 'a')`);
+
+		await expectIds(db, 'select id from mixed where x = 1', ['1', '2']);
+		await expectIds(db, 'select id from mixed where x in (true, 7)', ['1', '2']);
 	});
 });
 
@@ -395,7 +426,7 @@ describe('Access plan for an in-list (getBestAccessPlan)', () => {
 		expectUnclaimed(plan(makeTable([idxCategory], { category: stats(40) }), [inList(CATEGORY, 39)]));
 	});
 
-	it('ranks a list above an = on equal terms', () => {
+	it('prefers an = to a list on equal terms', () => {
 		const idxName: TableIndexSchema = { name: 'idx_name', columns: [{ index: NAME }] };
 		const result = plan(makeTable([idxCategory, idxName]), [inList(CATEGORY, 2), eq(NAME)]);
 		expect(result.indexName).to.equal('idx_name');

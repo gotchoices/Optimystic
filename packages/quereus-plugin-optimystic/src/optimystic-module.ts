@@ -15,7 +15,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import { ANY_TYPE, BOOLEAN_TYPE, ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
@@ -183,6 +183,13 @@ function seekTuplesOf(filterInfo: FilterInfo, planType: number | undefined): rea
  * so tree order is what it can offer and nothing here relies on more. If a table of this module is
  * ever wrapped in `using isolated`, a numeric or DESC multi-seek would be mis-merged: that needs
  * `debt-optimystic-true-key-ordering` first.
+ *
+ * NOTE: key framings of different storage classes can coincide: a text value with a blob's base64
+ * or a number's exponent form in an index, a number or boolean with its decimal text in a primary
+ * key. A seek value of another class than its column's can therefore find a row the predicate does
+ * not match. The engine converts a list of one type, so this takes a mixed list (`t in (1, 'a')` on
+ * a text primary key also returns the row `'1'`) or a bound string on a blob index. If that ever
+ * matters, drop such values here by the column's physical type.
  */
 function seekKeysInTreeOrder<TKey extends string>(
   seeks: readonly SeekTuple[],
@@ -2331,6 +2338,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * an insert stored. A partial key (fewer values than index columns) frames only the provided
    * leading columns and prefix-matches the rest; the planner may also hand over MORE constraint
    * values than the index covers, so the excess is truncated rather than rejected.
+   *
+   * A boolean is sought as its number: the engine compares `true` equal to `1`, and a number column
+   * stores the number's framing. No column that stores a boolean's own framing is ever sought
+   * ({@link indexSeekCanBeTrusted}), and a text column must not match a boolean by its name.
    */
   private indexSeekKey(indexManager: IndexManager, schema: StoredIndexSchema, seek: SeekTuple): IndexKey {
     const width = Math.min(seek.length, schema.columns.length);
@@ -2348,7 +2359,10 @@ export class OptimysticVirtualTable extends VirtualTable {
     return width === 0
       ? indexKeyFromValues([])
       : indexManager.createIndexKeyFromTuple(
-          indexManager.asIndexColumnTuple(schema, seek.slice(0, width) as readonly SqlValue[]),
+          indexManager.asIndexColumnTuple(
+            schema,
+            seek.slice(0, width).map(value => typeof value === 'boolean' ? Number(value) : value) as readonly SqlValue[],
+          ),
         );
   }
 
@@ -4682,6 +4696,19 @@ function seekCanBeTrusted(column: ColumnSchema | undefined, keyCollation: string
 }
 
 /**
+ * Whether a seek of a secondary index's column finds every row a predicate on it would: everything
+ * {@link seekCanBeTrusted} asks, and that the column cannot store a boolean. The engine compares
+ * `true` equal to `1`, but an index frames them as different bytes (`serializeIndexValue`), so on a
+ * `boolean` or `any` column one of the two is lost. A primary key frames both as `1`, so it needs
+ * no such rule.
+ */
+function indexSeekCanBeTrusted(column: ColumnSchema | undefined, keyCollation: string | undefined): boolean {
+  return seekCanBeTrusted(column, keyCollation)
+    && column?.logicalType.name !== BOOLEAN_TYPE.name
+    && column?.logicalType.name !== ANY_TYPE.name;
+}
+
+/**
  * The position of the filter a seek claims for one column: the first that fills the equality role,
  * since the engine seeks on the first and leaves a claim of any other unenforced (see
  * `findEqualityMatches` in `@quereus/quereus/src/vtab/memory/module.ts`). `-1` when there is none.
@@ -4704,8 +4731,8 @@ interface EqualitySeekMatch {
 }
 
 /**
- * The longest run of a key's leading columns a seek can serve: each must be trustworthy
- * ({@link seekCanBeTrusted}) and carry an equality-role filter ({@link firstEqualityRoleFilter}).
+ * The longest run of a key's leading columns a seek can serve: each must pass `canBeTrusted`
+ * and carry an equality-role filter ({@link firstEqualityRoleFilter}).
  *
  * A multi-value `in` is only ever the sole seek column: on the first column it is claimed and the
  * match stops there, and on a later one it ends the match before it, staying a residual while the
@@ -4721,11 +4748,12 @@ function matchEqualitySeek(
   keyColumns: readonly { readonly index: number; readonly collation?: string }[],
   tableInfo: TableSchema,
   filters: readonly PredicateConstraint[],
+  canBeTrusted: (column: ColumnSchema | undefined, keyCollation: string | undefined) => boolean,
 ): EqualitySeekMatch {
   const filterIndexes: number[] = [];
   let keyCount = 1;
   for (const keyColumn of keyColumns) {
-    if (!seekCanBeTrusted(tableInfo.columns[keyColumn.index], keyColumn.collation)) break;
+    if (!canBeTrusted(tableInfo.columns[keyColumn.index], keyColumn.collation)) break;
     const filterIndex = firstEqualityRoleFilter(filters, keyColumn.index);
     if (filterIndex < 0) break;
     const filter = filters[filterIndex]!;
@@ -6227,6 +6255,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       tableInfo.primaryKeyDefinition.map(pk => ({ index: pk.index, collation: tableInfo.columns[pk.index]?.collation })),
       tableInfo,
       request.filters,
+      seekCanBeTrusted,
     );
     const pkFullyMatched = pkColumns.length > 0 && pkMatch.filterIndexes.length === pkColumns.length;
 
@@ -6322,7 +6351,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
         if (index.predicate !== undefined) continue;
 
-        const match = matchEqualitySeek(index.columns, tableInfo, request.filters);
+        const match = matchEqualitySeek(index.columns, tableInfo, request.filters, indexSeekCanBeTrusted);
         if (match.filterIndexes.length === 0) continue;
 
         const seekColumns = match.filterIndexes.map(fi => request.filters[fi]!.columnIndex);

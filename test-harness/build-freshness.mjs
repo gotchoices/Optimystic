@@ -380,7 +380,13 @@ function outputRoot(entry) {
 const isBuildInput = (entry) =>
 	entry.isDirectory() ? !SOURCE_EXCLUDE_DIRS.has(entry.name) : !SOURCE_EXCLUDE.test(entry.name);
 
-/** Everything the compiler writes counts, `.tsbuildinfo` and compiled tests included. */
+/**
+ * Everything the compiler writes counts, `.tsbuildinfo` and compiled tests included.
+ *
+ * NOTE: so a typecheck that rewrites `tsconfig.test.tsbuildinfo` can make a stale `dist` read fresh:
+ * Quereus passed with `dist/src/index.js` 1.5 hours older than its source (inferred from the mtimes,
+ * not reproduced on its own). If that produces a wrong test result, leave that file out of the walk.
+ */
 const acceptAll = () => true;
 
 /** Newest mtime (ms) under `dir`, recursively, over the entries `accept` keeps. */
