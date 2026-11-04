@@ -3,7 +3,7 @@
  * put into the engine's order, and where a range predicate on a key column starts and ends it.
  *
  * An index tree's key is `frame(indexValues) ‖ frame(primaryKey)` (see index-manager.ts), compared
- * as raw UTF-16 code units (`compareTreeKeys` in optimystic-adapter/collection-factory.ts). A
+ * as raw UTF-16 code units (`compareTreeKeys` in key-encoding.ts). A
  * walk of the tree, forwards or backwards, therefore delivers rows ordered by the index columns
  * and then the primary key — but only where the stored bytes order as the engine orders the
  * values. {@link walkDelivering} decides at plan time which required orderings that is, and
@@ -17,8 +17,7 @@
 import { ANY_TYPE, BOOLEAN_TYPE, IndexConstraintOp, PhysicalType, compareSqlValues, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
 import type { BestAccessPlanRequest, ColumnSchema, OrderingSpec, PredicateConstraint, Row, SqlValue, TableSchema, TableIndexSchema } from '@quereus/quereus';
 import { KeyRange } from '@optimystic/db-core';
-import { compareTreeKeys } from '../optimystic-adapter/collection-factory.js';
-import { KEY_PREFIX_END, KEY_PRESENT_START } from './key-encoding.js';
+import { KEY_PREFIX_END, KEY_PRESENT_START, compareTreeKeys } from './key-encoding.js';
 import { indexKeyFromValues, type IndexEntry, type IndexKey } from './index-manager.js';
 
 /** One key column of an index or primary key: its table column position and declared collation. */
@@ -407,8 +406,8 @@ export function indexRangeScan(
  * returned, so a walk under a selective residual filter moves on too.
  *
  * NOTE: a page larger than this on a very large table gets the cost of a scan and sort rather than
- * the walk's. If pages over 256 rows on large tables show up slow, scale this by `analyze`'s row
- * count.
+ * the walk's, and a range holding more entries than this reads the whole table however small a part
+ * of it the range is. If either shows up slow on large tables, scale this by `analyze`'s row count.
  */
 export const WALK_ROWS_BEFORE_SCAN = 256;
 

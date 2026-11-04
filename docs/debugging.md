@@ -438,7 +438,8 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   - **A range bound was tested on the row** — the scan walked a range one of whose ends the tree
     could not apply (that end prints open in `seek=`, above), and the row the entry led to lies
     outside the predicate. The tree and the table agree; nothing is wrong. A `where t < ?` bound
-    to a value of that kind reads every entry under the prefix and rejects most of them.
+    to a value of that kind rejects most of the entries it reads, up to the 256 after which it
+    finishes by scanning the table (`scan=`, below).
 
   It is a floor for the same reason `matched=` is. One more thing can make `matched=` exceed the
   rows a `limit` asked for: text at or above U+D800 (an emoji, `～`, a private-use character) is

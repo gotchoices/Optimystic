@@ -23,11 +23,9 @@ import type { RowData, ParsedOptimysticOptions, TransactionState } from '../type
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
 import { LateBoundCohortReachability } from './late-bound-reachability.js';
+import { compareTreeKeys } from '../schema/key-encoding.js';
 
 const log = createLogger('collection-factory');
-
-/** The total order every tree this factory opens keeps its keys in: raw string comparison. */
-export const compareTreeKeys = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * A libp2p node this factory holds. Nodes it builds itself (`createLibp2pNode`) carry the full

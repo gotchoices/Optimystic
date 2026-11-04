@@ -2,7 +2,7 @@
  * key-encoding — order-preserving, injective tuple framing for tree keys.
  *
  * Both the data trees (primary keys) and the index trees are ordered by a plain
- * lexicographic string comparator (see collection-factory.ts `compare`). A composite
+ * lexicographic string comparator ({@link compareTreeKeys}). A composite
  * key is a tuple of column payloads that must survive round-tripping through that raw
  * UTF-16 code-unit ordering. The naive `parts.join('\x00')` this replaces is neither
  * injective (a payload containing the `\x00` separator shifts element boundaries so
@@ -66,6 +66,9 @@ const ESCAPE_HI = '\xff';
  * escape byte (`\xff`).
  */
 export const KEY_PREFIX_END = '\x03';
+
+/** The total order every tree keeps its keys in: raw string comparison, by UTF-16 code unit. */
+export const compareTreeKeys = (a: string, b: string): -1 | 0 | 1 => (a < b ? -1 : a > b ? 1 : 0);
 
 /**
  * Escape a payload so no bare `\x00` survives inside it: `\x00` -> `\x00\xff`.

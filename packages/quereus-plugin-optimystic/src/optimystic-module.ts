@@ -5,7 +5,7 @@
  * virtual tables backed by Optimystic distributed tree collections.
  */
 
-import { CollectionFactory, compareTreeKeys } from './optimystic-adapter/collection-factory.js';
+import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
@@ -34,7 +34,7 @@ import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKe
 import { WALK_ROWS_BEFORE_SCAN, bytesOrderAsValues, inEngineOrder, indexRangeScan, indexSeekCanBeTrusted, restOfWalk, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
 import type { RangeBound } from './schema/index-walk.js';
 import { IndexPredicate } from './schema/index-predicate.js';
-import { splitKeyTuple } from './schema/key-encoding.js';
+import { compareTreeKeys, splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
 import type { PrimaryKeyTuple } from './schema/key-tuples.js';
 import { createLogger, revisionToken } from './logger.js';
@@ -126,8 +126,8 @@ interface IndexScanPlan {
    * Whether the scan finishes by scanning the table once it has read {@link WALK_ROWS_BEFORE_SCAN}
    * entries: a walk of the whole index or a range predicate's span, one range at most, whose row
    * count nothing knows in advance. An equality seek or multi-seek reads the statement's own rows
-   * and never does. Neither shape this is set on runs over a partial index, which
-   * `getBestAccessPlan` never plans through, so every row of the table has an entry to compare.
+   * and never does. Nor does a read of a partial index ({@link holdsEveryRow}), whatever this says:
+   * the table holds rows the index never had. `getBestAccessPlan` plans through none today.
    */
   readonly mayFinishByScanning?: boolean;
 }
@@ -143,7 +143,7 @@ interface IndexScanPlan {
  *   from "entries found, rows resolved, verification rejected them later".
  * - `rejected` — how many of those entries the scan did NOT yield: the row their primary
  *   key names is gone, it is there but does not imply the entry (see the verification in
- *   {@link OptimysticVirtualTable.executeIndexScan}), a multi-seek already yielded it under
+ *   {@link OptimysticVirtualTable.verifiedIndexRows}), a multi-seek already yielded it under
  *   an earlier key, or the row failed a range bound the tree could not apply
  *   ({@link IndexScanPlan.rowTest}, a bound the `seek=` field prints as the open end of a
  *   `low:high` range). It is otherwise invisible from the read path, which now answers
@@ -2496,7 +2496,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     // row is tracked by primary key to be yielded, and so updated, once, at a memory cost
     // proportional to the rows returned. A scan that may finish by scanning tracks them for the same
     // reason, at a cost of at most WALK_ROWS_BEFORE_SCAN keys. An equality seek keeps nothing.
-    const tracksYielded = scan.ranges.length > 1 || scan.mayFinishByScanning === true;
+    const finishesByScanning = scan.mayFinishByScanning === true && holdsEveryRow(index.schema);
+    const tracksYielded = scan.ranges.length > 1 || finishesByScanning;
     const yielded = new Set<string>();
 
     // Each entry is checked against the row it resolves to before that row is yielded, and
@@ -2533,7 +2534,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
     // the fetch: a healthy entry's own tree key already carries the answer.
     const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
-    const entriesBeforeScan = scan.mayFinishByScanning === true ? WALK_ROWS_BEFORE_SCAN : Infinity;
+    const entriesBeforeScan = finishesByScanning ? WALK_ROWS_BEFORE_SCAN : Infinity;
     for (const { range, sought } of scan.ranges) {
       // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
       // part-way still names the key it was seeking rather than reporting `unset`.

@@ -113,7 +113,7 @@ shape is served from the local materialized tree without first reconciling.
 
 A secondary index tree's key is `frame(indexValues) ‖ frame(primaryKey)`, compared as raw UTF-16
 code units (`compareTreeKeys` in
-`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`), and `BTree.range`
+`packages/quereus-plugin-optimystic/src/schema/key-encoding.ts`), and `BTree.range`
 walks it in either direction. So a walk of the tree, forwards or backwards, delivers rows ordered by
 the index's columns and then the primary key's — the **walk key** — wherever the stored bytes order
 as the engine orders the values. `walkDelivering` in
