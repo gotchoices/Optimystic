@@ -3012,6 +3012,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		if (deltas === undefined) {
 			return false;
 		}
+		// NOTE: each read here awaits with the head already folded into the cache and still staged in
+		// the live tracker, so an unlatched read of a touched block in that window applies the head's
+		// operations twice. Only when the cache evicted such a block (128 entries, LRU) under a later
+		// segment's update; the coordinator's per-entry commit opens the same window for its second
+		// participant onwards. Backlog `bug-a-folded-head-stays-in-the-live-tracker-across-an-await`.
 		for (const id of touched) {
 			if (!this.sourceCache.retains(id) && deltas.some(delta => (delta.updates?.[id]?.length ?? 0) > 0)) {
 				await this.sourceCache.tryGet(id, 'navigation');
@@ -3181,13 +3186,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 				this.recordSealedRefusal(segment, err, segment.entryId !== unreported);
 			}
 		}
-		const open = this.segments.openActions();
-		this.segments.setOpen(unitsOf(open));
-		const restaged: StagedUnit<TAction>[] = [];
-		for (const action of open) {
-			const { transforms, applied } = await this.internalTransact(action);
-			restaged.push({ action, delta: transforms, applied });
-			this.segments.setOpen([...restaged, ...unitsOf(open.slice(restaged.length))]);
+		// The list holds this array from here on, so each unit is recorded in place as its action
+		// is re-staged, and a throw leaves the units behind it with no staging on record.
+		const units = unitsOf(this.segments.openActions());
+		this.segments.setOpen(units);
+		for (const [index, unit] of units.entries()) {
+			const { transforms, applied } = await this.internalTransact(unit.action);
+			units[index] = { action: unit.action, delta: transforms, applied };
 		}
 	}
 
