@@ -1750,7 +1750,7 @@ interface RenewV1 {
 > **When the check runs.** Only once the frame would otherwise act, so most frames that cannot act cost no
 > crypto (`resolveAuthenticatedRenew` in `packages/db-p2p/src/cohort-topic/host.ts`). A frame with no record
 > here, or one the freshness gate below refuses, gets its refusal without verification, and that refusal is
-> the same answer a forged frame gets, so answering early tells a sender nothing it could not already learn.
+> the same answer a forged frame gets, so answering early changes no reply, only how soon it comes (the `NOTE:` at `resolveAuthenticatedRenew`).
 > Otherwise the host verifies with the platform's own verifier (`verifyPeerSigAsync` in
 > `packages/db-p2p/src/cohort-topic/peer-sig.ts`: native in Node, WebCrypto Ed25519 where the runtime provides
 > it), then looks the record up again and runs the renew with a clock taken after the wait, since the wait can

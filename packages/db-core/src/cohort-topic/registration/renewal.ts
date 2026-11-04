@@ -404,8 +404,8 @@ export interface RenewalCohortSide {
 	onRenew(msg: RenewV1, now: number): RenewReplyV1;
 	/**
 	 * The answer the privileged `msg` gets whatever its signature says: no record, or it fails the freshness gate.
-	 * Undefined: the signature decides. A stale frame and a forged one get the same answer, so asking first tells
-	 * a sender nothing it could not already learn.
+	 * Undefined: the signature decides. A stale frame and a forged one get the same answer, so asking first changes
+	 * no reply.
 	 */
 	refusalBeforeSignature(msg: RenewV1, now: number): RenewReplyV1 | undefined;
 	/** The opaque answer to a privileged renew whose signature failed. */

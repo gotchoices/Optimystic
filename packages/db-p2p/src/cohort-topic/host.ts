@@ -1578,11 +1578,13 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		}
 		// Ahead of root-group reads and engine creation, so a forged frame reads no group and creates no engine,
 		// and after every refusal that needs no crypto. Probes take this path too.
+		// NOTE: a host stopped during this wait still runs the rest, and `forCoord` then adds an engine to a registry
+		// `stop()` has already closed. Only that register drives the engine: the gossip timer has stopped, and a cold
+		// quorum wait ends at its own bound on an unref'd timer. So it lasts only as long as the host object. If an engine
+		// ever starts a repeating timer of its own, make `forCoord` refuse after close.
 		if (origin === "remote" && nodeKey !== undefined && !(await peerSignatureVerifies("a register frame", reg.participantCoord, reg.signature, registerSigningPayload(reg)))) {
 			return { v: 1, result: "no_state" };
 		}
-		// Taken after the wait: the anti-DoS guards and the record stamps judge the clock the decision is made at.
-		const now = Date.now();
 		const topicId = b64urlToBytes(reg.topicId);
 		const participantCoord = b64urlToBytes(reg.participantCoord);
 		// FRET's ActivityHandler does not carry the routed key, so recompute the coordinate from the frame. For
@@ -1616,7 +1618,9 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		// forgeable, so the engine's step-1 bootstrap-evidence gate — which demands the same proof for
 		// `followOn: true` as for a `bootstrap: true` cold-root — is what keeps it honest (§Anti-DoS).
 		const followOn = reg.followOn === true;
-		return coordEngine.engine.handleRegister(reg, { followOn, treeTier: reg.treeTier, parentCoord }, now);
+		// The clock is read here, after the signature check and the root-group read have both waited: the anti-DoS
+		// guards and the record stamps judge the moment the decision is made.
+		return coordEngine.engine.handleRegister(reg, { followOn, treeTier: reg.treeTier, parentCoord }, Date.now());
 	};
 
 	// --- child-link dispatch: verify + record a child cohort (parent side) ---
@@ -3251,7 +3255,12 @@ export function resolveRenew(registry: CoordRegistry, renew: RenewV1, now: numbe
 /**
  * Resolve a withdraw or re-attach from another machine, checking its signature with the platform verifier only
  * once the frame would act. No record and a frame the freshness gate refuses are answered without crypto; both
- * answers are what a forged frame gets, so answering early tells a sender nothing it could not already learn.
+ * answers are what a forged frame gets, so answering early changes no reply.
+ *
+ * NOTE: accepted — it does change how soon the reply comes, so a stranger timing forged frames can tell whether a
+ * timestamp is newer than a record's `lastPing`, and so roughly when that participant last pinged (from reading the
+ * code; not measured). The replies already show whether a record exists, and `lastPing` protects nothing today. If it
+ * ever does, verify before answering a frame that holds a record.
  *
  * The verification can outlast the engine or the record, so the holder is looked up again after it, and the renew
  * then runs with a clock taken after the wait, which re-runs the freshness gate against current state.
