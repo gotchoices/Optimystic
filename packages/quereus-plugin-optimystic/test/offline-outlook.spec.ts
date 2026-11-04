@@ -11,6 +11,8 @@
 
 import { expect } from 'chai';
 import type { SqlValue } from '@quereus/quereus';
+import { waitFor } from '@optimystic/db-core/test';
+import { PowerLossKVStore } from '@optimystic/db-p2p/testing';
 import type { CommitOutlook, QueuedTransactionStatus } from '../dist/index.js';
 import { createMeshDbNode, startMockMesh, type MeshDbNode } from './mesh-node-harness.js';
 import { expectAssuredFailures } from './outlook-predictions.js';
@@ -100,6 +102,34 @@ async function queuedOutlook(node: Node, sql: string): Promise<{ transactionId: 
 
 const assured = (dependsOn: CommitOutlook['dependsOn'] = []): CommitOutlook =>
 	({ kind: 'assured', exposures: [], dependsOn, unchecked: [] });
+
+/** A journal that holds back one transaction's outcome record until {@link release}: until then that
+ * entry has left the queue and has not had its terminal status. */
+class OutcomeHeldJournal extends PowerLossKVStore {
+	private outcomeKey: string | undefined;
+	private gate: Promise<void> | undefined;
+	private open: (() => void) | undefined;
+	private reached!: () => void;
+	/** Resolves once the held outcome's write has arrived. */
+	readonly held = new Promise<void>(resolve => { this.reached = resolve; });
+
+	holdOutcomeOf(transactionId: string): void {
+		this.outcomeKey = `optimystic-offline/default/outcomes/${transactionId}`;
+		this.gate = new Promise(resolve => { this.open = resolve; });
+	}
+
+	release(): void {
+		this.open?.();
+	}
+
+	override async set(key: string, value: string): Promise<void> {
+		if (key === this.outcomeKey) {
+			this.reached();
+			await this.gate;
+		}
+		return super.set(key, value);
+	}
+}
 
 describe('Offline mode: the outlook of a queued transaction', function () {
 	this.timeout(30_000);
@@ -377,5 +407,29 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		expect(failed?.reason).to.equal('concurrent-modification');
 		expect(failed?.causedBy, 'the nearest failing transaction ahead of it').to.equal(first.transactionId);
 		expectAssuredFailures(node.plugin, 0);
+	});
+
+	it('a discard that settles while the entry ahead of it is still leaving is followed when that entry commits: a later writer of its key does not depend on it', async () => {
+		const { transactorFor } = await startMockMesh(1);
+		const journal = new OutcomeHeldJournal();
+		const node = followed(createMeshDbNode(transactorFor(0), { offline: { recheck: { baseMs: 20, maxMs: 100 }, journal } } as unknown as Record<string, SqlValue>));
+		let open = false;
+		node.plugin.collectionFactory.registerCohortReachability('shared:test', { reachable: () => Promise.resolve(open) });
+		for (const sql of [createNotes, createUsers]) await node.db.exec(sql);
+		node.plugin.offline.enter();
+		const leaving = await queuedOutlook(node, `insert into Notes (id, body) values ('n1', 'a')`);
+		const discarded = await queuedOutlook(node, `insert into Users (name, bio) values ('ada', 'a')`);
+
+		journal.holdOutcomeOf(leaving.transactionId);
+		open = true;
+		await journal.held;
+		node.plugin.offline.discard(discarded.transactionId);
+		await waitFor(() => node.statuses.some(status => status.kind === 'failed' && status.transactionId === discarded.transactionId));
+		journal.release();
+		await node.plugin.offline.whenDrained();
+
+		open = false;
+		const later = await queuedOutlook(node, `insert into Users (name, bio) values ('ada', 'b')`);
+		expect(later.outlook?.dependsOn, 'the discarded transaction has left the queue').to.deep.equal([]);
 	});
 });

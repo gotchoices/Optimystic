@@ -962,7 +962,8 @@ After any other status that changes what is queued — an entry partly committed
 restore put back ahead of others — the controller walks the whole queue in order instead
 (`followOutlooks`, same file) and rebuilds the index and the reverse map, since each of these can
 change other entries' dependencies in other ways. A commit takes the walk too while a queued entry
-has no judgement or another entry is on its way out. For each entry the walk drops the exposures and
+has no judgement, another entry is on its way out, or an earlier walk is still owed because it had to
+wait. For each entry the walk drops the exposures and
 guards in collections a partial commit has committed, since those have passed; computes `dependsOn`
 again against the entries ahead of it as they are now and the deferred records numbered below it; and
 derives `kind` from both, each dependency's kind being the one computed earlier in the same walk. Both

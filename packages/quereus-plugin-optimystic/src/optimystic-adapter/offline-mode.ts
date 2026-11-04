@@ -209,6 +209,10 @@ export class OfflineMode {
 	 * NOTE: holds a small map per key the queue writes for as long as the key is queued; if bulk offline
 	 * writes ever make that heavy, hold a key's one writer inline until a second appears. */
 	private queueWrites = new WriteIndex();
+	/** A status has asked for a {@link followQueue} that has not completed: it waited for a transaction
+	 * on its way out, or a follow threw. Until one completes, {@link judgements} and {@link queueWrites}
+	 * are not what {@link followCommitted} assumes. */
+	private walkOwed = false;
 	/** What each queued transaction's statements' write descriptions said about its elements, handed in
 	 * ahead of the `queued` status that judges it — by {@link enqueue} ahead of the enqueue, where the
 	 * journal also writes them into the entry record, and by the restore ahead of `queue.restore`, read
@@ -757,6 +761,9 @@ export class OfflineMode {
 	}
 
 	// ── the outlook ────────────────────────────────────────────────────────────────────────────
+	// NOTE: this file is about 1330 lines (`wc -l`), and this section is where it would split: its state
+	// is `judgements`, `dependents`, `queueWrites`, `walkOwed` and `entryFacts`. If the file grows much
+	// further, move the section behind one class.
 
 	/**
 	 * The outlook the open transaction would get were it committed now (docs/offline-sync.md §Using
@@ -883,6 +890,7 @@ export class OfflineMode {
 	 */
 	private followQueue(): void {
 		let changed: OutlookChange[];
+		this.walkOwed = true;
 		try {
 			const entries = this.queue.entries();
 			const queued = new Set(entries.map(entry => entry.id));
@@ -892,6 +900,7 @@ export class OfflineMode {
 			changed = this.holdFollowed(followOutlooks(entries.map(entry => this.followedEntry(entry)), this.deferredBelow(Infinity)), true);
 			this.dependents.clear();
 			for (const [transactionId, { outlook }] of this.judgements) this.noteDependencies(transactionId, outlook);
+			this.walkOwed = false;
 		} catch (error) {
 			log('offline:outlook-unfollowed: the recomputation threw: %o', error);
 			return;
@@ -911,6 +920,7 @@ export class OfflineMode {
 			changed = this.holdFollowed(followCommit(transactionId, this.judgements, this.dependents, id => this.queue.segmentRefused(id)), false);
 			this.dependents.delete(transactionId);
 		} catch (error) {
+			this.walkOwed = true;
 			log('offline:outlook-unfollowed: the recomputation threw: %o', error);
 			return;
 		}
@@ -977,13 +987,18 @@ export class OfflineMode {
 	}
 
 	/**
-	 * Follow `status` if it changes what is queued. A commit with every queued transaction judged and
-	 * no other on its way out takes {@link followCommitted}; everything else takes {@link followQueue}:
-	 * a failure, a partial commit and a restore can each change other transactions' dependencies in
-	 * ways a commit cannot, and the walk knows to wait for a removal in progress.
+	 * Follow `status` if it changes what is queued. A commit with every queued transaction judged, no
+	 * other on its way out and no walk owed takes {@link followCommitted}; everything else takes
+	 * {@link followQueue}: a failure, a partial commit and a restore can each change other transactions'
+	 * dependencies in ways a commit cannot, and the walk knows to wait for a removal in progress.
+	 *
+	 * NOTE: the size check is a count, so one transaction whose judgement threw beside one on its way
+	 * out passes it. The commit then follows narrowly with the leaving one's kind still held, and that
+	 * one's terminal status runs the walk. It needs a defect in a judgement as well as a discard; if it
+	 * is ever seen, have the queue say a removal is in progress rather than comparing counts.
 	 */
 	private followStatus(status: EntryStatus, firstQueued: boolean): void {
-		if (status.kind === 'committed' && this.judgements.size === this.queue.queueState().depth) {
+		if (status.kind === 'committed' && !this.walkOwed && this.judgements.size === this.queue.queueState().depth) {
 			this.followCommitted(status.entryId);
 		} else if (this.changesTheQueue(status, firstQueued)) {
 			this.followQueue();
