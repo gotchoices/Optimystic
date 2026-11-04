@@ -788,6 +788,8 @@ export class OptimysticVirtualTable extends VirtualTable {
   private unknownProfileLogged = false;
   /** The columns whose merge tag value named no merge were logged; once per column. */
   private readonly unknownMergeLogged = new Set<string>();
+  /** Keys the delete arm removed, per open transaction. See {@link removedEarlierInTransaction}. */
+  private readonly removedKeys = new WeakMap<TransactionState, Set<string>>();
   /** What the offline-mode controller asks to judge a transaction's checks on this table's trees,
    * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
   private readonly outlookSource: TableOutlookSource = {
@@ -3236,6 +3238,27 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Whether the row at `key` is gone because this table's delete arm already removed it in this
+   * transaction. The source scan can yield a row that an earlier row of the same statement then
+   * removes through a self-referencing cascade, and the engine's answer for that is "not found"
+   * (`ok` with no row). Any other miss still throws in {@link requirePreWriteRow}: a transient read
+   * miss answered as "not found" would lose the delete silently. A key put back since is present, so
+   * it is deleted as usual, and a savepoint rollback leaving a stale key changes nothing for the same
+   * reason.
+   */
+  private async removedEarlierInTransaction(key: string, transaction: TransactionState | null): Promise<boolean> {
+    if (!transaction || !this.removedKeys.get(transaction)?.has(key)) return false;
+    return !(await this.collection?.get(key));
+  }
+
+  private noteRemovedInTransaction(key: string, transaction: TransactionState | null): void {
+    if (!transaction) return;
+    const removed = this.removedKeys.get(transaction);
+    if (removed) removed.add(key);
+    else this.removedKeys.set(transaction, new Set([key]));
+  }
+
+  /**
    * Performs an INSERT, UPDATE, or DELETE operation
    */
   async update(args: UpdateArgs): Promise<UpdateResult> {
@@ -3606,6 +3629,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             const oldKeyTuple = this.rowCodec.asPrimaryKeyTuple(args.oldKeyValues);
             const deleteKey = this.rowCodec.createPrimaryKey(oldKeyTuple);
 
+            if (await this.removedEarlierInTransaction(deleteKey, txnState)) {
+              return { status: 'ok' };
+            }
+
             // Must precede the stage() below (which clears the slot) — see
             // requirePreWriteRow.
             const { row: oldRow, entry: oldEntry } = await this.requirePreWriteRow('DELETE', deleteKey, oldKeyTuple);
@@ -3623,6 +3650,7 @@ export class OptimysticVirtualTable extends VirtualTable {
             // its index deletes below finding nothing. No description is needed for that,
             // so a cascade child delete carries it too (see unchangedOrAbsent).
             await this.collection.stage([[deleteKey, undefined, unchangedOrAbsent(oldEntry)]]);
+            this.noteRemovedInTransaction(deleteKey, txnState);
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);

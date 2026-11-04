@@ -104,6 +104,15 @@ describe('A delete reports the row it removed', function () {
 				]);
 			});
 
+			// The source scan yields the child, which deleting the parent has removed by then.
+			it('a delete selecting both ends of a self-referencing cascade reports only the row it reached first', async () => {
+				const db = await openDb();
+				await db.exec(`create table T (id integer primary key, pid integer null references T(id) on delete cascade) ${usingClause('t')}`);
+				await db.exec('insert into T (id, pid) values (1, null), (2, 1), (3, null)');
+				expect(await queryAll(db, 'delete from T where id in (1, 2) returning id')).to.deep.equal([{ id: 1 }]);
+				expect(await queryAll(db, 'select id from T')).to.deep.equal([{ id: 3 }]);
+			});
+
 			// The engine collects the keys its end-of-statement restrict check probes only after it has
 			// seen a row in the module's answer; on an engine older than that this passes without the row.
 			it('on delete restrict refuses the delete and keeps both rows', async () => {
