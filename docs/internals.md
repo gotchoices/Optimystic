@@ -109,6 +109,86 @@ which spies on `query()` / the execute* methods / `Tree.update` and confirms tha
 writer's committed rows are visible to a count-only reader after that pull. No read
 shape is served from the local materialized tree without first reconciling.
 
+#### An ordered read walks a secondary index
+
+A secondary index tree's key is `frame(indexValues) ‖ frame(primaryKey)`, compared as raw UTF-16
+code units (`compareTreeKeys` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`), and `BTree.range`
+walks it in either direction. So a walk of the tree, forwards or backwards, delivers rows ordered by
+the index's columns and then the primary key's — the **walk key** — wherever the stored bytes order
+as the engine orders the values. `walkDelivering` in
+`packages/quereus-plugin-optimystic/src/schema/index-walk.ts` decides at plan time which required
+orderings those are, and `getBestAccessPlan` in
+`packages/quereus-plugin-optimystic/src/optimystic-module.ts` answers such a request with
+`providesOrdering`, `orderingIndexName` and an `indexDescriptor` whose `reverse` says which way
+(`walkDescriptor`). Four rules decide the claim:
+
+- **Which columns.** The required columns, less any **pinned** by a usable `=` or single-element
+  `in` filter (constant in the surviving rows, claimed or residual; only when the column's own
+  collation is BINARY and its type is not `boolean`, `any` or compared by meaning, so that equal
+  values have equal bytes — `where a = 'x'` on a `nocase` column keeps `'X'` and `'x'`, which sit in
+  separate groups of the tree), must match the walk key positionally with its pinned columns
+  skipped. An index on `(T)` therefore delivers `order by T, Id` when `Id` is a TEXT primary key.
+  An index column's own `desc` is ignored: nothing writes it into the key, so every tree is ascending
+  in its bytes.
+- **Which types.** Each matched column must be TEXT stored raw, BINARY on both the table column
+  and the key column, and not of a type that compares by meaning (`hasSemanticOrdering`: `timespan`
+  is TEXT but orders by elapsed time). A number is framed as `toExponential`, a blob as base64,
+  neither order-preserving; `json` is not TEXT.
+- **One direction.** Every remaining required column must be ascending, or every one descending,
+  which sets `reverse`. Nothing remaining is a forward walk, and is claimed for a seek (`where a = ?
+  order by a`) but proposed as no walk candidate — any access path delivers it.
+- **No NULL.** No NULL may reach a matched column in EITHER direction
+  (`nullSafeOrderingPrefixLength`, asked as if every key column were descending): the engine drops
+  an explicit `nulls first`/`nulls last` before the request reaches a module, so a module cannot
+  honour the placement (blocked ticket
+  `quereus-explicit-nulls-placement-is-lost-when-an-index-serves-order-by`). A column is safe when
+  it is NOT NULL (Quereus's default), pinned, or under a NULL-excluding filter such as `is not null`.
+  Once the engine keeps such a sort, the rule narrows to descending.
+
+**Pricing.** With an ordering required, candidates compete on their own cost plus
+`rows · log2(rows) · 0.1` for any that leaves the ordering to the engine's Sort (`sortCost`,
+mirroring the memory module's unexported `SORT_COST_PER_COMPARISON`); the returned `cost` stays the
+plan's own. A walk candidate per non-partial index that `walkDelivering` accepts costs one descent
+plus the rows wanted, claims no filter (every one stays a residual above it) and reports the table's
+row count, so it beats a scan and sort, while a selective seek on another index that leaves a small
+sort still beats it. An index the catalog lists but this table instance does not maintain is skipped
+as a walk candidate rather than chosen and refused; the equality path keeps its throw
+(`assertIndexMaintained`). A user's `LIMIT` sits above the Sort the walk replaces and never reaches
+the module (Quereus backlog `feat-sort-absorb-blind-to-limit-general`; only
+`rule-minmax-index-boundary` sends `request.limit`), so `order by T limit 10` and `order by T` are
+priced alike and the walk is claimed for both: a page reads about as many entries and rows as it
+returns, where the engine used to sort the whole table, and an ordered read of the whole table
+fetches one row per entry, about five times a scan, until
+`a-long-index-walk-finishes-by-scanning-the-table` lands.
+
+**Reading.** The engine's ordering-only arm emits `idx=<name>(0);plan=0` with no arguments;
+`runQuery` routes that through the index (`scanIndexName`), inside the same synchronous block that
+builds the views, so a committed read still pins both views at one moment. The direction is read off
+`filterInfo.accessPath` (`index.reverse`), a hand-built `FilterInfo` walking forward. Every index
+scan — one key, several, or the whole index — reads through one entry loop,
+`IndexManager.walkEntriesIn` in `packages/quereus-plugin-optimystic/src/schema/index-manager.ts`,
+over `indexValueRange` in the scan's direction; the empty prefix brackets every entry. Each entry is
+verified against the row it names (`rowImpliesEntry`) as before. The `index:seek` trace gains
+`dir=asc|desc` ([debugging.md §Which revision did a read descend?](debugging.md#which-revision-did-a-read-descend)).
+
+**Where the two orders differ.** The tree compares code units; the engine's BINARY collation
+compares code points (`compareCodePoints` in `@quereus/quereus/src/util/comparison.ts`). They
+disagree exactly when, at the first differing position, one string has a high surrogate and the
+other a unit at or above U+E000 — an emoji against `～`. Nothing stored changes for it; `inEngineOrder`
+in `packages/quereus-plugin-optimystic/src/schema/index-walk.ts` repairs the walk's rows as they come: a row
+none of whose walk-key columns holds a unit at or above U+D800 is a **pivot**, which compares the
+same way under both orders against every other row, so everything the walk returned before it stays
+before it in the engine's order and everything after stays after. Rows between pivots are held in a
+run and, at the next pivot or the end of the walk, sorted by the walk key with `compareSqlValues`
+(negated when reversed), then yielded. Text below U+D800 — BMP scripts, CJK and Hangul included — is
+never buffered, so a `limit` stops the walk at the first rows; a lone surrogate is never a pivot, so
+the order stays total and deterministic. Comparing the whole walk key rather than the claimed
+columns needs no record of what was claimed: rows that tie on the claimed columns may come out in
+either order. `packages/quereus-plugin-optimystic/test/ordering-claim-guard.spec.ts` pins the
+claim and `packages/quereus-plugin-optimystic/test/index-ordered-walk.spec.ts` the walk, against a
+memory table holding the same rows.
+
 #### Conflict replay must read at the revision it is adopting, not the one it is leaving
 
 `Collection.updateInternal` (`packages/db-core/src/collection/collection.ts`) advances

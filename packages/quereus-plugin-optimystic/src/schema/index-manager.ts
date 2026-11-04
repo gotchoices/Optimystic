@@ -205,19 +205,25 @@ export function hasNullIndexValue(index: StoredIndexSchema, row: Row): boolean {
  * `[indexKey, indexKey + KEY_PREFIX_END)`. Tree keys are `indexKey ‖ framedPrimaryKey`,
  * so every match begins with the complete framed prefix; see {@link KEY_PREFIX_END} for
  * why the terminator-successor `\x01` would wrongly also match a longer value whose
- * escape happens to continue past the prefix.
+ * escape happens to continue past the prefix. The EMPTY prefix (`indexKeyFromValues([])`)
+ * brackets every well-framed entry, since each begins with a tag below `KEY_PREFIX_END`:
+ * that is the range an ordered walk of the whole index reads.
+ *
+ * `ascending` is the direction the range is walked in. A `KeyRange`'s `first` is where the
+ * walk STARTS and `last` where it ENDS, in walk order, so a descending range names the
+ * exclusive upper bound first and the inclusive lower bound last — the same two keys, swapped.
  *
  * THE one definition of "the entries for this index value": the seek path
  * ({@link IndexManager.findEntriesIn}) scans it, and the unique-index write guard
  * ({@link uniquePrefixGuard}) claims it. A drift between the two would let a seek find a
  * duplicate the guard never refused (or the reverse), so they must share this formula.
  */
-export function indexValueRange(indexKey: IndexKey): KeyRange<string> {
-	return new KeyRange<string>(
-		{ key: indexKey, inclusive: true },
-		{ key: indexKey + KEY_PREFIX_END, inclusive: false },
-		true, // ascending
-	);
+export function indexValueRange(indexKey: IndexKey, ascending = true): KeyRange<string> {
+	const lower = { key: indexKey, inclusive: true };
+	const upper = { key: indexKey + KEY_PREFIX_END, inclusive: false };
+	return ascending
+		? new KeyRange<string>(lower, upper, true)
+		: new KeyRange<string>(upper, lower, false);
 }
 
 /**
@@ -668,8 +674,8 @@ export class IndexManager {
 	}
 
 	/**
-	 * Every ENTRY in the seek's prefix range, in tree order — the whole `[treeKey, primaryKey]`
-	 * pair rather than {@link findByIndexIn}'s primary key alone.
+	 * Every ENTRY in the seek's prefix range, in ascending tree order — the whole
+	 * `[treeKey, primaryKey]` pair rather than {@link findByIndexIn}'s primary key alone.
 	 *
 	 * The tree key is what makes an entry checkable: with it and the row its primary key
 	 * resolves to, {@link rowImpliesEntry} decides whether the entry belongs to that row.
@@ -678,22 +684,13 @@ export class IndexManager {
 	 *
 	 * The read source is assumed already current (this method never refreshes it).
 	 */
-	async* findEntriesIn(
+	findEntriesIn(
 		read: TreeReadView<IndexKey, IndexEntry>,
 		indexKey: IndexKey
 	): AsyncIterable<IndexEntry> {
 		// Range scan for all entries whose framed index tuple equals `indexKey` — the
 		// same range the unique-index write guard claims (see indexValueRange).
-		for await (const path of read.range(indexValueRange(indexKey))) {
-			if (!read.isValid(path)) {
-				continue;
-			}
-
-			const entry = read.at(path);
-			if (entry != null) {
-				yield entry;
-			}
-		}
+		return this.walkEntriesIn(read, indexValueRange(indexKey));
 	}
 
 	/**
@@ -702,8 +699,25 @@ export class IndexManager {
 	 * an entry whose key is not even well framed is still returned — the integrity check
 	 * exists to see exactly those. Like findEntriesIn, it never refreshes the source.
 	 */
-	async* allEntriesIn(read: TreeReadView<IndexKey, IndexEntry>): AsyncIterable<IndexEntry> {
-		for await (const path of read.range(new KeyRange<string>(undefined, undefined, true))) {
+	allEntriesIn(read: TreeReadView<IndexKey, IndexEntry>): AsyncIterable<IndexEntry> {
+		return this.walkEntriesIn(read, new KeyRange<string>(undefined, undefined, true));
+	}
+
+	/**
+	 * THE entry loop: every entry of `read` in `range`, in the range's own direction. A seek
+	 * ({@link findEntriesIn}), the integrity check ({@link allEntriesIn}) and the query path's
+	 * ordered walk (`executeIndexScan`, over {@link indexValueRange} in either direction) all
+	 * read entries through here, so what an entry is — a valid path holding a non-null pair — is
+	 * decided once. Never refreshes the source.
+	 */
+	async* walkEntriesIn(
+		read: TreeReadView<IndexKey, IndexEntry>,
+		range: KeyRange<string>,
+	): AsyncIterable<IndexEntry> {
+		// NOTE: a live walk that has yielded throws on a concurrent change, where the table scan it
+		// replaces resumes after its last key (executeTableScan). If ordered reads polled during an
+		// offline drain surface "Path is invalid", resume after the last entry the same way.
+		for await (const path of read.range(range)) {
 			if (!read.isValid(path)) {
 				continue;
 			}

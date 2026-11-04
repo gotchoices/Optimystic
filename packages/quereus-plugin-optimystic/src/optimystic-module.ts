@@ -15,8 +15,8 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ANY_TYPE, BOOLEAN_TYPE, ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, shiftSchemaIndicesForDrop } from '@quereus/quereus';
-import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
+import { ConflictResolution, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, isMultiValueEquality, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import type { VirtualTableModule, BaseModuleConfig, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
@@ -30,8 +30,8 @@ import { tagChangesBetween, withTagsOf } from './schema/tag-overlay.js';
 import type { TagSlots } from './schema/tag-overlay.js';
 import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged } from './schema/declared-tags.js';
 import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
-import { PhysicalType } from '@quereus/quereus';
-import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, indexValueRange, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
+import { inEngineOrder, indexSeekCanBeTrusted, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
 import { IndexPredicate } from './schema/index-predicate.js';
 import { splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
@@ -138,6 +138,13 @@ interface IndexSeekProbe {
 /** The `plan=` code of a multi-seek: one seek per argument, in `FilterInfo.args`. */
 const MULTI_SEEK_PLAN = 5;
 
+/**
+ * The `plan=` code of an ordered walk with no bounds and no arguments (`'scan'` in Quereus's
+ * `IndexPlanKind`): what the engine's ordering-only arm emits for a plan that names an index
+ * through `orderingIndexName` alone. Its direction travels on the access path's descriptor.
+ */
+const INDEX_WALK_PLAN = 0;
+
 /** One seek's values, in the column order of the index or primary key it seeks. */
 type SeekTuple = readonly unknown[];
 
@@ -177,8 +184,8 @@ function seekTuplesOf(filterInfo: FilterInfo, planType: number | undefined): rea
  * with bound parameters through unreduced.
  *
  * NOTE: the order is the tree's byte order, which is the index's declared order only for ascending
- * BINARY text (`treeDeliversOrdering`). Quereus requires a multi-seek to emit in the index's key
- * order because its isolation layer merges overlay rows by that order
+ * BINARY text (`bytesOrderAsValues` in schema/index-walk.ts). Quereus requires a multi-seek to emit
+ * in the index's key order because its isolation layer merges overlay rows by that order
  * (`docs/module-authoring.md` in the Quereus repository). This module is not wrapped by that layer,
  * so tree order is what it can offer and nothing here relies on more. If a table of this module is
  * ever wrapped in `using isolated`, a numeric or DESC multi-seek would be mis-merged: that needs
@@ -1848,11 +1855,14 @@ export class OptimysticVirtualTable extends VirtualTable {
       const isSecondaryIndex = indexName != null && indexName !== '_primary_';
 
       // The secondary index this scan reads through, if any: a modern index seek
-      // (idx=<name> with args) or a legacy index scan (idxNum >= 10, idxStr is the
-      // bare index name). Mirrors the dispatch order below — the legacy arm applies
-      // only when no modern plan matched first.
+      // (idx=<name> with args), an ordered walk of the whole index (idx=<name>;plan=0 with
+      // no args, which the engine emits for a plan that named the index through
+      // `orderingIndexName` alone — without this arm it would fall through to a table scan
+      // and the promised order would be lost without a word), or a legacy index scan
+      // (idxNum >= 10, idxStr is the bare index name). Mirrors the dispatch order below —
+      // the legacy arm applies only when no modern plan matched first.
       let scanIndexName: string | undefined;
-      if (isSecondaryIndex && filterInfo.args.length > 0) {
+      if (isSecondaryIndex && (filterInfo.args.length > 0 || planType === INDEX_WALK_PLAN)) {
         scanIndexName = indexName;
       } else if (
         filterInfo.idxNum >= 10
@@ -1896,16 +1906,21 @@ export class OptimysticVirtualTable extends VirtualTable {
       // says index-scan but a source is missing and the scan silently falls through to
       // a different access path.
       if (indexScan !== undefined) {
+        // The direction comes from the structured access path: a backward walk is one whose
+        // descriptor the planner marked `reverse` (walkDescriptor). A hand-built FilterInfo
+        // with no access path walks forward.
+        const reverse = filterInfo.accessPath?.kind === 'index' && filterInfo.accessPath.index.reverse === true;
+        const ranges = this.indexScanRanges(indexManager, indexScan.schema, seeks, reverse);
         // ONE site covers both arms, and neither view is rebuilt to trace it. The counter
         // is filled in by the scan as it produces entries; the line is emitted in a
         // `finally` so a consumer that abandons the iteration (a LIMIT, an error mid-scan)
         // still reports what the seek had produced by then.
         const probe: IndexSeekProbe | undefined = log.enabled ? { matched: 0, rejected: 0, keys: [] } : undefined;
         try {
-          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, seeks, probe);
+          yield* this.executeIndexScan(mainRead, rowCodec, indexManager, indexScan, ranges, reverse, probe);
         } finally {
           if (probe !== undefined) {
-            this.logIndexSeek(indexScan, mainTree, committed, probe);
+            this.logIndexSeek(indexScan, mainTree, committed, reverse, probe);
           }
         }
       } else if (planType === MULTI_SEEK_PLAN) {
@@ -2070,11 +2085,13 @@ export class OptimysticVirtualTable extends VirtualTable {
    * - `node=` — which node emitted the line ({@link CollectionFactory.nodeTag}). Two nodes
    *   writing one collection at the same instant used to emit byte-identical lines, so an
    *   operator could only attribute them positionally.
+   * - `dir=` — `asc` or `desc`: the direction the index tree was walked in. A backward walk
+   *   serves an `order by … desc`; a seek that claimed no ordering always walks forward.
    * - `seek=` — the framed index keys the descent bracketed on, in the order sought, each
    *   escaped by {@link printableSeekKey} and joined with commas (which the escaping leaves
    *   no key containing), so the line stays one whitespace-free token per field. Empty is
-   *   the whole-index prefix; `unset` means the scan sought nothing at all, and the two
-   *   must not be collapsed.
+   *   the whole-index prefix — an ordered walk of every entry; `unset` means the scan sought
+   *   nothing at all, and the two must not be collapsed.
    * - `matched=` — index entries the seek produced across those keys, counted before the
    *   row fetch, so "descended a stale index" is distinguishable from "descended a current
    *   index that genuinely has no entry".
@@ -2114,6 +2131,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     index: IndexScanSource,
     mainTree: Tree<string, RowData>,
     committed: boolean,
+    reverse: boolean,
     probe: IndexSeekProbe,
   ): void {
     const rev = (tree: {
@@ -2121,7 +2139,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       committedActionId(): string | undefined;
     }): string => revisionToken(tree.committedRevision() ?? 'none', tree.committedActionId() ?? 'none');
     log(
-      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s seek=%s matched=%d rejected=%d node=%s',
+      'index:seek table=%s index=%s collection=%s main=%s arm=%s rev=%s main_rev=%s dir=%s seek=%s matched=%d rejected=%d node=%s',
       this.tableName,
       index.schema.name,
       String(index.tree.getCollection().id),
@@ -2129,6 +2147,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       committed ? 'committed' : 'live',
       rev(index.tree),
       rev(mainTree),
+      reverse ? 'desc' : 'asc',
       probe.keys.length === 0 ? 'unset' : probe.keys.map(printableSeekKey).join(','),
       probe.matched,
       probe.rejected,
@@ -2240,29 +2259,73 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Execute an index-based scan. Both read sources are resolved by {@link runQuery}
-   * BEFORE this is called — for a committed read, in the same synchronous block as
-   * the main view, so the index entries and the rows they resolve to come from one
-   * committed moment. This method never builds or refreshes a view itself.
+   * The tree-key ranges an index scan walks, in the order to walk them: one per distinct sought
+   * key for an equality seek or multi-seek, and for a walk — no arguments, so one empty seek —
+   * the one range bracketing every entry ({@link indexValueRange} of the empty prefix). Each is
+   * built in the scan's direction; a backward multi-seek, which no plan claims today, would
+   * visit its keys from the highest down.
    *
-   * A multi-seek runs the same entry loop once per key over those same views: every seek reads
+   * NULL-bearing seeks are dropped ABOVE the key framing on purpose: indexKeyFromValues frames a
+   * NULL into a perfectly valid key — NULL has its own bare tag (key-encoding.ts) — which really
+   * does find the NULL-keyed row an INSERT stored. The scan's verification would not reject it
+   * either: the entry genuinely belongs to that row. Only refusing to seek at all is correct.
+   */
+  private indexScanRanges(
+    indexManager: IndexManager,
+    schema: StoredIndexSchema,
+    seeks: readonly SeekTuple[],
+    reverse: boolean,
+  ): KeyRange<string>[] {
+    const indexKeys = seekKeysInTreeOrder(seeks, seek => this.indexSeekKey(indexManager, schema, seek));
+    if (reverse) indexKeys.reverse();
+    return indexKeys.map(indexKey => indexValueRange(indexKey, !reverse));
+  }
+
+  /**
+   * Execute an index-based scan over `ranges` ({@link indexScanRanges}). Both read sources are
+   * resolved by {@link runQuery} BEFORE this is called — for a committed read, in the same
+   * synchronous block as the main view, so the index entries and the rows they resolve to come
+   * from one committed moment. This method never builds or refreshes a view itself.
+   *
+   * A multi-seek runs the same entry loop once per range over those same views: every seek reads
    * one refreshed or pinned moment, never a refresh per value.
+   *
+   * A single range — one sought key, or the whole index — is the shape whose order the engine
+   * may trust (`getBestAccessPlan` claims an ordering for no other), so its verified rows pass
+   * through {@link inEngineOrder}, which repairs the one text on which the tree's order and the
+   * engine's differ. The rows of a multi-seek, which claims no ordering, pass through as the
+   * tree yields them: in key order, as the engine asks of a multi-seek.
    */
   private async* executeIndexScan(
     mainRead: TreeReadView<string, RowData>,
     rowCodec: RowCodec,
     indexManager: IndexManager,
     index: IndexScanSource,
-    seeks: readonly SeekTuple[],
+    ranges: readonly KeyRange<string>[],
+    reverse: boolean,
     probe?: IndexSeekProbe,
   ): AsyncIterable<Row> {
-    // NULL-bearing seeks go ABOVE the key framing on purpose: indexKeyFromValues frames a NULL
-    // into a perfectly valid key — NULL has its own bare tag (key-encoding.ts) — which really
-    // does find the NULL-keyed row an INSERT stored. The verification below would not reject it
-    // either: the entry genuinely belongs to that row. Only refusing to seek at all is correct.
-    const indexKeys = seekKeysInTreeOrder(seeks, seek => this.indexSeekKey(indexManager, index.schema, seek));
+    const rows = this.verifiedIndexRows(mainRead, rowCodec, indexManager, index, ranges, probe);
+    if (ranges.length !== 1) {
+      yield* rows;
+      return;
+    }
+    yield* inEngineOrder(rows, walkKeyPositions(index.schema.columns, rowCodec.getPrimaryKeyIndices().map(position => ({ index: position }))), reverse);
+  }
 
-    // Each listed value's key is distinct, but a row can still have a valid entry under two of
+  /**
+   * Every row an index scan's entries resolve to and imply, range by range, in the order the tree
+   * yields the entries — the scan's loop proper, which {@link executeIndexScan} orders.
+   */
+  private async* verifiedIndexRows(
+    mainRead: TreeReadView<string, RowData>,
+    rowCodec: RowCodec,
+    indexManager: IndexManager,
+    index: IndexScanSource,
+    ranges: readonly KeyRange<string>[],
+    probe?: IndexSeekProbe,
+  ): AsyncIterable<Row> {
+    // Each sought key's range is distinct, but a row can still have a valid entry under two of
     // them: on a live read, a row whose value moves from one listed value to a later one in the
     // gap between the two seeks has an entry under each and passes verification under the second.
     // A scan that has yielded throws for a change between its steps, so that gap is narrow.
@@ -2270,7 +2333,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     // entries are ever visible to its later seek; today the engine finishes reading first. So a
     // row is tracked by primary key to be yielded, and so updated, once, at a memory cost
     // proportional to the rows returned.
-    const yielded = indexKeys.length > 1 ? new Set<string>() : undefined;
+    const yielded = ranges.length > 1 ? new Set<string>() : undefined;
 
     // Each entry is checked against the row it resolves to before that row is yielded, and
     // the check is the FULL one — `rowImpliesEntry`, the same predicate the integrity check
@@ -2306,11 +2369,12 @@ export class OptimysticVirtualTable extends VirtualTable {
     // a hot seek path ever shows up in a profile, the derivation is the part to narrow, not
     // the fetch: a healthy entry's own tree key already carries the answer.
     const indexKeyOf = (row: Row): IndexKey => indexManager.createIndexKey(index.schema, row);
-    for (const indexKey of indexKeys) {
+    for (const range of ranges) {
       // Recorded for the `index:seek` trace BEFORE the descent, so a scan that throws
-      // part-way still names the key it was seeking rather than reporting `unset`.
-      probe?.keys.push(indexKey);
-      for await (const entry of indexManager.findEntriesIn(index.read, indexKey)) {
+      // part-way still names the key it was seeking rather than reporting `unset`. The range's
+      // lower bound is the framed prefix sought, whichever way the range is walked.
+      probe?.keys.push((range.isAscending ? range.first : range.last)?.key ?? '');
+      for await (const entry of indexManager.walkEntriesIn(index.read, range)) {
         // Counted HERE, before the row fetch: `matched` must mean "entries the index
         // descent produced", not "rows that survived". An entry whose row is missing or
         // that the verification rejects still proves the index held something.
@@ -2347,17 +2411,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    */
   private indexSeekKey(indexManager: IndexManager, schema: StoredIndexSchema, seek: SeekTuple): IndexKey {
     const width = Math.min(seek.length, schema.columns.length);
-    // Zero constraint values would mean the plan wants the whole index: frame the empty
-    // prefix directly, since asIndexColumnTuple deliberately rejects an empty tuple and
-    // this case must bypass it rather than weaken that guard.
-    //
-    // NOTE: no planner path reaches this branch today. The secondary-index arm of
-    // getBestAccessPlan names an index only once at least one equality filter matched, and
-    // runQuery sets `scanIndexName` on that path only for `args.length > 0`; the other way
-    // in is the legacy `filterInfo.idxNum >= 10` arm, and `idxNum` is hard-coded to `0` at
-    // every construction site in `@quereus/quereus/src/vtab/filter-info.ts`, so that arm is
-    // dead. Kept because it is the correct framing the day an index-served ORDER BY or a
-    // whole-index plan does arrive — not because something currently uses it.
+    // Zero constraint values mean the plan wants the whole index — an ordered walk, whose
+    // FilterInfo carries no arguments: frame the empty prefix directly, since
+    // asIndexColumnTuple deliberately rejects an empty tuple and this case must bypass it
+    // rather than weaken that guard.
     return width === 0
       ? indexKeyFromValues([])
       : indexManager.createIndexKeyFromTuple(
@@ -4707,37 +4764,74 @@ const UNKNOWN_TABLE_ROWS = 1000;
 const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
 
 /**
- * Whether a seek on a key column finds every row a predicate on it would. The index and
- * primary-key trees compare raw bytes, so a seek finds only values whose stored bytes equal the
- * sought bytes, and a claimed filter is not re-checked by the engine. On a column where equal
- * values can have different bytes, a seek loses rows: a non-BINARY key collation, or a type that
- * compares by meaning (`hasSemanticOrdering`: `timespan`'s `'PT60M'` equals a stored `'PT1H'`).
- * Such a column stays a residual filter over a scan: slower, and correct.
- *
- * `keyCollation` is the same one `indexColumnCollationLookup` in
- * `@quereus/quereus/src/planner/rules/access/rule-select-access-path.ts` reads, so the module and
- * the engine judge one thing: the index column's for a secondary index, the table column's for the
- * primary key. The engine reads a `nocase` predicate over a `nocase` key as a full match, which is
- * a promise that the seek honours the collation; this module's cannot. The cost is that a
- * `collate binary` predicate over a `nocase` index, which a byte seek would answer correctly, scans.
+ * Mirrors `SORT_COST_PER_COMPARISON` in `@quereus/quereus/src/vtab/memory/module.ts`, which that
+ * module does not export, so this backend prices the Sort an access plan leaves above it as the
+ * engine's own tables do.
  */
-function seekCanBeTrusted(column: ColumnSchema | undefined, keyCollation: string | undefined): boolean {
-  return column !== undefined
-    && normalizeCollationName(keyCollation ?? 'BINARY') === 'BINARY'
-    && !hasSemanticOrdering(column.logicalType);
+const SORT_COST_PER_COMPARISON = 0.1;
+
+/** The cost of sorting `rows` rows above a plan that does not deliver the required ordering. */
+function sortCost(rows: number): number {
+  return rows <= 1 ? 0 : rows * Math.log2(rows) * SORT_COST_PER_COMPARISON;
+}
+
+/** The figures every candidate of one `getBestAccessPlan` call is priced from. */
+interface PlanPricing {
+  /** The table's row count: measured by `analyze`, else the default for an un-analyzed table. */
+  readonly tableRowCount: number;
+  /** One descent of a key's tree. */
+  readonly seekCost: number;
+}
+
+/** How a plan delivers the required ordering: the index whose tree it walks, and which way. */
+interface OrderedWalk {
+  readonly index: IndexSchema;
+  readonly reverse: boolean;
 }
 
 /**
- * Whether a seek of a secondary index's column finds every row a predicate on it would: everything
- * {@link seekCanBeTrusted} asks, and that the column cannot store a boolean. The engine compares
- * `true` equal to `1`, but an index frames them as different bytes (`serializeIndexValue`), so on a
- * `boolean` or `any` column one of the two is lost. A primary key frames both as `1`, so it needs
- * no such rule.
+ * A plan `getBestAccessPlan` may answer with, before it is shaped into a `BestAccessPlanResult`.
+ * Candidates are compared by {@link pricedWithSort}: `cost` is the plan's own and stays what the
+ * engine is told, and a candidate that leaves the required ordering to a Sort above it is charged
+ * for that Sort only when competing.
  */
-function indexSeekCanBeTrusted(column: ColumnSchema | undefined, keyCollation: string | undefined): boolean {
-  return seekCanBeTrusted(column, keyCollation)
-    && column?.logicalType.name !== BOOLEAN_TYPE.name
-    && column?.logicalType.name !== ANY_TYPE.name;
+interface PlanCandidate {
+  readonly cost: number;
+  readonly rows: number;
+  readonly handledFilters: readonly boolean[];
+  readonly isSet: boolean;
+  readonly explains: string;
+  readonly indexName?: string;
+  readonly seekColumnIndexes?: readonly number[];
+  /** Set when the plan delivers the request's whole required ordering. */
+  readonly ordering?: OrderedWalk;
+}
+
+/**
+ * What a candidate costs the statement when `required` is wanted above it: its own cost, plus the
+ * Sort over its rows when it does not deliver the ordering. Only the comparison carries the sort
+ * term; the plan's reported `cost` is its own.
+ */
+function pricedWithSort(candidate: PlanCandidate, required: readonly OrderingSpec[]): number {
+  return required.length > 0 && candidate.ordering === undefined
+    ? candidate.cost + sortCost(candidate.rows)
+    : candidate.cost;
+}
+
+/**
+ * The descriptor a plan that delivers an ordering returns, so the engine's structured access
+ * path carries the walk's direction (`IndexDescriptor.reverse`) to `runQuery`; the engine takes
+ * a supplied descriptor whenever its name is the plan's index (`resolveIndexDescriptor`).
+ * `keyColumns` describes what the tree holds — ascending bytes, whatever the index declared.
+ */
+function walkDescriptor(walk: OrderedWalk): IndexDescriptor {
+  return {
+    name: walk.index.name,
+    role: 'secondary',
+    keyColumns: walk.index.columns.map(column => ({ columnIndex: column.index, desc: false, collation: column.collation })),
+    unique: walk.index.unique === true,
+    reverse: walk.reverse,
+  };
 }
 
 /**
@@ -4822,6 +4916,57 @@ function measuredEqualityTupleSelectivity(tableInfo: TableSchema, eqColumns: rea
     factors.push(1 / Math.max(colStats.distinctCount, 1));
   }
   return factors.length > 0 ? combineConjunctive(factors) : undefined;
+}
+
+/**
+ * An equality seek of `index`'s leading columns on `match` ({@link matchEqualitySeek}): one key, or
+ * one per listed value of a multi-seek. It delivers the required ordering when a walk of the index
+ * does (`walkDelivering`, which treats the sought columns as pinned) and the seek is of one key — a
+ * multi-seek walks the index key by key, so it delivers none.
+ */
+function equalitySeekCandidate(
+  index: IndexSchema,
+  match: EqualitySeekMatch,
+  tableInfo: TableSchema,
+  request: BestAccessPlanRequest,
+  pricing: PlanPricing,
+): PlanCandidate {
+  const { tableRowCount, seekCost } = pricing;
+  const seekColumns = match.filterIndexes.map(fi => request.filters[fi]!.columnIndex);
+  const multiSeek = match.keyCount > 1;
+  // A prefix of a unique index is not unique.
+  const uniqueSeek = seekColumns.length === index.columns.length && (index.unique ?? false);
+  const measured = uniqueSeek ? undefined : measuredEqualityTupleSelectivity(tableInfo, seekColumns);
+  const rowsPerKey = uniqueSeek ? 1 : tableRowCount * (measured ?? EQ_SELECTIVITY_WITHOUT_STATS);
+  // The row count saturates at the table size: that is what makes a long list plan hash joins
+  // above it, as it does over a memory table.
+  const seekRows = Math.min(tableRowCount, match.keyCount * rowsPerKey);
+  // The no-statistics constant is charged once rather than per key. It reaches the whole table
+  // at ten values, so per key it would price every list of ten or more above a scan on an
+  // un-analyzed table, and it would rank `a in (x, y)` below `b = ?` for no measured reason.
+  // A measured figure reaches the table only as the list nears the column's distinct count,
+  // which is where a scan really is cheaper.
+  //
+  // NOTE: at the un-analyzed default of 1000 rows this makes a list of 46 or more values cost
+  // out as a scan, and under the in-process cost profile that goes back to a nested loop over
+  // it. If pages of more than about 45 values show up slow on un-analyzed tables, the
+  // no-statistics default is what to look at; `analyze` raises the crossover with the row count.
+  const indexCost = match.keyCount * seekCost + (uniqueSeek || measured !== undefined ? seekRows : rowsPerKey);
+  const indexRows = Math.max(1, Math.floor(seekRows));
+
+  const required = request.requiredOrdering ?? [];
+  const delivery = !multiSeek && required.length > 0 ? walkDelivering(required, index, tableInfo, request) : undefined;
+  return {
+    cost: indexCost,
+    rows: indexRows,
+    handledFilters: request.filters.map((_, idx) => match.filterIndexes.includes(idx)),
+    isSet: uniqueSeek && !multiSeek,
+    indexName: index.name,
+    seekColumnIndexes: seekColumns,
+    explains: `${uniqueSeek ? 'Unique index' : 'Index'} ${multiSeek ? `multi-seek of ${match.keyCount} keys` : 'seek'} on ${index.name} ` +
+      `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`,
+    ordering: delivery !== undefined ? { index, reverse: delivery.reverse } : undefined,
+  };
 }
 
 /**
@@ -6278,6 +6423,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const tableScanCost = Math.max(1000, tableRowCount);
     // One descent of a key's tree.
     const seekCost = Math.log2(Math.max(2, tableRowCount)) * 2;
+    const pricing: PlanPricing = { tableRowCount, seekCost };
+    const required = request.requiredOrdering ?? [];
 
     const claiming = (match: EqualitySeekMatch): boolean[] =>
       request.filters.map((_, idx) => match.filterIndexes.includes(idx));
@@ -6299,9 +6446,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         cost: seekCost,
         rows: 1,
         // Point lookup always satisfies any ORDER BY (single row)
-        providesOrdering: request.requiredOrdering && request.requiredOrdering.length > 0
-          ? [...request.requiredOrdering]
-          : undefined,
+        providesOrdering: required.length > 0 ? [...required] : undefined,
+        orderingIndexName: required.length > 0 ? '_primary_' : undefined,
         indexName: '_primary_',
         seekColumnIndexes: [...pkColumns],
         isSet: true, // PK lookup guarantees unique row
@@ -6309,15 +6455,26 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       };
     }
 
-    // Track best plan found
-    let bestCost = tableScanCost;
-    let bestRows = Math.max(1, tableRowCount);
-    let bestHandledFilters: boolean[] = request.filters.map(() => false);
-    let bestOrdering: OrderingSpec[] | undefined = undefined;
-    let bestIsSet = false;
-    let bestExplains = `Full table scan (${tableRowCount} rows)`;
-    let bestIndexName: string | undefined = undefined;
-    let bestSeekColumnIndexes: number[] | undefined = undefined;
+    // The cheapest candidate so far, starting from the plan that always works. Candidates compete
+    // on what they cost the statement (`pricedWithSort`): with an ordering required, one that does
+    // not deliver it is charged for the Sort the engine keeps above it, so an ordered walk through
+    // an index wins over a scan the engine then sorts, and a selective seek on another index that
+    // leaves a small sort still beats the walk.
+    let best: PlanCandidate = {
+      cost: tableScanCost,
+      rows: Math.max(1, tableRowCount),
+      handledFilters: request.filters.map(() => false),
+      isSet: false,
+      explains: `Full table scan (${tableRowCount} rows)`,
+    };
+    const consider = (candidate: PlanCandidate): void => {
+      const price = pricedWithSort(candidate, required);
+      const bestPrice = pricedWithSort(best, required);
+      // On a cost tie the longer seek wins: without statistics every equality tuple estimates
+      // the same rows, but the longer seek reads fewer and leaves less residual.
+      const longerMatch = (candidate.seekColumnIndexes?.length ?? 0) > (best.seekColumnIndexes?.length ?? 0);
+      if (price < bestPrice || (price === bestPrice && longerMatch)) best = candidate;
+    };
 
     for (let i = 0; i < request.filters.length; i++) {
       const filter = request.filters[i];
@@ -6333,13 +6490,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // Partial PK match - don't mark as handled, let Quereus apply the filter
         // but still estimate reduced selectivity for cost calculation
         const partialPkCost = tableRowCount * 0.3;
-        if (partialPkCost < bestCost) {
-          bestCost = partialPkCost;
-          bestRows = Math.max(1, Math.floor(tableRowCount * 0.3));
-          bestHandledFilters = request.filters.map(() => false); // NOT handled
-          bestIsSet = false;
-          bestExplains = `Partial primary key scan (cost: ${partialPkCost.toFixed(2)})`;
-        }
+        consider({
+          cost: partialPkCost,
+          rows: Math.max(1, Math.floor(tableRowCount * 0.3)),
+          handledFilters: request.filters.map(() => false), // NOT handled
+          isSet: false,
+          explains: `Partial primary key scan (cost: ${partialPkCost.toFixed(2)})`,
+        });
       } else if (isPkColumn && ['>', '>=', '<', '<='].includes(filter.op)) {
         // NOTE: Range seek deliberately not pushed down. RowCodec encodes numbers as toString()
         // (not order-preserving) and the tree uses a raw lexicographic comparator, so a seek span
@@ -6348,15 +6505,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         // optimystic-tree-comparator-lexicographic-missort).
         const selectivity = 0.25;
         const rangeCost = seekCost + tableRowCount * selectivity;
-        const rangeRows = Math.max(1, Math.floor(tableRowCount * selectivity));
-
-        if (rangeCost < bestCost) {
-          bestCost = rangeCost;
-          bestRows = rangeRows;
-          bestHandledFilters = request.filters.map(() => false); // NOT handled — engine applies predicate
-          bestExplains = `Primary key range scan (selectivity: ${selectivity.toFixed(2)}, cost: ${rangeCost.toFixed(2)})`;
-          // No bestIndexName / bestSeekColumnIndexes / bestOrdering — no seek until comparator is correct
-        }
+        consider({
+          cost: rangeCost,
+          rows: Math.max(1, Math.floor(tableRowCount * selectivity)),
+          handledFilters: request.filters.map(() => false), // NOT handled — engine applies predicate
+          isSet: false,
+          explains: `Primary key range scan (selectivity: ${selectivity.toFixed(2)}, cost: ${rangeCost.toFixed(2)})`,
+          // No indexName / seekColumnIndexes / ordering — no seek until comparator is correct
+        });
       }
     }
 
@@ -6364,91 +6520,102 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // cost. A multi-seek reports no set and no ordering, as both Quereus backends do.
     if (pkFullyMatched) {
       const multiSeekCost = pkMatch.keyCount * seekCost;
-      if (multiSeekCost < bestCost) {
-        bestCost = multiSeekCost;
-        bestRows = Math.max(1, Math.min(tableRowCount, pkMatch.keyCount));
-        bestHandledFilters = claiming(pkMatch);
-        bestIsSet = false;
-        bestIndexName = '_primary_';
-        bestSeekColumnIndexes = [...pkColumns];
-        bestExplains = `Primary key multi-seek of ${pkMatch.keyCount} keys (cost: ${multiSeekCost.toFixed(2)})`;
-      }
+      consider({
+        cost: multiSeekCost,
+        rows: Math.max(1, Math.min(tableRowCount, pkMatch.keyCount)),
+        handledFilters: claiming(pkMatch),
+        isSet: false,
+        indexName: '_primary_',
+        seekColumnIndexes: [...pkColumns],
+        explains: `Primary key multi-seek of ${pkMatch.keyCount} keys (cost: ${multiSeekCost.toFixed(2)})`,
+      });
     }
 
-    if (tableInfo.indexes && tableInfo.indexes.length > 0) {
-      for (const index of tableInfo.indexes) {
-        // A partial index holds only the rows its predicate admits, so a seek through it drops
-        // matching rows outside the predicate. Never planned through, as Quereus's memory module
-        // (`gatherAvailableIndexes` in `@quereus/quereus/src/vtab/memory/module.ts`) does; backlog
-        // `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
-        if (index.predicate !== undefined) continue;
+    for (const index of tableInfo.indexes ?? []) {
+      // A partial index holds only the rows its predicate admits, so a seek or walk through it
+      // drops matching rows outside the predicate. Never planned through, as Quereus's memory
+      // module (`gatherAvailableIndexes` in `@quereus/quereus/src/vtab/memory/module.ts`) does;
+      // backlog `feat-optimystic-plan-through-a-partial-index-whose-predicate-the-query-implies`.
+      if (index.predicate !== undefined) continue;
 
-        const match = matchEqualitySeek(index.columns, tableInfo, request.filters, indexSeekCanBeTrusted);
-        if (match.filterIndexes.length === 0) continue;
-
-        const seekColumns = match.filterIndexes.map(fi => request.filters[fi]!.columnIndex);
-        const multiSeek = match.keyCount > 1;
-        // A prefix of a unique index is not unique.
-        const uniqueSeek = seekColumns.length === index.columns.length && (index.unique ?? false);
-        const measured = uniqueSeek ? undefined : measuredEqualityTupleSelectivity(tableInfo, seekColumns);
-        const rowsPerKey = uniqueSeek ? 1 : tableRowCount * (measured ?? EQ_SELECTIVITY_WITHOUT_STATS);
-        // The row count saturates at the table size: that is what makes a long list plan hash joins
-        // above it, as it does over a memory table.
-        const seekRows = Math.min(tableRowCount, match.keyCount * rowsPerKey);
-        // The no-statistics constant is charged once rather than per key. It reaches the whole table
-        // at ten values, so per key it would price every list of ten or more above a scan on an
-        // un-analyzed table, and it would rank `a in (x, y)` below `b = ?` for no measured reason.
-        // A measured figure reaches the table only as the list nears the column's distinct count,
-        // which is where a scan really is cheaper.
-        //
-        // NOTE: at the un-analyzed default of 1000 rows this makes a list of 46 or more values cost
-        // out as a scan, and under the in-process cost profile that goes back to a nested loop over
-        // it. If pages of more than about 45 values show up slow on un-analyzed tables, the
-        // no-statistics default is what to look at; `analyze` raises the crossover with the row count.
-        const indexCost = match.keyCount * seekCost + (uniqueSeek || measured !== undefined ? seekRows : rowsPerKey);
-        const indexRows = Math.max(1, Math.floor(seekRows));
-
-        // On a cost tie the longer match wins: without statistics every equality tuple
-        // estimates the same rows, but the longer seek reads fewer and leaves less residual.
-        const longerMatch = seekColumns.length > (bestSeekColumnIndexes?.length ?? 0);
-        if (indexCost < bestCost || (indexCost === bestCost && longerMatch)) {
-          bestCost = indexCost;
-          bestRows = indexRows;
-          bestHandledFilters = claiming(match);
-          bestIsSet = uniqueSeek && !multiSeek;
-          bestIndexName = index.name;
-          bestSeekColumnIndexes = seekColumns;
-          bestExplains = `${uniqueSeek ? 'Unique index' : 'Index'} ${multiSeek ? `multi-seek of ${match.keyCount} keys` : 'seek'} on ${index.name} ` +
-            `(rows: ${indexRows}, cost: ${indexCost.toFixed(2)})`;
-
-          // Cleared when this index cannot deliver it, so an ordering an earlier,
-          // costlier index could deliver is never promised for this one. A multi-seek walks
-          // the index key by key, so it delivers none.
-          bestOrdering = !multiSeek && request.requiredOrdering && this.orderingMatchesIndex(request.requiredOrdering, index, tableInfo)
-            ? [...request.requiredOrdering]
-            : undefined;
-        }
+      const match = matchEqualitySeek(index.columns, tableInfo, request.filters, indexSeekCanBeTrusted);
+      if (match.filterIndexes.length > 0) {
+        consider(equalitySeekCandidate(index, match, tableInfo, request, pricing));
       }
+      const walk = this.orderedWalkCandidate(index, tableInfo, request, pricing);
+      if (walk !== undefined) consider(walk);
     }
 
     // Invariant: the planner may only route a scan through an index this table
     // actually maintains. Checked at plan selection so the query fails BEFORE it
     // silently answers from a stale tree (see assertIndexMaintained).
-    if (bestIndexName !== undefined && bestIndexName !== '_primary_') {
-      this.assertIndexMaintained(tableInfo, bestIndexName);
+    if (best.indexName !== undefined && best.indexName !== '_primary_') {
+      this.assertIndexMaintained(tableInfo, best.indexName);
     }
 
-    // Return the best access plan found
     return {
-      handledFilters: bestHandledFilters,
-      cost: bestCost,
-      rows: bestRows,
-      providesOrdering: bestOrdering,
-      indexName: bestIndexName,
-      seekColumnIndexes: bestSeekColumnIndexes,
-      isSet: bestIsSet,
-      explains: bestExplains,
+      handledFilters: [...best.handledFilters],
+      cost: best.cost,
+      rows: best.rows,
+      providesOrdering: best.ordering !== undefined ? [...required] : undefined,
+      orderingIndexName: best.ordering?.index.name,
+      indexDescriptor: best.ordering !== undefined ? walkDescriptor(best.ordering) : undefined,
+      indexName: best.indexName,
+      seekColumnIndexes: best.seekColumnIndexes !== undefined ? [...best.seekColumnIndexes] : undefined,
+      isSet: best.isSet,
+      explains: best.explains,
     };
+  }
+
+  /**
+   * An ordered walk of `index`'s whole tree, when it delivers the required ordering: forwards or
+   * backwards, claiming no filters (the engine keeps every one as a residual above it), so the
+   * walk's rows come out in the order the statement asked for and nothing above it has to sort.
+   * Undefined when the index cannot deliver the ordering, when every ordered column is pinned by
+   * the filters (any access path then delivers it, and reading the table through an index would
+   * buy nothing), or when this table instance does not maintain the index: that one is skipped
+   * rather than chosen and refused, since a scan answers the query correctly today and failing it
+   * would be a regression. The equality path keeps its throw ({@link assertIndexMaintained}).
+   *
+   * A user's LIMIT sits above the Sort this walk replaces, and `trySortAbsorbViaIndexOrdering`
+   * looks only downward, so it never reaches a module (Quereus backlog
+   * `feat-sort-absorb-blind-to-limit-general`); only `rule-minmax-index-boundary` sends one. So
+   * `order by T limit 10` and `order by T` are priced alike, and the walk is claimed for both: a
+   * page is far cheaper than a scan and sort, and an unbounded ordered read, which fetches one row
+   * per entry, costs about five times a scan until `a-long-index-walk-finishes-by-scanning-the-table`
+   * lands.
+   */
+  private orderedWalkCandidate(
+    index: IndexSchema,
+    tableInfo: TableSchema,
+    request: BestAccessPlanRequest,
+    pricing: PlanPricing,
+  ): PlanCandidate | undefined {
+    const required = request.requiredOrdering ?? [];
+    if (required.length === 0) return undefined;
+    const delivery = walkDelivering(required, index, tableInfo, request);
+    if (delivery === undefined || delivery.orders === 0) return undefined;
+    if (this.indexMaintenanceStateOf(tableInfo, index.name) === 'unmaintained') return undefined;
+
+    const { tableRowCount, seekCost } = pricing;
+    const wanted = request.limit != null
+      ? Math.min(tableRowCount, request.limit + (request.offset ?? 0))
+      : tableRowCount;
+    const cost = seekCost + wanted;
+    return {
+      cost,
+      rows: Math.max(1, tableRowCount),
+      handledFilters: request.filters.map(() => false),
+      isSet: false,
+      explains: `Ordered ${delivery.reverse ? 'backward' : 'forward'} walk of ${index.name} (rows: ${tableRowCount}, cost: ${cost.toFixed(2)})`,
+      ordering: { index, reverse: delivery.reverse },
+    };
+  }
+
+  /** What this table's instance says about maintaining `indexName`; see {@link assertIndexMaintained}. */
+  private indexMaintenanceStateOf(tableInfo: TableSchema, indexName: string): 'maintained' | 'unmaintained' | 'unknown' {
+    const tableKey = `${tableInfo.schemaName}.${tableInfo.name}`.toLowerCase();
+    return this.tables.get(tableKey)?.indexMaintenanceState(indexName) ?? 'unknown';
   }
 
   /**
@@ -6473,9 +6640,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * the same one resolveIndexTarget already had, and retrying the query resolves it.
    */
   private assertIndexMaintained(tableInfo: TableSchema, indexName: string): void {
-    const tableKey = `${tableInfo.schemaName}.${tableInfo.name}`.toLowerCase();
-    const state = this.tables.get(tableKey)?.indexMaintenanceState(indexName) ?? 'unknown';
-    if (state === 'unmaintained') {
+    if (this.indexMaintenanceStateOf(tableInfo, indexName) === 'unmaintained') {
       throw new QuereusError(
         unmaintainedIndexMessage(
           tableInfo.name,
@@ -6485,79 +6650,6 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
         StatusCode.ERROR,
       );
     }
-  }
-
-  /**
-   * Helper: Check if required ordering matches index order AND the storage tree
-   * can actually deliver it.
-   *
-   * The index tree is opened with a raw lexicographic string comparator
-   * (collection-factory.ts) and is only ever iterated forward. It therefore only
-   * *delivers* an ascending, BINARY-collated ordering over columns whose payload
-   * is the raw stored string (TEXT). Numeric columns are keyed via a
-   * non-order-preserving `toExponential(15)` payload, DESC needs reverse
-   * iteration, and non-BINARY collations need a collation-aware compare — none of
-   * which the tree provides. Promising `providesOrdering` for those cases makes
-   * the engine skip its own sort and return genuinely mis-ordered rows.
-   *
-   * So: match positionally (column + prefix length) AND require every ordered
-   * column to be ASC + BINARY + TEXT. Anything else → return false so the engine
-   * sorts (correct, just not pushed down). True numeric/DESC/collated ordering is
-   * gated work — see `debt-optimystic-true-key-ordering`.
-   */
-  private orderingMatchesIndex(
-    requiredOrdering: readonly OrderingSpec[],
-    index: { columns: readonly { index: number; desc?: boolean }[] },
-    tableInfo: TableSchema
-  ): boolean {
-    if (requiredOrdering.length > index.columns.length) return false;
-
-    for (let i = 0; i < requiredOrdering.length; i++) {
-      const orderSpec = requiredOrdering[i];
-      const indexCol = index.columns[i];
-
-      if (!orderSpec || !indexCol) return false;
-      if (orderSpec.columnIndex !== indexCol.index) return false;
-
-      // Only promise the ordering the raw ascending lexicographic tree genuinely delivers.
-      if (!this.treeDeliversOrdering(orderSpec, tableInfo)) return false;
-    }
-
-    return true;
-  }
-
-  /**
-   * True only when a raw lexicographic, ascending, forward-iterated tree scan
-   * coincides with the SQL order requested for this column: the request must be
-   * ASC, the column BINARY-collated, and its physical storage a raw string
-   * (TEXT). DESC, non-BINARY collations, and numeric/blob payloads are all
-   * encoded/iterated in a way the tree cannot reproduce, so the engine must sort.
-   */
-  private treeDeliversOrdering(
-    orderSpec: OrderingSpec,
-    tableInfo: TableSchema
-  ): boolean {
-    // Reverse iteration is not available: a forward-only tree can never provide DESC.
-    if (orderSpec.desc) return false;
-
-    const col = tableInfo.columns[orderSpec.columnIndex];
-    if (!col) return false;
-
-    // TEXT is the only affinity stored as a raw, order-preserving string payload.
-    // NOTE: this gates on the *declared* physicalType, but the stored index payload is
-    // chosen by the runtime JS value type in serializeIndexValue() (string -> raw,
-    // number -> non-order-preserving toExponential). They agree only because Quereus
-    // coerces TEXT-affinity inserts to strings before they reach this vtab. If that
-    // coercion contract ever changes (a numeric value reaching a TEXT column un-coerced),
-    // the promise here would over-order — anchor the check to the persisted affinity then.
-    if (col.logicalType?.physicalType !== PhysicalType.TEXT) return false;
-
-    // The tree compares raw code units — that is BINARY. Any other declared
-    // collation (NOCASE, RTRIM, custom) would order differently.
-    const collation = (col.collation || 'BINARY').toUpperCase();
-    if (collation !== 'BINARY') return false;
-
-    return true;
   }
 
   /**

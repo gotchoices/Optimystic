@@ -365,7 +365,7 @@ reading that header at.
 (`optimystic:quereus-plugin:module`) answers the read side — one line per index-driven scan:
 
 ```
-optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/main/Usage/index/by_token main=default/main/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa seek=%01tok-a%00 matched=0 rejected=0 node=A
+optimystic:quereus-plugin:module index:seek table=Usage index=by_token collection=default/main/Usage/index/by_token main=default/main/Usage arm=committed rev=3@tx:bT1r_04c main_rev=7@tx:Kx9f-2Qa dir=asc seek=%01tok-a%00 matched=0 rejected=0 node=A
 ```
 
 - `arm=committed` — a pre-transaction snapshot read, which deliberately never refreshes from the
@@ -393,13 +393,18 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
 - `collection=` / `main=` — the index collection's id and the main table collection's id. One
   line therefore names both collections the scan read, and joins to `commit:collections` and
   `index:tree-open`, which print the same ids.
+- `dir=` — `asc` or `desc`: which way the index tree was walked. `desc` means the statement's
+  `order by … desc` is being served by walking the index backwards (`walkDelivering` in
+  `packages/quereus-plugin-optimystic/src/schema/index-walk.ts`); a seek that claimed no ordering
+  always reads `asc`.
 - `seek=` — the framed index key the descent bracketed on, percent-escaped (the framing carries
   control bytes, so a raw key would break whitespace-separated parsing). An `in (…)` list seeks one
   key per distinct listed value on this one line: the keys are joined with commas in the order
   sought, which is the tree's ascending order rather than the order the statement wrote them, so
   `where token in ('tok-b', 'tok-a')` prints `seek=%02tok-a%00,%02tok-b%00`. Two nodes seeking the same
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than
-  the tree. An empty `seek=` is the whole-index prefix (a plan that wants every entry);
+  the tree. An empty `seek=` is the whole-index prefix: an ordered walk of every entry, serving an
+  `order by` with no equality on the index's leading columns, in the direction `dir=` says;
   `seek=unset` means the scan sought nothing at all — in practice every seek value arrived NULL,
   which the scan refuses because `col = NULL` is UNKNOWN, so `matched=0 rejected=0
   seek=unset` is a correct empty answer and not an index fault. **Compare it, do not decode
@@ -425,7 +430,12 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
     read is skewed (see `main_rev=` above). `arm=committed` cannot do this — both views are taken
     from one committed moment.
 
-  It is a floor for the same reason `matched=` is.
+  It is a floor for the same reason `matched=` is. One more thing can make `matched=` exceed the
+  rows a `limit` asked for: text at or above U+D800 (an emoji, `～`, a private-use character) is
+  held back and sorted in runs before it is yielded, because the tree's code-unit order and the
+  engine's code-point order differ on it (`inEngineOrder` in
+  `packages/quereus-plugin-optimystic/src/schema/index-walk.ts`), so a walk whose first rows are
+  such text reads the whole run before it yields the first of them.
 
 **Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
 query, and a full table scan all read without descending an index tree, so they emit nothing here.

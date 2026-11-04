@@ -203,6 +203,8 @@ export interface IndexSeekTrace {
 	mainAction: string;
 	/** Which node emitted the line (`CollectionFactory.nodeTag()`). */
 	node: string;
+	/** `asc` or `desc`: the direction the index tree was walked in. */
+	dir: string;
 	/** The framed seek key, percent-escaped by the emitter. `''` is the whole-index prefix;
 	 *  `unset` means the scan returned before framing a key. Compare between nodes for
 	 *  equality only — decoding it yields raw framing bytes, not the SQL value. */
@@ -231,13 +233,13 @@ export interface IndexSeekTrace {
 export function indexSeekTraces(lines: readonly string[]): IndexSeekTrace[] {
 	const traces: IndexSeekTrace[] = [];
 	for (const raw of lines) {
-		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) seek=(\S*) matched=(\d+) rejected=(\d+) node=(\S+)/
+		const m = /index:seek table=(\S+) index=(\S+) collection=(\S+) main=(\S+) arm=(\S+) rev=([^\s@]+)@(\S+) main_rev=([^\s@]+)@(\S+) dir=(\S+) seek=(\S*) matched=(\d+) rejected=(\d+) node=(\S+)/
 			.exec(plain(raw));
 		if (m) {
 			traces.push({
 				table: m[1]!, index: m[2]!, collection: m[3]!, main: m[4]!, arm: m[5]!,
-				rev: m[6]!, action: m[7]!, mainRev: m[8]!, mainAction: m[9]!,
-				seek: m[10]!, matched: Number(m[11]), rejected: Number(m[12]), node: m[13]!,
+				rev: m[6]!, action: m[7]!, mainRev: m[8]!, mainAction: m[9]!, dir: m[10]!,
+				seek: m[11]!, matched: Number(m[12]), rejected: Number(m[13]), node: m[14]!,
 			});
 		}
 	}
