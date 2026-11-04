@@ -11,9 +11,9 @@ import { applySchema, runTransaction, DEFAULT_DB_NAME, DEFAULT_DB_VERSION, type 
 export interface NSPluginDb {
 	/** Settles when the open does; a failed open rejects it. */
 	readonly ready: Promise<void>;
-	execute(sql: string, params?: ReadonlyArray<unknown>): Promise<unknown>;
-	get(sql: string, params?: ReadonlyArray<unknown>): Promise<Record<string, unknown> | null | undefined>;
-	select(sql: string, params?: ReadonlyArray<unknown>): Promise<Array<Record<string, unknown>>>;
+	execute(sql: string, params?: SqliteParam[]): Promise<unknown>;
+	get(sql: string, params?: SqliteParam[]): Promise<Record<string, unknown> | null | undefined>;
+	select(sql: string, params?: SqliteParam[]): Promise<Array<Record<string, unknown>>>;
 	close(): Promise<void>;
 }
 

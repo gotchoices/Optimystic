@@ -8,8 +8,8 @@
  * wrapper under Node mocha over a stand-in for the plugin built on `node:sqlite`,
  * matching the pattern `db-p2p-storage-web` uses with `fake-indexeddb`.
  *
- * The wrapper is **package-private**: only `openOptimysticNSDb` is exported to
- * consumers; the `SqliteDb` interface is an internal seam for tests.
+ * Consumers normally need only `openOptimysticNSDb`; `wrapNSPluginDb` is for a host
+ * that already holds an open plugin handle.
  */
 
 import { createLogger } from './logger.js';
@@ -106,10 +106,10 @@ export interface TransactionConnection {
 }
 
 /**
- * The transaction protocol `SqliteDb.transaction` runs inside its mutex slot: with `synced`, `PRAGMA synchronous = FULL` first; then `BEGIN IMMEDIATE`, the body, and `COMMIT`, or
- * `ROLLBACK` when the body or the commit throws; then, synced, `PRAGMA synchronous = NORMAL`
- * whichever way the transaction ended, so the connection's default is restored before the slot is
- * released. `BEGIN IMMEDIATE` takes the write lock up front rather than deferring it to the first
+ * The transaction protocol `SqliteDb.transaction` runs inside its mutex slot: with `synced`,
+ * `PRAGMA synchronous = FULL` first; then `BEGIN IMMEDIATE`, the body, and `COMMIT`, or `ROLLBACK`
+ * when the body or the commit throws; then, synced, `PRAGMA synchronous = NORMAL` whichever way the
+ * transaction ended, so the connection's default is restored before the slot is released. `BEGIN IMMEDIATE` takes the write lock up front rather than deferring it to the first
  * write, so contention surfaces here and not mid-body.
  *
  * A failure of the restore after a failed body is logged rather than thrown, so the body's error,

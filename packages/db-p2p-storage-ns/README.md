@@ -22,7 +22,7 @@ plugin). It cannot run in plain Node, browsers, or React Native — use the
 sibling adapter for each of those:
 
 - `@optimystic/db-p2p-storage-fs` — Node filesystem
-- `@optimystic/db-p2p-storage-rn` — React Native (MMKV)
+- `@optimystic/db-p2p-storage-rn` — React Native (LevelDB)
 - `@optimystic/db-p2p-storage-web` — Browser (IndexedDB)
 
 ## Install
@@ -33,10 +33,10 @@ yarn add @optimystic/db-p2p-storage-ns @optimystic/db-p2p @optimystic/db-core \
 ```
 
 `@nativescript-community/sqlite` is a peer dependency at `^4.1.0` — the host app
-pins the version it needs (same approach as `react-native-mmkv` for the RN
-package). It brings `sqlite-core`, both bindings (`sqlite-napi` for NativeScript
-9.1+, `sqlite-bridge` for any version) and `sqlite-default-engine`, so NativeScript
-8 needs nothing extra. This package does not use the plugin's `*Sync` methods,
+pins the version it needs (same approach as `rn-leveldb` for the RN package).
+It brings `sqlite-core`, both bindings (`sqlite-napi` for NativeScript 9.1+,
+`sqlite-bridge` for any version) and `sqlite-default-engine`, so NativeScript 8
+needs nothing extra. This package does not use the plugin's `*Sync` methods,
 which throw on the bridge.
 
 Use the Node-free `/rn` entry point of `@optimystic/db-p2p` so the Node-only

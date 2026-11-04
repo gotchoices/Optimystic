@@ -7,10 +7,10 @@ import type { SqliteDb } from '../src/db.js';
 // The test driver runs production ns-opener's transaction() — BEGIN/COMMIT/ROLLBACK on a single
 // shared connection, serialized on the connection mutex — over a REAL node:sqlite, with other
 // callers running between statements as they do on the plugin's native thread. Without the mutex
-// two concurrent transaction() bodies nest on one connection:
-// the second BEGIN throws "cannot start a transaction within a transaction", and its catch
-// ROLLBACKs the FIRST transaction's still-open writes; and a plain write issued meanwhile lands
-// inside the open transaction and is rolled back with it.
+// two concurrent transaction() bodies share one connection: the second BEGIN throws "cannot start a
+// transaction within a transaction", and its catch ROLLBACKs the FIRST transaction's still-open
+// writes; and a plain write issued meanwhile lands inside the open transaction and is rolled back
+// with it.
 //
 // Driven through `SqliteDb.transaction` directly, which is where the mutex lives: the block store
 // above it now commits a whole write group per transaction, so a test through the store would

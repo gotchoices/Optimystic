@@ -3,7 +3,7 @@
  *
  * SQLite allows at most one open transaction per connection, so every mutating
  * operation on a shared connection (plain writes AND transaction bodies) must be
- * serialized or a concurrent `BEGIN` will nest and cross-rollback another
+ * serialized, or a concurrent `BEGIN` fails and its rollback discards another
  * operation's still-open writes.
  *
  * This is deliberately NOT the global `Latches` keyed map from
