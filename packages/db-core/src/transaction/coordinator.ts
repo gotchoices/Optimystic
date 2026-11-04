@@ -1322,13 +1322,13 @@ export class TransactionCoordinator {
 					// landing it is (reportSaved), and the next attempt commits only what is still
 					// staged (stagedCollections) — the durable half is never re-logged. The stamp stays
 					// open for the retry; reportSaved or the success path releases it.
-					// The committed siblings keep their in-flight mark until the cycle ends, so the
-					// blanket refresh between attempts WALKS their log (the mark disables the tail
-					// shortcut) but cannot find their own entry: recordCommitted above advanced each
-					// one's held revision to the entry's own, and Log.getFrom returns only entries
-					// ABOVE the held revision. Collection.consumeOwnEntry is therefore unreachable for
-					// a sibling committed here, and no attempt was retained for it (the loop above
-					// skips committed participants) — the refresh is a reader's, at a cost of one walk.
+					// The committed siblings keep their in-flight mark until the cycle ends, but the
+					// blanket refresh between attempts cannot find their own entry: recordCommitted
+					// above advanced each one's held revision to the entry's own, and Log.getFrom
+					// returns only entries ABOVE the held revision. Collection.consumeOwnEntry is
+					// therefore unreachable for a sibling committed here, and this attempt was not
+					// retained for it (the loop above skips committed participants) — the refresh is a
+					// reader's, at a cost of one walk only if an earlier attempt of the cycle was retained.
 					for (const [collectionId, durability] of committed) {
 						recordCollectionDurability(cycle.saved, collectionId, durability);
 					}

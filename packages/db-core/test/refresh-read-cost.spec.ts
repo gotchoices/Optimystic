@@ -13,6 +13,7 @@ import { Tree } from '../src/collections/tree/index.js'
 import { TestTransactor } from '../src/testing/test-transactor.js'
 import { LogDataBlockType } from '../src/log/struct.js'
 import { Collection } from '../src/collection/collection.js'
+import { HlcClock } from '../src/hlc/clock.js'
 import type { BlockGets, CommittedTailAnswer, GetBlockResults, IBlock } from '../src/index.js'
 
 interface Row { key: number; value: string }
@@ -138,6 +139,24 @@ describe('refresh read cost', () => {
 
 		const { requests } = await net.cost(() => reader.update())
 		expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(1)
+	})
+
+	it("a head commit's opening refresh with nothing new stays at one request however long the history grows", async () => {
+		// Every drained offline entry opens with this refresh, under the in-flight mark, so a walk here
+		// would make each send read the collection's whole log.
+		const { reader } = await caughtUpReader('head-opening', 200)
+		await reader.stage([[200, row(200)]])
+		const collection = reader.getCollection()
+		expect(collection.sealPending('entry'), 'the staged row seals').to.be.true
+		const handle = await collection.openHeadCommit('entry', {
+			actionId: 'head-opening-action', timestamp: Date.now(), hlc: new HlcClock({ nodeId: 'test' }).now(), lane: 'serializable',
+		})
+		try {
+			const { requests } = await net.cost(() => handle.refresh({}, false))
+			expect(requests, `requests: ${JSON.stringify(net.requests)}`).to.be.at.most(1)
+		} finally {
+			handle.close()
+		}
 	})
 
 	it('a refresh that finds a new commit fetches no block twice, and sees the commit', async () => {

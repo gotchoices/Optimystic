@@ -48,7 +48,10 @@ remembered was asked for in the same request as the header, that answer is then
 discarded, and the walk fetches that block again on its way back through the chain (the
 accepted one-extra-request cost recorded at `Collection.logTailId` in
 `packages/db-core/src/collection/collection.ts`). An idle poll therefore costs one
-request per tree rather than the seven or more it used to. The budgets are asserted in
+request per tree rather than the seven or more it used to. A head commit's opening refresh
+(`Collection.commitHead`, `TransactionCoordinator.commitEntry`) pays the same one request: it runs
+under the in-flight mark, and only a refresh with a failed attempt retained under that mark, which
+may have landed, walks a log whose tail shows nothing newer. The budgets are asserted in
 `packages/db-core/test/refresh-read-cost.spec.ts`.
 
 On a peer-to-peer node that request is a network round trip only when another machine

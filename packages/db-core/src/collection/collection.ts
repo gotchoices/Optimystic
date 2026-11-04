@@ -1356,10 +1356,16 @@ export class Collection<TAction> implements ICollection<TAction> {
 		const tailRev = source.actionContext?.rev;
 
 		const actionContext = this.source.actionContext;
-		// A write's retry refresh always walks. Not needed for soundness — the write's own entry would
-		// sit above the held revision, which the tail test already refuses — but losing that entry
-		// loses the write, and a retry refresh is rare enough that the walk costs nothing that matters.
-		if (this.inFlightActionId === undefined && Collection.tailShowsNothingNewer(actionContext, ends.tail)) {
+		// A refresh with an attempt retained under the mark always walks: that attempt may have landed.
+		// Not needed for soundness — its entry would sit above the held revision, which the tail test
+		// already refuses — but that rests on the tail read being current, a retry is when a lagging
+		// coordinator has been in the picture, and missing the entry loses the write. With no attempt
+		// retained, no entry of this write can be in the log (every path that marks an action in flight
+		// retains each failed attempt before the refresh that follows, or seeds it through `resume` on
+		// a re-drive; see {@link retainInFlightAttempt}), so the walk has nothing to find. The opening
+		// refresh of every head commit is that case, and a walk there reads the whole log.
+		if ((this.inFlightActionId === undefined || this.inFlightAttempt === undefined)
+			&& Collection.tailShowsNothingNewer(actionContext, ends.tail)) {
 			return;
 		}
 
