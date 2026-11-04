@@ -405,6 +405,30 @@ describe('ALTER TABLE on an Optimystic table', function () {
 			expect((await savedT(store)).tags).to.deep.equal({ version: 1 });
 		});
 
+		it('a machine that overwrote a tag it had not seen puts that tag back when its apply fails', async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const b = await bBehindA(declared('version = 1'), declared('version = 2'), store);
+
+			await expectRestored(() => b.db.exec(declared('version = 3', { uExtra: FAILING })));
+			expect(b.db.schemaManager.findTable('t', 'main')!.tags, 'its own catalog goes back').to.deep.equal({ version: 1 });
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+		});
+
+		it('a retry after both commits of a failed apply were refused saves the tag change', async () => {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const refusing = refusingCommits(store);
+			const { db } = await openSession(refusing.transactor);
+			await db.exec(declared('version = 1'));
+			// The new table is what gives the undo batch a write to commit: its undo stages a gravestone.
+			const upgrade = declared('version = 2').replace('table u {', 'table v { id integer primary key } table u {');
+
+			refusing.refuse(2);
+			expect(await captureThrowMessage(() => db.exec(upgrade))).to.include('injected refusal');
+			refusing.refuse(0);
+			await db.exec(upgrade);
+			expect((await savedT(store)).tags).to.deep.equal({ version: 2 });
+		});
+
 		it("a structural event on a machine holding older tags leaves the record's tags alone", async () => {
 			const store = buildSharedLocalTransactor(new MemoryRawStorage());
 			const b = await bBehindA(declared('version = 1'), declared('version = 2'), store);

@@ -4696,8 +4696,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * them; `deferred` the populated index trees of each manager's tables whose flush was
    * handed to the end of the batch (keyed by tree, so a tree is flushed once however often
    * it was deferred), with the table and index each belongs to; `adopted` the catalog-only
-   * and tag changes the apply found already in a record, so their undo stays off it (see
-   * {@link alterCatalogOnly} and {@link followTableTags}); `owed` what a refused batch before this one left owing, with the
+   * changes the apply found already in a record, so their undo stays off it, and every tag change
+   * it made, so their undo restores the record (see {@link alterCatalogOnly} and
+   * {@link followTableTags}); `owed` what a refused batch before this one left owing, with the
    * engine's catalog as it stood before that apply, or before this one when none was refused.
    */
   private schemaBatch?: {
@@ -4845,8 +4846,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       if (outcome === 'saved') {
         // Inside `apply schema` the save staged into the batch, which is still open: endSchemaBatch
         // drains these saves before it closes it. A failed batch commit must mark the table
-        // unpersisted like any other table the batch altered. An adopted or undone change staged
-        // nothing and must not: that would re-persist this machine's older description.
+        // unpersisted like any other table the batch altered. A change that staged nothing must
+        // not: that would re-persist this machine's older description.
         this.recordBatchEffect(manager, 'written', tableKey);
       } else if (outcome === 'no-record') {
         // An instance whose record never landed re-persists it, tags included, from its own

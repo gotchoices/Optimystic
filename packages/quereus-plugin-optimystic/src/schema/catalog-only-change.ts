@@ -17,7 +17,8 @@
  *   what another machine committed.
  *
  * {@link tagsToSave} applies both rules to a tag change, which also changes only the record but
- * reaches the module as an announcement rather than through the `ALTER TABLE` hook.
+ * reaches the module as an announcement rather than through the `ALTER TABLE` hook, and goes one
+ * further: the undo of any tag change leaves the record holding what it held before that change.
  *
  * Objects are compared by their persisted form ignoring their tags and the case of their name.
  * Tags converge through the `set tags` statements the same apply emits, so counting them would
@@ -112,6 +113,10 @@ function comparable({ tags: _tags, name, ...rest }: CatalogObject): object {
  * drop constraint` over a record whose CHECK another machine re-bodied is adopted too, so the
  * record keeps that CHECK and a restart brings it back; if hosts ever issue imperative drops on
  * shared tables, have that case owned outside `apply schema`.
+ *
+ * NOTE: the last row's undo does not put back the CHECK it replaced, so a failed apply on that machine
+ * leaves the record with no CHECK of that name:
+ * `bug-optimystic-a-failed-apply-over-a-check-it-has-not-seen-removes-the-check` (backlog).
  */
 export function classifyCheckChange(record: StoredTableSchema, change: CheckChange): CatalogOnlyVerdict {
 	if (change.op === 'add') {
@@ -265,36 +270,41 @@ export function adoptedChangeKey(tableKey: string, kind: CatalogObjectKind, name
  * column absent, which is what the engine held before the add. A DROP COLUMN has no undo (Quereus
  * marks it irreversible), so an adopted one is recorded and never matched.
  *
- * A tag slot takes the same rule ({@link tagsToSave}). Quereus's undo of a tag step restores the
- * whole set the slot held before it, so it always matches, and the differ emits one tag step per slot
- * per apply, so a forward step never does.
+ * A CHECK or column change this machine made itself is not recorded: its undo is judged against the
+ * record like any change, which finds the record holding what this machine wrote.
  *
- * Changes this machine made itself are not recorded: their undo is judged against the record like
- * any change, and finds the record holding exactly what this machine wrote.
+ * A tag slot takes the same rule ({@link tagsToSave}), and records every change, with what the record
+ * held for the slot then, so that an undo puts exactly that back. Quereus's undo of a tag step restores
+ * the whole set the slot held before it, so it always matches, and the differ emits one tag step per
+ * slot per apply, so a forward step never does.
  */
 export class AdoptedChanges {
-	private readonly adopted = new Map<string, (CatalogObject | undefined)[]>();
+	private readonly adopted = new Map<string, { readonly before: CatalogObject | undefined; readonly recordHeld?: Tags }[]>();
 
-	/** Record that a change to `key` found the record already holding it; `before` is the engine's pre-change object. */
-	adopt(key: string, before: CatalogObject | undefined): void {
+	/**
+	 * Record a change to `key`; `before` is the engine's pre-change object. For a tag slot, `recordHeld`
+	 * is what the record held for it when the change was judged.
+	 */
+	adopt(key: string, before: CatalogObject | undefined, recordHeld?: Tags): void {
 		const stack = this.adopted.get(key) ?? [];
-		stack.push(before);
+		stack.push({ before, recordHeld });
 		this.adopted.set(key, stack);
 	}
 
-	/** Whether a change leaving `key`'s object as `after` undoes the newest change adopted for it. */
+	/** Whether a change leaving `key`'s object as `after` undoes the newest change recorded for it. */
 	undoes(key: string, after: CatalogObject | undefined): boolean {
 		const stack = this.adopted.get(key);
-		return stack !== undefined && stack.length > 0 && sameCatalogObject(stack[stack.length - 1], after);
+		return stack !== undefined && stack.length > 0 && sameCatalogObject(stack[stack.length - 1]!.before, after);
 	}
 
-	/** Forget the newest change adopted for `key`: its undo has run. */
-	release(key: string): void {
+	/** Forget the newest change recorded for `key`, whose undo has run, and answer its `recordHeld`. */
+	release(key: string): Tags | undefined {
 		const stack = this.adopted.get(key);
-		stack?.pop();
+		const released = stack?.pop();
 		if (stack?.length === 0) {
 			this.adopted.delete(key);
 		}
+		return released?.recordHeld;
 	}
 }
 
@@ -310,20 +320,31 @@ function tagSet(tags: Tags | undefined): CatalogObject & { readonly tagSet: Tags
  * Which of `changes`, the tag slots one `table_modified` of `tableKey` replaced, to save onto `record`,
  * the slots' new tags by slot. Empty when there is nothing to write. Each change is judged on its own:
  *
- * | change | record holds | verdict |
- * | --- | --- | --- |
- * | undoes the newest change adopted for the slot | anything | not saved: this machine's catalog only |
- * | any other | no such object | not saved: there is nothing to address |
- * | any other | the same tags | not saved, and adopted when `adopted` is given |
- * | any other | different tags | saved |
+ * | change | the record should then hold |
+ * | --- | --- |
+ * | undoes the newest change recorded for the slot | what it held before that change |
+ * | any other | the change's new tags |
+ *
+ * The slot is saved when the record holds something else, and left alone when it holds that already or
+ * has no such object. So the undo of a change the record already held writes nothing, and the undo of
+ * one that overwrote another machine's tags puts those tags back rather than this machine's older ones.
  *
  * `adopted` is the open `apply schema`'s; outside one no undo follows, so nothing is recorded. This
  * updates it, so call once per change, with the record the write will be made over.
  *
- * NOTE: the last row writes a change the record does not hold, so a machine applying an older
- * declaration overwrites a newer tag, and its undo writes its pre-apply tags. This matches a CHECK's
- * "local DDL wins" row in {@link classifyCheckChange}, and the plugin's README already tells hosts not
- * to apply an older declaration.
+ * NOTE: a forward change the record does not hold is written, so a machine applying an older
+ * declaration overwrites a newer tag. This matches a CHECK's "local DDL wins" row in
+ * {@link classifyCheckChange}, and the plugin's README already tells hosts not to apply an older
+ * declaration.
+ *
+ * NOTE: a forward save whose catalog read failed never reaches this function and records nothing, so
+ * its undo is judged as a forward change and can write this machine's older tags. That takes a failed
+ * read followed by a successful one inside one batch; if it is ever seen, record the change where the
+ * event arrives (`followTableTags`) and fill in what the record held when the read lands.
+ *
+ * NOTE: a slot is written whole, though `add tags` and `drop tags` name only some keys, so on a machine
+ * holding older tags they also put back its older values of the other keys:
+ * `bug-optimystic-an-imperative-tag-edit-on-an-older-machine-puts-its-other-tags-back` (backlog).
  */
 export function tagsToSave(
 	record: TagBearingSchema,
@@ -335,13 +356,14 @@ export function tagsToSave(
 	const save = new Map<string, Tags | undefined>();
 	for (const { slot, before, after } of changes) {
 		const key = adoptedChangeKey(tableKey, 'tags', slot);
-		if (adopted?.undoes(key, tagSet(after))) {
-			adopted.release(key);
-		} else if (held.has(slot)) {
-			if (!sameTags(held.get(slot), after)) {
-				save.set(slot, after);
-			} else {
-				adopted?.adopt(key, tagSet(before));
+		const undo = adopted?.undoes(key, tagSet(after));
+		const wanted = undo ? adopted?.release(key) : after;
+		if (held.has(slot)) {
+			if (!sameTags(held.get(slot), wanted)) {
+				save.set(slot, wanted);
+			}
+			if (!undo) {
+				adopted?.adopt(key, tagSet(before), held.get(slot));
 			}
 		}
 	}

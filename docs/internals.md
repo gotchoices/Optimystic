@@ -819,9 +819,11 @@ event changed and nothing else: one tag location at a time (the table, or a colu
 constraint or index), for a location both the old and new schema have (`tagChangesBetween` in
 `packages/quereus-plugin-optimystic/src/schema/tag-overlay.ts`), judged against the record
 (`tagsToSave` in `packages/quereus-plugin-optimystic/src/schema/catalog-only-change.ts`). A
-change the record already holds is adopted, and its undo in a failed `apply schema` stays off
-the record, the way a catalog-only `ALTER` arm treats a CHECK or a column. So a structural
-event such as `analyze`, or the undo of one, writes no tags and reads no catalog.
+change the record already holds is adopted and writes nothing. The undo of a tag change in a
+failed `apply schema` leaves the record holding what it held before that change, so it stays
+off the record after an adopted change and puts another machine's tags back after one that
+overwrote them. A structural event such as `analyze` changes no tags, so it writes none and
+reads no catalog.
 
 What this gives up is the first touch as a repair. A record that differs from the engine's
 entry only in form (out of canonical order, or written before uniqueness metadata existed)
