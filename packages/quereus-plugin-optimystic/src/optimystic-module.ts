@@ -324,6 +324,7 @@ function rangeSeekOf(filterInfo: FilterInfo, schema: StoredIndexSchema): RangeSe
     const value = filterInfo.args[argvIndex - 1];
     switch (constraint.op) {
       case IndexConstraintOp.EQ:
+        if (constraint.iColumn !== schema.columns[prefix.length]?.index) throw malformed(`equality ${prefix.length} is not on the index's column there`);
         prefix.push(value ?? null);
         break;
       case IndexConstraintOp.GT:
