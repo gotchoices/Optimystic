@@ -4,6 +4,10 @@ files: @quereus/quereus/src/planner/rules/access/rule-select-access-path.ts (`cl
 repro: verified
 ----
 
+**Filed upstream (2026-11-06)** as Quereus ticket `bug-collated-equality-keeps-an-ordering-claim-the-plan-cannot-serve`, in that repository's `tickets/fix/`.
+
+**Re-checked on Quereus 5.0.0 (2026-11-06): memory table now right, Optimystic not re-measured.** The memory table returns 2, 1, 4, because its plan is now `SORT` over `FILTER` over `SEQSCAN`. No 5.0.0 change touches `classifyCollationCover` or the ordering claim, so the Optimystic case is assumed unchanged until measured.
+
 **Blocked: a dependency outside this repository.** Unblocks when a Quereus release carries the two changes below and this repository's `@quereus/quereus` range moves to it. Nothing here waits on a decision; the proposal is the change itself.
 
 ## What goes wrong

@@ -4,6 +4,10 @@ files: @quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts (the `P
 repro: verified
 ----
 
+**Filed upstream (2026-11-06)** as Quereus ticket `bug-explicit-nulls-placement-is-lost-when-a-module-serves-order-by`, in that repository's `tickets/fix/`.
+
+**Re-checked on Quereus 5.0.0 (2026-11-06): not fixed, now hidden on memory tables.** `order by s nulls last` on the memory table returns a, b, null, but only because the plan now keeps a `SORT` above the `INDEXSCAN`. The `PlanNodeType.Sort` arm in `rule-grow-retrieve.ts` is unchanged from 4.25.0 and still builds `requiredOrdering` without `nulls`, so a module that claims the ordering still loses the placement.
+
 **Blocked: a dependency outside this repository.** Unblocks when a Quereus release carries the fix below and this repository's `@quereus/quereus` range moves to it. Nothing here is waiting on a decision; the proposal is the change itself.
 
 ## What goes wrong

@@ -4,6 +4,10 @@ files: @quereus/quereus/src/planner/rules/access/rule-select-access-path.ts (the
 repro: verified
 ----
 
+**Filed upstream (2026-11-06)** as Quereus ticket `bug-composite-in-seek-drops-a-bound-equality`, in that repository's `tickets/fix/`.
+
+**Re-checked on Quereus 5.0.0 (2026-11-06): still broken.** The two parameterised forms in the table above still return no rows on a memory table.
+
 **Blocked: a dependency outside this repository.** Unblocks when a Quereus release carries the fix below and this repository's `@quereus/quereus` range moves to it. Nothing here is waiting on a decision; the proposal is the change itself.
 
 ## What goes wrong
