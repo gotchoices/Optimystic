@@ -172,7 +172,10 @@ which FRET hashes into `H(rootKey)`. That reaches the storage group whenever the
 the ring where they are not.
 
 > **Implementation (db-core).** `rootCoord` in `packages/db-core/src/cohort-topic/addressing.ts` is the
-> hash; `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`, and `routeKey` with the same
+> hash, remembered per addressing instance for `ROOT_COORD_IDLE_MS` (10 min) after last use and at most
+> `ROOT_COORD_CACHE_SIZE` (512) roots, since every notification, gossip round and recover asks for the same
+> few (GitHub #57); `reactivityRootCoord` in `packages/db-core/src/reactivity/topic-anchor.ts` keeps one
+> addressing per ring hash so that cache survives across its calls. `coord(d, P, topicId, rootKey?)` dispatches to it at `d = 0`, and `routeKey` with the same
 > arguments returns the root key itself. A participant names the key on
 > `RegisterRequest` or as the third argument of `lookup` (`packages/db-core/src/cohort-topic/service.ts`);
 > the walk stamps it on every frame and a renewal's re-walk reuses it — or the key `moveRoot` (same file)

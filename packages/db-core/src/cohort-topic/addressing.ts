@@ -40,6 +40,28 @@
  */
 
 import type { IRingHash, RingCoord, TopicRouteKey } from "./ports.js";
+import { toString as uint8ArrayToString } from "uint8arrays/to-string";
+import { ExpiringLruMap } from "../utility/expiring-lru-map.js";
+
+/**
+ * Most root coordinates one addressing remembers. A node asks for the root of each watched collection's
+ * current tail — 99 distinct tails across two idle parties in the GitHub #57 measurement — so a few hundred
+ * covers a busy node with room to spare.
+ */
+export const ROOT_COORD_CACHE_SIZE = 512;
+
+/**
+ * How long a root coordinate is remembered after its last use. A tail stays a collection's tail until the log
+ * rolls over, and a live one is asked for at least once per gossip round or renewal (seconds apart), so ten
+ * minutes keeps every live tail warm and releases a rotated-away one well before the size cap would.
+ */
+export const ROOT_COORD_IDLE_MS = 10 * 60_000;
+
+/** Options for {@link HashTierAddressing}. */
+export interface TierAddressingOptions {
+	/** Clock for the root-coordinate cache's idle expiry. Defaults to `Date.now`. */
+	readonly now?: () => number;
+}
 
 /** Tier-addressing surface — derives the ring coordinate for tier `d` of a topic, and the key that routes to it. */
 export interface TierAddressing {
@@ -102,8 +124,10 @@ export function prefixBits(peerId: Uint8Array, n: number): Uint8Array {
 export class HashTierAddressing implements TierAddressing {
 	public readonly F: number;
 	private readonly log2F: number;
+	/** `rootCoord` answers by root key: callers pass fresh arrays, so the key is the bytes, not the object. */
+	private readonly rootCoords: ExpiringLruMap<string, RingCoord>;
 
-	constructor(private readonly hash: IRingHash, F: number = DEFAULT_FANOUT) {
+	constructor(private readonly hash: IRingHash, F: number = DEFAULT_FANOUT, options: TierAddressingOptions = {}) {
 		if (!Number.isInteger(F) || F < 2) {
 			throw new RangeError(`fan-out F must be an integer ≥ 2, got ${F}`);
 		}
@@ -113,14 +137,27 @@ export class HashTierAddressing implements TierAddressing {
 		}
 		this.F = F;
 		this.log2F = log2F;
+		this.rootCoords = new ExpiringLruMap(ROOT_COORD_CACHE_SIZE, ROOT_COORD_IDLE_MS, options.now);
 	}
 
 	coord0(topicId: Uint8Array): RingCoord {
 		return this.hash.H(this.tier0Key(topicId));
 	}
 
+	/**
+	 * Cached: a node re-derives the same few roots on every notification, gossip round and recover, and the
+	 * hash is pure JavaScript on React Native (GitHub #57). Each answer is a copy, so a caller that writes into
+	 * its coordinate cannot change what the next caller gets.
+	 */
 	rootCoord(rootKey: Uint8Array): RingCoord {
-		return this.hash.H(this.rootRouteKey(rootKey));
+		const routeKey = this.rootRouteKey(rootKey);
+		const cacheKey = uint8ArrayToString(routeKey, "base64url");
+		let coord = this.rootCoords.get(cacheKey);
+		if (coord === undefined) {
+			coord = this.hash.H(routeKey);
+			this.rootCoords.set(cacheKey, coord);
+		}
+		return coord.slice();
 	}
 
 	coordD(d: number, peerId: Uint8Array, topicId: Uint8Array): RingCoord {
@@ -175,6 +212,6 @@ export class HashTierAddressing implements TierAddressing {
 }
 
 /** Convenience factory mirroring the db-p2p adapter construction style. */
-export function createTierAddressing(hash: IRingHash, F: number = DEFAULT_FANOUT): TierAddressing {
-	return new HashTierAddressing(hash, F);
+export function createTierAddressing(hash: IRingHash, F: number = DEFAULT_FANOUT, options: TierAddressingOptions = {}): TierAddressing {
+	return new HashTierAddressing(hash, F, options);
 }

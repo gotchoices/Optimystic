@@ -33,7 +33,7 @@
  */
 
 import { createRingHash } from "../cohort-topic/ring-hash.js";
-import { createTierAddressing } from "../cohort-topic/addressing.js";
+import { createTierAddressing, type TierAddressing } from "../cohort-topic/addressing.js";
 import type { IRingHash, RingCoord } from "../cohort-topic/ports.js";
 
 /** Domain-separation suffix mixed into the reactivity topic. */
@@ -63,6 +63,26 @@ export function reactivityCollectionTopicId(collectionId: Uint8Array, hash: IRin
  * subscriber walk's root step, the forwarder's gossip and recover reads — must start from this one value.
  * It is the one coordinate of a collection's tree that changes when the tail rotates.
  */
-export function reactivityRootCoord(tailId: Uint8Array, hash: IRingHash = createRingHash()): RingCoord {
-	return createTierAddressing(hash).rootCoord(tailId);
+export function reactivityRootCoord(tailId: Uint8Array, hash?: IRingHash): RingCoord {
+	return addressingFor(hash).rootCoord(tailId);
+}
+
+/**
+ * One addressing per ring hash, so its root-coordinate cache survives across calls (GitHub #57). Keyed by
+ * the hash object, weakly, so a caller's hash and its cache go together; never shared across hashes, since a
+ * coordinate computed under one ring width is wrong under another.
+ */
+const addressings = new WeakMap<IRingHash, TierAddressing>();
+let defaultAddressing: TierAddressing | undefined;
+
+function addressingFor(hash: IRingHash | undefined): TierAddressing {
+	if (hash === undefined) {
+		return defaultAddressing ??= createTierAddressing(createRingHash());
+	}
+	let addressing = addressings.get(hash);
+	if (addressing === undefined) {
+		addressing = createTierAddressing(hash);
+		addressings.set(hash, addressing);
+	}
+	return addressing;
 }

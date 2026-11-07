@@ -5,6 +5,7 @@ import {
 	HashTierAddressing,
 	prefixBits,
 	DEFAULT_FANOUT,
+	ROOT_COORD_IDLE_MS,
 } from '../../src/cohort-topic/addressing.js';
 import { bytesToB64url, b64urlToBytes } from '../../src/cohort-topic/wire/codec.js';
 
@@ -263,5 +264,24 @@ describe('cohort-topic / tier addressing (coord_d)', () => {
 		it('coordD rejects d < 1', () => {
 			expect(() => addr.coordD(0, seededBytes(32, 1), topicA)).to.throw(RangeError);
 		});
+	});
+
+	it('rootCoord remembers a root until it goes unused for the idle bound', () => {
+		const ring = createRingHash();
+		let hashes = 0;
+		const counting = { ringBits: ring.ringBits, H: (bytes: Uint8Array) => { hashes++; return ring.H(bytes); } };
+		let clock = 0;
+		const addr = createTierAddressing(counting, DEFAULT_FANOUT, { now: () => clock });
+		const tail = seededBytes(32, 7);
+		const expected = hex(ring.H(tail));
+
+		expect(hex(addr.rootCoord(tail))).to.equal(expected);
+		clock += ROOT_COORD_IDLE_MS;
+		expect(hex(addr.rootCoord(Uint8Array.from(tail)))).to.equal(expected);
+		expect(hashes, 'used within the bound: served from the cache').to.equal(1);
+
+		clock += ROOT_COORD_IDLE_MS + 1;
+		expect(hex(addr.rootCoord(tail))).to.equal(expected);
+		expect(hashes, 'idle past the bound: recomputed').to.equal(2);
 	});
 });
