@@ -22,5 +22,16 @@ GitHub [#57](https://github.com/gotchoices/Optimystic/issues/57).
 ## Known gaps
 
 - No measurement of the saving, on Node or a phone.
-- `coord0`, `coordD`, `coord` and `routeKey` remain uncached, as the ticket scoped. `coord(0, …, rootKey)` with a root key goes through `hash.H` directly, not through the cache; the reported hot callers all use `rootCoord`.
+- `coord0`, `coordD` and `routeKey` remain uncached, as the ticket scoped.
 - A `HashTierAddressing` constructed fresh per call elsewhere (e.g. test harnesses) gains nothing, which is fine.
+
+## Review findings
+
+- **Read:** the implement diff (`ticket(implement): reactivity-root-coordinate-is-hashed-once-per-tail`), every `rootCoord` and `reactivityRootCoord` caller in db-core and db-p2p.
+- **Fixed inline:** `coord(0, …, rootKey)` hashed the root key directly, bypassing the cache, so a root-placed register frame's coordinate was recomputed each time. It now delegates to `rootCoord`, which also keeps the two derivations from drifting.
+- **Correctness:** answers are byte-identical to `H(key)` (test, plus the db-p2p `topic-bytes-encoding` spec under `yarn check`). A cache never serves across ring hashes: one cache per addressing, one addressing per hash object. Returned arrays are copies, so a caller writing into a coordinate cannot corrupt it.
+- **Resource bounds:** size 512 and 10 min idle, both named constants with reasons; expiry on lookup, so no timer to leak. An expired entry that is never looked up again stays until LRU-evicted, which is bounded by the size cap; acceptable at 512 × ~32 bytes.
+- **Type safety / lint:** eslint clean on the touched files; no `any`.
+- **Tests:** the one expiry test meets the bar (real branching). No other tests owed: the size cap is `LruMap`'s own, and a hash-count test for the plain hit would only restate the cache.
+- **Docs:** `docs/cohort-topic.md` implementation note and the release note are current. Nothing in `docs/reactivity.md` describes the cost, so nothing there needed changing.
+- **Not done:** no measurement of the saving, recorded in the release note.

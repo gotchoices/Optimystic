@@ -165,6 +165,7 @@ export class HashTierAddressing implements TierAddressing {
 	}
 
 	coord(d: number, peerId: Uint8Array, topicId: Uint8Array, rootKey?: Uint8Array): RingCoord {
+		if (d === 0 && rootKey !== undefined) return this.rootCoord(rootKey);
 		return this.hash.H(this.routeKey(d, peerId, topicId, rootKey));
 	}
 
