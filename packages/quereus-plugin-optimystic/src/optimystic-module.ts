@@ -125,9 +125,10 @@ interface IndexScanPlan {
   /**
    * Whether the scan finishes by scanning the table once it has read {@link WALK_ROWS_BEFORE_SCAN}
    * entries: a walk of the whole index or a range predicate's span, one range at most, whose row
-   * count nothing knows in advance. An equality seek or multi-seek reads the statement's own rows
-   * and never does. Nor does a read of a partial index ({@link holdsEveryRow}), whatever this says:
-   * the table holds rows the index never had. `getBestAccessPlan` plans through none today.
+   * count the read cannot know, since no limit reaches `query()`. An equality seek or multi-seek
+   * reads the statement's own rows and never does. Nor does a read of a partial index
+   * ({@link holdsEveryRow}), whatever this says: the table holds rows the index never had.
+   * `getBestAccessPlan` plans through none today.
    */
   readonly mayFinishByScanning?: boolean;
 }
@@ -4974,6 +4975,15 @@ const EQ_SELECTIVITY_WITHOUT_STATS = 0.1;
  */
 const SORT_COST_PER_COMPARISON = 0.1;
 
+/**
+ * One row an ordered walk fetches through the main tree by its primary key, against a scan's 1 per
+ * row: a walk descends the main tree once per row, which GitHub #52 measured at about five times
+ * what a scan costs per row when most of the table is wanted (docs/internals.md, *Finishing by
+ * scanning*). It prices the walk with no filter alone ({@link unfilteredWalkCost}); with no filter
+ * no seek competes, so it decides walk against scan and sort and tilts no comparison with a seek.
+ */
+const ROW_FETCH_COST = 5;
+
 /** The cost of sorting `rows` rows above a plan that does not deliver the required ordering. */
 function sortCost(rows: number): number {
   return rows <= 1 ? 0 : rows * Math.log2(rows) * SORT_COST_PER_COMPARISON;
@@ -4985,6 +4995,49 @@ interface PlanPricing {
   readonly tableRowCount: number;
   /** One descent of a key's tree. */
   readonly seekCost: number;
+  /** A full scan of the table, the plan that always works. */
+  readonly tableScanCost: number;
+}
+
+/**
+ * The rows a candidate reads under the licence `request.limit` grants: `limit + offset` when the
+ * engine sent a limit, the candidate delivers whatever ordering is required, and it claims every
+ * filter; `rows` otherwise. The engine sends a limit only when nothing between the scan and the
+ * LIMIT can discard a row, and keeps a plan priced against it only when that plan claims every
+ * filter — otherwise it asks again without one (`probeAccessPlan` in
+ * `@quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts`) — and a Sort above a plan
+ * drains every row it produces. One rule for every candidate, because pricing some against the
+ * bound and not others biases the comparison (`BestAccessPlanRequest.limit` in
+ * `@quereus/quereus/src/vtab/best-access-plan.ts`); the counterpart of `rowsToProduce` in
+ * `@quereus/quereus-store/src/common/store-module-access-plan.ts`.
+ *
+ * It sizes a candidate's per-row cost term only. A candidate's `rows` stays the cardinality,
+ * since the engine applies the limit above it, and nothing truncates the read: its consumer stops
+ * pulling.
+ */
+function rowsReadUnderLimit(
+  request: BestAccessPlanRequest,
+  rows: number,
+  deliversOrdering: boolean,
+  handledFilters: readonly boolean[],
+): number {
+  if (request.limit == null) return rows;
+  if ((request.requiredOrdering?.length ?? 0) > 0 && !deliversOrdering) return rows;
+  if (!handledFilters.every(handled => handled)) return rows;
+  return Math.min(rows, request.limit + (request.offset ?? 0));
+}
+
+/**
+ * What an ordered walk with no filter costs to read `wanted` rows, the scan it cannot avoid
+ * included: one descent of the index, a fetch through the main tree for each of the first
+ * {@link WALK_ROWS_BEFORE_SCAN} rows, and, when more are wanted, the table scan and sort the walk
+ * then finishes with (`verifiedIndexRows`). So a read the switch covers is priced as the walk it
+ * is, and a longer one above the scan and sort it turns into, by the fetches it made first.
+ */
+function unfilteredWalkCost(wanted: number, pricing: PlanPricing): number {
+  const { seekCost, tableRowCount, tableScanCost } = pricing;
+  const walked = seekCost + ROW_FETCH_COST * Math.min(wanted, WALK_ROWS_BEFORE_SCAN);
+  return wanted > WALK_ROWS_BEFORE_SCAN ? walked + tableScanCost + sortCost(tableRowCount) : walked;
 }
 
 /** How a plan delivers the required ordering: the index whose tree it walks, and which way. */
@@ -5130,7 +5183,8 @@ function measuredEqualityTupleSelectivity(tableInfo: TableSchema, eqColumns: rea
  * An equality seek of `index`'s leading columns on `match` ({@link matchEqualitySeek}): one key, or
  * one per combination of the listed values of a multi-seek. It delivers the required ordering when a walk of the index
  * does (`walkDelivering`, which treats the sought columns as pinned) and the seek is of one key — a
- * multi-seek walks the index key by key, so it delivers none.
+ * multi-seek walks the index key by key, so it delivers none. The rows it is priced as reading
+ * follow the one licence rule ({@link rowsReadUnderLimit}).
  */
 function equalitySeekCandidate(
   index: IndexSchema,
@@ -5159,15 +5213,17 @@ function equalitySeekCandidate(
   // out as a scan, and under the in-process cost profile that goes back to a nested loop over
   // it. If pages of more than about 45 values show up slow on un-analyzed tables, the
   // no-statistics default is what to look at; `analyze` raises the crossover with the row count.
-  const indexCost = match.keyCount * seekCost + (uniqueSeek || measured !== undefined ? seekRows : rowsPerKey);
+  const rowsRead = uniqueSeek || measured !== undefined ? seekRows : rowsPerKey;
   const indexRows = Math.max(1, Math.floor(seekRows));
 
   const required = request.requiredOrdering ?? [];
   const delivery = !multiSeek && required.length > 0 ? walkDelivering(required, index, tableInfo, request) : undefined;
+  const handledFilters = request.filters.map((_, idx) => match.filterIndexes.includes(idx));
+  const indexCost = match.keyCount * seekCost + rowsReadUnderLimit(request, rowsRead, delivery !== undefined, handledFilters);
   return {
     cost: indexCost,
     rows: indexRows,
-    handledFilters: request.filters.map((_, idx) => match.filterIndexes.includes(idx)),
+    handledFilters,
     isSet: uniqueSeek && !multiSeek,
     indexName: index.name,
     seekColumnIndexes: seekColumns,
@@ -5235,8 +5291,11 @@ function claimableBound(filter: PredicateConstraint, rangeColumn: KeyColumn): bo
  *
  * Priced as one descent plus the rows the bounds are assumed to keep of what the prefix admits —
  * the prefix's measured or default equality selectivity, 1 with no prefix, times
- * {@link RANGE_BOUND_SELECTIVITY} per bound. It delivers the required ordering when a walk of the
- * index does (`walkDelivering`): a range filter on the column satisfies that function's NULL rule.
+ * {@link RANGE_BOUND_SELECTIVITY} per bound — or fewer, under the one licence rule
+ * ({@link rowsReadUnderLimit}), when it delivers the ordering and nothing is left a residual: a
+ * further bound on the same side, or a filter on another column, leaves the full count. It
+ * delivers the required ordering when a walk of the index does (`walkDelivering`): a range filter
+ * on the column satisfies that function's NULL rule.
  * At read time the bounds become tree keys, or a test on each row (`indexRangeScan`).
  */
 function rangeSeekCandidate(
@@ -5262,14 +5321,15 @@ function rangeSeekCandidate(
     ? 1
     : measuredEqualityTupleSelectivity(tableInfo, prefixColumns) ?? EQ_SELECTIVITY_WITHOUT_STATS;
   const rows = Math.max(1, Math.floor(tableRowCount * prefixSelectivity * RANGE_BOUND_SELECTIVITY ** bounds.length));
-  const cost = seekCost + rows;
   const claimed = new Set([...match.filterIndexes, ...bounds]);
+  const handledFilters = filters.map((_, idx) => claimed.has(idx));
   const required = request.requiredOrdering ?? [];
   const delivery = required.length > 0 ? walkDelivering(required, index, tableInfo, request) : undefined;
+  const cost = seekCost + rowsReadUnderLimit(request, rows, delivery !== undefined, handledFilters);
   return {
     cost,
     rows,
-    handledFilters: filters.map((_, idx) => claimed.has(idx)),
+    handledFilters,
     isSet: false,
     indexName: index.name,
     seekColumnIndexes: [...prefixColumns, rangeColumn.index],
@@ -6732,7 +6792,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     const tableScanCost = Math.max(1000, tableRowCount);
     // One descent of a key's tree.
     const seekCost = Math.log2(Math.max(2, tableRowCount)) * 2;
-    const pricing: PlanPricing = { tableRowCount, seekCost };
+    const pricing: PlanPricing = { tableRowCount, seekCost, tableScanCost };
     const required = request.requiredOrdering ?? [];
 
     const claiming = (match: EqualitySeekMatch): boolean[] =>
@@ -6766,8 +6826,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
     // The cheapest candidate so far, starting from the plan that always works. Candidates compete
     // on what they cost the statement (`pricedWithSort`): with an ordering required, one that does
-    // not deliver it is charged for the Sort the engine keeps above it, so an ordered walk through
-    // an index wins over a scan the engine then sorts, and a selective seek on another index that
+    // not deliver it is charged for the Sort the engine keeps above it, so a page read by walking an
+    // index wins over a scan the engine then sorts, and a selective seek on another index that
     // leaves a small sort still beats the walk.
     let best: PlanCandidate = {
       cost: tableScanCost,
@@ -6892,12 +6952,36 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * rather than chosen and refused, since a scan answers the query correctly today and failing it
    * would be a regression. The equality path keeps its throw ({@link assertIndexMaintained}).
    *
-   * A user's LIMIT sits above the Sort this walk replaces, and `trySortAbsorbViaIndexOrdering`
-   * looks only downward, so it never reaches a module (Quereus backlog
-   * `feat-sort-absorb-blind-to-limit-general`); only `rule-minmax-index-boundary` sends one. So
-   * `order by T limit 10` and `order by T` are priced alike, and the walk is claimed for both: a
-   * page is far cheaper than a scan and sort, and an unbounded ordered read finishes by scanning
-   * the table ({@link WALK_ROWS_BEFORE_SCAN}), so it costs a scan and sort plus that many fetches.
+   * The engine sends a constant `order by … limit n` as `request.limit`, and a `limit ?` as one
+   * request per bound it tries (`tryLimitedSortAbsorb` and `tryRuntimeLimitChoice` in
+   * `@quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts`), so a walk is priced as
+   * what it reads. A walk with no filter claims every filter and so holds the licence
+   * ({@link rowsReadUnderLimit}): it is priced by {@link unfilteredWalkCost}, the scan it finishes
+   * with past {@link WALK_ROWS_BEFORE_SCAN} included, so a page of up to that many rows is walked
+   * and an unlimited ordered read of a larger table is left to the engine's scan and sort. Its cost
+   * rises with the bound up to the switch and then jumps above the scan and sort, which keeps the
+   * engine's bisection of a `limit ?` monotone.
+   *
+   * The walk truncates nothing at `limit + offset`: its consumer stops pulling, and the first
+   * entries in tree order are not the first rows in the engine's order wherever
+   * {@link inEngineOrder} reorders a run.
+   *
+   * NOTE: a sort key that spells out its NULLs (`order by t nulls first limit 20`, the default
+   * written out) reaches this module without its limit: `sortKeysAsTableOrdering` in
+   * `@quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` absorbs no Sort with an
+   * explicit `nulls`, and only the limit-free request of the physical pass carries the ordering. So
+   * such a page is priced as the whole read, and on a table over 256 rows the engine sorts it. The
+   * fix belongs in Quereus: treat an explicit `nulls first` there as the default it is.
+   *
+   * NOTE: accepted tradeoff — a walk under residual filters is priced at one unit a row over the
+   * whole table, whatever the limit, as a bet rather than an estimate. The engine strips the limit
+   * from a plan that leaves a residual, so such a walk can never be priced as a page, and pricing it
+   * at the full fetch-and-switch cost would make every filtered page (`where status = 'open' order
+   * by created desc limit 20` over an index on `created` alone) a scan and sort of the whole table.
+   * The switch bounds what the bet costs when no limit was there: at most WALK_ROWS_BEFORE_SCAN
+   * fetches on top of the scan and sort. Revisit when the walk claims its residual filters itself
+   * (backlog `feat-an-ordered-walk-tests-its-own-residual-filters`), after which it is priced as a
+   * walk with no filter.
    */
   private orderedWalkCandidate(
     index: IndexSchema,
@@ -6912,14 +6996,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (this.indexMaintenanceStateOf(tableInfo, index.name) === 'unmaintained') return undefined;
 
     const { tableRowCount, seekCost } = pricing;
-    const wanted = request.limit != null
-      ? Math.min(tableRowCount, request.limit + (request.offset ?? 0))
-      : tableRowCount;
-    const cost = seekCost + wanted;
+    const handledFilters = request.filters.map(() => false);
+    const cost = request.filters.length === 0
+      ? unfilteredWalkCost(rowsReadUnderLimit(request, tableRowCount, true, handledFilters), pricing)
+      : seekCost + tableRowCount;
     return {
       cost,
       rows: Math.max(1, tableRowCount),
-      handledFilters: request.filters.map(() => false),
+      handledFilters,
       isSet: false,
       explains: `Ordered ${delivery.reverse ? 'backward' : 'forward'} walk of ${index.name} (rows: ${tableRowCount}, cost: ${cost.toFixed(2)})`,
       ordering: { index, reverse: delivery.reverse },

@@ -454,8 +454,11 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   equality seek or an `in (…)` list. `matched=` and `rejected=` stay counts of index entries, so on
   a `scan=1` line `matched=256` is where the walk stopped, not how many rows the statement returned,
   and the rows the scan supplied are in neither count. A long ordered read reporting `scan=1` costs a
-  scan and sort; one that fills a page reports `scan=0`. A `limit` smaller than 256 can still report
-  `scan=1` when the first rows are text held back as above and the run outlasts the 256 entries.
+  scan and sort; one that fills a page reports `scan=0`. The planner leaves an unlimited ordered read
+  with no filter, on a table larger than 256 rows, to the engine's scan and sort, which emits no line
+  here; `scan=1` comes from a walk under a residual filter, a range, or a walk of a table that has
+  grown since `analyze` measured it. A `limit` smaller than 256 can still report `scan=1` when the
+  first rows are text held back as above and the run outlasts the 256 entries.
 
 **Only an index-driven plan emits this line.** A primary-key point lookup, a primary-key range
 query, and a full table scan all read without descending an index tree, so they emit nothing here.

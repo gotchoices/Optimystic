@@ -72,6 +72,15 @@ async function expectEngineSort(db: Database, query: string): Promise<void> {
 const COLUMNS = '(id text primary key, t text, g text, u text null, n integer)';
 
 /**
+ * A page larger than the table, for the statements that test whether an ordered read with no filter
+ * walks the index. Without a limit the planner prices such a read as the scan and sort a walk turns
+ * into past 256 rows, and an un-analyzed table is assumed to hold 1000, so the engine would sort
+ * every one of them whatever the walk can deliver; a page is walked exactly when the walk can
+ * deliver the ordering, and still returns every row.
+ */
+const PAGE = 'limit 100';
+
+/**
  * Text that exercises the walk's order: values that are prefixes of one another, values holding
  * a NUL (`\x00`, which the key framing escapes), the empty string, CJK below the surrogate range,
  * and the pairs on which code-unit and code-point order disagree — an emoji (a surrogate pair,
@@ -98,9 +107,9 @@ describe('An index walk serves order by', () => {
 	const rowsOf = async (table: string, clause: string, params: SqlValue[] = []): Promise<SqlRow[]> =>
 		await collectRows(db.eval(`select id, t from ${table} ${clause}`, params));
 
-	/** Both tables answer `clause` with the same rows in the same order. */
-	const expectSameOrder = async (clause: string, params: SqlValue[] = []): Promise<SqlRow[]> => {
-		const walked = await rowsOf('walked', clause, params);
+	/** The Optimystic table (`walked` unless named) and the memory table answer `clause` with the same rows in the same order. */
+	const expectSameOrder = async (clause: string, params: SqlValue[] = [], table = 'walked'): Promise<SqlRow[]> => {
+		const walked = await rowsOf(table, clause, params);
 		const model = await rowsOf('model', clause, params);
 		expect(walked, clause).to.deep.equal(model);
 		return walked;
@@ -112,23 +121,30 @@ describe('An index walk serves order by', () => {
 		await db.exec('create index idx_t on walked(t)');
 		await db.exec('create index idx_gt on walked(g, t)');
 		await db.exec('create index idx_u on walked(u)');
+		// `walked` again, measured by `analyze`, for the ordered reads no page can keep a walk: a key
+		// that spells out `nulls first` reaches the module with no limit (`sortKeysAsTableOrdering` in
+		// `@quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts` refuses every explicit
+		// `nulls`), and only a table the planner knows is small is walked whole.
+		await db.exec(`create table measured ${COLUMNS} using optimystic('tree://test/walk_measured')`);
+		await db.exec('create index idx_measured_u on measured(u)');
 		await db.exec(`create table model ${COLUMNS} using memory`);
 		for (const row of ROWS) {
-			await db.exec('insert into walked (id, t, g, u, n) values (?, ?, ?, ?, ?)', [...row]);
-			await db.exec('insert into model (id, t, g, u, n) values (?, ?, ?, ?, ?)', [...row]);
+			for (const table of ['walked', 'measured', 'model']) {
+				await db.exec(`insert into ${table} (id, t, g, u, n) values (?, ?, ?, ?, ?)`, [...row]);
+			}
 		}
+		await db.exec('analyze measured');
 	});
 
 	it('walks the index forward for an ascending ordering over the index column and the primary key', async () => {
-		const query = 'select id, t from walked order by t, id';
-		await expectOrderFromIndex(db, query);
-		const rows = await expectSameOrder('order by t, id');
+		await expectOrderFromIndex(db, `select id, t from walked order by t, id ${PAGE}`);
+		const rows = await expectSameOrder(`order by t, id ${PAGE}`);
 		expect(rows).to.have.length(ROWS.length);
 	});
 
 	it('walks the index backward for a descending ordering', async () => {
-		await expectOrderFromIndex(db, 'select id, t from walked order by t desc, id desc');
-		await expectSameOrder('order by t desc, id desc');
+		await expectOrderFromIndex(db, `select id, t from walked order by t desc, id desc ${PAGE}`);
+		await expectSameOrder(`order by t desc, id desc ${PAGE}`);
 	});
 
 	it('orders within an equality seek, in both directions', async () => {
@@ -214,14 +230,19 @@ describe('An index walk serves order by', () => {
 
 	it('walks a nullable column forward, NULLs first, and backward only under a NULL-excluding filter', async () => {
 		// The engine places NULLs first in both directions; a forward walk emits them first, a
-		// backward walk last. A `nulls last` key reaches no module, so the engine sorts it.
-		for (const clause of ['order by u, id', 'order by u nulls first, id']) {
-			await expectOrderFromIndex(db, `select id, t from walked ${clause}`);
-			await expectSameOrder(clause);
+		// backward walk last. A `nulls last` key reaches no module, so the engine sorts it. A spelled-out
+		// `nulls first` is read whole, from the measured table.
+		for (const [table, clause] of [['walked', `order by u, id ${PAGE}`], ['measured', 'order by u nulls first, id']] as const) {
+			await expectOrderFromIndex(db, `select id, t from ${table} ${clause}`);
+			await expectSameOrder(clause, [], table);
 		}
-		for (const clause of ['order by u nulls last, id', 'order by u desc, id desc', 'order by u desc nulls first, id desc']) {
-			await expectEngineSort(db, `select id, t from walked ${clause}`);
-			await expectSameOrder(clause);
+		for (const [table, clause] of [
+			['walked', `order by u nulls last, id ${PAGE}`],
+			['walked', `order by u desc, id desc ${PAGE}`],
+			['measured', 'order by u desc nulls first, id desc'],
+		] as const) {
+			await expectEngineSort(db, `select id, t from ${table} ${clause}`);
+			await expectSameOrder(clause, [], table);
 		}
 
 		await expectOrderFromIndex(db, 'select id, t from walked where u is not null order by u desc, id desc');
@@ -231,8 +252,8 @@ describe('An index walk serves order by', () => {
 	it('keeps the engine sort over a list on the ordered column, and over mixed directions', async () => {
 		await expectEngineSort(db, `select id, t from walked where g in ('x', 'y') order by t, id`);
 		await expectSameOrder(`where g in ('x', 'y') order by t, id`);
-		await expectEngineSort(db, 'select id, t from walked order by t, id desc');
-		await expectSameOrder('order by t, id desc');
+		await expectEngineSort(db, `select id, t from walked order by t, id desc ${PAGE}`);
+		await expectSameOrder(`order by t, id desc ${PAGE}`);
 	});
 
 	it('sees rows staged in the open transaction, in order', async () => {
@@ -242,9 +263,9 @@ describe('An index walk serves order by', () => {
 				await db.exec(`insert into ${table} (id, t, g, u, n) values ('s1', 'aa', 'x', 'uaa', 9), ('s2', 'a～a', 'y', null, 9)`);
 				await db.exec(`delete from ${table} where id = 'r01a'`);
 			}
-			const rows = await expectSameOrder('order by t, id');
+			const rows = await expectSameOrder(`order by t, id ${PAGE}`);
 			expect(rows.map(r => r.id)).to.include('s1').and.include('s2').and.not.include('r01a');
-			await expectSameOrder('order by t desc, id desc');
+			await expectSameOrder(`order by t desc, id desc ${PAGE}`);
 		} finally {
 			await db.exec('rollback');
 		}
@@ -260,8 +281,8 @@ describe('An index walk serves order by', () => {
 		await db.exec(`update model set t = 'moved' where id = 'r06a'`);
 
 		let rows: SqlRow[] = [];
-		const lines = await captureTrace(async () => { rows = await rowsOf('walked', 'order by t, id'); });
-		expect(rows).to.deep.equal(await rowsOf('model', 'order by t, id'));
+		const lines = await captureTrace(async () => { rows = await rowsOf('walked', `order by t, id ${PAGE}`); });
+		expect(rows).to.deep.equal(await rowsOf('model', `order by t, id ${PAGE}`));
 		expect(rows.filter(r => r.id === 'r06a')).to.have.length(1);
 		const [trace] = indexSeekTraces(lines).filter(t => t.index === 'idx_t');
 		expect(trace!.rejected, 'the stale entry is rejected rather than returned').to.equal(1);
@@ -296,7 +317,15 @@ describe('A filter compared under a coarser collation than its column leaves the
 
 const pad = (i: number): string => String(i).padStart(3, '0');
 /** `u` is NULL on the 300 low rows, so a forward walk of `idx_u` crosses the threshold among its NULLs. */
-const longRow = (id: string, t: string, i: number, u: string | null = t): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y', u];
+const longRow = (id: string, t: string, i: number, u: string | null = t): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y', u, i % 4];
+
+/**
+ * A residual filter every row passes (`n` is never negative), on a column no index holds. An
+ * unlimited ordered read with no filter, or one limited past 256 rows, is planned as a scan and sort
+ * and never reaches the switch; under a residual the walk is planned however much it reads (the bet
+ * `orderedWalkCandidate` records), so the shapes that read past 256 entries carry this.
+ */
+const EVERY_ROW = 'where n >= 0';
 
 /**
  * Rows for a walk that crosses `WALK_ROWS_BEFORE_SCAN` (256 entries). The low values come three to
@@ -332,24 +361,23 @@ describe('A long index walk finishes by scanning the table', () => {
 
 	before(async () => {
 		({ db } = openDatabase());
-		const columns = '(id text primary key, t text, g text, u text null)';
-		await db.exec(`create table walked ${columns} using optimystic('tree://test/long_walk_main')`);
+		await db.exec(`create table walked ${COLUMNS} using optimystic('tree://test/long_walk_main')`);
 		await db.exec('create index idx_t on walked(t)');
 		await db.exec('create index idx_gt on walked(g, t)');
 		await db.exec('create index idx_u on walked(u)');
-		await db.exec(`create table model ${columns} using memory`);
+		await db.exec(`create table model ${COLUMNS} using memory`);
 		await db.exec('begin');
 		for (const row of LONG_ROWS) {
-			await db.exec('insert into walked (id, t, g, u) values (?, ?, ?, ?)', [...row]);
-			await db.exec('insert into model (id, t, g, u) values (?, ?, ?, ?)', [...row]);
+			await db.exec('insert into walked (id, t, g, u, n) values (?, ?, ?, ?, ?)', [...row]);
+			await db.exec('insert into model (id, t, g, u, n) values (?, ?, ?, ?, ?)', [...row]);
 		}
 		await db.exec('commit');
 	});
 
 	for (const [shape, clause] of [
-		['a forward walk', 'order by t, id'],
-		['a backward walk, stopping inside a held run', 'order by t desc, id desc'],
-		['a limit past the threshold', 'order by t, id limit 300'],
+		['a forward walk', `${EVERY_ROW} order by t, id`],
+		['a backward walk, stopping inside a held run', `${EVERY_ROW} order by t desc, id desc`],
+		['a limit past the threshold', `${EVERY_ROW} order by t, id limit 300`],
 		['a limit met from a held run longer than the threshold', 'order by t desc, id desc limit 10'],
 		['a forward range, stopping inside a held run', `where t >= 'a017' order by t, id`],
 		['a forward range ending at <=', `where t > 'a010' and t <= 'a099' order by t, id`],
@@ -369,7 +397,7 @@ describe('A long index walk finishes by scanning the table', () => {
 	}
 
 	it('returns the NULLs the walk had not reached first, ahead of the values, for a forward walk of a nullable column', async () => {
-		const clause = 'order by u, id';
+		const clause = `${EVERY_ROW} order by u, id`;
 		await expectOrderFromIndex(db, `select id, t from walked ${clause}`);
 		const { walked, model, trace } = await readBoth(clause, 'idx_u');
 		expect(walked).to.deep.equal(model);

@@ -153,6 +153,14 @@ function plan(
 	);
 }
 
+/**
+ * A page-sized limit, for the cases that test which orderings a walk can claim. An ordered read with
+ * no filter and no limit is priced as the scan and sort a walk turns into past 256 rows, so over this
+ * fixture's million rows the engine sorts it whatever the claim; with a page the walk is chosen
+ * exactly when it can deliver the ordering.
+ */
+const PAGE = { limit: 20, offset: 0 };
+
 /** Assert the plan delivers `ordering` by walking `indexName` in the given direction. */
 function expectWalk(result: BestAccessPlanResult, indexName: string, ordering: Ordering, reverse: boolean, why: string): void {
 	expect(result.providesOrdering, `${why}: the ordering is claimed`).to.deep.equal(ordering);
@@ -288,14 +296,14 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 
 	it('walks a TEXT index forward for an ascending ordering, and backward for a descending one', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
-		walkOf('idx_name', asc(NAME), false, plan(tableInfo, [], asc(NAME)), 'ascending');
-		walkOf('idx_name', desc(NAME), true, plan(tableInfo, [], desc(NAME)), 'descending');
+		walkOf('idx_name', asc(NAME), false, plan(tableInfo, [], asc(NAME), PAGE), 'ascending');
+		walkOf('idx_name', desc(NAME), true, plan(tableInfo, [], desc(NAME), PAGE), 'descending');
 	});
 
 	it('walks backward for a descending ordering even over an index declared DESC, since the tree is ascending', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_name_desc', columns: [{ index: NAME, desc: true }] }]);
-		walkOf('idx_name_desc', desc(NAME), true, plan(tableInfo, [], desc(NAME)), 'declared desc, wanted desc');
-		walkOf('idx_name_desc', asc(NAME), false, plan(tableInfo, [], asc(NAME)), 'declared desc, wanted asc');
+		walkOf('idx_name_desc', desc(NAME), true, plan(tableInfo, [], desc(NAME), PAGE), 'declared desc, wanted desc');
+		walkOf('idx_name_desc', asc(NAME), false, plan(tableInfo, [], asc(NAME), PAGE), 'declared desc, wanted asc');
 	});
 
 	it('delivers the primary key after the index columns when the key is TEXT, and not when it is numeric', () => {
@@ -304,17 +312,17 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 			['id'],
 			[{ name: 'idx_t', columns: [{ index: 1 }] }],
 		);
-		walkOf('idx_t', asc(1, 0), false, plan(textKey, [], asc(1, 0)), 'a text primary key orders rows with equal index values');
-		walkOf('idx_t', desc(1, 0), true, plan(textKey, [], desc(1, 0)), 'and in reverse');
+		walkOf('idx_t', asc(1, 0), false, plan(textKey, [], asc(1, 0), PAGE), 'a text primary key orders rows with equal index values');
+		walkOf('idx_t', desc(1, 0), true, plan(textKey, [], desc(1, 0), PAGE), 'and in reverse');
 
 		const tableInfo = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
-		expectSorted(plan(tableInfo, [], asc(NAME, ID)), 'an INTEGER primary key is stored as its decimal text');
+		expectSorted(plan(tableInfo, [], asc(NAME, ID), PAGE), 'an INTEGER primary key is stored as its decimal text');
 	});
 
 	it('walks an index not every ordered column is in only when the rest are pinned', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
 		walkOf('idx_name', asc(CATEGORY, NAME), false, plan(tableInfo, [eqFilter(CATEGORY)], asc(CATEGORY, NAME)), 'category is pinned by a residual filter');
-		expectSorted(plan(tableInfo, [], asc(CATEGORY, NAME)), 'category is not pinned');
+		expectSorted(plan(tableInfo, [], asc(CATEGORY, NAME), PAGE), 'category is not pinned');
 	});
 
 	it('does NOT walk an index for an ordering every column of which is pinned', () => {
@@ -325,28 +333,28 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 
 	it('does NOT walk for mixed directions', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] }]);
-		expectSorted(plan(tableInfo, [], [...asc(CATEGORY), ...desc(NAME)]), 'asc then desc');
+		expectSorted(plan(tableInfo, [], [...asc(CATEGORY), ...desc(NAME)], PAGE), 'asc then desc');
 	});
 
 	it('walks a nullable column forwards, and backwards only under a NULL-excluding filter', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_s', columns: [{ index: S }] }]);
-		walkOf('idx_s', asc(S), false, plan(tableInfo, [], asc(S)), 'a forward walk emits the NULLs first, as the engine orders them');
-		expectSorted(plan(tableInfo, [], desc(S)), 'a backward walk would emit them last');
+		walkOf('idx_s', asc(S), false, plan(tableInfo, [], asc(S), PAGE), 'a forward walk emits the NULLs first, as the engine orders them');
+		expectSorted(plan(tableInfo, [], desc(S), PAGE), 'a backward walk would emit them last');
 		walkOf('idx_s', desc(S), true, plan(tableInfo, [notNullFilter(S)], desc(S)), '`s is not null` keeps every NULL out of the walk');
 	});
 
 	it('does NOT walk a column whose bytes do not order as its values', () => {
 		for (const [column, why] of [[PRICE, 'numeric'], [CITY, 'nocase column'], [SPAN, 'timespan compares by elapsed time'], [DATA, 'blob']] as const) {
 			const tableInfo = makeTableInfo([{ name: 'idx_c', columns: [{ index: column }] }]);
-			expectSorted(plan(tableInfo, [], asc(column)), why);
+			expectSorted(plan(tableInfo, [], asc(column), PAGE), why);
 		}
 		const nocaseIndex = makeTableInfo([{ name: 'idx_name_nocase', columns: [{ index: NAME, collation: 'NOCASE' }] }]);
-		expectSorted(plan(nocaseIndex, [], asc(NAME)), 'nocase on the index column');
+		expectSorted(plan(nocaseIndex, [], asc(NAME), PAGE), 'nocase on the index column');
 	});
 
 	it('never walks a partial index', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_name_part', columns: [{ index: NAME }], predicate: { type: 'literal' } }]);
-		expectSorted(plan(tableInfo, [], asc(NAME)), 'a partial index holds only the rows its predicate admits');
+		expectSorted(plan(tableInfo, [], asc(NAME), PAGE), 'a partial index holds only the rows its predicate admits');
 	});
 
 	it('loses to a selective seek on another index that leaves a small sort', () => {
@@ -366,8 +374,10 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 	});
 
 	it('beats the same seek when the seek matches most of the table', () => {
-		// One category: the seek fetches every row and the engine then sorts a million of them,
-		// which costs more than walking a million index entries into the required order.
+		// One category: the seek fetches every row and the engine then sorts a million of them. The
+		// walk under the residual is priced at one unit a row however much it reads, a bet
+		// `orderedWalkCandidate` records rather than an estimate: past 256 entries it finishes by
+		// scanning, so the bet costs at most those fetches on top of the scan and sort.
 		const tableInfo = {
 			...makeTableInfo([
 				{ name: 'idx_name', columns: [{ index: NAME }] },
@@ -383,21 +393,28 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 		walkOf('idx_name', asc(NAME), false, result, 'walk plus residual');
 	});
 
-	it('beats a scan the engine would sort, with a filter on an unindexed column left as a residual', () => {
+	it('beats a scan the engine would sort under a residual filter, priced alike with a limit and without', () => {
+		// The engine strips the limit from a plan that leaves a residual, so the walk holds no licence.
 		const tableInfo = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
 		const result = plan(tableInfo, [eqFilter(PRICE)], asc(NAME));
 		expect(result.handledFilters).to.deep.equal([false]);
 		walkOf('idx_name', asc(NAME), false, result, 'walk plus residual');
+		const limited = plan(tableInfo, [eqFilter(PRICE)], asc(NAME), { limit: 10, offset: 0 });
+		walkOf('idx_name', asc(NAME), false, limited, 'the same walk under a limit');
+		expect(limited.cost, 'the limit is not applied to a walk that leaves a filter').to.equal(result.cost);
 	});
 
-	it('prices a plan-time limit as the rows it stops after', () => {
-		// Only `rule-minmax-index-boundary` sends one today; a user's LIMIT never reaches the module.
+	it('walks a page of an ordered read with no filter, and leaves the whole read, or a page past the switch, to the engine', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_name', columns: [{ index: NAME }] }]);
 		const whole = plan(tableInfo, [], desc(NAME));
-		const one = plan(tableInfo, [], desc(NAME), { limit: 1, offset: 0 });
-		walkOf('idx_name', desc(NAME), true, one, 'a bounded walk is still the walk');
-		expect(one.cost, 'one entry read is priced far below the whole index').to.be.below(whole.cost / 1000);
-		expect(one.rows, 'rows stays the table size: the engine applies the limit').to.equal(whole.rows);
+		expectSorted(whole, 'a million rows fetched one at a time cost more than a scan and sort');
+		expect(whole.indexName, 'a plain scan').to.be.undefined;
+		const page = plan(tableInfo, [], desc(NAME), { limit: 10, offset: 0 });
+		walkOf('idx_name', desc(NAME), true, page, 'a page is walked');
+		expect(page.cost, 'ten entries read are priced far below the scan').to.be.below(whole.cost / 1000);
+		expect(page.rows, 'rows stays the table size: the engine applies the limit').to.equal(whole.rows);
+		expectSorted(plan(tableInfo, [], desc(NAME), { limit: 300, offset: 0 }), 'past 256 the walk finishes with the scan and sort, and costs more');
+		expectSorted(plan(tableInfo, [], desc(NAME), { limit: 250, offset: 50 }), 'the offset counts toward the rows read');
 	});
 });
 
@@ -477,6 +494,22 @@ describe('Range claims of a secondary index (getBestAccessPlan)', () => {
 
 		const listed = plan(tableInfo, [inFilter(CATEGORY, ['x', 'y']), bound('>', NAME)], []);
 		rangeOf(listed, 'idx_cat_name', [CATEGORY], [true, false], 'a list on the prefix is a multi-seek, the range a residual');
+	});
+
+	it('prices an ordered seek that claims every filter by the rows a limit stops it after, and one that leaves a residual by all of them', () => {
+		const tableInfo = makeTableInfo([{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] }]);
+		const claimed = [eqFilter(CATEGORY), bound('>', NAME)];
+		const whole = plan(tableInfo, claimed, desc(NAME));
+		const page = plan(tableInfo, claimed, desc(NAME), { limit: 10, offset: 0 });
+		rangeOf(page, 'idx_cat_name', [CATEGORY, NAME], [true, true], 'the page');
+		expect(page.cost, 'ten rows read').to.be.below(whole.cost / 100);
+		expect(page.rows, 'rows stays the range estimate: the engine applies the limit').to.equal(whole.rows);
+
+		const residual = [...claimed, bound('>', NAME, 'b')];
+		const residualWhole = plan(tableInfo, residual, desc(NAME));
+		const residualPage = plan(tableInfo, residual, desc(NAME), { limit: 10, offset: 0 });
+		rangeOf(residualPage, 'idx_cat_name', [CATEGORY, NAME], [true, true, false], 'a second lower bound stays a residual');
+		expect(residualPage.cost, 'the limit is not applied to a seek that leaves a filter').to.equal(residualWhole.cost);
 	});
 
 	it('beats the equality seek on the same prefix and the walk that delivers the same ordering', () => {

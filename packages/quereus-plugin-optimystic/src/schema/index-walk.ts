@@ -394,10 +394,12 @@ export function indexRangeScan(
 /**
  * How many index entries a walk or a range reads before it finishes by scanning the table instead
  * ({@link restOfWalk}). A walk descends the main tree once per row, about five times what a scan
- * costs per row when the read wants most of the table, and nothing can tell the planner in advance
- * that it will: a statement's LIMIT never reaches the module (Quereus backlog
- * `feat-sort-absorb-blind-to-limit-general`), a bound `limit ?` would be unknown at plan time
- * anyway, and a range's selectivity is an assumption. Only the walk finds out, because its consumer
+ * costs per row when the read wants most of the table. A statement's limit reaches the planner,
+ * which prices a walk with no filter by it and prices this switch in (`orderedWalkCandidate` in
+ * `optimystic-module.ts`), but it never reaches `query()`: a walk planned as a licensed page and one
+ * planned under residual filters run alike, so the walk cannot tell which it is. A walk under a
+ * residual, a table that has grown since `analyze` measured it, and a range whose selectivity is an
+ * assumption can each read far more than planned, and only the walk finds out, because its consumer
  * stops pulling.
  *
  * 256 is above the 100-row page GitHub #52 measures, and in that measurement (Node,
@@ -405,9 +407,11 @@ export function indexRangeScan(
  * top of the scan and sort it would otherwise have cost. It counts entries rather than rows
  * returned, so a walk under a selective residual filter moves on too.
  *
- * NOTE: a page larger than this on a very large table gets the cost of a scan and sort rather than
- * the walk's, and a range holding more entries than this reads the whole table however small a part
- * of it the range is. If either shows up slow on large tables, scale this by `analyze`'s row count.
+ * NOTE: a range holding more entries than this reads the whole table however small a part of it
+ * the range is; if that shows up slow on large tables, scale this by `analyze`'s row count. And if
+ * Quereus ever forwards a licensed `limit + offset` to `query()` (through `FilterInfo`), lift the
+ * switch for a walk or range that carries one and drop the scan term from a licensed walk's price,
+ * so a page larger than this on a large table is walked rather than scanned and sorted.
  */
 export const WALK_ROWS_BEFORE_SCAN = 256;
 
