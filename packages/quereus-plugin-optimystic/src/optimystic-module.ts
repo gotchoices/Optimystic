@@ -15,7 +15,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, equalityServesKeyColumn, rangeServesKeyColumn, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
@@ -32,7 +32,7 @@ import { contentKeyed, freshTagged, MERGE_TAG, PROFILE_TAG, singleWriterTagged }
 import { laneDeclarationChanged, mergeTag, profileTag } from './optimystic-adapter/lane.js';
 import { IndexManager, decodeIndexKey, hasNullIndexValue, indexEntryKey, indexKeyFromValues, indexValueRange, rowImpliesEntry, type IndexEntry, type IndexKey } from './schema/index-manager.js';
 import { WALK_ROWS_BEFORE_SCAN, bytesOrderAsValues, inEngineOrder, indexRangeScan, indexSeekCanBeTrusted, restOfWalk, seekCanBeTrusted, walkDelivering, walkKeyPositions } from './schema/index-walk.js';
-import type { RangeBound } from './schema/index-walk.js';
+import type { KeyColumn, RangeBound } from './schema/index-walk.js';
 import { IndexPredicate } from './schema/index-predicate.js';
 import { compareTreeKeys, splitKeyTuple } from './schema/key-encoding.js';
 import { compareIndexToRows, type IndexIntegrityReport } from './schema/index-integrity.js';
@@ -5039,17 +5039,21 @@ function walkDescriptor(walk: OrderedWalk): IndexDescriptor {
 }
 
 /**
- * The position of the filter a seek claims for one column: the first that fills the equality role,
- * since the engine seeks on the first and leaves a claim of any other unenforced (see
- * `findEqualityMatches` in `@quereus/quereus/src/vtab/memory/module.ts`). `-1` when there is none.
+ * The position of the filter a seek claims for one key column: the first that fills the equality
+ * role, since the engine seeks on the first and leaves a claim of any other unenforced (see
+ * `findEqualityMatches` in `@quereus/quereus/src/vtab/memory/module.ts`). `-1` when there is none,
+ * or when that filter compares under a collation the key column's does not refine
+ * (`equalityServesKeyColumn`): a byte seek for `b = 'x' collate nocase` would miss `'X'`. A later
+ * filter that would serve is not claimed in its place, for the same positional reason.
  *
  * A `runtimeSet` (`in (select …)`) is not claimed, which the contract allows; backlog
  * `feat-optimystic-in-subquery-seeks-the-index`.
  */
-function firstEqualityRoleFilter(filters: readonly PredicateConstraint[], columnIndex: number): number {
-  return filters.findIndex(f =>
-    f.usable && f.columnIndex === columnIndex && !f.runtimeSet && equalitySeekKeyCount(f) !== null,
+function firstEqualityRoleFilter(filters: readonly PredicateConstraint[], keyColumn: KeyColumn): number {
+  const position = filters.findIndex(f =>
+    f.usable && f.columnIndex === keyColumn.index && !f.runtimeSet && equalitySeekKeyCount(f) !== null,
   );
+  return position >= 0 && equalityServesKeyColumn(filters[position]!, keyColumn) ? position : -1;
 }
 
 /** What a seek of a key's leading columns would claim. */
@@ -5071,12 +5075,13 @@ const MAX_MULTI_SEEK_KEYS = 1000;
 
 /**
  * The longest run of a key's leading columns a seek can serve: each must pass `canBeTrusted`
- * and carry an equality-role filter ({@link firstEqualityRoleFilter}). The seek visits the
- * cross-product of the columns' values, so its key count is the product of their counts, and a
- * column whose count would take that product past {@link MAX_MULTI_SEEK_KEYS} ends the match.
+ * and carry an equality-role filter that compares under its collation ({@link firstEqualityRoleFilter}).
+ * The seek visits the cross-product of the columns' values, so its key count is the product of
+ * their counts, and a column whose count would take that product past {@link MAX_MULTI_SEEK_KEYS}
+ * ends the match.
  */
 function matchEqualitySeek(
-  keyColumns: readonly { readonly index: number; readonly collation?: string }[],
+  keyColumns: readonly KeyColumn[],
   tableInfo: TableSchema,
   filters: readonly PredicateConstraint[],
   canBeTrusted: (column: ColumnSchema | undefined, keyCollation: string | undefined) => boolean,
@@ -5085,7 +5090,7 @@ function matchEqualitySeek(
   let keyCount = 1;
   for (const keyColumn of keyColumns) {
     if (!canBeTrusted(tableInfo.columns[keyColumn.index], keyColumn.collation)) break;
-    const filterIndex = firstEqualityRoleFilter(filters, keyColumn.index);
+    const filterIndex = firstEqualityRoleFilter(filters, keyColumn);
     if (filterIndex < 0) break;
     const product = keyCount * equalitySeekKeyCount(filters[filterIndex]!)!;
     if (filterIndexes.length > 0 && product > keyCount && product > MAX_MULTI_SEEK_KEYS) break;
@@ -5196,16 +5201,19 @@ function firstBoundFilter(filters: readonly PredicateConstraint[], columnIndex: 
 }
 
 /**
- * Whether a range filter can be claimed: usable, not a runtime set, and with a plan-time value
- * that is a string, NULL, or unknown until bound. A literal of another type — `t > 5` on a text
+ * Whether a range filter on `rangeColumn` can be claimed: usable, not a runtime set, compared under
+ * the index column's own collation (`rangeServesKeyColumn`), and with a plan-time value that is a
+ * string, NULL, or unknown until bound. The tree brackets bytes, which order `'X'` below `'w'`, so a
+ * seek for `t > 'w' collate nocase` would miss `'X'`; such a bound stays with the engine, as a
+ * residual over whatever else serves the statement. A literal of another type — `t > 5` on a text
  * column — stays with the engine over a scan: the tree cannot bracket it, and a plan that walked
  * the whole index to test every row would cost a scan while reporting a fraction of one. A
  * backstop today: the engine plans such a comparison as a cast of the column, which is no
  * constraint, so no filter of that shape reaches this module (docs/internals.md, the three kinds
  * of bound).
  */
-function claimableBound(filter: PredicateConstraint): boolean {
-  return filter.usable && !filter.runtimeSet
+function claimableBound(filter: PredicateConstraint, rangeColumn: KeyColumn): boolean {
+  return filter.usable && !filter.runtimeSet && rangeServesKeyColumn(filter, rangeColumn)
     && (filter.value === undefined || filter.value === null || typeof filter.value === 'string');
 }
 
@@ -5220,7 +5228,10 @@ function claimableBound(filter: PredicateConstraint): boolean {
  * or `in`, since the engine's equality arm would then seek on a filter this module did not claim;
  * when it carries no bound; or when either first bound is not claimable ({@link claimableBound}),
  * since the engine would seek on it whether or not it was claimed. A further bound on the same
- * side stays unclaimed, and the engine keeps it as a residual.
+ * side stays unclaimed, and the engine keeps it as a residual. The engine holds a prefix equality
+ * of a range seek to the bounds' rule — the key column's own collation, not merely one it refines
+ * (`rangeServesKeyColumn`) — which the prefix meets because {@link matchEqualitySeek} trusts only
+ * BINARY key columns, over which the only refining collation is BINARY itself.
  *
  * Priced as one descent plus the rows the bounds are assumed to keep of what the prefix admits —
  * the prefix's measured or default equality selectivity, 1 with no prefix, times
@@ -5243,7 +5254,7 @@ function rangeSeekCandidate(
   const bounds = [LOWER_BOUND_OPS, UPPER_BOUND_OPS]
     .map(ops => firstBoundFilter(filters, rangeColumn.index, ops))
     .filter(position => position >= 0);
-  if (bounds.length === 0 || !bounds.every(position => claimableBound(filters[position]!))) return undefined;
+  if (bounds.length === 0 || !bounds.every(position => claimableBound(filters[position]!, rangeColumn))) return undefined;
 
   const { tableRowCount, seekCost } = pricing;
   const prefixColumns = match.filterIndexes.map(fi => filters[fi]!.columnIndex);

@@ -121,6 +121,11 @@ function eqFilter(columnIndex: number): any {
 	return { columnIndex, op: '=', usable: true, value: 'x' };
 }
 
+/** `filter` as the engine sends it when its comparison runs under NOCASE (`… collate nocase`). */
+function underNocase(filter: any): any {
+	return { ...filter, collation: 'NOCASE' };
+}
+
 function inFilter(columnIndex: number, values: SqlValue[]): any {
 	return { columnIndex, op: 'IN', usable: true, value: values };
 }
@@ -230,6 +235,25 @@ describe('Ordering claims of an equality seek (getBestAccessPlan.providesOrderin
 		const result = plan(tableInfo, [eqFilter(CITY)], asc(NAME));
 		expect(result.indexName, 'a nocase column is never sought').to.be.undefined;
 		expectSorted(result, 'a nocase pin');
+	});
+
+	it('neither seeks nor pins a BINARY column on an equality compared under NOCASE', () => {
+		// `category = 'x' collate nocase` keeps 'X' and 'x': a byte seek for 'x' would miss 'X', and
+		// the two sit in separate groups of the tree, so name is ordered only within each.
+		const filters = [underNocase(eqFilter(CATEGORY))];
+		const two = makeTableInfo([
+			{ name: 'idx_cat', columns: [{ index: CATEGORY }] },
+			{ name: 'idx_name', columns: [{ index: NAME }] },
+		]);
+		const walked = plan(two, filters, asc(NAME));
+		expect(walked.indexName, 'no seek of idx_cat').to.be.undefined;
+		expect(walked.handledFilters, 'the filter stays a residual above the walk').to.deep.equal([false]);
+		expectWalk(walked, 'idx_name', asc(NAME), false, 'the walk of idx_name serves the ordering');
+
+		const composite = makeTableInfo([{ name: 'idx_cat_name', columns: [{ index: CATEGORY }, { index: NAME }] }]);
+		const unpinned = plan(composite, filters, asc(NAME));
+		expect(unpinned.indexName, 'no seek of idx_cat_name').to.be.undefined;
+		expectSorted(unpinned, 'category is not pinned');
 	});
 
 	it('does NOT keep the ordering claim of an index that lost to a cheaper one', () => {
@@ -429,6 +453,12 @@ describe('Range claims of a secondary index (getBestAccessPlan)', () => {
 		}
 		scanOf(plan(makeTableInfo([{ name: 'idx_name_nocase', columns: [{ index: NAME, collation: 'NOCASE' }] }]), [bound('>', NAME, 'x')], []), 'nocase on the index column');
 		scanOf(plan(makeTableInfo([{ name: 'idx_name_part', columns: [{ index: NAME }], predicate: { type: 'literal' } }]), [bound('>', NAME, 'x')], []), 'a partial index');
+	});
+
+	it('does NOT claim a bound compared under another collation than the index column\'s', () => {
+		// The tree orders 'X' below 'w', so a byte seek for `name > 'w' collate nocase` would miss it.
+		scanOf(plan(nameIndex, [underNocase(bound('>', NAME, 'w'))], []), 'a nocase bound on a BINARY column');
+		scanOf(plan(nameIndex, [bound('>', NAME, 'a'), underNocase(bound('<', NAME, 'w'))], []), 'one such first bound declines the range');
 	});
 
 	it('seeks a list on the column instead, leaving the range as a residual', () => {

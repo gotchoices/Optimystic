@@ -14,7 +14,7 @@
  * table ({@link WALK_ROWS_BEFORE_SCAN}, {@link restOfWalk}).
  */
 
-import { ANY_TYPE, BOOLEAN_TYPE, IndexConstraintOp, PhysicalType, compareSqlValues, equalitySeekKeyCount, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
+import { ANY_TYPE, BOOLEAN_TYPE, IndexConstraintOp, PhysicalType, compareSqlValues, equalitySeekKeyCount, equalityServesKeyColumn, hasSemanticOrdering, isMultiValueEquality, normalizeCollationName, nullSafeOrderingPrefixLength } from '@quereus/quereus';
 import type { BestAccessPlanRequest, ColumnSchema, OrderingSpec, PredicateConstraint, Row, SqlValue, TableSchema, TableIndexSchema } from '@quereus/quereus';
 import { KeyRange } from '@optimystic/db-core';
 import { KEY_PREFIX_END, KEY_PRESENT_START, compareTreeKeys } from './key-encoding.js';
@@ -101,26 +101,21 @@ export function walkKeyPositions(
 /**
  * A column is pinned when a usable `=` or single-element `in` filter fixes its value, so it is
  * constant in the rows that survive and contributes no ordering. It counts here only when the
- * rows the filter keeps also have equal BYTES in that column ({@link indexSeekCanBeTrusted} under
- * the column's own collation, which is the one its predicates compare under): `where a = 'x'` on
- * a `nocase` column keeps `'X'` and `'x'`, which sit in separate groups of the tree, and the key
- * columns after `a` are ordered only within each group. The filter need not be one the plan
- * claims — an unclaimed one is enforced by the engine as a residual, which removes the other rows
- * just as well.
- * NOTE: a filter's comparison collation is not on `PredicateConstraint`, so `b = 'x' collate
- * nocase` on a BINARY column pins `b` here as a plain `=` would, and a walk ordered by the key
- * columns after it interleaves its 'X' and 'x' groups. The engine's own memory module pins the
- * same way, and the engine also keeps a plan's ordering claim after declining its seek for that
- * mismatch; both are the blocked ticket
- * `quereus-a-collate-nocase-equality-keeps-an-ordering-claim-the-plan-cannot-serve`. Once the
- * constraint carries its collation, pin only when it is at least as fine as BINARY.
+ * rows the filter keeps also have equal BYTES in that column: the column passes
+ * {@link indexSeekCanBeTrusted} under its own collation, and the filter's comparison refines that
+ * collation (`equalityServesKeyColumn`). Either way round, `where a = 'x'` on a `nocase` column, or `where
+ * a = 'x' collate nocase` on a BINARY one, keeps `'X'` and `'x'`, which sit in separate groups of
+ * the tree, and the key columns after `a` are ordered only within each group. The filter need not
+ * be one the plan claims — an unclaimed one is enforced by the engine as a residual, which removes
+ * the other rows just as well.
  */
 function pinnedColumns(filters: readonly PredicateConstraint[], tableInfo: TableSchema): Set<number> {
 	const pinned = new Set<number>();
 	for (const filter of filters) {
 		if (!filter.usable || filter.runtimeSet || isMultiValueEquality(filter) || equalitySeekKeyCount(filter) !== 1) continue;
 		const column = tableInfo.columns[filter.columnIndex];
-		if (indexSeekCanBeTrusted(column, column?.collation)) pinned.add(filter.columnIndex);
+		if (column === undefined || !indexSeekCanBeTrusted(column, column.collation)) continue;
+		if (equalityServesKeyColumn(filter, column)) pinned.add(filter.columnIndex);
 	}
 	return pinned;
 }

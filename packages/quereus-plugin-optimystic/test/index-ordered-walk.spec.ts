@@ -268,6 +268,31 @@ describe('An index walk serves order by', () => {
 	});
 });
 
+describe('A filter compared under a coarser collation than its column leaves the order to another index', () => {
+	let db: Database;
+
+	before(async () => {
+		({ db } = openDatabase());
+		const columns = '(id text primary key, b text, c text)';
+		await db.exec(`create table walked ${columns} using optimystic('tree://test/collated_filter_main')`);
+		await db.exec('create index idx_b on walked(b)');
+		await db.exec('create index idx_c on walked(c)');
+		await db.exec(`create table model ${columns} using memory`);
+		for (const table of ['walked', 'model']) {
+			await db.exec(`insert into ${table} (id, b, c) values ('1', 'X', 'b'), ('2', 'x', 'a'), ('3', 'y', 'c'), ('4', 'x', 'd')`);
+		}
+	});
+
+	it('walks the ordered column\'s index with the filter as a residual, for an equality and a range', async () => {
+		// idx_b's bytes put 'X' apart from 'x' and below 'w', so neither filter can seek it.
+		for (const clause of [`where b = 'x' collate nocase order by c`, `where b > 'w' collate nocase order by c`]) {
+			await expectOrderFromIndex(db, `select id from walked ${clause}`);
+			const walked = await collectRows(db.eval(`select id from walked ${clause}`));
+			expect(walked, clause).to.deep.equal(await collectRows(db.eval(`select id from model ${clause}`)));
+		}
+	});
+});
+
 const pad = (i: number): string => String(i).padStart(3, '0');
 /** `u` is NULL on the 300 low rows, so a forward walk of `idx_u` crosses the threshold among its NULLs. */
 const longRow = (id: string, t: string, i: number, u: string | null = t): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y', u];
