@@ -15,7 +15,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
-import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, isMultiValueEquality, shiftSchemaIndicesForDrop } from '@quereus/quereus';
+import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
@@ -199,20 +199,26 @@ const isRangeSeekPlan = (planType: number | undefined): boolean =>
 type SeekTuple = readonly unknown[];
 
 /**
- * The seeks a plan asks for: one single-value seek per argument of a multi-seek, otherwise the
- * one tuple `args`.
+ * The seeks a plan asks for: one tuple per seek of a multi-seek, otherwise the one tuple `args`.
  *
- * A wider multi-seek flattens its tuples into `args` and names their width in `idxStr`. This
- * module never claims one (`matchEqualitySeek`), and reading one as width 1 would seek on wrong
- * values and drop a predicate the engine no longer enforces, so it is refused.
+ * A multi-seek of more than one key column — an `in` beside another key column's `=` or `in`
+ * (`matchEqualitySeek`) — flattens the cross-product's tuples into `args` and names their width as
+ * the `seekWidth` parameter of `idxStr`; a single-column one names none. A width that does not
+ * divide `args` is refused: read any other way it would seek on wrong values, and the engine has
+ * dropped the predicate it replaces.
  */
 function seekTuplesOf(filterInfo: FilterInfo, planType: number | undefined): readonly SeekTuple[] {
   if (planType !== MULTI_SEEK_PLAN) return [filterInfo.args];
-  const seekWidth = decodeIdxStr(filterInfo.idxStr)?.params.get('seekWidth');
-  if (seekWidth !== undefined && seekWidth !== '1') {
-    throw new QuereusError(`Multi-seek of width ${seekWidth} is not supported: ${filterInfo.idxStr}`, StatusCode.INTERNAL);
+  const declared = decodeIdxStr(filterInfo.idxStr)?.params.get('seekWidth');
+  const width = declared === undefined ? 1 : Number(declared);
+  if (!Number.isInteger(width) || width < 1 || filterInfo.args.length % width !== 0) {
+    throw new QuereusError(`Multi-seek of width ${declared} over ${filterInfo.args.length} arguments: ${filterInfo.idxStr}`, StatusCode.INTERNAL);
   }
-  return filterInfo.args.map(arg => [arg]);
+  const tuples: SeekTuple[] = [];
+  for (let start = 0; start < filterInfo.args.length; start += width) {
+    tuples.push(filterInfo.args.slice(start, start + width));
+  }
+  return tuples;
 }
 
 /**
@@ -2346,8 +2352,8 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Read the row at each primary key the seeks name, against the supplied read source (live
-   * collection or a committed view): one for a point lookup, one per listed value for a
-   * multi-seek on a single-column key, the two ways getBestAccessPlan claims the key's
+   * collection or a committed view): one for a point lookup, one per tuple of a multi-seek's
+   * cross-product of listed values, the two ways getBestAccessPlan claims the key's
    * `=` and `in` filters. The read source is already network-refreshed (live) or a static
    * snapshot (committed); this method never refreshes it.
    */
@@ -5055,18 +5061,19 @@ interface EqualitySeekMatch {
 }
 
 /**
+ * The most keys a seek may visit once a later key column multiplies them. The first column's list
+ * is the one the statement wrote and competes on cost alone; a later column's `in` multiplies it
+ * (`a in (1..100) and b in (1..100)` is 10,000 seeks), so the column that would take the product
+ * past this ends the match and stays a residual over the seek of the columns before it. The value
+ * of `MAX_MULTI_SEEK_KEYS` in `@quereus/quereus-store/src/common/store-module-access-plan.ts`.
+ */
+const MAX_MULTI_SEEK_KEYS = 1000;
+
+/**
  * The longest run of a key's leading columns a seek can serve: each must pass `canBeTrusted`
- * and carry an equality-role filter ({@link firstEqualityRoleFilter}).
- *
- * A multi-value `in` is only ever the sole seek column: on the first column it is claimed and the
- * match stops there, and on a later one it ends the match before it, staying a residual while the
- * columns before it seek as they would alone. A single-element `in (?)` is not multi-value: the
- * engine emits an ordinary equality seek for it.
- *
- * NOTE: the limit exists because of an engine defect. With a composite seek, Quereus turns a bound
- * `=` beside an `in` into a NULL key and the seek returns nothing, so claiming one here would turn
- * a correct prefix seek plus residual into an empty result. `blocked/` ticket
- * `quereus-composite-in-seek-drops-a-bound-equality` carries the fix and what lifting this takes.
+ * and carry an equality-role filter ({@link firstEqualityRoleFilter}). The seek visits the
+ * cross-product of the columns' values, so its key count is the product of their counts, and a
+ * column whose count would take that product past {@link MAX_MULTI_SEEK_KEYS} ends the match.
  */
 function matchEqualitySeek(
   keyColumns: readonly { readonly index: number; readonly collation?: string }[],
@@ -5080,12 +5087,10 @@ function matchEqualitySeek(
     if (!canBeTrusted(tableInfo.columns[keyColumn.index], keyColumn.collation)) break;
     const filterIndex = firstEqualityRoleFilter(filters, keyColumn.index);
     if (filterIndex < 0) break;
-    const filter = filters[filterIndex]!;
-    const multiValue = isMultiValueEquality(filter);
-    if (multiValue && filterIndexes.length > 0) break;
+    const product = keyCount * equalitySeekKeyCount(filters[filterIndex]!)!;
+    if (filterIndexes.length > 0 && product > keyCount && product > MAX_MULTI_SEEK_KEYS) break;
     filterIndexes.push(filterIndex);
-    keyCount *= equalitySeekKeyCount(filter)!;
-    if (multiValue) break;
+    keyCount = product;
   }
   return { filterIndexes, keyCount };
 }

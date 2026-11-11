@@ -399,7 +399,8 @@ optimystic:quereus-plugin:module index:seek table=Usage index=by_token collectio
   always reads `asc`.
 - `seek=` — the framed index key the descent bracketed on, percent-escaped (the framing carries
   control bytes, so a raw key would break whitespace-separated parsing). An `in (…)` list seeks one
-  key per distinct listed value on this one line: the keys are joined with commas in the order
+  key per distinct listed value — per distinct combination, when the list sits beside other sought
+  key columns — on this one line: the keys are joined with commas in the order
   sought, which is the tree's ascending order rather than the order the statement wrote them, so
   `where token in ('tok-b', 'tok-a')` prints `seek=%02tok-a%00,%02tok-b%00`. Two nodes seeking the same
   SQL value must print the same `seek=`; a difference means the key framing diverged rather than

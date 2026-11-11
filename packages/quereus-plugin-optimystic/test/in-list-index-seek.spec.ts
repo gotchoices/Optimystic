@@ -124,6 +124,26 @@ interface SeekCase {
 	params?: SqlValue[];
 	/** The index the statement must plan an INDEXSEEK through. */
 	seeks?: string;
+	/** Whether that seek claims every filter, so the plan keeps no FILTER above it. */
+	claimsAll?: boolean;
+}
+
+/**
+ * Plan `where` against `sought` and check the seek it must take, then check the rows against the
+ * same statement over `scanned`, a table the engine can only scan and filter itself.
+ */
+async function expectSeekAgrees(db: Database, sought: string, scanned: string, seekCase: SeekCase): Promise<void> {
+	const { where, params = [], seeks, claimsAll } = seekCase;
+	if (seeks !== undefined) {
+		const plan = await planOf(db, `select id from ${sought} where ${where}`);
+		expect(seeksThrough(plan, seeks), plan.described).to.equal(true);
+		if (claimsAll === true) expect(plan.ops, plan.described).to.not.include('FILTER');
+	}
+	const idsOf = async (table: string): Promise<SqlValue[]> => {
+		const rows = await collectRows(db.eval(`select id from ${table} where ${where}`, params));
+		return rows.map(r => r.id!).sort();
+	};
+	expect(await idsOf(sought)).to.deep.equal(await idsOf(scanned));
 }
 
 const NUL_VALUE = 'a\x00b';
@@ -140,9 +160,11 @@ const CASES: SeekCase[] = [
 	{ name: 'the empty string', where: 'a in (?, ?)', params: ['', 'b'], seeks: 'idx_a' },
 	{ name: 'values absent from the table', where: 'a in (?, ?)', params: ['nope', 'nada'], seeks: 'idx_a' },
 	{ name: 'the leading column of a two-column index', where: `b in ('x', 'y')`, seeks: 'idx_bc' },
-	{ name: 'a leading in with a bound trailing =', where: 'b in (?, ?) and c = ?', params: ['x', 'y', 'p'], seeks: 'idx_bc' },
-	{ name: 'a bound = with a trailing literal in', where: `b = ? and c in ('p', 'q')`, params: ['x'], seeks: 'idx_bc' },
-	{ name: 'a bound = with a trailing bound in', where: 'b = ? and c in (?, ?)', params: ['x', 'p', 'q'], seeks: 'idx_bc' },
+	{ name: 'a leading in with a bound trailing =', where: 'b in (?, ?) and c = ?', params: ['x', 'y', 'p'], seeks: 'idx_bc', claimsAll: true },
+	{ name: 'a bound = with a trailing literal in', where: `b = ? and c in ('p', 'q')`, params: ['x'], seeks: 'idx_bc', claimsAll: true },
+	{ name: 'a bound = with a trailing bound in', where: 'b = ? and c in (?, ?)', params: ['x', 'p', 'q'], seeks: 'idx_bc', claimsAll: true },
+	{ name: 'a bound null = with a trailing in', where: `b = ? and c in ('p', 'q')`, params: [null], seeks: 'idx_bc', claimsAll: true },
+	{ name: 'a list on each column of a composite index', where: 'b in (?, ?) and c in (?, ?)', params: ['x', 'y', 'q', 'r'], seeks: 'idx_bc', claimsAll: true },
 	{ name: '= ahead of in on one column', where: `a = 'a' and a in ('a', 'ab')`, seeks: 'idx_a' },
 	{ name: 'in ahead of = on one column', where: `a in ('a', 'ab') and a = 'a'`, seeks: 'idx_a' },
 	{ name: 'a single-element in', where: 'a in (?)', params: ['a'], seeks: 'idx_a' },
@@ -196,14 +218,8 @@ describe('in-list seeks agree with a scan of the same rows', () => {
 		for (const [i, row] of ROWS.entries()) await insertBoth(row, i);
 	});
 
-	for (const { name, where, params, seeks } of CASES) {
-		it(name, async () => {
-			if (seeks !== undefined) {
-				const plan = await planOf(db, `select id from sought where ${where}`);
-				expect(seeksThrough(plan, seeks), plan.described).to.equal(true);
-			}
-			expect(await idsOf('sought', where, params)).to.deep.equal(await idsOf('scanned', where, params));
-		});
+	for (const seekCase of CASES) {
+		it(seekCase.name, () => expectSeekAgrees(db, 'sought', 'scanned', seekCase));
 	}
 
 	it('finds staged inserts and not staged deletes inside an open transaction', async () => {
@@ -239,6 +255,34 @@ describe('in-list seeks agree with a scan of the same rows', () => {
 		const rows = await collectRows(db.eval(query));
 		expect(rows.map(r => r.a)).to.deep.equal(['a', 'a', 'ab', 'b']);
 	});
+});
+
+describe('in-list seeks of a composite primary key agree with a scan of the same rows', () => {
+	let db: Database;
+
+	const PK_CASES: SeekCase[] = [
+		{ name: 'a bound = with a trailing literal in', where: `b = ? and c in ('p', 'q')`, params: ['x'] },
+		{ name: 'a bound = with a trailing bound in', where: 'b = ? and c in (?, ?)', params: ['x', 'p', 'q'] },
+		{ name: 'a leading bound in with a bound =', where: 'b in (?, ?) and c = ?', params: ['x', 'y', 'p'] },
+		{ name: 'a leading literal in with a literal =', where: `b in ('x', 'y') and c = 'p'` },
+		{ name: 'a list on each column, one value prefixing another', where: 'b in (?, ?) and c in (?, ?)', params: ['x', 'xa', 'p', 'r'] },
+		{ name: 'a bound null = with a trailing in', where: `b = ? and c in ('p', 'q')`, params: [null] },
+	].map(c => ({ ...c, seeks: 'primary', claimsAll: true }));
+
+	before(async () => {
+		db = openDatabase().db;
+		await db.exec(`create table pk_sought (b text, c text, id text, primary key (b, c)) using optimystic('tree://test/in_pk_sought')`);
+		await db.exec(`create table pk_scanned (seq integer primary key, b text, c text, id text) using optimystic('tree://test/in_pk_scanned')`);
+		const rows = [['x', 'p', '1'], ['x', 'q', '2'], ['y', 'p', '3'], ['x', 'r', '4'], ['xa', 'p', '5'], ['xa', 'r', '6']];
+		for (const [seq, row] of rows.entries()) {
+			await db.exec('insert into pk_sought (b, c, id) values (?, ?, ?)', row);
+			await db.exec('insert into pk_scanned (seq, b, c, id) values (?, ?, ?, ?)', [seq, ...row]);
+		}
+	});
+
+	for (const seekCase of PK_CASES) {
+		it(seekCase.name, () => expectSeekAgrees(db, 'pk_sought', 'pk_scanned', seekCase));
+	}
 });
 
 // --- columns where equal values can have different bytes ---------------------
@@ -384,9 +428,9 @@ const inList = (columnIndex: number, count: number): PredicateConstraint => ({
 	value: Array.from({ length: count }) as unknown as SqlValue,
 });
 
-function plan(table: TableSchema, filters: PredicateConstraint[], requiredOrdering?: OrderingSpec[]): BestAccessPlanResult {
+function plan(table: TableSchema, filters: PredicateConstraint[], requiredOrdering?: OrderingSpec[], estimatedRows = TABLE_ROWS): BestAccessPlanResult {
 	const mod = new OptimysticModule({} as never, {} as never);
-	return mod.getBestAccessPlan({} as never, table, { columns: [], filters, estimatedRows: TABLE_ROWS, requiredOrdering });
+	return mod.getBestAccessPlan({} as never, table, { columns: [], filters, estimatedRows, requiredOrdering });
 }
 
 const stats = (distinctCount: number): ColumnStatistics => ({ distinctCount, nullCount: 0 });
@@ -462,18 +506,29 @@ describe('Access plan for an in-list (getBestAccessPlan)', () => {
 		expect(equalFirst.cost).to.be.closeTo(SEEK_COST + 100, 1e-9);
 	});
 
-	it('seeks a multi-value in only as the sole column of a composite index', () => {
+	it('seeks every column of a composite index through a multi-value in, up to the cap on the product', () => {
 		const leading = plan(makeTable([idxCatName]), [inList(CATEGORY, 2), eq(NAME)]);
-		expect(leading.seekColumnIndexes).to.deep.equal([CATEGORY]);
-		expect(leading.handledFilters).to.deep.equal([true, false]);
+		expect(leading.seekColumnIndexes).to.deep.equal([CATEGORY, NAME]);
+		expect(leading.handledFilters).to.deep.equal([true, true]);
 
 		const trailing = plan(makeTable([idxCatName]), [eq(CATEGORY), inList(NAME, 2)]);
-		expect(trailing.seekColumnIndexes).to.deep.equal([CATEGORY]);
-		expect(trailing.handledFilters).to.deep.equal([true, false]);
+		expect(trailing.seekColumnIndexes).to.deep.equal([CATEGORY, NAME]);
+		expect(trailing.handledFilters).to.deep.equal([true, true]);
+		expect(trailing.explains).to.contain('multi-seek of 2 keys');
 
-		const single = plan(makeTable([idxCatName]), [eq(CATEGORY), inList(NAME, 1)]);
-		expect(single.seekColumnIndexes).to.deep.equal([CATEGORY, NAME]);
-		expect(single.handledFilters).to.deep.equal([true, true]);
+		const both = plan(makeTable([idxCatName]), [inList(CATEGORY, 2), inList(NAME, 3)]);
+		expect(both.handledFilters).to.deep.equal([true, true]);
+		expect(both.explains).to.contain('multi-seek of 6 keys');
+
+		// 40 × 40 is past the 1000-key cap: the trailing list stays a residual over the 40 seeks.
+		const capped = plan(makeTable([idxCatName]), [inList(CATEGORY, 40), inList(NAME, 40)], undefined, 1_000_000);
+		expect(capped.seekColumnIndexes).to.deep.equal([CATEGORY]);
+		expect(capped.handledFilters).to.deep.equal([true, false]);
+
+		// A single value does not raise the product, so it extends a list already past the cap.
+		const narrowed = plan(makeTable([idxCatName]), [inList(CATEGORY, 1500), eq(NAME)], undefined, 1_000_000);
+		expect(narrowed.seekColumnIndexes).to.deep.equal([CATEGORY, NAME]);
+		expect(narrowed.handledFilters).to.deep.equal([true, true]);
 	});
 
 	it('competes a primary-key list on cost, against a scan and a secondary index', () => {
@@ -490,9 +545,14 @@ describe('Access plan for an in-list (getBestAccessPlan)', () => {
 		expect(lost.handledFilters).to.deep.equal([false, true]);
 	});
 
-	it('leaves a composite primary key\'s list to a scan, and point-seeks one fully bound by = and single-element in', () => {
+	it('multi-seeks a composite primary key\'s list, and point-seeks one fully bound by = and single-element in', () => {
 		const composite = [{ index: ID }, { index: CATEGORY }];
-		expectUnclaimed(plan(makeTable([], {}, composite), [inList(ID, 2), eq(CATEGORY)]));
+		const listed = plan(makeTable([], {}, composite), [inList(ID, 2), eq(CATEGORY)]);
+		expect(listed.indexName).to.equal('_primary_');
+		expect(listed.seekColumnIndexes).to.deep.equal([ID, CATEGORY]);
+		expect(listed.handledFilters).to.deep.equal([true, true]);
+		expect(listed.rows).to.equal(2);
+		expect(listed.isSet).to.equal(false);
 
 		const bound = plan(makeTable([], {}, composite), [inList(ID, 1), eq(CATEGORY)]);
 		expect(bound.indexName).to.equal('_primary_');
