@@ -5123,7 +5123,7 @@ function measuredEqualityTupleSelectivity(tableInfo: TableSchema, eqColumns: rea
 
 /**
  * An equality seek of `index`'s leading columns on `match` ({@link matchEqualitySeek}): one key, or
- * one per listed value of a multi-seek. It delivers the required ordering when a walk of the index
+ * one per combination of the listed values of a multi-seek. It delivers the required ordering when a walk of the index
  * does (`walkDelivering`, which treats the sought columns as pinned) and the seek is of one key — a
  * multi-seek walks the index key by key, so it delivers none.
  */
