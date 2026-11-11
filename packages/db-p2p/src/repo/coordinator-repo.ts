@@ -1,4 +1,4 @@
-import type { WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
+import type { ConnectedCohort, WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
 import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits, laneField } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
 import type { PeerId } from "@libp2p/interface";
@@ -11,7 +11,7 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js";
-import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
+import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveReadRepairQuietWindowMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
@@ -29,6 +29,7 @@ import { SilentConsultHolds } from "./silent-consult-holds.js";
 import { commitBatchOf, pendBatchOf, refusesSolo, statedLane, type CommitBatch, type PendBatch, type RequestBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
 import { HeldBlockConsults } from "./held-block-consults.js";
+import { cohortCommitsNeedEveryMember, quietCohortFor, quietCohortHolds, type QuietCohort } from "./quiet-cohort.js";
 import { withDeadline } from "../with-deadline.js";
 
 /**
@@ -622,11 +623,29 @@ export interface ICoordinatorClusterSeam {
  * exits, and only a floor STRICTLY above it triggers again ({@link CoordinatorRepo.floorDemandsConsult}).
  * A stamp written without a floor (a commit, or a pass that was not asked one) clears the memory:
  * a commit moves `latest`, and a floor above the new `latest` is new information.
+ *
+ * `quiet` is the cohort the marking consult heard from in full, when that consult may start a quiet
+ * span ({@link CoordinatorRepo.quietSpanStartedBy}): while that cohort stays connected the window's
+ * expiry alone starts no consult, up to `readRepairQuietWindowMs` after `at`
+ * ({@link CoordinatorRepo.quietCohortStillVouches}). Every other stamp carries none, so any other
+ * marking — a commit, the solo-self exit, a consult that did not hear from everyone — ends the span.
+ * `quietLogged` says the span has already been reported once.
  */
 interface FreshnessStamp {
 	at: number;
 	floorConsulted?: number;
+	quiet?: QuietCohort;
+	quietLogged?: boolean;
 }
+
+/**
+ * Why the lazy read-repair window asks for a consult of a held block
+ * ({@link CoordinatorRepo.readRepairDemand}): never checked in this process, checked longer than one
+ * window ago, picked by `readRepairSampleRate`, or every read (`'paranoid'`). Only `'expired'` can be
+ * answered by a quiet span: an unstamped block has no span, and a sampled consult is an operator's
+ * request for random verification.
+ */
+type ReadRepairDemand = 'unstamped' | 'expired' | 'sampled' | 'always';
 
 /** Cluster coordination repo - uses local store, as well as distributes changes to other nodes using cluster consensus. */
 export class CoordinatorRepo implements IRepo {
@@ -675,6 +694,13 @@ export class CoordinatorRepo implements IRepo {
 	private readonly readRepairMode: 'off' | 'lazy' | 'paranoid';
 	private readonly readRepairWindowMs: number;
 	private readonly readRepairSampleRate: number;
+	/**
+	 * How long a quiet span lasts after the consult that started it, or 0 when this node starts none:
+	 * not `'lazy'`, a declared window at or below {@link readRepairWindowMs} (which no expired read
+	 * could fall inside), or a key network that cannot report a connected cohort. See
+	 * {@link FreshnessStamp}.
+	 */
+	private readonly readRepairQuietWindowMs: number;
 	/** Simple-majority threshold from the consensus policy; drives the read-repair corroboration quorum. */
 	private readonly simpleMajorityThreshold: number;
 	/**
@@ -771,6 +797,7 @@ export class CoordinatorRepo implements IRepo {
 			readRepairMode: cfg?.readRepairMode ?? 'lazy',
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
 			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0,
+			readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(cfg?.readRepairQuietWindowMs),
 			// Through the shared resolver, not a second literal: a hand-wired coordinator and a node
 			// assembly given the same operator number must bound their per-peer reads identically, and
 			// a degenerate declaration must fail here exactly as it fails at node construction.
@@ -782,6 +809,11 @@ export class CoordinatorRepo implements IRepo {
 		this.readRepairMode = policy.readRepairMode!;
 		this.readRepairWindowMs = policy.readRepairWindowMs!;
 		this.readRepairSampleRate = policy.readRepairSampleRate!;
+		this.readRepairQuietWindowMs = this.readRepairMode === 'lazy'
+			&& policy.readRepairQuietWindowMs! > this.readRepairWindowMs
+			&& typeof keyNetwork.connectedCohort === 'function'
+			? policy.readRepairQuietWindowMs!
+			: 0;
 		this.cohortQueryTimeoutMs = policy.cohortQueryTimeoutMs!;
 		this.reconcilePassTimeoutMs = reconcilePassTimeoutMs(this.cohortQueryTimeoutMs);
 		// Only the `'lazy'` window ever reads a hold, so any other mode places none — and logs none.
@@ -1003,10 +1035,16 @@ export class CoordinatorRepo implements IRepo {
 	 * A consult that throws is caught here and flags only this block, so one block's failed consult
 	 * cannot fail the rest of the read.
 	 *
+	 * A held block whose window has merely expired is served with no consult at all while its quiet
+	 * span holds ({@link quietCohortStillVouches}): its last consult heard from every member of a cohort
+	 * in which every commit needs every member, and none of them has disconnected since.
+	 *
 	 * A consult this pass runs, blocking or behind the read, joins `round` (the read's
 	 * {@link ConsultRound}, when there is one) and asks each peer through it. It joins before this
 	 * method's first await — everything ahead of the join is synchronous — which is what lets `get`
-	 * close the round as soon as it has started every pass.
+	 * close the round as soon as it has started every pass. The quiet-span check is the one await ahead
+	 * of a consult, so a pass that makes it joins first and hands that seat to the consult it then
+	 * starts, or leaves it unused when the span holds.
 	 */
 	private async readRepairBlock(blockId: BlockId, blockGets: BlockGets, results: GetBlockResults, options?: MessageOptions, round?: ConsultRound): Promise<void> {
 		const localEntry = results[blockId];
@@ -1020,7 +1058,8 @@ export class CoordinatorRepo implements IRepo {
 		// block whose consult asked nobody it is the evidence that the block exists
 		// (`unavailableReasonFor`).
 		const floor = blockGets.floors?.[blockId];
-		const windowDemands = !isMissing && this.shouldReadRepair(blockId);
+		const windowDemand = isMissing ? undefined : this.readRepairDemand(blockId);
+		const windowDemands = windowDemand !== undefined;
 		const floorDemands = !isMissing && this.floorDemandsConsult(blockId, floor, localRev);
 		const isStale = windowDemands || floorDemands;
 		if (!isMissing && !isStale) {
@@ -1034,12 +1073,23 @@ export class CoordinatorRepo implements IRepo {
 			return;
 		}
 
-		// `shouldReadRepair` says true on every read under `'paranoid'`, so the mode is tested here
+		// `readRepairDemand` asks on every read under `'paranoid'`, so the mode is tested here
 		// rather than inferred from `windowDemands`.
 		const windowOnly = isStale && !floorDemands && this.readRepairMode === 'lazy';
 		if (windowOnly && blockGets.skipWindowConsult) {
 			// The asker opted out of exactly this consult (`BlockGets.skipWindowConsult`): served from the
 			// local copy with the memo's stamp, and the window left expired so the next read consults.
+			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			return;
+		}
+		// Only an expired window can be answered by a quiet span: a sample is an operator's request for a
+		// consult, and an unstamped block has no span to extend.
+		const stamp = windowOnly && windowDemand === 'expired' ? this.lastSeenCommitMs.get(blockId) : undefined;
+		const reserved = stamp?.quiet ? round?.join() : undefined;
+		if (stamp?.quiet && await this.quietCohortStillVouches(blockId, stamp, stamp.quiet, localRev)) {
+			reserved?.ready();
+			// Served exactly as a read inside the window is, and the stamp is left as it is, so the span
+			// still ends `readRepairQuietWindowMs` after the consult that started it.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			return;
 		}
@@ -1049,7 +1099,7 @@ export class CoordinatorRepo implements IRepo {
 			// The trigger line is logged only when a consult actually starts: a read that lands while the
 			// block's pass is still running, or past the cap, consulted nobody, and the line's one-per-consult
 			// reading (docs/debugging.md) is what the issue #8 count relied on.
-			if (this.startHeldBlockConsult(blockId, blockGets.context, held, floor, asker, round)) {
+			if (this.startHeldBlockConsult(blockId, blockGets.context, held, floor, asker, round, reserved)) {
 				this.logRepairTriggered(blockId, localRev, 'window', true, floor);
 			}
 			// Served from the local copy, stamped from the unsettled-claim memo as it stands: what moves
@@ -1061,7 +1111,7 @@ export class CoordinatorRepo implements IRepo {
 		if (isStale) this.logRepairTriggered(blockId, localRev, floorDemands ? 'floor' : 'window', false, floor);
 
 		const passSeq = this.nextPassSeq();
-		const seat = round?.join();
+		const seat = reserved ?? round?.join();
 		try {
 			const { absence, currency, heldBySilence } = await leavingSeat(seat, this.fetchBlockFromCluster(blockId, blockGets.context, held, floor, asker, seat));
 			// A missing block consults on every read whatever the hold says, so its silences place none.
@@ -1355,18 +1405,21 @@ export class CoordinatorRepo implements IRepo {
 	 * the cohort. If missing-block consults to a silent cohort ever show up as read amplification, hold
 	 * the latest-query for them too, flagging the absence `'peers-unreachable'` as the last consult
 	 * concluded.
+	 *
+	 * Answers WHY it wants one ({@link ReadRepairDemand}), or `undefined` when it does not, so that a
+	 * quiet span answers only an expired window and never a sampled consult.
 	 */
-	private shouldReadRepair(blockId: BlockId): boolean {
+	private readRepairDemand(blockId: BlockId): ReadRepairDemand | undefined {
 		switch (this.readRepairMode) {
-			case 'off': return false;
-			case 'paranoid': return true;
+			case 'off': return undefined;
+			case 'paranoid': return 'always';
 			case 'lazy': {
-				if (this.silentConsultHolds.holds(blockId)) return false;
+				if (this.silentConsultHolds.holds(blockId)) return undefined;
 				const lastSeen = this.lastSeenCommitMs.get(blockId)?.at;
-				if (lastSeen == null) return true;
-				if (this.now() - lastSeen > this.readRepairWindowMs) return true;
-				if (this.readRepairSampleRate > 0 && this.rand() < this.readRepairSampleRate) return true;
-				return false;
+				if (lastSeen == null) return 'unstamped';
+				if (this.now() - lastSeen > this.readRepairWindowMs) return 'expired';
+				if (this.readRepairSampleRate > 0 && this.rand() < this.readRepairSampleRate) return 'sampled';
+				return undefined;
 			}
 		}
 	}
@@ -1413,7 +1466,7 @@ export class CoordinatorRepo implements IRepo {
 	 * log volume for a probed but never-written collection. Re-stamping on every read would keep the
 	 * stamp fresh and silence the line for good on a block read more often than once a window.
 	 *
-	 * Withholding the stamp never skips a consult: `get` asks {@link shouldReadRepair} only about
+	 * Withholding the stamp never skips a consult: `get` asks {@link readRepairDemand} only about
 	 * present blocks. A HELD block reaches the exit only when read-repair already chose to consult, so
 	 * this is always false for one. Its line and stamp are unchanged, and the line keeps pairing with
 	 * `cluster-tx:read-repair-triggered`.
@@ -1431,12 +1484,98 @@ export class CoordinatorRepo implements IRepo {
 	 * Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). `floor` is
 	 * the asker's floor the marking pass consulted under, recorded so a later read under the same
 	 * floor does not consult again inside the window; omitted (a commit, or a pass not asked one) it
-	 * clears any floor recorded before — see {@link FreshnessStamp}.
+	 * clears any floor recorded before. `quiet` starts a quiet span ({@link quietSpanStartedBy});
+	 * omitted, it ends any span recorded before — see {@link FreshnessStamp}.
 	 */
-	private markBlocksSeen(blockIds: readonly BlockId[], floor?: number): void {
+	private markBlocksSeen(blockIds: readonly BlockId[], floor?: number, quiet?: QuietCohort): void {
 		const now = this.now();
 		for (const id of blockIds) {
-			this.lastSeenCommitMs.set(id, floor === undefined ? { at: now } : { at: now, floorConsulted: floor });
+			this.lastSeenCommitMs.set(id, {
+				at: now,
+				...(floor === undefined ? {} : { floorConsulted: floor }),
+				...(quiet === undefined ? {} : { quiet })
+			});
+		}
+	}
+
+	/**
+	 * The cohort `connectedCohort` reports for `blockId` just before a consult of a cohort of
+	 * `cohortSize` starts, when that consult could start a quiet span: the span is enabled and every
+	 * commit in a cohort that size needs every member. Taken before the consult, so a connection that
+	 * breaks while it runs already shows as a different run. Never rejects: a lookup that fails is
+	 * logged and leaves the consult unable to start a span, which is the window's cadence.
+	 */
+	private async connectedCohortBeforeConsult(blockId: BlockId, cohortSize: number): Promise<ConnectedCohort | undefined> {
+		if (this.readRepairQuietWindowMs === 0 || !cohortCommitsNeedEveryMember(cohortSize, this.superMajorityThreshold)) return undefined;
+		try {
+			return await this.keyNetwork.connectedCohort?.(routingKeyForBlock(blockId));
+		} catch (err) {
+			this.log('cluster-fetch:connected-cohort-failed', { blockId, error: (err as Error).message });
+			return undefined;
+		}
+	}
+
+	/**
+	 * The quiet span a consult that is about to mark a block seen starts ({@link FreshnessStamp}), or
+	 * `undefined`: nobody in `consulted` was silent (a stated holding, `BlockGets.askerHolds`, is an
+	 * answer), no peer claims anything ahead of `current` — what this node holds once the pass is done,
+	 * a claim at its revision under another action included — and the snapshot taken before the
+	 * consult names exactly the consulted cohort, every commit among which needs every member
+	 * ({@link quietCohortFor}).
+	 */
+	private quietSpanStartedBy(before: ConnectedCohort | undefined, consulted: readonly string[], silent: readonly string[], claims: readonly RevClaim[], current: ActionRev | undefined): QuietCohort | undefined {
+		if (before === undefined || silent.length > 0 || current === undefined) return undefined;
+		const ahead = claims.some(c => c.rev > current.rev || (c.rev === current.rev && c.actionId !== current.actionId));
+		return ahead ? undefined : quietCohortFor(before, consulted, this.superMajorityThreshold);
+	}
+
+	/**
+	 * Whether a held block's quiet span still answers its expired window, so the read is served with no
+	 * consult (docs/transactions.md § Lazy read-repair window): the cohort `connectedCohort` reports now
+	 * is the one `stamp`'s consult heard from, on the same connection runs, so every commit to the block
+	 * since needed this node's promise; the consult was at most `readRepairQuietWindowMs` ago; and this
+	 * node holds no live pending record for the block, so no commit it promised is unresolved here. The
+	 * stamp is not refreshed. Logs `cluster-tx:read-repair-quiet` the first time `stamp` extends a read.
+	 * Never rejects: a check that throws is logged and answers false, so the read consults as it would
+	 * have without a span — the caller holds a seat in its read's round across this await.
+	 *
+	 * NOTE: a commit whose promise this node approved WITHOUT holding the pend's record
+	 * (`validateCommitOperations` abstains for a member that missed the pend) leaves nothing here to
+	 * see until its decision is applied, which refuses as behind and reconciles; a coordinator that
+	 * gives up delivering it while staying connected is bounded only by `readRepairQuietWindowMs`. If a
+	 * read is ever traced to that interval, also consult while this node's cluster member holds a
+	 * consensus record touching the block that it voted on and has not settled.
+	 *
+	 * NOTE: a partner whose cohort view leaves this node out while still connected (still identifying it
+	 * after a reconnect, or its membership predicate dropped it) can commit alone. That commit names this
+	 * node in its under-replication ledger, so the drain pushes the copy at the next identify, and the
+	 * reconnect already started a new run here; what remains is bounded by that push or by
+	 * `readRepairQuietWindowMs`. If a read is ever traced to it, close it at the partner: refuse a solo
+	 * commit while connected to a peer that serves the network but is not yet in the partner's view.
+	 *
+	 * NOTE: one cohort assembly (about 0.01 ms per `findCluster` on Node) and one metadata read, paid by
+	 * each expired read of each block in place of a network consult. If it shows in an on-device
+	 * profile, take the snapshot once per read (`get` already deduplicates block ids) rather than once
+	 * per block.
+	 */
+	private async quietCohortStillVouches(blockId: BlockId, stamp: FreshnessStamp, quiet: QuietCohort, localRev: number | undefined): Promise<boolean> {
+		try {
+			const [now, claims] = await Promise.all([
+				this.keyNetwork.connectedCohort?.(routingKeyForBlock(blockId)),
+				this.livePendingClaims(blockId)
+			]);
+			// A repo that cannot list its pending records cannot rule one out.
+			const pendingHeld = claims === undefined || claims.length > 0;
+			const ageMs = this.now() - stamp.at;
+			if (!quietCohortHolds(quiet, now, ageMs, this.readRepairQuietWindowMs, this.superMajorityThreshold, pendingHeld)) return false;
+			if (!stamp.quietLogged) {
+				stamp.quietLogged = true;
+				this.log('cluster-tx:read-repair-quiet', { blockId, localRev, ageMs, members: quiet.members.length });
+			}
+			return true;
+		} catch (err) {
+			this.log('cluster-fetch:quiet-check-failed', { blockId, error: (err as Error).message });
+			return false;
 		}
 	}
 
@@ -1567,12 +1706,15 @@ export class CoordinatorRepo implements IRepo {
 	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
 	 * for this consult, not the floor — and `held` is what that read loaded, which is the baseline
 	 * the pass measures its outcome against and what the consult tells each peer this node holds.
-	 * A pass that starts joins the read's `round`, so its questions ride in that read's requests.
+	 * A pass that starts joins the read's `round`, so its questions ride in that read's requests. A
+	 * read that already took its seat (`reserved`, see {@link readRepairBlock}) hands it to the pass, and
+	 * leaves it when no pass starts.
 	 */
-	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, round: ConsultRound | undefined): boolean {
+	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, round: ConsultRound | undefined, reserved?: ConsultSeat): boolean {
 		// Joins only a pass that starts: a read that finds one running, or the slots full, asks nobody.
 		const outcome = this.heldBlockConsults.start(blockId, round, () =>
-			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), round?.join()));
+			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), reserved ?? round?.join()));
+		if (outcome.kind !== 'started') reserved?.ready();
 		if (outcome.kind === 'deferred') {
 			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: outcome.inFlight, slotsInUse: outcome.slotsInUse });
 		}
@@ -1739,7 +1881,7 @@ export class CoordinatorRepo implements IRepo {
 			const namedThisWindow = this.soloAbsenceNamedThisWindow(blockId, localRev);
 			if (!namedThisWindow) this.log('cluster-fetch:solo-self-skip', { blockId });
 			// Arm the lazy read-repair window. Without this the window is never stamped,
-			// `shouldReadRepair` reads `lastSeen == null` forever, and every read re-enters this
+			// `readRepairDemand` reads `lastSeen == null` forever, and every read re-enters this
 			// exit — read -> stale -> consult -> solo skip -> no-op -> still stale, unbounded
 			// (GitHub issue #8: a solo node spent 47 minutes on a cold schema apply, logging 3,880
 			// triggers against 3,879 no-ops).
@@ -1770,7 +1912,11 @@ export class CoordinatorRepo implements IRepo {
 			return { absence: 'unasked', currency: { kind: 'no-evidence' } };
 		}
 
+		const cohortBefore = await this.connectedCohortBeforeConsult(blockId, peerIds.length);
 		const { corroborated, corroboration, local, silent, answered, claims, consulted, uncorroboratedRev, deadlock } = await this.queryClusterForLatest(peerIds, blockId, context, held, asker, seat);
+		/** The quiet span this consult starts, if any, once this node holds `current` ({@link quietSpanStartedBy}). */
+		const quietSpanAt = (current: ActionRev | undefined): QuietCohort | undefined =>
+			this.quietSpanStartedBy(cohortBefore, peerIds, silent, claims, current);
 		for (const peerId of answered) this.silentConsultHolds.noteAnswered(peerId);
 		// Any silence taints the WHOLE consult, not a fraction of it (fail-closed): one silent
 		// peer could be the sole holder, and the cost — an extra transactor-level retry against
@@ -1859,7 +2005,7 @@ export class CoordinatorRepo implements IRepo {
 			// reportRepairDeadlock is what lets the window re-arm after it expires without the log
 			// repeating.
 			if (deadlock === 'cohort-too-small') {
-				this.markBlocksSeen([blockId], floor);
+				this.markBlocksSeen([blockId], floor, currency.kind === 'nothing-ahead' ? quietSpanAt(local ?? held) : undefined);
 				return { absence, currency };
 			}
 			// Left unarmed so a peer that recovers is heard, but held so the next read does not re-ask at
@@ -1904,15 +2050,18 @@ export class CoordinatorRepo implements IRepo {
 		//     partner can present or withhold).
 		// What was bought instead is observability: `voters` (and `certified`) on the line below say
 		// when this node's currency rests on one peer's word, without re-deriving it from logs.
-		// Revisit only if a cadence-independent freshness signal (e.g. cross-cohort anchoring) ever
-		// exists to arm against — a shorter cadence alone can never be the fix, per reason 1.
+		// The cadence-independent freshness signal this decision once waited for now exists — the quiet
+		// span (`quietCohortStillVouches`): in a cohort where every commit needs every member, a member
+		// that stayed connected to all of them cannot have missed a commit, so the span lengthens the
+		// cadence where reason 1 says it cannot teach anything. It is an addition to this arming, not a
+		// change of it: the single-voter arming decision stands as recorded above.
 		if (baselineRev !== undefined && corroborated.rev <= baselineRev) {
 			this.log('cluster-fetch:local-current', {
 				blockId, localRev: baselineRev, clusterRev: corroborated.rev,
 				voters: corroboration?.voters,
 				...(corroboration?.certified ? { certified: true } : {})
 			});
-			this.markBlocksSeen([blockId], floor);
+			this.markBlocksSeen([blockId], floor, quietSpanAt(local ?? held));
 			// Only reachable when this node HOLDS a revision (the baseline), so `get` never
 			// consults this verdict — computed consistently rather than hard-coded.
 			// Currency: the cohort corroborated at or below what this node holds, so nothing is
@@ -1949,7 +2098,7 @@ export class CoordinatorRepo implements IRepo {
 		// window suppresses the retry — the window damps repair effort, not honesty.
 		// NOTE: that damping covers only a block this node holds at an OLDER revision. A block entirely
 		// missing locally never consults the window (`get` consults on every read of a missing block,
-		// before `shouldReadRepair`), so a persistently failing acquisition — e.g. a two-node deployment
+		// before `readRepairDemand`), so a persistently failing acquisition — e.g. a two-node deployment
 		// that never set `assumedClusterSize`, where the content quorum can never be met — re-runs on
 		// every read of that block. It costs the consult only: the acquisition restores from the
 		// archives the consult already received (`consulted`). If it ever shows as read amplification,
@@ -1963,7 +2112,9 @@ export class CoordinatorRepo implements IRepo {
 		// just failed on this cohort is not made to succeed by re-asking seconds later — but if a
 		// profile ever shows floored reads stuck a window behind a revision the cohort holds, record
 		// the floor only when `converged` and let the floor be the retry cadence for this exit.
-		this.markBlocksSeen([blockId], floor);
+		// A quiet span starts only when the pass reached exactly the corroborated revision, whose action
+		// is then the one this node holds.
+		this.markBlocksSeen([blockId], floor, converged && rev === corroborated.rev ? quietSpanAt(corroborated) : undefined);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
 		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
 		// if its claimants are among those peers.
@@ -3188,12 +3339,22 @@ export class CoordinatorRepo implements IRepo {
 	 * unknown claim — which reserves, so the corroboration can only over-name, never under-name.
 	 */
 	private async pendingClaimsOf(blockId: BlockId): Promise<PendingClaim[]> {
-		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
-		if (typeof reader.listPendingClaims === 'function') {
-			return (await reader.listPendingClaims(blockId)).filter(claim => !isAbandonedClaim(claim, reader.runId));
-		}
+		const live = await this.livePendingClaims(blockId);
+		if (live !== undefined) return live;
 		const results: GetBlockResults = await this.storageRepo.get({ blockIds: [blockId] });
 		return (results[blockId]?.state?.pendings ?? []).map(actionId => ({ actionId }));
+	}
+
+	/**
+	 * This node's live pending records on `blockId` from storage that can list them
+	 * (`IPendingClaimReader`, probed as `ClusterMember` probes it), or `undefined` from storage that
+	 * cannot. A record an earlier run of this node left for a writer in its own process is left out
+	 * (`isAbandonedClaim`): that pend was applied here alone, so nothing can ever commit it.
+	 */
+	private async livePendingClaims(blockId: BlockId): Promise<PendingClaim[] | undefined> {
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		if (typeof reader.listPendingClaims !== 'function') return undefined;
+		return (await reader.listPendingClaims(blockId)).filter(claim => !isAbandonedClaim(claim, reader.runId));
 	}
 
 	/**

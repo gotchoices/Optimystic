@@ -206,6 +206,16 @@ export interface ClusterPolicyOptions {
 		 * delay, throws at node construction — see {@link resolveReadRepairWindowMs}.
 		 */
 		readRepairWindowMs?: number;
+		/**
+		 * How long, in milliseconds, a held block whose whole cohort of two or three machines has stayed
+		 * connected goes without a cohort consult after one that heard from every member and found
+		 * nothing ahead (default {@link DEFAULT_READ_REPAIR_QUIET_WINDOW_MS} = 300 000; `'lazy'` mode
+		 * only). `0` turns it off, and so in effect does any value at or below
+		 * {@link readRepairWindowMs}. A value that is not a finite number in `[0,
+		 * MAX_READ_REPAIR_WINDOW_MS]` throws at node construction — see
+		 * {@link resolveReadRepairQuietWindowMs}. See {@link ClusterConsensusConfig.readRepairQuietWindowMs}.
+		 */
+		readRepairQuietWindowMs?: number;
 	};
 }
 
@@ -432,6 +442,34 @@ export function resolveReadRepairWindowMs(declared: number | undefined): number 
 	if (!Number.isFinite(declared) || declared <= 0 || declared > MAX_READ_REPAIR_WINDOW_MS) {
 		throw new Error(
 			`clusterPolicy.readRepairWindowMs must be a finite number of milliseconds above 0 and no greater than ${MAX_READ_REPAIR_WINDOW_MS}; got ${String(declared)}`
+		);
+	}
+	return declared;
+}
+
+/**
+ * The longest a held block goes without a consult while its whole cohort has stayed connected, when
+ * nothing is declared: the watch service's own bound for recovering a commit nobody announced (its
+ * verifying tick, every 10 renewals of 30 s), so a missed decision is found within the same five
+ * minutes either way.
+ */
+export const DEFAULT_READ_REPAIR_QUIET_WINDOW_MS = 300_000;
+
+/**
+ * The read-repair quiet window, in milliseconds: the declared `clusterPolicy.readRepairQuietWindowMs`,
+ * or {@link DEFAULT_READ_REPAIR_QUIET_WINDOW_MS} when none was declared. `0` is a declaration (off).
+ *
+ * Anything else that is not a finite number in `[0, MAX_READ_REPAIR_WINDOW_MS]` THROWS, as
+ * {@link resolveReadRepairWindowMs} does and for its reason: falling through would keep the default
+ * on the deployment that typed the field to change it, and a negative clamped to zero would turn the
+ * extension off for an operator who mistyped a duration. `CoordinatorRepo` applies this same resolver
+ * to whatever it is handed, so a direct constructor and a node agree on the default.
+ */
+export function resolveReadRepairQuietWindowMs(declared: number | undefined): number {
+	if (declared === undefined) return DEFAULT_READ_REPAIR_QUIET_WINDOW_MS;
+	if (!Number.isFinite(declared) || declared < 0 || declared > MAX_READ_REPAIR_WINDOW_MS) {
+		throw new Error(
+			`clusterPolicy.readRepairQuietWindowMs must be a finite number of milliseconds from 0 (0 disables) to ${MAX_READ_REPAIR_WINDOW_MS}; got ${String(declared)}`
 		);
 	}
 	return declared;
@@ -681,6 +719,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		// `'lazy'` and an absent window to 10 000). The mode is a closed union and needs no validation;
 		// the window throws on a degenerate declaration, as the cohort deadline does.
 		readRepairMode: options.clusterPolicy?.readRepairMode,
-		readRepairWindowMs: resolveReadRepairWindowMs(options.clusterPolicy?.readRepairWindowMs)
+		readRepairWindowMs: resolveReadRepairWindowMs(options.clusterPolicy?.readRepairWindowMs),
+		readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(options.clusterPolicy?.readRepairQuietWindowMs)
 	};
 }

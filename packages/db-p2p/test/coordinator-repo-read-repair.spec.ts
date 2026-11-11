@@ -11,7 +11,7 @@
  */
 
 import { expect } from 'chai';
-import { localDurability } from '@optimystic/db-core';
+import { canonicalBlockHash, localDurability } from '@optimystic/db-core';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import type { PeerId } from '@libp2p/interface';
@@ -22,7 +22,7 @@ import type {
 } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
-import { resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
+import { DEFAULT_READ_REPAIR_QUIET_WINDOW_MS, resolveClusterPolicy } from '../src/cluster/cluster-policy.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag, hasTagAtRev } from './support/capture-log.js';
@@ -1255,6 +1255,83 @@ describe('CoordinatorRepo read-repair', () => {
 
 		expect(hasTag(captured, 'cluster-tx:read-repair-triggered'), 'no consult started').to.equal(false);
 		expect(mesh.consultRequests(member, writer), 'the writer is not asked about its own write').to.equal(0);
+	});
+
+	describe('a held block whose whole cohort stays connected', () => {
+		// GitHub #56: in a cohort where every commit needs every member's promise, a member connected to
+		// all of them throughout cannot have missed a change, yet every read past the window asked them.
+		const quietBlock: BlockId = 'block-read-while-nothing-changes';
+		const STEP_MS = 15_000;
+
+		/** A cohort of `size` machines that all hold `quietBlock`, a reader among them, and one clock. */
+		const quietCohort = async (size: number) => {
+			const mesh = await createMesh(size, { responsibilityK: size, clusterPolicy: { repairCorroborationClusterSize: size } });
+			const [writer, reader] = mesh.nodes as [MeshNode, MeshNode];
+			let clock = 1_000_000;
+			for (const node of mesh.nodes) node.coordinatorRepo.now = () => clock;
+			const block = { header: { id: quietBlock, type: 'test', collectionId: 'collection-1' }, items: [] };
+			const transforms = { inserts: { [quietBlock]: block }, updates: {}, deletes: [] };
+			expect((await writer.coordinatorRepo.pend({ actionId: 'a-write', rev: 1, transforms, policy: 'c' })).success, 'pend').to.equal(true);
+			// The declared digest is what lets each member keep the cohort's proof of the commit.
+			const blockDigests = { [quietBlock]: { digest: await canonicalBlockHash(block) } };
+			expect((await writer.coordinatorRepo.commit({ actionId: 'a-write', blockIds: [quietBlock], tailId: quietBlock, rev: 1, blockDigests })).success, 'commit').to.equal(true);
+			const readAfter = async (ms: number): Promise<void> => {
+				clock += ms;
+				await reader.coordinatorRepo.get({ blockIds: [quietBlock] });
+				await reader.coordinatorRepo.settleHeldBlockConsults();
+			};
+			return { mesh, writer, reader, readAfter, consults: () => mesh.consultRequests(reader, writer) };
+		};
+
+		it('ten reads of an unchanged block 15 s apart consult once, and say so once', async () => {
+			const { readAfter, consults } = await quietCohort(2);
+			const captured = await captureCoordinatorLog(async () => {
+				for (let i = 0; i < 10; i++) await readAfter(STEP_MS);
+			});
+			expect(consults(), 'the first consult starts the quiet span; nothing ends it').to.equal(1);
+			expect(captured.filter(args => typeof args[0] === 'string' && args[0].includes('cluster-tx:read-repair-quiet')), 'logged on the first read it answers').to.have.length(1);
+		});
+
+		describe('consults again once the span lapses', () => {
+			it('when a member\'s connection breaks', async () => {
+				const { mesh, writer, readAfter, consults } = await quietCohort(2);
+				await readAfter(STEP_MS);
+				mesh.reconnect(writer);
+				await readAfter(STEP_MS);
+				expect(consults()).to.equal(2);
+			});
+
+			it('while this node holds a pending record for the block', async () => {
+				const { reader, readAfter, consults } = await quietCohort(2);
+				await readAfter(STEP_MS);
+				const pending = await reader.storageRepo.pend({ actionId: 'a-unresolved', rev: 2, transforms: { inserts: {}, updates: { [quietBlock]: [['items', 0, 0, ['x']]] }, deletes: [] }, policy: 'c' });
+				expect(pending.success, 'pend').to.equal(true);
+				await readAfter(STEP_MS);
+				expect(consults()).to.equal(2);
+			});
+
+			it('once readRepairQuietWindowMs has passed since the consult', async () => {
+				const { readAfter, consults } = await quietCohort(2);
+				await readAfter(STEP_MS);
+				await readAfter(DEFAULT_READ_REPAIR_QUIET_WINDOW_MS + 1);
+				expect(consults()).to.equal(2);
+			});
+
+			it('never, in a cohort of four, where a commit can land without one member', async () => {
+				const { readAfter, consults } = await quietCohort(4);
+				for (let i = 0; i < 3; i++) await readAfter(STEP_MS);
+				expect(consults()).to.equal(3);
+			});
+		});
+
+		it('a consult with a silent member starts no span, even when it finds this node current', async () => {
+			const { mesh, readAfter, consults } = await quietCohort(3);
+			mesh.failures.silentPeers = new Set([mesh.nodes[2]!.peerId.toString()]);
+			const captured = await captureCoordinatorLog(() => readAfter(STEP_MS));
+			expect(hasTag(captured, 'cluster-fetch:local-current'), 'the answering member\'s proof settles currency alone').to.equal(true);
+			await readAfter(STEP_MS);
+			expect(consults()).to.equal(2);
+		});
 	});
 
 	describe('a read from a cohort member that says what it holds', () => {

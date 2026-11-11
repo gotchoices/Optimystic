@@ -1007,6 +1007,7 @@ interface ClusterConsensusConfig {
   slotHoldWindowMs?: number;          // Default 3000ms; 0 disables — how long a member holds a block's next slot for a writer it has refused as stale SlotHoldAfterLosses (3) times
   readRepairMode?: 'off' | 'lazy' | 'paranoid'; // Default 'lazy' — whether a read of a block this node holds re-verifies it against the cohort behind the read (lazy), on every read and waiting (paranoid), or never (off)
   readRepairWindowMs?: number;        // Default 10000ms — how long a held block is served without starting a cohort consult (lazy only); must be a finite number above 0
+  readRepairQuietWindowMs?: number;   // Default 300000ms; 0 disables — how long a held block goes without a consult while its whole cohort of two or three machines stays connected (lazy only); a value at or below readRepairWindowMs disables it in effect
 }
 ```
 

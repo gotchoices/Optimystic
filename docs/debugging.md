@@ -951,7 +951,7 @@ optimystic:db-p2p:coordinator-repo:12D3KooWAbCd cluster-tx:read-repair-triggered
 
 Background, in one paragraph: a node that holds a block does not re-check it with its cohort on every read. In the default `lazy` read-repair mode it stamps the time the cohort last confirmed the block — a commit whose votes were a majority of the full cohort, whether this node coordinated it or its cluster member applied it for another coordinator, or a consult that settled the block (including the no-op consult on a node that is its block's whole cohort) — and re-checks only once `readRepairWindowMs` (10 s by default) has passed since that stamp. The stamp is what "arms" the window. Which outcomes stamp it, and the configuration knobs, are in [docs/transactions.md §Lazy read-repair window](transactions.md#lazy-read-repair-window); this entry covers only how to read the line.
 
-The line fires when a read of a block this node **holds** decides to consult the cohort (`shouldReadRepair` and `floorDemandsConsult` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
+The line fires when a read of a block this node **holds** decides to consult the cohort (`readRepairDemand` and `floorDemandsConsult` in `packages/db-p2p/src/repo/coordinator-repo.ts`). A read of a block this node does not hold consults without ever emitting it. Fields:
 
 - `mode` — the `readRepairMode` in force, `lazy` or `paranoid`. Mode `off` never consults about a held block, so it never emits this line.
 - `ageMs` — milliseconds since the block was last stamped (`ageMs` in `packages/db-p2p/src/repo/coordinator-repo.ts`), or `undefined` when it has no stamp.
@@ -984,6 +984,16 @@ Counted by `ageMs` on the reporter's next capture, the result was 290 triggers. 
 Two lessons carry over to any capture. Classify each trigger by `ageMs`, never by the gap since the previous one. And a `cluster-fetch:solo-self-skip` with no matching `read-repair-triggered` is a consult about a block this node does not hold, not a re-entry of the window. On current releases that second kind is logged at most once per block per `readRepairWindowMs`, although every read of a block the node does not hold still consults, so counting those lines no longer counts consults. For a block the node holds, the line still appears once per consult.
 
 Credit to `risavian` for noticing that the field classifies each trigger on its own.
+
+### `cluster-tx:read-repair-quiet` — an expired window answered without a consult
+
+Logged under `coordinator-repo` (peer-id suffixed), once per quiet span: on the first read whose expired window the span answers instead of starting a consult (`quietCohortStillVouches` in `packages/db-p2p/src/repo/coordinator-repo.ts`; the rule is in [transactions.md § Lazy read-repair window](transactions.md#lazy-read-repair-window)). A span starts at a consult that heard from every other member of a cohort of two or three machines and found nothing ahead, and holds while every member stays connected to this node. Fields:
+
+- `blockId`, and `localRev`, the revision served.
+- `ageMs` — milliseconds since the consult that started the span: above `readRepairWindowMs`, at most `readRepairQuietWindowMs`.
+- `members` — how many machines the cohort holds, this node included.
+
+The later reads the span answers log nothing, so on a quiet two- or three-machine group a block shows one `cluster-tx:read-repair-triggered` (`reason: 'window'`) per span rather than one per window, with this line after it. A span's end is not logged: a member reconnecting, the cohort changing, a pending record for the block held here, `readRepairQuietWindowMs` passing, or any other stamp (a commit, a member's apply) each ends it by making the next expired read consult, which logs the trigger as usual. A group whose trigger count did not drop is one where `connectedCohort` answers `undefined` for the block — a cohort that is a selection from a wider network, a remembered member that is offline, a bootstrap peer not yet heard from, or a relay whose FRET table holds many other networks' peers (the `NOTE:` at `Libp2pKeyPeerNetwork.connectedCohort` in `packages/db-p2p/src/libp2p-key-network.ts`). Two failure lines leave the read consulting as it would without a span: `cluster-fetch:quiet-check-failed` (the check before serving threw) and `cluster-fetch:connected-cohort-failed` (the snapshot a consult takes before it starts threw).
 
 ### `coordinator-repo:pend-cluster-complete` — whose verdict answered the writer?
 

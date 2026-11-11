@@ -440,6 +440,16 @@ export interface ClusterConsensusConfig {
 	/** Per-read probability of triggering read-repair in 'lazy' mode even within the window (0..1). Default 0 (no random check). */
 	readRepairSampleRate?: number;
 	/**
+	 * For 'lazy' mode: how long after a consult that heard from every other member of a held block's
+	 * cohort and found nothing ahead the block may go without another one, while every commit to it
+	 * needs every member's promise (two or three members at the default threshold), every member has
+	 * stayed connected to this node, and this node holds no pending record for the block. Default
+	 * 300 000 (`DEFAULT_READ_REPAIR_QUIET_WINDOW_MS` in db-p2p); `0` turns it off, and so in effect
+	 * does any value at or below `readRepairWindowMs`. See docs/transactions.md § Lazy read-repair
+	 * window. On a node, set through `clusterPolicy.readRepairQuietWindowMs`.
+	 */
+	readRepairQuietWindowMs?: number;
+	/**
 	 * How long ONE cohort peer gets to answer ONE read-path request, in milliseconds (default
 	 * {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS} = 1000). It sets BOTH per-peer deadlines on the read
 	 * path — the latest-revision query (`CoordinatorRepo.queryClusterForLatest`) and the archive

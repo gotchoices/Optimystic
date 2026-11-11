@@ -5,7 +5,7 @@
  * solo-self short-circuit: it skips the cluster-latest callback (correctly — there is no
  * remote to sync from, and dialling self can hang a listener-less node). Before the fix it
  * returned WITHOUT stamping `lastSeenCommitMs`, so the lazy read-repair window was never
- * armed: `shouldReadRepair` saw `lastSeen == null` on every read and re-triggered the
+ * armed: `readRepairDemand` saw `lastSeen == null` on every read and re-triggered the
  * consult forever. The reporter's device logged 3,880 `cluster-tx:read-repair-triggered`
  * against 3,879 `cluster-tx:read-repair-noop` and a 47-minute cold schema apply.
  *
@@ -238,7 +238,7 @@ describe('CoordinatorRepo solo-cohort read-repair window', () => {
 
 	it('a missing block is never suppressed by the held-block stamp', async () => {
 		// The solo exit stamps the block id that reached it into `lastSeenCommitMs`, INCLUDING one that
-		// is missing locally. That stamp is inert for a missing block: `get` asks `shouldReadRepair`
+		// is missing locally. That stamp is inert for a missing block: `get` asks `readRepairDemand`
 		// only about present blocks and consults on every read of a missing one. It has to stay that
 		// way. `lastSeenCommitMs` is also stamped for missing blocks whose absence is NOT confirmed (a
 		// claimed revision this node could not acquire), and a stamp that suppressed a missing block's
