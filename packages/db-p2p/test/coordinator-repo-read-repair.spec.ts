@@ -1275,9 +1275,9 @@ describe('CoordinatorRepo read-repair', () => {
 			// The declared digest is what lets each member keep the cohort's proof of the commit.
 			const blockDigests = { [quietBlock]: { digest: await canonicalBlockHash(block) } };
 			expect((await writer.coordinatorRepo.commit({ actionId: 'a-write', blockIds: [quietBlock], tailId: quietBlock, rev: 1, blockDigests })).success, 'commit').to.equal(true);
-			const readAfter = async (ms: number): Promise<void> => {
+			const readAfter = async (ms: number, blockIds: BlockId[] = [quietBlock]): Promise<void> => {
 				clock += ms;
-				await reader.coordinatorRepo.get({ blockIds: [quietBlock] });
+				await reader.coordinatorRepo.get({ blockIds });
 				await reader.coordinatorRepo.settleHeldBlockConsults();
 			};
 			return { mesh, writer, reader, readAfter, consults: () => mesh.consultRequests(reader, writer) };
@@ -1290,6 +1290,20 @@ describe('CoordinatorRepo read-repair', () => {
 			});
 			expect(consults(), 'the first consult starts the quiet span; nothing ends it').to.equal(1);
 			expect(captured.filter(args => typeof args[0] === 'string' && args[0].includes('cluster-tx:read-repair-quiet')), 'logged on the first read it answers').to.have.length(1);
+		});
+
+		it('a read whose span holds for one block still consults another block alongside it', async () => {
+			// The quiet check holds a seat in the read's consult round across its await: a seat it never
+			// readied would hold back the other block's request, and this read, forever.
+			const { writer, readAfter, consults } = await quietCohort(2);
+			await readAfter(STEP_MS);
+			const other: BlockId = 'block-written-after-the-span-started';
+			const block = { header: { id: other, type: 'test', collectionId: 'collection-1' }, items: [] };
+			expect((await writer.coordinatorRepo.pend({ actionId: 'a-other', rev: 1, transforms: { inserts: { [other]: block }, updates: {}, deletes: [] }, policy: 'c' })).success, 'pend').to.equal(true);
+			const blockDigests = { [other]: { digest: await canonicalBlockHash(block) } };
+			expect((await writer.coordinatorRepo.commit({ actionId: 'a-other', blockIds: [other], tailId: other, rev: 1, blockDigests })).success, 'commit').to.equal(true);
+			await readAfter(STEP_MS, [quietBlock, other]);
+			expect(consults(), 'one request, for the block with no span').to.equal(2);
 		});
 
 		describe('consults again once the span lapses', () => {

@@ -717,7 +717,7 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		slotHoldWindowMs: resolveSlotHoldWindowMs(options.clusterPolicy?.slotHoldWindowMs),
 		// Read-repair knobs, passed through to `CoordinatorRepo` (which defaults an absent mode to
 		// `'lazy'` and an absent window to 10 000). The mode is a closed union and needs no validation;
-		// the window throws on a degenerate declaration, as the cohort deadline does.
+		// both windows throw on a degenerate declaration, as the cohort deadline does.
 		readRepairMode: options.clusterPolicy?.readRepairMode,
 		readRepairWindowMs: resolveReadRepairWindowMs(options.clusterPolicy?.readRepairWindowMs),
 		readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(options.clusterPolicy?.readRepairQuietWindowMs)
