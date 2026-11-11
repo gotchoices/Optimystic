@@ -269,7 +269,8 @@ describe('An index walk serves order by', () => {
 });
 
 const pad = (i: number): string => String(i).padStart(3, '0');
-const longRow = (id: string, t: string, i: number): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y'];
+/** `u` is NULL on the 300 low rows, so a forward walk of `idx_u` crosses the threshold among its NULLs. */
+const longRow = (id: string, t: string, i: number, u: string | null = t): readonly SqlValue[] => [id, t, i % 2 === 0 ? 'x' : 'y', u];
 
 /**
  * Rows for a walk that crosses `WALK_ROWS_BEFORE_SCAN` (256 entries). The low values come three to
@@ -279,7 +280,7 @@ const longRow = (id: string, t: string, i: number): readonly SqlValue[] => [id, 
  * a range that starts 250 entries below that text.
  */
 const LONG_ROWS: readonly (readonly SqlValue[])[] = [
-	...Array.from({ length: 300 }, (_, i) => longRow(`l${pad(i)}`, `a${pad(Math.floor(i / 3))}`, i)),
+	...Array.from({ length: 300 }, (_, i) => longRow(`l${pad(i)}`, `a${pad(Math.floor(i / 3))}`, i, null)),
 	...Array.from({ length: 130 }, (_, i) => longRow(`e${pad(i)}`, `😀${pad(i)}`, i)),
 	...Array.from({ length: 65 }, (_, i) => longRow(`p${pad(i)}`, `\uE000${pad(i)}`, i)),
 	...Array.from({ length: 65 }, (_, i) => longRow(`w${pad(i)}`, `～${pad(i)}`, i)),
@@ -305,15 +306,16 @@ describe('A long index walk finishes by scanning the table', () => {
 
 	before(async () => {
 		({ db } = openDatabase());
-		const columns = '(id text primary key, t text, g text)';
+		const columns = '(id text primary key, t text, g text, u text null)';
 		await db.exec(`create table walked ${columns} using optimystic('tree://test/long_walk_main')`);
 		await db.exec('create index idx_t on walked(t)');
 		await db.exec('create index idx_gt on walked(g, t)');
+		await db.exec('create index idx_u on walked(u)');
 		await db.exec(`create table model ${columns} using memory`);
 		await db.exec('begin');
 		for (const row of LONG_ROWS) {
-			await db.exec('insert into walked (id, t, g) values (?, ?, ?)', [...row]);
-			await db.exec('insert into model (id, t, g) values (?, ?, ?)', [...row]);
+			await db.exec('insert into walked (id, t, g, u) values (?, ?, ?, ?)', [...row]);
+			await db.exec('insert into model (id, t, g, u) values (?, ?, ?, ?)', [...row]);
 		}
 		await db.exec('commit');
 	});
@@ -339,6 +341,15 @@ describe('A long index walk finishes by scanning the table', () => {
 			expect(trace.matched, 'and stopped reading the index there').to.equal(256);
 		});
 	}
+
+	it('returns the NULLs the walk had not reached first, ahead of the values, for a forward walk of a nullable column', async () => {
+		const clause = 'order by u, id';
+		await expectOrderFromIndex(db, `select id, t from walked ${clause}`);
+		const { walked, model, trace } = await readBoth(clause, 'idx_u');
+		expect(walked).to.deep.equal(model);
+		expect(trace.scan, 'the read crossed the threshold among the NULLs').to.equal(true);
+		expect(trace.matched).to.equal(256);
+	});
 
 	it('returns the same rows for a range that claims no ordering', async () => {
 		const clause = `where t >= 'a017'`;
