@@ -284,8 +284,9 @@ describe('A filter compared under a coarser collation than its column leaves the
 	});
 
 	it('walks the ordered column\'s index with the filter as a residual, for an equality and a range', async () => {
-		// idx_b's bytes put 'X' apart from 'x' and below 'w', so neither filter can seek it.
-		for (const clause of [`where b = 'x' collate nocase order by c`, `where b > 'w' collate nocase order by c`]) {
+		// idx_b's bytes put 'X' apart from 'x' and below 'w', so neither filter can seek it; the
+		// primary key's do the same for the last, which must not pass for a partial key match.
+		for (const clause of [`where b = 'x' collate nocase order by c`, `where b > 'w' collate nocase order by c`, `where id = 'x' collate nocase order by c`]) {
 			await expectOrderFromIndex(db, `select id from walked ${clause}`);
 			const walked = await collectRows(db.eval(`select id from walked ${clause}`));
 			expect(walked, clause).to.deep.equal(await collectRows(db.eval(`select id from model ${clause}`)));

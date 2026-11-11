@@ -6793,9 +6793,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       const isPkColumn = pkColumns.includes(filter.columnIndex);
 
       if (isPkColumn && filter.op === '=') {
-        // A column no seek can serve is a plain scan with a residual, not a cheaper partial match.
+        // A column no seek can serve, or an equality compared under a collation the column's does not
+        // refine (`id = 'x' collate nocase`), is a plain scan with a residual, not a cheaper partial
+        // match — priced as one, it would beat the walk of another index that serves the ordering.
         const column = tableInfo.columns[filter.columnIndex];
-        if (!seekCanBeTrusted(column, column?.collation)) continue;
+        if (column === undefined || !seekCanBeTrusted(column, column.collation) || !equalityServesKeyColumn(filter, column)) continue;
         // Partial PK match - don't mark as handled, let Quereus apply the filter
         // but still estimate reduced selectivity for cost calculation
         const partialPkCost = tableRowCount * 0.3;
