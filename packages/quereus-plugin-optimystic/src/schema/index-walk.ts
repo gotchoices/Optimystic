@@ -168,13 +168,18 @@ export interface WalkDelivery {
  * one direction, which sets `reverse`; `order by a asc, b desc` is never delivered. With nothing
  * remaining the walk is forward.
  *
- * No NULL may reach a matched column, in either direction (`nullSafeOrderingPrefixLength`, asked
- * about every consumed key column as if it were descending): the engine loses an explicit `nulls
- * first` or `nulls last` before the request reaches a module, so a module cannot honour the
- * placement — see the blocked ticket
- * `quereus-explicit-nulls-placement-is-lost-when-an-index-serves-order-by`. A column is safe when
- * it is NOT NULL (the default in Quereus), pinned, or under a NULL-excluding filter such as
- * `is not null`, claimed or not.
+ * No NULL may reach a matched column of a backward walk (`nullSafeOrderingPrefixLength`, told
+ * the walk's direction over a key that is ascending in its bytes). A required ordering always
+ * means NULLs first, in both directions: the engine sends a module no ordering for a `nulls
+ * last` key (Quereus invariant OPT-063, `extractOrderingFromSortKeys` in
+ * `@quereus/quereus/src/planner/framework/physical-utils.ts`). The tree frames NULL below every
+ * present value (`encodeKeyElement`), so a forward walk emits a column's NULLs first, as asked,
+ * and a backward walk emits them last, where `order by s desc` wants them first whether or not it
+ * says `nulls first`. In a backward walk a column is safe when it is NOT NULL (the default in
+ * Quereus), pinned, or under a NULL-excluding filter such as `is not null`, claimed or not.
+ * NOTE: `OrderingSpec.nullsFirst` is not read, as the memory module does not read it: nothing in
+ * the engine sets it. If something ever does, a forward walk of a nullable column must decline
+ * `nullsFirst: false`.
  */
 export function walkDelivering(
 	required: readonly OrderingSpec[],
@@ -196,10 +201,10 @@ export function walkDelivering(
 		consumed++;
 	}
 
-	const asDescending = key.map(column => ({ index: column.index, desc: true, collation: column.collation }));
-	if (nullSafeOrderingPrefixLength(tableInfo, request, asDescending, consumed, pinned) !== consumed) return undefined;
+	const reverse = remaining.length > 0 && remaining[0]!.desc;
+	if (nullSafeOrderingPrefixLength(tableInfo, request, key, consumed, pinned, reverse) !== consumed) return undefined;
 
-	return { reverse: remaining.length > 0 && remaining[0]!.desc, orders: remaining.length };
+	return { reverse, orders: remaining.length };
 }
 
 /**

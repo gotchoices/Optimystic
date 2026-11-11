@@ -138,13 +138,15 @@ orderings those are, and `getBestAccessPlan` in
 - **One direction.** Every remaining required column must be ascending, or every one descending,
   which sets `reverse`. Nothing remaining is a forward walk, and is claimed for a seek (`where a = ?
   order by a`) but proposed as no walk candidate — any access path delivers it.
-- **No NULL.** No NULL may reach a matched column in EITHER direction
-  (`nullSafeOrderingPrefixLength`, asked as if every key column were descending): the engine drops
-  an explicit `nulls first`/`nulls last` before the request reaches a module, so a module cannot
-  honour the placement (blocked ticket
-  `quereus-explicit-nulls-placement-is-lost-when-an-index-serves-order-by`). A column is safe when
-  it is NOT NULL (Quereus's default), pinned, or under a NULL-excluding filter such as `is not null`.
-  Once the engine keeps such a sort, the rule narrows to descending.
+- **No NULL backwards.** A required ordering always means NULLs first, in both directions: the
+  engine sends a module no ordering for a `nulls last` key (Quereus invariant OPT-063,
+  `extractOrderingFromSortKeys` in `@quereus/quereus/src/planner/framework/physical-utils.ts`).
+  The tree frames NULL below every present value, so a forward walk emits a column's NULLs first,
+  as asked, and `order by s` over a nullable `s` walks the index. A backward walk emits them last,
+  so no NULL may reach a matched column of one (`nullSafeOrderingPrefixLength`, told the walk's
+  direction): `order by s desc`, with or without `nulls first`, is sorted by the engine unless the
+  column is NOT NULL (Quereus's default), pinned, or under a NULL-excluding filter such as
+  `is not null`.
 
 **Pricing.** With an ordering required, candidates compete on their own cost plus
 `rows · log2(rows) · 0.1` for any that leaves the ordering to the engine's Sort (`sortCost`,

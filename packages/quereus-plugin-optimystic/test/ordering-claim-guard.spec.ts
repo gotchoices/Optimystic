@@ -8,12 +8,12 @@
  * can be walked either way, so it delivers an `order by` over a prefix of that key — the index
  * columns, then the primary key — in either direction, for columns whose stored bytes order as the
  * engine orders their values: TEXT, BINARY on both the column and the key column, not compared by
- * meaning. A column pinned by an equality filter is constant and skipped. No NULL may reach an
- * ordered column, because the engine loses an explicit `nulls first`/`nulls last` before the
- * request reaches a module (blocked ticket
- * `quereus-explicit-nulls-placement-is-lost-when-an-index-serves-order-by`), so a nullable ordered
- * column is claimed only under a NULL-excluding filter. Claiming anything else makes the engine
- * skip its Sort and return genuinely mis-ordered rows.
+ * meaning. A column pinned by an equality filter is constant and skipped. A required ordering
+ * always means NULLs first (the engine sends no ordering for a `nulls last` key, Quereus invariant
+ * OPT-063), and the tree keeps NULL below every present value, so a forward
+ * walk over a nullable column is claimed while a backward one is claimed only under a
+ * NULL-excluding filter. Claiming anything else makes the engine skip its Sort and return genuinely
+ * mis-ordered rows.
  *
  * The planner-level tests feed `requiredOrdering` straight into the planner, so they do NOT depend
  * on how the optimizer shapes an ORDER BY clause. The SQL-level tests at the bottom are end-to-end
@@ -304,12 +304,11 @@ describe('Ordering claims of an index walk (getBestAccessPlan.providesOrdering)'
 		expectSorted(plan(tableInfo, [], [...asc(CATEGORY), ...desc(NAME)]), 'asc then desc');
 	});
 
-	it('does NOT walk over a nullable column in either direction, except under a NULL-excluding filter', () => {
+	it('walks a nullable column forwards, and backwards only under a NULL-excluding filter', () => {
 		const tableInfo = makeTableInfo([{ name: 'idx_s', columns: [{ index: S }] }]);
-		expectSorted(plan(tableInfo, [], asc(S)), 'nullable, ascending');
-		expectSorted(plan(tableInfo, [], desc(S)), 'nullable, descending');
-		walkOf('idx_s', asc(S), false, plan(tableInfo, [notNullFilter(S)], asc(S)), '`s is not null` keeps every NULL out of the walk');
-		walkOf('idx_s', desc(S), true, plan(tableInfo, [notNullFilter(S)], desc(S)), 'and descending');
+		walkOf('idx_s', asc(S), false, plan(tableInfo, [], asc(S)), 'a forward walk emits the NULLs first, as the engine orders them');
+		expectSorted(plan(tableInfo, [], desc(S)), 'a backward walk would emit them last');
+		walkOf('idx_s', desc(S), true, plan(tableInfo, [notNullFilter(S)], desc(S)), '`s is not null` keeps every NULL out of the walk');
 	});
 
 	it('does NOT walk a column whose bytes do not order as its values', () => {

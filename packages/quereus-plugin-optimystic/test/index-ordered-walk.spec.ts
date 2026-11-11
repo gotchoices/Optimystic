@@ -212,14 +212,18 @@ describe('An index walk serves order by', () => {
 		}
 	});
 
-	it('keeps the engine sort over a nullable column, and walks it under a NULL-excluding filter', async () => {
-		await expectEngineSort(db, 'select id, t from walked order by u, id');
-		await expectSameOrder('order by u, id');
-		await expectEngineSort(db, 'select id, t from walked order by u desc, id desc');
-		await expectSameOrder('order by u desc, id desc');
+	it('walks a nullable column forward, NULLs first, and backward only under a NULL-excluding filter', async () => {
+		// The engine places NULLs first in both directions; a forward walk emits them first, a
+		// backward walk last. A `nulls last` key reaches no module, so the engine sorts it.
+		for (const clause of ['order by u, id', 'order by u nulls first, id']) {
+			await expectOrderFromIndex(db, `select id, t from walked ${clause}`);
+			await expectSameOrder(clause);
+		}
+		for (const clause of ['order by u nulls last, id', 'order by u desc, id desc', 'order by u desc nulls first, id desc']) {
+			await expectEngineSort(db, `select id, t from walked ${clause}`);
+			await expectSameOrder(clause);
+		}
 
-		await expectOrderFromIndex(db, 'select id, t from walked where u is not null order by u, id');
-		await expectSameOrder('where u is not null order by u, id');
 		await expectOrderFromIndex(db, 'select id, t from walked where u is not null order by u desc, id desc');
 		await expectSameOrder('where u is not null order by u desc, id desc');
 	});
