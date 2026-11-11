@@ -1352,6 +1352,15 @@ describe('Libp2pKeyPeerNetwork', () => {
 	describe('connect()', () => {
 		const PROTOCOL = '/test/1.0.0';
 		const FAKE_STREAM = { id: 'fake-stream' } as unknown;
+		/**
+		 * The peer a case's stub connections lead to, when the stub names none. These doubles answer
+		 * `getConnections` the same whatever peer is asked about, so this stands in for whichever peer
+		 * the case dials; the key network's constructor reads every connection's `remotePeer`.
+		 */
+		let connectedPeer: PeerId;
+		before(async () => {
+			connectedPeer = await makePeerId();
+		});
 
 		function createLibp2pWithConnect(options: {
 			connections?: Connection[];
@@ -1374,6 +1383,9 @@ describe('Libp2pKeyPeerNetwork', () => {
 					};
 				}
 			};
+			for (const connection of options.connections ?? []) {
+				if ((connection as { remotePeer?: PeerId }).remotePeer === undefined) Object.assign(connection, { remotePeer: connectedPeer });
+			}
 			return {
 				peerId: selfPeerId,
 				getConnections: (_peerId: PeerId) => options.connections ?? [],
@@ -2780,6 +2792,71 @@ describe('Libp2pKeyPeerNetwork', () => {
 
 			expect(Object.keys(await network.findCluster(KEY)), 'the live cohort').to.have.members([live1, live2]);
 			expect(await network.absentCohortMembers(KEY)).to.deep.equal([near]);
+		});
+	});
+
+	describe('connectedCohort()', () => {
+		const PREFIX = '/optimystic/netA';
+		const servesProto = [`${PREFIX}/cluster/1.0.0`, `${PREFIX}/repo/1.0.0`];
+		const KEY = routingKeyForBlock('connected-cohort-key');
+
+		/** A node whose FRET holds `band` near the key, whose peerStore holds `protocols`, and whose libp2p tracks `connections` (mutated by the case). */
+		function smallNetwork(band: string[], protocols: Map<string, string[]>, connections: Connection[]): { libp2p: DispatchingLibp2p; network: Libp2pKeyPeerNetwork } {
+			const fret = {
+				assembleCohort: () => band,
+				getNetworkSizeEstimate: () => ({ size_estimate: band.length, confidence: 0.5 }),
+				detectPartition: () => false,
+				exportTable: () => undefined
+			};
+			const peerStore = {
+				all: async () => [],
+				get: async (pid: { toString(): string }) => ({ protocols: protocols.get(pid.toString()) ?? [], addresses: [] })
+			};
+			const libp2p = createMockLibp2p(selfPeerId, { fret, peerStore, connections });
+			return { libp2p, network: new Libp2pKeyPeerNetwork(libp2p, 3, undefined, undefined, undefined, undefined, PREFIX) };
+		}
+		const connectionTo = (peer: PeerId, id: string): Connection => Object.assign(outboundConnTo(peer), { id });
+
+		it("keeps a partner's run while one of its two connections closes, and starts a new one once its last closes and another opens", async () => {
+			const partner = await makePeerId();
+			const first = connectionTo(partner, 'c1');
+			const second = connectionTo(partner, 'c2');
+			const connections = [first, second];
+			const { libp2p, network } = smallNetwork([selfPeerId.toString(), partner.toString()], new Map([[partner.toString(), servesProto]]), connections);
+			// As libp2p's connection manager does, the closing connection leaves the list before this listener runs.
+			const close = (connection: Connection): void => {
+				connections.splice(connections.indexOf(connection), 1);
+				libp2p.dispatch('connection:close', connection);
+			};
+
+			const before = await network.connectedCohort(KEY);
+			expect(before?.members).to.deep.equal([selfPeerId.toString(), partner.toString()].sort());
+			close(second);
+			expect((await network.connectedCohort(KEY))?.runs, 'one connection still open').to.deep.equal(before!.runs);
+			close(first);
+			expect(await network.connectedCohort(KEY), 'no connection, no run').to.equal(undefined);
+			const third = connectionTo(partner, 'c3');
+			connections.push(third);
+			libp2p.dispatch('connection:open', third);
+			const after = await network.connectedCohort(KEY);
+			expect(after?.runs[partner.toString()]).to.be.a('number').and.not.equal(before!.runs[partner.toString()]);
+		});
+
+		it('is undefined while the band holds a peer not yet identified, and names the whole cohort once it is', async () => {
+			const partner = await makePeerId();
+			const fresh = await makePeerId();
+			const protocols = new Map([[partner.toString(), servesProto]]);
+			const { libp2p, network } = smallNetwork(
+				[selfPeerId.toString(), partner.toString(), fresh.toString()],
+				protocols,
+				[connectionTo(partner, 'c1'), connectionTo(fresh, 'c2')]
+			);
+
+			expect(await network.connectedCohort(KEY)).to.equal(undefined);
+			protocols.set(fresh.toString(), servesProto);
+			libp2p.dispatch('peer:update', peerUpdated(fresh));
+			expect((await network.connectedCohort(KEY))?.members)
+				.to.deep.equal([selfPeerId.toString(), partner.toString(), fresh.toString()].sort());
 		});
 	});
 

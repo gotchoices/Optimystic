@@ -32,6 +32,22 @@ export type FindCoordinatorOptions = {
 
 
 /**
+ * What {@link IKeyNetwork.connectedCohort} reports for a key: a cohort that is the whole serving
+ * network this node knows of, this node among it and every other member connected to it.
+ *
+ * A **connection run** is the span during which a remote peer has at least one open connection to
+ * this node; it ends when the peer's last connection closes, and the next connection starts a new
+ * run with a new id. So two reports with equal `members` and equal `runs` prove that no member's
+ * connection to this node broke between them.
+ */
+export type ConnectedCohort = {
+	/** The cohort `findCluster` assembles for the key now, as peer-id strings, this node included, sorted ascending. */
+	readonly members: readonly string[];
+	/** Per member other than this node: the id of its current connection run. Ids are never reused within a process. */
+	readonly runs: Readonly<Record<string, number>>;
+};
+
+/**
  * Maps a block to the peers responsible for it.
  *
  * Every key is a {@link RoutingKey} minted by `routingKeyForBlock`. Implementations hash it into a ring
@@ -81,4 +97,18 @@ export type IKeyNetwork = {
 	 * such peers omit this, which reads as "none known".
 	 */
 	absentCohortMembers?(key: RoutingKey): Promise<string[]>;
+
+	/**
+	 * Optionally report, for `key`, that the cohort `findCluster` would assemble now is every machine
+	 * that could coordinate a commit to the key's block as far as this node can know — the whole
+	 * serving network it knows of, this node included — and that every other member is connected to
+	 * this node, with the connection run each is on (see {@link ConnectedCohort}). Answers from what
+	 * the node already holds, without dialing or opening a stream.
+	 *
+	 * `undefined` means no such guarantee: the cohort is a selection from a wider network, a peer is
+	 * not yet identified or is remembered but absent, a member is not connected, or the
+	 * implementation cannot judge. Implementations that track no connections omit this, which reads
+	 * the same, so a caller then behaves as if the method did not exist.
+	 */
+	connectedCohort?(key: RoutingKey): Promise<ConnectedCohort | undefined>;
 }

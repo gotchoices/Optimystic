@@ -1,6 +1,6 @@
 import type { AbortOptions, Libp2p, PeerId, Stream } from "@libp2p/interface";
 import { toString as u8ToString } from 'uint8arrays'
-import type { ClusterPeers, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork, RoutingKey } from "@optimystic/db-core";
+import type { ClusterPeers, ConnectedCohort, CoordinatorIntent, FindCoordinatorOptions, IKeyNetwork, IPeerNetwork, RoutingKey } from "@optimystic/db-core";
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { FretService, SerializedTable } from 'p2p-fret'
 import { hashKey, hashPeerId, lexLess, minDistance } from 'p2p-fret'
@@ -13,6 +13,7 @@ import { UNDECLARED_STREAM_OPEN_DEADLINES, type StreamOpenDeadlines } from './rp
 import type { BootstrapContact } from './network/bootstrap-contact.js'
 import { admittedBy, type NetworkMembershipGate } from './network-membership-gate.js'
 import { PeerRecordCache, readPeerStoreRecord, type PeerStoreRecord } from './network/peer-record-cache.js'
+import { ConnectionRuns } from './network/connection-runs.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -250,6 +251,13 @@ interface ServingCohort {
 	 * it is the trigger for the bootstrap contact wait.
 	 */
 	alone: boolean
+	/**
+	 * Scoped path only: the cohort is every peer FRET holds near the key that could serve this
+	 * network. FRET returned fewer peers than it was asked for, so it knows of none further out; no
+	 * band member is still unidentified; and the cut to `clusterSize` left no serving member out.
+	 * Where {@link Libp2pKeyPeerNetwork.connectedCohort} starts.
+	 */
+	spansBand?: boolean
 }
 
 export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
@@ -368,6 +376,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.setupConnectionTracking();
 		this.setupSelfAddressTracking();
 		this.peerRecords = new PeerRecordCache(this.libp2p, { log: this.log });
+		this.connectionRuns = new ConnectionRuns(this.libp2p);
 	}
 
 	/**
@@ -410,6 +419,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * {@link assertNotSelfRelayOnly}, which reads the store directly.
 	 */
 	private readonly peerRecords: PeerRecordCache
+	/** The connection run each connected peer is on, for {@link connectedCohort}. */
+	private readonly connectionRuns: ConnectionRuns
 
 	private toCacheKey(key: Uint8Array): string { return u8ToString(key, 'base64url') }
 
@@ -1744,6 +1755,55 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	}
 
 	/**
+	 * Whether `key`'s cohort is every machine that could coordinate a commit to the key's block, as far
+	 * as this node can know, with every other member connected to it — and if so which connection run
+	 * each member is on ({@link ConnectedCohort}). Read from the same assembly `findCluster` uses, so
+	 * the two cannot disagree about the members, plus the peer-record cache and libp2p's connection
+	 * list; it dials nothing and opens no stream.
+	 *
+	 * `undefined` unless all of these hold:
+	 *  - the path is scoped (`protocolPrefix` set): the unscoped path classifies nobody, so "every
+	 *    serving peer is in the cohort" cannot be judged there;
+	 *  - this node is in the cohort;
+	 *  - the cohort spans its band ({@link ServingCohort.spansBand}): FRET knows no peer further from
+	 *    the key, no band member is unidentified, and the cohort is not a selection. `foreign` band
+	 *    members (relays, other networks) do not count against it;
+	 *  - no remembered serving peer lies outside the band, so a partner that went offline but is
+	 *    still remembered makes it `undefined`;
+	 *  - no configured bootstrap peer is still unheard ({@link awaitingBootstrapContact}), since such a
+	 *    peer may be a member this node cannot count yet;
+	 *  - every member other than this node has a current connection run ({@link connectionRuns}).
+	 *
+	 * NOTE: a peer of this network whose identify has not landed can show a partial protocol list
+	 * and read `foreign` (see the NOTE on {@link membershipOf}), so for that moment it does not stop
+	 * the answer. It is transient, ends at identify, and a membership change then makes the answer
+	 * differ. If a stale read is ever traced to that window, also answer `undefined` while an identify
+	 * exchange is in flight (`IdentifyProgress`, as the cohort reachability gate does).
+	 */
+	async connectedCohort(key: RoutingKey): Promise<ConnectedCohort | undefined> {
+		if (this.protocolPrefix == null) return undefined
+		const { cohort, band, spansBand } = await this.assembleServingCohort(key)
+		const selfId = this.libp2p.peerId.toString()
+		if (spansBand !== true || !cohort.includes(selfId)) return undefined
+		const runs = this.connectionRunsOf(cohort.filter(id => id !== selfId))
+		if (runs === undefined) return undefined
+		if ((await this.servingPeersOutside(band)).length > 0) return undefined
+		if (await this.awaitingBootstrapContact()) return undefined
+		return { members: [...cohort].sort(), runs }
+	}
+
+	/** Each peer's current connection run, or `undefined` when any of them has none. */
+	private connectionRunsOf(peers: readonly string[]): Record<string, number> | undefined {
+		const runs: Record<string, number> = {}
+		for (const id of peers) {
+			const run = this.connectionRuns.runOf(id)
+			if (run === undefined) return undefined
+			runs[id] = run
+		}
+		return runs
+	}
+
+	/**
 	 * Remote peers outside `band` whose membership verdict, read from their peerStore protocols now, is `serves`.
 	 *
 	 * NOTE: one ring hash in {@link nearestTo} per remembered serving peer outside the band, on every
@@ -1829,7 +1889,14 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		const cohort = serving.slice(0, this.clusterSize)
 		this.log('cohort:membership key=%s band=%d serves=%d unknown=%d foreign=%d refused=%d cohort=%d selfInCohort=%s',
 			coordStr, band.length, serving.length, unknown, foreign, refused, cohort.length, cohort.includes(selfId))
-		return { cohort, band, peerStoreRecords, alone: !serving.some(id => id !== selfId) }
+		// NOTE: "FRET returned fewer than it was asked for" is how the band says it holds every peer
+		// near the key. A node whose FRET table holds more peers near the key than the over-fetch
+		// width — a relay shared with many other networks' nodes — therefore never spans its band, and
+		// `connectedCohort` answers `undefined` for every key, keeping today's read-repair cadence. If
+		// such a deployment reports GitHub #56's consult cost, ask FRET whether its table holds more
+		// peers near the key, rather than reading the band's length.
+		const spansBand = nearest.length < wants && unknown === 0 && serving.length <= this.clusterSize
+		return { cohort, band, peerStoreRecords, alone: !serving.some(id => id !== selfId), spansBand }
 	}
 
 	/**

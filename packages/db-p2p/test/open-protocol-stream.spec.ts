@@ -71,6 +71,8 @@ describe('openProtocolStream: connection selection across every entry point', ()
 
 	interface ConnStub {
 		id: string;
+		/** Always the peer every case dials (`peerId`), as libp2p's `getConnections(peer)` would return. */
+		remotePeer: PeerId;
 		status: string;
 		direction: 'inbound' | 'outbound';
 		timeline: { open: number };
@@ -87,6 +89,7 @@ describe('openProtocolStream: connection selection across every entry point', ()
 	function makeConn(kind: 'direct' | 'limited', status = 'open', behaviour: Behaviour = 'opens', openedAt = 0): ConnStub {
 		const conn: ConnStub = {
 			id: `conn-${++nextConnId}`,
+			remotePeer: peerId,
 			status,
 			direction: 'inbound',
 			timeline: { open: openedAt },

@@ -1,5 +1,5 @@
 import type { PeerId, PrivateKey } from '@libp2p/interface';
-import type { IKeyNetwork, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IKeyNetwork, ConnectedCohort, ClusterPeers, ICluster, ClusterRecord, ClusterConsensusConfig, CarriedOutcome, IRepo, BlockId, ITransactor, ITransactionValidator, PeerId as DbPeerId, RoutingKey, ActionContext, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { FindCoordinatorOptions } from '@optimystic/db-core';
 import type { IPeerNetwork } from '@optimystic/db-core';
 import { NetworkTransactor, routingKeyForBlock } from '@optimystic/db-core';
@@ -220,6 +220,38 @@ class MockPeerNetwork implements IPeerNetwork {
 }
 
 /**
+ * The mesh's stand-in for every node's `ConnectionRuns` (`network/connection-runs.ts`): the connection
+ * run each node is on with each other node, as `connectedCohort` reads it. A run starts the first time
+ * a node is read as connected to a peer, ends when it is read as separated from it (a partition) or
+ * when either end reconnects, and the next reading starts a new one. Ids come from one counter, so no
+ * id is reused within a mesh.
+ */
+class MeshConnectionRuns {
+	/** Run ids by node, then by the peer at the other end. */
+	private readonly runs = new Map<string, Map<string, number>>();
+	private lastRun = 0;
+
+	/** `self`'s current run with `peer`, started if it has none; `undefined`, and the run ended, when `separated`. */
+	observe(self: string, peer: string, separated: boolean): number | undefined {
+		let ofSelf = this.runs.get(self);
+		if (!ofSelf) this.runs.set(self, ofSelf = new Map());
+		if (separated) {
+			ofSelf.delete(peer);
+			return undefined;
+		}
+		let run = ofSelf.get(peer);
+		if (run === undefined) ofSelf.set(peer, run = ++this.lastRun);
+		return run;
+	}
+
+	/** End every run `peer` is on, at both ends. */
+	breakAll(peer: string): void {
+		this.runs.delete(peer);
+		for (const ofSelf of this.runs.values()) ofSelf.delete(peer);
+	}
+}
+
+/**
  * Mock IKeyNetwork that places a block where production does, by construction: it ranks the mesh's nodes
  * with FRET's own `assembleCohort` over a ring (`DigitreeStore`) holding every node at its real ring
  * coordinate (`hashPeerId`), the walk `Libp2pKeyPeerNetwork` asks FRET for. Like production it hashes the
@@ -324,6 +356,17 @@ export interface Mesh {
 	 * as the conformance reopen case opens a fresh driver, and later restarts reuse it.
 	 */
 	restart(node: MeshNode, options?: { rawStorage?: IRawStorage }): void;
+	/**
+	 * `node` dropped every connection it had and made them again: every connection run it is on, at
+	 * either end, is replaced by a new one the next time a node's `connectedCohort` reads it. This is
+	 * how a spec says "the partner disconnected and came back" without inventing a partition
+	 * lifecycle. A restart does the same.
+	 *
+	 * A partition (`MeshFailureConfig.partitionSides`) ends a run only when a `connectedCohort` call is
+	 * made while it is in place, so a partition applied and lifted between two such calls leaves the
+	 * runs as they were; a spec that needs the break seen either reads in between or calls this.
+	 */
+	reconnect(node: MeshNode): void;
 	/**
 	 * How many latest-revision consult requests `asker`'s coordinator has sent `target` — each one
 	 * `sync` request in production, whether it named one block or several. A node asking itself is
@@ -520,6 +563,7 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 	 * the two sides of a node can never see different topologies. It holds no state, so a restarted
 	 * node keeps it.
 	 */
+	const connectionRuns = new MeshConnectionRuns();
 	const makeNodeKeyNetwork = (selfPeerId: PeerId): IKeyNetwork => {
 		const selfStr = selfPeerId.toString();
 		const sideOfSelf = () => failures.partitionSides?.find(s => s.has(selfStr));
@@ -543,6 +587,24 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 				if (!side) return [];
 				const peers = await keyNetwork.findCluster(key);
 				return Object.keys(peers).filter(id => id !== selfStr && !side.has(id));
+			},
+			// Every mesh node serves, so the cohort is the whole network exactly when it holds every node.
+			// A member is connected unless this node's partition side leaves it out.
+			async connectedCohort(key): Promise<ConnectedCohort | undefined> {
+				if (failures.findClusterFails) return undefined;
+				const cohort = Object.keys(await keyNetwork.findCluster(key));
+				if (!cohort.includes(selfStr) || cohort.length < nodes.length) return undefined;
+				const side = sideOfSelf();
+				const runs: Record<string, number> = {};
+				let connected = true;
+				// Every member is read, so a separation from any of them ends its run even when another
+				// already makes the answer `undefined`.
+				for (const id of cohort.filter(id => id !== selfStr)) {
+					const run = connectionRuns.observe(selfStr, id, side !== undefined && !side.has(id));
+					if (run === undefined) connected = false;
+					else runs[id] = run;
+				}
+				return connected ? { members: [...cohort].sort(), runs } : undefined;
 			}
 		};
 	};
@@ -794,6 +856,8 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		// a local fault no spec injects today. If a spec ever does, or restarts a node MID-transaction,
 		// sever the old coordinator's local member too.
 		lifetimeByPeer.get(peerIdStr)!.stopped = true;
+		// A relaunched process holds none of the old one's connections.
+		connectionRuns.breakAll(peerIdStr);
 		node.clusterMember.dispose();
 		const lifetime: NodeLifetime = { stopped: false };
 		lifetimeByPeer.set(peerIdStr, lifetime);
@@ -801,7 +865,14 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		buildCoordinator(node, lifetime);
 	};
 
-	return { nodes, failures, keyNetwork, restart, consultRequests };
+	const reconnect = (node: MeshNode): void => {
+		if (!nodes.includes(node)) {
+			throw new Error(`reconnect: ${node.peerId.toString()} is not a node of this mesh`);
+		}
+		connectionRuns.breakAll(node.peerId.toString());
+	};
+
+	return { nodes, failures, keyNetwork, restart, reconnect, consultRequests };
 }
 
 /**
