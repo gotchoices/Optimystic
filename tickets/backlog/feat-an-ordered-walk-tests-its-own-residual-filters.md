@@ -1,0 +1,15 @@
+description: A filtered, ordered page on an Optimystic table (`where status = 'open' order by created desc limit 20`, with an index on `created` only) walks the index while the engine filters above it, so the engine never tells the walk the page size and the planner can only guess at its cost; letting the walk test those filters itself would let it be priced and planned as the page it is.
+architecture: docs/internals.md#an-ordered-read-walks-a-secondary-index
+files: packages/quereus-plugin-optimystic/src/optimystic-module.ts (`orderedWalkCandidate`, `verifiedIndexRows`, `IndexScanPlan.rowTest`), packages/quereus-plugin-optimystic/src/schema/index-walk.ts (`indexRangeScan`, whose row test is the precedent), @quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts (`probeAccessPlan`, `truncationIsSafe`), @quereus/quereus/src/vtab/best-access-plan.ts (`BestAccessPlanResult.handledFilters`, `residualFilter`)
+tradeoffs: The walk's scan switch already caps what the planner's guess costs (at most 256 row fetches on top of a scan and sort), so this buys accurate plans for filtered pages and pages past 256 rows rather than fixing a slow path, and it adds a per-row predicate evaluator to the module beside the engine's own.
+----
+
+## Today
+
+An ordered walk of a secondary index claims none of the statement's filters; each stays a residual `Filter` above it. Quereus sends a module the statement's `limit + offset` only for a plan that claims every filter: it asks with the limit, and when the chosen plan leaves a residual (`truncationIsSafe` in `@quereus/quereus/src/planner/rules/retrieve/rule-grow-retrieve.ts`), asks again without it. So a walk under a residual is always priced as a read of the whole table. `orderedWalkCandidate` prices it at one unit per row — below a scan and sort — as an accepted bet (its `NOTE:`), relying on the walk switching to a table scan after `WALK_ROWS_BEFORE_SCAN` entries when the read turns out long.
+
+## Wanted
+
+The walk claims the filters it can evaluate on a row it has already fetched and verified — equality, `in`, range comparisons and NULL tests on any column, under the column's collation — and tests each fetched row against them, as a range seek already tests the bounds the tree could not apply (`IndexScanPlan.rowTest`). A walk that claims every filter is then licensed by the engine: it receives the limit, is priced as the rows it must read to fill it (the limit over the claimed filters' estimated selectivity), and its residual bet and accepted-tradeoff `NOTE:` go away.
+
+Questions the plan must settle: which filter shapes are claimable without reimplementing the engine's comparison (the engine's `compareSqlValues` is what the range row test already uses); how the selectivity estimate is formed without statistics; whether Quereus's `BestAccessPlanResult.residualFilter` is the intended channel for this; and that a claimed filter the walk then fails to apply underproduces (`truncationIsSafe`'s note on OPT-024), so the claim and the test must come from one function.
