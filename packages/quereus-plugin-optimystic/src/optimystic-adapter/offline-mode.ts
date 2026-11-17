@@ -1130,16 +1130,17 @@ export class OfflineMode {
 	}
 
 	/**
-	 * Tell the `Database`'s watchers about each table behind `changedCollections`, whose rows changed
-	 * in this machine's view with no Quereus commit saying so: the removal of `transactionId` took them
-	 * out (the collections it still held a segment in), or a network-acknowledged commit that timed
-	 * out after it was sent left them in while throwing. Each table once per call; a cascade announces
-	 * again for every entry it fails, which costs a watcher one re-query each. Fire-and-forget, never
-	 * thrown into the drain or the commit.
+	 * Tell the `Database`'s watchers and its materialized-view follower about each table behind
+	 * `changedCollections`, whose rows changed in this machine's view with no Quereus commit saying so:
+	 * the removal of `transactionId` took them out (the collections it still held a segment in), or a
+	 * network-acknowledged commit that timed out after it was sent left them in while throwing. Either
+	 * way a view over the table was maintained without them, or rolled back with them, so it is rebuilt.
+	 * Each table once per call; a cascade announces again for every entry it fails, which costs a watcher
+	 * one re-query each. Fire-and-forget, never thrown into the drain or the commit.
 	 */
 	private announceChanged(transactionId: string, changedCollections: readonly CollectionId[]): void {
 		for (const [name, table] of this.tablesBehind(changedCollections)) {
-			announceExternalChange(this.db, table,
+			announceExternalChange(this.db, table, 'changed', this.bridge.getMaterializedViewFollower(),
 				error => log('offline:announce-failed transaction=%s table=%s: %o', transactionId, name, error));
 		}
 	}

@@ -445,6 +445,39 @@ whole-table invalidations, so the cost is one extra re-query. The watch closes o
 `drop table`, and on `plugin.dispose()` for a `Database` closed without dropping
 its tables.
 
+### Materialized views over Optimystic tables
+
+Quereus keeps a materialized view up to date row by row for the writes its own
+statements make. Rows another machine commits reach an Optimystic table without
+one, so the plugin rebuilds every materialized view that reads the table
+(`refresh materialized view`) once this machine learns of the commit — from its
+own storage, a network change notification, or a read of the table that pulls
+the commit in. Views over plain views over the table count too; a view that
+reads only another view is brought up to date by that view's rebuild.
+
+- **When.** After the statement running at the time, and never inside an explicit
+  transaction: a rebuild owed while one is open waits for its commit or rollback.
+  Commits that arrive while a rebuild is pending are folded into it.
+- **Between the commit and the rebuild,** reads of the view still answer from the
+  old rows — read directly, or in place of a query over the table that Quereus
+  answers from the view (a `select sum(Units) from Chit` when a view holds that sum).
+- **This machine's own commits** never rebuild a view; Quereus maintained it as
+  they were made.
+- **A failed rebuild** is logged once per view and message and retried after 1 s,
+  doubling to 60 s. Dropping or recreating the view ends it.
+- **`plugin.materializedViews.settled()`** resolves once nothing is pending: no
+  change waiting, no rebuild running or owed, except rebuilds waiting to retry
+  after a failure. It waits for an open explicit transaction to end first, so
+  never await it inside one or inside a statement.
+- **A table on the `network` transactor without `optimystic.network_watch`** hears
+  another machine's commit only when this machine stores the table's blocks or
+  reads the table, so a view over it can stay behind until then; the plugin logs
+  one warning per view and table. Tag the table (*Network change notification*
+  above) to be told of every commit.
+
+There is no setting yet to keep a view out of every query until its rebuild
+instead; that waits on a Quereus API.
+
 ## Transaction Engine
 
 The package exports a `QuereusEngine` that implements `ITransactionEngine` from `@optimystic/db-core`. It re-executes SQL statements through Quereus for transaction validation, and computes schema hashes from the database catalog.

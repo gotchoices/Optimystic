@@ -1279,6 +1279,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // against the table — at PLAN time, which no amount of re-initialization
       // downstream can rescue — until some non-index query happens to run a
       // successful full pass.
+      const replaced = this.collection;
       this.collection = collection;
       this.rowCodec = rowCodec;
       this.indexManager = indexManager;
@@ -1297,6 +1298,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // registerCollections). Must happen before any DML so the coordinator
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
+      this.followForMaterializedViews(replaced, collection);
       // A journaled offline transaction deferred because this table could not be reached is put back
       // now that it can (docs/offline-sync.md §Restore after a restart); scheduled, never awaited here.
       this.txnBridge.getOfflineMode()?.tableReadable(this.qualifiedTable);
@@ -1544,7 +1546,9 @@ export class OptimysticVirtualTable extends VirtualTable {
 
   /**
    * Translate a collection change — a local commit event, or a network watch's
-   * wake — into a coarse whole-table Quereus watch invalidation. Errors are
+   * wake — into a coarse whole-table Quereus watch invalidation, and a hint to the
+   * materialized-view follower, which pulls the table to learn whether the commit
+   * was another writer's. Errors are
    * isolated and logged — a watch-dispatch failure must not propagate into the
    * synchronous storage commit callback that invoked this listener (the
    * StorageRepo already isolates throwing listeners; this is a second line of
@@ -1552,7 +1556,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * notifyExternalChange).
    */
   private handleCollectionChange(): void {
-    announceExternalChange(this.db, this.qualifiedTable, (error: unknown) => {
+    announceExternalChange(this.db, this.qualifiedTable, 'hint', this.txnBridge.getMaterializedViewFollower(), (error: unknown) => {
       log(
         `WARN: notifyExternalChange failed for '${this.tableName}': ` +
         `${error instanceof Error ? error.message : String(error)}`
@@ -1561,7 +1565,38 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
-   * Tear down the collection-change subscription (idempotent). Called from
+   * Register this table with the materialized-view follower, which rebuilds the views reading it when
+   * rows reach it from another writer ({@link pullEveryTree} is what it pulls with). On every full
+   * initialization; a later one replaces the registration. When it replaces a handle an earlier pass
+   * published (the upgrade after a provisional pass) at another revision, rows may have arrived that no
+   * refresh walked, so the table is reported changed. The two revisions are of one collection, so they
+   * compare; a lineage change between them reads as different too, which is the right answer.
+   */
+  private followForMaterializedViews(replaced: Tree<string, any> | undefined, collection: Tree<string, any>): void {
+    const follower = this.txnBridge.getMaterializedViewFollower();
+    if (follower === undefined || this.options.collectionUri === 'tree://optimystic/schema') return;
+    follower.followTable(this.qualifiedTable, {
+      pull: () => this.pullEveryTree(),
+      toldOfRemoteCommits: () => this.options.transactor !== 'network' || this.networkWatchTagged,
+    });
+    if (replaced !== undefined && replaced !== collection
+      && replaced.getCollection().committedRevision() !== collection.getCollection().committedRevision()) {
+      follower.noteExternalChange(this.qualifiedTable, 'changed');
+    }
+  }
+
+  /** Bring the table's main tree and every index tree up to date with the network, as a live read does
+   * ({@link refreshLive}), so offline mode's degraded reads apply. */
+  private async pullEveryTree(): Promise<void> {
+    if (this.collection !== undefined) await this.refreshLive(this.collection);
+    for (const tree of this.indexManager?.getIndexTrees() ?? []) {
+      await this.refreshLive(tree);
+    }
+  }
+
+  /**
+   * Tear down the collection-change subscription and the materialized-view
+   * follower's registration (idempotent). Called from
    * OptimysticModule.destroy (DROP TABLE / module teardown).
    *
    * Deliberately NOT called from disconnect(): in this vtab, disconnect() is a
@@ -1585,6 +1620,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.changeSubscribed = false;
     this.networkWatchArmed = false;
     this.reconcileNetworkWatch();
+    this.txnBridge.getMaterializedViewFollower()?.unfollowTable(this.qualifiedTable);
   }
 
   /**

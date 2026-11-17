@@ -102,6 +102,12 @@ export class CollectionFactory {
    */
   private sealedRefusedListener: TreeCollectionOptions['onSealedRefused'];
   /**
+   * Told when a tree this factory opens adopts commits it did not write, with the tree's collection
+   * id ({@link setExternalCommitsListener}): the materialized-view follower's, set once at registration
+   * for the reason {@link sealedRefusedListener} is.
+   */
+  private externalCommitsListener: ((collectionId: CollectionId, rev: number) => void) | undefined;
+  /**
    * The one stable gate per transactor key that {@link getCohortReachability} hands out, standing in
    * for the gate registered for the key ({@link registerCohortReachability}) and for the always-open
    * gate until one is.
@@ -117,10 +123,27 @@ export class CollectionFactory {
     this.sealedRefusedListener = listener;
   }
 
-  /** The collection options both open paths pass to `Tree`: the refusal callback, when one is set.
-   * Never a merge declaration: the table classifies per statement and passes the lane on each write. */
-  private treeOptions(): Pick<TreeCollectionOptions, 'onSealedRefused'> | undefined {
-    return this.sealedRefusedListener === undefined ? undefined : { onSealedRefused: this.sealedRefusedListener };
+  /**
+   * Set the listener every tree opened from now on reports adopted commits to
+   * (`TreeCollectionOptions.onExternalCommits`, bound to the tree's collection id). Once, as
+   * {@link setSealedRefusedListener}. The listener runs inside the collection's await-free adopt step,
+   * under its latch, so it must only record.
+   */
+  setExternalCommitsListener(listener: (collectionId: CollectionId, rev: number) => void): void {
+    if (this.externalCommitsListener !== undefined) throw new Error('an external-commits listener is already set on this factory');
+    this.externalCommitsListener = listener;
+  }
+
+  /** The collection options both open paths pass to `Tree`: the refusal callback and the adopted-commits
+   * callback, each when one is set. Never a merge declaration: the table classifies per statement and
+   * passes the lane on each write. */
+  private treeOptions(collectionId: CollectionId): Pick<TreeCollectionOptions, 'onSealedRefused' | 'onExternalCommits'> | undefined {
+    const external = this.externalCommitsListener;
+    if (this.sealedRefusedListener === undefined && external === undefined) return undefined;
+    return {
+      onSealedRefused: this.sealedRefusedListener,
+      onExternalCommits: external === undefined ? undefined : rev => external(collectionId, rev),
+    };
   }
 
   /**
@@ -144,7 +167,7 @@ export class CollectionFactory {
       keyExtractor,
       compare, // Total order
       undefined,
-      this.treeOptions()
+      this.treeOptions(collectionId)
     );
 
     this.cacheCollection(options, txnState, collection);
@@ -176,7 +199,7 @@ export class CollectionFactory {
       keyExtractor,
       compare, // Total order
       undefined,
-      this.treeOptions()
+      this.treeOptions(collectionId)
     );
     if (!collection) {
       return undefined;

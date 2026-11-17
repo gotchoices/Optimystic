@@ -17,6 +17,7 @@ import { addListener, notifyListeners } from './listeners.js';
 import { guardRefusalIn } from './guard-refusal.js';
 import { SessionModeRefusedError } from './offline-mode.js';
 import type { OfflineMode } from './offline-mode.js';
+import type { MaterializedViewFollower } from './materialized-view-follower.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
 import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
@@ -502,6 +503,12 @@ export class TransactionBridge {
    * transaction is then network-acknowledged and takes legacy direct sync.
    */
   private offline: OfflineMode | undefined;
+  /**
+   * The materialized-view follower of the `Database` this bridge serves
+   * ({@link attachMaterializedViewFollower}): a table registers with it, and every caller of
+   * `announceExternalChange` notes it, through here. Absent for a bridge built bare (tests).
+   */
+  private materializedViewFollower: MaterializedViewFollower | undefined;
 
   constructor(collectionFactory: CollectionFactory) {
     this.collectionFactory = collectionFactory;
@@ -521,6 +528,17 @@ export class TransactionBridge {
    * to; `undefined` for a bridge built bare. */
   getOfflineMode(): OfflineMode | undefined {
     return this.offline;
+  }
+
+  /** Attach the materialized-view follower; set once by the plugin's `register`, as the offline-mode controller is. */
+  attachMaterializedViewFollower(follower: MaterializedViewFollower): void {
+    if (this.materializedViewFollower !== undefined) throw new Error('a materialized-view follower is already attached to this bridge');
+    this.materializedViewFollower = follower;
+  }
+
+  /** The attached materialized-view follower; `undefined` for a bridge built bare. */
+  getMaterializedViewFollower(): MaterializedViewFollower | undefined {
+    return this.materializedViewFollower;
   }
 
   /**
@@ -1762,7 +1780,10 @@ export class TransactionBridge {
    * Resolves once no transaction is active on this bridge: at once when none is, else when the
    * current one ends, by commit or rollback. For work that must run between transactions and is
    * scheduled from inside one — the offline-mode controller's restore pass, triggered by a table's
-   * initialization inside a statement (`OfflineMode.tableReadable`). Says nothing about the next
+   * initialization inside a statement (`OfflineMode.tableReadable`), and the materialized-view
+   * follower's rebuilds, which never run inside an explicit transaction. Every Optimystic connection
+   * joins every transaction Quereus begins, so this hears every commit and rollback once one has
+   * registered. Says nothing about the next
    * transaction, which may begin right after; the caller re-checks {@link isTransactionActive}.
    */
   whenTransactionIdle(): Promise<void> {

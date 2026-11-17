@@ -1641,6 +1641,35 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   what it adopted, so two handles over one collection in one `Database` report each
   other's commits — an over-report, never a missed one. It is what a materialized view
   over a table needs to tell "fallen behind" from "my own write" (GitHub #58).
+- **A materialized view over the table is rebuilt when another writer's commit
+  reaches it.** Quereus maintains a view row by row only for its own statements'
+  writes, and a log entry does not reliably carry the old row, so row-level
+  ingestion is out of reach; the plugin rebuilds instead. One
+  `MaterializedViewFollower` per `Database`
+  (`packages/quereus-plugin-optimystic/src/optimystic-adapter/materialized-view-follower.ts`)
+  hears three signals, each synchronous and dropped when no view reads the table:
+  *adopted* (the callback above, which `CollectionFactory.setExternalCommitsListener`
+  binds to each tree's collection id, mapped to tables through `TransactionBridge.tablesOf`)
+  marks the table dirty; *hint* (the storage event or network-watch wake above) fires
+  for this machine's own commits too, so the follower pulls the table, which turns
+  another writer's commit into *adopted* and its own into nothing; *changed* (a failed
+  offline transaction's removal) marks the table dirty directly. The vtab's
+  `handleCollectionChange` and the offline-mode controller reach it through
+  `announceExternalChange`, so a site cannot tell the watchers and not the follower.
+  Its run, never inside the callback that signalled: under the exec lock
+  (`Database.ingestExternalRowWrite` with an empty result), skip while an explicit
+  transaction is open and wait for its end (`TransactionBridge.whenTransactionIdle`),
+  else pull every tree of each hinted or dirty table; then `refresh materialized view`
+  each view reading a dirty table, a view after any owed view it reads. A rebuild that
+  ran inside an explicit transaction (a `begin` queued ahead of it, seen from the
+  view's `materialized_view_refreshed` event) is owed again once that transaction
+  ends; one that fails is retried after 1 s doubling to 60 s per view. Signals during
+  a run fold into it. Between the signal and the rebuild's commit, reads of the view
+  answer from the old rows; keeping a view off every query until then needs a Quereus
+  API (blocked ticket `a-materialized-view-can-be-kept-off-while-it-is-behind`). A
+  table on the `network` transactor without `optimystic.network_watch` hears another
+  machine's commit only when this node stores it or reads the table, so a view over
+  it can stay behind until then; the follower warns once per view and table.
 - **Double wake from storage and network (accepted).** On a node that both stores
   a table tagged for network change notification (below) and watches it, another
   machine's commit wakes watchers twice: once from the table's own storage listener,

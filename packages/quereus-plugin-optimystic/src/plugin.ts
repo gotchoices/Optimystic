@@ -10,6 +10,7 @@ import { FunctionFlags, TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OfflineMode } from './optimystic-adapter/offline-mode.js';
+import { MaterializedViewFollower } from './optimystic-adapter/materialized-view-follower.js';
 import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import { moduleCostProfile } from './optimystic-adapter/cost-profile.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
@@ -62,6 +63,12 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
 	const txnBridge = new TransactionBridge(collectionFactory);
+	// Keeps the materialized views over this Database's Optimystic tables in step with rows other writers
+	// commit (README § Materialized views over Optimystic tables). Wired before any table opens, as the
+	// offline queue is: every tree the factory opens reports the other writers' commits it adopts to it.
+	const materializedViews = new MaterializedViewFollower(db, txnBridge);
+	txnBridge.attachMaterializedViewFollower(materializedViews);
+	collectionFactory.setExternalCommitsListener(materializedViews.onExternalCommits);
 	// One offline queue per Database, idle until the first locally acknowledged commit. Wired before
 	// any table opens: every tree the factory opens from here on reports sealed-segment refusals to it.
 	// It announces a failed transaction's tables to this Database's watchers.
@@ -195,6 +202,18 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 */
 		offline,
 		/**
+		 * Materialized views over Optimystic tables (README § Materialized views over Optimystic tables):
+		 * when another machine's commit reaches this one, every materialized view reading the changed
+		 * table is rebuilt (`refresh materialized view`), after the statement running then and outside
+		 * any explicit transaction, with a burst of commits folded into one rebuild. `settled()` resolves
+		 * once nothing is pending — no change waiting, no rebuild running or owed, except rebuilds that
+		 * failed and are waiting to retry (logged). It waits for an open explicit transaction to end
+		 * first, so never await it inside one or inside a statement.
+		 */
+		materializedViews: {
+			settled: (): Promise<void> => materializedViews.settled(),
+		},
+		/**
 		 * Resolves once every tag change made so far on an Optimystic table is saved to the table's
 		 * catalog record — so a later `hydrate` restores it. A tag change made by `apply schema` is
 		 * saved before the apply returns; an imperative `alter … set|add|drop tags` (on a table, a
@@ -208,7 +227,8 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		/**
 		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
 		 * full-replication events (forgetting every commit still followed, see
-		 * `TransactionBridge.dispose`), the offline queue's drain (`OfflineMode.dispose`: a
+		 * `TransactionBridge.dispose`), the materialized-view follower (a rebuild in flight is let
+		 * finish, nothing further is rebuilt), the offline queue's drain (`OfflineMode.dispose`: a
 		 * submission in flight is aborted after its current network step, nothing further is sent,
 		 * and queued entries stay sealed in their collections), and its LEASES on the raw-storage read caches behind
 		 * `local` transactors over host-supplied storage (see `CollectionFactory.dispose`). Call
@@ -230,6 +250,8 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 			// nothing left to release it). A pending `whenDrained` rejects with QueueDisposedError, and
 			// entries still queued stay sealed in their collections (nothing of the application's is dropped).
 			await offline.dispose();
+			// After the queue, whose last removals may still report changed tables; before the bridge, which it reads.
+			await materializedViews.dispose();
 			txnBridge.dispose();
 			await collectionFactory.dispose();
 		},
