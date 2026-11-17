@@ -9,10 +9,26 @@
  */
 
 import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
-import type { ITransactor } from '@optimystic/db-core';
+import type { IBlockChangeNotifier, ITransactor } from '@optimystic/db-core';
 
 export function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor {
+	return transactorOver(new StorageRepo(storage));
+}
+
+/**
+ * {@link buildSharedLocalTransactor} that also reports every commit applied to the repo, its sharers'
+ * own included, as the real `local` transactor does — for a spec where each `Database` must hear the
+ * others' commits from storage (`materialized-view-follows-other-writers.spec.ts`).
+ */
+export function buildSharedNotifyingTransactor(storage: MemoryRawStorage): ITransactor & IBlockChangeNotifier {
 	const repo = new StorageRepo(storage);
+	return {
+		...transactorOver(repo),
+		onCollectionChange: (collectionId, listener) => repo.onCollectionChange(collectionId, listener),
+	};
+}
+
+function transactorOver(repo: StorageRepo): ITransactor {
 	return {
 		async get(blockGets) { return await repo.get(blockGets); },
 		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },

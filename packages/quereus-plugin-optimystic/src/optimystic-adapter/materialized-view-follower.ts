@@ -12,7 +12,12 @@ const log = createLogger('materialized-views');
 
 /** The first wait before a failed rebuild is tried again; each further failure of the view doubles it. */
 const RETRY_FIRST_MS = 1_000;
-/** The longest wait between two tries of a view that keeps failing to rebuild. */
+/**
+ * The longest wait between two tries of a view that keeps failing to rebuild.
+ * NOTE: a view that can never rebuild (a source table dropped while it was owed) is retried at this
+ * interval for the `Database`'s life, one quiet statement a minute; if that ever shows up, stop
+ * retrying a view Quereus marks stale, or after a bounded number of failures.
+ */
 const RETRY_MAX_MS = 60_000;
 /**
  * How often to look again while Quereus has an explicit transaction open that no Optimystic connection

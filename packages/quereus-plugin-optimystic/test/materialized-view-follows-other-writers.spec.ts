@@ -12,9 +12,10 @@
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
-import type { IBlockChangeNotifier, ITransactor } from '@optimystic/db-core';
+import { MemoryRawStorage } from '@optimystic/db-p2p';
+import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { buildSharedNotifyingTransactor } from './shared-local-transactor.js';
 
 type Row = Record<string, SqlValue>;
 
@@ -23,20 +24,6 @@ const collectRows = async (iter: AsyncIterable<Row>): Promise<Row[]> => {
 	for await (const row of iter) rows.push(row);
 	return rows;
 };
-
-/** A `local`-style transactor over one `StorageRepo`, shared by both `Database`s, that reports the
- * commits applied to it as the real `local` transactor does. */
-function buildSharedLocalTransactor(storage: MemoryRawStorage): ITransactor & IBlockChangeNotifier {
-	const repo = new StorageRepo(storage);
-	return {
-		async get(blockGets) { return await repo.get(blockGets); },
-		async getStatus(_trxRefs) { throw new Error('getStatus not implemented in test transactor'); },
-		async pend(request) { return await repo.pend(request); },
-		async commit(request) { return await repo.commit(request); },
-		async cancel(trxRef) { return await repo.cancel(trxRef); },
-		onCollectionChange: (collectionId, listener) => repo.onCollectionChange(collectionId, listener),
-	} as ITransactor & IBlockChangeNotifier;
-}
 
 function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 	const plugin = register(db, {
@@ -56,7 +43,7 @@ function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
 
 /** A, holding `ChitTotal` over `Chit`, and B, a second writer of `Chit`; plus A's rebuild count. */
 async function twoWriters() {
-	const shared = buildSharedLocalTransactor(new MemoryRawStorage());
+	const shared = buildSharedNotifyingTransactor(new MemoryRawStorage());
 	const dbA = new Database();
 	const pluginA = registerWithSharedTransactor(dbA, shared);
 	await dbA.exec(`create table Chit (Id integer primary key, Side text, Units integer) using optimystic('tree://mv-follow/chit')`);

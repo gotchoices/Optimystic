@@ -827,7 +827,9 @@ cascades:
 4. Every table whose visible rows changed is announced through `Database.notifyExternalChange`, so
    `Database.watch` subscribers re-query; the same call the reactive watch bridge already makes for
    a remote commit (`announceExternalChange` in
-   `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`, shared by both).
+   `packages/quereus-plugin-optimystic/src/optimystic-adapter/external-change.ts`, shared by both),
+   which also has every materialized view reading such a table rebuilt, since the view was
+   maintained with the removed rows ([internals.md §Reactive Watch Bridge](internals.md#reactive-watch-bridge-quereus-vtab)).
    The tables are the ones behind the `failed` status's `changedCollections`: the collections the
    entry still had a segment in when it was removed, which for a partly committed entry excludes the
    half that committed. The plugin's controller announces each such table once, after the `failed`
