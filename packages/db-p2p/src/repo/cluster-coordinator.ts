@@ -69,10 +69,33 @@ function settledActionIdsOf(message: RepoMessage): ActionId[] {
 		'commit' in op ? [op.commit.actionId] : 'cancel' in op ? [op.cancel.actionRef.actionId] : []);
 }
 
-/** Fold the commit signatures of every answered response into a record in place. */
-function mergeCommits(record: ClusterRecord, responses: ReadonlyArray<{ response?: ClusterRecord | null }>): void {
-	for (const { response } of responses) {
-		if (response) record.commits = { ...record.commits, ...response.commits };
+/**
+ * The only way a commit signature enters `record.commits`: each answering member's OWN entry, keyed by
+ * the peer asked (as {@link collectApplyOutcomes} takes reports), and only when its answer's promise map
+ * equals `record.promises` exactly — same peers, same signatures. A commit signature covers
+ * `computeClusterCommitHash(messageHash, message, promises, membershipDigest)`, so one signed over any
+ * other map fails every member's check and gets its signer penalized for `InvalidSignature`. A member on
+ * an older build adds its own late promise to a decided record and signs over that; its commit is dropped
+ * here, and it stays owed the record like any member that did not commit.
+ */
+function keepCommitsSignedOverRecordPromises(
+	record: ClusterRecord,
+	answers: ReadonlyArray<{ peerId: string; response?: ClusterRecord | null }>,
+	round: string
+): void {
+	const promiseMap = canonicalJson(record.promises);
+	const dropped: string[] = [];
+	for (const { peerId, response } of answers) {
+		const own = response?.commits?.[peerId];
+		if (response == null || own === undefined) continue;
+		if (canonicalJson(response.promises ?? {}) === promiseMap) {
+			record.commits = { ...record.commits, [peerId]: own };
+		} else {
+			dropped.push(peerId);
+		}
+	}
+	if (dropped.length > 0) {
+		log('cluster-tx:commit-over-other-promise-map', { messageHash: record.messageHash, round, dropped });
 	}
 }
 
@@ -1194,20 +1217,15 @@ export class ClusterCoordinator {
 	 * (docs/correctness.md Theorem 9).
 	 *
 	 * **A member's commit signature is kept from this round only when it was signed over the final promise
-	 * map** ({@link keepCommitsSignedOverMergedPromises}). A member signs its commit as soon as its view of
-	 * the record shows a super-majority of approved promises, and at the default threshold that happens
-	 * while answering this round only in a two-member cohort (this node's pre-vote plus the member's own
-	 * promise). A commit signature covers `computeClusterCommitHash(messageHash, message, promises,
-	 * membershipDigest)`, so one signed over the map this round ends with verifies against the record,
-	 * and keeping it lets this node's member reach consensus on its pre-sign ({@link commitTransaction})
-	 * without a commit round. Any other commit signature is dropped, as every one from this round used to
-	 * be: it would fail every member's signature check and get its signer penalized for `InvalidSignature`.
+	 * map** ({@link keepCommitsSignedOverRecordPromises}, the rule every round uses). A member signs its
+	 * commit as soon as its view of the record shows a super-majority of approved promises, and at the
+	 * default threshold that happens while answering this round only in a two-member cohort (this node's
+	 * pre-vote plus the member's own promise). Kept, it lets this node's member reach consensus on its
+	 * pre-sign ({@link commitTransaction}) without a commit round.
 	 *
-	 * The rule cannot bring in backlog `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`
-	 * (a commit signature invalidated by a promise merged after it): the kept signature is over the final
-	 * map, and no promise is merged after it. Every remote answer is merged before the keep runs, and the
-	 * keep runs only when this node's member's promise is already in the map, so {@link presignLocalCommit}
-	 * has no promise to add either. Keep both true.
+	 * The keep runs after every answer's promises are merged, and nothing merges a promise after it: the
+	 * commit round runs only on a decided record, and neither this node's member nor any other adds a
+	 * promise to one (`ClusterMember.getTransactionPhase`), so a kept signature stays valid. Keep both true.
 	 */
 	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
@@ -1304,10 +1322,7 @@ export class ClusterCoordinator {
 			messageHash: record.messageHash,
 			mergedPromises: Object.keys(record.promises ?? {})
 		});
-		// A pre-vote that threw left this node's promise out of the map, and the pre-sign would add it.
-		if (selfId === undefined || !(selfId in record.peers) || selfId in record.promises) {
-			this.keepCommitsSignedOverMergedPromises(record, roundPeers.map((peerId, idx) => ({ peerId, response: results[idx] ?? null })));
-		}
+		keepCommitsSignedOverRecordPromises(record, roundPeers.map((peerId, idx) => ({ peerId, response: results[idx] })), 'promise');
 		log('cluster-tx:promise-merge-end', {
 			messageHash: record.messageHash,
 			finalPromises: Object.keys(record.promises ?? {}),
@@ -1315,23 +1330,6 @@ export class ClusterCoordinator {
 		});
 		this.updateTransactionRecord(record, 'after-promises');
 		return { record };
-	}
-
-	/**
-	 * Keep the commit signature each promise-round member signed while answering, when its answer's
-	 * promise map equals `record`'s merged one exactly — same peers, same signatures — and so the
-	 * signature verifies against `record` (see {@link collectPromises}). Only the member's own entry is
-	 * taken, keyed by the peer asked, as {@link collectApplyOutcomes} takes reports.
-	 */
-	private keepCommitsSignedOverMergedPromises(record: ClusterRecord, answers: ReadonlyArray<{ peerId: string; response: ClusterRecord | null }>): void {
-		const merged = canonicalJson(record.promises);
-		for (const { peerId, response } of answers) {
-			const own = response?.commits?.[peerId];
-			if (response == null || own === undefined) continue;
-			const kept = canonicalJson(response.promises ?? {}) === merged;
-			log('cluster-tx:promise-round-commit', { messageHash: record.messageHash, peerId, kept });
-			if (kept) record.commits = { ...record.commits, [peerId]: own };
-		}
 	}
 
 	/**
@@ -1353,8 +1351,8 @@ export class ClusterCoordinator {
 	 * one, which `CoordinatorRepo`'s solo path keeps away from this class. Were one to arrive anyway — a
 	 * cohort that shrank between `resolveCohort` and {@link getClusterForBlock}, admitted by
 	 * `allowUnvalidatedSmallCluster` — it is signed over the map before any remote promise is merged, so
-	 * the round's own rule for commit signatures ({@link keepCommitsSignedOverMergedPromises}) would not
-	 * keep it either. The member reaches consensus and applies during the pre-vote, and the dropped
+	 * the rule for commit signatures ({@link keepCommitsSignedOverRecordPromises}) would not keep it
+	 * either. The member reaches consensus and applies during the pre-vote, and the dropped
 	 * signature is re-collected by {@link presignLocalCommit}, as it was when self voted inside the round.
 	 */
 	private async prevoteLocalPromise(record: ClusterRecord): Promise<ClusterLogPeerOutcome | undefined> {
@@ -1405,7 +1403,7 @@ export class ClusterCoordinator {
 	 *
 	 * **There is no commit round when the pre-sign completes the majority.** That happens when the record
 	 * already carries remote commit signatures kept from the promise round
-	 * ({@link keepCommitsSignedOverMergedPromises}) — at the default thresholds, in a two-member cohort.
+	 * ({@link keepCommitsSignedOverRecordPromises}) — at the default thresholds, in a two-member cohort.
 	 * This node's member then reaches consensus and applies during its pre-sign, and every remote member
 	 * is owed only the consensus delivery ({@link deliverDecidedWithoutCommitRound}), so the operation
 	 * still costs each remote member two calls, the second being the delivery — or one, when a pend's
@@ -1424,7 +1422,7 @@ export class ClusterCoordinator {
 		// A member can reach consensus during THIS round (see above), so its apply report arrives on
 		// these responses. The broadcast's copy wins on overlap, being the later of the two.
 		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
-		mergeCommits(record, deliveries);
+		keepCommitsSignedOverRecordPromises(record, deliveries, 'commit');
 		log('cluster-tx:commit-merge', {
 			messageHash: record.messageHash,
 			presigned,
@@ -1433,7 +1431,9 @@ export class ClusterCoordinator {
 		this.updateTransactionRecord(record, 'after-commit');
 
 		if (!this.hasCommitMajority(record)) {
-			this.scheduleOrClearRetry(record, deliveries.filter(d => !d.success).map(d => d.peerId));
+			// Owed: every member of the round whose commit the record does not hold — one whose delivery
+			// failed, and one that answered with a commit the rule above could not keep.
+			this.scheduleOrClearRetry(record, roundPeers.filter(peerId => record.commits[peerId] === undefined));
 			return record;
 		}
 		log('cluster-tx:commit-majority-reached', {
@@ -1557,7 +1557,7 @@ export class ClusterCoordinator {
 	 * the round then runs with it included, as it always did.
 	 *
 	 * The member reaches consensus here, and applies, when the record already carries remote commit
-	 * signatures kept from the promise round ({@link keepCommitsSignedOverMergedPromises}) that its own
+	 * signatures kept from the promise round ({@link keepCommitsSignedOverRecordPromises}) that its own
 	 * completes to a majority — in a two-member cohort at the default thresholds, the ordinary path.
 	 * {@link commitTransaction} then runs no commit round, and the consensus delivery skips this member as
 	 * already executed. Otherwise the record carries no commit but its own, which is a majority only in a
@@ -1570,12 +1570,9 @@ export class ClusterCoordinator {
 		}
 		try {
 			const response = await this.localCluster!.update({ ...record });
-			// Its promise too, not only its commit. A member whose promise round delivery failed (possible
-			// only in a cohort of four or more, where super-majority can be reached without it) adds its
-			// promise here and signs its commit over a commit hash covering it; a round that carried the
-			// commit without the promise would fail every remote member's signature check.
-			record.promises = { ...record.promises, ...response.promises };
-			mergeCommits(record, [{ response }]);
+			// Its commit only. The record is decided, so a member whose pre-vote threw signs without adding
+			// a promise, over the map the commits already collected cover (`ClusterMember.getTransactionPhase`).
+			keepCommitsSignedOverRecordPromises(record, [{ peerId: selfId, response }], 'presign');
 			log('cluster-tx:commit-presign', { messageHash: record.messageHash, signed: response.commits[selfId] !== undefined });
 			return true;
 		} catch (err) {
@@ -1875,9 +1872,13 @@ export class ClusterCoordinator {
 			.filter(peerId => !selfToBroadcast || peerId !== selfId)
 			.filter(peerId => !state.carrying.has(peerId))
 			.map(peerId => this.deliver(payload, peerId, 0, 'commit-retry')));
-		mergeCommits(record, deliveries);
-		this.noteDelivered(record, pendingPeers, deliveries.filter(d => d.success).map(d => d.peerId), collectApplyOutcomes(deliveries));
-		if (this.hasCommitMajority(record)) {
+		keepCommitsSignedOverRecordPromises(record, deliveries, 'retry');
+		const majority = this.hasCommitMajority(record);
+		// Short of a majority, a member that answered with a commit the record could not keep stays owed;
+		// once there is one, the broadcast below covers every member that answered and has not applied.
+		const settled = deliveries.filter(d => d.success && (majority || record.commits[d.peerId] !== undefined));
+		this.noteDelivered(record, pendingPeers, settled.map(d => d.peerId), collectApplyOutcomes(deliveries));
+		if (majority) {
 			// The retry may itself have assembled the majority (a two-member cohort whose remote member
 			// missed the commit round), and then this node's member has not applied; a remote member that
 			// applied on receipt before this node's member did may hold a behind refusal; and in a cohort

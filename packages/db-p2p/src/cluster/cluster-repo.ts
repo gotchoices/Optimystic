@@ -1,7 +1,7 @@
 import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMessage, ITransactionValidator, ClusterConsensusConfig, UnvalidatablePendPolicy, CommitResult, PendResult, PendRequest, BlockId, ActionId, ActionRev, CommitRequest, CommitCert, InvalidateRequest, MemberApplyOutcome, GetBlockResults, ValidityRejection } from "@optimystic/db-core";
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
-import { blockIdsForTransforms, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
+import { blockIdsForTransforms, canonicalJson, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
 import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, committedTailIds, invalidationActionId } from "./commit-cert.js";
@@ -910,8 +910,8 @@ export class ClusterMember implements ICluster {
 		// completes super-majority ⇒ our commit is due; our commit completes the majority ⇒
 		// consensus; our reject/conflict vote makes the record terminal), and any follow-on phase
 		// not re-handled here would silently wait for the coordinator's next delivery — e.g. a
-		// member whose promise the coordinator never collected receives the commit-phase record,
-		// adds its promise, and must then also commit in the SAME delivery. One loop replaces the
+		// member of a two-member cohort receives the record with one approval, adds its promise,
+		// which decides it, and must then also commit in the SAME delivery. One loop replaces the
 		// hand-written per-branch re-checks that used to cover only the follow-ons their authors
 		// thought of. Only the three vote-adding phases continue; each strictly grows the record
 		// (adds a promise or commit key), so the loop terminates — the cap guards a
@@ -1106,7 +1106,7 @@ export class ClusterMember implements ICluster {
 		if (existing.messageHash !== incoming.messageHash) {
 			throw new Error('Message hash mismatch');
 		}
-		if (ClusterMember.canonicalJson(existing.message) !== ClusterMember.canonicalJson(incoming.message)) {
+		if (canonicalJson(existing.message) !== canonicalJson(incoming.message)) {
 			throw new Error('Message content mismatch');
 		}
 		if (existing.membershipVersion === 2 || incoming.membershipVersion === 2) {
@@ -1130,18 +1130,12 @@ export class ClusterMember implements ICluster {
 				});
 				throw new Error('Peers mismatch');
 			}
-		} else if (ClusterMember.canonicalJson(existing.peers) !== ClusterMember.canonicalJson(incoming.peers)) {
+		} else if (canonicalJson(existing.peers) !== canonicalJson(incoming.peers)) {
 			// v1 (legacy, membership unbound): full peer-object equality is the only available guard.
 			throw new Error('Peers mismatch');
 		}
 
-		// Merge signatures with equivocation detection
-		const mergedPromises = this.detectEquivocation(
-			existing.promises, incoming.promises, 'promise', existing.messageHash
-		);
-		const mergedCommits = this.detectEquivocation(
-			existing.commits, incoming.commits, 'commit', existing.messageHash
-		);
+		const { promises, commits } = this.mergeSignatures(existing, incoming);
 
 		// Union the advisory apply outcomes per peer, first-seen wins. A peer only ever writes its own
 		// entry, so "first-seen wins" is per-peer idempotence, not a conflict rule. Omitted entirely
@@ -1152,10 +1146,52 @@ export class ClusterMember implements ICluster {
 
 		return {
 			...existing,
-			promises: mergedPromises,
-			commits: mergedCommits,
+			promises,
+			commits,
 			...(mergedOutcomes === undefined ? {} : { applyOutcomes: mergedOutcomes })
 		};
+	}
+
+	/**
+	 * The promise and commit maps of the held record merged with an incoming one, under the rule that a
+	 * decided record's promise map is never extended ({@link isDecided}) and a commit signature sits only
+	 * in a record whose promise map is exactly the one it was signed over:
+	 * - held record decided: the held map, since it is the one this member may already have signed over;
+	 *   promises the incoming record adds are not taken;
+	 * - otherwise, incoming record decided: the incoming map, dropping the held record's extra promises
+	 *   (this member's own late one included) — an undecided record carries no commit signature that
+	 *   verifies, so nothing of the held side is lost;
+	 * - neither decided: the union, first-seen winning.
+	 *
+	 * Each side's commit signatures are taken only when that side's promise map equals the chosen one;
+	 * the rest are dropped and logged. Promise equivocation is detected over every peer both maps share
+	 * whichever map is chosen, since a promise hash does not depend on the map; a decided incoming map is
+	 * adopted verbatim even where an equivocating peer flipped its vote in it, because its commits bind it.
+	 * Commit equivocation is detected only between commits both kept, the only ones over one commit hash.
+	 *
+	 * NOTE: one message routed through two coordinators (one `messageHash`) can be decided over two
+	 * different maps. A member keeps the first decided map only while it holds the record, which it drops
+	 * once it signs; after that it signs the second map as a fresh record. Before this rule it signed over
+	 * the union, which verified against neither, so this is no worse.
+	 */
+	private mergeSignatures(existing: ClusterRecord, incoming: ClusterRecord): Pick<ClusterRecord, 'promises' | 'commits'> {
+		const messageHash = existing.messageHash;
+		const union = this.detectEquivocation(existing.promises, incoming.promises, 'promise', messageHash);
+		const promises = this.isDecided(existing) ? existing.promises
+			: this.isDecided(incoming) ? incoming.promises
+			: union;
+		const map = canonicalJson(promises);
+		const heldFits = canonicalJson(existing.promises) === map;
+		const incomingFits = canonicalJson(incoming.promises) === map;
+		const commits = heldFits && incomingFits ? this.detectEquivocation(existing.commits, incoming.commits, 'commit', messageHash)
+			: heldFits ? existing.commits
+			: incomingFits ? incoming.commits
+			: {};
+		const dropped = Object.keys({ ...existing.commits, ...incoming.commits }).filter(peerId => !(peerId in commits));
+		if (dropped.length > 0) {
+			log('cluster-member:commit-over-other-promise-map', { messageHash, dropped });
+		}
+		return { promises, commits };
 	}
 
 	/**
@@ -1289,21 +1325,6 @@ export class ClusterMember implements ICluster {
 		}
 	}
 
-	/**
-	 * Deterministic JSON: sorts object keys so comparisons are order-independent.
-	 * NOTE: this is a second copy of the canonicalization in db-core `membership.ts` (which feeds the hash
-	 * preimages). It is used here only for equality checks (message-content / v1-peers compare), and those
-	 * run *after* a messageHash-equality gate, so a drift between the two can't silently forge agreement —
-	 * but keep them byte-identical. If a third caller appears, promote to a single exported helper.
-	 */
-	private static canonicalJson(value: unknown): string {
-		return JSON.stringify(value, (_, v) =>
-			v && typeof v === 'object' && !Array.isArray(v)
-				? Object.keys(v).sort().reduce((o: Record<string, unknown>, k) => { o[k] = v[k]; return o; }, {})
-				: v
-		);
-	}
-
 	private async computePromiseHash(record: ClusterRecord): Promise<string> {
 		return computeClusterPromiseHash(record.messageHash, record.message, recordMembershipDigest(record));
 	}
@@ -1377,12 +1398,27 @@ export class ClusterMember implements ICluster {
 		return phase === TransactionPhase.Rejected || phase === TransactionPhase.ConflictSuperseded;
 	}
 
+	/** The approved promises a record needs to be decided: `ceil(cohort × superMajorityThreshold)`. */
+	private superMajorityOf(record: ClusterRecord): number {
+		return Math.ceil(Object.keys(record.peers).length * this.superMajorityThreshold);
+	}
+
+	/**
+	 * Whether `record`'s approved promises reach super-majority. A decided record's promise map is never
+	 * extended: every commit signature covers the whole map (`computeClusterCommitHash`), so one more
+	 * promise would invalidate every commit already signed over it. The threshold is the coordinator's
+	 * (`assertSuperMajorityCoupling`), so both sides agree on when the map freezes.
+	 */
+	private isDecided(record: ClusterRecord): boolean {
+		return Object.values(record.promises).filter(s => s.type === 'approve').length >= this.superMajorityOf(record);
+	}
+
 	private async getTransactionPhase(record: ClusterRecord): Promise<PhaseResult> {
 		const peerCount = Object.keys(record.peers).length;
 		const promiseCount = Object.keys(record.promises).length;
 		const ourId = this.peerId.toString();
 
-		const superMajority = Math.ceil(peerCount * this.superMajorityThreshold);
+		const superMajority = this.superMajorityOf(record);
 		const maxAllowedRejections = peerCount - superMajority;
 
 		// Check for rejections — rejected if too many rejections to ever reach super-majority.
@@ -1404,13 +1440,50 @@ export class ClusterMember implements ICluster {
 			return { phase: TransactionPhase.ConflictSuperseded };
 		}
 
-		// Check if we need to vote. A lost race is answered with a conflict vote, not silence:
-		// absence used to mean both "unreachable" and "refusing in favour of a rival", and the
-		// coordinator could not tell the two apart. Once our conflict vote is merged into
+		// The commit vote is deliberately blind to what OUR own promise was, or whether we cast one: the
+		// rest of the cohort reaching super-majority is the commit rule (Theorem 1 Case 2), so a member
+		// that rejected, conflict-voted or never saw the promise round still signs the commit the cohort
+		// decided on rather than stalling it. A decided record cannot have met either threshold above: its
+		// approvals leave too few other votes to cross them.
+		//
+		// A member with no promise on a decided record signs WITHOUT adding one ({@link isDecided}): the
+		// commit signatures already collected cover the map as it is. An expired record included — the
+		// member used to add an expiry reject first and then sign, the same outcome. Nor does it cast a
+		// conflict vote, or clear a rival it would have beaten: what keeps a rival out is quorum
+		// intersection (Theorem 9: no rival can assemble its own super-majority once this one has), NOT
+		// the reservation, which only orders *concurrently-pending* rivals. It skips pend validation and
+		// stale-loss counting too: the content was checked by the super-majority that decided it, and
+		// losing to a decided record is not a loss.
+		//
+		// NOTE: signing the commit drops this member's reservation on the record
+		// (`shouldPersist = false` in the caller), and the phase fixpoint means that happens on the FIRST
+		// delivery when the record already arrives at super-majority, with no promise vote at all. The
+		// safety argument is the quorum intersection above.
+		//
+		// The lost update this once predicted WAS observed (a pend admitted between a rival's
+		// pend-consensus and commit-consensus, then refused by every member's storage at apply and
+		// still reported to the writer as a success). Holding the reservation until `handleConsensus`
+		// would not have closed it — the loser was approved before the winner's apply had even
+		// reached most members — so the cure went elsewhere: `validatePendOperations` now rejects a
+		// pend whose blocks are held by a different unresolved STORAGE pending record (the durable
+		// reservation that spans pend-apply → commit/cancel), and the coordinator returns storage's
+		// retained apply verdict instead of fabricating success (`getExecutedPendResult`). Residual:
+		// a member that has not yet applied the rival's pend abstains from that vote, and only the
+		// coordinating node's own verdict is threaded back — see the handoff notes on
+		// `CoordinatorRepo.pend`.
+		const decided = this.isDecided(record);
+		if (decided && !record.commits[ourId]) {
+			return { phase: TransactionPhase.OurCommitNeeded };
+		}
+
+		// Check if we need to vote — on an undecided record only, so a member that signed a decided one
+		// without a promise does not add one on the next step. A lost race is answered with a conflict
+		// vote, not silence: absence used to mean both "unreachable" and "refusing in favour of a rival",
+		// and the coordinator could not tell the two apart. Once our conflict vote is merged into
 		// `promises`, this branch is skipped forever — a conflict vote is terminal for this record;
 		// a retry must be a fresh transaction (new messageHash), which `CoordinatorRepo.pend`
 		// already mints per call.
-		if (!record.promises[ourId]) {
+		if (!decided && !record.promises[ourId]) {
 			// Expiry is answered ahead of the race: an expired record can never win, and running
 			// `findConflict` on it could still clear a live rival's reservation it beats on the tie-breaks.
 			if (expiryOf(record)) {
@@ -1423,37 +1496,8 @@ export class ClusterMember implements ICluster {
 			return { phase: TransactionPhase.OurPromiseNeeded };
 		}
 
-		// Check if we have enough approved promises to proceed to commit. Deliberately blind to what
-		// OUR own vote was: the rest of the cohort reaching super-majority is the commit rule
-		// (Theorem 1 Case 2), so a member that rejected — or conflict-voted — still signs the commit
-		// the cohort decided on rather than stalling it. Only the rejection/superseded thresholds
-		// above can stop a record here, and both are checked first.
-		//
-		// NOTE: signing the commit drops this member's reservation on the record
-		// (`shouldPersist = false` in the caller), and the phase fixpoint means that can now happen on
-		// the FIRST delivery when the record already arrives at super-majority, rather than a
-		// round-trip later. The safety argument is quorum intersection (Theorem 9: no rival can
-		// assemble its own super-majority once this one has), NOT the reservation — the reservation
-		// only orders *concurrently-pending* rivals.
-		//
-		// The lost update this predicted WAS observed (a pend admitted between a rival's
-		// pend-consensus and commit-consensus, then refused by every member's storage at apply and
-		// still reported to the writer as a success). Holding the reservation until `handleConsensus`
-		// would not have closed it — the loser was approved before the winner's apply had even
-		// reached most members — so the cure went elsewhere: `validatePendOperations` now rejects a
-		// pend whose blocks are held by a different unresolved STORAGE pending record (the durable
-		// reservation that spans pend-apply → commit/cancel), and the coordinator returns storage's
-		// retained apply verdict instead of fabricating success (`getExecutedPendResult`). Residual:
-		// a member that has not yet applied the rival's pend abstains from that vote, and only the
-		// coordinating node's own verdict is threaded back — see the handoff notes on
-		// `CoordinatorRepo.pend`.
-		const approvedPromises = Object.values(record.promises).filter(s => s.type === 'approve');
-		if (approvedPromises.length >= superMajority && !record.commits[ourId]) {
-			return { phase: TransactionPhase.OurCommitNeeded };
-		}
-
 		// Check if still collecting promises
-		if (promiseCount < peerCount && approvedPromises.length < superMajority) {
+		if (promiseCount < peerCount && !decided) {
 			return { phase: TransactionPhase.Promising };
 		}
 

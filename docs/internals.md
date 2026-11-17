@@ -1158,16 +1158,38 @@ Three rules hold this together, each of which has a failure mode if dropped:
   the reputation accounting and the shortfall arithmetic see it exactly as they saw a failed local delivery
   before. Pinned by `packages/db-p2p/test/cluster-coordinator-promise-retry.spec.ts` ("does NOT retry the
   LOCAL cluster on a throw").
-- **The promise round keeps a commit signature only when it was signed over the final promise map.** Merging a
-  member's promises into a record that already carries commit signatures is the defect in backlog
-  `bug-a-late-promise-invalidates-the-commit-signatures-already-collected`: a commit signature covers the
-  promise map it was signed over, so a late promise invalidates it. The round therefore merges every answer's
-  promises first, and only then keeps a member's own commit signature from its answer, and only when that
-  answer's promise map equals the merged one exactly (`keepCommitsSignedOverMergedPromises`, compared by
-  `canonicalJson`) — at the default threshold, in a cohort of two. No promise is merged after the keep: it runs
-  only once this node's member's promise is in the map, so the pre-sign has none to add. Any other commit
-  signature is dropped, as every one used to be; one signed over a smaller map would fail every member's check
-  and get its signer penalized. Keep both orderings.
+- **A decided promise map is never extended, and a commit signature sits only in a record whose promise map is
+  exactly the one it was signed over.** A commit signature covers the whole promise map
+  (`computeClusterCommitHash` in `packages/db-core/src/cluster/membership.ts`), every member checks every
+  commit signature against the record it holds, and a `BlockCommitProof` projected from a member's record
+  carries that same map, so a promise added after anyone signed invalidates every commit on the record. A
+  record is *decided* when its approved promises reach super-majority, and both sides keep the rule:
+  - **The member** (`getTransactionPhase` and `ClusterMember.mergeSignatures` in
+    `packages/db-p2p/src/cluster/cluster-repo.ts`) never adds a promise to a decided record: one that missed
+    the promise round and is sent the commit round signs its commit without a promise, which is what the
+    commit vote's blindness to its own promise already allowed. Merging a held record with an incoming one
+    keeps a decided held map, adopts a decided incoming map over an undecided held one (dropping the member's
+    own unmerged promise), and otherwise unites the two; each side's commits are taken only when its map is
+    the one kept. Before this, a late member added its promise and signed over the extended map, the
+    coordinator merged that commit into a record without the promise, and every member refused the consensus
+    broadcast (`Invalid commit signature`), penalizing an honest member, while the retry timer re-sent the
+    same record; it is pinned by `packages/db-p2p/test/late-member-signs-over-the-decided-promise-map.spec.ts`.
+  - **The coordinator** takes a commit signature into its record only through
+    `keepCommitsSignedOverRecordPromises` in `packages/db-p2p/src/repo/cluster-coordinator.ts`: the answering
+    member's own entry, keyed by the peer asked, and only when the answer's promise map equals the record's
+    exactly (compared by `canonicalJson`). The promise round, the pre-sign, the commit round and the commit
+    retry all use it, and the promise round runs it after merging every answer's promises, so in a cohort of
+    two the other member's promise-round commit is kept and the pre-sign completes the majority. A dropped
+    signature is logged (`cluster-tx:commit-over-other-promise-map`) and its member stays owed the record:
+    short of a majority the commit retry keeps re-sending it, and once there is one the consensus broadcast
+    reaches it.
+  - **Mixed versions.** A member on an older build still adds its late promise; a newer coordinator drops its
+    commit instead of poisoning the broadcast, and the member applies when the broadcast reaches it. That
+    member's own stored proof may carry the extended map and so fail to verify — its own loss, not the
+    cohort's. A newer member under an older coordinator, which merges every commit it is answered with,
+    signs over the decided map, so the broadcast verifies before coordinators upgrade.
+  The signed-hash layout is unchanged: changing what `computeClusterCommitHash` covers would break every
+  stored proof and every mixed-version cohort. Keep both halves.
 - **It fixes the two coordinators' members, not the whole cohort.** A member that is neither coordinator still
   votes for whichever record reached it first, and its approval re-inflates that record to two against the
   newcomer's one, so from three members up the count comparison can decide again one layer out. Observed at

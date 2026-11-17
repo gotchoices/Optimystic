@@ -928,17 +928,23 @@ describe('ClusterCoordinator cohort-membership guard', function () {
 });
 
 /**
- * A member that votes as `ClusterMember` does on the points the promise-round commit rule depends on: it
- * adds its promise, and once the promise map it sees holds `superMajority` approvals it signs a commit over
- * that map (the signature names the map, so a test can see what it covers). Remembers every record it is sent.
+ * A member that votes as `ClusterMember` did before a decided promise map was frozen: it adds its promise —
+ * even to a record already at super-majority — and once the promise map it sees holds `superMajority`
+ * approvals it signs a commit over that map (the signature names the map, so a test can see what it
+ * covers). Remembers every record it is sent, and throws on any `refuses` accepts.
  */
 class SigningMember {
 	readonly received: ClusterRecord[] = [];
 
-	constructor(readonly peerIdStr: string, private readonly superMajority: number) {}
+	constructor(
+		readonly peerIdStr: string,
+		private readonly superMajority: number,
+		private readonly refuses: (record: ClusterRecord) => boolean = () => false
+	) {}
 
 	async update(record: ClusterRecord): Promise<ClusterRecord> {
 		this.received.push(structuredClone(record));
+		if (this.refuses(record)) throw new Error(`${this.peerIdStr} unreachable`);
 		const promises = { ...record.promises, [this.peerIdStr]: record.promises[this.peerIdStr] ?? { type: 'approve', signature: `psig-${this.peerIdStr}` } as Signature };
 		const signs = Object.keys(promises).length >= this.superMajority && record.commits[this.peerIdStr] === undefined;
 		const signedOver = Object.keys(promises).sort().join('+');
@@ -947,16 +953,18 @@ class SigningMember {
 	}
 }
 
-describe('ClusterCoordinator keeps a promise-round commit signature only when it covers the merged promises', function () {
+describe('ClusterCoordinator keeps a commit signature only when it covers the record\'s promises', function () {
 	/**
 	 * Run one transaction over `memberCount` signing members, the first of them this node's own, and return
-	 * the record this node's member was handed for its commit pre-sign, plus what each remote member was sent.
+	 * the record this node's member was handed for its commit pre-sign, what each remote member was sent, the
+	 * record the transaction ended with, and the members its commit retry still owes. `refuses` makes the
+	 * member at an index throw on the records it accepts.
 	 */
-	const run = async (memberCount: number, superMajorityThreshold: number) => {
+	const run = async (memberCount: number, superMajorityThreshold: number, refuses: Record<number, (record: ClusterRecord) => boolean> = {}) => {
 		const clock = new FakeScheduler();
 		const peerIds = await Promise.all(Array.from({ length: memberCount }, makePeerId));
 		const superMajority = Math.ceil(memberCount * superMajorityThreshold);
-		const members = new Map(peerIds.map(pid => [pid.toString(), new SigningMember(pid.toString(), superMajority)]));
+		const members = new Map(peerIds.map((pid, index) => [pid.toString(), new SigningMember(pid.toString(), superMajority, refuses[index])]));
 		const clusterPeers: ClusterPeers = Object.fromEntries(peerIds.map(pid =>
 			[pid.toString(), { multiaddrs: ['/ip4/127.0.0.1/tcp/8000'], publicKey: u8ToString(pid.publicKey!.raw, 'base64url') }]));
 		const keyNetwork: IKeyNetwork = {
@@ -972,10 +980,11 @@ describe('ClusterCoordinator keeps a promise-round commit signature only when it
 			undefined, undefined, undefined,
 			clockOpts(clock)
 		);
-		await coordinator.executeClusterTransaction('block-1' as BlockId, { operations: [{ get: { blockIds: ['block-1'] } }], expiration: clock.now + 30000 });
+		const { record } = await coordinator.executeClusterTransaction('block-1' as BlockId, { operations: [{ get: { blockIds: ['block-1'] } }], expiration: clock.now + 30000 });
 		const remote = peerIds.slice(1).map(pid => members.get(pid.toString())!);
+		const owed: Set<string> | undefined = (coordinator as any).transactions.get(record.messageHash)?.retry?.pendingPeers;
 		// The pre-vote is the local member's first call; the pre-sign its second.
-		return { presign: local.received[1]!, remote };
+		return { presign: local.received[1]!, remote, record, owed: [...owed ?? []], ids: peerIds.map(pid => pid.toString()) };
 	};
 
 	// The kept case — a two-member cohort, where no commit round runs — is pinned on a real mesh by
@@ -992,5 +1001,21 @@ describe('ClusterCoordinator keeps a promise-round commit signature only when it
 				expect(commit.signature, `${signer}'s commit on a record sent to a member covers that record's promises`).to.equal(`csig-over-${map}`);
 			}
 		}
+	});
+
+	it('drops a commit-round answer signed over a promise map with an extra entry, and owes that member the record', async () => {
+		// Four members at the default threshold (super-majority 3, commit majority 3). The last misses the
+		// promise round and, as a build before the decided map was frozen does, adds its own promise to the
+		// decided record it is sent in the commit round. The second fails the commit round, so the commits
+		// that remain fall short of a majority unless the late member's is taken.
+		const { record, owed, ids } = await run(4, 0.75, {
+			1: r => Object.keys(r.commits).length > 0,
+			3: r => Object.keys(r.commits).length === 0
+		});
+		const [self, failed, healthy, late] = ids as [string, string, string, string];
+
+		expect(Object.keys(record.promises), 'the decided map').to.have.members([self, failed, healthy]);
+		expect(Object.keys(record.commits), 'the late member\'s commit is not taken').to.have.members([self, healthy]);
+		expect(owed, 'the commit retry owes the late member the record, beside the member that failed').to.have.members([failed, late]);
 	});
 });

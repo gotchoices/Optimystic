@@ -131,10 +131,13 @@ enum TransactionPhase {
 ```
 
 Each delivery drives this machine to a **fixpoint**, not one step: `processUpdate` recomputes the
-phase after every vote it adds, so a record that arrives already carrying a super-majority is
-promised, committed, and applied in a single `update()` call. Only the vote-adding phases loop, and
-each strictly grows the record, so it terminates. Practical consequence for tests and callers: a
-member does not need a second delivery to advance a phase it could already have advanced.
+phase after every vote it adds, so a record whose own promise completes its super-majority is
+promised, committed, and applied in a single `update()` call, and one that arrives already carrying a
+super-majority is committed and applied in one — without a promise, since a decided record's promise
+map is never extended ([Phase 2](#phase-2-commit-execution-simple-majority-required)). Only the
+vote-adding phases loop, and each strictly grows the record, so it terminates. Practical consequence
+for tests and callers: a member does not need a second delivery to advance a phase it could already
+have advanced.
 
 ### Phase Flow Diagram
 
@@ -178,7 +181,7 @@ longer reach super-majority" — the writer retries as a fresh transaction.
 
 ### Phase 1: Promise Collection (Super-Majority Required)
 
-During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority.
+During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority. A member that first sees the record once it already holds that super-majority casts no promise at all and signs its commit instead (see the decided-map rule under [Phase 2](#phase-2-commit-execution-simple-majority-required)).
 
 A member answers with exactly one of four signed vote kinds (`Signature` in
 `packages/db-core/src/cluster/structs.ts`). Which one is decided in two places: `getTransactionPhase`
@@ -231,10 +234,10 @@ Two consequences worth keeping in mind when changing this phase. The pre-vote's 
 outcome for the round on **both** paths — a throw counts as that one invocation and is recorded in the round's
 summary (so the per-peer logging, reputation accounting and shortfall arithmetic see it), rather than putting
 the member back into the round for a second call; a local throw is a real fault, not the relayed stream reset
-the per-peer immediate retry exists for. And only `promises` is merged: merging a vote into a record that
-already carries commit signatures invalidates them (backlog
-`bug-a-late-promise-invalidates-the-commit-signatures-already-collected`), which the pre-vote cannot do
-because no commit signature exists before this round completes.
+the per-peer immediate retry exists for. And only `promises` is merged: a promise merged into a record that
+already carries commit signatures invalidates them (see the decided-map rule under
+[Phase 2](#phase-2-commit-execution-simple-majority-required)), which the pre-vote cannot do because no
+commit signature exists before this round completes.
 
 It fixes the two racing coordinators' members, not every member. A member that is neither coordinator still
 votes for whichever record reached it first, and its own approval re-inflates that record to two against the
@@ -320,13 +323,30 @@ signatures it verified, having signed its own only after seeing a super-majority
 the record simply arrives one round earlier than the broadcast would bring it. In a cohort of four or
 more the two commits are short of a majority and nobody applies on receipt.
 
+**A decided promise map is never extended.** A commit signature covers the record's whole promise map
+(`computeClusterCommitHash` in `packages/db-core/src/cluster/membership.ts`), and every member checks
+every commit signature against the record it holds, so once a record's approved promises reach
+super-majority — it is *decided* — one more promise would invalidate every commit already on it. A
+member therefore never adds a promise to a decided record: one that missed the promise round (its
+delivery failed, possible from four members up, where super-majority is reached without it) and is sent
+the commit round signs its commit without a promise (`getTransactionPhase` in
+`packages/db-p2p/src/cluster/cluster-repo.ts`), as blind to its own promise as the commit vote always
+was. When a member merges a record it holds with an incoming one (`ClusterMember.mergeSignatures`), a
+decided held map is kept, a decided incoming map replaces an undecided held one (the member's own
+unmerged promise included), two undecided maps are united, and each side's commit signatures are taken
+only when that side's map is the one kept. The coordinator applies the same rule when it collects
+answers: it takes each member's own commit signature, and only when the answer's promise map equals the
+record's exactly (`keepCommitsSignedOverRecordPromises` in
+`packages/db-p2p/src/repo/cluster-coordinator.ts`, used by the promise round, the pre-sign, the commit
+round and the commit retry). A signature over another map — from a member on a build that predates the
+rule, which still adds its late promise — is dropped and logged (`cluster-tx:commit-over-other-promise-map`),
+and that member stays owed the record like any member that has not committed.
+
 **In a cohort of two there is no commit round.** The other member, answering the promise round, already
 sees both approvals (the coordinator's pre-vote and its own) and signs its commit in the same answer.
-The coordinator keeps that signature when the answer's promise map equals the round's merged one — the
-map a commit signature covers — so its own member's pre-sign completes the majority and applies, and
-the other member is owed only the decision (`keepCommitsSignedOverMergedPromises` and
-`deliverDecidedWithoutCommitRound` in `packages/db-p2p/src/repo/cluster-coordinator.ts`). A commit
-signature signed over any other map is dropped, as every one from the promise round used to be.
+That signature covers the round's final map, so the coordinator keeps it, its own member's pre-sign
+completes the majority and applies, and the other member is owed only the decision
+(`deliverDecidedWithoutCommitRound` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
 
 Once the merged commits reach the majority, `broadcastMergedRecord` delivers the record to the
 coordinator's own member (awaited, unless it already applied) and then only to the remote members still

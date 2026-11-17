@@ -937,11 +937,11 @@ describe('ClusterMember', () => {
 
 	describe('phase fixpoint (2-member-must-answer-a-lost-conflict-race)', () => {
 		// A member whose promise the coordinator never collected (possible whenever super-majority is
-		// below full cohort size, e.g. 4 peers at 0.75 ⇒ 3) receives the commit-phase record, and used
-		// to stop after adding its promise: the record was then in OurCommitNeeded but nobody re-checked,
-		// so its commit waited for the coordinator's next broadcast retry. The phase loop must drive
-		// promise AND commit in the same delivery.
-		it('adds both promise and commit in one delivery when the record already has super-majority', async () => {
+		// below full cohort size, e.g. 4 peers at 0.75 ⇒ 3) receives the commit-phase record. Its commit
+		// must land in the SAME delivery, not wait for the coordinator's next broadcast retry — and it must
+		// not add its promise first: the record is decided, and the commit signatures already on it cover
+		// its promise map as it is (ticket a-decided-promise-map-is-never-extended).
+		it('signs its commit in one delivery, without adding a promise, when the record already has super-majority', async () => {
 			const peer2 = await makeKeyPair();
 			const peer3 = await makeKeyPair();
 			const peer4 = await makeKeyPair();
@@ -959,7 +959,7 @@ describe('ClusterMember', () => {
 			};
 
 			const result = await clusterMemberInstance.update(record);
-			expect(result.promises[ourId]!.type).to.equal('approve');
+			expect(result.promises, 'the decided promise map is not extended').to.deep.equal(record.promises);
 			expect(result.commits[ourId], 'commit must land in the SAME delivery, not the next retry').to.not.equal(undefined);
 			expect(result.commits[ourId]!.type).to.equal('approve');
 		});
