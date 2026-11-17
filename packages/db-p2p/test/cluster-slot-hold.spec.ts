@@ -17,6 +17,7 @@
  *  - a record that arrived already refused by another member counts without this member voting,
  *    and counts once however many times it is delivered;
  *  - a pend refused on one block keeps its hold on another;
+ *  - a holder whose pend was decided without this member consumes the hold when this member signs it;
  *  - no hold refusal ever feeds the stuck-reservation counter;
  *  - `slotHoldWindowMs: 0` counts, grants and checks nothing.
  */
@@ -141,6 +142,9 @@ interface Voter {
 	/** `pend` as a record the OTHER member has already refused as stale — terminal on arrival at a
 	 *  two-member cohort, so this member never votes on it. */
 	refusedElsewhere(pend: PendRequest): Promise<ClusterRecord>;
+	/** `pend` as a record of a four-member cohort whose three OTHER members already approved it, so it
+	 *  is decided (super-majority 3 of 4) before this member ever sees it. */
+	decidedElsewhere(pend: PendRequest): Promise<ClusterRecord>;
 	/** Deliver a prebuilt record and return this member's own vote on it, if it cast one. */
 	deliver(record: ClusterRecord): Promise<Signature | undefined>;
 	/** Move the member's clock forward. Seeded from real time, since only the hold and the
@@ -181,6 +185,17 @@ const memberOver = async (repo: IRepo, slotHoldWindowMs = WINDOW_MS): Promise<Vo
 			const reject: ClusterVote = { type: 'reject', rejectReason: 'stale revision: refused by the coordinating member' };
 			const signature = await other.privateKey.sign(clusterVoteSigningPayload(await promiseHashOf(record), reject));
 			record.promises[other.peerId.toString()] = { ...reject, signature: uint8ArrayToString(signature, 'base64url') };
+			return record;
+		},
+		async decidedElsewhere(pend) {
+			const others = await Promise.all([1, 2, 3].map(makeKeyPair));
+			const record = await makePendRecord(makeClusterPeers([self, ...others]), pend);
+			const approve: ClusterVote = { type: 'approve' };
+			const promiseHash = await promiseHashOf(record);
+			for (const signer of others) {
+				const signature = await signer.privateKey.sign(clusterVoteSigningPayload(promiseHash, approve));
+				record.promises[signer.peerId.toString()] = { ...approve, signature: uint8ArrayToString(signature, 'base64url') };
+			}
 			return record;
 		},
 		async deliver(record) {
@@ -374,6 +389,24 @@ describe('ClusterMember — a slot is held for a writer this member has refused 
 			const fresh = await voter.vote(pendOf(FRESH, 6, [BLOCK]));
 			expect(fresh.signature?.type, 'the first block is still held for the aged action').to.equal('held');
 			expect(fresh.signature).to.have.property('heldBy', AGED);
+		});
+	});
+
+	it('is consumed when this member signs the holder\'s pend decided without its promise', async () => {
+		// From four members up a pend reaches super-majority without one member, which is then sent the
+		// commit round and signs without promising (ticket a-decided-promise-map-is-never-extended) — so
+		// it never judges the pend against its holds, and the hold must be consumed on the signature.
+		await withVoter(async (voter, repo) => {
+			await loseStale(voter, AGED, SlotHoldAfterLosses);
+
+			const signed = await captureLog('cluster-member', async () => {
+				expect(await voter.deliver(await voter.decidedElsewhere(pendOf(AGED, 6))), 'no promise added').to.equal(undefined);
+			});
+			expect(linesWith(signed, CONSUMED).map(args => (args[1] as { blockId?: string }).blockId)).to.deep.equal([BLOCK]);
+
+			repo.state = { latest: { rev: 6, actionId: AGED } };
+			const fresh = await voter.vote(pendOf(FRESH, 7));
+			expect(fresh.signature?.type, 'the holder won its slot; nothing stands on the block').to.equal('approve');
 		});
 	});
 

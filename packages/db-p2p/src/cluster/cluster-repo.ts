@@ -964,6 +964,9 @@ export class ClusterMember implements ICluster {
 					log('cluster-member:action-commit', {
 						messageHash: record.messageHash
 					});
+					if (!currentRecord.promises[ourId]) {
+						this.consumeOwnSlotHoldsOfDecided(currentRecord);
+					}
 					currentRecord = await this.handleCommitNeeded(currentRecord);
 					log('cluster-member:action-commit-complete', {
 						messageHash: record.messageHash,
@@ -1453,7 +1456,12 @@ export class ClusterMember implements ICluster {
 		// intersection (Theorem 9: no rival can assemble its own super-majority once this one has), NOT
 		// the reservation, which only orders *concurrently-pending* rivals. It skips pend validation and
 		// stale-loss counting too: the content was checked by the super-majority that decided it, and
-		// losing to a decided record is not a loss.
+		// losing to a decided record is not a loss. The one piece of pend validation it still owes is the
+		// consumption of the action's own slot hold, which the caller does (`consumeOwnSlotHoldsOfDecided`).
+		// NOTE: a rival this member already approved and holds is not cleared either, so it lingers until the
+		// `CONFLICT_STALE_THRESHOLD_MS` sweep and can draw a conflict vote against that rival's retry
+		// meanwhile (one vote, not the write, from four members up); if such votes show up in logs, clear
+		// the held records that conflict with a decided record when this member signs it.
 		//
 		// NOTE: signing the commit drops this member's reservation on the record
 		// (`shouldPersist = false` in the caller), and the phase fixpoint means that happens on the FIRST
@@ -2361,10 +2369,33 @@ export class ClusterMember implements ICluster {
 			};
 		}
 		for (const blockId of own) {
-			this.slotHolds.delete(blockId);
-			log('cluster-member:slot-hold-consumed', { messageHash: record.messageHash, blockId, actionId: pendRequest.actionId });
+			this.consumeSlotHold(record, blockId, pendRequest.actionId);
 		}
 		return undefined;
+	}
+
+	/**
+	 * Consume the slot holds a decided pend record's own actions hold here. A member that signs a decided
+	 * record without promising on it ({@link getTransactionPhase}) never runs {@link judgeSlotHolds}, so
+	 * without this the hold would go on answering rivals `held` for the rest of its window after its
+	 * holder had already won the slot.
+	 */
+	private consumeOwnSlotHoldsOfDecided(record: ClusterRecord): void {
+		if (this.slotHoldWindowMs === 0) return;
+		for (const operation of record.message.operations) {
+			if (!('pend' in operation)) continue;
+			const { actionId } = operation.pend;
+			for (const blockId of blockIdsForTransforms(operation.pend.transforms)) {
+				if (this.slotHolds.peek(blockId)?.actionId === actionId) {
+					this.consumeSlotHold(record, blockId, actionId);
+				}
+			}
+		}
+	}
+
+	private consumeSlotHold(record: ClusterRecord, blockId: BlockId, actionId: ActionId): void {
+		this.slotHolds.delete(blockId);
+		log('cluster-member:slot-hold-consumed', { messageHash: record.messageHash, blockId, actionId });
 	}
 
 	/**

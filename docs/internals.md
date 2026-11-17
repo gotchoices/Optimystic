@@ -2310,7 +2310,9 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   block that pend named for the action, in memory, for `slotHoldWindowMs` (`ClusterConsensusConfig`;
   default 3 s, `0` disables), and answers every other action's pend of the block with the same `held`
   vote until the action's own pend consumes the hold or the window lapses (`noteStaleLoss` and
-  `judgeSlotHolds` in `packages/db-p2p/src/cluster/cluster-repo.ts`). It closes the sequential
+  `judgeSlotHolds` in `packages/db-p2p/src/cluster/cluster-repo.ts`). A member that signs the
+  action's pend decided without it, having cast no promise on it, consumes the hold then
+  (`consumeOwnSlotHoldsOfDecided`, same file). It closes the sequential
   starvation the aged priority cannot reach — rivals that commit and leave before the slow writer's
   pend arrives never meet it in `resolveRace` — see
   [correctness.md Theorem 9](correctness.md#theorem-9-progress-under-contention). A member counts
