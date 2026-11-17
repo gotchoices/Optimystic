@@ -352,7 +352,7 @@ export interface RelayReservationSupervisor {
 	readonly firstDrive: Promise<string | null>;
 	/** Whether the node currently advertises a circuit address through this relay. Read live. */
 	readonly held: boolean;
-	/** True while a drive is in flight. */
+	/** True while a drive or a renewal is in flight. */
 	readonly driving: boolean;
 	/** Epoch ms of the next scheduled check or retry; `null` while driving or once stopped. */
 	readonly retryAtMs: number | null;
@@ -360,7 +360,8 @@ export interface RelayReservationSupervisor {
 	readonly lastError: string | null;
 	/**
 	 * Idempotent. Clears the pending timer, removes both event listeners, aborts an in-flight dial,
-	 * and discards the result of an in-flight reservation request without starting anything after it.
+	 * and discards the result of an in-flight reservation request or renewal without starting anything
+	 * after it.
 	 */
 	stop(): void;
 }
@@ -645,6 +646,8 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 		clearRelayFilterEntry(transport.reservationStore, this.relayPeerId);
 		const outcome = await raceDeadline(forceReservationRenewal(transport.reservationStore, this.relayPeerId), deadline);
 		if (outcome === DEADLINE_PASSED) {
+			// NOTE: libp2p's refresh keeps running with the address still advertised; if it later fails,
+			// libp2p withdraws the address and that `self:peer:update` wakes a drive. Reasoned, not tested.
 			return `the renewal request did not complete within ${this.driveTimeoutMs}ms`;
 		}
 		return outcome;
