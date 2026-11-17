@@ -140,21 +140,17 @@ describe('ALTER TABLE on an Optimystic table', function () {
 			.to.include(`Module for table 't' does not support ALTER TABLE ADD COLUMN`);
 	});
 
-	it('RENAME COLUMN still renames for the session, schema-only, and still is not saved', async () => {
-		// Unchanged from the engine's schema-only fallback — including that a restart undoes it
-		// (tickets/backlog/bug-optimystic-rename-column-lost-on-restart). This pins today's
-		// behaviour so the hook changes nothing; that ticket owns changing it.
-		const store = buildSharedLocalTransactor(new MemoryRawStorage());
-		const { db } = await openSession(store);
+	it('refuses RENAME COLUMN, changing nothing', async () => {
+		// A row is stored keyed by column name, so the instance cannot take the new name, and Quereus
+		// refuses every later statement whose connected instance disagrees with the catalog entry.
+		const { db } = await openSession(buildSharedLocalTransactor(new MemoryRawStorage()));
 		await db.exec(TABLES);
+		const before = db.schemaManager.findTable('t', 'main');
 
-		await db.exec('alter table main.t rename column c to cc');
-		expect(db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'cc']);
-		expect(await queryAll(db, 'select id, cc from main.t')).to.deep.equal([{ id: 1, cc: 'x' }]);
-
-		const restarted = await openSession(store);
-		await restarted.plugin.hydrate(restarted.db);
-		expect(restarted.db.schemaManager.findTable('t', 'main')!.columns.map(col => col.name)).to.deep.equal(['id', 'a', 'c']);
+		expect(await captureThrowMessage(() => db.exec('alter table main.t rename column c to cc')))
+			.to.include(`Module for table 't' does not support ALTER TABLE RENAME COLUMN`);
+		expect(db.schemaManager.findTable('t', 'main')).to.equal(before);
+		expect(await queryAll(db, 'select id, c from main.t')).to.deep.equal([{ id: 1, c: 'x' }]);
 	});
 
 	it('ADD CONSTRAINT CHECK is enforced at once and survives a restart that only hydrates', async () => {
@@ -198,13 +194,13 @@ describe('ALTER TABLE on an Optimystic table', function () {
 
 		await db.exec('alter table main.t add check (a <> 13)');
 		const named = db.schemaManager.findTable('t', 'main')!.checkConstraints.map(check => check.name);
-		expect(named).to.deep.equal(['pos', 'check_1']);
+		expect(named).to.deep.equal(['pos', '_check_1']);
 
 		const restarted = await openSession(store);
 		await restarted.plugin.hydrate(restarted.db);
 		expect(restarted.db.schemaManager.findTable('t', 'main')!.checkConstraints.map(check => check.name))
-			.to.have.members(['pos', 'check_1']);
-		expect(await captureThrowMessage(() => restarted.db.exec('insert into main.t (id, a) values (4, 13)'))).to.include('check_1');
+			.to.have.members(['pos', '_check_1']);
+		expect(await captureThrowMessage(() => restarted.db.exec('insert into main.t (id, a) values (4, 13)'))).to.include('_check_1');
 	});
 
 	it('DROP and ADD CHECK on a hydrated table no statement has touched yet are saved, and the table then works', async () => {

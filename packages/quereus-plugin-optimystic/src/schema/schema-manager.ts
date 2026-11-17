@@ -10,7 +10,8 @@
 import type { Tree } from '@optimystic/db-core';
 import { structuralEquals } from '@optimystic/db-core';
 import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSchema, ConflictResolution, ForeignKeyConstraintSchema, SqlValue } from '@quereus/quereus';
-import { buildColumnIndexMap, compilePredicate, getTypeOrDefault, inferType } from '@quereus/quereus';
+import { QuereusError, StatusCode, buildColumnIndexMap, compilePredicate, getType, inferType } from '@quereus/quereus';
+import type { LogicalType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
@@ -746,6 +747,21 @@ export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
 }
 
 /**
+ * The registered logical type a catalog record names by its canonical name (`LogicalType.name`, as
+ * {@link columnSchemaToStored} wrote it). A name this process has not registered is refused, naming
+ * it, as Quereus refuses its own catalog's unregistered types: read as BLOB instead, the column's
+ * row codec and storage-adoption guard would key on a type it was never written under.
+ */
+function registeredStoredType(name: string, subject: string): LogicalType {
+	const type = getType(name);
+	if (type) return type;
+	throw new QuereusError(
+		`Unknown type '${name}' for ${subject} in a stored table description: register the type (Database.registerType) before opening the table`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
  * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The logical type
  * is re-inferred from the declared spelling by the same rule CREATE TABLE uses (`inferType`),
  * falling back to the stored canonical name for a column declared without a type. Also used by
@@ -756,7 +772,9 @@ export function columnSchemaToStored(col: ColumnSchema): StoredColumnSchema {
 export function storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
 	return {
 		name: col.name,
-		logicalType: col.declaredType !== undefined ? inferType(col.declaredType) : getTypeOrDefault(col.affinity),
+		logicalType: col.declaredType !== undefined
+			? inferType(col.declaredType)
+			: registeredStoredType(col.affinity, `column '${col.name}'`),
 		declaredType: col.declaredType,
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,
@@ -1754,7 +1772,7 @@ export class SchemaManager {
 	private storedToMutationContextVar(variable: StoredMutationContextVar): MutationContextDefinition {
 		return {
 			name: variable.name,
-			logicalType: getTypeOrDefault(variable.type),
+			logicalType: registeredStoredType(variable.type, `mutation context variable '${variable.name}'`),
 			notNull: variable.notNull,
 		};
 	}

@@ -622,27 +622,6 @@ function withoutColumnAt(schema: TableSchema, position: number): TableSchema {
 }
 
 /**
- * Quereus's schema-only RENAME COLUMN, reproduced unchanged — the fallback its ALTER TABLE
- * RENAME COLUMN arm runs for a module without an `alterTable` hook: the column renamed in the
- * catalog entry, nothing written. The engine has already checked that `oldName` exists and
- * `newName` is free.
- *
- * NOTE: the rename never reaches the catalog record, so a restart that only hydrates brings the
- * old name back (tickets/backlog/bug-optimystic-rename-column-lost-on-restart). Kept exactly as
- * the engine did it so that implementing `alterTable` changed no rename behaviour; that ticket
- * owns persisting the rename or refusing it.
- */
-function renameColumnSchemaOnly(tableSchema: TableSchema, oldName: string, newName: string): TableSchema {
-  const colIndex = tableSchema.columnIndexMap.get(oldName.toLowerCase());
-  const columns = tableSchema.columns.map((col, i) => (i === colIndex ? { ...col, name: newName } : col));
-  return {
-    ...tableSchema,
-    columns: Object.freeze(columns),
-    columnIndexMap: buildColumnIndexMap(columns),
-  };
-}
-
-/**
  * The transactor a table runs on when it names none: the plugin config's `default_transactor`,
  * else `'network'`. `register` chooses the module's cost profile from the same answer, so a
  * table's binding and the planner's view of its read cost cannot pick different defaults.
@@ -6457,10 +6436,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * restarted machine that only hydrates gets the old table back.
    *
    * Having the hook takes every other arm off Quereus's path for modules without one, so each
-   * answers here as it did there: RENAME COLUMN renames schema-only
-   * ({@link renameColumnSchemaOnly}); the rest — DROP CONSTRAINT of a UNIQUE or FOREIGN KEY, and
-   * the column shapes the two column arms do not accept, included — are refused as UNSUPPORTED in
-   * Quereus's own words. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes
+   * answers here as it did there, refused as UNSUPPORTED in Quereus's own words — DROP CONSTRAINT
+   * of a UNIQUE or FOREIGN KEY, and the column shapes the two column arms do not accept, included.
+   * RENAME COLUMN is refused too: a row is stored keyed by its column names, so this instance must
+   * keep the stored names, and Quereus refuses every later statement on a module with this hook
+   * whose instance reports names its catalog entry does not (`assertCatalogMatchesModule` in
+   * `@quereus/quereus/src/runtime/stale-catalog-guard.ts`). A rename that is saved is backlog
+   * `feat-optimystic-rename-column`. ALTER PRIMARY KEY's final refusal is still Quereus's: it takes
    * UNSUPPORTED from here as "fall back to a rebuild", which it then refuses because this module
    * has no `renameTable`.
    *
@@ -6473,7 +6455,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    *
    * NOTE: Quereus's materialized-view reshape paths also call this hook, but only for a module
    * with `getBackingHost`, which this one lacks. If it ever gains it, those reshapes get these
-   * refusals mid-sequence and the unsaved RENAME COLUMN — revisit the arms then.
+   * refusals mid-sequence — revisit the arms then.
    *
    * Returns the engine's catalog entry with the change applied, built as the engine's own
    * fallbacks built it. Emits no schema-change event: this module has no emitter, so Quereus
@@ -6500,7 +6482,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
           ? await this.addCheckConstraint(tableSchema, change.constraint)
           : refuse('ADD CONSTRAINT');
       case 'renameColumn':
-        return renameColumnSchemaOnly(tableSchema, change.oldName, change.newName);
+        return refuse('ALTER TABLE RENAME COLUMN');
       case 'addColumn':
         return await this.addColumn(db, tableSchema, change, refuse);
       case 'dropColumn':
