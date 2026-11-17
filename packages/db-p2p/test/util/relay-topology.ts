@@ -27,7 +27,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { webSockets } from '@libp2p/websockets';
 import { tcp } from '@libp2p/tcp';
 import { identify } from '@libp2p/identify';
-import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2';
+import { circuitRelayServer, circuitRelayTransport, type CircuitRelayService } from '@libp2p/circuit-relay-v2';
 import { multiaddr, type Multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode, type Libp2pTransports } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
@@ -140,6 +140,15 @@ export async function spawnPlainRelayNode(network: string, opts: SpawnPlainRelay
 			})
 		}
 	}) as unknown as Libp2p;
+}
+
+/**
+ * The circuit-relay server of a {@link spawnPlainRelayNode} relay. Its `reservations` map is public on
+ * `CircuitRelayService`; deleting a client from it makes the relay forget that client's reservation
+ * while the connection to it stays open.
+ */
+export function relayServiceOf(relay: Libp2p): CircuitRelayService {
+	return (relay as unknown as Libp2p<{ relay: CircuitRelayService }>).services.relay;
 }
 
 /**

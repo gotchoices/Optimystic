@@ -24,7 +24,11 @@
  *    asks the circuit-relay transport's reservation store for a `discovered` slot on it, waits
  *    until the node advertises a circuit address through it, and repeats that whenever the address
  *    goes away. "Held" is judged per relay ({@link routesThroughRelay}), so one relay's slot never
- *    satisfies another relay's supervisor.
+ *    satisfies another relay's supervisor. It is also judged locally, from the addresses this node
+ *    advertises, which say nothing about whether the relay still keeps the slot: a relay can forget
+ *    a reservation while the connection to it stays open, and then nobody can reach the node through
+ *    it. So while held, the supervisor re-sends the reservation request every `renewMs` (5 min by
+ *    default, {@link forceReservationRenewal}); that renewal is what checks "held" against the relay.
  *
  * `createLibp2pNodeBase` applies the plan before building libp2p's options, starts the supervisors
  * first thing after `node.start()`, and awaits their first drives so a relay that cannot be
@@ -136,6 +140,12 @@ export interface RelayFilterLike {
 export interface RelayReservationStoreLike {
 	addRelay(peerId: PeerId, type: 'discovered' | 'configured'): Promise<unknown>;
 	hasReservation(peerId: PeerId): boolean;
+	/**
+	 * The relay's grant for the reservation this store holds on `peerId`. The live object the store
+	 * keeps, not a copy: {@link forceReservationRenewal} writes `expire` on it. `expire` is the relay's
+	 * expiry in Unix seconds.
+	 */
+	getReservation(peerId: PeerId): { expire: bigint } | undefined;
 	relayFilter?: RelayFilterLike;
 }
 
@@ -152,17 +162,36 @@ export interface CircuitRelayTransportLike {
  * which must fail loudly if an upgrade moves any of it. There is no public route: the `Libp2p`
  * interface has no `listen`, and nothing public exposes the reservation store. `node.components`
  * is a real public field on libp2p's node class, just not on the interface; `transportManager`
- * is a component; the circuit-relay transport is the one whose `reservationStore` has `addRelay`
- * and `hasReservation`. What the store does on 4.2.13, read from
+ * is a component; the circuit-relay transport is the one whose `reservationStore` has `addRelay`,
+ * `hasReservation` and `getReservation`. What the store does on 4.2.13, read from
  * `node_modules/@libp2p/circuit-relay-v2/src/transport/`: `listener.ts` publishes a `configured`
  * reservation from inside `listen()`, and on `relay:created-reservation` only when it is for the
  * relay that listener already published (a bare listener that has published nothing ignores it),
- * while a bare listener publishes any `discovered` reservation carrying its pending id; and
- * `reservation-store.ts` drops a reservation on `connection:close`, re-queues the pending id only
- * for `discovered` ones, renews a reservation in place while its relay connection is still open
- * (4.1.3 removed and re-created it), and adds a relay whose request failed with `DialError` or
+ * while a bare listener publishes any `discovered` reservation carrying its pending id, and
+ * re-confirms its addresses on a later event for the relay it holds; and `reservation-store.ts`
+ * drops a reservation on `connection:close`, re-queues the pending id only for `discovered` ones,
+ * renews a reservation in place while its relay connection is still open (4.1.3 removed and
+ * re-created it), and adds a relay whose request failed with `DialError` or
  * `UnsupportedProtocolError` to the private `relayFilter`, refusing it afterwards with "The relay
  * was previously invalid" until the filter is reset.
+ *
+ * Renewal ({@link forceReservationRenewal}) rests on two more facts of `addRelay` there. A plain
+ * `addRelay` on a reservation that is held, whose connection is still open, and that expires more
+ * than its `REFRESH_WINDOW` (10 min) from now returns that reservation WITHOUT contacting the
+ * relay, so it cannot repair a relay that forgot the reservation. Anything else refreshes in place:
+ * a fresh RESERVE over the open connection, the address kept advertised meanwhile, the entry's slot
+ * id reused, libp2p's own refresh timer re-armed, the keep-alive tag renewed, and
+ * `relay:created-reservation` dispatched; if that RESERVE fails, the `catch` removes the entry,
+ * which withdraws the address. Zeroing `expire` on the held reservation is the only route into
+ * that refresh, and it mutates a libp2p-owned object: `expire` is read only by the refresh-window
+ * check, a successful refresh replaces the entry with the relay's new expiry, and if `addRelay`
+ * throws before its job runs (`RelayQueueFullError`, or the relay filter) the zero stays, which
+ * only means the next request refreshes too. On the relay side (`src/server/reservation-store.ts`,
+ * `reserve`), a RESERVE from a peer that holds a reservation resets its lifetime and one from a
+ * peer it forgot creates a new one, so any RESERVE that reaches the relay repairs it. The supervisor
+ * only ever holds `discovered` reservations on its relays (the plan leaves no `configured`
+ * listener on them), so renewing as `discovered` reuses the entry's slot id and never meets
+ * `HadEnoughRelaysError`, whose pending-slot check an existing entry skips.
  */
 export function findCircuitRelayTransport(node: Libp2p): CircuitRelayTransportLike | null {
 	for (const transport of nodeTransports(node)) {
@@ -200,7 +229,9 @@ function nodeTransports(node: Libp2p): readonly unknown[] {
 function isReservationStore(value: unknown): value is RelayReservationStoreLike {
 	if (typeof value !== 'object' || value === null) return false;
 	const store = value as Partial<RelayReservationStoreLike>;
-	return typeof store.addRelay === 'function' && typeof store.hasReservation === 'function';
+	return typeof store.addRelay === 'function'
+		&& typeof store.hasReservation === 'function'
+		&& typeof store.getReservation === 'function';
 }
 
 /**
@@ -251,6 +282,29 @@ export function clearRelayFilterEntry(store: RelayReservationStoreLike, relayPee
 	}
 }
 
+/**
+ * Re-send the request for the reservation the store holds on `relayPeerId`, over the connection it
+ * was made on, so a relay that forgot it holds it again. A plain `addRelay` would not reach the
+ * relay at all (see the `NOTE:` at {@link findCircuitRelayTransport}), so this first marks the held
+ * reservation as expired. The address stays advertised throughout; if the relay refuses, libp2p
+ * removes the reservation and withdraws the address, which is the truth then.
+ *
+ * Never throws. Resolves `null` once the store renewed the reservation, otherwise the reason it
+ * did not — including that the store holds no reservation on the relay, in which case nothing is
+ * requested. Takes no signal, as `addRelay` does not; a caller with a deadline races it.
+ */
+export async function forceReservationRenewal(store: RelayReservationStoreLike, relayPeerId: PeerId): Promise<string | null> {
+	try {
+		const held = store.getReservation(relayPeerId);
+		if (held === undefined) return 'the store holds no reservation on the relay to renew';
+		held.expire = 0n;
+		await store.addRelay(relayPeerId, 'discovered');
+		return null;
+	} catch (err) {
+		return `the renewal request failed: ${errorMessage(err)}`;
+	}
+}
+
 /** Deadline for one drive: dial, reservation request and the wait for the address share it. */
 export const DEFAULT_RELAY_DRIVE_TIMEOUT_MS = 10_000;
 /** Gap between liveness checks while the reservation is held; a fallback in case an event is missed. */
@@ -264,9 +318,17 @@ export const DEFAULT_RELAY_MIN_BACKOFF_MS = 1_000;
 export const DEFAULT_RELAY_MAX_BACKOFF_MS = 30_000;
 /** How often a drive re-reads the address list while waiting for the address to be published. */
 export const DEFAULT_RELAY_POLL_MS = 100;
+/**
+ * Gap between renewals of a held reservation. It bounds how long a relay that forgot the
+ * reservation leaves the node unreachable; the cost is one RESERVE stream per supervised relay per
+ * interval, far inside the relay's default two-hour reservation lifetime.
+ */
+export const DEFAULT_RELAY_RENEW_MS = 5 * 60_000;
+/** Each renewal interval is `renewMs` ± this fraction, so many nodes on one relay do not renew in step. */
+export const RELAY_RENEW_JITTER = 0.1;
 
 export interface RelayReservationSupervisorOptions {
-	/** Default {@link DEFAULT_RELAY_DRIVE_TIMEOUT_MS}. */
+	/** Default {@link DEFAULT_RELAY_DRIVE_TIMEOUT_MS}. Also bounds one renewal. */
 	driveTimeoutMs?: number;
 	/** Default {@link DEFAULT_RELAY_CHECK_MS}. */
 	checkMs?: number;
@@ -276,6 +338,8 @@ export interface RelayReservationSupervisorOptions {
 	maxBackoffMs?: number;
 	/** Default {@link DEFAULT_RELAY_POLL_MS}. */
 	pollMs?: number;
+	/** Default {@link DEFAULT_RELAY_RENEW_MS}; each interval is jittered by {@link RELAY_RENEW_JITTER}. */
+	renewMs?: number;
 }
 
 /** A running supervisor for one node and one relay. Obtained from {@link superviseRelayReservation}. */
@@ -308,8 +372,16 @@ export interface RelayReservationSupervisor {
  * added addresses); `peer:connect` for this relay (a dial by anything on this node reconnected it,
  * which turns a partner's dial through the relay into an immediate re-reserve, and resets the
  * backoff); a liveness poll every `checkMs` while held; and a doubling backoff from `minBackoffMs`
- * to `maxBackoffMs` after a failed drive. Drives are serialized per relay: a trigger that arrives
- * mid-drive does nothing by itself, because every drive ends with the same re-check and reschedule.
+ * to `maxBackoffMs` after a failed drive. Drives and renewals are serialized per relay: a trigger
+ * that arrives mid-drive does nothing by itself, because every drive ends with the same re-check
+ * and reschedule.
+ *
+ * "Held" is judged locally, from the addresses the node advertises, and a relay can forget a
+ * reservation while the connection to it stays open. So while held, the supervisor also renews the
+ * reservation every `renewMs`, jittered ({@link forceReservationRenewal}): the renewal is what
+ * checks "held" against the relay. The renewal clock starts when a drive lands the reservation or a
+ * tick first finds it held, and restarts after every renewal. A renewal the relay refuses withdraws
+ * the address, and the supervisor drives again at once rather than after a backoff.
  *
  * `HadEnoughRelaysError` from the reservation store means this node's pending slot was already
  * filled with a reservation on a different relay (libp2p's relay discovery, see the accepted
@@ -369,6 +441,27 @@ function delay(ms: number): Promise<void> {
 	});
 }
 
+/**
+ * Settle with `work`'s outcome, or with {@link DEADLINE_PASSED} at `deadline`, whichever is first.
+ * For work that takes no signal: the abandoned promise stays handled — `Promise.race` attaches
+ * handlers to it — and its later outcome is ignored.
+ */
+async function raceDeadline<T>(work: Promise<T>, deadline: number): Promise<T | typeof DEADLINE_PASSED> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const expired = new Promise<typeof DEADLINE_PASSED>(resolve => {
+		timer = setTimeout(() => resolve(DEADLINE_PASSED), remaining(deadline));
+		unrefTimer(timer);
+	});
+	try {
+		return await Promise.race([work, expired]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+/** `ms` scaled by a uniform factor in `1 ± jitter`. */
+const jittered = (ms: number, jitter: number): number => ms * (1 + (Math.random() * 2 - 1) * jitter);
+
 /** The self-rescheduling loop behind {@link superviseRelayReservation}. */
 class RelayReservationLoop implements RelayReservationSupervisor {
 	readonly firstDrive: Promise<string | null>;
@@ -379,11 +472,14 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 	private readonly minBackoffMs: number;
 	private readonly maxBackoffMs: number;
 	private readonly pollMs: number;
+	private readonly renewMs: number;
 	private backoffMs: number;
 	private timer: ReturnType<typeof setTimeout> | null = null;
 	private stopped = false;
 	private inFlight = false;
 	private nextTickAtMs: number | null = null;
+	/** When the held reservation is next renewed; `null` while none is held. */
+	private nextRenewAtMs: number | null = null;
 	private failure: string | null = null;
 	private dialAbort: AbortController | null = null;
 	private slotTakenLogged = false;
@@ -402,6 +498,7 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 		this.minBackoffMs = Math.max(1, opts.minBackoffMs ?? DEFAULT_RELAY_MIN_BACKOFF_MS);
 		this.maxBackoffMs = Math.max(this.minBackoffMs, opts.maxBackoffMs ?? DEFAULT_RELAY_MAX_BACKOFF_MS);
 		this.pollMs = Math.max(1, opts.pollMs ?? DEFAULT_RELAY_POLL_MS);
+		this.renewMs = Math.max(1, opts.renewMs ?? DEFAULT_RELAY_RENEW_MS);
 		this.backoffMs = this.minBackoffMs;
 		this.firstDrive = new Promise(resolve => {
 			this.settleFirstDrive = resolve;
@@ -462,10 +559,29 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 	private async tick(trigger: string): Promise<void> {
 		if (this.stopped || this.inFlight) return;
 		this.nextTickAtMs = null;
+		if (!this.held) {
+			await this.driveAndSettle(trigger);
+			return;
+		}
+		if (!this.renewalDue()) {
+			this.onHeld();
+			return;
+		}
+		await this.renewOnce();
+		// A trigger that ran in the gap after the renewal already re-checked and owns the loop now.
+		if (this.stopped || this.inFlight) return;
 		if (this.held) {
 			this.onHeld();
 			return;
 		}
+		// The relay refused the renewal and libp2p withdrew the address. The refusal is already the
+		// evidence a backoff would wait for, so ask again at once.
+		await this.driveAndSettle('renew-failed');
+	}
+
+	private async driveAndSettle(trigger: string): Promise<void> {
+		// Whatever this drive lands is a fresh reservation, whose renewal clock starts when it lands.
+		this.nextRenewAtMs = null;
 		await this.driveOnce(trigger);
 		if (this.stopped) return;
 		// A drive that landed the reservation resumes the healthy cadence at once; backing off here
@@ -477,14 +593,61 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 		this.scheduleBackoff();
 	}
 
-	/** Healthy tick: nothing to request, so only reset and re-check later. */
+	/** Healthy tick: nothing to request, so only reset and re-check later, or renew when that is sooner. */
 	private onHeld(): void {
 		this.backoffMs = this.minBackoffMs;
 		this.failure = null;
 		// Once held, a later slot-taken episode is a new event and deserves its own log line.
 		this.slotTakenLogged = false;
 		this.settleFirst(null);
-		this.schedule(this.checkMs);
+		const renewAtMs = this.nextRenewAtMs ?? this.armRenewal();
+		this.schedule(Math.min(this.checkMs, Math.max(0, renewAtMs - Date.now())));
+	}
+
+	private renewalDue(): boolean {
+		return this.nextRenewAtMs !== null && Date.now() >= this.nextRenewAtMs;
+	}
+
+	/** Start the renewal clock over from now; returns when the next renewal is due. */
+	private armRenewal(): number {
+		const renewAtMs = Date.now() + jittered(this.renewMs, RELAY_RENEW_JITTER);
+		this.nextRenewAtMs = renewAtMs;
+		return renewAtMs;
+	}
+
+	/** One renewal, logged; the renewal clock restarts after it whatever the outcome. */
+	private async renewOnce(): Promise<void> {
+		this.inFlight = true;
+		try {
+			const reason = await this.renew();
+			if (this.stopped) return;
+			if (reason === null) {
+				log('relay-reservation:renewed relay=%s', this.relay.dialAddr);
+			} else {
+				log.error('relay-reservation:renew-failed relay=%s reason=%s', this.relay.dialAddr, reason);
+			}
+		} catch (err) {
+			// `renew` is fail-soft by contract; as in `driveOnce`, the loop survives it breaking.
+			log.error('relay-reservation:renew-failed relay=%s reason=%s', this.relay.dialAddr, errorMessage(err));
+		} finally {
+			this.inFlight = false;
+			if (!this.stopped) this.armRenewal();
+		}
+	}
+
+	/** One renewal under one deadline. Never throws; returns `null` when the store renewed the reservation. */
+	private async renew(): Promise<string | null> {
+		const transport = findCircuitRelayTransport(this.node);
+		if (transport === null) {
+			return 'the node has no circuit-relay transport — add circuitRelayTransport() to transports';
+		}
+		const deadline = Date.now() + this.driveTimeoutMs;
+		clearRelayFilterEntry(transport.reservationStore, this.relayPeerId);
+		const outcome = await raceDeadline(forceReservationRenewal(transport.reservationStore, this.relayPeerId), deadline);
+		if (outcome === DEADLINE_PASSED) {
+			return `the renewal request did not complete within ${this.driveTimeoutMs}ms`;
+		}
+		return outcome;
 	}
 
 	private async driveOnce(trigger: string): Promise<void> {
@@ -554,24 +717,17 @@ class RelayReservationLoop implements RelayReservationSupervisor {
 	 * `addRelay` takes no signal. `'discovered'`, never `'configured'`: only a `discovered`
 	 * reservation is published by the bare listener the plan gave libp2p. A concurrent `addRelay`
 	 * for the same relay from libp2p's own discovery joins the same queue job, so there is no
-	 * double reservation. The abandoned promise stays handled — `Promise.race` attaches handlers.
+	 * double reservation.
 	 */
 	private async requestReservation(store: RelayReservationStoreLike, deadline: number): Promise<string | null> {
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const expired = new Promise<typeof DEADLINE_PASSED>(resolve => {
-			timer = setTimeout(() => resolve(DEADLINE_PASSED), remaining(deadline));
-			unrefTimer(timer);
-		});
 		try {
-			const outcome = await Promise.race([store.addRelay(this.relayPeerId, 'discovered'), expired]);
+			const outcome = await raceDeadline(store.addRelay(this.relayPeerId, 'discovered'), deadline);
 			if (outcome === DEADLINE_PASSED) {
 				return `reservation request to relay ${this.relay.dialAddr} did not complete within ${this.driveTimeoutMs}ms`;
 			}
 			return null;
 		} catch (err) {
 			return this.describeReservationFailure(err);
-		} finally {
-			clearTimeout(timer);
 		}
 	}
 

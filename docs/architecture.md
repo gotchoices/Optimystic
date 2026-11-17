@@ -261,8 +261,9 @@ end up holding the first one's data locally, both write, one is away for a while
 The two-phone pairing gets the same treatment with every byte between the machines crossing a circuit
 relay, in `packages/db-p2p/test/two-phones-over-relay.integration.spec.ts`, which also restarts the relay
 itself. A node listening on `<relay>/p2p-circuit` keeps its reservation on that relay itself, re-reserving
-after a relay restart, a dropped relay connection, or the routine renewal of the slot (`superviseRelayReservation`
-in `packages/db-p2p/src/network/relay-reservation.ts`).
+after a relay restart, a dropped relay connection, or the routine renewal of the slot, and re-sending the
+request every few minutes so a relay that forgot the slot while the connection stayed open holds it again
+(`superviseRelayReservation` in `packages/db-p2p/src/network/relay-reservation.ts`).
 
 ### Arachnode — concentric storage rings
 

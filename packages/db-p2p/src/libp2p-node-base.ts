@@ -42,7 +42,7 @@ import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
-import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations } from './network/relay-reservation.js';
+import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations, type RelayReservationSupervisorOptions } from './network/relay-reservation.js';
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
 import { combineIdentifyObservers, identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import { IdentifyProgress } from './network/identify-progress.js';
@@ -308,6 +308,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * which would hide the circuit address; both are rejected before anything starts.
 	 */
 	listenAddrs?: string[];
+	/**
+	 * Timings of the supervisor that keeps each relay named by {@link NodeOptions.listenAddrs}
+	 * reserved. Every field defaults; the one a host is most likely to change is `renewMs`, how often
+	 * a held reservation is re-requested so a relay that forgot it holds it again (5 min by default).
+	 * Ignored when no listen address names a relay.
+	 */
+	relayReservation?: RelayReservationSupervisorOptions;
 	/**
 	 * Multiaddrs to advertise INSTEAD OF the listen addrs. For a node behind a NAT / reverse proxy /
 	 * DNS front that binds one address but is reachable at another. When non-empty these REPLACE the
@@ -1367,7 +1374,7 @@ export async function createLibp2pNodeBase(
 		// `listen()` on the configured shape did. A host that would rather start offline and let the
 		// supervisor recover is a separate decision, not an option here.
 		if (relayPlan.supervisedRelays.length > 0) {
-			const relaySupervisors = superviseRelayReservations(node, relayPlan.supervisedRelays);
+			const relaySupervisors = superviseRelayReservations(node, relayPlan.supervisedRelays, options.relayReservation);
 			const previousStop = node.stop.bind(node);
 			node.stop = async () => {
 				try {

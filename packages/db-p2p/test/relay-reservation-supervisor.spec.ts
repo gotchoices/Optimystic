@@ -9,8 +9,9 @@
  *    (stricter than phase 5 of `two-phones-over-relay.integration.spec.ts`, where each phone's dials
  *    to the other reconnect the relay), and the relay hangs up while staying up.
  * 2. The supervisor on its own, over plain libp2p nodes at test timings: recovery after a relay
- *    restart, the two halves of `stop()`, and the accepted-tradeoff case where libp2p's relay
- *    discovery has filled the pending slot with a reservation on a different relay.
+ *    restart, renewal after the relay forgets the reservation while the connection stays open, the
+ *    two halves of `stop()`, and the accepted-tradeoff case where libp2p's relay discovery has
+ *    filled the pending slot with a reservation on a different relay.
  * 3. Startup: a relay that cannot be reserved and a missing circuit transport still reject node
  *    creation. The rollback half of that contract (a rejected startup releases the listener port)
  *    lives in `startup-rollback.spec.ts` next to its siblings.
@@ -46,12 +47,13 @@ import {
 	CIRCUIT_SEARCH_LISTEN_ADDR,
 	DEFAULT_RELAY_DRIVE_TIMEOUT_MS,
 	DEFAULT_RELAY_MAX_BACKOFF_MS,
+	RELAY_RENEW_JITTER,
 	superviseRelayReservation,
 	type RelayReservationSupervisor,
 	type RelayReservationSupervisorOptions,
 	type SupervisedRelay
 } from '../src/network/relay-reservation.js';
-import { spawnCircuitOnlyPeer, spawnRestartablePlainRelay, pickRelayWsAddr, type RestartablePlainRelay } from './util/relay-topology.js';
+import { spawnCircuitOnlyPeer, spawnRestartablePlainRelay, pickRelayWsAddr, relayServiceOf, type RestartablePlainRelay } from './util/relay-topology.js';
 
 /** Distinct per-spec: the identify protocol ids are network-scoped, so a shared name lets specs cross-talk. */
 const NETWORK = 'relay-reservation-supervisor';
@@ -176,6 +178,24 @@ async function startSearchClient(): Promise<Libp2p> {
 	}) as unknown as Libp2p;
 }
 
+/** A node that only dials, through a relay: no listen address, so it never asks any relay for a slot. */
+async function startDialer(): Promise<Libp2p> {
+	return await createLibp2p({
+		addresses: { listen: [] },
+		transports: [webSockets(), circuitRelayTransport()],
+		connectionEncrypters: [noise()],
+		streamMuxers: [yamux()],
+		services: { identify: identify() }
+	}) as unknown as Libp2p;
+}
+
+/** Every message in `err` and in the errors it aggregates, so a relay status inside a wrapped dial error is found. */
+function errorText(err: unknown): string {
+	if (!(err instanceof Error)) return String(err);
+	const nested = (err as Error & { errors?: unknown[] }).errors ?? [];
+	return [err.message, ...nested.map(errorText)].join(' | ');
+}
+
 /** A relay with STOCK identify: the search client identifies it, so libp2p's relay discovery nominates it. */
 async function startDiscoverableRelay(): Promise<Libp2p> {
 	return await createLibp2p({
@@ -219,6 +239,46 @@ describe('superviseRelayReservation (one relay, test timings)', function () {
 		await relay.start();
 		await waitFor(() => holdsCircuitVia(client, relayPeerId), { timeoutMs: 15_000, intervalMs: 50, description: 'the reservation comes back' });
 		await waitFor(() => supervisor!.lastError === null, { timeoutMs: 5_000, intervalMs: 50, description: 'the error clears once held' });
+	});
+
+	it('renews the reservation after the relay forgets it while the connection stays open, without withdrawing the address', async () => {
+		const RENEW_MS = 2_000;
+		relay = await spawnRestartablePlainRelay(NETWORK);
+		const client = track(await startSearchClient());
+		const dialer = track(await startDialer());
+		supervisor = superviseRelayReservation(client, relayOf(relay), { ...FAST, renewMs: RENEW_MS });
+		expect(await supervisor.firstDrive).to.equal(null);
+		const circuitAddr = client.getMultiaddrs().find(a => routesThroughRelay(a.toString(), relay!.peerId.toString(), noLog));
+		expect(circuitAddr, 'the client advertises a circuit address through the relay').to.not.equal(undefined);
+
+		// The renewal clock started as the first drive landed, so the next renewal is about RENEW_MS away.
+		// Forgetting the reservation now leaves the relay refusing circuits to the client until then.
+		const forgotAt = Date.now();
+		relayServiceOf(relay.node).reservations.delete(client.peerId);
+
+		const outcomes: string[] = [];
+		const advertised: boolean[] = [];
+		const deadline = forgotAt + RENEW_MS * (1 + RELAY_RENEW_JITTER) + 3_000;
+		let reachedAt: number | undefined;
+		while (reachedAt === undefined && Date.now() < deadline) {
+			advertised.push(holdsCircuitVia(client, relay.peerId));
+			try {
+				await dialer.dial(circuitAddr!);
+				reachedAt = Date.now();
+				outcomes.push('connected');
+				// Hang up so the next dial, if any, goes back through the relay.
+				await dialer.hangUp(client.peerId);
+			} catch (err) {
+				outcomes.push(errorText(err));
+				await delay(200);
+			}
+		}
+		advertised.push(holdsCircuitVia(client, relay.peerId));
+		console.log(`      reachable again ${reachedAt === undefined ? 'never' : `${reachedAt - forgotAt} ms`} after the relay forgot; ${outcomes.length} dial(s)`);
+
+		expect(outcomes[0], 'the first dial after the relay forgot is refused for lack of a reservation').to.contain('NO_RESERVATION');
+		expect(reachedAt, `the client never became reachable again: ${[...new Set(outcomes)].join(' ; ')}`).to.not.equal(undefined);
+		expect(advertised.every(Boolean), `the client stopped advertising its circuit address at some sample: ${advertised.join(',')}`).to.equal(true);
 	});
 
 	it('stopped mid-backoff: no retry is pending, and nothing dials the relay when it appears', async () => {

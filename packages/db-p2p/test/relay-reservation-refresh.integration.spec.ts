@@ -27,7 +27,7 @@ import type { PeerId } from '@libp2p/interface';
 import { delay } from '@optimystic/db-core/test';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { routesThroughRelay } from '../src/peer-address-book.js';
-import { findCircuitRelayTransport, type RelayReservationStoreLike } from '../src/network/relay-reservation.js';
+import { findCircuitRelayTransport } from '../src/network/relay-reservation.js';
 import { spawnPlainRelayNode, spawnCircuitOnlyPeer, pickRelayWsAddr } from './util/relay-topology.js';
 
 const NETWORK = 'relay-reservation-refresh-it';
@@ -42,11 +42,6 @@ const noLog = (): void => { /* the held check never logs on well-formed addresse
 
 const holdsCircuitVia = (node: Libp2p, relayPeerId: PeerId): boolean =>
 	node.getMultiaddrs().some(a => routesThroughRelay(a.toString(), relayPeerId.toString(), noLog));
-
-/** The store also exposes the granted reservation; `expire` is the relay's expiry in Unix seconds. */
-type StoreWithReservations = RelayReservationStoreLike & {
-	getReservation(peerId: PeerId): { expire: bigint | number } | undefined;
-};
 
 /** Length of the longest run of `false` in `samples`. */
 function longestAbsence(samples: readonly boolean[]): number {
@@ -79,8 +74,7 @@ describe("libp2p's own reservation refresh does not lose the circuit address", f
 		relay = await spawnPlainRelayNode(NETWORK, { reservationTtl: RESERVATION_TTL_MS });
 		phone = await spawnCircuitOnlyPeer(NETWORK, pickRelayWsAddr(relay));
 		const relayPeerId = relay.peerId;
-		const store = findCircuitRelayTransport(phone)!.reservationStore as StoreWithReservations;
-		expect(typeof store.getReservation, 'the seam spec pins the rest of the store; this spec needs getReservation too').to.equal('function');
+		const store = findCircuitRelayTransport(phone)!.reservationStore;
 		const granted = store.getReservation(relayPeerId);
 		expect(granted, 'the phone holds a reservation at start').to.not.equal(undefined);
 		const initialExpiry = Number(granted!.expire);

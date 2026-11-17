@@ -34,3 +34,4 @@ So the supervisor could leave the app's configured address alone and ask again w
 - Node creation still rejects when the relay cannot be reserved at start (today the supervisors' first drives are awaited for that).
 - `test/relay-reservation-seam.spec.ts` keeps pinning whatever the new shape relies on, in place of "a bare listener never publishes a `configured` reservation".
 - A host that passes a bare `/p2p-circuit` itself is still left alone.
+- The periodic renewal (`forceReservationRenewal`, added by ticket `a-relay-reservation-the-relay-dropped-is-never-renewed`) re-requests the held reservation as `'discovered'`. That is right only while every supervised reservation is `discovered`: on 4.2.13 a refresh that names `'discovered'` over a `configured` entry takes a new pending slot id, or throws `HadEnoughRelaysError` when there is none, and that throw removes the reservation. A switch to `'configured'` has to renew as `'configured'` too.

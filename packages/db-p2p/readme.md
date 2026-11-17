@@ -691,8 +691,11 @@ To be reachable through a relay instead, listen on `<relay address>/p2p-circuit`
 full dial address, `/p2p/<relay id>` included). The node reserves a slot on that relay at start and
 keeps it itself afterwards, re-reserving after the relay restarts, after the connection to it drops,
 and across libp2p's routine renewal (`superviseRelayReservation` in `src/network/relay-reservation.ts`);
-node creation still rejects if the relay cannot be reserved at all. A bare `/p2p-circuit` listen
-address is left to the host, which then owns that reservation.
+node creation still rejects if the relay cannot be reserved at all. A relay can also forget a
+reservation while the connection to it stays open, which the node cannot see from its side, so it
+re-sends its reservation request every 5 minutes by default: a relay that forgot it holds it again
+within that interval, and `relayReservation.renewMs` changes the interval. A bare `/p2p-circuit`
+listen address is left to the host, which then owns that reservation.
 
 #### React Native
 

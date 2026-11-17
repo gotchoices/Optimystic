@@ -9,8 +9,10 @@
  * fails soft with "no circuit-relay transport", and every relay-only node would silently be back to
  * never re-reserving — so the shape is pinned here to fail loudly instead.
  *
- * The last two cases pin the two libp2p facts the whole rewrite rests on: a bare `/p2p-circuit`
- * listener publishes a `discovered` reservation, and it never publishes a `configured` one.
+ * The next two cases pin the two libp2p facts the whole rewrite rests on: a bare `/p2p-circuit`
+ * listener publishes a `discovered` reservation, and it never publishes a `configured` one. The last
+ * pins the fact the supervisor's renewal rests on: a plain `addRelay` never reaches a relay that forgot
+ * a held reservation, and `forceReservationRenewal` does, without withdrawing the address.
  *
  * The relay is `spawnPlainRelayNode` — identify under a network prefix the stock-identify client
  * never negotiates — so libp2p's own relay discovery cannot nominate the relay and the reservation
@@ -23,10 +25,10 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import { webSockets } from '@libp2p/websockets';
 import { identify } from '@libp2p/identify';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
-import { waitFor } from '@optimystic/db-core/test';
+import { delay, waitFor } from '@optimystic/db-core/test';
 import { routesThroughRelay } from '../src/peer-address-book.js';
-import { CIRCUIT_SEARCH_LISTEN_ADDR, findCircuitRelayTransport } from '../src/network/relay-reservation.js';
-import { spawnPlainRelayNode, pickRelayWsAddr } from './util/relay-topology.js';
+import { CIRCUIT_SEARCH_LISTEN_ADDR, findCircuitRelayTransport, forceReservationRenewal } from '../src/network/relay-reservation.js';
+import { spawnPlainRelayNode, pickRelayWsAddr, relayServiceOf } from './util/relay-topology.js';
 
 const NETWORK = 'relay-reservation-seam';
 
@@ -74,6 +76,7 @@ describe('findCircuitRelayTransport (the libp2p internals seam)', function () {
 		expect(transport, 'libp2p internals moved: no transport with a reservationStore on node.components.transportManager').to.not.equal(null);
 		expect(typeof transport!.reservationStore.addRelay).to.equal('function');
 		expect(typeof transport!.reservationStore.hasReservation).to.equal('function');
+		expect(typeof transport!.reservationStore.getReservation).to.equal('function');
 		// `relayFilter` is a private field on the 4.2.13 store; `clearRelayFilterEntry` degrades without it,
 		// so this pins that the un-poisoning step is still live rather than silently a no-op.
 		expect(typeof transport!.reservationStore.relayFilter?.remove, 'reservationStore.relayFilter.remove').to.equal('function');
@@ -112,5 +115,39 @@ describe('findCircuitRelayTransport (the libp2p internals seam)', function () {
 		// `libp2p-node-base.ts` at `planRelayListenAddrs`.
 		await new Promise(resolve => setTimeout(resolve, 1_000));
 		expect(holdsCircuitVia(client, relay), `a configured reservation was published by a bare listener: ${client.getMultiaddrs().join(', ')}`).to.equal(false);
+	});
+
+	it('a relay that forgot a held reservation is reached by forceReservationRenewal, never by a plain addRelay', async () => {
+		const relay = track(await spawnPlainRelayNode(NETWORK));
+		const client = track(await startSearchClient());
+		await client.dial(pickRelayWsAddr(relay));
+		const store = findCircuitRelayTransport(client)!.reservationStore;
+		await store.addRelay(relay.peerId, 'discovered');
+		await waitFor(() => holdsCircuitVia(client, relay),
+			{ timeoutMs: 5_000, intervalMs: 50, description: 'the bare listener publishes the discovered reservation' });
+		const server = relayServiceOf(relay);
+		expect(server.reservations.has(client.peerId), 'the relay holds the reservation').to.equal(true);
+
+		// The relay forgets; the connection, and the client's own record of the reservation, stay.
+		server.reservations.delete(client.peerId);
+		await store.addRelay(relay.peerId, 'discovered');
+		expect(server.reservations.has(client.peerId),
+			'a plain addRelay on a held, connected reservation far from expiry reached the relay — the renewal may no longer need to zero `expire`').to.equal(false);
+
+		const withdrawals: string[] = [];
+		const onSelfUpdate = (): void => {
+			if (!holdsCircuitVia(client, relay)) withdrawals.push(client.getMultiaddrs().join(', ') || 'none');
+		};
+		client.addEventListener('self:peer:update', onSelfUpdate);
+		try {
+			expect(await forceReservationRenewal(store, relay.peerId)).to.equal(null);
+			// A withdrawal would be dispatched within a tick or two of the refresh; give it the chance.
+			await delay(250);
+		} finally {
+			client.removeEventListener('self:peer:update', onSelfUpdate);
+		}
+		expect(server.reservations.has(client.peerId), 'the relay holds the reservation again').to.equal(true);
+		expect(withdrawals, 'address updates without the circuit address while the renewal ran').to.deep.equal([]);
+		expect(holdsCircuitVia(client, relay)).to.equal(true);
 	});
 });
