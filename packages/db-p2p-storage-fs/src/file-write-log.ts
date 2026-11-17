@@ -27,8 +27,8 @@ export const DEFAULT_CHECKPOINT_BYTES = 16 * 1024 * 1024;
 export const DEFAULT_CHECKPOINT_IDLE_MS = 5000;
 
 /**
- * How many files, then directories, the open's replay and the last release's checkpoint sync at
- * once: no commit competes with either. Every other checkpoint syncs one at a time (see
+ * How many files, then directories, are synced at once where no commit competes: the open's replay,
+ * and a checkpoint once the last release has begun. A checkpoint otherwise syncs one at a time (see
  * `FileWriteLog.syncSealed`).
  */
 const UNCONTENDED_SYNC_CONCURRENCY = 16;
@@ -876,8 +876,9 @@ export class FileWriteLog {
 	 * whole duration; on macOS each one is an `F_FULLFSYNC`, a flush of the drive's whole write cache.
 	 * Synced many at a time, they held every thread and queued the commits' own appends and log syncs
 	 * behind them for the length of the checkpoint (GitHub #62). One at a time, a commit's log sync
-	 * waits for at most the one tree sync already in flight. The last release's checkpoint has no
-	 * commit to make way for, and syncs at the replay's width.
+	 * waits for at most the one tree sync already in flight. Once the last release has begun no commit
+	 * is left to make way for, so what remains — all of the final checkpoint, or the rest of one that
+	 * was running — syncs at the replay's width.
 	 *
 	 * NOTE: a checkpoint's file sync holds a handle open while later commits may delete and re-create
 	 * the same path. libuv opens with delete sharing and, on Windows 10 1809 and later, unlinks with
@@ -886,22 +887,25 @@ export class FileWriteLog {
 	 * write on EPERM for the length of one sync.
 	 */
 	private async syncSealed({ dirty, pace }: SealedSegment): Promise<void> {
-		if (this.closed) {
-			await syncDirtyPaths(dirty);
-			return;
-		}
-		for (const file of dirty.files) await this.pacedSync(fsyncFile, file, pace);
-		for (const dir of dirty.directories) await this.pacedSync(fsyncDir, dir, pace);
+		await this.syncEachPaced([...dirty.files], fsyncFile, pace);
+		await this.syncEachPaced([...dirty.directories], fsyncDir, pace);
 	}
 
-	private async pacedSync(sync: (target: string) => Promise<void>, target: string, pace: CheckpointPace): Promise<void> {
-		await this.giveWayToLog();
-		await sync(target);
-		pace.completeOne();
+	private async syncEachPaced(targets: readonly string[], sync: (target: string) => Promise<void>, pace: CheckpointPace): Promise<void> {
+		for (const [at, target] of targets.entries()) {
+			await this.giveWayToLog();
+			if (this.closed) {
+				await forEachConcurrently(targets.slice(at), UNCONTENDED_SYNC_CONCURRENCY, sync);
+				return;
+			}
+			await sync(target);
+			pace.completeOne();
+		}
 	}
 
 	/**
-	 * Wait while a task is queued or running on the log's queue, unless the checkpoint is behind.
+	 * Wait while a task is queued or running on the log's queue, unless the checkpoint is behind or the
+	 * last release has begun (which drains the queue, so a wait in progress is woken).
 	 *
 	 * NOTE: a writer of strict flushes keeps the queue busy most of the time (each sync step's log
 	 * sync and tree writes run in it), so the checkpoint makes few syncs before it falls behind, and
@@ -910,7 +914,7 @@ export class FileWriteLog {
 	 * stop giving way part-way to `checkpointBytes` rather than at it.
 	 */
 	private async giveWayToLog(): Promise<void> {
-		while (this.queuedTasks > 0 && !this.isBehind()) {
+		while (this.queuedTasks > 0 && !this.isBehind() && !this.closed) {
 			await new Promise<void>(resolve => { this.wakeWaitingSync = resolve; });
 		}
 	}
@@ -976,7 +980,7 @@ export class FileWriteLog {
 	}
 }
 
-/** Sync every file, then every directory, {@link UNCONTENDED_SYNC_CONCURRENCY} at a time: for the replay and the last release's checkpoint. */
+/** Sync every file, then every directory, {@link UNCONTENDED_SYNC_CONCURRENCY} at a time: for the replay. */
 async function syncDirtyPaths(dirty: DirtyPaths): Promise<void> {
 	await forEachConcurrently(dirty.files, UNCONTENDED_SYNC_CONCURRENCY, fsyncFile);
 	await forEachConcurrently(dirty.directories, UNCONTENDED_SYNC_CONCURRENCY, fsyncDir);

@@ -361,9 +361,9 @@ append and log sync wait for at most the one tree sync in flight (`FileWriteLog.
 thread pool, four threads by default, and a sync holds one for its whole length; on macOS libuv
 implements `fsync` as `F_FULLFSYNC`, a flush of the drive's whole write cache, made one after another
 by the device. Sixteen at a time, a checkpoint held every thread for its whole length and queued every
-commit and read behind it, which is GitHub #62's seconds-long commit at each checkpoint. The last
-close's checkpoint has no commit to make way for and syncs sixteen at a time, as the open's replay
-does. When the current log reaches `checkpointBytes` while the checkpoint before it is still running,
+commit and read behind it, which is GitHub #62's seconds-long commit at each checkpoint. Once the
+last close has begun no commit is left to make way for, so its checkpoint, and the rest of one still
+running, syncs sixteen at a time, as the open's replay does. When the current log reaches `checkpointBytes` while the checkpoint before it is still running,
 the checkpoint is **behind**: its syncs stop making way, and a commit, after its append and outside
 the queue, waits until the checkpoint has completed the commit's share of its syncs — the record's
 bytes times the sealed segment's paths per byte, or more when finishing before the current log

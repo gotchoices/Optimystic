@@ -153,7 +153,8 @@ flush that started a checkpoint, and the dozen after it, take seconds on macOS,
 GitHub issue #62: there every sync flushes the drive's whole write cache, and
 every file operation of the process shares Node's four I/O threads.) The
 checkpoint the last close runs has no writes to make way for, and syncs sixteen
-at a time, as the open's replay does.
+at a time, as the open's replay does; so does the rest of one still running when
+the close begins.
 
 When writes outrun the disk — the log reaches `checkpointBytes` again while the
 checkpoint before it is still syncing — the checkpoint is **behind**: its syncs

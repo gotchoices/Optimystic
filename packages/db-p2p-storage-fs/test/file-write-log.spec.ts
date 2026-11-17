@@ -386,6 +386,29 @@ describe('FileWriteLog checkpoint pacing', () => {
 		}
 	});
 
+	it('a checkpoint running when the last release begins syncs the rest of its paths many at a time', async () => {
+		const log = FileWriteLog.acquire(base, { setTimer: noTimers });
+		const isTreeBelowRoot = (filePath: string) => filePath !== log.logPath && filePath !== log.basePath;
+		const parking = parkHandleSyncs(isTreeBelowRoot);
+		let releasing: Promise<void> | undefined;
+		try {
+			await log.commit(Array.from({ length: 40 }, (_, i) => put(`blk/file-${i}.json`, `v${i}`)), STRICT);
+			void log.checkpoint();
+			const first = await parking.parked(isTreeBelowRoot);
+			releasing = log.release();
+			first.release();
+			await parking.parked(isTreeBelowRoot);
+			await parking.parked(isTreeBelowRoot);
+			assert.ok(parking.mostInFlight(isTreeBelowRoot) > 1, 'the rest is synced at the replay\'s width');
+			parking.releaseAll();
+			await releasing;
+		} finally {
+			parking.releaseAll();
+			await (releasing ?? log.release());
+			parking.restore();
+		}
+	});
+
 	it('a commit made while the checkpoint is behind waits for its share of the checkpoint\'s syncs, and no longer', async () => {
 		const checkpointBytes = 1000;
 		const log = FileWriteLog.acquire(base, { setTimer: noTimers, checkpointBytes });
