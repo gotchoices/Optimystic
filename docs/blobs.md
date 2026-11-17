@@ -187,6 +187,7 @@ The transaction that commits a row carries the reference and its reference-tree 
 - **The writer keeps what it wrote.** While a transaction that references a blob is open or queued, the blob is pinned on the writer. When the transaction commits, the writer announces the blob and holds it as `owed` until its cohort fully holds it. So a committed reference is always backed by at least the writer's copy, and a reader that cannot reach it sees "not yet", not a broken file.
 - **A transaction that rolls back** leaves nothing behind anywhere else: its bytes never left the writer, and unpinning lets the writer's sweep remove them.
 - **A reader decides how long to wait.** `stat`, `read` with `waitMs`, and the typed reasons give an application what it needs to show "still arriving".
+- **An application that wants the bytes on the network before anyone sees the reference** commits twice. It first commits a row that only holds the reference (an attachment row), which is what authorizes the cohort to store the blob. It waits for `onDurability` to report `majority` or `full`. Then it commits the row people act on (the message that shows the attachment). The second commit cannot land before the bytes are held by others, and no machine ever stored bytes that no committed row referenced.
 
 ## SQL
 
