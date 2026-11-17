@@ -2,7 +2,9 @@
 
 **Status: proposed design. Nothing in this document is implemented yet.** It is the design of record for native large-value support (GitHub #63, and the Quereus side of the same request, gotchoices/quereus#40). Each section says what is to be built; the tickets that build it cite the section they serve.
 
-A **blob** is an immutable sequence of bytes of known size, such as a photo, a video or a document. A row holds a short **reference** to it. The bytes are stored and moved by their own subsystem: they are never encoded as JSON, never enter a transaction, a log entry or a consensus record, and are copied between machines in small pieces that can be resumed and checked one at a time.
+A **blob** is an immutable sequence of bytes, such as a photo, a video or a document. A row holds a short **reference** to it. The bytes are stored and moved by their own subsystem: they are never encoded as JSON, never enter a transaction, a log entry or a consensus record, and are copied between machines in small pieces that can be resumed and checked one at a time.
+
+In one sentence: **blobs are stored the way IPFS stores files, placed by FRET instead of provider records, fetched only by members of the network, and kept alive by the database** — a machine holds a blob for others exactly as long as a committed row references it.
 
 ## Why
 
@@ -19,45 +21,38 @@ What this design does **not** change: an ordinary transaction is still limited t
 
 ## Design principles
 
-- **Content addressing.** A reference names bytes, not a place. Everything received is checked against the reference, so no signature, commit proof or trusted sender is needed to accept a piece, and equal content is stored once.
+- **Content addressing, in IPFS's formats.** A reference is a content identifier (CID). Everything received is checked against it, so no signature, commit proof or trusted sender is needed to accept a piece, equal content is stored once, and what a node stores are ordinary IPFS blocks that IPFS tools can read.
 - **Bytes stay bytes.** No base64, no JSON, no canonicalization and no cloning of content, in storage or on the wire. Content is hashed once when written and once when received.
 - **Small, independent pieces.** A piece is the unit of storage, transfer, verification and retry. A transfer that stops loses at most the piece in flight.
 - **Outside consensus.** The cohort agrees on the reference, which is an ordinary column value. No member votes on whether the bytes have arrived.
+- **The database decides what is alive.** A machine stores a blob on another machine's behalf only when committed state references it, and stops when committed state no longer does. There is no lease to renew and no expiry clock.
 - **Known but not here is an ordinary state.** A reference whose bytes are not on this machine is reported as such, with a reason, and can be fetched. It is never a missing-block error.
 - **One placement rule.** The machines responsible for a blob are chosen the way a block's are: the key network's cohort at the blob's coordinate.
-- **db-core stays network-free.** Reference format, tree shape, verification and planning are pure logic in `db-core` behind ports; storage and transport bind in `db-p2p`, the split the cohort-topic subsystem uses (`packages/db-core/test/no-fret-import.spec.ts`).
+- **db-core stays network-free.** Formats, verification, reference trees and planning are pure logic in `db-core` behind ports; storage and transport bind in `db-p2p`, the split the cohort-topic subsystem uses (`packages/db-core/test/no-fret-import.spec.ts`).
 
 ## References and pieces
 
-A **piece** is up to `P` bytes, where `P = 2^pieceBits`. A piece is named by the SHA-256 of its bytes. `pieceBits` is 18 by default (256 KiB, the size Sereus Chat found workable on a cellular link through a relay) and may be 16 through 20.
+A blob is stored as an IPFS file is, with the parameters current IPFS tools use by default:
 
-A blob's pieces form a tree whose shape is fixed by the blob's size and `pieceBits`:
-
-- **Data pieces** hold the content in order: every one exactly `P` bytes except the last, which holds the remainder. A blob of zero bytes has one empty data piece.
-- **List pieces** hold the concatenated 32-byte hashes of their children, up to `P / 32` children each (8192 at the default), so a list piece is never larger than a data piece and is stored and moved the same way.
-- Levels are built until one piece remains. Its hash is the **root**. A blob of at most `P` bytes has no list piece: its root is the hash of its one data piece.
+- **Pieces.** The content is cut into pieces of 256 KiB (the last one shorter). Each is a raw IPFS block, named by the SHA-256 of its bytes. 256 KiB is also the size Sereus Chat found workable on a cellular link through a relay.
+- **List pieces.** A blob of more than one piece has a tree above its pieces: UnixFS file nodes (the `dag-pb` codec), each listing up to 174 children with their sizes, balanced, built until one node remains. A list piece is a few kilobytes and is stored and moved like any other piece.
+- **The reference** is the CID of the root: version 1, SHA-256, written in lowercase base32. A blob of one piece is referenced by that piece's CID directly. A reference has exactly one accepted spelling, so references compare as strings.
 
 ```
-size = 600 KiB, pieceBits = 18          root = sha256(list)
-                                              │
-                                   list: h0 ‖ h1 ‖ h2   (96 bytes)
-                                     │      │      │
-                                   256K   256K    88K    data pieces
+600 KiB file                       bafybei…   (the reference: CID of the list piece)
+                                      │
+                         list: [bafkrei…a 256K, bafkrei…b 256K, bafkrei…c 88K]
+                                   │           │           │
+                                  256K        256K        88K     raw pieces
 ```
 
-At the default, one list piece covers 2 GiB and two levels cover 16 TiB.
+One list piece covers about 44 MiB at these parameters, two levels about 7.4 GiB, three about 1.3 TiB.
 
-A **blob reference** is a string:
+Choosing IPFS's formats over a private one costs a little (a list piece is protobuf rather than bare hashes, and the size is in the root piece rather than in the reference) and buys three things: the formats and their edge cases are already specified and tested elsewhere; the libraries exist and are small (`multiformats`, already a dependency of `db-core`, plus the dag-pb and UnixFS codecs); and a node's pieces are valid IPFS blocks, so content can be exported to or imported from IPFS, and an IPFS transport could be added later without touching what is stored. The intent is that a file put here has the same CID `ipfs add --cid-version 1` gives it; the work that builds the format pins that with test vectors.
 
-```
-oblob:1:<pieceBits>:<size>:<root>
-```
+What is **not** taken from IPFS is its network: no public DHT, no provider records, no bitswap. Those have no notion of membership, which is the question a private database has to answer first ([Who may fetch and who may store](#who-may-fetch-and-who-may-store)).
 
-`1` is the format version (it fixes SHA-256 and the tree rule), `pieceBits` and `size` are canonical decimal, and `root` is base64url without padding. A reference has exactly one spelling, so references compare as strings. The prefix names this store: an application that already holds references of its own (Sereus Chat's `chunks:1:` references) dispatches on the prefix and keeps reading the old ones.
-
-The reference carries the size and the piece size because the tree's shape, and so what every piece must look like, follows from them. A reader knows for each hash whether it names a data piece or a list piece and exactly how long that piece must be, so a piece of the wrong kind or length is refused even though its hash matches. The same bytes written with two different `pieceBits` are two different references; writers use the default unless they have a reason.
-
-**Verification.** A reader checks the root piece against the reference, each list piece's length against the shape, and each child against the hash its parent lists, top down. A byte range needs only the pieces on its path. A writer builds the tree bottom up from a stream, holding one piece and one partial list piece per level.
+**Verification.** A reader checks each piece against the CID that named it, top down from the reference. Because a list piece is written by whoever made the blob, a reader also bounds what it will follow: a piece of at most 1 MiB, a bounded number of children and levels, child sizes that add up to what the parent declares, only the two codecs above, and a list piece that carries links and no content of its own. Anything else is a malformed blob, reported as corrupt and never partially served. A byte range needs only the pieces on its path. A writer builds the tree bottom up from a stream, holding one piece and one partial list piece per level.
 
 **Hashing** goes through one injected port (bytes in, 32 bytes out, asynchronous). The default uses the platform's native digest (`crypto.subtle`) where there is one and falls back to JavaScript. A host may supply its own (React Native), and a supplied digest is checked against known answers once when installed. Pure JavaScript hashing measured 19 s per MB on an older phone, so the port is not optional in practice.
 
@@ -67,9 +62,9 @@ Each node keeps two things.
 
 **A piece store.** A map from piece hash to bytes, immutable once written, behind a small interface of its own (`IPieceStore`): has, get, put, delete, list, bytes used, flush. It is deliberately not another logical store of `RawStoreDriver` (`packages/db-p2p/src/storage/raw-store-driver.ts`): that kernel JSON-encodes every value and stages writes in an in-memory overlay and a journal, which is right for small versioned records and wrong for megabytes of immutable bytes that need no cross-key atomicity. Each storage package supplies an implementation beside its block store (files, a SQLite table, an IndexedDB object store, a LevelDB key range read as bytes), and one conformance suite runs against all of them. A host passes it to the node as it passes block storage; the default is in memory. A piece is written only after its hash has been checked, and a put of a hash already present writes nothing.
 
-**Blob records.** One small record per blob this node has a reason to hold, in the node's key-value store: the reference, whether every piece is present, when it was last read, and its **holds** (below). Records are what make the node's set of blobs enumerable after a restart.
+**Blob records.** One small record per blob this node has a reason to hold, in the node's key-value store: the reference, its size once known, whether every piece is present, when it was last read, and its **holds** (below). Records are what make the node's set of blobs enumerable after a restart.
 
-Piece bytes count toward the node's reported storage use, so capacity-driven decisions see them.
+Piece bytes count toward the node's reported storage use, so capacity-driven decisions see them. They are counted once: a block store that already measures the whole directory or database it shares with the piece store has counted them, and the piece store's own figure is added only where it has not.
 
 ### Holds
 
@@ -78,8 +73,8 @@ A node keeps a blob only while some hold names it. There are four kinds:
 | Hold | Meaning | Released when |
 |---|---|---|
 | **pin** (with an owner label) | The application, or the SQL layer on behalf of an open or queued transaction, needs it here. | The owner unpins it. |
-| **owed** | This node wrote or announced it and its cohort does not fully hold it yet. | Every cohort member that accepts blobs confirms it holds it. |
-| **responsible** | This node is in the blob's cohort and accepts blobs. | The node leaves the cohort and enough others hold it, or the blob is reclaimed ([Lifetime](#lifetime)). |
+| **owed** | This node announced it and its cohort does not fully hold it yet. | Every cohort member that accepts blobs confirms it holds it. |
+| **responsible** | This node is in the blob's cohort, accepts blobs, and found the blob referenced by committed state. | The node leaves the cohort and enough others hold it, or the blob is no longer referenced ([Lifetime](#lifetime)). |
 | **cached** | It was fetched for a read. | Evicted, least recently read first, to stay within a cache budget. |
 
 Pieces are shared between blobs. A piece is deleted only by a sweep that finds it in no held blob's tree.
@@ -90,7 +85,7 @@ A node exposes one handle, `node.blobs`, declared on `OptimysticNodeAttachments`
 
 ```ts
 interface BlobService {
-	/** Store a stream as a blob. Resolves once every piece is durable on this node. */
+	/** Store a stream as a blob, pinned for `owner`. Resolves once every piece is durable on this node. */
 	put(source: AsyncIterable<Uint8Array>, options?: BlobPutOptions): Promise<BlobPutResult>;
 	/** What this node knows about a blob, without fetching content. */
 	stat(ref: BlobRef, options?: { probe?: boolean }): Promise<BlobStat>;
@@ -100,25 +95,39 @@ interface BlobService {
 	fetch(ref: BlobRef, options?: BlobFetchOptions): Promise<void>;
 	pin(ref: BlobRef, owner: string): Promise<void>;
 	unpin(ref: BlobRef, owner: string): Promise<void>;
-	/** Tell the blob's cohort about it, optionally naming what keeps it alive. */
-	announce(ref: BlobRef, retention?: BlobRetention): Promise<void>;
+	/** Tell the blob's cohort that committed state now references it, and where. */
+	announce(ref: BlobRef, scope: BlobScope): Promise<void>;
 	onProgress(listener: (event: BlobProgressEvent) => void): () => void;
 	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void;
 }
 
-interface BlobPutOptions { pieceBits?: number; owner?: string; retention?: BlobRetention; replicate?: boolean; signal?: AbortSignal }
+interface BlobPutOptions { owner?: string; signal?: AbortSignal }
 interface BlobPutResult { ref: BlobRef; size: number }
 interface BlobReadOptions { offset?: number; length?: number; from?: 'anywhere' | 'here'; waitMs?: number; signal?: AbortSignal }
-interface BlobStat { ref: BlobRef; size: number; locality: 'here' | 'partial' | 'elsewhere' | 'unknown'; heldBytes: number; durability?: BlobDurability }
-type BlobRetention = { scope: string } | { keep: true } | undefined;
+interface BlobStat { ref: BlobRef; size?: number; locality: 'here' | 'partial' | 'elsewhere' | 'unknown'; heldBytes: number; durability?: BlobDurability }
+/** The id of the reference tree that lists the blob (see Registering references). */
+type BlobScope = string;
 ```
 
-- **`put`** reads the source one piece at a time, hashes and stores each, and never holds more than a piece and its list pieces in memory. It resolves when the blob is durable *here*, which is the same promise an offline commit makes. Copying to other machines happens afterwards in the background and is reported through `onDurability`; a caller that wants to wait for it can.
-- **`stat`** answers from local records. With `probe` it also asks the blob's cohort, which is what distinguishes `elsewhere` (someone reachable holds it) from `unknown`.
+- **`put`** reads the source one piece at a time, hashes and stores each, and never holds more than a piece and its list pieces in memory. It resolves when the blob is durable *here*, pinned for its owner (the label `default` when none is given, so a blob put without one is still held until it is unpinned). Nothing leaves the machine yet: no other machine can know the reference before a row carrying it commits, so there is nothing to gain by sending the bytes sooner.
+- **`announce`** is what starts copying, once the reference is committed. The SQL layer calls it; an application writing collections directly calls it after its own commit.
+- **`stat`** answers from local records. With `probe` it also asks the blob's cohort, which is what distinguishes `elsewhere` (someone reachable holds it) from `unknown`. The size is known once the root piece is here.
 - **`read`** yields verified bytes. Pieces not held are fetched from other holders as the read reaches them, and kept under a `cached` hold. `waitMs` keeps a read trying while the bytes are still arriving somewhere; without it a read fails at the first piece nobody reachable holds.
-- **Failures are typed.** `BlobUnavailableError` carries the reference and a reason: `not-here` (the read said `from: 'here'`), `not-held` (every holder asked answered that it does not have it), `peers-unreachable` (some of them did not answer), `cohort-unreachable` (none could be asked). All four mean "not yet", and are the blob counterpart of `BlockUnavailableReason` in `packages/db-core/src/network/struct.ts`. `BlobCorruptError` means a holder served bytes that fail verification and no other holder could supply them. `BlobRefError` means the string is not a reference.
+- **Failures are typed.** `BlobUnavailableError` carries the reference and a reason: `not-here` (the read said `from: 'here'`), `not-held` (every holder asked answered that it does not have it), `peers-unreachable` (some of them did not answer), `cohort-unreachable` (none could be asked). All four mean "not yet", and are the blob counterpart of `BlockUnavailableReason` in `packages/db-core/src/network/struct.ts`. `BlobCorruptError` means the blob is malformed, or a holder served bytes that fail verification and no other holder could supply them. `BlobRefError` means the string is not a reference.
 
 Optimystic owns no file access. A host turns a picked file into a stream for `put` and writes the stream from `read` where it wants it.
+
+## Registering references
+
+Liveness is a question about the database — "does any committed row reference this blob?" — so the database has to be able to answer it cheaply, for any blob, on a machine that knows nothing about the application's schema. Two ordinary tree collections make that possible.
+
+**A reference tree** lists the blobs one collection references. Its entries are keyed by reference, then by whatever names the referrer (for a SQL table: primary key, then column), so "is this blob referenced here?" is a short range read, and many blobs are checked in one ordered pass. An entry is written and removed **in the same transaction** as the row that holds or drops the reference. `db-core` provides the helper that stages these entries; the SQL plugin uses it for every table with a blob column, and an application writing collections directly uses it itself.
+
+**The scope registry** is one small tree per network, at a well-known id, listing the ids of the network's reference trees. A reference tree is added to it once, when it is created, and removed when the collection that held the references is dropped, which makes the blobs it listed unreferenced there. It is how a storage node enumerates every place a reference could be without reading a schema catalog.
+
+So a blob is not registered anywhere on its own. What is registered is the *reference*, as a side effect of the transaction that commits it, and a blob is alive while any registered reference tree lists it.
+
+**Under transaction validation** these entries are derived, not asserted. A validating member re-executes the transaction's statements, and the plugin derives the reference-tree entries from the rows the statements change, as it derives index entries. A writer therefore cannot commit a row without its entry, or remove an entry while keeping the row: the operations would not match what the members compute. Members never check whether the bytes exist; that is not a deterministic function of the transaction. Where no member re-validates (no deployment does at pend today — backlog `feat-no-deployment-validates-transactions-at-pend`), a reference tree is exactly as trustworthy as an index tree: a writer the cohort accepts could falsify either.
 
 ## Moving pieces between machines
 
@@ -127,8 +136,8 @@ One new protocol, `<prefix>/db-p2p/blob/1.0.0`, registered like the node's other
 | Request | Answer |
 |---|---|
 | `stat` — references | For each: `whole`, `partial` or `none`. |
-| `get` — up to 16 piece hashes | A header saying which are held, then one raw frame per held piece, in the order asked. |
-| `announce` — a reference and its retention | `whole` (already held), `fetching` (will pull it) or `declined`. |
+| `get` — up to 16 piece CIDs | A header saying which are held, then one raw frame per held piece, in the order asked. |
+| `announce` — a reference and its scope | `whole` (already held), `fetching` (will pull it), `declined` (does not take blobs), `not-responsible` (its own view of the blob's cohort does not include it) or `unreferenced` (it did not find the reference: the scope is not registered, does not list the blob, or could not be read). |
 | `held` — a reference | Empty. Sent to a peer that announced, when the pull completes. |
 
 **Content moves by `get` only, and the receiver always pulls.** A node that wants a blob copied to another machine announces it; the other machine decides whether to take it and then fetches at its own pace. There is no push of content, so a node never has to accept, buffer or verify bytes it did not ask for, and there is one code path that receives and checks pieces.
@@ -139,28 +148,44 @@ One new protocol, `<prefix>/db-p2p/blob/1.0.0`, registered like the node's other
 
 **Other traffic is not held up.** Background copying uses at most one `get` stream per peer and a small number per node, 16 pieces at most per stream, so the stream multiplexer can interleave transaction and read traffic between pieces. A read the application is waiting on goes ahead of background copying.
 
-**Trust.** The protocol is gated by `authorizeInboundStream` like the four database protocols (`createInboundStreamAuthorization` in `packages/db-p2p/src/inbound-authorization.ts`), and a node announces to, and fetches from, only peers its network membership predicate admits. Within those bounds any member can fetch any piece whose hash it knows. A peer that serves bytes failing the requested hash is penalized (`PenaltyReason` in `packages/db-p2p/src/reputation/types.ts`, the reason existing repair paths use for unverifiable content): the stream is authenticated and the fault is attributable.
-
 **Relays.** A circuit relay with stock limits resets a relayed stream after 128 KiB. A blob cannot cross such a relay; the fetch fails, keeps what it stored, and resumes when a direct or unlimited path exists.
+
+## Who may fetch and who may store
+
+IPFS answers neither question: anyone may fetch a block from anyone who has it, and a node stores what its operator pins. Here both have answers.
+
+**Fetching is limited to the network's members.** The blob protocol is gated by `authorizeInboundStream` like the four database protocols (`createInboundStreamAuthorization` in `packages/db-p2p/src/inbound-authorization.ts`), and a node fetches from, and announces to, only peers its network membership predicate admits. The protocol id carries the network's prefix, so two networks sharing a machine or a relay do not see each other's requests. Inside a network, any member can fetch any piece whose CID it knows, which is the same reach a member has over blocks. A network with no predicate is open, as it is for blocks.
+
+**Storing is authorized by a committed transaction, not by who asks.** A node takes a blob on another's behalf only after reading committed state and finding the reference in the scope the announcement names, and only when that scope is in the registry and the node is in the blob's cohort. An announcement is a hint about where to look; it grants nothing. The right to make a network store bytes is therefore exactly the right to commit a row, which the network already governs.
+
+There is no access control finer than membership: a reference is not a secret within a network, and a member that knows a CID can learn whether the content exists. An application that needs more than that encrypts before `put`.
 
 ## Placement, copying and durability
 
-**Who is responsible.** A blob's routing key is the bytes of its root hash; the key network turns it into a coordinate and a cohort exactly as it does for a block (`routingKeyForBlock` in `packages/db-core/src/network/routing-key.ts` gains a sibling for blobs). A node may be configured not to take blobs it is merely responsible for (`blobs.hold: 'on-demand'`, against the default `'eager'`): such a node declines announcements, and holds only what it wrote, pinned or read. This is how a phone joins a group without storing every file in it.
+**Who is responsible.** A blob's routing key is the digest in its reference; the key network turns it into a coordinate and a cohort exactly as it does for a block (`routingKeyForBlock` in `packages/db-core/src/network/routing-key.ts` gains a sibling for blobs). A node may be configured not to take blobs it is merely responsible for (`blobs.hold: 'on-demand'`, against the default `'eager'`): such a node declines announcements, and holds only what it wrote, pinned or read. This is how a phone joins a group without storing every file in it.
 
-**Copying.** When a blob is put (unless `replicate: false`) or announced, the node records a durable **owed entry**: the reference, its retention, and the cohort members not yet known to hold it. A drain announces the blob to each owed member that is connected, on start, when a peer connects or is identified, and on a timer while anything is owed, skipping passes during a detected partition. It is the same schedule, give-up rule and membership filter as `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`), and the two share that scheduling code rather than repeating it. A member is taken off the entry when it reports `whole` or sends `held`. A member that declines is remembered as declining and is not owed.
+**Copying.** `announce` records a durable **owed entry**: the reference, its scope, and the cohort members not yet known to hold it. A drain announces the blob to each owed member that is connected, on start, when a peer connects or is identified, and on a timer while anything is owed, skipping passes during a detected partition. It is the same schedule, give-up rule and membership filter as `UnderReplicationDrain` (`packages/db-p2p/src/repo/under-replication-drain.ts`), and the two share that scheduling code rather than repeating it. The owed members are derived from the cohort afresh on each pass, so the entry follows the cohort. A member is taken off the entry when it reports `whole` or sends `held`. A member that answers `declined` is remembered as declining until it next connects, and is not owed. A member that answers `not-responsible` or `unreferenced` is asked again on a later pass, under the give-up rule: the first means the two machines' views of the cohort differ for now, the second that the member has not seen the commit or could not read it.
 
-**Durability** is reported in the classes a commit uses (`DurabilityQuorum` in `packages/db-core/src/network/struct.ts`), counted over the cohort members that accept blobs: `full` when every one holds it, `majority`, `local` when only this node does, `unrouted` when the cohort could not be resolved. Each change is an `onDurability` event, and reaching `full` removes the owed entry and its hold. In a group where no other member accepts blobs the class stays `local` and the writer keeps the blob; readers fetch it from the writer on demand.
+**Durability** is reported in the classes a commit uses (`DurabilityQuorum` in `packages/db-core/src/network/struct.ts`), counted over the cohort members that accept blobs, with the count beside the class:
+
+- `unrouted` — the cohort could not be resolved.
+- `local` — this node alone holds it, or fewer than a strict majority of the accepting members do. This is wider than a commit's `local`, because a commit is not acknowledged below a majority and a blob is usable from its first copy.
+- `majority` — a strict majority of the accepting members hold it.
+- `full` — every accepting member holds it, and at least one of them is not this node.
+
+Each change is an `onDurability` event, and reaching `full` removes the owed entry and its hold. In a group where no other member accepts blobs the class stays `local` and the writer keeps the blob; readers fetch it from the writer on demand.
 
 **When the cohort changes.** A node's held blobs are enumerable from its records, so the cohort comparison `RebalanceMonitor` (`packages/db-p2p/src/cluster/rebalance-monitor.ts`) makes for blocks is made for blobs too, by giving it the routing key rule rather than a second copy of its logic. A member that joins a held blob's cohort is announced to. A node that leaves a blob's cohort drops its `responsible` hold only after confirming that enough current members hold the blob.
 
-**Readers repair.** A node that is responsible for a blob, accepts blobs, and fetches it for a read keeps it under a `responsible` hold.
+**Readers repair.** A node that is responsible for a blob, accepts blobs, finds it referenced and fetches it for a read keeps it under a `responsible` hold.
 
 ## Committing a reference
 
-The transaction that commits a row carries only the reference. Its relation to the bytes is:
+The transaction that commits a row carries the reference and its reference-tree entry, and nothing else. Its relation to the bytes is:
 
-- **The reference can land before the bytes.** No member checks availability when it votes. Checking would tie consensus to bulk transfer and would make an offline commit impossible.
-- **The writer keeps what it wrote.** From `put` until its cohort fully holds the blob, the writer holds it under `owed`; while a transaction that references it is open or queued, the SQL layer also holds it under a pin. So a committed reference is always backed by at least the writer's copy, and a reader that cannot reach it sees "not yet", not a broken file.
+- **The reference lands before the bytes move.** No member checks availability when it votes. Checking would tie consensus to bulk transfer, would make an offline commit impossible, and is not something every member can compute alike.
+- **The writer keeps what it wrote.** While a transaction that references a blob is open or queued, the blob is pinned on the writer. When the transaction commits, the writer announces the blob and holds it as `owed` until its cohort fully holds it. So a committed reference is always backed by at least the writer's copy, and a reader that cannot reach it sees "not yet", not a broken file.
+- **A transaction that rolls back** leaves nothing behind anywhere else: its bytes never left the writer, and unpinning lets the writer's sweep remove them.
 - **A reader decides how long to wait.** `stat`, `read` with `waitMs`, and the typed reasons give an application what it needs to show "still arriving".
 
 ## SQL
@@ -171,20 +196,22 @@ The plugin adds a logical type, **`blobref`**: text whose value must be a well-f
 create table Attachment (
 	Id text primary key,
 	Name text,
+	ByteSize integer,
 	Content blobref null
 );
 ```
 
 ```ts
-const { ref } = await plugin.blobs.put(fileStream);
-await db.exec('insert into Attachment (Id, Name, Content) values (?, ?, ?)', [id, name, ref]);
+const { ref, size } = await plugin.blobs.put(fileStream);
+await db.exec('insert into Attachment (Id, Name, ByteSize, Content) values (?, ?, ?, ?)', [id, name, size, ref]);
 for await (const bytes of plugin.blobs.read(ref)) { /* … */ }
 ```
 
-- **`plugin.blobs`** is the node's blob service for the plugin's network, with `put` pinning on behalf of the current transaction.
-- **A reference tree per table.** For a table with a `blobref` column the plugin maintains one more tree collection beside the table's index trees, `<table>/blobrefs`, keyed by reference then primary key then column. It is staged in the same transaction as the row, the way `IndexManager` (`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`) stages index entries, so "which rows reference this blob" is a range read of committed state. It exists for [Lifetime](#lifetime).
-- **Pins follow the transaction.** A reference staged by a statement is pinned under the transaction's identity. The pin is released when the transaction commits (after announcing the blob with the reference tree as its scope), rolls back, or, for a queued offline transaction, settles. Pins are stored in the blob records and reconciled against the offline queue on restore.
-- **SQL functions.** `BlobSize(ref)` (read from the reference) and `BlobLocality(ref)` (the local `stat`). Content does not pass through SQL.
+- **`plugin.blobs`** is the node's blob service for the plugin's default network, and `plugin.blobsFor(table)` the service of the network a given table uses. A reference means something only in the network whose machines hold the bytes.
+- **A put outside a transaction** (as in the example above) is pinned as `unstaged`. The first statement that stages the reference moves the pin to its transaction; a blob no statement has staged after a holding period (24 hours by default) is unpinned.
+- **A reference tree per table.** For a table with a `blobref` column the plugin maintains the table's reference tree, `<table>/blobrefs`, beside its index trees and staged the way `IndexManager` (`packages/quereus-plugin-optimystic/src/schema/index-manager.ts`) stages index entries, and adds it to the scope registry when the table is created or gains its first such column. Dropping the table removes it from the registry.
+- **Pins follow the transaction.** A reference staged by a statement is pinned under the transaction's identity. The pin is released when the transaction commits (after announcing the blob with the table's reference tree as its scope), rolls back, or, for a queued offline transaction, settles. Pins are stored in the blob records and reconciled against the offline queue on restore.
+- **SQL functions.** `BlobLocality(ref)` and `BlobSize(ref)`, both answered from the local `stat`. Content does not pass through SQL.
 
 Existing `blob` columns are untouched: values stay inline, base64 in the row, and keep reading. Two further steps build on the explicit type and are separate work:
 
@@ -195,32 +222,50 @@ Existing `blob` columns are untouched: values stay inline, base64 in the row, an
 
 Nothing reclaims block storage today, so a blob that is never reclaimed is no worse than a base64 value in a row. Reclaiming is still designed in, because blobs are where the bytes are.
 
+- **Referenced blobs are kept.** A `responsible` hold lasts while any registered reference tree lists the blob.
+- **Unreferenced blobs are reclaimed by each holder on its own reading of committed state.** Periodically a holder passes its held references against every registered reference tree. A blob listed nowhere at two passes a grace period apart (7 days by default) loses its `responsible` hold. No message from another peer deletes anything.
+- **An owed blob follows the same rule.** A writer whose cohort never fully holds a blob would otherwise keep it for ever. The pass also covers owed entries: one whose scope has not listed the blob at two passes a grace period apart is dropped with its hold.
+- **Only a certain answer counts.** A pass counts toward reclaiming only when every tree read was authoritative and confirmed current. A read that fails, is flagged unavailable or possibly stale, was answered with a block older than the log names it, or cannot reach the registry counts as "still referenced". So does a read that rested on asking nobody, unless the node is alone by the test the offline queue's reachability gate applies (no known member missing, no bootstrap peer still awaited): a node that merely cannot see its cohort gets unflagged "absent" answers for collections it does not hold, and must not act on them. And a registry that reads as absent on a node holding blobs counts as "still referenced", since the registry existed when those holds were taken. A machine that is partitioned, starting cold, or being fed old state keeps what it has.
+- **There is nothing to renew.** A design in which writers periodically extend a blob's lease was rejected: it costs a transaction per blob per period for ever, and it fails toward data loss whenever the renewing machine is a phone that stayed offline. Here the row is the lease, and it lasts as long as the row does.
 - **Cached blobs** are evicted under a budget, least recently read first. This is local and needs no agreement.
-- **Retention** is what an announcement says keeps a blob alive at its responsible holders: a **scope** (the id of a reference tree), **keep** (held until the holder leaves the cohort; for applications that manage references themselves), or neither, which makes the blob **provisional**.
-- **Provisional blobs** are kept for a grace period after the last announcement (7 days by default) and then reclaimed. This covers a transaction that put a blob and rolled back.
-- **Scoped blobs** are reclaimed by each holder on its own reading of committed state: when the reference tree has held no entry for the blob at two checks a grace period apart, the holder drops its `responsible` hold. No message from another peer deletes anything. A blob named under several scopes is kept while any of them references it.
-- **A reference that outlives its bytes** is possible only where the reference tree no longer lists it: an old revision of a row read from history. Such a read reports the blob as not held.
-- **Late commits are safe.** A transaction queued longer than the grace period still has the writer's pinned copy, and its commit announces the blob again with its scope.
+- **A reference that outlives its bytes** is possible only where no reference tree lists it any longer: an old revision of a row read from history. Such a read reports the blob as not held.
+- **Re-referencing is safe.** A row that comes to reference a blob others have reclaimed, or are about to, is committed by a writer that either holds the bytes (it just `put` them, and announces) or copied the reference from another row. In the second case the blob was referenced when it was copied, the new entry is visible to the next pass, and the two-pass rule keeps the holder from having dropped it in between.
+
+## Threats
+
+What a member that the network admits, or a stranger, can and cannot do.
+
+| Attack | Outcome |
+|---|---|
+| Fill other machines' storage by announcing blobs | Refused. A holder pulls only what a registered reference tree lists, so the attacker must commit rows, which is the network's existing write authority and leaves attributable rows that can be deleted. |
+| Aim storage at one victim by choosing content whose hash lands in its cohort | Possible in principle (as it is for block ids), and bounded the same way: each blob needs a committed reference. |
+| Flood announcements to make holders read reference trees | Bounded per peer; an announcement naming an unregistered scope is refused before any read. |
+| Make a live blob expire | Requires committing the removal of its references, which is deleting the rows. Feeding a holder stale or empty reads does not work: only certain answers count, twice, a grace period apart. |
+| Serve wrong bytes | Detected at the piece. The peer is penalized (`PenaltyReason` in `packages/db-p2p/src/reputation/types.ts`, the reason existing repair paths use for unverifiable content): the stream is authenticated and the fault attributable. The reader asks another holder. |
+| Craft a malformed tree to exhaust a reader | Bounded by the limits a reader applies before following any link. |
+| Exhaust a holder's bandwidth with `get` | Bounded per peer and per node; pieces are small and a holder may refuse a peer that is over its allowance. |
+| Learn whether known content exists in the network | A member can. Not treated as a secret; encrypt before `put` if it must be. |
+| Fetch content without being a member | Refused at the stream, before any request is read. |
 
 ## Platforms and limits
 
-- A piece at the default size is below every per-value limit the storage backends are known to have, including NativeScript's 512 KiB threshold for large JNI results.
+- A piece this design writes (256 KiB) is below every per-value limit the storage backends are known to have, including NativeScript's 512 KiB threshold for large JNI results. A reader accepts pieces of up to 1 MiB from blobs made by other IPFS tools, so every piece store must also store and return a piece of that size.
 - React Native's LevelDB store reads values as text for the block store; its piece store reads bytes.
 - Browsers store pieces in IndexedDB; adding the object store is a database version change.
-- A blob's size is limited only by a JavaScript safe integer.
+- The dag-pb and UnixFS codecs are new dependencies of `db-core`, and must pass the React Native bundle check.
 
 ## Compatibility
 
-The change is additive. A node on an older build does not register the blob protocol; peers see that from its protocol list and treat it as a member that does not accept blobs. Stored data gains a piece store and new key-value namespaces, and loses nothing, so an older build's data opens unchanged. A table that declares a `blobref` column cannot be opened by a plugin that predates the type; adopting the type is a schema change an application rolls out like any other.
+The change is additive. A node on an older build does not register the blob protocol; peers see that from its protocol list and treat it as a member that does not accept blobs. Stored data gains a piece store and new key-value namespaces, and loses nothing, so an older build's data opens unchanged. A table that declares a `blobref` column cannot be opened by a plugin that predates the type; adopting the type is a schema change an application rolls out like any other. An application with references of its own (Sereus Chat's `chunks:1:` references) tells them from these by their prefix and keeps reading the old ones.
 
 ## What this answers in GitHub #63
 
 | Ask | Answer |
 |---|---|
 | Skip the canonicalize, hash and clone passes for large values | A blob is hashed once per machine and never encoded, canonicalized or cloned. |
-| Carry a value once, not two to three times | A piece travels once, as raw bytes; the row and its log entry carry a reference of about 70 characters. |
+| Carry a value once, not two to three times | A piece travels once, as raw bytes; the row and its log entry carry a reference of about 60 characters. |
 | Deadline by progress, not a fixed total | True of blob transfer. Transaction deadlines are unchanged. |
 | Retries that resume | A fetch resumes at the missing piece. |
 | A write of any size should work without the application cutting it up | True of content. A transaction of ordinary rows is still limited to one frame. |
 
-The expected cost is one hash and one store write per piece on the writer, the same on each receiver, and a wire size of the content plus 32 bytes per piece. The work that builds the transfer measures time per MB and bytes on the wire against the #63 script's shape and states the result here.
+The expected cost is one hash and one store write per piece on the writer, the same on each receiver, and a wire size of the content plus a few kilobytes of list pieces per 45 MiB. The work that builds the transfer measures time per MB and bytes on the wire against the #63 script's shape and states the result here.

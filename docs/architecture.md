@@ -370,6 +370,7 @@ Instrumentation is built on the `debug` library (see [debugging.md](debugging.md
 | [matchmaking.md](matchmaking.md) | Peer discovery and quorum assembly (cohort-topic directory application) |
 | [crdt-sync.md](crdt-sync.md) | Convergent replicated state sync underpinning partition recovery |
 | [partition-healing.md](partition-healing.md) | Partition-induced invariant reconciliation: two-tier intent/invariant rules, deterministic application-defined merge |
+| [blobs.md](blobs.md) | Large values (proposed design, not implemented): content-addressed pieces stored and moved outside transactions, kept alive by the rows that reference them |
 | [offline-sync.md](offline-sync.md) | Offline mode (design; stages 1–3 implemented): SQL commits acknowledged once queued locally, optionally journaled, drained to the network in order with per-transaction status |
 | [correctness.md](correctness.md) | Formal safety and liveness properties |
 | [internals.md](internals.md) | Developer guide: data flow, invariants, pitfalls |
