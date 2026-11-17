@@ -34,3 +34,11 @@ Cohort selection already supports a node that does not serve. `findCluster` admi
 
 - Choosing which peers serve. That is the embedder's call (Sereus exposes it as a per-node role).
 - Owner-aware placement (`backlog/feat-cohort-selection-owner-aware-placement`), which selects among serving peers and is unaffected.
+
+## Evidence: GitHub sereus#63
+
+Sereus asked for the same capability from the application side (cadre-core 1.23.0). Every machine of a party is put into the party's control-network write cohorts, including machines that should only read (a paired officer's dashboard browser, voters' phones). With one unresponsive browser in the cohort they measured 84 to 105 s per control write, against well under 1 s without it. The wait itself is the other-peer stall tracked from Optimystic's own GitHub #64; this ticket is what keeps such a machine out of the cohort in the first place. What the report adds to the plan:
+
+- **Both kinds of network.** The need is for Sereus's control network as well as its per-workspace networks, so the option is per node, whatever the network is used for.
+- **The client still writes, and the plan must say at what cost.** The reporter requires a refused machine to keep reading (remotely when it holds nothing) and to write its own rows. Their interim patch let it coordinate its own writes and measured about 120 ms for a voter's registration write. Under this plan a client's write goes to a remote coordinator instead; the plan should state that this is the intended trade and what a client write costs on a relayed link.
+- **The other side of the same choice already exists.** `NodeOptions.isNetworkMember` lets every other node refuse a peer as a cohort member or coordinator ([docs/internals.md §Network Membership Predicate](../../docs/internals.md#network-membership-predicate)); Sereus's patch was the same idea (`controlCohortRefusal` / `strandCohortRefusal` predicates, plus an edge node withdrawing its storage protocols behind a closed identify gate). The plan should say how `servesBlocks: false` (the node declares itself a client) and the predicate (others decide) relate, and which one an embedder with a read-only role should use, so Sereus can drop its patch.

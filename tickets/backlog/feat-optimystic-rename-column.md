@@ -1,15 +1,12 @@
-description: Renaming a column on an Optimystic-backed table works for the rest of the session but is not saved, so after a restart the column has its old name again.
-files:
-  - packages/quereus-plugin-optimystic/src/optimystic-module.ts (`alterTable` `renameColumn` arm, added by optimystic-alter-add-check-persists)
-  - packages/quereus-plugin-optimystic/src/schema/schema-manager.ts (index columns persisted by NAME; CHECK / default / generated expressions persisted as ASTs naming columns)
-  - ../quereus/packages/quereus/src/runtime/emit/alter-table.ts (~L388–470, rename column)
-prereq: optimystic-alter-add-check-persists
-repro: verified
-severity: wrong-result
-likelihood: unusual
-tradeoffs: Declarative hosts rarely rename columns, and doing it properly means rewriting every place the record names the column (index columns, CHECK, default and generated expressions, foreign keys) — refusing the rename outright is a cheaper honest alternative.
+description: Let a column of an Optimystic-backed table be renamed, with the new name saved so it survives a restart. Today the rename is refused.
+files: packages/quereus-plugin-optimystic/src/optimystic-module.ts (`alterTable`, its `renameColumn` arm; `alterCatalogOnly`), packages/quereus-plugin-optimystic/src/schema/row-codec.ts (rows encoded as objects keyed by column name), packages/quereus-plugin-optimystic/src/schema/schema-manager.ts (index columns stored by name; CHECK, default and generated expressions stored as syntax trees naming columns), ../quereus/packages/quereus/src/runtime/emit/alter-table.ts (`runRenameColumn`), ../quereus/packages/quereus/src/runtime/stale-catalog-guard.ts (`assertCatalogMatchesModule`)
+tradeoffs: Declarative hosts rarely rename columns (an `apply schema` diff sees a drop and an add, not a rename), and a saved rename has to change either every stored row or the row encoding itself, which is a storage-format change with upgrade-check fixtures to match.
 ----
 
-Verified 2026-09-17: `create table main.t (id integer primary key, a integer null, constraint pos check (a > 0))`, insert a row, `alter table main.t rename column a to aa` succeeds and the session sees `[id, aa]`. A new session over the same storage that runs `hydrate` sees `[id, a]`. The rename goes through Quereus's engine-side schema-only fallback, which never reaches the catalog record.
+Formerly `bug-optimystic-rename-column-lost-on-restart`. Until Quereus 5.6.0, `alter table … rename column` on an Optimystic table renamed the column in this session's engine catalog only: the catalog record kept the old name, so a restart that hydrated brought it back (verified 2026-09-17). Quereus 5.6.0 added a check at connect (`assertCatalogMatchesModule` in `@quereus/quereus/src/runtime/stale-catalog-guard.ts`) that refuses every later statement on a table whose module has an `alterTable` hook and whose connected instance reports column names its catalog entry does not. The instance cannot take the new name, because the row codec encodes each row as an object keyed by column name, so the renamed column would read as absent. The plugin therefore now refuses RENAME COLUMN with `StatusCode.UNSUPPORTED` and changes nothing (pinned by "refuses RENAME COLUMN, changing nothing" in `packages/quereus-plugin-optimystic/test/alter-table-arms.spec.ts`).
 
-Expected: either the rename is persisted (record columns, index column names, and every stored expression that names the column rewritten, byte-identical to a fresh declaration with the new name), or it is refused with a clear error instead of silently reverting on restart.
+## What a saved rename needs
+
+- The catalog record takes the new name everywhere it names the column: the column list, index and unique-constraint column lists, foreign keys (on this table and on tables referencing it), and every stored expression (CHECK, default, generated, partial-index predicate). The result is byte-identical to a fresh declaration under the new name, so `apply schema` of that declaration diffs to nothing.
+- Stored rows stay readable under the new name. Either every row is rewritten (a whole-table write, refused while offline transactions are queued for the table, like ADD and DROP COLUMN), or rows stop being keyed by name — for example encoded positionally, with the record's column order as the key. The second is a row-format change: it needs a reader for rows written by earlier releases, and an `upgrade-check` fixture decision.
+- Another machine that hydrated before the rename keeps working from its own copy of the table description until it restarts (the same limit `bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced` describes).
