@@ -52,3 +52,7 @@ This needs a decision on the restoration-availability guarantee (can a node prov
 restorable from peers before dropping it locally?) that touches replication/responsibility and may
 warrant human sign-off on the durability model. Promote to `plan/` once the sweep + capacity work has
 settled and the restoration-availability question is scoped.
+
+## Arm: shared commit proofs
+
+Since `a-commit-proof-is-stored-once-not-once-per-block`, a revision's entry in the proofs store is a reference to one record in the commit-proofs store, keyed by the proof's `messageHash` and shared by every block revision that commit covers. Nothing deletes either today. A sweep that drops a revision record must drop its proofs-store reference with it, and may delete the shared record only when no other revision still references it — so it needs a reference count or a mark-and-sweep over the proofs store. Store-level tie: `saveBlockProof` in `packages/db-p2p/src/storage/kv-raw-storage.ts`.
