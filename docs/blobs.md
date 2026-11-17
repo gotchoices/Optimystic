@@ -233,6 +233,17 @@ Nothing reclaims block storage today, so a blob that is never reclaimed is no wo
 - **Accepted limits.** A reference copied from another row into a transaction that then stays queued offline for longer than the grace period, on a machine that never held the bytes, can commit after every holder has reclaimed the blob; it then reads as not held. Dropping a table leaves its reference tree in storage, so re-creating a table of the same name registers the old tree again and keeps the blobs its old rows listed. And the grace period is measured on each holder's own clock, so a clock set forward shortens it.
 - **Re-referencing is safe.** A row that comes to reference a blob others have reclaimed, or are about to, is committed by a writer that either holds the bytes (it just `put` them, and announces) or copied the reference from another row. In the second case the blob was referenced when it was copied, the new entry is visible to the next pass, and the two-pass rule keeps the holder from having dropped it in between.
 
+## Extending toward a file system
+
+This design gives blobs, not a file system: no names, no directories, no editing in place. A file system is expected to be built on top, with rows as the directory entries (a table of name, parent and a `blobref`), which already gives atomic rename and move, liveness by row, and partial reads. The design keeps four properties so that going further stays an addition and never a rewrite. They are requirements on the implementation.
+
+- **Below the format layer, a blob is only pieces and links.** Storage, transfer, holds, the sweep, copying and reclaiming never interpret a piece. They reach a blob's pieces through one walk in `db-core`, and one function there decodes a list piece. Admitting another kind of node, such as a UnixFS directory, changes that function and the walk; a directory's root would then be held, copied and reclaimed as a file's is.
+- **The reader accepts more than the writer makes.** Any UnixFS file tree within the reader's bounds is readable, whatever its piece sizes and fan-out. So a second way of cutting pieces (boundaries chosen from the content, so that an insertion does not shift every later piece) needs a new writer and no change to readers, stores or the wire.
+- **Building a tree is separate from cutting pieces.** The code that assembles list pieces from a sequence of leaf links is usable on its own. An append or an overwrite can then make a new blob from an existing blob's leaf links plus new pieces, without reading the unchanged content again. Because pieces are shared, the new blob costs only its new pieces and list pieces.
+- **The reference grammar is not narrowed to this writer's output.** A reference is any version-1, SHA-256 CID of a raw or dag-pb piece. A directory root is a dag-pb piece, so it would need no new kind of reference.
+
+What an extension would still have to decide: whether a directory is rows or a UnixFS node (rows give transactions and per-file placement; a node gives one reference for a whole tree and import from IPFS, but places the whole tree on one cohort unless child files are treated as blobs of their own); how an editor names the blob it is splicing from; and file-system semantics that have no counterpart here, such as permissions finer than membership and locks. Editing a range of a column value through SQL is the Quereus work described under [SQL](#sql).
+
 ## Threats
 
 What a member that the network admits, or a stranger, can and cannot do.
