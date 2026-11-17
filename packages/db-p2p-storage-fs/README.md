@@ -121,7 +121,8 @@ written since the last flush to `<basePath>/write-ahead.log` as one record — a
 length, a CRC-32, then each put or delete with its path. A flush given no
 window (`withinMs` absent or 0) then waits for the disk once, and that sync
 covers every record appended before it. A flush given a window resolves as soon
-as the record is appended; the log syncs by the earliest deadline any waiting
+as the record is appended (unless a checkpoint is behind; see **Checkpoint**
+below); the log syncs by the earliest deadline any waiting
 record was given, so many groups share one sync. A group that arrives to find
 an earlier deadline already passed makes the sync itself before it resolves,
 whatever its own window, so a disk that falls behind slows the writers rather
@@ -145,7 +146,29 @@ writes go to at once — then syncs every file written since the last checkpoint
 and every directory whose entries changed, then deletes the sealed segment. It
 runs when the log reaches `checkpointBytes`, `checkpointIdleMs` after the last
 append, and when the last store over the directory closes. Only the seal waits
-in line with writes; the syncs run beside them. A crash during a checkpoint
+in line with writes; the syncs run beside them, one at a time, and each starts
+only once no write is in line, so a flush's own append and sync wait for at most
+the one checkpoint sync already running. (Syncing many at once is what made the
+flush that started a checkpoint, and the dozen after it, take seconds on macOS,
+GitHub issue #62: there every sync flushes the drive's whole write cache, and
+every file operation of the process shares Node's four I/O threads.) The
+checkpoint the last close runs has no writes to make way for, and syncs sixteen
+at a time, as the open's replay does.
+
+When writes outrun the disk — the log reaches `checkpointBytes` again while the
+checkpoint before it is still syncing — the checkpoint is **behind**: its syncs
+stop making way, and each flush, after its append, waits until the checkpoint
+has made that flush's share of them before it resolves. The share is what the
+flush's bytes cost (its record's bytes times the sealed segment's syncs per
+byte), or more when the checkpoint made little progress before it fell behind:
+enough that it finishes before the log reaches twice `checkpointBytes`. Writes
+then slow to the pace the disk keeps, rather than one flush waiting out a whole
+checkpoint, and the log holds about twice `checkpointBytes` at most, plus a
+group from each store over the directory. A flush never waits for a checkpoint
+it did not fall behind. The first flush to wait in a checkpoint logs
+`checkpoint-behind` on the `optimystic:db-p2p-storage-fs:write-log` channel,
+with how many of the checkpoint's syncs are done; seen often, the disk cannot
+keep up with the writes. A crash during a checkpoint
 leaves the sealed segment behind, and the next open replays it before the
 current log. A checkpoint that fails latches the store failed, like a failed
 flush, because a half-synced tree under a discarded log could not be recovered.

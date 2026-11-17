@@ -263,7 +263,7 @@ store once its LevelDB binding can sync a batch (it cannot today, so there every
 |---|---|---|---|---|
 | `MemoryStoreDriver` | the in-memory map update | nothing | ignored | `'none'` |
 | `WriteGroupDriver` (`packages/db-p2p/src/storage/write-group-driver.ts`) | nothing: it is recorded in memory and served from there | seals the group and hands it to the backend's `commit`; a strict flush resolves when the batch is durable, a relaxed one when it is committed | the time left to the earliest deadline of the flushes sharing the seal is passed to the backend's `commit` as `syncWithinMs`; honoured only as far as the backend defers | the backend's |
-| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
+| `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once (or, while a checkpoint is behind, once its share of the checkpoint's syncs is done) and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
 | `JournalBatchBackend` (`packages/db-p2p/src/storage/journal-batch-backend.ts`), under `WriteGroupDriver`, over a `JournalStore` the engine implements | nothing: it is recorded in memory and served from there | over a store that can sync: a strict flush is one synced apply of every journal record held plus the group itself; a relaxed one appends the group as one unsynced journal record and resolves, and the held records are applied in one synced apply by the earliest deadline among them. Over a store that cannot sync: one atomic apply per group, never journaled | honoured over a store that can sync: one apply covers every record appended since the last, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed; ignored over one that cannot | the store's: `'power-loss'` when it can sync an apply, else what the engine gives |
 | `LevelDBJournalStore` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the handle can sync a batch (`canSync` on the package's `LevelDBLike`, which `classic-level` reports and `rn-leveldb` cannot yet): as the journal backend's row, an append being one unsynced LevelDB batch putting the record under the journal's tag byte and an apply one batch over the data tags and the journal written with LevelDB's `sync` option. Where it cannot: one unsynced batch per group, never journaled | honoured where the handle can sync, as the journal backend's row; ignored where it cannot | `'power-loss'` where the handle can sync, else `'process-crash'`, which `rn-leveldb` is today |
 | `IndexedDBJournalStore` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the browser honours `durability: 'strict'` (every current release): as the journal backend's row, an append being one relaxed `readwrite` transaction on the `journal` object store and an apply one strict transaction over the six data stores and the journal, which completes only once the browser has put it on the disk. Where it does not: one relaxed transaction per group, never journaled | honoured where the browser honours strict transactions, as the journal backend's row; ignored where it does not | `'power-loss'` where the browser honours strict transactions, else `'process-crash'` |
@@ -322,8 +322,8 @@ a CRC-32, then each put or delete with its path relative to the store directory)
 it survives a crash of this process from that moment: the next open's replay applies it. What the
 sync adds is surviving a power cut, and the log makes one sync cover many records
 (`FileWriteLog.commit`): a batch committed with `syncWithinMs` 0 is synced before its commit
-resolves, with every batch waiting ahead of it; one committed with a window resolves at once and
-waits in the log's `unsynced` list with its deadline, counted from the commit's call, and a timer
+resolves, with every batch waiting ahead of it; one committed with a window resolves at once — unless
+a checkpoint is behind, below — and waits in the log's `unsynced` list with its deadline, counted from the commit's call, and a timer
 armed for the earliest deadline runs the sync for everything waiting. A commit that finds the
 earliest waiting deadline already passed syncs before it resolves whatever its own window, so when
 the disk falls behind, writers wait for it rather than the window growing; a sync that started
@@ -353,8 +353,25 @@ The log keeps every file it wrote and every directory whose entries changed sinc
 checkpoint, and a checkpoint (`FileWriteLog.checkpoint`) spends that set to discard the log: it
 **seals** the log, in line with commits so no apply is in flight, by renaming it to
 `write-ahead.log.sealed`, starting an empty one and taking the set; it **syncs** every file and then
-every directory in the set, sixteen at a time, while commits carry on into the new log; and it
-**truncates** by deleting the sealed segment and syncing the directory. A file deleted since the seal
+every directory in the set while commits carry on into the new log; and it **truncates** by deleting
+the sealed segment and syncing the directory. The syncs run one at a time, and each starts only when
+no task is queued or running in the log's queue — a commit, a sync step, a seal — so a commit's own
+append and log sync wait for at most the one tree sync in flight (`FileWriteLog.syncSealed` in
+`packages/db-p2p-storage-fs/src/file-write-log.ts`). Every `fs` call of the process runs on libuv's
+thread pool, four threads by default, and a sync holds one for its whole length; on macOS libuv
+implements `fsync` as `F_FULLFSYNC`, a flush of the drive's whole write cache, made one after another
+by the device. Sixteen at a time, a checkpoint held every thread for its whole length and queued every
+commit and read behind it, which is GitHub #62's seconds-long commit at each checkpoint. The last
+close's checkpoint has no commit to make way for and syncs sixteen at a time, as the open's replay
+does. When the current log reaches `checkpointBytes` while the checkpoint before it is still running,
+the checkpoint is **behind**: its syncs stop making way, and a commit, after its append and outside
+the queue, waits until the checkpoint has completed the commit's share of its syncs — the record's
+bytes times the sealed segment's paths per byte, or more when finishing before the current log
+reaches twice `checkpointBytes` takes more (`CheckpointPace.charge` in
+`packages/db-p2p-storage-fs/src/checkpoint-pace.ts`). Shares are charged in append order on one count,
+so writers together are held to the rate the disk makes the tree durable, and the log stays near twice
+`checkpointBytes`. A commit never waits for a checkpoint it did not fall behind, and the first to wait
+in a checkpoint logs `checkpoint-behind` on the write-log channel. A file deleted since the seal
 is skipped and one rewritten since is synced with content the new log also covers. It runs when the
 log reaches `checkpointBytes` (16 MiB by default), `checkpointIdleMs` (5 s) after the last append,
 and on the last close of the directory's log, one at a time, and a failure latches the store failed

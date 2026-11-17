@@ -11,7 +11,7 @@ import {
 	encodeWriteLogRecord, decodeWriteLog, type WriteLogEntry,
 } from '../src/index.js';
 import { trackedStores } from './support/tracked-stores.js';
-import { interceptHandleSync, interceptRename, parkUnlink, withFailingWriteFile } from './support/fs-injection.js';
+import { interceptHandleSync, interceptRename, parkHandleSyncs, parkUnlink, withFailingWriteFile } from './support/fs-injection.js';
 
 // ---------------------------------------------------------------------------
 // The write-ahead log on its own: what a strict replay applies from a damaged log, what a commit
@@ -327,6 +327,146 @@ describe('FileWriteLog checkpoint', () => {
 			assert.ok(!(await sealedExists()));
 			assert.ok((await logFileBytes(base)).equals(Buffer.from(WRITE_LOG_HEADER)));
 		});
+	});
+});
+
+describe('FileWriteLog checkpoint pacing', () => {
+	let base: string;
+	/** Timers the log arms are never fired, so the size threshold is the only checkpoint trigger. */
+	const noTimers = (): (() => void) => () => { };
+	/** 20 files in one new directory: the sealed segment covers 22 paths — the files, `blk`, and the store's root, whose entry for `blk` is new. */
+	const twentyFiles = (valueBytes: number): WriteLogEntry[] =>
+		Array.from({ length: 20 }, (_, i) => put(`blk/file-${String(i).padStart(2, '0')}.json`, 'x'.repeat(valueBytes)));
+	const TWENTY_FILES_PATHS = 22;
+
+	beforeEach(async () => {
+		base = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-wal-pacing-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(base, { recursive: true, force: true });
+	});
+
+	it('syncs one tree path at a time, and starts none while a commit is in the log\'s queue', async () => {
+		const log = FileWriteLog.acquire(base, { setTimer: noTimers });
+		const isLog = (filePath: string) => filePath === log.logPath;
+		const isTree = (filePath: string) => !isLog(filePath);
+		// The store's root is synced by the open, the seal and the truncate as well as by the
+		// checkpoint (on every platform but win32), so it is never parked and not counted as started.
+		const isTreeBelowRoot = (filePath: string) => isTree(filePath) && filePath !== log.basePath;
+		let parkLogSync = false;
+		const parking = parkHandleSyncs(filePath => isLog(filePath) ? parkLogSync : isTreeBelowRoot(filePath));
+		try {
+			await log.commit(Array.from({ length: 40 }, (_, i) => put(`blk/file-${i}.json`, `v${i}`)), STRICT);
+			const checkpointing = log.checkpoint();
+			const first = await parking.parked(isTreeBelowRoot);
+
+			parkLogSync = true;
+			const committing = log.commit([put('blk/later.json', 'later')], STRICT);
+			const logSync = await parking.parked(isLog);
+			first.release();
+			await first.closed;
+			await new Promise(resolve => setImmediate(resolve));
+			assert.strictEqual(parking.started(isTreeBelowRoot), 1, 'no tree sync starts while the commit holds the queue');
+			assert.strictEqual(await isSettled(committing), false);
+
+			parkLogSync = false;
+			logSync.release();
+			await committing;
+			await parking.parked(isTreeBelowRoot);
+			assert.strictEqual(parking.started(isTreeBelowRoot), 2, 'the next tree sync starts once the commit has resolved');
+
+			parking.releaseAll();
+			await checkpointing;
+			assert.strictEqual(parking.mostInFlight(isTree), 1, 'never more than one tree sync in flight');
+		} finally {
+			parking.releaseAll();
+			await log.release();
+			parking.restore();
+		}
+	});
+
+	it('a commit made while the checkpoint is behind waits for its share of the checkpoint\'s syncs, and no longer', async () => {
+		const checkpointBytes = 1000;
+		const log = FileWriteLog.acquire(base, { setTimer: noTimers, checkpointBytes });
+		const isTree = (filePath: string) => filePath !== log.logPath;
+		const parking = parkHandleSyncs(filePath => isTree(filePath) && filePath !== log.basePath);
+		try {
+			const sealedBatch = twentyFiles(30);
+			const sealedBytes = encodeWriteLogRecord(sealedBatch).length;
+			assert.ok(sealedBytes >= checkpointBytes, 'the batch crosses the size threshold');
+			await log.commit(sealedBatch, STRICT);
+			const checkpointing = log.checkpoint();
+
+			// Ten syncs while nothing is queued: the checkpoint is not starved, so a share is what the
+			// record's own bytes cost, `record bytes × paths / sealed bytes`, rounded up.
+			for (let i = 0; i < 10; i++) {
+				const parked = await parking.parked(isTree);
+				parked.release();
+			}
+			let next = await parking.parked(isTree);
+
+			const filler = [put('other/filler.json', 'y'.repeat(checkpointBytes - 100))];
+			assert.ok(encodeWriteLogRecord(filler).length < checkpointBytes);
+			await log.commit(filler, STRICT);
+			const late = [put('other/late.json', 'z'.repeat(60))];
+			const share = Math.ceil(encodeWriteLogRecord(late).length * TWENTY_FILES_PATHS / sealedBytes);
+			assert.ok(share >= 2, 'the share spans more than one sync');
+			const committing = log.commit(late, STRICT);
+			await log.sync(); // queued behind the commit's append, so the commit has been charged
+
+			for (let synced = 0; synced < share; synced++) {
+				assert.strictEqual(await isSettled(committing), false, `still waiting after ${synced} of its ${share} syncs`);
+				next.release();
+				await next.closed;
+				if (synced + 1 < share) next = await parking.parked(isTree);
+			}
+			assert.strictEqual(await isSettled(committing), true, 'resolved once its share was synced');
+			assert.strictEqual(await isSettled(checkpointing), false, 'while the checkpoint still has syncs to make');
+
+			parking.releaseAll();
+			await checkpointing;
+		} finally {
+			parking.releaseAll();
+			await log.release();
+			parking.restore();
+		}
+	});
+
+	it('a commit that takes the log past twice checkpointBytes waits for the rest of the checkpoint', async () => {
+		const checkpointBytes = 1000;
+		const log = FileWriteLog.acquire(base, { setTimer: noTimers, checkpointBytes });
+		const isTree = (filePath: string) => filePath !== log.logPath;
+		const parking = parkHandleSyncs(filePath => isTree(filePath) && filePath !== log.basePath);
+		try {
+			// A sealed segment three times the threshold, with no sync made yet: its own bytes would charge
+			// the late record under half the checkpoint's syncs.
+			const sealedBatch = twentyFiles(130);
+			const sealedBytes = encodeWriteLogRecord(sealedBatch).length;
+			await log.commit(sealedBatch, STRICT);
+			let next = await parking.parked(isTree);
+
+			await log.commit([put('other/filler.json', 'y'.repeat(checkpointBytes - 100))], STRICT);
+			const late = [put('other/late.json', 'z'.repeat(checkpointBytes + 100))];
+			const ownShare = Math.ceil(encodeWriteLogRecord(late).length * TWENTY_FILES_PATHS / sealedBytes);
+			const committing = log.commit(late, STRICT);
+			await log.sync();
+
+			for (let released = 0; released < 19; released++) {
+				next.release();
+				await next.closed;
+				next = await parking.parked(isTree);
+			}
+			assert.ok(ownShare < 19);
+			assert.strictEqual(await isSettled(committing), false, 'still waiting with one file of the sealed segment unsynced');
+
+			parking.releaseAll();
+			await committing;
+		} finally {
+			parking.releaseAll();
+			await log.release();
+			parking.restore();
+		}
 	});
 });
 

@@ -6,6 +6,7 @@ import * as path from 'path';
 import { crc32 } from 'zlib';
 import { armUnrefTimer } from '@optimystic/db-core';
 import { StoreFailedError, SyncDeadlines, type CommittedBatch, type SetTimer, type SinkCommitOptions, type StoreIdentity } from '@optimystic/db-p2p';
+import { CheckpointPace } from './checkpoint-pace.js';
 import { createLogger } from './logger.js';
 import { acquireStoreLock, StoreLockedError, type StoreLock } from './store-lock.js';
 
@@ -25,8 +26,12 @@ export const DEFAULT_CHECKPOINT_BYTES = 16 * 1024 * 1024;
 /** {@link FileWriteLogOptions.checkpointIdleMs}'s default. */
 export const DEFAULT_CHECKPOINT_IDLE_MS = 5000;
 
-/** How many files, then directories, a checkpoint syncs at once. */
-const CHECKPOINT_SYNC_CONCURRENCY = 16;
+/**
+ * How many files, then directories, the open's replay and the last release's checkpoint sync at
+ * once: no commit competes with either. Every other checkpoint syncs one at a time (see
+ * `FileWriteLog.syncSealed`).
+ */
+const UNCONTENDED_SYNC_CONCURRENCY = 16;
 
 /**
  * The log's fixed header: the magic bytes `OPTIMYSTIC-WAL`, then one format-version byte. A file
@@ -321,6 +326,12 @@ function checkpointSettings(options: FileWriteLogOptions): CheckpointSettings {
 const noop = (): void => { };
 const emptyDirty = (): DirtyPaths => ({ files: new Set(), directories: new Set() });
 
+/** What a checkpoint's seal hands its sync phase: the paths to sync, and the pace commits are charged against. */
+interface SealedSegment {
+	readonly dirty: DirtyPaths;
+	readonly pace: CheckpointPace;
+}
+
 /**
  * The write-ahead log of one store directory: `<basePath>/write-ahead.log`, every batch of writes
  * appended as one record, synced by the earliest deadline any batch was given, and applied to the
@@ -389,6 +400,12 @@ export class FileWriteLog {
 	private lock: StoreLock | undefined;
 	/** Commits and seals run one at a time, in order, on this chain; it never rejects. */
 	private queue: Promise<unknown> = Promise.resolve();
+	/** Tasks queued or running on {@link queue}. A checkpoint's tree sync starts only while this is 0, unless the checkpoint is behind. */
+	private queuedTasks = 0;
+	/** Wakes the checkpoint's sync phase waiting in {@link giveWayToLog}; at most one checkpoint runs, so at most one waits. */
+	private wakeWaitingSync: (() => void) | undefined;
+	/** The running checkpoint's progress, from its seal until its truncate has finished; see {@link isBehind}. */
+	private pace: CheckpointPace | undefined;
 	private fault: { cause: unknown } | undefined;
 	private closed = false;
 	/** The checkpoint running now, if any, which also runs every one asked for while it ran. */
@@ -454,6 +471,10 @@ export class FileWriteLog {
 	 * - **Backpressure:** a commit that finds the earliest unsynced deadline already passed runs the
 	 *   sync step before it resolves, whatever its own window. When the disk falls behind, writers
 	 *   wait for it instead of the window quietly growing.
+	 * - **Checkpoint pacing:** a commit that finds the checkpoint behind ({@link isBehind}) resolves
+	 *   only once the running checkpoint has made the syncs its record is charged
+	 *   (`CheckpointPace.charge`), waited for after its append and outside the queue. A commit never
+	 *   waits for a checkpoint it did not fall behind.
 	 *
 	 * The deadlines, the timer and the backpressure test are the rules of `SyncDeadlines`, from
 	 * `@optimystic/db-p2p`, which every store that defers its sync shares.
@@ -467,11 +488,11 @@ export class FileWriteLog {
 			return Promise.reject(new RangeError(`syncWithinMs must be a finite number of milliseconds at or above 0, got ${syncWithinMs}`));
 		}
 		const deadline = this.unsynced.deadlineFor(syncWithinMs);
-		return this.enqueue(async () => {
+		const appended = this.enqueue(async () => {
 			await this.open();
 			if (this.closed) throw new Error(`write-ahead log at ${this.basePath} is closed`);
 			this.throwIfFailed();
-			await this.append(entries);
+			const recordBytes = await this.append(entries);
 			// A checkpoint syncs the tree outside the queue, so its failure can latch the log while the
 			// append is in flight; the commit is then refused like every later one, its record left to the
 			// next open's replay. Checked with no await before `defer`, which throws once latched.
@@ -479,7 +500,14 @@ export class FileWriteLog {
 			const durable = this.unsynced.defer(entries, deadline);
 			if (this.unsynced.mustSyncNow(deadline)) await this.syncUnsynced();
 			this.scheduleCheckpoint();
-			return { durable };
+			return { batch: { durable }, share: this.chargeIfBehind(recordBytes) };
+		});
+		// The share is waited for once the task has left the queue, so a waiting commit holds back no
+		// append behind it and is not a task the checkpoint's syncs give way to: were it either, the
+		// checkpoint would wait for the commit that waits for it.
+		return appended.then(async ({ batch, share }) => {
+			await share;
+			return batch;
 		});
 	}
 
@@ -533,7 +561,11 @@ export class FileWriteLog {
 	}
 
 	private enqueue<T>(task: () => Promise<T>): Promise<T> {
-		const run = this.queue.then(task);
+		this.queuedTasks += 1;
+		const run = this.queue.then(task).finally(() => {
+			this.queuedTasks -= 1;
+			if (this.queuedTasks === 0) this.wakeCheckpointSync();
+		});
 		this.queue = run.catch(noop);
 		return run;
 	}
@@ -598,10 +630,12 @@ export class FileWriteLog {
 
 	/** Apply one log file's intact records, in order, into `touched`. */
 	private async replaySegment(filePath: string, touched: DirtyPaths): Promise<'absent' | 'complete' | 'stopped-short'> {
-		// NOTE: a log file is read into memory for one decode. A checkpoint bounds the current log to
-		// about `checkpointBytes` plus what is appended while a checkpoint runs, and a sealed segment
-		// to one such log; if a log is ever found much larger than that, decode it record by record
-		// from a stream instead.
+		// NOTE: a log file is read into memory for one decode. The current log reaches about twice
+		// `checkpointBytes` at most — past `checkpointBytes` with the checkpoint before it still
+		// syncing, each commit waits for a share of that checkpoint's syncs charged to finish it by then
+		// (`CheckpointPace.charge`) — plus about one record from each store over the directory, since a
+		// commit waits after its append; a sealed segment is one such log. If a log is ever found much
+		// larger than that, decode it record by record from a stream instead.
 		const bytes = await readFileIfExists(filePath);
 		if (bytes === undefined) return 'absent';
 		const decoded = decodeWriteLog(bytes);
@@ -634,13 +668,14 @@ export class FileWriteLog {
 	 * Append the batch as one record. The record has reached the operating system when this
 	 * resolves, so it survives a crash of this process: the next open's replay applies it. A failed
 	 * append latches the log, and rejects every batch still waiting for its sync, since no sync will
-	 * ever be made for them.
+	 * ever be made for them. Resolves with the record's length.
 	 */
-	private async append(entries: readonly WriteLogEntry[]): Promise<void> {
+	private async append(entries: readonly WriteLogEntry[]): Promise<number> {
 		try {
 			const record = encodeWriteLogRecord(entries);
 			await writeAll(this.handle!, record);
 			this.appendedBytes += record.length;
+			return record.length;
 		} catch (err) {
 			throw this.latch(err);
 		}
@@ -778,9 +813,9 @@ export class FileWriteLog {
 	 *    still waiting, rename the log to {@link SEALED_WRITE_LOG_FILENAME} and start an empty one, and
 	 *    take the dirty set, leaving an empty one. Commits resume on the new log at once; only this
 	 *    step waits in the queue.
-	 * 2. **Sync**, off the commit path: every file in the taken set, then every directory. A file
-	 *    deleted since is skipped; one rewritten since is synced with its newer content, which the
-	 *    new log covers too.
+	 * 2. **Sync**, off the commit path: every file in the taken set, then every directory, at the
+	 *    pace {@link syncSealed} sets. A file deleted since is skipped; one rewritten since is synced
+	 *    with its newer content, which the new log covers too.
 	 * 3. **Truncate**: unlink the sealed segment and sync the directory.
 	 *
 	 * A crash anywhere in this leaves the sealed segment, the current log or both, and the next open
@@ -792,22 +827,27 @@ export class FileWriteLog {
 		const sealed = await this.seal();
 		if (!sealed) return;
 		try {
-			await syncDirtyPaths(sealed);
+			await this.syncSealed(sealed);
 			await fs.unlink(this.sealedPath);
 			await fsyncDir(this.basePath);
 		} catch (err) {
 			throw this.latch(err);
+		} finally {
+			this.pace = undefined;
+			sealed.pace.end();
 		}
 	}
 
 	/**
-	 * Step 1 of {@link checkpointOnce}: the dirty set the sealed segment covers, or `undefined` when
-	 * there is nothing to seal. The sync step runs first, so the sealed segment holds only synced
-	 * records whose tree writes are in the set the checkpoint goes on to sync. An unsynced record
-	 * always has bytes, so `appendedBytes` is never 0 while one waits: the early return cannot skip
-	 * one, and the final checkpoint on the last release syncs whatever is still waiting.
+	 * Step 1 of {@link checkpointOnce}: the dirty set the sealed segment covers, with the pace its
+	 * syncs are counted on, or `undefined` when there is nothing to seal. The sync step runs first, so
+	 * the sealed segment holds only synced records whose tree writes are in the set the checkpoint
+	 * goes on to sync. An unsynced record always has bytes, so `appendedBytes` is never 0 while one
+	 * waits: the early return cannot skip one, and the final checkpoint on the last release syncs
+	 * whatever is still waiting. The pace is published inside the queued task, with the log's size
+	 * reset beside it, so every commit after the seal measures {@link isBehind} against it.
 	 */
-	private seal(): Promise<DirtyPaths | undefined> {
+	private seal(): Promise<SealedSegment | undefined> {
 		return this.enqueue(async () => {
 			if (this.fault || this.appendedBytes === 0) return undefined;
 			await this.syncUnsynced();
@@ -820,11 +860,92 @@ export class FileWriteLog {
 			} catch (err) {
 				throw this.latch(err);
 			}
-			const sealed = this.dirty;
+			const dirty = this.dirty;
+			const pace = new CheckpointPace(dirty.files.size + dirty.directories.size, this.appendedBytes);
 			this.dirty = emptyDirty();
 			this.appendedBytes = 0;
-			return sealed;
+			this.pace = pace;
+			return { dirty, pace };
 		});
+	}
+
+	/**
+	 * Step 2 of {@link checkpointOnce}: one path at a time, each started only once the log's queue is
+	 * empty — unless the checkpoint is behind, when they stop giving way. Every `fs` call of the
+	 * process shares libuv's thread pool (four threads by default), and a sync holds a thread for its
+	 * whole duration; on macOS each one is an `F_FULLFSYNC`, a flush of the drive's whole write cache.
+	 * Synced many at a time, they held every thread and queued the commits' own appends and log syncs
+	 * behind them for the length of the checkpoint (GitHub #62). One at a time, a commit's log sync
+	 * waits for at most the one tree sync already in flight. The last release's checkpoint has no
+	 * commit to make way for, and syncs at the replay's width.
+	 *
+	 * NOTE: a checkpoint's file sync holds a handle open while later commits may delete and re-create
+	 * the same path. libuv opens with delete sharing and, on Windows 10 1809 and later, unlinks with
+	 * POSIX semantics, so the name goes at once; on an older Windows the re-create would fail with
+	 * EPERM while the deleted name lingers, latching the store. If that is ever seen, retry the apply's
+	 * write on EPERM for the length of one sync.
+	 */
+	private async syncSealed({ dirty, pace }: SealedSegment): Promise<void> {
+		if (this.closed) {
+			await syncDirtyPaths(dirty);
+			return;
+		}
+		for (const file of dirty.files) await this.pacedSync(fsyncFile, file, pace);
+		for (const dir of dirty.directories) await this.pacedSync(fsyncDir, dir, pace);
+	}
+
+	private async pacedSync(sync: (target: string) => Promise<void>, target: string, pace: CheckpointPace): Promise<void> {
+		await this.giveWayToLog();
+		await sync(target);
+		pace.completeOne();
+	}
+
+	/**
+	 * Wait while a task is queued or running on the log's queue, unless the checkpoint is behind.
+	 *
+	 * NOTE: a writer of strict flushes keeps the queue busy most of the time (each sync step's log
+	 * sync and tree writes run in it), so the checkpoint makes few syncs before it falls behind, and
+	 * a writer faster than the disk then alternates a run of `checkpointBytes` at full speed with one
+	 * at about twice the disk's pace (modelled for GitHub #62). If that alternation is seen to hurt,
+	 * stop giving way part-way to `checkpointBytes` rather than at it.
+	 */
+	private async giveWayToLog(): Promise<void> {
+		while (this.queuedTasks > 0 && !this.isBehind()) {
+			await new Promise<void>(resolve => { this.wakeWaitingSync = resolve; });
+		}
+	}
+
+	private wakeCheckpointSync(): void {
+		const wake = this.wakeWaitingSync;
+		this.wakeWaitingSync = undefined;
+		wake?.();
+	}
+
+	/**
+	 * The checkpoint is behind: the current log has reached `checkpointBytes` while the checkpoint
+	 * before it is still running. Lasts until that checkpoint ends, since the log only grows until the
+	 * next seal.
+	 */
+	private isBehind(): boolean {
+		return this.pace !== undefined && this.appendedBytes >= this.settings.checkpointBytes;
+	}
+
+	/**
+	 * After an append: when the checkpoint is behind, stop its syncs giving way and charge this
+	 * commit its share of them, returning the wait for it; otherwise nothing. The first commit to wait
+	 * in a checkpoint says so, once, on the write-log channel.
+	 */
+	private chargeIfBehind(recordBytes: number): Promise<void> | undefined {
+		const pace = this.pace;
+		if (!pace || !this.isBehind()) return undefined;
+		this.wakeCheckpointSync();
+		const share = pace.charge(recordBytes, this.appendedBytes, this.settings.checkpointBytes);
+		if (share && pace.firstToWait()) {
+			const { synced, paths } = pace.progress;
+			log('checkpoint-behind: the log of %s reached %d bytes, past checkpointBytes (%d), while the checkpoint before it had synced %d of %d paths; each write now waits for its share of the rest, so writes slow to the pace the disk keeps',
+				this.basePath, this.appendedBytes, this.settings.checkpointBytes, synced, paths);
+		}
+		return share;
 	}
 
 	// --- close ---
@@ -855,18 +976,10 @@ export class FileWriteLog {
 	}
 }
 
-/**
- * Sync every file, then every directory, {@link CHECKPOINT_SYNC_CONCURRENCY} at a time.
- *
- * NOTE: a checkpoint's file sync holds a handle open while later commits may delete and re-create
- * the same path. libuv opens with delete sharing and, on Windows 10 1809 and later, unlinks with
- * POSIX semantics, so the name goes at once; on an older Windows the re-create would fail with
- * EPERM while the deleted name lingers, latching the store. If that is ever seen, retry the apply's
- * write on EPERM for the length of one sync.
- */
+/** Sync every file, then every directory, {@link UNCONTENDED_SYNC_CONCURRENCY} at a time: for the replay and the last release's checkpoint. */
 async function syncDirtyPaths(dirty: DirtyPaths): Promise<void> {
-	await forEachConcurrently(dirty.files, CHECKPOINT_SYNC_CONCURRENCY, fsyncFile);
-	await forEachConcurrently(dirty.directories, CHECKPOINT_SYNC_CONCURRENCY, fsyncDir);
+	await forEachConcurrently(dirty.files, UNCONTENDED_SYNC_CONCURRENCY, fsyncFile);
+	await forEachConcurrently(dirty.directories, UNCONTENDED_SYNC_CONCURRENCY, fsyncDir);
 }
 
 /** Run `fn` over `items` with at most `limit` in flight; after the first failure no more start, and it is thrown once all in flight have settled. */
