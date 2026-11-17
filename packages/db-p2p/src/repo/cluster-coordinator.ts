@@ -296,6 +296,12 @@ interface CommitRetryState {
 	 * not a counted attempt, so the first retry after it starts the attempt budget and the backoff afresh.
 	 */
 	deferred?: true;
+	/**
+	 * Re-armed by {@link ClusterCoordinator.runRetry} because every pending member had a request riding to
+	 * it. Its timer is only a fallback, at the longest retry interval: the answer that ends one of those
+	 * requests re-arms the retry at its own interval ({@link ClusterCoordinator.resumeRetryAfterInFlight}).
+	 */
+	waitingOnInFlight?: true;
 }
 
 /**
@@ -560,6 +566,7 @@ export class ClusterCoordinator {
 			if (outcome?.delivered === true && state?.retry !== undefined) {
 				this.settleOwedDelivery(state, state.retry, peerId, outcome.outcome);
 			}
+			if (state !== undefined) this.resumeRetryAfterInFlight(state);
 		}
 	}
 
@@ -657,6 +664,18 @@ export class ClusterCoordinator {
 			return;
 		}
 		this.foldStragglerAnswer(state, state.retry, phase, delivery);
+		this.resumeRetryAfterInFlight(state);
+	}
+
+	/**
+	 * A request riding to one of `state`'s owed members ended. A retry that was only waiting on such
+	 * requests runs at its own interval again, so a member the request did not settle is sent the record
+	 * promptly rather than at the fallback. A retry run in progress re-arms itself.
+	 */
+	private resumeRetryAfterInFlight(state: ClusterTransactionState): void {
+		const retry = state.retry;
+		if (retry?.waitingOnInFlight !== true || retry.running === true) return;
+		this.armRetry(state, Array.from(retry.pendingPeers), { attempt: retry.attempt, intervalMs: retry.intervalMs, ...(retry.deferred ? { deferred: true } : {}) });
 	}
 
 	/**
@@ -1952,6 +1971,12 @@ export class ClusterCoordinator {
 	 *
 	 * Never awaited into the caller's throw and never rethrows: an abandonment must not turn into a
 	 * *different* failure, and the staleness sweep remains the backstop if delivery fails.
+	 *
+	 * NOTE: a promise-round straggler ({@link adoptStragglers}) is sent this while its promise request is
+	 * still on its way. Taken in the other order, the stale promise request plants a reservation after the
+	 * abandonment cleared nothing, and it holds until the member's staleness sweep — the shape the escorted
+	 * pend NOTE at {@link takeOwedRecords} records. If such reservations show up as `held` or `conflict`
+	 * votes, send this to an in-flight member when its answer arrives instead.
 	 */
 	private broadcastAbandonment(record: ClusterRecord, reason: string): void {
 		const peerIds = Object.keys(record.peers);
@@ -2007,16 +2032,20 @@ export class ClusterCoordinator {
 		log('cluster-tx:retry-scheduled', { messageHash, attempt: nextAttempt, missingPeers, delayMs: baseInterval });
 	}
 
-	/** Replace `state`'s retry with one owing `peers` the record, whose timer fires after `timing.intervalMs`. */
-	private armRetry(state: ClusterTransactionState, peers: readonly string[], timing: { attempt: number; intervalMs: number; deferred?: true }): void {
+	/**
+	 * Replace `state`'s retry with one owing `peers` the record, whose timer fires after `timing.intervalMs`
+	 * — or, for a retry waiting on in-flight requests, after the longest retry interval.
+	 */
+	private armRetry(state: ClusterTransactionState, peers: readonly string[], timing: { attempt: number; intervalMs: number; deferred?: true; waitingOnInFlight?: true }): void {
 		const { messageHash } = state;
 		if (state.owedSince === undefined && this.hasCommitMajority(state.record)) {
 			state.owedSince = this.now();
 		}
 		state.retry?.cancel?.();
+		const delayMs = timing.waitingOnInFlight ? Math.max(timing.intervalMs, this.retryMaxIntervalMs) : timing.intervalMs;
 		const cancel = this.setTimer(() => {
 			void this.retryCommits(messageHash);
-		}, timing.intervalMs);
+		}, delayMs);
 		state.retry = { pendingPeers: new Set(peers), ...timing, cancel };
 		this.persistCoordinatorState(messageHash, state.record, 'broadcasting', {
 			pendingPeers: [...peers],
@@ -2051,9 +2080,11 @@ export class ClusterCoordinator {
 	 * member is in flight the run sends nothing and re-arms at the same attempt and interval, spending
 	 * nothing of the budget: a silent straggler's request routinely outlives the whole default budget
 	 * (250 ms doubling, five attempts, about 7.75 s), and counting those runs would release the
-	 * transaction with the straggler never delivered. The wait stays bounded, because every in-flight
-	 * request ends at its RPC deadline (`rpc-deadline.ts`); the member is then sent the record, and
-	 * attempts count again.
+	 * transaction with the straggler never delivered. Its timer then waits the longest retry interval, as a
+	 * fallback only: the answer that ends one of those requests re-arms it at its own interval
+	 * ({@link resumeRetryAfterInFlight}), so a request riding to its RPC deadline costs a few timer wakes
+	 * rather than one per interval. The wait stays bounded, because every in-flight request ends at its
+	 * RPC deadline (`rpc-deadline.ts`); the member is then sent the record, and attempts count again.
 	 */
 	private async runRetry(state: ClusterTransactionState, retry: CommitRetryState): Promise<void> {
 		const { messageHash, record } = state;
@@ -2061,7 +2092,7 @@ export class ClusterCoordinator {
 		const selfId = this.localCluster?.peerId.toString();
 		if ([...pendingPeers].every(peerId => state.inFlight.has(peerId))) {
 			log('cluster-tx:retry-in-flight', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
-			this.armRetry(state, Array.from(pendingPeers), { attempt, intervalMs: retry.intervalMs, ...(retry.deferred ? { deferred: true } : {}) });
+			this.armRetry(state, Array.from(pendingPeers), { attempt, intervalMs: retry.intervalMs, ...(retry.deferred ? { deferred: true } : {}), waitingOnInFlight: true });
 			return;
 		}
 		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers), ...(retry.deferred ? { deferred: true } : {}) });
