@@ -31,6 +31,7 @@ import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type Consul
 import { HeldBlockConsults } from "./held-block-consults.js";
 import { cohortCommitsNeedEveryMember, quietCohortFor, quietCohortHolds, type QuietCohort } from "./quiet-cohort.js";
 import { withDeadline } from "../with-deadline.js";
+import { isDurableMajority } from "./round-decision.js";
 
 /**
  * Acquire a block's content for a cohort-corroborated revision, from the cohort, and persist it.
@@ -4367,15 +4368,6 @@ function pendCohortDurability(record: ClusterRecord, selfAccepted: boolean | und
 		unconfirmed,
 		cohortPeerIds
 	};
-}
-
-/**
- * The durability gate's rule: a STRICT majority of the cohort the commit ran on — the same majority
- * {@link clusterReachedCommitConsensus} measures votes against, applied to durable holders instead
- * of approving votes.
- */
-function isDurableMajority(durableHolders: number, cohortSize: number): boolean {
-	return cohortSize > 0 && durableHolders > cohortSize / 2;
 }
 
 /** True if a simple majority of cluster peers signed an approving commit. */

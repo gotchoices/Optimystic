@@ -1199,6 +1199,37 @@ Three rules hold this together, each of which has a failure mode if dropped:
   retry cycle rather than per round; the residual and why it is not simply relaxable are recorded at
   `resolveRace`.
 
+**Each round stops waiting once its outcome is decided.** The coordinator asks the members of a round in
+parallel and stops once the answers in hand decide it either way — the promise round when the approvals
+reach the super-majority or no longer can, the commit round when the commits it would keep reach the simple
+majority or no longer can, the consensus broadcast when a strict majority of the cohort holds the record or
+no longer can — after a grace for the members still unanswered of as long again as the decision took, at
+least 50 ms (`awaitDecision` and the three rules in `packages/db-p2p/src/repo/round-decision.ts`). Before
+this, one member that was connected but did not answer — a sleeping phone, a background browser tab — cost
+every write it took part in its whole RPC deadline, once per round (GitHub #64). Healthy members answer
+within moments of each other, so in a healthy cohort everyone lands in the grace and nothing changes; a silent
+member costs a round about twice its decision time. The pre-vote, the pre-sign and the broadcast's local
+delivery stay awaited before any remote decision, so this node's member is never left behind and every rule
+already knows its vote and verdict. The broadcast counts its holders with the durability gate's own function
+(`isDurableMajority`), so finishing early never leaves `CoordinatorRepo.commit` short of a majority one more
+answer would have made.
+
+A member still unanswered after the grace is a **straggler**, and it is owed the record. Its request keeps
+running and marks it in flight (`ClusterTransactionState.inFlight`, which also covers a record carried on
+another request), so no later round, carried delivery or retry run sends to it meanwhile — the commit round
+in particular never sends to a member whose promise request is still on its way, since a commit-round record
+processed first would have it sign and clear the transaction and the stale promise request then plant a
+fresh reservation. When the rounds end, every straggler not yet settled joins the commit retry's pending set,
+so the transaction is not released and the persisted coordinator state lists it. Its answer, whenever it
+comes, is recorded — its apply report, its commit when signed over the record's promise map — but its
+promise is never merged, which would void every commit signed over the decided map (the rule above), and
+neither its slowness nor its eventual failure is reported to reputation. A retry run that finds every
+pending member in flight re-arms without spending an attempt, since a silent member's request routinely
+outlives the whole retry budget; the wait is bounded by the RPC deadline every request ends at. What it buys
+depends on the cohort's size: at the default thresholds the promise round can finish early from four
+members up (without one member from four to seven, two at eight), the commit round and the broadcast from
+three up, and a two-member cohort gains nothing — its three requests per write are unchanged.
+
 #### Commit content-digest check (promise round)
 
 The client that authored a transaction declares, inside the commit request it submits for
@@ -2442,8 +2473,11 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   same file) then delivers the merged record to the coordinator's own member first, unless it
   already applied, awaited, and only then to the remote members that still need it: one whose
   commit-round call failed, one whose response does not report having applied
-  (`MemberApplyOutcome.executed`, which an older build never sets), and one that reports a refused
-  commit — and, in a cohort of two, every remote member. In a healthy two- or three-member cohort a
+  (`MemberApplyOutcome.executed`, which an older build never sets), one that reports a refused
+  commit, a member an earlier round stopped waiting for that has answered since — and, in a cohort
+  of two, every remote member. It stops waiting once a strict majority of the cohort holds the record,
+  and a member still unanswered then is owed it in the background (see *Each round stops waiting once
+  its outcome is decided*). In a healthy two- or three-member cohort a
   consensus operation therefore costs each remote member two calls rather than three (in a cohort
   of two, the second is the decision; for a single-collection write's pend it rides on the
   commit's first request instead). A member that

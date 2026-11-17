@@ -301,6 +301,21 @@ with a signed reject or conflict vote. Read it as "retry", never as "this write 
 writes only its own entry, the coordinator keys each entry by the peer it actually asked, and it
 re-checks the shape rather than trusting it.
 
+**The round stops waiting once its outcome is decided.** The coordinator does not await every member.
+It stops once the votes in hand reach the super-majority, or once the approvals plus every member still
+unanswered could no longer reach it (`promiseRoundDecided` in `packages/db-p2p/src/repo/round-decision.ts`),
+after a short grace for the unanswered members: as long again as the decision took, at least 50 ms
+(`STRAGGLER_GRACE_FLOOR_MS`). Healthy members answer within moments of each other, so in a healthy cohort
+everyone lands in the grace; a member that is connected but silent costs the round about twice its decision
+time instead of its whole RPC deadline. A member still unanswered after the grace is a **straggler**: its
+request keeps running, it is owed the record ([Commit Retry Loop](#commit-retry-loop)), its promise is
+never merged — once the record is decided, one more promise would void every commit signed over it, the
+decided-map rule under [Phase 2](#phase-2-commit-execution-simple-majority-required) — and neither its
+slowness nor its eventual failure reaches reputation. A member that failed before the round was decided is
+penalised as before: the round needed it. The outcome is classified on the votes in hand, so a round
+decided out of reach names its merely-unanswered members among `PromiseShortfallError.silentPeers`, and the
+abandonment broadcast still goes out only when those votes prove the transaction dead.
+
 **Super-Majority Validation** (in ClusterCoordinator):
 ```typescript
 const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold); // Default 0.75
@@ -348,13 +363,45 @@ That signature covers the round's final map, so the coordinator keeps it, its ow
 completes the majority and applies, and the other member is owed only the decision
 (`deliverDecidedWithoutCommitRound` in `packages/db-p2p/src/repo/cluster-coordinator.ts`).
 
+**The commit round stops waiting once its outcome is decided**, as the promise round does: once the
+commits the record would hold reach the simple majority, or once they plus every member still unanswered
+could not (`commitRoundDecided`), after the same grace. It is never sent to a member whose promise-round
+request is still on its way: sent both, the member could take them in either order, and a commit-round
+record processed first has it sign and clear the transaction, after which the stale promise request plants
+a fresh reservation that nothing clears until the broadcast. A super-majority is at least a simple
+majority, so the members that answered the promise round can carry the commit majority alone. A
+straggler's commit signature, when it comes, is kept by the decided-map rule above; it is owed the record
+like any straggler.
+
 Once the merged commits reach the majority, `broadcastMergedRecord` delivers the record to the
 coordinator's own member (awaited, unless it already applied) and then only to the remote members still
 needing it: a member whose commit-round call failed, one whose answer does not report having applied
 (`MemberApplyOutcome.executed`, which a member on an older build never sets), one reporting a refused
 commit — sending that one the record again, now that the coordinator's member holds the revision, gives
-a behind member another reconcile — and, in a cohort of two, the other member. In a healthy two- or
-three-member cohort a consensus operation therefore costs each remote member two calls instead of three.
+a behind member another reconcile — in a cohort of two, the other member, and every straggler of an
+earlier round that has answered since. In a healthy two- or three-member cohort a consensus operation
+therefore costs each remote member two calls instead of three.
+
+**The broadcast stops waiting once a strict majority of the cohort holds the record**, or once no member
+still unanswered could make one (`broadcastDecided`), after the same grace. "Holds" is the durability
+gate's own test for a commit record — the member's report says its storage holds the revision — and, for a
+pend or cancel record, having applied it with no pend refusal reported; the coordinator's own member counts
+by its retained verdict, and as a possible holder when it applied without holding, since its second
+reconcile may yet make it one. The majority is counted with the gate's own function (`isDurableMajority`),
+so finishing early never leaves `CoordinatorRepo.commit` short of a majority one more answer would have
+made.
+
+What finishing early buys depends on the cohort's size. At the default thresholds:
+
+| Cohort | Promise round can finish early | Commit round and broadcast can finish early |
+| --- | --- | --- |
+| 2 | no — needs both | no — needs both |
+| 3 | no — needs all three | yes, without one member |
+| 4 to 7 | yes, without one member | yes |
+| 8 | yes, without two members | yes |
+
+A two-member cohort gains nothing, and its request count — three per single-collection write — is
+unchanged. A three-member cohort with a silent member is still held up by the promise round.
 
 **A write's pend delivers its decision with the commit.** In a cohort of two, the decision of a pend
 record whose writer marked every operation the action's only reservation (`PendRequest.soleReservation`:
@@ -407,7 +454,11 @@ private async handleCommitNeeded(record: ClusterRecord): Promise<ClusterRecord> 
 
 ### Consensus Achievement
 
-When majority consensus is reached, the transaction is executed. Execution is guarded by a synchronous check-and-set on `executedTransactions` to prevent duplicate execution — JavaScript's single-threaded event loop makes this atomic as long as the guard runs before the first `await`.
+When majority consensus is reached, the transaction is executed. On the coordinator's side, the write is
+answered once the consensus broadcast is decided ([Phase 2](#phase-2-commit-execution-simple-majority-required)):
+a member still unanswered then applies when the record reaches it, in the background. Its late report is
+recorded — its apply report, and its commit signature when that was signed over the record's promise map —
+so a member that answers late is booked as one the retry reached. Execution is guarded by a synchronous check-and-set on `executedTransactions` to prevent duplicate execution — JavaScript's single-threaded event loop makes this atomic as long as the guard runs before the first `await`.
 
 The real `handleConsensus` lives on `ClusterMember` in `packages/db-p2p/src/cluster/cluster-repo.ts` (not in `cluster-coordinator.ts` — that is the *coordinator* side). The snippet below is a simplification: current code delegates the per-operation dispatch to `applyConsensusOperations` and, after the loop succeeds and its writes are power-loss durable (`markExecutedOnceDurable`), writes a durable executed-marker via `stateStore.markExecuted` for post-restart dedup.
 
@@ -708,7 +759,11 @@ A successful retry clears the pending list; hitting the max attempts emits `clus
 
 Cluster members are idempotent: they ignore duplicate commits once their signature is present, so forced retries do not double-apply user operations.
 
-The timer is not the only way a pending peer gets the record: any other request the coordinator sends that peer carries it first ([below](#owed-deliveries-ride-on-the-next-request)), and a peer that takes it that way leaves the retry exactly as one the timer reached does. The timer skips a peer while the record is riding to it on another request, and it is still pending until that request's answer says it took the record.
+The timer is not the only way a pending peer gets the record: any other request the coordinator sends that peer carries it first ([below](#owed-deliveries-ride-on-the-next-request)), and a peer that takes it that way leaves the retry exactly as one the timer reached does. The timer skips a peer while a request is taking the record to it — carried on another request, or its own round's request still unanswered — and it is still pending until that request's answer says it took the record.
+
+**Stragglers are owed the record.** A member a round stopped waiting for ([Phase 1](#phase-1-promise-collection-super-majority-required)) is put in the retry's pending set when the rounds end, so a transaction with a straggler always arms a retry, and the persisted coordinator state lists it for `recoverTransactions`. Its answer, whenever it comes, is folded in like a carried one: its apply report and, when signed over the record's promise map, its commit join the record. A broadcast answer settles the member, since the coordinator's own member applied first; a promise or commit answer settles it only when it reports having applied without a refused commit, and otherwise the retry sends it the record. A late commit that completes a majority the commit round fell short of is left to the next retry run, which broadcasts once the record carries one.
+
+**A run that can send nothing spends nothing.** When every pending member has a request riding to it, the run re-arms at the same attempt and interval instead of counting an attempt. A silent straggler's request routinely outlives the whole budget above; counting those runs would release the transaction with the straggler never delivered. The wait stays bounded, because every in-flight request ends at its RPC deadline (`packages/db-p2p/src/rpc-deadline.ts`), after which the member is sent the record and attempts count again.
 
 ### Owed deliveries ride on the next request
 
@@ -872,6 +927,7 @@ const updatedRecord = await clusterMember.update(incomingRecord);
 - **Promise Phase**: Single round-trip to all peers (~100-500ms)
 - **Commit Phase**: Second round-trip for final confirmation (~100-500ms)
 - **Total Transaction Time**: two round trips to each remote member in a cohort of three or fewer — in a cohort of three members apply on receipt of the commit round; in a cohort of two there is no commit round, and the second is the decision, which for a single-collection write's pend rides on the commit's first request instead, so such a write costs three in all; a third, the consensus broadcast, in a cohort of four or more, and to any member that missed the commit round or reports a refused commit
+- **A slow member**: each round waits only until its outcome is decided, plus a grace of as long again (at least 50 ms), so a member that is connected but silent holds a round up by about twice its decision time rather than its RPC deadline — where the cohort can decide without it. Which rounds can depends on the cohort's size (the table under [Phase 2](#phase-2-commit-execution-simple-majority-required)): from four members up every round can; at three the promise round still needs every member; at two nothing changes
 
 ### Throughput Optimization
 

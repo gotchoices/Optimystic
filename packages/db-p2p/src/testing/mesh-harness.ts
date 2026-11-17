@@ -23,6 +23,7 @@ import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES } from '../protocol-limits.js';
 import type { ClusterLatestBatchCallback } from '../repo/consult-round.js';
 import { coordinatorRepo, type ClusterLatestCallback, type ClusterLatestAnswer } from '../repo/coordinator-repo.js';
 import type { BlockHolders } from '../cluster/rebalance-monitor.js';
+import type { IPeerReputation } from '../reputation/types.js';
 import type { CoordinatorRepo } from '../repo/coordinator-repo.js';
 import { stateHoldingsOnReads } from '../repo/stated-holdings.js';
 import { forwardedBatchMethods } from '../repo/request-batch.js';
@@ -146,6 +147,11 @@ export interface MeshOptions {
 	 * coordinator runs on the resolved policy alone.
 	 */
 	coordinatorConfig?: Partial<ClusterConsensusConfig>;
+	/**
+	 * Each node's coordinator reports cohort members' faults to this — the reputation service
+	 * `libp2p-node-base` hands its coordinator. Omitted → no reputation subsystem, as before.
+	 */
+	reputationFor?: (node: MeshNode) => IPeerReputation;
 	/**
 	 * Passed to every node's `StorageRepo` as `changeHoldMs` — how long a per-collection change event
 	 * is held while another collection of the same action is still pending on that node; `0` disables
@@ -793,7 +799,9 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			// production `minAbsoluteClusterSize` (2, not the coordinator's own fallback of 3), and the
 			// `allowUnvalidatedSmallCluster` gate — ARMED (false) unless the mesh opted out at its call
 			// site.
-			{ ...policy, ...options.coordinatorConfig }
+			{ ...policy, ...options.coordinatorConfig },
+			undefined,
+			options.reputationFor?.(node)
 		);
 		node.coordinatorRepo = factory({
 			storageRepo: node.storageRepo,

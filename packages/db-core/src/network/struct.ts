@@ -334,7 +334,11 @@ export type PromiseShortfall = {
 	peerCount: number;
 	/** The approvals the round needed: `ceil(peerCount × superMajorityThreshold)`. */
 	needed: number;
-	/** Peer-id strings of the cohort members that cast no promise vote at all. */
+	/**
+	 * Peer-id strings of the cohort members whose promise vote the round did not count: those that never
+	 * answered, and those still unanswered when the answers in hand put the bar out of reach (the round
+	 * stops waiting then, so a member merely slower than the rest is named here too).
+	 */
 	silentPeers: string[];
 	/**
 	 * Set only when no consensus round ran: a coordinator whose cohort for the write was only itself

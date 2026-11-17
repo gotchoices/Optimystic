@@ -1019,3 +1019,117 @@ describe('ClusterCoordinator keeps a commit signature only when it covers the re
 		expect(owed, 'the commit retry owes the late member the record, beside the member that failed').to.have.members([failed, late]);
 	});
 });
+
+/** A member that refuses its promise with a reject vote and otherwise answers as {@link MockClusterClient}. */
+class RejectingMember extends MockClusterClient {
+	override async update(record: ClusterRecord): Promise<ClusterRecord> {
+		if (this.peerIdStr in record.promises) return await super.update(record);
+		this.updateCalls++;
+		const reject: Signature = { type: 'reject', signature: `psig-${this.peerIdStr.substring(0, 8)}`, rejectReason: 'invalid transform' };
+		return { ...record, promises: { ...record.promises, [this.peerIdStr]: reject } };
+	}
+}
+
+/** A {@link MockClusterClient} whose first request waits on `hold`, keeping every record it is sent. */
+class HeldMember extends MockClusterClient {
+	readonly received: ClusterRecord[] = [];
+	hold?: Promise<void>;
+
+	override async update(record: ClusterRecord): Promise<ClusterRecord> {
+		this.received.push(record);
+		if (this.received.length === 1) await this.hold;
+		return await super.update(record);
+	}
+}
+
+/**
+ * Ticket: a-consensus-round-stops-waiting-once-its-outcome-is-decided.
+ *
+ * A round stops waiting for members once the answers in hand decide it, and not before; a member it left
+ * behind is owed the record for as long as its request is still on its way.
+ */
+describe('ClusterCoordinator stops waiting once a round is decided', function () {
+	const cfg: ClusterConsensusConfig & { clusterSize: number } = {
+		clusterSize: 4,
+		superMajorityThreshold: 0.75,
+		simpleMajorityThreshold: 0.51,
+		minAbsoluteClusterSize: 2,
+		allowClusterDownsize: true,
+		clusterSizeTolerance: 0.5,
+		partitionDetectionWindow: 60000
+	};
+
+	/** Four members, none of them this node's: super-majority 3, commit majority 3. */
+	const setup = async (make: (idStr: string, index: number) => MockClusterClient) => {
+		const clock = new FakeScheduler();
+		const peerIds = await Promise.all(Array.from({ length: 4 }, makePeerId));
+		const members = peerIds.map((pid, index) => make(pid.toString(), index));
+		const byId = new Map(members.map(member => [member.peerIdStr, member]));
+		const clusterPeers: ClusterPeers = Object.fromEntries(peerIds.map(pid =>
+			[pid.toString(), { multiaddrs: ['/ip4/127.0.0.1/tcp/8000'], publicKey: u8ToString(pid.publicKey!.raw, 'base64url') }]));
+		const keyNetwork: IKeyNetwork = {
+			async findCoordinator() { return peerIds[0]!; },
+			async findCluster() { return { ...clusterPeers }; }
+		};
+		const coordinator = new ClusterCoordinator(keyNetwork, ((peerId: PeerId) => byId.get(peerId.toString())!) as any, cfg,
+			undefined, undefined, undefined, undefined, clockOpts(clock));
+		const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'] } }], expiration: clock.now + 600_000 };
+		return { clock, coordinator, members, message };
+	};
+
+	it('a round the answers in hand cannot yet decide waits for the member still unanswered', async () => {
+		let release!: () => void;
+		const { clock, coordinator, members, message } = await setup((idStr, index) =>
+			index === 2 ? new RejectingMember(idStr) : index === 3 ? new HeldMember(idStr) : new MockClusterClient(idStr));
+		(members[3] as HeldMember).hold = new Promise<void>(resolve => { release = resolve; });
+
+		let settled = false;
+		const transaction = coordinator.executeClusterTransaction('block-1' as BlockId, message).finally(() => { settled = true; });
+		// Two approvals and a reject: the held member's approval would still make three, so no answer in
+		// hand decides the round — and no timer does either.
+		for (let turn = 0; turn < 10; turn++) {
+			clock.advance(10_000);
+			await flush();
+		}
+		expect(settled, 'the round waits while the held member could still decide it').to.equal(false);
+
+		release();
+		const { record } = await transaction;
+		expect(record.promises[members[3]!.peerIdStr]?.type, 'the held member\'s approval decided the round').to.equal('approve');
+		expect(Object.keys(record.commits), 'the cohort committed').to.have.length.at.least(3);
+	});
+
+	it('a straggler whose request outlives the whole retry budget is still sent the record once it answers', async () => {
+		let release!: () => void;
+		const { clock, coordinator, members, message } = await setup((idStr, index) =>
+			index === 3 ? new HeldMember(idStr) : new MockClusterClient(idStr));
+		const straggler = members[3] as HeldMember;
+		straggler.hold = new Promise<void>(resolve => { release = resolve; });
+
+		const transaction = coordinator.executeClusterTransaction('block-1' as BlockId, message);
+		// Three approvals decide the promise round; the round then gives the held member its grace.
+		await flush();
+		clock.advance(1_000);
+		const { record } = await transaction;
+		const retry = (): { attempt: number; pendingPeers: Set<string> } | undefined => (coordinator as any).transactions.get(record.messageHash)?.retry;
+		expect([...retry()?.pendingPeers ?? []], 'the straggler is owed the record').to.deep.equal([straggler.peerIdStr]);
+
+		// Far past the default budget (250 ms doubling, five attempts): nothing is sent while the request
+		// still rides, and no attempt is spent.
+		for (let elapsed = 0; elapsed < 30_000; elapsed += 250) {
+			clock.advance(250);
+			await flush();
+		}
+		expect(retry()?.attempt, 'no attempt spent while the straggler\'s request rides').to.equal(1);
+		expect(straggler.received, 'nothing else was sent to it meanwhile').to.have.length(1);
+
+		release();
+		await flush();
+		clock.advance(250);
+		await flush();
+		expect(straggler.received.slice(1).some(sent => Object.keys(sent.commits).length >= 3), 'the straggler was sent the decided record').to.equal(true);
+		clock.advance(1_000);
+		await flush();
+		expect((coordinator as any).transactions.has(record.messageHash), 'the finished retry released the transaction').to.equal(false);
+	});
+});

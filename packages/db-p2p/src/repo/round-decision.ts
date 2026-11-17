@@ -4,10 +4,11 @@ import { canonicalJson } from "@optimystic/db-core";
 /**
  * When a consensus round may stop waiting for the members it has not heard from. A round asks every
  * member it targets in parallel, and each of the coordinator's three rounds — promise, commit, and the
- * consensus broadcast — resolves as soon as the answers in hand decide its outcome, either way. The
- * members still unheard from at that moment are the round's **stragglers**: the coordinator keeps
- * their requests running and owes them the record afterwards (`ClusterCoordinator`'s straggler path).
- * This module is the mechanism and the three rules; it holds no state and never touches the network.
+ * consensus broadcast — stops waiting once the answers in hand decide its outcome, either way, and the
+ * members still unanswered have had a short grace ({@link DecisionGrace}). The members still unheard
+ * from then are the round's **stragglers**: the coordinator keeps their requests running and owes them
+ * the record afterwards (`ClusterCoordinator`'s straggler path). This module is the mechanism and the
+ * three rules; it holds no state and never touches the network.
  */
 
 /** One member's answer to a delivery; `response` is absent, and `error` present, when it failed. */
@@ -33,20 +34,55 @@ export interface DecidedRound {
 export type RoundDecided = (answered: readonly MemberDelivery[], outstanding: number) => boolean;
 
 /**
- * Resolve once `decided(answered, outstanding)` is true, or once nothing is outstanding. The rule is
- * asked before any answer arrives and again after each one, so a round with nobody to ask resolves
- * at once. A request that rejects counts as a failed delivery — the callers' requests never reject,
- * but a round must not hang or leak an unhandled rejection if one ever does.
+ * The least a decided round still waits for its unanswered members ({@link DecisionGrace}): enough for
+ * members answering at the same moment as the deciding one, give or take scheduling, to land in hand.
  */
-export function awaitDecision(requests: ReadonlyMap<string, Promise<MemberDelivery>>, decided: RoundDecided): Promise<DecidedRound> {
+export const STRAGGLER_GRACE_FLOOR_MS = 50;
+
+/**
+ * The clock a round's grace runs on. Once a round is decided with members still unanswered, it waits for
+ * them a little longer: as long again as the decision took, and at least {@link STRAGGLER_GRACE_FLOOR_MS}.
+ * Healthy members answer within moments of each other, so in a healthy cohort every answer lands in that
+ * window and nobody is left behind — no member reports late, the write's durability class stays `full`,
+ * and no background delivery or under-replication push follows. A member that is connected but silent
+ * costs the round about twice its decision time rather than its whole RPC deadline.
+ *
+ * NOTE: the grace is the one place a round waits on time rather than on answers. If healthy members are
+ * routinely left behind (`cluster-tx:stragglers` on writes no member was slow for), lengthen it; if a
+ * silent member still costs writes too much, shorten it — down to none, the pure "stop at the decision".
+ */
+export interface DecisionGrace {
+	now: () => number;
+	/** A one-shot timer; the returned function cancels it. */
+	setTimer: (fn: () => void, delayMs: number) => () => void;
+}
+
+/**
+ * Resolve once `decided(answered, outstanding)` is true — after the {@link DecisionGrace} for anyone still
+ * unanswered, when one is given — or once nothing is outstanding. The rule is asked before any answer
+ * arrives and again after each one until it holds, so a round with nobody to ask resolves at once. A
+ * decided round stays decided: an answer can neither revive a round out of reach nor undo a reached one,
+ * since approvals, commits and holders only grow. A request that rejects counts as a failed delivery — the
+ * callers' requests never reject, but a round must not hang or leak an unhandled rejection if one ever does.
+ */
+export function awaitDecision(requests: ReadonlyMap<string, Promise<MemberDelivery>>, decided: RoundDecided, grace?: DecisionGrace): Promise<DecidedRound> {
 	return new Promise<DecidedRound>(resolve => {
+		const startedAt = grace?.now();
 		const answered: MemberDelivery[] = [];
 		const outstanding = new Map<string, Promise<MemberDelivery>>();
 		let done = false;
-		const settleIfDecided = (): void => {
-			if (done || (outstanding.size > 0 && !decided(answered, outstanding.size))) return;
+		let cancelGrace: (() => void) | undefined;
+		const finish = (): void => {
+			if (done) return;
 			done = true;
+			cancelGrace?.();
 			resolve({ answered: [...answered], stragglers: new Map(outstanding) });
+		};
+		const onAnswer = (): void => {
+			if (outstanding.size === 0) return finish();
+			if (cancelGrace !== undefined || !decided(answered, outstanding.size)) return;
+			if (grace === undefined || startedAt === undefined) return finish();
+			cancelGrace = grace.setTimer(finish, Math.max(STRAGGLER_GRACE_FLOOR_MS, grace.now() - startedAt));
 		};
 		for (const [peerId, request] of requests) {
 			const settled = request.then(
@@ -57,10 +93,10 @@ export function awaitDecision(requests: ReadonlyMap<string, Promise<MemberDelive
 				if (done) return;
 				outstanding.delete(peerId);
 				answered.push(delivery);
-				settleIfDecided();
+				onAnswer();
 			});
 		}
-		settleIfDecided();
+		onAnswer();
 	});
 }
 

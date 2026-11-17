@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome, TransactionInvalidity, ValidityRefusal } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, canonicalJson, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -12,6 +12,10 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { ResponsibilityRefusalError } from "./responsibility.js";
 import { unrefTimer } from "../unref-timer.js";
 import { LatePendRefusals, conflictPendRefusalOf } from "./late-pend-refusals.js";
+import {
+	awaitDecision, broadcastDecided, collectApplyOutcomes, commitRoundDecided, commitsSignedOverRecordPromises, holdsRecord,
+	promiseRoundDecided, type DecidedRound, type LocalHolding, type MemberDelivery, type RoundDecided
+} from "./round-decision.js";
 
 const log = createLogger('cluster')
 
@@ -22,29 +26,13 @@ const log = createLogger('cluster')
  */
 export const DEFAULT_PEND_DELIVERY_DEFERRAL_MS = 2000;
 
-/**
- * Pick each peer's OWN {@link ClusterRecord.applyOutcomes} entry out of the record that peer answered
- * with, and key it under the peer we actually asked.
- *
- * Taking only `response.applyOutcomes[peerId]` — rather than spreading the whole map — is what keeps
- * one member from reporting outcomes on other members' behalf: a peer that echoes back a record full
- * of entries contributes exactly one, its own. The field is unsigned advisory data (see its doc
- * comment for why that is safe), so this is a shaping rule, not a security boundary.
- *
- * Returns `undefined` when no peer reported anything, so the common case adds no empty object to the
- * record.
- */
-function collectApplyOutcomes(
-	responses: ReadonlyArray<{ peerId: string; response?: ClusterRecord | null }>
-): ClusterRecord['applyOutcomes'] {
-	let collected: NonNullable<ClusterRecord['applyOutcomes']> | undefined;
-	for (const { peerId, response } of responses) {
-		const own = response?.applyOutcomes?.[peerId];
-		if (own === undefined) continue;
-		collected ??= {};
-		collected[peerId] = own;
-	}
-	return collected;
+/** The round a straggler was left behind by: the promise round, the commit round, or the consensus broadcast. */
+type RoundPhase = 'promise' | 'commit' | 'broadcast';
+
+/** A straggler's answer that arrived while the rounds were still running, waiting for the step that arms the retry. */
+interface LateAnswer {
+	phase: RoundPhase;
+	delivery: MemberDelivery;
 }
 
 /** Fold collected outcomes into a record in place, later report winning per peer. No-op for `undefined`. */
@@ -83,28 +71,13 @@ function keepCommitsSignedOverRecordPromises(
 	answers: ReadonlyArray<{ peerId: string; response?: ClusterRecord | null }>,
 	round: string
 ): void {
-	const promiseMap = canonicalJson(record.promises);
-	const dropped: string[] = [];
-	for (const { peerId, response } of answers) {
-		const own = response?.commits?.[peerId];
-		if (response == null || own === undefined) continue;
-		if (canonicalJson(response.promises ?? {}) === promiseMap) {
-			record.commits = { ...record.commits, [peerId]: own };
-		} else {
-			dropped.push(peerId);
-		}
+	const { kept, dropped } = commitsSignedOverRecordPromises(record, answers);
+	if (Object.keys(kept).length > 0) {
+		record.commits = { ...record.commits, ...kept };
 	}
 	if (dropped.length > 0) {
 		log('cluster-tx:commit-over-other-promise-map', { messageHash: record.messageHash, round, dropped });
 	}
-}
-
-/** One member's answer to a delivery; `response` is absent, and `error` present, when it failed. */
-interface MemberDelivery {
-	peerId: string;
-	success: boolean;
-	response?: ClusterRecord;
-	error?: string;
 }
 
 /**
@@ -122,6 +95,15 @@ function membersAwaitingConsensus(deliveries: readonly MemberDelivery[]): string
 			return own?.executed !== true || own.commit?.success === false;
 		})
 		.map(({ peerId }) => peerId);
+}
+
+/**
+ * Whether a straggler's answer leaves it owed nothing: a broadcast answer, since the broadcast delivered
+ * this node's member first (the reasoning `ClusterCoordinator.settleOwedDelivery` records), and any other
+ * answer reporting it applied without a refused commit.
+ */
+function settlesStraggler(phase: RoundPhase, delivery: MemberDelivery): boolean {
+	return delivery.success && (phase === 'broadcast' || membersAwaitingConsensus([delivery]).length === 0);
 }
 
 /**
@@ -332,14 +314,31 @@ interface ClusterTransactionState {
 	resolutionTimeout?: NodeJS.Timeout;
 	retry?: CommitRetryState;
 	/**
-	 * Remote members this record is riding to right now, carried on a request for another record
-	 * ({@link ClusterCoordinator.takeOwedRecords}). Such a member stays in `retry.pendingPeers` until the
-	 * answer says it took the record; meanwhile no other request carries it there and the retry timer
-	 * does not send it there. Kept here rather than on `retry`, which every re-arm replaces.
+	 * Remote members a request is taking this record to right now: a round's request still in flight
+	 * after the round was decided ({@link ClusterCoordinator.adoptStragglers}), or the record carried on a
+	 * request for another record ({@link ClusterCoordinator.takeOwedRecords}). Such a member stays in
+	 * `retry.pendingPeers` until its answer says it took the record; meanwhile no other request carries
+	 * it there, no later round sends to it, and the retry timer does not send to it. Kept here rather
+	 * than on `retry`, which every re-arm replaces.
 	 */
-	carrying: Set<string>;
+	inFlight: Set<string>;
+	/**
+	 * Members a round left behind — its request to them still in flight when it was decided — and that no
+	 * later round has sent to since. Each is owed the record: the step that arms the retry puts every one
+	 * still here into its pending set ({@link ClusterCoordinator.owedAfterRounds}).
+	 */
+	stragglers: Set<string>;
+	/**
+	 * Stragglers' answers that arrived before the retry was armed, kept until the next round boundary
+	 * folds them into the record the rounds are building ({@link ClusterCoordinator.foldBufferedAnswers}).
+	 * Writing them into `record` instead would be lost: the rounds replace it with their own copy
+	 * ({@link ClusterCoordinator.updateTransactionRecord}).
+	 */
+	lateAnswers: LateAnswer[];
 	/** When a retry was first armed for this record with a commit majority on it: the order owed records are carried in. */
 	owedSince?: number;
+	/** Set by {@link ClusterCoordinator.releaseTransaction}, so a second exit reaching the same entry arms no second release. */
+	released?: true;
 }
 
 /** Manages distributed transactions across clusters */
@@ -360,7 +359,7 @@ export class ClusterCoordinator {
 	 * {@link takeOwedRecords} carries records to. Bounded, as it is keyed by peers off the wire.
 	 *
 	 * NOTE: owed-delivery bookkeeping (this map, `takeOwedRecords`, `returnCarried`,
-	 * `settleCarriedDelivery`, the pend deferral and the retry timer) has outgrown this file; moving it
+	 * `settleOwedDelivery`, the straggler path, the pend deferral and the retry timer) has outgrown this file; moving it
 	 * into its own module is backlog `debt-cluster-coordinator-owed-delivery-outgrew-its-file`.
 	 */
 	private readonly carryCapablePeers = new LruMap<string, true>(1024);
@@ -501,10 +500,16 @@ export class ClusterCoordinator {
 	 * records by member instead.
 	 * NOTE: a record whose retry run is sending it to `peerId` right now is not marked in flight, so a
 	 * request made meanwhile carries it too; the member dedups the second copy. If that ever shows up as
-	 * wasted traffic, mark the run's own deliveries in `carrying` as well.
-	 * NOTE: an escorted pend that was already riding on another request is marked once, so whichever of
-	 * the two answers first clears the mark and the retry timer may send the record again while the other
-	 * still rides; the member dedups it. If that ever shows up as wasted traffic, count rides per member.
+	 * wasted traffic, mark the run's own deliveries in `inFlight` as well.
+	 * NOTE: an escorted pend that was already in flight to the member — carried on another request, or its
+	 * own round's request still unanswered ({@link adoptStragglers}) — is marked once, so whichever answers
+	 * first clears the mark and the retry timer may send the record again while the other still rides; the
+	 * member dedups it. If that ever shows up as wasted traffic, count rides per member.
+	 * NOTE: an escorted pend whose promise-round request is still on its way can reach the member second,
+	 * after the carried decided copy applied and cleared the transaction there; the stale promise request
+	 * then plants a reservation that holds until the member's staleness sweep, as a coordinator that timed
+	 * out would leave. The commit round avoids the same ordering by never sending to an in-flight member;
+	 * if such reservations show up as conflict votes, have the member skip persisting a record it executed.
 	 */
 	private takeOwedRecords(peerId: string, forRecord: ClusterRecord): ClusterRecord[] {
 		if (!this.carryCapablePeers.has(peerId)) return [];
@@ -524,17 +529,17 @@ export class ClusterCoordinator {
 			.filter(state => pendActionIdsOf(state.record.message).some(actionId => settling.has(actionId)))
 			.slice(0, MaxCarriedRecords);
 		const others = owed
-			.filter(state => !escorted.includes(state) && !state.carrying.has(peerId))
+			.filter(state => !escorted.includes(state) && !state.inFlight.has(peerId))
 			.slice(0, MaxCarriedRecords - escorted.length);
 		const taken = [...escorted, ...others];
-		for (const state of taken) state.carrying.add(peerId);
+		for (const state of taken) state.inFlight.add(peerId);
 		return taken.map(state => ({ ...state.record }));
 	}
 
 	/**
 	 * Settle each record {@link takeOwedRecords} took for `peerId`, by what the member answered for it
 	 * (`outcomes`; empty when the carrying request failed). A delivered record is booked exactly as a
-	 * delivery by the retry timer is ({@link settleCarriedDelivery}); any other clears the in-flight mark
+	 * delivery by the retry timer is ({@link settleOwedDelivery}); any other clears the in-flight mark
 	 * and stays owed, for the timer or the next request. Delivery is idempotent on the member
 	 * (`handleConsensus` dedups by `messageHash`), so a record that member applied but whose answer was
 	 * lost costs only a re-send.
@@ -543,7 +548,7 @@ export class ClusterCoordinator {
 		for (const record of carried) {
 			const outcome = outcomes.find(o => o.messageHash === record.messageHash);
 			const state = this.transactions.get(record.messageHash);
-			state?.carrying.delete(peerId);
+			state?.inFlight.delete(peerId);
 			log('cluster-tx:carried-outcome', {
 				messageHash: record.messageHash,
 				peerId,
@@ -553,31 +558,37 @@ export class ClusterCoordinator {
 			// No retry left means the transaction was released while this rode — its budget ran out — and
 			// there is nothing left to book the answer against.
 			if (outcome?.delivered === true && state?.retry !== undefined) {
-				this.settleCarriedDelivery(state, state.retry, peerId, outcome.outcome);
+				this.settleOwedDelivery(state, state.retry, peerId, outcome.outcome);
 			}
 		}
 	}
 
 	/**
-	 * Book a carried record `peerId` took: its report joins the record and it leaves the retry, which
-	 * finishes once nobody is left. When this node's member applied the record and `peerId` now reports
-	 * holding the revision, this node's member gets the second reconcile {@link broadcastMergedRecord}
-	 * would have given it — not awaited, since it belongs to another transaction than the request that
-	 * carried the record.
+	 * Book a record `peerId` took while owed it — carried on a request for another record, or as the late
+	 * answer of a round that left it behind ({@link foldStragglerAnswer}): its report joins the record and
+	 * it leaves the retry, which finishes once nobody is left. When this node's member applied the record
+	 * and `peerId` now reports holding the revision, this node's member gets the second reconcile
+	 * {@link broadcastMergedRecord} would have given it — not awaited, since nothing waits on this answer.
 	 *
 	 * A delivered answer books the member done even when it reports a refused commit. The timer's run
 	 * re-sends to such a member because there it may have applied before this node's member did, with
 	 * no holder to reconcile from; a record is carried only after this node's member applied, so the
-	 * member's own reconcile already had that holder. The finish is left to a retry run in progress
+	 * member's own reconcile already had that holder — as it did for a broadcast's straggler, the
+	 * broadcast having delivered this node's member first. The finish is left to a retry run in progress
 	 * ({@link CommitRetryState.running}), whose broadcast can still put a member back.
 	 */
-	private settleCarriedDelivery(state: ClusterTransactionState, retry: CommitRetryState, peerId: string, outcome: MemberApplyOutcome | undefined): void {
+	private settleOwedDelivery(state: ClusterTransactionState, retry: CommitRetryState, peerId: string, outcome: MemberApplyOutcome | undefined): void {
 		this.noteDelivered(state.record, retry.pendingPeers, [peerId], outcome === undefined ? undefined : { [peerId]: outcome });
-		if (outcome?.commit?.success === true && this.localMemberHasApplied(state.record, undefined)) {
-			void this.reconcileLocalMemberAgain(state.record);
-		}
+		this.reconcileAgainOnRemoteHolder(state.record, outcome);
 		if (retry.pendingPeers.size === 0 && retry.running !== true) {
 			this.finishRetry(state.messageHash);
+		}
+	}
+
+	/** A remote member's report that it holds the commit: this node's member's second reconcile, when it applied. Not awaited. */
+	private reconcileAgainOnRemoteHolder(record: ClusterRecord, outcome: MemberApplyOutcome | undefined): void {
+		if (outcome?.commit?.success === true && this.localMemberHasApplied(record, undefined)) {
+			void this.reconcileLocalMemberAgain(record);
 		}
 	}
 
@@ -589,6 +600,134 @@ export class ClusterCoordinator {
 		mergeApplyOutcomes(record, outcomes);
 		this.latePendRefusals.retain(record, outcomes, this.localCluster?.peerId.toString());
 		for (const peerId of delivered) pendingPeers.delete(peerId);
+	}
+
+	/**
+	 * One round's wait ({@link awaitDecision}): resolves once `decided` says the answers in hand settle the
+	 * round and the unanswered members have had their grace (`DecisionGrace` in `round-decision.ts`, on
+	 * this coordinator's clock), and hands the members still unanswered to the straggler path ({@link adoptStragglers}) before
+	 * the round's caller resumes — so an answer already on its way is buffered by the time the caller
+	 * folds what arrived ({@link foldBufferedAnswers}).
+	 */
+	private async awaitRound(record: ClusterRecord, phase: RoundPhase, requests: ReadonlyMap<string, Promise<MemberDelivery>>, decided: RoundDecided): Promise<DecidedRound> {
+		const round = await awaitDecision(requests, decided, { now: this.now, setTimer: this.setTimer });
+		this.adoptStragglers(record.messageHash, round.stragglers, phase);
+		return round;
+	}
+
+	/**
+	 * A decided round's stragglers are owed the record. Each is marked in flight — no later round, carried
+	 * delivery or retry run sends to it while its request still rides — and its answer, whenever it comes,
+	 * goes to {@link onStragglerAnswer}. Before the retry is armed a straggler joins `state.stragglers`,
+	 * which the step that arms it reads ({@link owedAfterRounds}); a retry run's own broadcast adds its
+	 * stragglers to the retry's pending set directly.
+	 */
+	private adoptStragglers(messageHash: string, stragglers: ReadonlyMap<string, Promise<MemberDelivery>>, phase: RoundPhase): void {
+		if (stragglers.size === 0) return;
+		log('cluster-tx:stragglers', { messageHash, phase, peerIds: [...stragglers.keys()] });
+		const state = this.transactions.get(messageHash);
+		for (const [peerId, answer] of stragglers) {
+			state?.inFlight.add(peerId);
+			(state?.retry?.pendingPeers ?? state?.stragglers)?.add(peerId);
+			void answer.then(delivery => this.onStragglerAnswer(messageHash, phase, delivery));
+		}
+	}
+
+	/**
+	 * A straggler answered. Its answer is recorded — its apply report, its commit when that was signed over
+	 * the record's promise map, and whether it is still owed anything — but its promise is never merged,
+	 * and neither its slowness nor its failure reaches reputation: the round did not need it. Before the
+	 * retry is armed the rounds are still building their own copy of the record, so the answer waits in
+	 * `state.lateAnswers` for the next round boundary; after, it is folded at once. A released transaction
+	 * keeps no answer.
+	 */
+	private onStragglerAnswer(messageHash: string, phase: RoundPhase, delivery: MemberDelivery): void {
+		const { peerId, success, error, response } = delivery;
+		const vote = phase === 'promise' ? response?.promises?.[peerId]?.type : undefined;
+		log('cluster-tx:straggler-answer', {
+			messageHash, peerId, phase, success,
+			...(error === undefined ? {} : { error }),
+			...(vote === undefined ? {} : { vote })
+		});
+		const state = this.transactions.get(messageHash);
+		if (state === undefined || state.released) return;
+		state.inFlight.delete(peerId);
+		if (state.retry === undefined) {
+			state.lateAnswers.push({ phase, delivery });
+			return;
+		}
+		this.foldStragglerAnswer(state, state.retry, phase, delivery);
+	}
+
+	/**
+	 * A straggler's answer after the retry was armed, folded into the retry's record as a carried delivery's
+	 * is. A failed answer leaves the member owed, now that nothing rides to it, for the retry to send. A late
+	 * commit that completes a majority the round fell short of is left to the next retry run, which
+	 * broadcasts once the record carries one.
+	 */
+	private foldStragglerAnswer(state: ClusterTransactionState, retry: CommitRetryState, phase: RoundPhase, delivery: MemberDelivery): void {
+		if (!delivery.success) return;
+		keepCommitsSignedOverRecordPromises(state.record, [delivery], `late-${phase}`);
+		const outcome = delivery.response?.applyOutcomes?.[delivery.peerId];
+		if (settlesStraggler(phase, delivery)) {
+			this.settleOwedDelivery(state, retry, delivery.peerId, outcome);
+		} else {
+			this.noteDelivered(state.record, retry.pendingPeers, [], outcome === undefined ? undefined : { [delivery.peerId]: outcome });
+		}
+	}
+
+	/**
+	 * Fold the answers stragglers gave while the rounds ran into `record`, the rounds' own copy: commits
+	 * signed over its promise map, and apply reports. A straggler an answer settles leaves the straggler set,
+	 * owed nothing more. Called at each round boundary, before the next round picks its targets.
+	 */
+	private foldBufferedAnswers(record: ClusterRecord): void {
+		const state = this.transactions.get(record.messageHash);
+		if (state === undefined || state.lateAnswers.length === 0) return;
+		for (const { phase, delivery } of state.lateAnswers.splice(0)) {
+			if (!delivery.success) continue;
+			keepCommitsSignedOverRecordPromises(record, [delivery], `late-${phase}`);
+			const outcomes = collectApplyOutcomes([delivery]);
+			mergeApplyOutcomes(record, outcomes);
+			if (settlesStraggler(phase, delivery)) {
+				state.stragglers.delete(delivery.peerId);
+				if (this.localCluster?.wasTransactionExecuted?.(record.messageHash) === true) {
+					this.reconcileAgainOnRemoteHolder(record, outcomes?.[delivery.peerId]);
+				}
+			}
+		}
+	}
+
+	/**
+	 * The members a round sends to now: `base`, less any a request is still riding to, plus every straggler
+	 * still owed that nothing rides to any more. Each returned straggler leaves the straggler set — what
+	 * becomes of it is now this round's to say.
+	 */
+	private targetsNow(record: ClusterRecord, base: readonly string[]): string[] {
+		this.foldBufferedAnswers(record);
+		const state = this.transactions.get(record.messageHash);
+		if (state === undefined) return [...base];
+		const targets = new Set(base.filter(peerId => !state.inFlight.has(peerId)));
+		for (const peerId of state.stragglers) {
+			if (!state.inFlight.has(peerId)) targets.add(peerId);
+		}
+		for (const peerId of targets) state.stragglers.delete(peerId);
+		return [...targets];
+	}
+
+	/**
+	 * The rounds are over: everyone the retry must owe the record — `owed`, the round's own failures, and
+	 * every straggler an answer has not settled. So a transaction with stragglers always arms a retry, which
+	 * keeps {@link executeClusterTransaction} from releasing it and lists the stragglers in the persisted
+	 * coordinator state.
+	 */
+	private owedAfterRounds(record: ClusterRecord, owed: readonly string[]): string[] {
+		this.foldBufferedAnswers(record);
+		const state = this.transactions.get(record.messageHash);
+		const all = new Set(owed);
+		for (const peerId of state?.stragglers ?? []) all.add(peerId);
+		state?.stragglers.clear();
+		return [...all];
 	}
 
 	/**
@@ -868,7 +1007,9 @@ export class ClusterCoordinator {
 			record,
 			pending,
 			lastUpdate: this.now(),
-			carrying: new Set()
+			inFlight: new Set(),
+			stragglers: new Set(),
+			lateAnswers: []
 		};
 		this.transactions.set(messageHash, state);
 		this.persistCoordinatorState(messageHash, record, 'promising');
@@ -1223,9 +1364,17 @@ export class ClusterCoordinator {
 	 * pre-vote plus the member's own promise). Kept, it lets this node's member reach consensus on its
 	 * pre-sign ({@link commitTransaction}) without a commit round.
 	 *
-	 * The keep runs after every answer's promises are merged, and nothing merges a promise after it: the
-	 * commit round runs only on a decided record, and neither this node's member nor any other adds a
-	 * promise to one (`ClusterMember.getTransactionPhase`), so a kept signature stays valid. Keep both true.
+	 * The keep runs after every answered promise is merged, and nothing merges a promise after it: the
+	 * commit round runs only on a decided record, neither this node's member nor any other adds a promise
+	 * to one (`ClusterMember.getTransactionPhase`), and a straggler's promise is never merged
+	 * ({@link onStragglerAnswer}), so a kept signature stays valid. Keep all three true.
+	 *
+	 * **The round stops waiting once the answers decide it** ({@link promiseRoundDecided}): when the
+	 * approvals reach super-majority, or when the approvals plus every member still unanswered could not.
+	 * Members unanswered then are stragglers, owed the record in the background ({@link adoptStragglers});
+	 * {@link executeTransaction} classifies the outcome on the votes in hand. At the default threshold a
+	 * round succeeds without a member's answer only from four members up: a cohort of two or three needs
+	 * every promise to proceed, though one that fails fast can still put the bar out of reach early.
 	 */
 	private async collectPromises(peers: ClusterPeers, record: ClusterRecord): Promise<{ record: ClusterRecord }> {
 		const peerIds = Object.keys(peers);
@@ -1246,88 +1395,57 @@ export class ClusterCoordinator {
 		const prevote = await this.prevoteLocalPromise(record);
 		if (prevote) summary.push(prevote);
 		const roundPeers = prevote ? peerIds.filter(id => id !== selfId) : peerIds;
-		// For each remaining peer, create a client and request a promise. A remote promise rides
-		// a libp2p stream that a relayed (limited) connection can reset transiently, so
-		// each remote request gets `promiseImmediateRetries` in-line re-attempts before
-		// it counts as a failure — without this a single relayed reset drops the peer and
-		// sinks super-majority (the commit broadcast already has the same guard).
-		// Every peer here is remote: `record.peers` is the map `peerIds` was taken from, so the only
-		// local member this round could have held is the one the pre-vote above just removed.
-		const promiseRequests = roundPeers.map(peerIdStr => {
-			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId: peerIdStr, isLocal: false });
-			return new Pending(this.updateMember(peerIdStr, record, this.promiseImmediateRetries, 'promise'));
-		});
-
-		// Wait for all promises to complete
-		const results = await Promise.all(promiseRequests.map((p, idx) => p.result().then(res => {
-			const peerIdStr = roundPeers[idx]!;
+		// Each remote request gets `promiseImmediateRetries` in-line re-attempts before it counts as a
+		// failure: a remote promise rides a libp2p stream that a relayed (limited) connection can reset
+		// transiently, and without the retry a single relayed reset drops the peer and sinks
+		// super-majority (the commit broadcast already has the same guard). Every peer here is remote:
+		// `record.peers` is the map `peerIds` was taken from, so the only local member this round could
+		// have held is the one the pre-vote above just removed. A snapshot is sent, because a straggler's
+		// request is still on its way after `record` takes the round's promises.
+		const payload: ClusterRecord = { ...record };
+		const requests = new Map(roundPeers.map(peerId => {
+			log('cluster-tx:promise-request', { messageHash: record.messageHash, peerId, isLocal: false });
+			return [peerId, this.deliver(payload, peerId, this.promiseImmediateRetries, 'promise')] as const;
+		}));
+		const superMajority = Math.ceil(peerIds.length * this.cfg.superMajorityThreshold);
+		const { answered, stragglers } = await this.awaitRound(record, 'promise', requests, promiseRoundDecided(record, superMajority));
+		for (const { peerId, success, response, error } of answered) {
 			log('cluster-tx:promise-response', {
 				messageHash: record.messageHash,
-				peerId: peerIdStr,
-				success: true,
-				returnedPromises: Object.keys(res.promises ?? {}),
-				returnedCommits: Object.keys(res.commits ?? {})
+				peerId,
+				success,
+				...(success ? { returnedPromises: Object.keys(response?.promises ?? {}), returnedCommits: Object.keys(response?.commits ?? {}) } : { error })
 			});
-			summary.push({ peerId: peerIdStr, success: true });
-			return res;
-		}).catch(err => {
-			const peerIdStr = roundPeers[idx]!;
-			log('cluster-tx:promise-response', { messageHash: record.messageHash, peerId: peerIdStr, success: false, error: err });
-			summary.push({ peerId: peerIdStr, success: false, error: err instanceof Error ? err.message : String(err) });
-			this.reputation?.reportPeer(peerIdStr, PenaltyReason.ConsensusTimeout, `promise:${record.messageHash}`);
-			return null;
-		})));
-		const successes = summary.filter(entry => entry.success).map(entry => entry.peerId);
-		const failures = summary.filter(entry => !entry.success);
+			summary.push({ peerId, success, ...(error === undefined ? {} : { error }) });
+			// Only a member the round waited for is penalised: it was needed. A straggler never is.
+			if (!success) this.reputation?.reportPeer(peerId, PenaltyReason.ConsensusTimeout, `promise:${record.messageHash}`);
+		}
 		log('cluster-tx:promise-summary', {
 			messageHash: record.messageHash,
-			successes,
-			failures
+			successes: summary.filter(entry => entry.success).map(entry => entry.peerId),
+			failures: summary.filter(entry => !entry.success),
+			stragglers: [...stragglers.keys()]
 		});
 
-		log('cluster-tx:promise-merge-begin', {
-			messageHash: record.messageHash,
-			initialPromises: Object.keys(record.promises ?? {}),
-			transactionsKeys: Array.from(this.transactions.keys()),
-			hasTransaction: this.transactions.has(record.messageHash)
-		});
-
-		// Merge all promises into the record
-		for (const result of results.filter(Boolean) as ClusterRecord[]) {
-			log('cluster-tx:promise-merge-input', {
-				messageHash: record.messageHash,
-				resultFrom: Object.keys(result.promises ?? {}),
-				recordBefore: Object.keys(record.promises ?? {})
-			});
-			const resultPromises = Object.keys(result.promises ?? {});
-			log('cluster-tx:promise-merge-result', {
-				messageHash: record.messageHash,
-				peerPromises: resultPromises
-			});
-			if (typeof record.suggestedClusterSize === 'number' && typeof result.suggestedClusterSize === 'number') {
-				const expected = result.suggestedClusterSize;
-				const actual = Object.keys(peers).length;
+		// Merge the answered promises into the record. A straggler's promise never is, whenever it comes:
+		// once decided, a promise added to the map would void every commit signed over it.
+		for (const { response } of answered) {
+			if (response === undefined) continue;
+			if (typeof record.suggestedClusterSize === 'number' && typeof response.suggestedClusterSize === 'number') {
+				const expected = response.suggestedClusterSize;
+				const actual = peerIds.length;
 				const maxDiff = Math.ceil(Math.max(1, expected * this.cfg.clusterSizeTolerance));
 				if (Math.abs(actual - expected) > maxDiff) {
 					log('cluster-tx:size-variance', { expected, actual, tolerance: this.cfg.clusterSizeTolerance });
 				}
 			}
-			record.promises = { ...record.promises, ...result.promises };
-			log('cluster-tx:promise-merge-after', {
-				messageHash: record.messageHash,
-				mergedPromises: Object.keys(record.promises ?? {})
-			});
+			record.promises = { ...record.promises, ...response.promises };
 		}
 		log('cluster-tx:promise-merge', {
 			messageHash: record.messageHash,
 			mergedPromises: Object.keys(record.promises ?? {})
 		});
-		keepCommitsSignedOverRecordPromises(record, roundPeers.map((peerId, idx) => ({ peerId, response: results[idx] })), 'promise');
-		log('cluster-tx:promise-merge-end', {
-			messageHash: record.messageHash,
-			finalPromises: Object.keys(record.promises ?? {}),
-			transactionsEntry: this.transactions.get(record.messageHash)
-		});
+		keepCommitsSignedOverRecordPromises(record, answered, 'promise');
 		this.updateTransactionRecord(record, 'after-promises');
 		return { record };
 	}
@@ -1410,6 +1528,15 @@ export class ClusterCoordinator {
 	 * delivery rides on its commit ({@link deferPendDelivery}). The order members apply in is then
 	 * this node's first and the remote ones after, the order a cohort of four or more already uses, whose
 	 * behind-member reconciles {@link broadcastMergedRecord} covers.
+	 *
+	 * **The round stops waiting once the merged commits reach the majority, or once they no longer can**
+	 * ({@link commitRoundDecided}): a remote member still unanswered then is a straggler, owed the record in
+	 * the background ({@link adoptStragglers}). The round never sends to a member a promise-round request is
+	 * still riding to ({@link targetsNow}). Sent the commit round as well, it could take the two in either
+	 * order, and a commit-round record processed first has it sign and clear the transaction, after which
+	 * the stale promise request plants a fresh reservation (`activeTransactions`) that nothing clears until
+	 * the broadcast. Super-majority is at least a simple majority, so the members that answered the promise
+	 * round can carry the commit majority alone.
 	 */
 	private async commitTransaction(record: ClusterRecord): Promise<ClusterRecord> {
 		const selfId = this.localCluster?.peerId.toString();
@@ -1417,23 +1544,28 @@ export class ClusterCoordinator {
 		if (presigned && this.hasCommitMajority(record)) {
 			return await this.deliverDecidedWithoutCommitRound(record);
 		}
-		const roundPeers = Object.keys(record.peers).filter(id => !presigned || id !== selfId);
-		const deliveries = await this.collectCommits(record, roundPeers);
+		const roundPeers = this.targetsNow(record, Object.keys(record.peers).filter(id => !presigned || id !== selfId));
+		const { answered, stragglers } = await this.collectCommits(record, roundPeers);
 		// A member can reach consensus during THIS round (see above), so its apply report arrives on
 		// these responses. The broadcast's copy wins on overlap, being the later of the two.
-		mergeApplyOutcomes(record, collectApplyOutcomes(deliveries));
-		keepCommitsSignedOverRecordPromises(record, deliveries, 'commit');
+		mergeApplyOutcomes(record, collectApplyOutcomes(answered));
+		keepCommitsSignedOverRecordPromises(record, answered, 'commit');
+		this.foldBufferedAnswers(record);
 		log('cluster-tx:commit-merge', {
 			messageHash: record.messageHash,
 			presigned,
-			mergedCommits: Object.keys(record.commits)
+			mergedCommits: Object.keys(record.commits),
+			...(stragglers.size === 0 ? {} : { stragglers: [...stragglers.keys()] })
 		});
 		this.updateTransactionRecord(record, 'after-commit');
 
 		if (!this.hasCommitMajority(record)) {
 			// Owed: every member of the round whose commit the record does not hold — one whose delivery
-			// failed, and one that answered with a commit the rule above could not keep.
-			this.scheduleOrClearRetry(record, roundPeers.filter(peerId => record.commits[peerId] === undefined));
+			// failed, one that answered with a commit the rule above could not keep, and a straggler — and
+			// every member a promise-round request is still riding to.
+			const owed = this.owedAfterRounds(record, roundPeers.filter(peerId => record.commits[peerId] === undefined));
+			this.updateTransactionRecord(record, 'commit-short');
+			this.scheduleOrClearRetry(record, owed);
 			return record;
 		}
 		log('cluster-tx:commit-majority-reached', {
@@ -1443,7 +1575,7 @@ export class ClusterCoordinator {
 			threshold: this.cfg.simpleMajorityThreshold
 		});
 		// This node's member is not in the list: the broadcast decides its delivery itself.
-		return await this.deliverConsensus(record, membersAwaitingConsensus(deliveries.filter(d => d.peerId !== selfId)));
+		return await this.deliverConsensus(record, this.targetsNow(record, membersAwaitingConsensus(answered.filter(d => d.peerId !== selfId))));
 	}
 
 	/**
@@ -1454,10 +1586,10 @@ export class ClusterCoordinator {
 	private async deliverDecidedWithoutCommitRound(record: ClusterRecord): Promise<ClusterRecord> {
 		const selfId = this.localCluster?.peerId.toString();
 		log('cluster-tx:commit-round-skipped', { messageHash: record.messageHash, commits: Object.keys(record.commits) });
+		const remote = this.targetsNow(record, Object.keys(record.peers).filter(id => id !== selfId));
 		this.updateTransactionRecord(record, 'after-presign');
-		const remote = Object.keys(record.peers).filter(id => id !== selfId);
 		if (this.mayDeferPendDelivery(record, remote)) {
-			this.deferPendDelivery(record, remote);
+			this.deferPendDelivery(record, this.owedAfterRounds(record, remote));
 			return record;
 		}
 		return await this.deliverConsensus(record, remote);
@@ -1465,15 +1597,17 @@ export class ClusterCoordinator {
 
 	/**
 	 * Deliver a majority record to this node's member and to `awaiting` ({@link broadcastMergedRecord}),
-	 * and arm the scheduled retry for whoever it did not reach.
+	 * and arm the scheduled retry for whoever it did not reach: a member whose delivery failed, and every
+	 * straggler still owed ({@link owedAfterRounds}).
 	 */
 	private async deliverConsensus(record: ClusterRecord, awaiting: readonly string[]): Promise<ClusterRecord> {
 		const { failures, applyOutcomes } = await this.broadcastMergedRecord(record, awaiting);
 		mergeApplyOutcomes(record, applyOutcomes);
+		const owed = this.owedAfterRounds(record, failures);
 		// The scheduled retry works from the stored copy, and reads its apply outcomes to decide on the
 		// coordinating member's second reconcile, so it needs the broadcast's too.
 		this.updateTransactionRecord(record, 'after-broadcast');
-		this.scheduleOrClearRetry(record, failures);
+		this.scheduleOrClearRetry(record, owed);
 		return record;
 	}
 
@@ -1585,12 +1719,15 @@ export class ClusterCoordinator {
 	}
 
 	/**
-	 * Send `record` to each of `peerIds` in parallel for its commit vote. No per-peer immediate retry:
+	 * Send `record` to each of `peerIds` for its commit vote, and stop waiting once the answers decide the
+	 * round ({@link commitRoundDecided}). This node's member, when the round includes it (its pre-sign
+	 * threw), answers first, awaited: the local member is never a straggler. No per-peer immediate retry:
 	 * a failure here is recovered by the consensus broadcast's in-line retry and the scheduled
 	 * commit-retry timer. (The promise round has no such backstop, which is why `collectPromises` gets
-	 * the immediate retry instead.)
+	 * the immediate retry instead.) A member that failed before the round was decided is penalised; a
+	 * straggler never is.
 	 */
-	private async collectCommits(record: ClusterRecord, peerIds: readonly string[]): Promise<MemberDelivery[]> {
+	private async collectCommits(record: ClusterRecord, peerIds: readonly string[]): Promise<DecidedRound> {
 		if (verbose) {
 			const peerDetail = peerIds.map(id => ({
 				id: id.substring(0, 12),
@@ -1598,29 +1735,39 @@ export class ClusterCoordinator {
 			}));
 			log('cluster-tx:commit-peers', { messageHash: record.messageHash, peers: peerDetail });
 		}
-		// A snapshot: the members answer from the record as sent, and `record` is merged into only after
-		// every answer is in.
+		// A snapshot: the members answer from the record as sent, and `record` is merged into after the
+		// round is decided, while a straggler's request may still be on its way.
 		const payload: ClusterRecord = { ...record };
 		const selfId = this.localCluster?.peerId.toString();
-		const deliveries = await Promise.all(peerIds.map(peerId => {
+		const request = (peerId: string): Promise<MemberDelivery> => {
 			log('cluster-tx:commit-request', { messageHash: record.messageHash, peerId, isLocal: peerId === selfId });
 			return this.deliver(payload, peerId, 0, 'commit');
-		}));
-		for (const { peerId, success } of deliveries) {
+		};
+		const local = selfId !== undefined && peerIds.includes(selfId) ? [await request(selfId)] : [];
+		const remote = new Map(peerIds.filter(peerId => peerId !== selfId).map(peerId => [peerId, request(peerId)] as const));
+		const decided = commitRoundDecided(record, this.commitMajority(record));
+		const round = await this.awaitRound(record, 'commit', remote, (answered, outstanding) => decided([...local, ...answered], outstanding));
+		const answered = [...local, ...round.answered];
+		for (const { peerId, success } of answered) {
 			if (!success) this.reputation?.reportPeer(peerId, PenaltyReason.ConsensusTimeout, `commit:${record.messageHash}`);
 		}
 		log('cluster-tx:commit-summary', {
 			messageHash: record.messageHash,
-			successes: deliveries.filter(d => d.success).map(d => d.peerId),
-			failures: deliveries.filter(d => !d.success).map(({ peerId, error }) => ({ peerId, error }))
+			successes: answered.filter(d => d.success).map(d => d.peerId),
+			failures: answered.filter(d => !d.success).map(({ peerId, error }) => ({ peerId, error })),
+			stragglers: [...round.stragglers.keys()]
 		});
-		return deliveries;
+		return { answered, stragglers: round.stragglers };
+	}
+
+	/** The commit signatures a record needs to prove the commit: a simple majority (>50%) of its cohort. */
+	private commitMajority(record: ClusterRecord): number {
+		return Math.floor(Object.keys(record.peers).length * this.cfg.simpleMajorityThreshold) + 1;
 	}
 
 	/** Whether `record`'s commit signatures reach the simple majority (>50%) that proves the commit. */
 	private hasCommitMajority(record: ClusterRecord): boolean {
-		const peerCount = Object.keys(record.peers).length;
-		return Object.keys(record.commits).length >= Math.floor(peerCount * this.cfg.simpleMajorityThreshold) + 1;
+		return Object.keys(record.commits).length >= this.commitMajority(record);
 	}
 
 	/** Schedule a commit retry for `missingPeers`, or clear any pending one when nobody is missing. */
@@ -1678,12 +1825,24 @@ export class ClusterCoordinator {
 	 * one more reconcile (`reconcileRefusedCommit`). The member skips it unless its retained refusal has
 	 * the behind shape, so only a behind coordinator pays the extra fetch. It finishes before this
 	 * method returns, so `executeClusterTransaction` reads the refreshed verdict.
+	 *
+	 * **The remote deliveries stop being waited for once a strict majority of the cohort holds the record,
+	 * or once no outstanding answer could make one** ({@link broadcastDecided}, counting with the
+	 * durability gate's own `isDurableMajority`), so finishing early never leaves `CoordinatorRepo.commit`
+	 * short of a majority one more answer would have made. A member still unanswered then is a straggler,
+	 * owed the record in the background ({@link adoptStragglers}); the second reconcile above runs on the
+	 * answers in hand.
 	 */
 	private async broadcastMergedRecord(record: ClusterRecord, remoteTargets: readonly string[]): Promise<{ failures: string[]; applyOutcomes?: ClusterRecord['applyOutcomes'] }> {
 		const local = await this.deliverToLocalMember(record);
-		const remote = await Promise.all(remoteTargets.map(peerId =>
-			this.deliver(record, peerId, this.commitBroadcastImmediateRetries, 'commit-broadcast')));
-		const deliveries = local === undefined ? remote : [local, ...remote];
+		// A snapshot, since a straggler's request may still be on its way when `record` is next written.
+		const payload: ClusterRecord = { ...record };
+		const requests = new Map(remoteTargets.map(peerId =>
+			[peerId, this.deliver(payload, peerId, this.commitBroadcastImmediateRetries, 'commit-broadcast')] as const));
+		const selfId = this.localCluster?.peerId.toString();
+		const { answered } = await this.awaitRound(record, 'broadcast', requests,
+			broadcastDecided(record, selfId, this.localHolding(record, local)));
+		const deliveries = local === undefined ? answered : [local, ...answered];
 		// This delivery is where most members apply the operations, so their responses carry the only
 		// report the coordinator ever gets of what each member's OWN storage said. Collecting it here is
 		// what lets a pend refused by a non-coordinating member reach the writer as a conflict instead of
@@ -1730,6 +1889,40 @@ export class ClusterCoordinator {
 		const selfId = this.localCluster?.peerId.toString();
 		const outcomes = { ...record.applyOutcomes, ...latest };
 		return Object.keys(record.peers).some(id => id !== selfId && outcomes[id]?.commit?.success === true);
+	}
+
+	/**
+	 * What the consensus broadcast knows of this node's own member once its delivery is done
+	 * ({@link broadcastDecided}): whether it holds the record, and, if it applied without holding, that its
+	 * second reconcile may yet make it a holder. Nothing for a node outside the cohort.
+	 */
+	private localHolding(record: ClusterRecord, local: MemberDelivery | undefined): LocalHolding {
+		const applied = this.localMemberHasApplied(record, local);
+		const holds = applied && holdsRecord(record.message, this.localApplyOutcome(record, local));
+		return { holds, mayYetHold: applied && !holds };
+	}
+
+	/**
+	 * This node's member's apply report for `record`: its retained verdicts where the member keeps them,
+	 * else what it reported on this delivery's answer or an earlier one. The retained verdicts are the ones
+	 * the durability gate reads (`localCommitResult`), so the broadcast counts this member as the gate will.
+	 */
+	private localApplyOutcome(record: ClusterRecord, local: MemberDelivery | undefined): MemberApplyOutcome | undefined {
+		const member = this.localCluster;
+		if (member === undefined) return undefined;
+		const selfId = member.peerId.toString();
+		const { messageHash } = record;
+		const { pend: reportedPend, ...reported } = local?.response?.applyOutcomes?.[selfId] ?? record.applyOutcomes?.[selfId] ?? {};
+		const retainedPend = member.getExecutedPendResult?.(messageHash);
+		// The report carries only a conflict-shaped pend refusal, so the retained verdict is read the same way.
+		const pend = retainedPend === undefined ? reportedPend : conflictPendRefusalOf({ pend: retainedPend }) && retainedPend;
+		const commit = member.getExecutedCommitResult?.(messageHash);
+		return {
+			...reported,
+			...(member.wasTransactionExecuted?.(messageHash) === true ? { executed: true } : {}),
+			...(pend ? { pend } : {}),
+			...(commit === undefined ? {} : { commit })
+		};
 	}
 
 	/**
@@ -1850,11 +2043,27 @@ export class ClusterCoordinator {
 		}
 	}
 
-	/** One scheduled attempt of `retry`: deliver to its pending members, then finish or re-arm it. */
+	/**
+	 * One scheduled attempt of `retry`: deliver to its pending members, then finish or re-arm it.
+	 *
+	 * A member a request is riding to right now — a round's straggler, or the record carried on another
+	 * request — is left to that request's answer, and stays pending until it arrives. When every pending
+	 * member is in flight the run sends nothing and re-arms at the same attempt and interval, spending
+	 * nothing of the budget: a silent straggler's request routinely outlives the whole default budget
+	 * (250 ms doubling, five attempts, about 7.75 s), and counting those runs would release the
+	 * transaction with the straggler never delivered. The wait stays bounded, because every in-flight
+	 * request ends at its RPC deadline (`rpc-deadline.ts`); the member is then sent the record, and
+	 * attempts count again.
+	 */
 	private async runRetry(state: ClusterTransactionState, retry: CommitRetryState): Promise<void> {
 		const { messageHash, record } = state;
 		const { pendingPeers, attempt } = retry;
 		const selfId = this.localCluster?.peerId.toString();
+		if ([...pendingPeers].every(peerId => state.inFlight.has(peerId))) {
+			log('cluster-tx:retry-in-flight', { messageHash, attempt, peerIds: Array.from(pendingPeers) });
+			this.armRetry(state, Array.from(pendingPeers), { attempt, intervalMs: retry.intervalMs, ...(retry.deferred ? { deferred: true } : {}) });
+			return;
+		}
 		log('cluster-tx:retry-start', { messageHash, attempt, peerIds: Array.from(pendingPeers), ...(retry.deferred ? { deferred: true } : {}) });
 		// Each pending member gets the record as it stands: it adds its commit, and applies once the
 		// record then carries a majority, which in a small cohort this very delivery can complete. This
@@ -1862,15 +2071,9 @@ export class ClusterCoordinator {
 		// majority; before that (the commit round failed on it too) it is asked for its commit like the rest.
 		const payload: ClusterRecord = { ...record };
 		const selfToBroadcast = this.hasCommitMajority(record);
-		// A member the record is riding to on another request right now is left to that request's
-		// answer, and stays pending until it arrives, so the retry is re-armed rather than finished on
-		// its account.
-		// NOTE: a timer that fires while every pending member's delivery is riding elsewhere sends
-		// nothing and still spends an attempt. Harmless while a request outlives a retry interval only
-		// rarely; if carried requests on slow links routinely do, re-arm without counting the attempt.
 		const deliveries = await Promise.all(Array.from(pendingPeers)
 			.filter(peerId => !selfToBroadcast || peerId !== selfId)
-			.filter(peerId => !state.carrying.has(peerId))
+			.filter(peerId => !state.inFlight.has(peerId))
 			.map(peerId => this.deliver(payload, peerId, 0, 'commit-retry')));
 		keepCommitsSignedOverRecordPromises(record, deliveries, 'retry');
 		const majority = this.hasCommitMajority(record);
@@ -1945,6 +2148,8 @@ export class ClusterCoordinator {
 	 */
 	private releaseTransaction(messageHash: string, reason: ReleaseReason): void {
 		const state = this.transactions.get(messageHash);
+		if (state?.released) return;
+		if (state) state.released = true;
 		if (state?.retry) {
 			state.retry.cancel?.();
 			state.retry = undefined;
@@ -2008,7 +2213,9 @@ export class ClusterCoordinator {
 					record: state.record,
 					pending,
 					lastUpdate: state.lastUpdate,
-					carrying: new Set()
+					inFlight: new Set(),
+					stragglers: new Set(),
+					lateAnswers: []
 				};
 				this.transactions.set(messageHash, txState);
 				// Schedule retry from where we left off

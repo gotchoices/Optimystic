@@ -28,7 +28,11 @@ export class PromiseShortfallError extends Error {
 	readonly peerCount: number;
 	/** The approvals the round needed. */
 	readonly needed: number;
-	/** Peer-id strings of the cohort members that cast no promise vote at all. */
+	/**
+	 * Peer-id strings of the cohort members whose promise vote the round did not count: those that never
+	 * answered, and those still unanswered when the answers in hand put the bar out of reach — the round
+	 * stops waiting then, so a member merely slower than the rest is named here too.
+	 */
 	readonly silentPeers: readonly string[];
 	/** Why a lone coordinator refused to write alone, when that is what this shortfall is
 	 * ({@link PromiseShortfall.soloRefused}); absent when a consensus round fell short. */
