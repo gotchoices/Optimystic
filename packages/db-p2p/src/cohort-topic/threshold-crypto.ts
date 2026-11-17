@@ -138,8 +138,12 @@ export class FretCohortThresholdCrypto implements ICohortThresholdCrypto {
 		}
 
 		// Concurrently collect endorsements from the rest of the cohort, up to the deadline.
-		const others = this.deps.cohortMembers().filter((m) => m !== selfStr);
-		if (others.length > 0 && collected.size < minSigs) {
+		const others = [...new Set(this.deps.cohortMembers())].filter((m) => m !== selfStr);
+		// A cohort with fewer members than `minSigs` — every cohort on a network smaller than `k − x` — cannot
+		// reach the threshold whoever endorses, so no `/sign` round is sent; the publisher retries each gossip
+		// round, and dialing every member each time would buy nothing.
+		const reachable = collected.size + others.length >= minSigs;
+		if (others.length > 0 && collected.size < minSigs && reachable) {
 			const request: SignRequestV1 = {
 				v: 1,
 				kind: this.deps.kind,

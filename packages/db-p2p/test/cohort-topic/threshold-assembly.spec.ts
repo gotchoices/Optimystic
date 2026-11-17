@@ -192,7 +192,10 @@ describe('cohort-topic: real k − x threshold-signature assembly', () => {
 	it('minSigs greater than the cohort size cannot succeed (tiny-network guard)', async () => {
 		const members = await makeMembers(2);
 		const byId = new Map(members.map((m) => [m.idStr, m]));
-		const crypto = assemblerFor(members[0]!, members, honestDialSign(byId));
+		const honest = honestDialSign(byId);
+		let dials = 0;
+		const countingDial: typeof honest = (peerIdStr, request) => { dials++; return honest(peerIdStr, request); };
+		const crypto = assemblerFor(members[0]!, members, countingDial);
 		// Cohort has 2 members; minSigs 5 is unreachable even with everyone willing.
 		let threw = false;
 		try {
@@ -201,6 +204,7 @@ describe('cohort-topic: real k − x threshold-signature assembly', () => {
 			threw = true;
 		}
 		expect(threw, 'cannot assemble more signatures than the cohort has members').to.equal(true);
+		expect(dials, 'no /sign round is sent for a threshold the cohort cannot reach').to.equal(0);
 	});
 
 	it('drops poisoned / forged / duplicate SignReplies before counting, then still reaches the quorum', async () => {

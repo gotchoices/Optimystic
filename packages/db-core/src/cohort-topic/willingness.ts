@@ -257,10 +257,10 @@ class GossipWillingnessCheck implements WillingnessCheck {
 	}
 
 	/** Sibling member keys (base64url) whose *gossiped* willingness vector serves `tier`. */
-	// NOTE: counts every member the view holds a contribution from, including one no longer in `cohortMembers`,
-	// against a quorum taken over `cohortMembers`; if admissions or `unwilling_member` candidates are seen resting
-	// on members that left the cohort, count only siblings in the list `readCohort` read.
 	private willingSiblings(tier: Tier): string[] {
+		// NOTE: counts every member the view holds a contribution from, including one no longer in `cohortMembers`,
+		// against a quorum taken over `cohortMembers`; if admissions or `unwilling_member` candidates are seen resting
+		// on members that left the cohort, count only siblings in the list `readCohort` read.
 		const out: string[] = [];
 		for (const [member, contribution] of this.deps.view.all()) {
 			if (member === this.deps.selfMember) continue; // self counted via live willingness
