@@ -401,6 +401,11 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return this.protocolPrefix;
 	}
 
+	/** `IPeerNetwork.localPeerId`: the libp2p node's own id. */
+	get localPeerId(): PeerId {
+		return this.libp2p.peerId;
+	}
+
 	// coordinator cache: key (base64url) -> peerId until expiry (bounded LRU-ish via Map insertion order)
 	private readonly coordinatorCache = new Map<string, { id: PeerId, expires: number }>()
 	private static readonly MAX_CACHE_ENTRIES = 1000

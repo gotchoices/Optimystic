@@ -5,7 +5,7 @@ import type {
 import type { RepoMessage } from "@optimystic/db-core";
 import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
-import type { RedirectPayload } from "./redirect.js";
+import { pickRedirectTarget, type RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { commitBatchOf, pendBatchOf } from "./request-batch.js";
@@ -177,13 +177,12 @@ export class RepoClient extends ProtocolClient implements IRepo {
 			if (hop >= 2) {
 				throw new Error('Redirect loop detected in RepoClient (max hops reached)')
 			}
-			const currentIdStr = this.peerId.toString()
-			const peers = redirectResponse.redirect.peers
-			const next = peers.find((p) => p.id !== currentIdStr) ?? peers[0]!
+			const next = pickRedirectTarget(
+				redirectResponse.redirect.peers,
+				this.peerId.toString(),
+				this.peerNetwork.localPeerId?.toString()
+			)
 			const nextId = peerIdFromString(next.id)
-			if (next.id === currentIdStr) {
-				throw new Error('Redirect loop detected in RepoClient (same peer)')
-			}
 			// NOTE: the redirect target is followed without consulting the network membership
 			// predicate (`NodeOptions.isNetworkMember`), here and in `ClusterClient`. The redirect
 			// comes from a cohort member that applies its own predicate, so it reaches a refused

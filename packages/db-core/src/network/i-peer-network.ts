@@ -2,6 +2,12 @@ import type { AbortOptions, PeerId, Stream } from "./types.js";
 
 export type IPeerNetwork = {
   /**
+   * This node's own peer id, so a protocol client never dials or follows a redirect to itself.
+   * Implementations without an identity omit it.
+   */
+  readonly localPeerId?: PeerId;
+
+  /**
    * Dial a peer and establish a protocol stream
    */
   connect(peerId: PeerId, protocol: string, options?: AbortOptions): Promise<Stream>;

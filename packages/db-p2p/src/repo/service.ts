@@ -268,8 +268,14 @@ export class RepoService implements Startable {
 	 * coordinator flags what it could not confirm); every other operation propagates the error, which
 	 * aborts the stream so the writer excludes this peer and re-picks — the posture `CoordinatorRepo` takes
 	 * on the same fault.
+	 *
+	 * The redirect never names `requester`, the peer that sent the request: this node's view of the cohort
+	 * can include a peer whose own view sent the request here, and redirecting it to itself fails its
+	 * dial. When the requester is the only peer left to name, the request is handled locally instead,
+	 * where `CoordinatorRepo` serves a read and refuses a write for a block this node is not responsible
+	 * for. The responsible ids stamped on the message stay the whole cohort.
 	 */
-	async checkRedirect(blockKey: string, opName: string, message: RepoMessage): Promise<RedirectPayload | null> {
+	async checkRedirect(blockKey: string, opName: string, message: RepoMessage, requester?: PeerId): Promise<RedirectPayload | null> {
 		const keyNetwork = this.getKeyNetwork()
 		if (!keyNetwork) return null
 
@@ -290,8 +296,14 @@ export class RepoService implements Startable {
 		const smallMesh = cluster.length < this.responsibilityK
 
 		if (!smallMesh && !isMember) {
+			const requesterId = requester?.toString()
+			const targets = cluster.filter(id => id !== requesterId)
+			if (targets.length === 0) {
+				this.log('redirect:only-requester op=%s blockKey=%s requester=%s', opName, blockKey, requesterId)
+				return null
+			}
 			this.log('redirect op=%s blockKey=%s cluster=%d', opName, blockKey, cluster.length)
-			return encodePeers(await Promise.all(cluster.map(async id => ({
+			return encodePeers(await Promise.all(targets.map(async id => ({
 				id,
 				addrs: await this.getPeerAddrs(peerIdFromString(id))
 			}))))
@@ -373,7 +385,7 @@ export class RepoService implements Startable {
 				const operation = message.operations[0]
 				const { blockKey, opName } = this.deriveMessageKey(message)
 				const redirect = blockKey !== undefined
-					? await this.checkRedirect(blockKey, opName, message)
+					? await this.checkRedirect(blockKey, opName, message, peerId)
 					: null
 
 				let response: any

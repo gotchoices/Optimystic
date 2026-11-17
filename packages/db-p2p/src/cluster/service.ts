@@ -175,8 +175,12 @@ export class ClusterService implements Startable {
 	 * Returns a {@link RedirectPayload} when this node is not responsible, or null
 	 * when the update should be processed locally (we are a member, the mesh is too
 	 * small to scope, or we lack the identity/peer set to make a decision).
+	 *
+	 * The redirect never names `requester`, the peer that sent the update: following
+	 * a redirect to itself fails its dial. When the requester is the only other peer
+	 * the record names, the update is processed locally instead of redirected.
 	 */
-	async checkRedirect(record: ClusterRecord): Promise<RedirectPayload | null> {
+	async checkRedirect(record: ClusterRecord, requester?: PeerId): Promise<RedirectPayload | null> {
 		const selfId = this.getSelfId();
 		if (!selfId) return null;					// no identity → can't scope, process locally
 
@@ -189,7 +193,12 @@ export class ClusterService implements Startable {
 		const smallMesh = peerIds.length < this.responsibilityK;
 
 		if (!smallMesh && !isMember) {
-			const others = peerIds.filter(id => id !== selfStr);
+			const requesterStr = requester?.toString();
+			const others = peerIds.filter(id => id !== selfStr && id !== requesterStr);
+			if (others.length === 0) {
+				this.log('redirect:only-requester messageHash=%s requester=%s', record.messageHash, requesterStr);
+				return null;
+			}
 			return encodePeers(await Promise.all(others.map(async id => {
 				const recAddrs = peers[id]?.multiaddrs ?? [];
 				const addrs = recAddrs.length > 0 ? recAddrs : await this.getPeerAddrs(id);
@@ -242,13 +251,13 @@ export class ClusterService implements Startable {
 				cluster: this.cluster,
 				selfId: this.getSelfId()?.toString(),
 				learnPeerAddresses: (record) => this.learnPeerAddresses(record),
-				checkRedirect: (record) => this.checkRedirect(record),
+				checkRedirect: (record) => this.checkRedirect(record, remotePeer),
 				log: this.log
 			})
 			: undefined;
 		let response: object;
 		try {
-			response = await this.processRecord(message);
+			response = await this.processRecord(message, remotePeer);
 		} catch (err) {
 			this.log.error('error processing cluster %s from %p - %e', message.operation, remotePeer, err);
 			response = toClusterErrorEnvelope(err);
@@ -256,7 +265,7 @@ export class ClusterService implements Startable {
 		return carried === undefined ? response : { ...response, carried };
 	}
 
-	private async processRecord(message: ClusterRequest): Promise<RedirectPayload | ClusterRecord> {
+	private async processRecord(message: ClusterRequest, remotePeer: PeerId | undefined): Promise<RedirectPayload | ClusterRecord> {
 		if (message.operation === 'update') {
 			// Learn the cohort's addresses FIRST — before both the redirect decision and
 			// local consensus, since either can go on to dial these same peers. libp2p only
@@ -266,7 +275,7 @@ export class ClusterService implements Startable {
 			this.learnPeerAddresses(message.record);
 			// Scope consensus to responsible peers: redirect when we are not a
 			// member of the record's authoritative peer set, otherwise process.
-			const redirect = await this.checkRedirect(message.record);
+			const redirect = await this.checkRedirect(message.record, remotePeer);
 			return redirect ?? await this.cluster.update(message.record);
 		}
 		throw new Error(`Unknown operation: ${message.operation}`);

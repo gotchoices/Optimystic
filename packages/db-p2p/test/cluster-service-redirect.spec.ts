@@ -181,6 +181,27 @@ describe('ClusterService redirect logic', () => {
 			expect(result!.redirect.peers.map(p => p.id)).to.deep.equal([a.toString()]);
 		});
 
+		// GitHub #65: a redirect naming the peer that sent the update sends it to itself.
+		it('leaves the requesting peer out of the redirect', async () => {
+			const self = await makePeerId();
+			const requester = await makePeerId();
+			const other = await makePeerId();
+			const service = new ClusterService(makeComponents({ cluster: makeStubCluster(), peerId: self }), { responsibilityK: 2 });
+
+			const result = await service.checkRedirect(makeRecord(makePeers([requester, other])), requester);
+			expect(result!.redirect.peers.map(p => p.id)).to.deep.equal([other.toString()]);
+		});
+
+		it('processes the update locally when the requesting peer is the only one to redirect to', async () => {
+			const self = await makePeerId();
+			const requester = await makePeerId();
+			const stub = makeStubCluster();
+			const service = new ClusterService(makeComponents({ cluster: stub, peerId: self }));
+
+			await service.processOperation({ operation: 'update', record: makeRecord(makePeers([requester])) }, requester);
+			expect(stub.calls).to.equal(1);
+		});
+
 		it('prefers multiaddrs embedded in record.peers for redirect targets', async () => {
 			const self = await makePeerId();
 			const a = await makePeerId();

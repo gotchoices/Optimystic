@@ -3,7 +3,7 @@ import { blockIdsForTransforms, jsonEncodedBytes } from '@optimystic/db-core';
 import { ProtocolClient } from '../protocol-client.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { isClusterErrorEnvelope, clusterErrorFromEnvelope } from './cluster-error.js';
-import type { RedirectPayload } from '../repo/redirect.js';
+import { pickRedirectTarget, type RedirectPayload } from '../repo/redirect.js';
 import { mergeRecordPeerAddresses } from '../peer-address-book.js';
 import { createLogger } from '../logger.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
@@ -96,12 +96,12 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 			if (hop >= 2) {
 				throw new Error('Redirect loop detected in ClusterClient (max hops reached)')
 			}
-			const currentIdStr = this.peerId.toString()
-			const next = redirectResponse.redirect.peers.find((p) => p.id !== currentIdStr) ?? redirectResponse.redirect.peers[0]!
+			const next = pickRedirectTarget(
+				redirectResponse.redirect.peers,
+				this.peerId.toString(),
+				this.peerNetwork.localPeerId?.toString()
+			)
 			const nextId = peerIdFromString(next.id)
-			if (next.id === currentIdStr) {
-				throw new Error('Redirect loop detected in ClusterClient (same peer)')
-			}
 			// Learn the redirect target's addresses BEFORE dialing it: the redirect is the only
 			// notice we get that this peer matters, and if it is relay-only we have no address
 			// for it at all. Merging after the dial would help only some later hop.

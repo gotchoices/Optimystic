@@ -203,3 +203,69 @@ describe('ClusterClient coordinator-cache hint key', () => {
 		expect(bytesEqual(recorded[0]!.key, routingKeyForBlock('inserts')), 'must not key on the field name').to.equal(false);
 	});
 });
+
+/**
+ * Fake IPeerNetwork that knows its own id (`localPeerId`) and whose FIRST dial replies with a redirect
+ * naming `redirectPeers`, in that order; every later dial replies with `terminal`. It captures every
+ * dial target and every peer the client teaches it an address for or records as a coordinator.
+ */
+function makeSelfAwareRedirectNetwork(self: PeerId, redirectPeers: PeerId[], terminal: unknown) {
+	const dialed: string[] = [];
+	const taught: string[] = [];
+	const hinted: string[] = [];
+	const network = {
+		localPeerId: self,
+		async connect(peerId: CorePeerId, _proto: string) {
+			const payload = dialed.length === 0
+				? { redirect: { peers: redirectPeers.map(p => ({ id: p.toString(), addrs: [] })), reason: 'not_in_cluster' } }
+				: terminal;
+			dialed.push(peerId.toString());
+			return streamReplaying(await encodeJson(payload)) as unknown;
+		},
+		recordPeerAddresses(peerId: CorePeerId) {
+			taught.push(peerId.toString());
+		},
+		recordCoordinator(_key: Uint8Array, peerId: PeerId) {
+			hinted.push(peerId.toString());
+		},
+	} as unknown as IPeerNetwork;
+	return { network, dialed, taught, hinted };
+}
+
+// GitHub #65: a host's view of a block's cohort can name the very peer asking it, and the asker
+// used to follow the redirect to itself. The pick is shared with ClusterClient (`pickRedirectTarget`).
+describe('RepoClient redirect target', () => {
+	it('skips this node in a redirect and follows it to the next peer named', async () => {
+		const self = await makePeerId();
+		const asked = await makePeerId();
+		const other = await makePeerId();
+		const { network, dialed, taught, hinted } = makeSelfAwareRedirectNetwork(self, [self, other], {});
+		const client = RepoClient.create(asked, network, '/optimystic/test');
+
+		await client.get({ blockIds: ['block-A'] }, soonExpiring());
+
+		expect(dialed).to.deep.equal([asked.toString(), other.toString()]);
+		expect(taught, 'addresses learned only for the target').to.deep.equal([other.toString()]);
+		expect(hinted, 'coordinator hint recorded only for the target').to.deep.equal([other.toString()]);
+	});
+
+	it('fails without a second dial when the redirect names only this node and the peer asked', async () => {
+		const self = await makePeerId();
+		const asked = await makePeerId();
+		const { network, dialed, taught, hinted } = makeSelfAwareRedirectNetwork(self, [self, asked], {});
+		const client = RepoClient.create(asked, network, '/optimystic/test');
+
+		let thrown: unknown;
+		try {
+			await client.get({ blockIds: ['block-A'] }, soonExpiring());
+		} catch (err) {
+			thrown = err;
+		}
+
+		expect(thrown).to.be.instanceOf(Error);
+		expect((thrown as Error).message).to.match(/named no peer other than the one asked and this node/);
+		expect(dialed).to.deep.equal([asked.toString()]);
+		expect(taught).to.be.empty;
+		expect(hinted).to.be.empty;
+	});
+});

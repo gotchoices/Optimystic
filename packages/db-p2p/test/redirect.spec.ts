@@ -338,6 +338,35 @@ describe('RepoService redirect logic', () => {
 			expect(peerIds).to.not.include(self.toString());
 		});
 
+		// GitHub #65: this node's view of the cohort can name the peer whose own view sent it here.
+		it('leaves the requesting peer out of the redirect, and keeps it in the responsible ids', async () => {
+			const self = await makePeerId();
+			const requester = await makePeerId();
+			const other = await makePeerId();
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, keyNetwork: makeKeyNetwork([requester, other]) }),
+				{ responsibilityK: 2 }
+			);
+
+			const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] };
+			const result = await service.checkRedirect('block-1', 'get', message, requester);
+
+			expect(result!.redirect.peers.map(p => p.id)).to.deep.equal([other.toString()]);
+			expect((message as any).cluster).to.deep.equal([requester.toString(), other.toString()]);
+		});
+
+		it('handles the request locally when the requesting peer is the only one to redirect to', async () => {
+			const self = await makePeerId();
+			const requester = await makePeerId();
+			const service = new RepoService(
+				makeComponents({ repo: makeStubRepo(), peerId: self, keyNetwork: makeKeyNetwork([requester]) }),
+				{ responsibilityK: 1 }
+			);
+
+			const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] };
+			expect(await service.checkRedirect('block-1', 'get', message, requester)).to.be.null;
+		});
+
 		it('attaches cluster info to message', async () => {
 			const self = await makePeerId();
 			const coordinator = await makePeerId();
