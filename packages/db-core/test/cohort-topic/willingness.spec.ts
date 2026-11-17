@@ -40,6 +40,11 @@ function reg(tier: number): RegisterV1 {
 	};
 }
 
+/** A cohort listing exactly the members `view` has heard from (self is counted by the check either way). */
+function membersHeardIn(view: MutableCohortView): () => string[] {
+	return () => [...view.all().keys()];
+}
+
 /** Add a sibling member to the view with a willingness vector (4-bit) and identifying key. */
 function addSibling(view: MutableCohortView, key: string, willingness: number): void {
 	view.merge(key, {
@@ -128,7 +133,7 @@ describe('cohort-topic / barometer', () => {
 });
 
 describe('cohort-topic / willingness check', () => {
-	const cfg = { cohortSize: 4, quorum: 2 };
+	const cfg = { quorum: 2 };
 
 	it('accepts when the routed member is willing and quorum holds', () => {
 		const view = createCohortView();
@@ -137,6 +142,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer: createLoadBarometer(),
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: () => 0,
 			config: cfg,
 		});
@@ -155,6 +161,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer,
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: () => 0,
 			config: cfg,
 		}).evaluate(reg(Tier.T1), coreProfile(), 5_000);
@@ -173,6 +180,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer: createLoadBarometer(),
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: () => 0,
 			config: cfg,
 		}).evaluate(reg(Tier.T3), edgeProfile(), 5_000);
@@ -186,6 +194,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer: createLoadBarometer(),
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: () => 0,
 			attempts: () => 2, // third rejection
 			config: cfg,
@@ -197,29 +206,34 @@ describe('cohort-topic / willingness check', () => {
 		expect(out.retryAfterMs).to.equal(4_000);
 	});
 
-	it('tells a quorum short for want of unheard members (awaitingMembers) from one whose members answered unwilling', () => {
+	it('admits on a majority of the cohort as listed at each evaluation, and tells unheard members from unwilling ones', () => {
 		const view = createCohortView();
-		const self = bytesToB64url(peer('self'));
-		const sibA = bytesToB64url(peer('sib-A'));
-		const sibB = bytesToB64url(peer('sib-B'));
+		const [self, sibA, sibB, sibC, sibD] = ['self', 'sib-A', 'sib-B', 'sib-C', 'sib-D'].map((label) => bytesToB64url(peer(label)));
+		// A network of three machines: the cohort is all three, far below the default wantK.
+		let members = [self!, sibA!, sibB!];
 		const check = createWillingnessCheck({
 			barometer: createLoadBarometer(),
 			view,
-			selfMember: self,
-			cohortMembers: () => [self, sibA, sibB],
+			selfMember: self!,
+			cohortMembers: () => members,
 			primaryTopicCount: () => 0,
-			config: { cohortSize: 3, quorum: 2 },
 		});
 		const evaluate = (): unknown => check.evaluate(reg(Tier.T1), coreProfile(), 5_000);
 
-		// Nobody heard: self willing + two unheard could reach quorum 2.
+		// Quorum 2 of 3. Nobody heard: self willing + two unheard could reach it.
 		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: true });
 		// One sibling answered unwilling: it is heard, but the other could still fill the quorum.
-		addSibling(view, sibA, 0);
+		addSibling(view, sibA!, 0);
 		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: true });
 		// Both answered unwilling: the answers are in and short.
-		addSibling(view, sibB, 0);
+		addSibling(view, sibB!, 0);
 		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: false });
+		// One sibling now willing: self and it are a majority of three.
+		addSibling(view, sibB!, 0b1111);
+		expect(evaluate()).to.include({ kind: 'accepted' });
+		// The cohort grows to five while the check lives: quorum 3, short again until a new member answers.
+		members = [self!, sibA!, sibB!, sibC!, sibD!];
+		expect(evaluate()).to.include({ kind: 'unwilling_cohort', awaitingMembers: true });
 	});
 
 	it('sheds the tier via the per-tier primary-topic budget even when load is idle', () => {
@@ -230,6 +244,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer: createLoadBarometer(),
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: (t) => (t === Tier.T1 ? 2048 : 0), // at the budget cap for T1
 			config: cfg,
 		}).evaluate(reg(Tier.T1), coreProfile(), 5_000);
@@ -249,6 +264,7 @@ describe('cohort-topic / willingness check', () => {
 			barometer: createLoadBarometer(),
 			view,
 			selfMember: bytesToB64url(peer('self')),
+			cohortMembers: membersHeardIn(view),
 			primaryTopicCount: () => 0,
 			attempts: () => 0,
 			config: cfg,

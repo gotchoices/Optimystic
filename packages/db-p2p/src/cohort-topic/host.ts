@@ -2789,14 +2789,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 		barometer: ctx.barometer,
 		view,
 		selfMember,
-		// The members a short quorum may still be waiting to hear from, in the form the view is keyed by.
+		// The cohort as it is now, in the form the view is keyed by: the willingness quorum is a majority of it
+		// (the FRET cohort around the coord, at most `wantK`, or the root group), and a short quorum may still be
+		// waiting to hear from some of it.
 		cohortMembers: (): string[] => cohort().members.map(bytesToB64url),
 		primaryTopicCount: (tier: Tier): number => countPrimaryTopics(store, ctx.selfMemberBytes, tier),
-		// The willingness quorum is a majority of the cohort size: `wantK` for a FRET cohort, the root group's
-		// size for a root-placed one. The size is read once here, which is exact for a group sized by storage
-		// placement (members rotate, the count does not) and merely permissive for a group still filling on a
-		// small network, where the quorum stays at the smaller count until the engine is recreated.
-		config: { cohortSize: rootGroup === undefined ? ctx.wantK : rootGroup.view.members.length },
 	});
 	const traffic = createTrafficCounters({ view, store, selfMember, childCohortCount: (topicId: Uint8Array): number => childRegistry.count(topicId) });
 	const promotion = createPromotionLifecycle({

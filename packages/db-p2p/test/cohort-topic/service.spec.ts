@@ -86,8 +86,8 @@ function buildSingleMemberCohort(opts: { memberId: Uint8Array; capPromote: numbe
 		barometer,
 		view,
 		selfMember,
+		cohortMembers: (): string[] => [selfMember],
 		primaryTopicCount: (): number => 0,
-		config: { cohortSize: 1 },
 	});
 	const traffic = createTrafficCounters({ view, store, selfMember });
 	const promotion = createPromotionLifecycle({

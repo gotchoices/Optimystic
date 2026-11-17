@@ -23,3 +23,7 @@ The only way to build those hooks today is to reach the node's cohort-topic host
 
 - The self-served answers must be indistinguishable from the remote ones — same admission, rate-limit and validation — or a seeker that is its own cohort member gets a different matchmaking result from one that is not.
 - Related: `feat-matchmaking-real-libp2p-sweep-ports` needs the same self-serve binding for a swept shard whose primary is the seeker itself.
+
+## Another hand-built binding (from `matchmaking-cannot-register-on-a-small-network`)
+
+`packages/db-p2p/test/matchmaking-small-network.integration.spec.ts` builds the same three hooks by hand (`selfServeOn` there), which shows each one has a working path today: `register` routes the frame through a `FretTopicRouter` over the node's own FRET (`routeAndAct` with the tier's route key), so FRET's activity handler runs the same admission as any routed register; `query` calls `createMatchmakingQueryHandler` in `packages/db-p2p/src/matchmaking/query-transport.ts` over the host's registry in process; `renew` is `resolveRenew`. On a one-machine network every message a seeker sends needs one of them. When this ticket lands, that spec should drop its binding too.

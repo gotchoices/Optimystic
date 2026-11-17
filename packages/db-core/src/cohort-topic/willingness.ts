@@ -49,8 +49,8 @@ export interface UnwillingCohortOutcome {
 	 * True iff the quorum is short only because cohort members have not gossiped yet: it would be met if
 	 * every member this check holds no contribution from turned out willing. A member that has gossiped
 	 * *unwilling* counts as heard, so a cohort whose answers are in and short reports `false` — as does an
-	 * unserviceable tier, and a check given no {@link WillingnessDeps.cohortMembers}. The cohort side may hold
-	 * the request briefly for those answers instead of declining (§Cold-start instantiation).
+	 * unserviceable tier. The cohort side may hold the request briefly for those answers instead of declining
+	 * (§Cold-start instantiation).
 	 */
 	readonly awaitingMembers: boolean;
 }
@@ -130,13 +130,13 @@ export function backoffRetryMs(attempt: number, config: BackoffConfig = DEFAULT_
 // --- willingness check ---
 
 export interface WillingnessConfig {
-	/** Cohort size `k` (drives the default quorum). Default 16. */
-	cohortSize?: number;
 	/**
 	 * Members that must be willing to serve a tier for the cohort to take it on (the admission quorum,
-	 * `docs/cohort-topic.md` §Admission quorum). Default: strict majority of `cohortSize`
-	 * ({@link defaultQuorum}). Deliberately not the threshold-signature `minSigs = k − x` — see the doc
-	 * for why the two differ and when to revisit the default.
+	 * `docs/cohort-topic.md` §Admission quorum). Default: a strict majority ({@link defaultQuorum}) of the
+	 * cohort as {@link WillingnessDeps.cohortMembers} lists it at each evaluation, so a cohort smaller than
+	 * `wantK` — every cohort on a network of fewer machines — admits on a majority of the members it has.
+	 * Deliberately not the threshold-signature `minSigs = k − x` — see the doc for why the two differ and
+	 * when to revisit the default.
 	 */
 	quorum?: number;
 	/** Load bucket at/above which a tier is shed. Default {@link DEFAULT_OVERLOAD_BUCKET} (6). */
@@ -158,11 +158,12 @@ export interface WillingnessDeps {
 	/** This member's own id, base64url (the `fromMember` key) — excluded from the sibling scan. */
 	selfMember: string;
 	/**
-	 * The cohort's current members, base64url (the form {@link selfMember} and the view keys use), read at
-	 * each evaluation. It tells a member that has not gossiped yet apart from one that gossiped unwilling
-	 * ({@link UnwillingCohortOutcome.awaitingMembers}). Absent → no member counts as unheard.
+	 * The cohort's current members, base64url (the form {@link selfMember} and the view keys use), read once
+	 * per evaluation. Its size, self counted once whether listed or not, is what the default quorum is a
+	 * majority of; and it tells a member that has not gossiped yet apart from one that gossiped unwilling
+	 * ({@link UnwillingCohortOutcome.awaitingMembers}).
 	 */
-	cohortMembers?: () => readonly string[];
+	cohortMembers: () => readonly string[];
 	/** Count of topics this member is already `primary` for at `tier` (the budget gate input). */
 	primaryTopicCount: (tier: Tier) => number;
 	/**
@@ -178,8 +179,14 @@ export function defaultQuorum(cohortSize: number): number {
 	return Math.floor(cohortSize / 2) + 1;
 }
 
+/** The cohort as one evaluation sees it: every member, self included once, and those not yet heard from. */
+interface CohortReading {
+	readonly size: number;
+	readonly unheard: number;
+}
+
 class GossipWillingnessCheck implements WillingnessCheck {
-	private readonly quorum: number;
+	private readonly quorumOverride: number | undefined;
 	private readonly overloadBucket: number;
 	private readonly maxPrimaryTopicsPerTier: number;
 	private readonly backoff: BackoffConfig;
@@ -187,8 +194,7 @@ class GossipWillingnessCheck implements WillingnessCheck {
 
 	constructor(private readonly deps: WillingnessDeps) {
 		const cfg = deps.config ?? {};
-		const cohortSize = cfg.cohortSize ?? 16;
-		this.quorum = cfg.quorum ?? defaultQuorum(cohortSize);
+		this.quorumOverride = cfg.quorum;
 		this.overloadBucket = cfg.overloadBucket ?? DEFAULT_OVERLOAD_BUCKET;
 		this.maxPrimaryTopicsPerTier = cfg.maxPrimaryTopicsPerTier ?? 2048;
 		this.backoff = cfg.backoff ?? DEFAULT_BACKOFF_CONFIG;
@@ -205,11 +211,13 @@ class GossipWillingnessCheck implements WillingnessCheck {
 		const selfWilling = this.selfLiveWilling(self, tier);
 		const siblings = this.willingSiblings(tier);
 		const willingCount = siblings.length + (selfWilling ? 1 : 0);
+		const cohort = this.readCohort();
+		const quorum = this.quorumOverride ?? defaultQuorum(cohort.size);
 
 		// Quorum gate (§Tier ladder): the cohort takes on tier-T duties only if a quorum of members
 		// is willing; otherwise registrations get UnwillingCohort and the caller backs off in time.
-		if (willingCount < this.quorum) {
-			return this.declineCohort(reg, willingCount + this.unheardMemberCount() >= this.quorum);
+		if (willingCount < quorum) {
+			return this.declineCohort(reg, willingCount + cohort.unheard >= quorum);
 		}
 		if (selfWilling) {
 			return { kind: "accepted" };
@@ -222,15 +230,21 @@ class GossipWillingnessCheck implements WillingnessCheck {
 		return { kind: "unwilling_cohort", retryAfterMs: backoffRetryMs(this.attempts(reg), this.backoff), awaitingMembers };
 	}
 
-	/** Cohort members other than self this check holds no gossiped contribution from. */
-	private unheardMemberCount(): number {
-		const unheard = new Set<string>();
-		for (const member of this.deps.cohortMembers?.() ?? []) {
+	/**
+	 * Read the cohort once: its size with self counted once (a snapshot that omits self — a root group that
+	 * rotated past this node — still has self deciding), and the members other than self this check holds
+	 * no gossiped contribution from.
+	 */
+	private readCohort(): CohortReading {
+		const members = new Set<string>(this.deps.cohortMembers());
+		members.add(this.deps.selfMember);
+		let unheard = 0;
+		for (const member of members) {
 			if (member !== this.deps.selfMember && this.deps.view.get(member) === undefined) {
-				unheard.add(member);
+				unheard++;
 			}
 		}
-		return unheard.size;
+		return { size: members.size, unheard };
 	}
 
 	/** Live willingness of *this* member for `tier`: profile ∧ load-under-threshold ∧ under budget. */
@@ -243,6 +257,9 @@ class GossipWillingnessCheck implements WillingnessCheck {
 	}
 
 	/** Sibling member keys (base64url) whose *gossiped* willingness vector serves `tier`. */
+	// NOTE: counts every member the view holds a contribution from, including one no longer in `cohortMembers`,
+	// against a quorum taken over `cohortMembers`; if admissions or `unwilling_member` candidates are seen resting
+	// on members that left the cohort, count only siblings in the list `readCohort` read.
 	private willingSiblings(tier: Tier): string[] {
 		const out: string[] = [];
 		for (const [member, contribution] of this.deps.view.all()) {

@@ -311,7 +311,6 @@ describe('cohort-topic / member-engine: a register waits once for members not he
 				selfMember: bytesKey(self),
 				cohortMembers: (): string[] => members.map(bytesKey),
 				primaryTopicCount: (): number => 0,
-				config: { cohortSize: members.length },
 			}),
 			promotion: {
 				onParticipantCountChange: (): Promise<undefined> => Promise.resolve(undefined),
