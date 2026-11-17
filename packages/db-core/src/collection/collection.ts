@@ -188,6 +188,15 @@ export type CollectionInitOptions<TAction> = {
 	 * and inside await-free steps on all of them, so it must be synchronous and must not call into
 	 * this collection; a throw out of it is caught and logged (`collection:view-changed-callback-threw`). */
 	onViewChanged?: () => void;
+	/** Called, synchronously, once per refresh that adopted changes this instance did not write: log
+	 * entries other writers committed, a durable invalidation, or another lineage (see
+	 * docs/internals.md §Reactive Watch Bridge). `rev` is the revision adopted. This instance's own
+	 * commits never count: a successful one is folded in and the held revision moves past it, a torn
+	 * one is finished and consumed as the write's own, and one still on the network defers the
+	 * refresh. Runs inside the refresh's await-free adopt step, under the collection latch on most
+	 * paths, so it must be synchronous and must not call into this collection; a throw out of it is
+	 * caught and logged (`collection:external-commits-callback-threw`). */
+	onExternalCommits?: (rev: number) => void;
 }
 
 /** Options for building a committed read view (see {@link Collection.createReadTracker}
@@ -393,6 +402,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 		private readonly onSealedRefused?: (entryId: EntryId, error: ActionRefusedError) => void,
 		/** See {@link CollectionInitOptions.onViewChanged}. */
 		private readonly onViewChanged?: () => void,
+		/** See {@link CollectionInitOptions.onExternalCommits}. */
+		private readonly onExternalCommits?: (rev: number) => void,
 		/** Short random tag naming THIS instance (see {@link newInstanceTag}). Open paths generate
 		 * it BEFORE construction (so pre-construction diagnostics such as attachToLog can carry it);
 		 * the default covers direct construction in tests. */
@@ -443,7 +454,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			return undefined;
 		}
 		await Collection.attachToLog<TAction>(source, sourceCache, tracker, floors, id, instanceTag, ends, clockOf(transactor));
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, init.onExternalCommits, instanceTag);
 		collection.logTailId = ends.header.tailId;
 		return collection;
 	}
@@ -474,7 +485,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			inventedBaseline = copyTransforms(tracker.transforms);
 		}
 
-		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, instanceTag);
+		const collection = new Collection(id, transactor, init.modules, source, sourceCache, tracker, floors, init.merge, init.onSealedRefused, init.onViewChanged, init.onExternalCommits, instanceTag);
 		collection.logTailId = ends?.header.tailId;
 		collection.inventedBaseline = inventedBaseline;
 		return collection;
@@ -943,6 +954,18 @@ export class Collection<TAction> implements ICollection<TAction> {
 		} catch (err) {
 			log('collection:view-changed-callback-threw id=%s tag=%s error=%s',
 				this.id, this.instanceTag, err instanceof Error ? err.message : String(err));
+		}
+	}
+
+	/** Tell {@link CollectionInitOptions.onExternalCommits} that a refresh adopted revision `rev` and,
+	 * with it, changes this instance did not write. Called only from {@link forgetAndAdopt}, after the
+	 * adoption and in the same synchronous step. */
+	private externalCommitsAdopted(rev: number): void {
+		try {
+			this.onExternalCommits?.(rev);
+		} catch (err) {
+			log('collection:external-commits-callback-threw id=%s tag=%s rev=%d error=%s',
+				this.id, this.instanceTag, rev, err instanceof Error ? err.message : String(err));
 		}
 	}
 
@@ -1499,7 +1522,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 			anyConflicts = true;
 		}
 
-		const adoption = this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends);
+		const othersWrote = Collection.walkedOthersWrites(latest?.entries ?? [], ownEntry, invalidations.length);
+		const adoption = this.forgetAndAdopt(latest, entryRevs, revertedBlockIds, ends, othersWrote);
 
 		Collection.reportShortfall(this.id, this.instanceTag, tailRev, actionContext?.rev, this.source.actionContext?.rev);
 
@@ -1559,12 +1583,22 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * write through it never mints below an entry it has seen — whatever the verdict, since a clock
 	 * only rises and the entries were read either way.
 	 *
+	 * **Last, it tells the owner when what it adopted includes other writers' changes**
+	 * ({@link CollectionInitOptions.onExternalCommits}): the walk found them (`othersWrote`), or the
+	 * adoption is another lineage. In this step rather than after it, so the owner hears of it from
+	 * every path that refreshes — a reader's, a write's between attempts, a head commit's — and
+	 * before anything the refresh does next (the replay) can throw. A refused read adopted nothing
+	 * and reports nothing.
+	 *
+	 * @param othersWrote whether the walk found anything another writer committed
+	 * ({@link walkedOthersWrites}).
 	 * @returns what the adoption did, as {@link judgeAdoption} answered it before anything changed. */
 	private forgetAndAdopt(
 		latest: GetFromResult<Action<TAction>> | undefined,
 		entryRevs: ReadonlyMap<ActionId, number>,
 		revertedBlockIds: BlockId[],
 		ends: LogEnds,
+		othersWrote: boolean,
 	): Adoption {
 		const adoption = Collection.judgeAdoption(this.source.actionContext, latest?.context);
 		if (latest?.hlcHighWater !== undefined) clockOf(this.transactor).observe(latest.hlcHighWater);
@@ -1580,7 +1614,27 @@ export class Collection<TAction> implements ICollection<TAction> {
 		this.sourceCache.clear(revertedBlockIds);
 		Collection.advanceContext(this.source, this.id, this.instanceTag, 'refresh', latest?.context, adoption);
 		Collection.keepLogEnds(this.sourceCache, this.floors, this.source.actionContext, ends);
+		const adopted = this.source.actionContext;
+		if (adopted !== undefined && (adoption === 'adopt-divergent' || (adoption === 'adopt' && othersWrote))) {
+			this.externalCommitsAdopted(adopted.rev);
+		}
 		return adoption;
+	}
+
+	/** Whether a refresh's walk found changes this instance did not write: an action entry other than
+	 * `ownEntry` — the in-flight write's own, which the refresh finishes and consumes — or a durable
+	 * invalidation, which reverted committed content. Every other action entry above the held
+	 * revision is another writer's, because this instance's own commits are folded in and the held
+	 * revision moves past them ({@link foldOwnCommit}, {@link recordCommitted}), and a refresh that
+	 * meets its head commit still on the network returns before adopting anything
+	 * ({@link headInFlight}). `entries` holds action entries only; a checkpoint, which changes no
+	 * block, is never among them. */
+	private static walkedOthersWrites<T>(
+		entries: readonly ActionEntry<T>[],
+		ownEntry: ActionEntry<T> | undefined,
+		invalidationCount: number,
+	): boolean {
+		return invalidationCount > 0 || entries.some(entry => entry !== ownEntry);
 	}
 
 	/** Put the header and log tail block {@link readLogEnds} already fetched into a handle's own
@@ -1591,8 +1645,8 @@ export class Collection<TAction> implements ICollection<TAction> {
 	 * - **A refresh that walked** ({@link forgetAndAdopt}). Without it, a write that follows ANOTHER
 	 *   handle's commit fetches the log tail twice: the refresh reads it, the walked entry names it
 	 *   (a commit's blocks include the log block its entry was appended to) so the clear drops it,
-	 *   and `Chain.add` then reads it again to append this write's own entry. Last in that one
-	 *   synchronous step, after BOTH clears — offering before either would simply be undone by it.
+	 *   and `Chain.add` then reads it again to append this write's own entry. Last of that one
+	 *   synchronous step's cache moves, after BOTH clears — offering before either would simply be undone by it.
 	 *   An id that an invalidation reverted is therefore re-offered rather than left forgotten, which
 	 *   is sound because the revert is itself a commit and {@link readLogEnds} read unpinned: what it
 	 *   read already includes the revert.

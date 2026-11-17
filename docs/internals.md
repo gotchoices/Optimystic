@@ -77,7 +77,7 @@ A **write** pays that same refresh plus what the write itself needs: one request
 nothing else has committed since this handle last looked, two when another handle has.
 The second is the leaf the other writer changed, which has to be re-read. There is no
 third, because the refresh KEEPS the header and log tail it just read in the collection's
-own cache (`Collection.keepLogEnds`, the last move of
+own cache (`Collection.keepLogEnds`, the last cache move of
 `Collection.forgetAndAdopt`'s one synchronous step). Without it the tail is fetched twice
 per contended write: the walked entry names the log tail — a commit's blocks include the
 log block its entry was appended to — so the clear beside that entry drops the tail, and
@@ -1626,6 +1626,21 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   `notifyExternalChange`. The second is redundant but harmless. v1 does not attempt
   author-suppression; a future refinement could tag events with the authoring
   peer/actionId and let the vtab skip events it just authored.
+- **A collection handle says when it adopted another writer's commit.** The storage
+  event above is about a node's storage, not about what one handle reads. A handle's
+  own signal is `CollectionInitOptions.onExternalCommits` in
+  `packages/db-core/src/collection/collection.ts` (`Tree` takes it through
+  `TreeCollectionOptions`): called once per refresh that adopted log entries another
+  writer committed, a durable invalidation, or another lineage, with the revision
+  adopted, from inside the refresh's await-free adopt step (`Collection.forgetAndAdopt`).
+  So it fires whichever path refreshed — a read's pull-on-read, the offline drain's
+  head commit, the coordinator's refresh between attempts — and never for the handle's
+  own commits: a successful one is folded in and the held revision moves past it, a
+  torn one is finished and consumed as the write's own, and one still on the network
+  defers the refresh. An open walks nothing and reports nothing. Each handle reports
+  what it adopted, so two handles over one collection in one `Database` report each
+  other's commits — an over-report, never a missed one. It is what a materialized view
+  over a table needs to tell "fallen behind" from "my own write" (GitHub #58).
 - **Double wake from storage and network (accepted).** On a node that both stores
   a table tagged for network change notification (below) and watches it, another
   machine's commit wakes watchers twice: once from the table's own storage listener,
