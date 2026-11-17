@@ -355,18 +355,6 @@ describe('RepoService redirect logic', () => {
 			expect((message as any).cluster).to.deep.equal([requester.toString(), other.toString()]);
 		});
 
-		it('handles the request locally when the requesting peer is the only one to redirect to', async () => {
-			const self = await makePeerId();
-			const requester = await makePeerId();
-			const service = new RepoService(
-				makeComponents({ repo: makeStubRepo(), peerId: self, keyNetwork: makeKeyNetwork([requester]) }),
-				{ responsibilityK: 1 }
-			);
-
-			const message: RepoMessage = { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] };
-			expect(await service.checkRedirect('block-1', 'get', message, requester)).to.be.null;
-		});
-
 		it('attaches cluster info to message', async () => {
 			const self = await makePeerId();
 			const coordinator = await makePeerId();
@@ -569,9 +557,10 @@ describe('RepoService redirect logic', () => {
 			};
 		};
 
-		const drive = async (service: RepoService, message: RepoMessage): Promise<{ response: unknown, aborted: boolean }> => {
+		const drive = async (service: RepoService, message: RepoMessage, remotePeer?: PeerId): Promise<{ response: unknown, aborted: boolean }> => {
 			const { stream, sent, done, wasAborted } = makeServiceStream(await encodeJson(message));
-			(service as unknown as { handleIncomingStream: (s: unknown, c: unknown) => void }).handleIncomingStream(stream, undefined);
+			const connection = remotePeer ? { remotePeer } : undefined;
+			(service as unknown as { handleIncomingStream: (s: unknown, c: unknown) => void }).handleIncomingStream(stream, connection);
 			await done;
 			return { response: (await decodeJson(sent))[0], aborted: wasAborted() };
 		};
@@ -595,6 +584,20 @@ describe('RepoService redirect logic', () => {
 				expect((response as RedirectPayload).redirect.peers).to.deep.equal([{ id: member.toString(), addrs: ['/ip4/10.0.0.7/tcp/4001'] }]);
 			}
 			expect(reached, 'no redirected write reaches the coordinator').to.deep.equal([]);
+		});
+
+		// GitHub #65: the connection's peer is the requester `checkRedirect` leaves out of the redirect.
+		it('handles a request locally when the peer that sent it is the only one to redirect to', async () => {
+			const self = await makePeerId();
+			const requester = await makePeerId();
+			const { repo, reached } = makeRecordingRepo();
+			const service = new RepoService(makeComponents({ repo, peerId: self, keyNetwork: makeKeyNetwork([requester]) }), { responsibilityK: 1 });
+
+			const { response, aborted } = await drive(service, { operations: [{ get: { blockIds: ['block-1'], context: { committed: [], rev: 0 } } }] }, requester);
+
+			expect(aborted).to.equal(false);
+			expect(response).to.not.have.property('redirect');
+			expect(reached).to.deep.equal(['get']);
 		});
 
 		it('hands a pend for a cohort that includes this node to the repo', async () => {
