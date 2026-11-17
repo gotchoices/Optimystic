@@ -18,6 +18,7 @@ import type {
 	IBlock,
 	BlockContentDigests,
 	BlockBaseRevs,
+	ActionId,
 } from '../src/index.js';
 import type { WriteContext } from '../src/transaction/entry-commit.js';
 
@@ -188,8 +189,8 @@ async function declaredFor(coordinator: TransactionCoordinator, collections: Map
 	const transforms = new Map(Array.from(collections, ([id, collection]) => [id, (collection as { tracker: Tracker<IBlock> }).tracker.transforms]));
 	const ids = [...collections.keys()];
 	const described = await (coordinator as unknown as {
-		declareTouchedBlocks: (t: Map<CollectionId, Transforms>, c: Map<CollectionId, BlockId>, r: Map<CollectionId, number>) => Promise<{ success: true; attempts: ReadonlyMap<CollectionId, PhaseAttempt> }>;
-	}).declareTouchedBlocks(transforms, new Map(ids.map(id => [id, `${id}-tail` as BlockId])), new Map(ids.map(id => [id, 1])));
+		declareTouchedBlocks: (a: ActionId, t: Map<CollectionId, Transforms>, c: Map<CollectionId, BlockId>, r: Map<CollectionId, number>) => Promise<{ success: true; attempts: ReadonlyMap<CollectionId, PhaseAttempt> }>;
+	}).declareTouchedBlocks(context.actionId, transforms, new Map(ids.map(id => [id, `${id}-tail` as BlockId])), new Map(ids.map(id => [id, 1])));
 	return described.attempts;
 }
 

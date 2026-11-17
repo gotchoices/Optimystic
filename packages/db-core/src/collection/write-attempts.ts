@@ -8,7 +8,7 @@ import type { BasePins } from "../transform/base-pins.js";
 import type { CacheSource } from "../transform/cache-source.js";
 import { copyTransforms } from "../transform/helpers.js";
 import { describeTouchedBlocks, baseRevsField } from "../transform/digest.js";
-import { oversizedBlock } from "../network/block-size.js";
+import { oversizedWriteRefusal } from "../network/block-size.js";
 import { mergeDurability } from "../network/durability.js";
 import { highestStaleAt, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
@@ -296,9 +296,11 @@ export type StagedAttempt = {
  * cheap relative to the round trips it is retrying; if a high-contention write ever shows digest
  * hashing in a profile, memoize per (id, staged ops).
  *
- * @throws BlockTooLargeError when a touched block would be left larger than one message can carry —
- * before anything is sent, judged apart from the declaration (which never throws), and unretried by
- * either write path, since a later attempt would leave the same block. */
+ * @throws TransactionTooLargeError when a touched block would be left over the per-block limit and the
+ * attempt's transforms are over the per-transaction one, so the pend could not be sent either; and
+ * BlockTooLargeError when only the block is — both judged by `oversizedWriteRefusal` before anything is
+ * sent, apart from the declaration (which never throws), and unretried by either write path, since a
+ * later attempt would be refused the same way. */
 export async function stageAttempt<TAction>(
 	collectionId: CollectionId,
 	cache: CacheSource<IBlock>,
@@ -315,7 +317,7 @@ export async function stageAttempt<TAction>(
 	const added = await collectionLog.addActions([...target.actions], identity.actionId, rev,
 		() => tracker.transformedBlockIds(), { timestamp: identity.timestamp, hlc: identity.hlc, lane: identity.lane });
 	const touched = await describeTouchedBlocks(tracker, tracker.transformedBlockIds());
-	const tooLarge = oversizedBlock(touched.bytes);
+	const tooLarge = oversizedWriteRefusal(touched.bytes, tracker.transforms, identity.actionId);
 	if (tooLarge) throw tooLarge;
 	return {
 		tracker,

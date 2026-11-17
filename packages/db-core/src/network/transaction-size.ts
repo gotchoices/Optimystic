@@ -33,16 +33,26 @@ export function jsonEncodedBytes(value: unknown): number {
  * Raised before anything is sent, so nothing was reserved and nothing needs cancelling. Not a
  * `StaleFailure` and never retried — the same transaction is the same size on every attempt. The
  * writer has to split the change into smaller transactions.
+ *
+ * Three places raise it, each as early as it can prove the pend is over the limit: staging, once the
+ * actions one collection has staged are over it on their own ({@link assertStagedActionsFit}); building
+ * an attempt, once a block the write leaves is over the per-block limit and the attempt's transforms are
+ * over this one (`oversizedWriteRefusal`); and the pend itself ({@link assertTransactionFits}).
  */
 export class TransactionTooLargeError extends Error {
 	constructor(
-		readonly actionId: ActionId,
-		/** What the transaction's pend encodes to, by {@link jsonEncodedBytes}. */
+		/** The transaction's action id, or `undefined` when it was refused while still staging, before
+		 * the commit minted one. */
+		readonly actionId: ActionId | undefined,
+		/** The transaction's pend encodes to at least this many bytes, by {@link jsonEncodedBytes}:
+		 * exactly this many when the pend itself was measured, more when the writer measured a part of it
+		 * before building it — the attempt's transforms, or the actions staged so far. */
 		readonly bytes: number,
 		/** The limit it exceeded: {@link MAX_TRANSACTION_BYTES}. */
 		readonly limit: number = MAX_TRANSACTION_BYTES,
 	) {
-		super(`transaction ${actionId} encodes to ${bytes} bytes, over the per-transaction limit MAX_TRANSACTION_BYTES (${limit} bytes); split it into smaller transactions`);
+		const subject = actionId === undefined ? 'the transaction staged so far' : `transaction ${actionId}`;
+		super(`${subject} encodes to at least ${bytes} bytes, over the per-transaction limit MAX_TRANSACTION_BYTES (${limit} bytes); split it into smaller transactions`);
 		this.name = 'TransactionTooLargeError';
 	}
 }
@@ -70,4 +80,20 @@ export function assertTransactionFits(requests: readonly PendRequest[]): void {
 	if (requests.length === 0) return;
 	const bytes = transactionBytes(requests);
 	if (bytes > MAX_TRANSACTION_BYTES) throw new TransactionTooLargeError(requests[0]!.actionId, bytes);
+}
+
+/**
+ * Throws {@link TransactionTooLargeError}, with no action id, when the actions one collection has staged
+ * for its next commit — its open segment — encode to `actionBytes` together and that is over
+ * {@link MAX_TRANSACTION_BYTES}: the check `Collection.act` makes before staging more.
+ *
+ * Sound because the log entry a commit appends repeats every action it records verbatim, so the
+ * actions' sizes summed are a lower bound of the pend that carries the entry, and a pend over the limit
+ * can never be sent. Early rather than precise: the pend also carries the blocks the actions changed,
+ * which for a tree hold a row's data a second time, so this fires only once about twice the row data
+ * {@link assertTransactionFits} admits is staged, and a transaction between the two is still refused at
+ * commit. What it buys is not staging the rest of a transaction that can never commit.
+ */
+export function assertStagedActionsFit(actionBytes: number): void {
+	if (actionBytes > MAX_TRANSACTION_BYTES) throw new TransactionTooLargeError(undefined, actionBytes);
 }

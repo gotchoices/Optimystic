@@ -1,5 +1,7 @@
 import type { BlockId } from "../blocks/structs.js";
-import { MAX_TRANSACTION_BYTES } from "./transaction-size.js";
+import type { ActionId } from "../collection/action.js";
+import type { Transforms } from "../transform/struct.js";
+import { MAX_TRANSACTION_BYTES, TransactionTooLargeError, jsonEncodedBytes } from "./transaction-size.js";
 
 /**
  * The most bytes one block may encode to, measured by `jsonEncodedBytes` (the UTF-8 length of its
@@ -16,7 +18,9 @@ import { MAX_TRANSACTION_BYTES } from "./transaction-size.js";
  * - **No single transaction can exceed it on its own.** A block holding one entry or child is never
  *   larger than the transaction that wrote it, since that entry is inside the transaction's pend (as the
  *   new block's insert, or as the update operation that appends it), and the pend is held to
- *   {@link MAX_TRANSACTION_BYTES}.
+ *   {@link MAX_TRANSACTION_BYTES}. The writer judges the transaction first when both are over
+ *   ({@link oversizedWriteRefusal}), so a transaction too large to send is refused as one, whatever
+ *   block it would have grown.
  *
  * Structures that hold many entries per block (the log, tree nodes) keep each block that holds more than
  * one entry near {@link BLOCK_TARGET_BYTES}, far under this limit; this is the bound itself.
@@ -43,10 +47,12 @@ export const BLOCK_TARGET_BYTES = 1024 * 1024;
 /**
  * A write that would leave a block larger than {@link MAX_BLOCK_BYTES}: once committed, the block could
  * never be copied to another machine in one message. Raised by the writer before anything is sent
- * ({@link oversizedBlock}), so nothing was reserved and nothing needs cancelling. Not a `StaleFailure`
- * and never retried — the same write leaves the same block on every attempt. The structures that hold
- * many entries per block split by size (the log rolls over, a tree node divides), so this names a block
- * that outgrew the limit some other way; the change has to be written in a form that does not.
+ * ({@link oversizedWriteRefusal}), so nothing was reserved and nothing needs cancelling. Not a
+ * `StaleFailure` and never retried — the same write leaves the same block on every attempt. The
+ * structures that hold many entries per block split by size (the log rolls over, a tree node divides),
+ * so this names a block that outgrew the limit some other way — over several writes, each small enough
+ * to send, since a write too large to send is refused as a {@link TransactionTooLargeError} instead —
+ * and the change has to be written in a form that does not.
  */
 export class BlockTooLargeError extends Error {
 	constructor(
@@ -78,4 +84,31 @@ export function oversizedBlock(bytes: Readonly<Record<BlockId, number>>): BlockT
 		if (size > MAX_BLOCK_BYTES) return new BlockTooLargeError(blockId, size);
 	}
 	return undefined;
+}
+
+/**
+ * The refusal both write paths make before anything is sent, judged on what one collection's attempt
+ * would send: `touchedBytes`, per block, what the write would leave its content encoding to, and
+ * `transforms`, the attempt's staged transforms with its log append. `undefined` when every block fits.
+ *
+ * When a block is over {@link MAX_BLOCK_BYTES}, the transaction is judged first: transforms over
+ * {@link MAX_TRANSACTION_BYTES} are refused as a {@link TransactionTooLargeError}, since a collection's
+ * pend carries its transforms plus an envelope, and any batch it travels in carries that pend, so the
+ * transaction could not be sent whatever became of the block. Only a block over the limit inside
+ * transforms under it — a block grown over several writes — is a {@link BlockTooLargeError}. The
+ * transforms are measured only on that refusal path, so a write that fits pays nothing for it.
+ *
+ * NOTE: the transforms can be under the limit while one block and the full pend are over it — a block
+ * cannot be much larger than transforms holding it whole, so this takes a base that was already over the
+ * limit; it is refused as the block, which is then the truthful refusal.
+ */
+export function oversizedWriteRefusal(
+	touchedBytes: Readonly<Record<BlockId, number>>,
+	transforms: Transforms,
+	actionId: ActionId,
+): TransactionTooLargeError | BlockTooLargeError | undefined {
+	const tooLarge = oversizedBlock(touchedBytes);
+	if (tooLarge === undefined) return undefined;
+	const bytes = jsonEncodedBytes(transforms);
+	return bytes > MAX_TRANSACTION_BYTES ? new TransactionTooLargeError(actionId, bytes) : tooLarge;
 }

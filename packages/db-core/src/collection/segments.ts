@@ -3,6 +3,7 @@ import type { AlreadyAppliedTally } from "./action.js";
 import { addTallies, ZeroTally } from "./action.js";
 import type { ActionRefusedError } from "./struct.js";
 import { emptyTransforms, foldTransforms } from "../transform/helpers.js";
+import { jsonEncodedBytes } from "../network/transaction-size.js";
 
 /** A queue entry's id, opaque to the collection: the offline-sync queue (docs/offline-sync.md)
  * mints one per locally committed transaction and seals that transaction's actions under it. */
@@ -19,13 +20,22 @@ export type EntryId = string;
  * inside a group. Immutable once made, so a snapshot may hold the same unit. */
 export type StagedUnit<TAction> = {
 	readonly action: Action<TAction>;
+	/** What the action encodes to by `jsonEncodedBytes`, measured once, when the unit is made, and
+	 * carried by every unit rebuilt from it, so the open segment's total ({@link SegmentList.openBytes})
+	 * never serializes an action twice. */
+	readonly bytes: number;
 	readonly delta?: Transforms;
 	readonly applied?: AlreadyAppliedTally;
 };
 
+/** The unit for `action` with its staging not on record. */
+export function unitOf<TAction>(action: Action<TAction>): StagedUnit<TAction> {
+	return { action, bytes: jsonEncodedBytes(action) };
+}
+
 /** Units for `actions` whose staging is not on record. */
 export function unitsOf<TAction>(actions: readonly Action<TAction>[]): StagedUnit<TAction>[] {
-	return actions.map(action => ({ action }));
+	return actions.map(unitOf);
 }
 
 /** The actions one queue entry staged into a collection, closed off from later staging. */
@@ -97,6 +107,9 @@ export class SegmentList<TAction> {
 	 * ({@link StagedUnit}). Private so that it is replaced through {@link setOpen} alone and grown
 	 * through {@link pushOpen} alone, each unit carrying what its staging produced. */
 	private units: StagedUnit<TAction>[] = [];
+	/** The units' `bytes` summed: set by {@link setOpen}, grown by {@link pushOpen}, so every way the
+	 * open segment changes keeps it right. A replay's in-place recording keeps each unit's `bytes`. */
+	private unitBytes = 0;
 	/** Bumped on every change to the sealed list — a seal, an unseal, an insert, a drop, a refusal
 	 * recorded. Captured by a snapshot so a restore can tell whether the sealed segments it was taken
 	 * over are still the ones in place (ticket `offline-sync-open-segment-snapshot`). Read and written
@@ -119,18 +132,28 @@ export class SegmentList<TAction> {
 		return this.units.length;
 	}
 
+	/** What the open segment's actions encode to together, by `jsonEncodedBytes`: the lower bound of
+	 * the next commit's pend that `Collection.act` holds to the per-transaction limit. */
+	openBytes(): number {
+		return this.unitBytes;
+	}
+
 	/** Replace the open segment: the one way it is set. A caller putting actions back whose staging
 	 * it does not have records them through {@link unitsOf}, and the next replay records it. */
 	setOpen(units: StagedUnit<TAction>[]): void {
 		this.units = units;
+		this.unitBytes = units.reduce((total, unit) => total + unit.bytes, 0);
 	}
 
-	/** Append the actions one `act` call staged as one unit, with the delta and tally that staging
-	 * produced, recorded as {@link StagedUnit} describes for a group. */
-	pushOpen(actions: readonly Action<TAction>[], delta: Transforms, applied: AlreadyAppliedTally): void {
+	/** Append the actions one `act` call staged as one unit, with what each encodes to (`sizes`, in
+	 * the same order) and the delta and tally that staging produced, recorded as {@link StagedUnit}
+	 * describes for a group. */
+	pushOpen(actions: readonly Action<TAction>[], sizes: readonly number[], delta: Transforms, applied: AlreadyAppliedTally): void {
 		const last = actions.length - 1;
 		actions.forEach((action, index) => {
-			this.units.push(index === last ? { action, delta, applied } : { action, delta: emptyTransforms(), applied: ZeroTally });
+			const bytes = sizes[index]!;
+			this.units.push(index === last ? { action, bytes, delta, applied } : { action, bytes, delta: emptyTransforms(), applied: ZeroTally });
+			this.unitBytes += bytes;
 		});
 	}
 
@@ -149,7 +172,7 @@ export class SegmentList<TAction> {
 		const segment: SealedSegment<TAction> = { entryId, actions: this.units.map(unit => unit.action), ...foldUnits(this.units) };
 		this.sealed.push(segment);
 		this.byEntry.set(entryId, segment);
-		this.units = [];
+		this.setOpen([]);
 		this.version++;
 		return true;
 	}
@@ -173,7 +196,7 @@ export class SegmentList<TAction> {
 		}
 		this.sealed.pop();
 		this.byEntry.delete(entryId);
-		this.units = unitsOf(newest.actions);
+		this.setOpen(unitsOf(newest.actions));
 		this.version++;
 	}
 

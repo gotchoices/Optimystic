@@ -13,9 +13,10 @@ import { TransactorSource, answeredBlock, servedRevision } from "../transactor/t
 import { BlockFloors } from "../transactor/block-floors.js";
 import type { WriteDurability } from "../network/struct.js";
 import { withBlockRevs } from "../network/durability.js";
+import { assertStagedActionsFit, jsonEncodedBytes } from "../network/transaction-size.js";
 import type { CollectionHeaderBlock, CollectionId, CommittedTail, CommittedTailAnswer, CommittedTailQuery, CommittedTailReadOptions, HeadCommitOptions, ICollection, InFlightAttempt, InFlightCycle, OpenHeadCommitOptions, SyncOptions, TornActionReason } from "./index.js";
 import { ActionRefusedError, CollectionHeaderVanishedError, SealedSegmentsError, TornActionError } from "./struct.js";
-import { SegmentList, unitsOf } from "./segments.js";
+import { SegmentList, unitOf } from "./segments.js";
 import type { EntryId, SealedSegment, StagedUnit } from "./segments.js";
 import type { ActionContext, ActionRev, AlreadyAppliedTally } from "./action.js";
 import { actionIdAt, addTallies, ZeroTally } from "./action.js";
@@ -881,12 +882,20 @@ export class Collection<TAction> implements ICollection<TAction> {
 		}
 	}
 
+	/** Stage `actions` into the OPEN segment as one unit — a sealed segment is closed to further
+	 * staging — recording what the staging produced with them, so the segment they are sealed into
+	 * knows what it staged without staging it again (SealedSegment.delta).
+	 *
+	 * Refused before anything is staged when the open segment's actions and these would encode past
+	 * the per-transaction limit together (`assertStagedActionsFit`): every one of them rides verbatim
+	 * in the next commit's log entry, so that commit could never be sent, and staging more of it would
+	 * only cost time and memory. Each action is measured once, here, and the size kept on its unit.
+	 * Replays do not come through here: they re-stage what was already admitted. */
 	private async actInternal(...actions: Action<TAction>[]) {
+		const sizes = actions.map(action => jsonEncodedBytes(action));
+		assertStagedActionsFit(sizes.reduce((total, size) => total + size, this.segments.openBytes()));
 		const { transforms, applied } = await this.internalTransact(...actions);
-		// Staging appends to the OPEN segment: a sealed segment is closed to further staging. What
-		// the staging produced is recorded with the actions, so the segment they are sealed into
-		// knows what it staged without staging it again (SealedSegment.delta).
-		this.segments.pushOpen(actions, transforms, applied);
+		this.segments.pushOpen(actions, sizes, transforms, applied);
 	}
 
 	private internalTransact(...actions: Action<TAction>[]): Promise<Staging> {
@@ -1336,7 +1345,7 @@ export class Collection<TAction> implements ICollection<TAction> {
 			} else {
 				// A replacement's staging is not on record; the replay this forces records it.
 				changed = true;
-				if (effective !== undefined) after.push({ action: effective });
+				if (effective !== undefined) after.push(unitOf(effective));
 			}
 		}
 		this.segments.setOpen(after);
@@ -3187,12 +3196,13 @@ export class Collection<TAction> implements ICollection<TAction> {
 			}
 		}
 		// The list holds this array from here on, so each unit is recorded in place as its action
-		// is re-staged, and a throw leaves the units behind it with no staging on record.
-		const units = unitsOf(this.segments.openActions());
+		// is re-staged, and a throw leaves the units behind it with no staging on record. Each keeps
+		// the size measured when it was first staged.
+		const units: StagedUnit<TAction>[] = this.segments.openUnits().map(({ action, bytes }) => ({ action, bytes }));
 		this.segments.setOpen(units);
 		for (const [index, unit] of units.entries()) {
 			const { transforms, applied } = await this.internalTransact(unit.action);
-			units[index] = { action: unit.action, delta: transforms, applied };
+			units[index] = { action: unit.action, bytes: unit.bytes, delta: transforms, applied };
 		}
 	}
 

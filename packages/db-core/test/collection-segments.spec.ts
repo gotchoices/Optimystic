@@ -23,6 +23,7 @@ import {
 	PromiseShortfallError,
 	SealedSegmentsError,
 	SegmentList,
+	unitsOf,
 	SyncRetryExhaustedError,
 	TornActionError,
 	TransactionCoordinator,
@@ -206,8 +207,8 @@ describe('Collection sealed segments', function () {
 			// One `act` call over two actions stages them as one unit: the group's delta and tally sit
 			// on its last action. A later unit updates the block the first inserted.
 			const block = { header: { id: 'b1', type: 'TEST', collectionId: 'c' }, items: [] as string[] };
-			list.pushOpen([{ type: 'a', data: 1 }, { type: 'a', data: 2 }], { inserts: { b1: structuredClone(block) }, updates: {}, deletes: [] }, { applied: 1, alreadyApplied: 0 });
-			list.pushOpen([{ type: 'a', data: 3 }], { inserts: {}, updates: { b1: [['items', 0, 0, ['x']]], b2: [['items', 1, 0, ['y']]] }, deletes: ['b3'] }, { applied: 0, alreadyApplied: 1 });
+			list.pushOpen([{ type: 'a', data: 1 }, { type: 'a', data: 2 }], [1, 1], { inserts: { b1: structuredClone(block) }, updates: {}, deletes: [] }, { applied: 1, alreadyApplied: 0 });
+			list.pushOpen([{ type: 'a', data: 3 }], [1], { inserts: {}, updates: { b1: [['items', 0, 0, ['x']]], b2: [['items', 1, 0, ['y']]] }, deletes: ['b3'] }, { applied: 0, alreadyApplied: 1 });
 			expect(list.openUnits().map(unit => unit.delta?.inserts), 'the group records its delta on its last action').to.deep.equal([{}, { b1: block }, {}]);
 			expect(list.seal('E1')).to.be.true;
 			expect(list.openActions(), 'the open segment starts afresh').to.deep.equal([]);
@@ -221,7 +222,7 @@ describe('Collection sealed segments', function () {
 			expect(sealed.applied, 'and their tallies summed').to.deep.equal({ applied: 1, alreadyApplied: 1 });
 			expect(list.stagedDeltas(), 'what a committed head is taken out against').to.deep.equal([sealed.delta]);
 
-			list.setOpen([{ action: { type: 'a', data: 3 } }]);
+			list.setOpen(unitsOf([{ type: 'a', data: 3 }]));
 			list.seal('E2');
 			expect(list.find('E2')!.delta, 'a unit whose staging is not on record seals a segment with none').to.be.undefined;
 			expect(list.stagedDeltas(), 'and the subtraction then has nothing to go on').to.be.undefined;
@@ -241,7 +242,7 @@ describe('Collection sealed segments', function () {
 
 		it('unseals only the newest segment over an empty open segment, and inserts before a named segment or last (ticket offline-sync-journal-port)', () => {
 			const list = new SegmentList<number>();
-			const staged = (data: number) => list.pushOpen([{ type: 'a', data }], { inserts: {}, updates: {}, deletes: [] }, { applied: 0, alreadyApplied: 0 });
+			const staged = (data: number) => list.pushOpen([{ type: 'a', data }], [1], { inserts: {}, updates: {}, deletes: [] }, { applied: 0, alreadyApplied: 0 });
 			staged(1);
 			list.seal('E1');
 			staged(2);

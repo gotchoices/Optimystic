@@ -11,7 +11,7 @@ import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
 import type { Lane } from "../lane/lane.js";
 import { TransactionTooLargeError } from "../network/transaction-size.js";
-import { BlockTooLargeError, oversizedBlock } from "../network/block-size.js";
+import { BlockTooLargeError, oversizedWriteRefusal } from "../network/block-size.js";
 import type { Collection, CollectionSnapshot, RefreshReport } from "../collection/collection.js";
 import type { InFlightCycle, SyncOptions } from "../collection/index.js";
 import { DefaultMaxStalledAttempts, RevisionStallWatch } from "../collection/write-attempts.js";
@@ -2091,7 +2091,7 @@ export class TransactionCoordinator {
 	): Promise<CoordinationResult> {
 		// Before anything is sent: one materialization of every block the transaction touches, measured
 		// against MAX_BLOCK_BYTES here and declared on the commit below.
-		const described = await this.declareTouchedBlocks(collectionTransforms, criticalBlocks, pendedRevs);
+		const described = await this.declareTouchedBlocks(context.actionId, collectionTransforms, criticalBlocks, pendedRevs);
 		if (!described.success) {
 			log('trx:phases trxId=%s refused before sending: %s', context.actionId, described.error);
 			return described;
@@ -2208,9 +2208,11 @@ export class TransactionCoordinator {
 	 * What each collection's staged transforms send, described from its live tracker after the log
 	 * append: one local materialization of every block the transforms touch
 	 * ({@link describeTouchedBlocks}), taken before anything is sent. A block the write would leave
-	 * over `MAX_BLOCK_BYTES` refuses the transaction here, as a pend-phase failure carrying the
-	 * {@link BlockTooLargeError} — the same shape as a pend too large to send, so `commit` throws it by
-	 * name and `execute` reports it as a failure. Otherwise each collection's digests are kept as its
+	 * over `MAX_BLOCK_BYTES` refuses the transaction here, as a pend-phase failure carrying the refusal
+	 * {@link oversizedWriteRefusal} judges — a `TransactionTooLargeError` when the collection's
+	 * transforms are over the per-transaction limit too, a {@link BlockTooLargeError} otherwise — the
+	 * same shape as a pend too large to send, so `commit` throws it by name and `execute` reports it as
+	 * a failure. Otherwise each collection's digests are kept as its
 	 * commit's declaration ({@link commitRequestFor}), so the commit does not materialize again, and
 	 * the base each update-only block's operations were computed against is read from the same
 	 * tracker's pins for its pend (`PendRequest.baseRevs`; storage keeps it with the pending record so
@@ -2221,6 +2223,7 @@ export class TransactionCoordinator {
 	 * is a defect here: {@link applyActionsToCollection} has already refused it.
 	 */
 	private async declareTouchedBlocks(
+		actionId: ActionId,
 		collectionTransforms: ReadonlyMap<CollectionId, Transforms>,
 		criticalBlocks: ReadonlyMap<CollectionId, BlockId>,
 		pendedRevs: ReadonlyMap<CollectionId, number>
@@ -2233,7 +2236,7 @@ export class TransactionCoordinator {
 			}
 			const blockIds = blockIdsForTransforms(transforms);
 			const touched = await describeTouchedBlocks(collection.tracker, blockIds);
-			const tooLarge = oversizedBlock(touched.bytes);
+			const tooLarge = oversizedWriteRefusal(touched.bytes, transforms, actionId);
 			if (tooLarge) return pendFailure([tooLarge]);
 			attempts.set(collectionId, {
 				transforms,
