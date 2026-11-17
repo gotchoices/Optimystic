@@ -98,9 +98,10 @@ export function oversizedBlock(bytes: Readonly<Record<BlockId, number>>): BlockT
  * transforms under it — a block grown over several writes — is a {@link BlockTooLargeError}. The
  * transforms are measured only on that refusal path, so a write that fits pays nothing for it.
  *
- * NOTE: the transforms can be under the limit while one block and the full pend are over it — a block
- * cannot be much larger than transforms holding it whole, so this takes a base that was already over the
- * limit; it is refused as the block, which is then the truthful refusal.
+ * NOTE: transforms just under the limit can still make a pend over it once the envelope (a validation
+ * payload, say) is added, while the write also leaves a block grown by earlier writes over the block
+ * limit. That write is refused as the block, not the transaction: both are true of it, and only the
+ * block's refusal says the change has to be written in another form, since splitting it would not help.
  */
 export function oversizedWriteRefusal(
 	touchedBytes: Readonly<Record<BlockId, number>>,
