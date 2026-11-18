@@ -165,6 +165,10 @@ function sliceOf(child: DecodedChild, offset: number, range: ByteRange): BlobRan
 
 /** The children whose content intersects `range`, each with where its content starts in the blob. */
 function* childrenIn(list: DecodedListPiece, listOffset: number, range: ByteRange): Generator<{ child: DecodedChild; offset: number }> {
+	// An empty range intersects nothing, not even the child whose span it falls inside.
+	if (range.start === range.end) {
+		return;
+	}
 	let offset = listOffset;
 	for (const child of list.children) {
 		if (offset >= range.end) {

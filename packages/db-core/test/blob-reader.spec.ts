@@ -220,6 +220,11 @@ describe('reading a built blob', () => {
 		expect(entries[2]!.id).to.equal(kept!.id);
 		expect(source.gets.filter(id => cidOfPiece(id).code === RAW_CODEC), 'data pieces read').to.deep.equal([]);
 	});
+
+	it('walks only the root for an empty range inside the blob', async () => {
+		const entries = await drain(walkBlobPieces(largeRef, new MapSource(large), { offset: 100, length: 0 }));
+		expect(entries.map(entry => entry.id)).to.deep.equal([rootPieceId(largeRef)]);
+	});
 });
 
 /** A malformed tree: its reference, and a piece below (or after) the fault that must never be requested. */
@@ -412,6 +417,14 @@ describe('a malformed tree', () => {
 			}
 		});
 	}
+
+	it('is refused through a verified source too, which skips only the hashing', async () => {
+		const tree = new HandTree();
+		const leaf = await tree.raw(LEAF);
+		const ref = refOf(await tree.list(Array.from({ length: MAX_BLOB_LIST_LINKS + 1 }, () => ({ cid: leaf, size: LEAF.byteLength }))));
+		const error = await rejection(drain(readBlob(ref, new MapSource(tree.pieces, { verified: true }))));
+		expect((error as BlobCorruptError).reason).to.equal('too-many-links');
+	});
 });
 
 describe('walkBlobPieces', () => {
