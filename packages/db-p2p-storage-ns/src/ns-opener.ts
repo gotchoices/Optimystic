@@ -161,8 +161,8 @@ class NSPluginStatement implements SqliteStatement {
 		// such a row is answered by the overlay and never reaches this connection; a
 		// listing does reach it, and may see the batch's uncommitted rows, but merges the
 		// overlay over them, so it answers the same whether the transaction has committed
-		// or not (and a rolled-back batch latches the store). The key-value store and the
-		// identity helper write other tables, by autocommit statements, and the sync's
+		// or not (and a rolled-back batch latches the store). The key-value store, the piece
+		// store and the identity helper write other tables, by autocommit statements, and the sync's
 		// `durability_mark` row is read by nobody. If a reader of a batch's rows ever
 		// bypasses the overlay, serialize reads too.
 		const row = await this.raw.get(this.sql, params);

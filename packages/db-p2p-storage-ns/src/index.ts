@@ -5,5 +5,5 @@ export { SqliteRawStorage, SqliteBatchBackend } from './sqlite-storage.js';
 export type { SqliteRawStorageOptions, SqliteBatchBackendOptions } from './sqlite-storage.js';
 export { syncSqliteDb } from './sqlite-sync.js';
 export { SqliteKVStore } from './sqlite-kv-store.js';
-export { SqlitePieceStore, PIECE_LIST_PAGE } from './sqlite-piece-store.js';
+export { SqlitePieceStore } from './sqlite-piece-store.js';
 export { loadOrCreateNSPeerKey, DEFAULT_PEER_KEY_NAME } from './identity.js';

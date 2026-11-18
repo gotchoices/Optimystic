@@ -236,6 +236,6 @@ NativeScript 8.9, so the plugin's JNI bridge.
 Not run by anyone yet: a long session with real network traffic; iOS; the
 Node-API binding NativeScript 9.1+ selects; a power cut (a force-stop kills the
 process only); `SqlitePieceStore` at all — a 1 MiB piece read back over the JNI
-bridge, a zero-length piece read back (the `NOTE:` in `get`), and how the plugin
+bridge, a zero-length piece read back (`get` reads a NULL as one), and how the plugin
 binds a typed array that is a view into a larger buffer (`put` copies such a
 view first).

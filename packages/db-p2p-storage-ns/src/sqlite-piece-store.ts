@@ -88,10 +88,12 @@ export class SqlitePieceStore implements IPieceStore {
 		const row = await this.stmts.get.get(id);
 		if (!row) return undefined;
 		// The driver returns a fresh array per row, which no one else holds.
-		// NOTE: `node:sqlite` reads an empty BLOB back as an empty array; if the plugin on a device
-		// answers one with NULL, read NULL here as the zero-length piece.
 		const bytes = row.bytes;
-		if (!(bytes instanceof Uint8Array)) throw new TypeError(`Piece ${id} is stored as ${bytes === null ? 'null' : typeof bytes}, not bytes`);
+		// The column is NOT NULL, so a NULL here is a driver's spelling of an empty BLOB: SQLite's C
+		// API answers a zero-length BLOB with a null pointer, which a binding may pass on as null.
+		// `node:sqlite` returns an empty array; the plugin on a device is unverified.
+		if (bytes === null) return new Uint8Array(0);
+		if (!(bytes instanceof Uint8Array)) throw new TypeError(`Piece ${id} is stored as ${typeof bytes}, not bytes`);
 		return bytes;
 	}
 
