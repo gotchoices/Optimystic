@@ -1341,13 +1341,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// Shared, not copied: storage encodes the transform to JSON and keeps nothing of it.
 				const blockTransform = sharedTransformForBlockId(request.transforms, blockId);
 				const baseRev = declaredBaseFor(request.baseRevs, blockId, blockTransform);
-				await blockStorage.savePendingTransaction(request.actionId, blockTransform, {
-					...(request.rev === undefined ? {} : { rev: request.rev }),
-					...(baseRev === undefined ? {} : { baseRev }),
-					...(localRun === undefined ? {} : { localRun })
-				}, latch);
-				// After the save, so a preview that read the record this one replaced keeps no digest of it.
-				this.previewedDigests.forget(blockId, request.actionId);
+				try {
+					await blockStorage.savePendingTransaction(request.actionId, blockTransform, {
+						...(request.rev === undefined ? {} : { rev: request.rev }),
+						...(baseRev === undefined ? {} : { baseRev }),
+						...(localRun === undefined ? {} : { localRun })
+					}, latch);
+				} finally {
+					// After the save, so a preview that read the record this one replaced keeps no digest of
+					// it; and even when the save throws, since a failed write may still have replaced it.
+					this.previewedDigests.forget(blockId, request.actionId);
+				}
 				saved.push(blockId);
 			}
 
