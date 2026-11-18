@@ -39,8 +39,9 @@ import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 // The seeker is bound to an in-process answer for messages its own node must serve (`selfServe`), built from the
 // node's host by hand: a node does not offer one ready-made yet (backlog `feat-node-offers-matchmaking-self-serve`).
 // On two and three machines the seeker walks from a node that is not the topic's routed member, so its register and
-// query cross a real socket. On one machine the seeker is the provider's own node, and it queries rather than walks
-// (see the comment there).
+// query cross a real socket. On one machine the seeker is the provider's own node: its walk looks without registering
+// (a seeker register would replace the provider's registration, one per machine per topic), and the provider must
+// still be listed once the walk has ended.
 //
 // Gated on OPTIMYSTIC_INTEGRATION=1 like the other real-socket specs:
 //   yarn workspace @optimystic/db-p2p test:integration
@@ -180,21 +181,18 @@ async function registerProvider(session: MatchmakingProviderSession, topic: Matc
 					service: seeker.host.service,
 					selfServe: selfServeOn(seeker),
 				});
-				if (machineCount === 1) {
-					// The seeker is the provider's own peer here, and a walk would register it under the provider's
-					// participant id and so replace the provider's record (backlog
-					// `bug-a-walk-by-a-provider-replaces-its-own-registration`). A one-shot query registers nothing.
-					const reply = await seekerSession.query({
-						v: 1, topicId: bytesToB64url(topicId), includeProviders: true, includeSeekers: false,
-						limit: QUERY_LIMIT_MAX, requesterId: seeker.id, timestamp: Date.now(), signature: 'AA',
-					});
-					const entry = (reply.providers ?? []).find((p) => p.participantId === provider.id);
-					expect(entry, "the seeker's query found the provider").to.not.equal(undefined);
-					expect(verifyProviderEntry(topicId, entry!, verifyPeerSig), "the served entry carries the provider's own signature").to.equal(true);
-					return;
-				}
 				const found = await seekerSession.walk(topic, { wantCount: 1, patienceMs: 15_000 });
 				expect(found.map((entry) => entry.participantId), "the seeker's walk found the provider").to.include(provider.id);
+
+				// The walk left the provider's registration in place, still a provider's: at one machine the walk was the
+				// provider's own, and a seeker register or withdraw from it would have replaced or removed that record.
+				const reply = await seekerSession.query({
+					v: 1, topicId: bytesToB64url(topicId), includeProviders: true, includeSeekers: false,
+					limit: QUERY_LIMIT_MAX, requesterId: seeker.id, timestamp: Date.now(), signature: 'AA',
+				});
+				const entry = (reply.providers ?? []).find((p) => p.participantId === provider.id);
+				expect(entry, 'a query after the walk still lists the provider').to.not.equal(undefined);
+				expect(verifyProviderEntry(topicId, entry!, verifyPeerSig), "the served entry carries the provider's own signature").to.equal(true);
 			});
 		});
 	}

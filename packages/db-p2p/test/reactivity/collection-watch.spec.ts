@@ -78,6 +78,12 @@ class HeldRegistrationService implements CohortTopicService {
 		this.moves.push({ handle, rootKey });
 		(handle as { rootKey?: Uint8Array }).rootKey = rootKey;
 	}
+	holds(): never {
+		throw new Error('holds not used');
+	}
+	isLive(): never {
+		throw new Error('isLive not used');
+	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip is not used by the watch service');
 	}

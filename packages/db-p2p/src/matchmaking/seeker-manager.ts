@@ -10,6 +10,12 @@
  * makes seeker TTL eviction directly observable — the property this ticket proves. The `QueryV1`
  * issuance, filter evaluation, and hang-out decision (which would keep a hanging-out seeker's
  * registration alive via renewals) land in `matchmaking-query-filter-hangout`.
+ *
+ * A machine holds at most one registration per topic (`docs/matchmaking.md` §Overview), so a brief seeker
+ * registration never displaces another of the machine's registrations there: {@link MatchmakingSeekerManager.register}
+ * refuses with {@link TopicRegistrationHeldError}. The reverse is allowed — a provider registering over a brief
+ * seeker registration displaces it (the offer wins), and this manager's handle then goes stale, so its withdraw
+ * sends nothing (`CohortTopicService.withdraw`'s identity guard).
  */
 
 import { Tier, SEEKER_TTL_MS, type CohortTopicService, type MatchmakingSeeker, type RegistrationHandle } from "@optimystic/db-core";
@@ -22,6 +28,18 @@ export interface MatchmakingSeekerManagerOptions {
 	readonly seeker: MatchmakingSeeker;
 	/** Seeker TTL (ms). Default {@link SEEKER_TTL_MS} (10 s). */
 	readonly ttlMs?: number;
+}
+
+/**
+ * A seeker registration was refused because this machine already holds another registration for the topic (in
+ * practice a provider's). A cohort keeps one record per machine per topic, so registering would replace it; a
+ * walk of the topic looks without registering instead.
+ */
+export class TopicRegistrationHeldError extends Error {
+	constructor(readonly topicId: Uint8Array) {
+		super("matchmaking seeker: this machine already holds a registration for the topic, which a seeker registration would replace; walk the topic instead");
+		this.name = "TopicRegistrationHeldError";
+	}
 }
 
 /** Wires one matchmaking seeker's brief registration to the cohort-topic substrate at tier T2. */
@@ -42,11 +60,19 @@ export class MatchmakingSeekerManager {
 		return this.handle;
 	}
 
-	/** Register the seeker briefly at tier T2 with the short seeker TTL; no renewal is started. */
+	/**
+	 * Register the seeker briefly at tier T2 with the short seeker TTL; no renewal is started. Throws
+	 * {@link TopicRegistrationHeldError} when this machine holds a live registration for the topic other than this
+	 * manager's own.
+	 */
 	async register(): Promise<RegistrationHandle> {
+		const topicId = this.seeker.topicId;
+		if (this.service.holds(topicId) && !this.holdsOwnRegistration()) {
+			throw new TopicRegistrationHeldError(topicId);
+		}
 		const appPayload = await this.seeker.appPayloadBytes();
 		this.handle = await this.service.register({
-			topicId: this.seeker.topicId,
+			topicId,
 			tier: Tier.T2,
 			appPayload,
 			ttl: this.ttlMs,
@@ -60,5 +86,9 @@ export class MatchmakingSeekerManager {
 		if (this.handle !== undefined) {
 			await this.service.withdraw(this.handle);
 		}
+	}
+
+	private holdsOwnRegistration(): boolean {
+		return this.handle !== undefined && this.service.isLive(this.handle);
 	}
 }

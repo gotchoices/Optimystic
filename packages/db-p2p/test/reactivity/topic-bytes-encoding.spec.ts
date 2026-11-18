@@ -59,6 +59,8 @@ describe('reactivity / topic-bytes encoding (root coordinate = the tail block\'s
 			renewMany: () => Promise.resolve(),
 			withdraw: () => Promise.resolve(),
 			moveRoot: () => { throw new Error('moveRoot is not used here'); },
+			holds: () => { throw new Error('holds is not used here'); },
+			isLive: () => { throw new Error('isLive is not used here'); },
 			lookup: () => Promise.reject(new Error('lookup is not used here')),
 			cohortGossip: () => { throw new Error('cohortGossip is not used here'); },
 			verifier: () => ({ cache: () => {}, forget: () => {}, verifyMessage: () => Promise.resolve('verified') }),

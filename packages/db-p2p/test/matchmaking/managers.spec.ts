@@ -11,12 +11,13 @@ import {
 	PROVIDER_TTL_CORE_MS,
 	PROVIDER_TTL_EDGE_MS,
 	SEEKER_TTL_MS,
+	bytesToB64url,
 	type CohortTopicService,
 	type RegisterRequest,
 	type RegistrationHandle,
 } from '@optimystic/db-core';
 import { MatchmakingProviderManager } from '../../src/matchmaking/provider-manager.js';
-import { MatchmakingSeekerManager } from '../../src/matchmaking/seeker-manager.js';
+import { MatchmakingSeekerManager, TopicRegistrationHeldError } from '../../src/matchmaking/seeker-manager.js';
 
 /**
  * Manager-tier coverage (gap #3 from the implement handoff): the db-p2p managers are thin wrappers
@@ -29,10 +30,12 @@ class RecordingService implements CohortTopicService {
 	readonly registers: RegisterRequest[] = [];
 	renews = 0;
 	withdraws = 0;
+	/** The live handle per topic, as the real service keys them: a later register displaces, a withdraw of the live one drops it. */
+	private readonly live = new Map<string, RegistrationHandle>();
 
 	async register(req: RegisterRequest): Promise<RegistrationHandle> {
 		this.registers.push(req);
-		return {
+		const handle = {
 			topicId: req.topicId,
 			tier: req.tier,
 			primary: new Uint8Array(32),
@@ -40,6 +43,8 @@ class RecordingService implements CohortTopicService {
 			cohortEpoch: new Uint8Array(32),
 			renewal: {},
 		} as unknown as RegistrationHandle;
+		this.live.set(bytesToB64url(req.topicId), handle);
+		return handle;
 	}
 	async renew(_handle: RegistrationHandle): Promise<void> {
 		this.renews++;
@@ -50,11 +55,20 @@ class RecordingService implements CohortTopicService {
 	async lookup(): Promise<never> {
 		throw new Error('lookup not used by managers');
 	}
-	async withdraw(_handle: RegistrationHandle): Promise<void> {
+	async withdraw(handle: RegistrationHandle): Promise<void> {
 		this.withdraws++;
+		if (this.isLive(handle)) {
+			this.live.delete(bytesToB64url(handle.topicId));
+		}
 	}
 	moveRoot(): never {
 		throw new Error('moveRoot not used by managers');
+	}
+	holds(topicId: Uint8Array): boolean {
+		return this.live.has(bytesToB64url(topicId));
+	}
+	isLive(handle: RegistrationHandle): boolean {
+		return this.live.get(bytesToB64url(handle.topicId)) === handle;
 	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip not used by managers');
@@ -176,5 +190,22 @@ describe('matchmaking / seeker manager', () => {
 		await manager.register();
 		await manager.withdraw();
 		expect(service.withdraws).to.equal(1);
+	});
+
+	// One registration per machine per topic: a brief seeker registration must not replace the machine's other
+	// registration there (a provider's), but may replace its own.
+	it('refuses to register over another live registration of the machine for the topic, not over its own', async () => {
+		const service = new RecordingService();
+		const seeker = makeSeeker();
+		await service.register({ topicId: seeker.topicId, tier: Tier.T2 }); // e.g. this machine's provider registration
+		const refused = new MatchmakingSeekerManager({ service, seeker });
+		const err = await refused.register().then(() => undefined, (e: unknown) => e);
+		expect(err, 'a held registration refuses the seeker register').to.be.instanceOf(TopicRegistrationHeldError);
+		expect(service.registers, 'nothing was registered over it').to.have.length(1);
+
+		const own = new MatchmakingSeekerManager({ service: new RecordingService(), seeker });
+		await own.register();
+		await own.register();
+		expect(own.registration, 'the manager re-registers over its own live registration').to.not.equal(undefined);
 	});
 });

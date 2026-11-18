@@ -17,6 +17,12 @@
  *
  * How a frame reaches a member (a dial over the cohort-topic `register` protocol, or an
  * in-process hook when that member is this node) is injected as {@link SeekerKeepAliveDeps.send}.
+ *
+ * A cohort keeps one record per (topic, machine), matched by that pair on renew and withdraw. So once the
+ * machine registers for the topic another way while the walk is live (a provider registering on the same
+ * node), the record is the machine's other registration, not the walk's: the keep-alive checks
+ * {@link SeekerKeepAliveDeps.stillOurs} before every ping and every withdraw, and when it answers `false`
+ * forgets the registration without sending anything, so neither a ping nor a tombstone reaches that record.
  */
 
 import {
@@ -45,6 +51,11 @@ export interface SeekerKeepAliveDeps {
 	 * when no reply could be had (the sender logs why).
 	 */
 	readonly send: (member: string, renew: RenewV1) => Promise<RenewReplyV1 | undefined>;
+	/**
+	 * Whether the cohort's record for (topic, this machine) can still be the walk's: `false` once the machine
+	 * holds another registration for the topic, which replaced the walk's record at the cohort.
+	 */
+	readonly stillOurs: () => boolean;
 	/** Logger (the transport binds its `matchmaking-query` namespace). */
 	readonly log: Log;
 }
@@ -88,7 +99,7 @@ export class SeekerKeepAlive {
 
 	/** Ping the slot primary, at most once per `ttl / 3`; a no-op with no live registration. Never throws. */
 	async renew(): Promise<void> {
-		const live = this.live;
+		const live = this.ownLive("renew");
 		const now = Date.now();
 		// NOTE: pings go out only when the walk wakes. On the push path that is a push or a safety poll (5 s by
 		// default, half the 10 s seeker TTL), so one failed ping can let the record lapse, leaving the rest of that
@@ -116,7 +127,7 @@ export class SeekerKeepAlive {
 	 * A no-op with no live registration. Never throws.
 	 */
 	async withdraw(): Promise<void> {
-		const live = this.live;
+		const live = this.ownLive("withdraw");
 		if (live === undefined) {
 			return;
 		}
@@ -136,6 +147,20 @@ export class SeekerKeepAlive {
 		} catch (err) {
 			this.log("matchmaking withdraw failed (tier %d); the record ages out by TTL: %o", live.treeTier, err);
 		}
+	}
+
+	/**
+	 * The live registration, unless the machine's own registration for the topic has replaced it at the cohort:
+	 * then it is forgotten, so nothing is sent for it again.
+	 */
+	private ownLive(action: "renew" | "withdraw"): LiveRegistration | undefined {
+		const live = this.live;
+		if (live === undefined || this.deps.stillOurs()) {
+			return live;
+		}
+		this.live = undefined;
+		this.log("matchmaking %s at tier %d skipped: this machine's own registration for the topic replaced the walk's record", action, live.treeTier);
+		return undefined;
 	}
 
 	/** Send one plain ping; `moved` when the reply named a new slot primary, now adopted in `live`. */

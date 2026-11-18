@@ -5,12 +5,17 @@ import type { Libp2p } from 'libp2p';
 import type { FretService } from 'p2p-fret';
 import {
 	matchTopicId,
+	b64urlToBytes,
 	bytesToB64url,
 	providerSigningPayload,
+	registerSigningPayload,
+	validateRegisterV1,
 	type CohortTopicService,
 	type QueryV1,
 	type RegisterReplyV1,
 	type RegisterV1,
+	type RenewReplyV1,
+	type RenewV1,
 	type TopicTrafficV1,
 } from '@optimystic/db-core';
 import { createLibp2pMatchmakingTransport, createLibp2pMatchmakingSeekerSession } from '../../src/matchmaking/query-transport.js';
@@ -55,7 +60,15 @@ function queryFor(): QueryV1 {
 	};
 }
 
-async function setup(opts: { cohort: (self: string) => string[]; sizeEstimate?: number; selfServe?: Parameters<typeof createLibp2pMatchmakingTransport>[0]['selfServe'] }) {
+/** A node that holds no cohort-topic registration (the walk always registers). */
+const holdsNothing = { holds: (): boolean => false };
+
+async function setup(opts: {
+	cohort: (self: string) => string[];
+	sizeEstimate?: number;
+	selfServe?: Parameters<typeof createLibp2pMatchmakingTransport>[0]['selfServe'];
+	holds?: () => boolean;
+}) {
 	const key = await generateKeyPair('Ed25519');
 	const selfPeerId = peerIdFromPrivateKey(key).toString();
 	const transport = createLibp2pMatchmakingTransport({
@@ -64,6 +77,7 @@ async function setup(opts: { cohort: (self: string) => string[]; sizeEstimate?: 
 		selfPeerId,
 		key,
 		wantK: 4,
+		localRegistrations: opts.holds !== undefined ? { holds: opts.holds } : holdsNothing,
 		...(opts.selfServe !== undefined ? { selfServe: opts.selfServe } : {}),
 	});
 	return { key, selfPeerId, transport };
@@ -159,6 +173,47 @@ describe('matchmaking / query transport (client side)', () => {
 		expect(probe.topicTraffic!.childCohortCount).to.equal(7);
 	});
 
+	// One registration per machine per topic: a cohort keeps one record per (topic, machine), so a walk by a machine
+	// that holds a registration for the topic (a provider walking its own topic) must neither register under the
+	// machine's id, which would replace that registration, nor withdraw the record once the machine registered over
+	// the walk's. The probe must also be a frame a remote cohort accepts: wire-valid and signed over its own image.
+	it('a walk probes instead of registering while its machine holds a registration for the topic, and never withdraws that record', async () => {
+		const cases = [
+			{ name: 'holds nothing', heldAtRegister: false, heldAtClose: false, probe: false, withdraws: 1 },
+			{ name: 'holds a registration', heldAtRegister: true, heldAtClose: true, probe: true, withdraws: 0 },
+			{ name: 'registers after the walk did', heldAtRegister: false, heldAtClose: true, probe: false, withdraws: 0 },
+		];
+		for (const c of cases) {
+			let held = c.heldAtRegister;
+			const registers: RegisterV1[] = [];
+			const renews: RenewV1[] = [];
+			const { transport, selfPeerId } = await setup({
+				cohort: (self) => [self],
+				holds: () => held,
+				selfServe: {
+					register: async (reg: RegisterV1): Promise<RegisterReplyV1> => {
+						registers.push(validateRegisterV1(reg));
+						return { v: 1, result: 'accepted' };
+					},
+					renew: async (renew: RenewV1): Promise<RenewReplyV1> => {
+						renews.push(renew);
+						return { v: 1, result: 'withdrawn' };
+					},
+				},
+			});
+			const walk = transport.walkTransport(topicId);
+			expect((await walk.register(0)).result, `${c.name}: the cohort's answer reaches the walk`).to.equal('accepted');
+			held = c.heldAtClose;
+			await walk.close!();
+
+			const reg = registers[0]!;
+			expect(reg.probe === true, `${c.name}: sent as a probe`).to.equal(c.probe);
+			expect(reg.appPayload === undefined, `${c.name}: carries no payload`).to.equal(c.probe);
+			expect(transport.verifyEntry(selfPeerId, registerSigningPayload(reg), b64urlToBytes(reg.signature)), `${c.name}: signed over its image`).to.equal(true);
+			expect(renews.filter((r) => r.withdraw === true), `${c.name}: withdraws sent`).to.have.length(c.withdraws);
+		}
+	});
+
 	// A remote primary with no result for the seeker. A query maps it to the benign empty advisory reply (the walk
 	// keeps going); a register — whose responder always answers — rejects, naming the non-conforming reply.
 	// The server-side counter proves each dial reached the handler, so the empty reply is the no-result branch,
@@ -187,6 +242,7 @@ describe('matchmaking / query transport (client side)', () => {
 			selfPeerId: seeker.peerId.toString(),
 			key: seekerKey,
 			wantK: 4,
+			localRegistrations: holdsNothing,
 		});
 
 		const oneShot = await transport.queryCohort(queryFor());

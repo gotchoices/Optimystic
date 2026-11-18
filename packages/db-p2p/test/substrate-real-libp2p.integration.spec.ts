@@ -991,6 +991,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			selfPeerId: seeker.idStr,
 			key: seeker.key,
 			wantK: WANT_K,
+			localRegistrations: seeker.host.service,
 		});
 
 		// The small-N FRET size estimate yields a shallow d_max (single-tier-0 milestone — the walk registers +
@@ -1073,6 +1074,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 			selfPeerId: seeker.idStr,
 			key: seeker.key,
 			wantK: WANT_K,
+			localRegistrations: seeker.host.service,
 			arrivalPush,
 			selfServe: { renew: async (r: RenewV1) => resolveRenew(seeker.host.registry, r, Date.now()) },
 		});

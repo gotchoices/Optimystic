@@ -159,6 +159,15 @@ export interface CohortTopicService {
 	 * A stale handle (no longer the live registration for its topic) is a no-op.
 	 */
 	moveRoot(handle: RegistrationHandle, rootKey: Uint8Array): void;
+	/**
+	 * Whether this machine holds a live registration for `topicId`, at any tier: one registered through this
+	 * service and not withdrawn. A cohort keeps one record per (topic, machine), so this registration is the
+	 * machine's whole presence at the topic; anything else that registers under this machine's id for the topic
+	 * replaces it at the cohort (matchmaking's walk looks without registering while this answers `true`).
+	 */
+	holds(topicId: Uint8Array): boolean;
+	/** Whether `handle` is still the live registration for its topic: `false` once a later register displaced it or it was withdrawn. */
+	isLive(handle: RegistrationHandle): boolean;
 	/** Origination hook the change-notifier bridge invokes per local member commit; see {@link LocalChangeHook}. */
 	onLocalCommit?: LocalChangeHook;
 	/** Cohort gossip bus — applications fold app state into the existing gossip. */
@@ -370,6 +379,17 @@ class WalkRegisterService implements CohortTopicService {
 		}
 		live.root.key = rootKey;
 		(handle as { rootKey?: Uint8Array }).rootKey = rootKey;
+	}
+
+	holds(topicId: Uint8Array): boolean {
+		// NOTE: a register still walking is not held yet (its renewal starts once the walk is accepted), so a matchmaking
+		// walk started in that window registers and replaces the record being admitted. If callers ever start a walk
+		// while their own register for the topic is in flight, count in-flight registers here too.
+		return this.renewals.has(recordKey(topicId, this.participantId));
+	}
+
+	isLive(handle: RegistrationHandle): boolean {
+		return this.liveRenewal(handle) !== undefined;
 	}
 
 	async withdraw(handle: RegistrationHandle): Promise<void> {

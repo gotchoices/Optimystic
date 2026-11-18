@@ -82,6 +82,12 @@ class RecordingService implements CohortTopicService {
 	moveRoot(_handle: RegistrationHandle, rootKey: Uint8Array): void {
 		this.moves.push(rootKey);
 	}
+	holds(): never {
+		throw new Error('holds not used');
+	}
+	isLive(): never {
+		throw new Error('isLive not used');
+	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip not used by managers');
 	}

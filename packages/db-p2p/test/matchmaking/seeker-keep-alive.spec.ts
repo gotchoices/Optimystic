@@ -16,6 +16,7 @@ function keepAliveAnswering(replies: Record<string, RenewReplyV1['result']>): { 
 			sentTo.push(member);
 			return { v: 1, result: replies[member]! };
 		},
+		stillOurs: () => true,
 		log: () => {},
 	});
 	return { keepAlive, sentTo };

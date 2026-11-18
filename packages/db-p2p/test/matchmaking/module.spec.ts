@@ -66,6 +66,12 @@ class RecordingService implements CohortTopicService {
 	moveRoot(): never {
 		throw new Error('moveRoot not used');
 	}
+	holds(): boolean {
+		return false; // registrations are not tracked here
+	}
+	isLive(): never {
+		throw new Error('isLive not used');
+	}
 	cohortGossip(): never {
 		throw new Error('cohortGossip not used');
 	}

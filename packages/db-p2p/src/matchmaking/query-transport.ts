@@ -20,6 +20,16 @@
  * while it hangs out and withdraws it when it leaves a tier ({@link SeekerKeepAlive}, signed `RenewV1`s to the
  * slot primary), on both paths; a push-opted walk also listens on the node's {@link ArrivalPushReceiver}.
  *
+ * **One registration per machine per topic** (`docs/matchmaking.md` §Overview). A cohort keeps one record per
+ * (topic, machine), and the walk registers under this node's id, so a walk by a machine that already holds a
+ * registration for the topic through its cohort-topic service (a provider walking its own topic) would replace
+ * that registration. Such a walk looks without registering: each tier's register goes out as a read-only probe
+ * (`RegisterV1.probe`), which the cohort answers exactly as it would a register while admitting nothing. The walk
+ * then gets no arrival pushes and is listed as no seeker; its machine's own provider record is in every query
+ * reply, so it finds itself. Whether the machine holds one is read on every tier
+ * ({@link Libp2pMatchmakingTransportDeps.localRegistrations}), and the keep-alive never pings or withdraws a record
+ * the machine has since registered over.
+ *
  * **Layering.** Matchmaking sits *above* the cohort-topic substrate (it depends on
  * `decodeMatchAppPayload`), so it owns its own protocol family ({@link MatchmakingProtocols}) and is wired
  * at the composition root (`libp2p-node-base.ts`) using only the host's public surface
@@ -68,6 +78,7 @@ import {
 	QUERY_LIMIT_MAX,
 	SEEKER_TTL_MS,
 	type CapabilityFilter,
+	type CohortTopicService,
 	type EntrySigVerifier,
 	type HangOutConfig,
 	type MatchTopicAnchor,
@@ -241,6 +252,12 @@ export interface Libp2pMatchmakingTransportDeps {
 	readonly selfPeerId: string;
 	/** The seeker's node key — signs its own register frames + the tier-0 self-vouch reputation endorsement. */
 	readonly key: PrivateKey;
+	/**
+	 * The registrations this node's cohort-topic service holds (the node's `host.service`). A walk of a topic this
+	 * node holds a registration for looks without registering, so the walk never replaces it (see the module header).
+	 * Required: answering "holds nothing" for a node that does hold one is exactly the replacement this prevents.
+	 */
+	readonly localRegistrations: Pick<CohortTopicService, "holds">;
 	/** Cohort size `k` (FRET `assembleCohort` wants). */
 	readonly wantK: number;
 	/** Tier addressing; default {@link createTierAddressing}`(new RingHash())` — byte-identical to the host. */
@@ -303,7 +320,7 @@ function resolveFretEngine(fret: FretService): FretService {
  * `assembleCohort(coord, wantK)[0]` (the same primary the host's direct-dial `/register` path serves).
  */
 export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTransportDeps): Libp2pMatchmakingTransport {
-	const { node, selfPeerId, key, wantK } = deps;
+	const { node, selfPeerId, key, wantK, localRegistrations } = deps;
 	const fret = resolveFretEngine(deps.fret);
 	const addressing = deps.addressing ?? createTierAddressing(new RingHash());
 	const fanout = deps.fanout ?? DEFAULT_FANOUT;
@@ -404,6 +421,26 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 		return { ...body, signature: bytesToB64url(await signPeer(key, registerSigningPayload(body))) };
 	};
 
+	/**
+	 * Build a signed read-only probe at `treeTier`: a register frame with `probe` set, which the cohort answers with
+	 * its classification and traffic snapshot and admits nothing. No `bootstrap`, no evidence (a probe never
+	 * instantiates a cold cohort) and no payload (nothing is stored).
+	 */
+	const buildSeekerProbe = async (topicId: Uint8Array, treeTier: number): Promise<RegisterV1> => {
+		const body: Omit<RegisterV1, "signature"> = {
+			v: 1,
+			topicId: bytesToB64url(topicId),
+			tier: Tier.T2,
+			treeTier,
+			participantCoord: bytesToB64url(seekerBytes),
+			ttl: seekerTtlMs,
+			probe: true,
+			timestamp: Date.now(),
+			correlationId: bytesToB64url(randomBytes(16)),
+		};
+		return { ...body, signature: bytesToB64url(await signPeer(key, registerSigningPayload(body))) };
+	};
+
 	/** Dial the routed primary's `/register` with the signed seeker frame and decode the `RegisterReplyV1`. */
 	const dialRegister = async (primary: string, reg: RegisterV1): Promise<RegisterReplyV1> => {
 		if (primary === selfPeerId) {
@@ -462,7 +499,11 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 	pushReceiverFor(pushByDefault);
 
 	const walkTransport = (topicId: Uint8Array, options?: SeekerWalkTransportOptions): SeekerWalkTransport => {
-		const receiver = pushReceiverFor(options?.pushOnArrival ?? pushByDefault);
+		const wantedReceiver = pushReceiverFor(options?.pushOnArrival ?? pushByDefault);
+		const holdsRegistration = (): boolean => localRegistrations.holds(topicId);
+		// A walk whose machine already holds a registration here never registers, so no cohort could push to it.
+		// One that gains a registration mid-walk keeps its subscription; its safety poll covers the pushes it loses.
+		const receiver = holdsRegistration() ? undefined : wantedReceiver;
 		// One correlation id per walk, carried by every tier's register: a member's push binding follows the
 		// seeker from tier to tier, and the tier left behind drops its binding once the walk withdraws there.
 		const seekerState = new MatchmakingSeeker({
@@ -473,8 +514,29 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 			...(filter !== undefined ? { filter } : {}),
 			...(receiver !== undefined ? { pushOnArrival: true } : {}),
 		});
-		const keepAlive = new SeekerKeepAlive({ topicId, participantId: seekerBytes, ttlMs: seekerTtlMs, sign: signImage, send: sendRenew, log });
+		const keepAlive = new SeekerKeepAlive({
+			topicId,
+			participantId: seekerBytes,
+			ttlMs: seekerTtlMs,
+			sign: signImage,
+			send: sendRenew,
+			stillOurs: () => !holdsRegistration(),
+			log,
+		});
 		const subscription = receiver?.subscribe(topicId, bytesToB64url(seekerState.correlationId));
+		let lookingOnlyLogged = false;
+		/** The tier's register, or a probe while this machine holds a registration for the topic. */
+		const registerFrame = async (treeTier: number): Promise<RegisterV1> => {
+			if (!holdsRegistration()) {
+				return buildSeekerRegister(topicId, treeTier, await seekerState.appPayloadBytes());
+			}
+			if (!lookingOnlyLogged) {
+				lookingOnlyLogged = true;
+				log("matchmaking walk of topic %s looks without registering from tier %d: this machine holds a registration for the topic, which a seeker register would replace%s",
+					bytesToB64url(topicId), treeTier, wantedReceiver !== undefined ? "; it gets no arrival pushes" : "");
+			}
+			return buildSeekerProbe(topicId, treeTier);
+		};
 		let closed = false;
 		return {
 			register: async (treeTier: number): Promise<SeekerProbeReply> => {
@@ -484,9 +546,9 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 					// FRET has not assembled a cohort for this coord yet: treat as cold (the walk steps on).
 					return { result: "no_state" };
 				}
-				const reg = await buildSeekerRegister(topicId, treeTier, await seekerState.appPayloadBytes());
+				const reg = await registerFrame(treeTier);
 				const reply = await dialRegister(primary, reg);
-				if (reply.result === "accepted") {
+				if (reply.result === "accepted" && reg.probe !== true) {
 					keepAlive.accepted(treeTier, reg.correlationId, reply.primary, primary);
 				}
 				return toProbeReply(reply);
@@ -517,9 +579,15 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 	return { walkTransport, queryCohort, estimateDMax, verifyEntry };
 }
 
-/** Construction inputs for {@link createLibp2pMatchmakingSeekerSession} (transport deps + session knobs). */
-export interface Libp2pMatchmakingSeekerSessionDeps extends Libp2pMatchmakingTransportDeps {
-	/** Participant-facing cohort-topic substrate API (the seeker's brief T2 registration via `session.register`). */
+/**
+ * Construction inputs for {@link createLibp2pMatchmakingSeekerSession} (transport deps + session knobs). The
+ * transport's {@link Libp2pMatchmakingTransportDeps.localRegistrations} is the session's {@link service}.
+ */
+export interface Libp2pMatchmakingSeekerSessionDeps extends Omit<Libp2pMatchmakingTransportDeps, "localRegistrations"> {
+	/**
+	 * This node's participant-facing cohort-topic substrate API: the seeker's brief T2 registration via
+	 * `session.register`, and what the session's walks read to look without registering where it holds a registration.
+	 */
 	readonly service: MatchmakingSeekerSessionDeps["service"];
 	/** Topic anchor; defaults to db-core's ring-hash anchor. */
 	readonly anchor?: MatchTopicAnchor;
@@ -544,7 +612,7 @@ export interface Libp2pMatchmakingSeekerSessionDeps extends Libp2pMatchmakingTra
  * with the node key (the same key the transport signs its walk frames with).
  */
 export function createLibp2pMatchmakingSeekerSession(deps: Libp2pMatchmakingSeekerSessionDeps): MatchmakingSeekerSession {
-	const transport = createLibp2pMatchmakingTransport(deps);
+	const transport = createLibp2pMatchmakingTransport({ ...deps, localRegistrations: deps.service });
 	const sign = async (payload: Uint8Array): Promise<string> => bytesToB64url(await signPeer(deps.key, payload));
 	const sessionDeps: MatchmakingSeekerSessionDeps = {
 		service: deps.service,
