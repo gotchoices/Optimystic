@@ -6,7 +6,7 @@ const encoder = new TextEncoder();
 let decoderInstance: TextDecoder | undefined;
 const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
 
-/** Thrown by every operation of a {@link PowerLossKVStore} after its {@link PowerLossKVStore.powerLoss}. */
+/** Thrown by every operation of a {@link PowerLossKVStore} or a `PowerLossPieceStore` after its `powerLoss()`. */
 export class StoreLostPowerError extends Error {
 	constructor() {
 		super('this store lost power: everything it held in memory is gone; reopen() it');

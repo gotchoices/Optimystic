@@ -48,7 +48,9 @@ methods are the one place every value write funnels through — the
 
 **Scope:** this holds only for writes issued *in this process*. It is not a
 guarantee against mutation from outside the process — that boundary is
-Invariant 5 below.
+Invariant 5 below. Blob pieces are the one exception: they are kept in an
+`IPieceStore` beside the block store, outside this kernel
+([docs/blobs.md §The local store](../../../docs/blobs.md#the-local-store)).
 
 **Violate it and:** any in-process reader that assumes it has seen every write —
 a cache, or the byte-counter this seam was deliberately left open for — silently

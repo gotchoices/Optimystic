@@ -1,6 +1,9 @@
 import { expect } from 'chai';
 import { StorageMonitor } from '../src/storage/storage-monitor.js';
 import type { IRawStorage } from '../src/storage/i-raw-storage.js';
+import type { IPieceStore } from '../src/blob/piece-store.js';
+import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
+import { conformancePieceId } from '../src/testing/piece-store-conformance.js';
 
 /**
  * Builds a minimal `IRawStorage` stub. All persistence-shaped methods throw to
@@ -122,6 +125,42 @@ describe('StorageMonitor', () => {
 			const capacity = await monitor.getCapacity();
 			expect(capacity.available).to.equal(600);
 			expect(capacity.used).to.equal(400);
+		});
+	});
+
+	describe('piece bytes', () => {
+		const blockBytes = 1000;
+		const pieceBytes = 300;
+		const blockStore = (): IRawStorage => makeStorage({
+			getApproximateBytesUsed: async () => blockBytes,
+			getStoreIdentity: () => 'file:/node/blocks'
+		});
+
+		/** An `IPieceStore` at `identity` reporting `pieceBytes`; StorageMonitor reads only those two. */
+		const pieceStoreAt = (identity: string): IPieceStore => {
+			const reject = () => { throw new Error('not implemented in test stub'); };
+			return {
+				has: reject, get: reject, put: reject, delete: reject, list: reject, flush: reject,
+				bytesUsed: async () => pieceBytes,
+				durability: 'power-loss',
+				storeIdentity: () => identity
+			};
+		};
+
+		it("adds the piece store's figure when its identity is absent or differs from the block store's", async () => {
+			const memory = new MemoryPieceStore();
+			const bytes = new Uint8Array(pieceBytes);
+			await memory.put(await conformancePieceId(bytes), bytes);
+
+			for (const pieces of [memory, pieceStoreAt('file:/elsewhere')]) {
+				const monitor = new StorageMonitor(blockStore(), { usedBytesCacheTtlMs: 0 }, pieces);
+				expect((await monitor.getCapacity()).used).to.equal(blockBytes + pieceBytes);
+			}
+		});
+
+		it("leaves the piece store's figure out when the block store already measures its location", async () => {
+			const monitor = new StorageMonitor(blockStore(), { usedBytesCacheTtlMs: 0 }, pieceStoreAt('file:/node/blocks'));
+			expect((await monitor.getCapacity()).used).to.equal(blockBytes);
 		});
 	});
 

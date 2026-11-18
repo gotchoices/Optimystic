@@ -1,3 +1,5 @@
+export * from "./blob/piece-store.js";
+export * from "./blob/memory-piece-store.js";
 export * from "./cluster/client.js";
 export * from "./cluster/client-signature-verifier.js";
 export * from "./cluster/cluster-repo.js";

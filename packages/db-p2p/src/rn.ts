@@ -8,6 +8,8 @@
 // that. Enforced from this side by `test/entry-parity.spec.ts` — keep the two files in step, and
 // keep every line here a plain `export * from '...'` so that spec can compare them.
 
+export * from './blob/piece-store.js';
+export * from './blob/memory-piece-store.js';
 export * from './cluster/client.js';
 export * from './cluster/client-signature-verifier.js';
 export * from './cluster/cluster-repo.js';

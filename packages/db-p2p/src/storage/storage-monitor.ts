@@ -1,3 +1,4 @@
+import type { IPieceStore } from '../blob/piece-store.js';
 import type { IRawStorage } from './i-raw-storage.js';
 
 export interface StorageCapacity {
@@ -34,11 +35,32 @@ export interface StorageMonitorConfig {
 }
 
 /**
+ * Whether `storage`'s `getApproximateBytesUsed` already measures `pieces`' bytes. Every disk block
+ * store measures its whole directory or database, so a piece store inside the same location is
+ * counted there and adding its own figure would count it twice. Decided by store identity, whose
+ * contract is one-directional: equal identities prove one location, so the piece bytes are left
+ * out; anything else (either identity absent, two different strings, or a block store with no
+ * `getApproximateBytesUsed`, which measures nothing) adds them.
+ */
+// NOTE: two spellings of one location read as two identities, so a piece store over a differently
+// spelled path to the block store's directory is counted twice. That errs toward reporting the node
+// fuller than it is, which delays nothing and moves a ring outward at worst; revisit if a host reports it.
+export function blockStoreCountsPieces(storage: IRawStorage, pieces: IPieceStore): boolean {
+	if (typeof storage.getApproximateBytesUsed !== 'function') return false;
+	const blockIdentity = storage.getStoreIdentity?.();
+	return blockIdentity !== undefined && blockIdentity === pieces.storeIdentity?.();
+}
+
+/**
  * Monitors storage capacity for ring selection.
- * Provides estimates based on storage backend or supplied overrides.
+ * Provides estimates based on storage backend or supplied overrides. Used bytes are the block
+ * store's figure plus the piece store's, unless {@link blockStoreCountsPieces} says the block store
+ * already measured the pieces.
  */
 export class StorageMonitor {
 	private readonly now: () => number;
+	/** The piece store whose figure is added to the block store's; undefined when the block store counts it, or there is none. */
+	private readonly uncountedPieces: IPieceStore | undefined;
 	/** Memoized used-bytes scan; undefined until the first scan resolves, then re-armed each miss. */
 	private usedBytesCache: { value: number; expiresAt: number } | undefined;
 	/** In-flight scan Promise so concurrent misses share one scan (single-flight). */
@@ -46,9 +68,12 @@ export class StorageMonitor {
 
 	constructor(
 		private readonly storage: IRawStorage,
-		private readonly config: StorageMonitorConfig = {}
+		private readonly config: StorageMonitorConfig = {},
+		pieces?: IPieceStore
 	) {
 		this.now = config.now ?? ((): number => Date.now());
+		// Both identities are fixed at construction, so the decision is made once.
+		this.uncountedPieces = pieces && !blockStoreCountsPieces(storage, pieces) ? pieces : undefined;
 	}
 
 	async getCapacity(): Promise<StorageCapacity> {
@@ -112,8 +137,13 @@ export class StorageMonitor {
 		return scan;
 	}
 
+	/** One scan: both figures are memoized together, and a rejection of either rejects the scan. */
 	private async estimateUsedSpace(): Promise<number> {
-		return (await this.storage.getApproximateBytesUsed?.()) ?? 0;
+		const [blockBytes, pieceBytes] = await Promise.all([
+			this.storage.getApproximateBytesUsed?.(),
+			this.uncountedPieces?.bytesUsed()
+		]);
+		return (blockBytes ?? 0) + (pieceBytes ?? 0);
 	}
 }
 
