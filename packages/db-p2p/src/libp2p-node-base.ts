@@ -33,6 +33,8 @@ import { BlobFetcher } from './blob/blob-fetcher.js';
 import type { BlobHolderDeps } from './blob/blob-holders.js';
 import { buildBlobProtocol } from './blob/blob-protocol.js';
 import { NodeBlobService } from './blob/node-blob-service.js';
+import { BlobReferenceCheck } from './blob/reference-check.js';
+import { createNodeNetworkTransactor } from './node-network-transactor.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -1692,6 +1694,22 @@ export async function createLibp2pNodeBase(
 			holders: blobTransfer.holders,
 			probeTimeoutMs: linkDeadlines.responseTimeoutMs,
 		});
+		// The node's own reader of committed state, for deciding whether a blob is referenced (docs/blobs.md
+		// §Who may fetch and who may store). Built the way a host's transactor over the node is, but with no
+		// change notifier: it reads, it does not watch. Not attached to the node, so no host writes through a
+		// transactor that would never hear of its own commits. It never pends or cancels, so it never owes a
+		// cancel and needs no `stop()` on the node's way down.
+		const committedReader = createNodeNetworkTransactor({
+			peerId: node.peerId,
+			keyNetwork,
+			coordinatedRepo: served?.coordinatedRepo,
+			storageRepo: served?.storageRepo,
+			protocolPrefix,
+			linkDeadlines,
+			clock: hlcClock,
+		});
+		// Unused until the announce receiver (`feat-blob-announcements-are-answered`) takes it.
+		const blobReferences = new BlobReferenceCheck({ transactor: committedReader });
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to

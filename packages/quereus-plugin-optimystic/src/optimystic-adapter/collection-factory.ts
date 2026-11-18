@@ -1,18 +1,16 @@
-import type { ITransactor, IKeyNetwork, CollectionId, PeerId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
 import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
 	createLibp2pNode,
+	createNodeNetworkTransactor,
 	DEFAULT_CLUSTER_SIZE,
 	Libp2pKeyPeerNetwork,
-	RepoClient,
-	stateHoldingsOnReads,
 	StorageRepo,
 	MemoryRawStorage,
 	type ReadCacheLease,
 	withReadCache,
 	signPeer,
-	resolveLinkDeadlines,
 	type OptimysticClientNodeAttachments,
 	type OptimysticNodeAttachments,
 	type CollectionWatchHandle,
@@ -418,60 +416,14 @@ export class CollectionFactory {
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
 
-    // A node a host injected may carry no store, and a client has none; its reads then state nothing.
-    const localStore = node.storageRepo;
-    const getRepo = (peerId: PeerId): IRepo => {
-      // This node itself: its coordinated repo. A client has none, and no transactor ever picks it, since
-      // a client is in no cohort and never coordinates; the throw is that assertion.
-      if (peerId.toString() === node.peerId.toString()) {
-        if (!coordinatedRepo) {
-          throw new Error(`node ${node.peerId.toString()} stores no blocks (servesBlocks: false) yet was picked to coordinate; a client is in no cohort`);
-        }
-        return coordinatedRepo;
-      }
-      // For remote peers, create a RepoClient. Its reads say what this node holds of each block, so a
-      // coordinator whose cohort includes this node need not ask it back over the network.
-      const remote = RepoClient.create(peerId, keyNetwork, protocolPrefix);
-      return localStore ? stateHoldingsOnReads(remote, localStore) : remote;
-    };
-
-    // The node's own derived deadlines, so a declared link round trip reaches every repo dial and
-    // the budget around them. A node a host injected without building it through `createLibp2pNode`
-    // carries none; it gets the undeclared ones.
-    const { dialTimeoutMs, transactionTimeoutMs, retryBackoffBaseMs } = node.linkDeadlines ?? resolveLinkDeadlines();
-
-    return new NetworkTransactor({
-      // Four dial deadlines (30 s when undeclared): a dial to a dead coordinator that runs out its
-      // deadline, the cold relayed dial to the one picked next, that coordinator's own cold dial to a
-      // cohort member, and the warm round trips of the consensus rounds. At a 3 s round trip, 132 s.
-      // NOTE: a write against an unreachable cohort takes that long to fail, and a cluster member keeps
-      // the record's consensus state until the expiration it stamps; if either matters more than a
-      // re-picked coordinator, give this budget fewer dials and accept that a dead coordinator then
-      // cannot be re-picked over cold relayed links.
-      timeoutMs: transactionTimeoutMs,
-      // A cancel is a stream negotiation and a request to the coordinator, which then runs a
-      // consensus round with the block's cohort: about six round trips on warm connections, so a
-      // fixed 5 s fails every cancel once the round trip passes about 800 ms. The derived dial
-      // deadline is eleven round trips, and 3 s when undeclared, so the 5 s floor keeps an undeclared
-      // node where it was.
-      // NOTE: holds a warm-connection cancel with five round trips to spare, but not one that must
-      // first open a cold relayed connection (up to ten more). A cancel usually reuses the connection
-      // its pend just opened; if cancels on slow links run out of time anyway (a failed cancel leaves
-      // its pending records standing until a re-send lands; see `NetworkTransactor.dischargeCancel`),
-      // give this budget its own number of round trips.
-      abortOrCancelTimeoutMs: Math.max(5_000, dialTimeoutMs),
-      dialTimeoutMs,
-      // One declared round trip before a retry, doubling; 0 (no wait) on an undeclared link.
-      retryBackoffBaseMs,
+    return createNodeNetworkTransactor({
+      peerId: node.peerId,
       keyNetwork,
-      getRepo,
+      coordinatedRepo,
+      storageRepo: node.storageRepo,
+      protocolPrefix,
+      linkDeadlines: node.linkDeadlines,
       localChangeNotifier: blockChangeNotifier,
-      // `getRepo` serves this node from its coordinated repo, so ties among a block's responsible
-      // peers go to this node and its own writes skip the network hop. A client has nothing co-located.
-      localPeerId: coordinatedRepo ? node.peerId : undefined,
-      // The node's own HLC clock, which its storage raises to every write it stores, so the writes
-      // this transactor mints never sit below one the node holds. A node a host injected without
-      // building it through `createLibp2pNode` carries none; its writes mint from the process-wide clock.
       clock: node.hlcClock,
     });
   }
