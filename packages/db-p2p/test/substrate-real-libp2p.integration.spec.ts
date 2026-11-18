@@ -1327,9 +1327,14 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
  * by that member, and the notification reaches the watcher over the notify socket and verifies against
  * the group's membership at `ceil(3 × 0.75) = 3` signatures.
  *
- * The case passes only on a wake that a delivered notification accounts for: the watcher's subscriber
- * registry saw a frame for the topic, and no tail read ran on the watcher between the commit and the wake.
- * The cohort-topic options are the production defaults (`wantK` 16, `minSigs` 14): neither governs a
+ * An attempt counts when the watch woke, the watcher's subscriber registry received a frame for the topic,
+ * and no tail read ran on the watcher between the commit and both of those. The watcher is outside the log
+ * tail's storage group, but it may store the collection's other blocks (the tree's leaf is placed by its own
+ * id), so its own storage can wake it before the notification lands; the delivered frame is what shows the
+ * notify socket carried the commit, as in the describe above. The first commit after a registration reaches
+ * the announcing member can go unannounced (docs/reactivity.md, "A commit right after a registration can reach
+ * nobody"): its attempt times out waiting for the frame, and the next attempt is disqualified, correctly, by
+ * the tail read the subscription manager's gap recovery makes. The cohort-topic options are the production defaults (`wantK` 16, `minSigs` 14): neither governs a
  * root-placed root, which is the point.
  *
  * NOTE: this reproduces the threshold arm of the defect, not the disjoint-group arm. With `wantK` 16 on six
@@ -1428,30 +1433,34 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 			await waitFor(() => watcher.reactivityWatch!.isAttached(COLLECTION), { timeoutMs: 180_000, intervalMs: 250, description: 'the watch registered with the root group through the real register walk' });
 
 			// The watcher's registration landed on one group member and replicates to the rest over cohort
-			// gossip; the writer announces to the registrations its own engine holds.
+			// gossip; the writer announces to the registrations its own engine holds. Wait on the lookup the
+			// forwarder host makes (`directSubscribers` in src/libp2p-node-base.ts): the root-placed engine at the
+			// tail's root coordinate, which a lookup by topic alone can disagree with.
 			const writerHost = (writer as unknown as { cohortTopicHost: CohortTopicHost }).cohortTopicHost;
+			const rootCoord = reactivityRootCoord(reactivityTailBytes(tail!.tailId));
 			await waitFor(() => {
-				const engine = writerHost.registry.findServing(topicId, 0);
-				return engine !== undefined && reactivityDirectSubscribers(engine, topicId).includes(watcher.peerId.toString());
+				const engine = writerHost.registry.findByCoord(rootCoord);
+				return engine !== undefined && engine.rootPlaced && reactivityDirectSubscribers(engine, topicId).includes(watcher.peerId.toString());
 			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing group member" });
 			expect(wakes, 'only the first tail read has woken the watch: nothing has changed since it opened').to.equal(1);
 
-			// An attempt proves the notification path only if a delivered frame accounts for the wake and no tail
-			// read ran in between; an attempt with no wake is repeated (the group's membership certificate is
-			// published on its next gossip round, and the announcing node verifies against it).
+			// An attempt waits for the wake AND the frame, since the watcher's own storage can wake it first, and
+			// counts only if no tail read ran in between. A commit that goes unannounced costs two attempts: its own,
+			// by timeout, and the next, whose notification arrives with a revision gap and is disqualified by the
+			// gap-recovery tail read. Six attempts leave room for two such losses.
 			let wokeByNotification = false;
-			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
+			for (let attempt = 0; attempt < 6 && !wokeByNotification; attempt++) {
 				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
 				const readsBeforeCommit = reads.started;
 				const wakesBeforeCommit = wakes;
 				const deliveredBeforeCommit = delivered;
 				await writerTree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
 				try {
-					await waitFor(() => wakes > wakesBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke' });
+					await waitFor(() => wakes > wakesBeforeCommit && delivered > deliveredBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke and the notification arrived' });
 				} catch {
 					continue;
 				}
-				wokeByNotification = reads.started === readsBeforeCommit && delivered > deliveredBeforeCommit;
+				wokeByNotification = reads.started === readsBeforeCommit;
 			}
 			expect(wokeByNotification, 'a commit coordinated inside the storage group woke a watcher outside it by a delivered notification, with no tail read in between').to.equal(true);
 		} finally {
