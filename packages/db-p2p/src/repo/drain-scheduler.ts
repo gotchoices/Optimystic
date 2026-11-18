@@ -4,8 +4,8 @@ import { admittedBy, type NetworkMembershipGate } from '../network-membership-ga
 import type { Logger } from '../logger.js';
 import { unrefTimer } from '../unref-timer.js';
 
-/** What woke a pass. */
-export type DrainTrigger = 'start' | 'connection' | 'identify' | 'recheck' | 'manual';
+/** What woke a pass: `manual` is `checkNow`, `wake` the owner's `wake()`. */
+export type DrainTrigger = 'start' | 'connection' | 'identify' | 'recheck' | 'manual' | 'wake';
 
 /** The slice of libp2p a drain uses: identity, the connection events, who is connected, and the peer store. */
 export type DrainLibp2p = Pick<Libp2p, 'peerId' | 'addEventListener' | 'removeEventListener' | 'getConnections'> & {
@@ -174,7 +174,7 @@ export class DrainScheduler<TEntry, TTally extends string> implements Startable 
 	 * an owner that has just added an entry. Forgets no peer state. A no-op while stopped.
 	 */
 	wake(): void {
-		this.schedule('manual');
+		this.schedule('wake');
 	}
 
 	/** Observability: given-up (entry, peer) pairs, whether a timer is armed, and the last pass. */
