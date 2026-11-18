@@ -36,7 +36,8 @@ export class BlobGetSlots {
 
 	/**
 	 * Waits for a slot to `peer` at `priority`; resolves with an idempotent release. Rejects with
-	 * `signal.reason` when the signal aborts first (at once when it already has).
+	 * `signal.reason` when the signal aborts first (at once when it already has). Once granted the
+	 * slot is the caller's to release, even if the signal aborts before the caller's continuation runs.
 	 */
 	acquire(peer: string, priority: FetchPriority, signal?: AbortSignal): Promise<() => void> {
 		return this.pools[priority].acquire(peer, signal);
