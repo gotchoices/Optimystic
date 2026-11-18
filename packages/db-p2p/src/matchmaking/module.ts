@@ -233,10 +233,12 @@ export class MatchmakingSeekerSession {
 			...(reg.filter !== undefined ? { filter: reg.filter } : {}),
 			...(reg.pushOnArrival !== undefined ? { pushOnArrival: reg.pushOnArrival } : {}),
 		});
+		const previous = this.manager?.registration;
 		this.manager = new MatchmakingSeekerManager({
 			service: this.deps.service,
 			seeker,
 			...(this.deps.ttlMs !== undefined ? { ttlMs: this.deps.ttlMs } : {}),
+			...(previous !== undefined ? { replaces: previous } : {}),
 		});
 		await this.manager.register();
 	}

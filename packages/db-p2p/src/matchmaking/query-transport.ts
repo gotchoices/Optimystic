@@ -388,20 +388,29 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 		}
 	};
 
+	/** The fields every seeker register frame at `treeTier` carries, register or probe: fresh timestamp and correlation id. */
+	const seekerFrameBody = (topicId: Uint8Array, treeTier: number): Omit<RegisterV1, "signature"> => ({
+		v: 1,
+		topicId: bytesToB64url(topicId),
+		tier: Tier.T2,
+		treeTier,
+		participantCoord: bytesToB64url(seekerBytes),
+		ttl: seekerTtlMs,
+		timestamp: Date.now(),
+		correlationId: bytesToB64url(randomBytes(16)),
+	});
+
+	/** Sign a register frame body with the node key over its canonical image. */
+	const signRegisterFrame = async (body: Omit<RegisterV1, "signature">): Promise<RegisterV1> =>
+		({ ...body, signature: bytesToB64url(await signPeer(key, registerSigningPayload(body))) });
+
 	/** Build a signed seeker `RegisterV1` at `treeTier` (tier-0 carries the self-vouch bootstrap evidence). */
 	const buildSeekerRegister = async (topicId: Uint8Array, treeTier: number, appPayload: Uint8Array): Promise<RegisterV1> => {
 		const baseBody: Omit<RegisterV1, "signature"> = {
-			v: 1,
-			topicId: bytesToB64url(topicId),
-			tier: Tier.T2,
-			treeTier,
-			participantCoord: bytesToB64url(seekerBytes),
-			ttl: seekerTtlMs,
+			...seekerFrameBody(topicId, treeTier),
 			// A tier-0 probe is the cold-root bootstrap (needs evidence on a configured node); a tier-`d>0`
 			// probe is a plain walk step that falls through `no_state` on a cohort that does not serve the topic.
 			bootstrap: treeTier === 0,
-			timestamp: Date.now(),
-			correlationId: bytesToB64url(randomBytes(16)),
 			appPayload: bytesToB64url(appPayload),
 		};
 		// A configured production node gates a T2 `bootstrap: true` register on bootstrap evidence, so the
@@ -418,28 +427,19 @@ export function createLibp2pMatchmakingTransport(deps: Libp2pMatchmakingTranspor
 				}),
 			}
 			: baseBody;
-		return { ...body, signature: bytesToB64url(await signPeer(key, registerSigningPayload(body))) };
+		return signRegisterFrame(body);
 	};
 
 	/**
 	 * Build a signed read-only probe at `treeTier`: a register frame with `probe` set, which the cohort answers with
 	 * its classification and traffic snapshot and admits nothing. No `bootstrap`, no evidence (a probe never
 	 * instantiates a cold cohort) and no payload (nothing is stored).
+	 * NOTE: a probe counts against the cohort's probe rate limit, and an over-rate probe is answered
+	 * `unwilling_cohort`, which ends the walk. One probe per tier per walk stays far under it; if walks ever probe a
+	 * tier repeatedly (re-registering each requery), check the limit before relying on it.
 	 */
-	const buildSeekerProbe = async (topicId: Uint8Array, treeTier: number): Promise<RegisterV1> => {
-		const body: Omit<RegisterV1, "signature"> = {
-			v: 1,
-			topicId: bytesToB64url(topicId),
-			tier: Tier.T2,
-			treeTier,
-			participantCoord: bytesToB64url(seekerBytes),
-			ttl: seekerTtlMs,
-			probe: true,
-			timestamp: Date.now(),
-			correlationId: bytesToB64url(randomBytes(16)),
-		};
-		return { ...body, signature: bytesToB64url(await signPeer(key, registerSigningPayload(body))) };
-	};
+	const buildSeekerProbe = (topicId: Uint8Array, treeTier: number): Promise<RegisterV1> =>
+		signRegisterFrame({ ...seekerFrameBody(topicId, treeTier), probe: true });
 
 	/** Dial the routed primary's `/register` with the signed seeker frame and decode the `RegisterReplyV1`. */
 	const dialRegister = async (primary: string, reg: RegisterV1): Promise<RegisterReplyV1> => {

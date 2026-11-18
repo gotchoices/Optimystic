@@ -18,7 +18,7 @@
  * sends nothing (`CohortTopicService.withdraw`'s identity guard).
  */
 
-import { Tier, SEEKER_TTL_MS, type CohortTopicService, type MatchmakingSeeker, type RegistrationHandle } from "@optimystic/db-core";
+import { Tier, SEEKER_TTL_MS, bytesEqual, type CohortTopicService, type MatchmakingSeeker, type RegistrationHandle } from "@optimystic/db-core";
 
 /** Construction inputs for a {@link MatchmakingSeekerManager}. */
 export interface MatchmakingSeekerManagerOptions {
@@ -28,6 +28,12 @@ export interface MatchmakingSeekerManagerOptions {
 	readonly seeker: MatchmakingSeeker;
 	/** Seeker TTL (ms). Default {@link SEEKER_TTL_MS} (10 s). */
 	readonly ttlMs?: number;
+	/**
+	 * The brief registration this one replaces — the session's previous seeker registration, made by an earlier
+	 * manager. While it is still the live registration for this seeker's topic, {@link MatchmakingSeekerManager.register}
+	 * registers over it rather than refusing.
+	 */
+	readonly replaces?: RegistrationHandle;
 }
 
 /**
@@ -47,12 +53,14 @@ export class MatchmakingSeekerManager {
 	private readonly service: CohortTopicService;
 	private readonly seeker: MatchmakingSeeker;
 	private readonly ttlMs: number;
+	private readonly replaces: RegistrationHandle | undefined;
 	private handle?: RegistrationHandle;
 
 	constructor(options: MatchmakingSeekerManagerOptions) {
 		this.service = options.service;
 		this.seeker = options.seeker;
 		this.ttlMs = options.ttlMs ?? SEEKER_TTL_MS;
+		this.replaces = options.replaces;
 	}
 
 	/** The live registration handle, or `undefined` before {@link register}. */
@@ -63,7 +71,7 @@ export class MatchmakingSeekerManager {
 	/**
 	 * Register the seeker briefly at tier T2 with the short seeker TTL; no renewal is started. Throws
 	 * {@link TopicRegistrationHeldError} when this machine holds a live registration for the topic other than this
-	 * manager's own.
+	 * manager's own or the one it {@link MatchmakingSeekerManagerOptions.replaces}.
 	 */
 	async register(): Promise<RegistrationHandle> {
 		const topicId = this.seeker.topicId;
@@ -88,7 +96,10 @@ export class MatchmakingSeekerManager {
 		}
 	}
 
+	/** Whether the live registration for the topic is this seeker's own (this manager's, or the one it replaces). */
 	private holdsOwnRegistration(): boolean {
-		return this.handle !== undefined && this.service.isLive(this.handle);
+		const topicId = this.seeker.topicId;
+		return [this.handle, this.replaces].some((own) =>
+			own !== undefined && bytesEqual(own.topicId, topicId) && this.service.isLive(own));
 	}
 }

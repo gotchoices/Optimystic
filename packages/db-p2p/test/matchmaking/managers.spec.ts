@@ -18,6 +18,7 @@ import {
 } from '@optimystic/db-core';
 import { MatchmakingProviderManager } from '../../src/matchmaking/provider-manager.js';
 import { MatchmakingSeekerManager, TopicRegistrationHeldError } from '../../src/matchmaking/seeker-manager.js';
+import { MatchmakingSeekerSession, type MatchTopicRef } from '../../src/matchmaking/module.js';
 
 /**
  * Manager-tier coverage (gap #3 from the implement handoff): the db-p2p managers are thin wrappers
@@ -193,7 +194,7 @@ describe('matchmaking / seeker manager', () => {
 	});
 
 	// One registration per machine per topic: a brief seeker registration must not replace the machine's other
-	// registration there (a provider's), but may replace its own.
+	// registration there (a provider's), but may replace the session's own earlier one.
 	it('refuses to register over another live registration of the machine for the topic, not over its own', async () => {
 		const service = new RecordingService();
 		const seeker = makeSeeker();
@@ -203,9 +204,19 @@ describe('matchmaking / seeker manager', () => {
 		expect(err, 'a held registration refuses the seeker register').to.be.instanceOf(TopicRegistrationHeldError);
 		expect(service.registers, 'nothing was registered over it').to.have.length(1);
 
-		const own = new MatchmakingSeekerManager({ service: new RecordingService(), seeker });
-		await own.register();
-		await own.register();
-		expect(own.registration, 'the manager re-registers over its own live registration').to.not.equal(undefined);
+		// The session builds a new manager per register, so its own earlier registration is the one it may replace.
+		const ownService = new RecordingService();
+		const session = new MatchmakingSeekerSession({
+			service: ownService,
+			sign: fakeSign,
+			verifyEntry: () => true,
+			walkTransport: () => { throw new Error('walk not used'); },
+			queryCohort: () => Promise.reject(new Error('query not used')),
+			estimateDMax: async () => 0,
+		});
+		const topic: MatchTopicRef = { kind: 'task', label: 'cluster-validate' };
+		await session.register(topic, { wantCount: 3, contactHint: 's' });
+		await session.register(topic, { wantCount: 2, contactHint: 's' });
+		expect(ownService.registers, 'the session re-registers over its own brief registration').to.have.length(2);
 	});
 });
