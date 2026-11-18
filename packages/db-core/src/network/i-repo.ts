@@ -50,6 +50,10 @@ export type MessageOptions = {
 	 * {@link asker}: a path that forgets it leaves the record standing, as every record stood before
 	 * the mark existed, whereas a forgotten negative mark would have a live remote writer's record
 	 * judged dead.
+	 *
+	 * It also says the writer measured the pend against `MAX_TRANSACTION_BYTES` before sending it, so
+	 * `CoordinatorRepo.pendMany` does not measure it again. An in-process writer that sets the mark
+	 * must measure first, or an oversized pend to a cohort of one commits unchecked.
 	 */
 	localWriter?: true;
 }
