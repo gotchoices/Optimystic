@@ -52,7 +52,11 @@ export function recordMembershipDigest(record: Pick<ClusterRecord, 'membershipVe
 }
 
 const encoder = new TextEncoder();
-const utf8 = (text: string): Uint8Array => encoder.encode(text);
+// The template literal is what keeps a hostile part hashing as the string concatenation did: a record off
+// the wire (a dispute's `originalRecord`, a proof) may carry no `messageHash` or `promises` at all, which
+// the old `+` spelled "undefined", where `TextEncoder.encode(undefined)` would encode nothing. (Two
+// adjacent missing parts the old `+` added to "NaN"; no record that reaches a signer has that shape.)
+const utf8 = (text: string | undefined): Uint8Array => encoder.encode(`${text}`);
 
 // NOTE: the memo is sound only because no `RepoMessage` is changed once it has been hashed: a message
 // mutated after its first hash would go on hashing as it was, and a signature would then cover content
@@ -73,9 +77,9 @@ export function canonicalMessageBytes(message: RepoMessage): Uint8Array {
 	const held = messageBytes.get(message);
 	if (held !== undefined) return held;
 	// A record off the wire is hashed before its shape is checked, so `message` may be no object at all;
-	// such a message is never memoized (a WeakMap refuses it as a key), and the template literal spells
-	// `canonicalJson`'s `undefined` for a value JSON cannot encode as the string preimage always did.
-	const bytes = utf8(`${canonicalJson(message)}`);
+	// such a message is never memoized (a WeakMap refuses it as a key), and `utf8` spells `canonicalJson`'s
+	// `undefined` for a value JSON cannot encode as the string preimage always did.
+	const bytes = utf8(canonicalJson(message));
 	if (typeof message === 'object' && message !== null) messageBytes.set(message, bytes);
 	return bytes;
 }

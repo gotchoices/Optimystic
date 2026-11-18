@@ -5,6 +5,9 @@ import {
 	computeClusterPromiseHash,
 	membershipDigestFromIds,
 } from '../src/cluster/membership.js'
+import { canonicalJson } from '../src/utility/canonical-json.js'
+import { sha256 } from 'multiformats/hashes/sha2'
+import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
 import type { Signature } from '../src/cluster/structs.js'
 import type { BlockId, RepoMessage } from '../src/index.js'
 
@@ -57,5 +60,16 @@ describe('cluster record hash layout', () => {
 		expect(messageHash, 'messageHash').to.equal('zDQ3qTb5NbQhKJ4ACGRWgNK4PuR7fGxZYpjHMG8AtKrGk')
 		expect(await computeClusterPromiseHash(messageHash, m, digest), 'promiseHash').to.equal('e0K4fC-mZQTUQmX7rLWaa-DemN-xOGtPWOp1BaPwOC8')
 		expect(await computeClusterCommitHash(messageHash, m, promises, digest), 'commitHash').to.equal('5gEnKyWS6XXTHkYnlmA5R-vXlEFKwZpcJZWva__eQ-k')
+	})
+
+	// A dispute's `originalRecord` and a proof come off the wire unchecked, so any part may be missing;
+	// the string concatenation the hashes were defined by spelled a missing part "undefined".
+	it('hashes a record with missing parts as the string concatenation did', async () => {
+		const m = message()
+		const missing = undefined as unknown as string
+		const absentPromises = undefined as unknown as Record<string, Signature>
+		const concatenated = missing + canonicalJson(m) + '' + canonicalJson(absentPromises)
+		const expected = uint8ArrayToString((await sha256.digest(new TextEncoder().encode(concatenated))).digest, 'base64url')
+		expect(await computeClusterCommitHash(missing, m, absentPromises)).to.equal(expected)
 	})
 })
