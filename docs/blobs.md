@@ -262,7 +262,7 @@ There is no access control finer than membership: a reference is not a secret wi
 
 Each change is an `onDurability` event, and reaching `full` removes the owed entry and its hold. In a group where no other member accepts blobs the class stays `local` and the writer keeps the blob; readers fetch it from the writer on demand.
 
-**When the cohort changes.** A node's held blobs are enumerable from its records, so the cohort comparison `RebalanceMonitor` (`packages/db-p2p/src/cluster/rebalance-monitor.ts`) makes for blocks is made for blobs too, by giving it the routing key rule rather than a second copy of its logic. A member that joins a held blob's cohort is announced to. A node that leaves a blob's cohort drops its `responsible` hold only after confirming that enough current members hold the blob.
+**When the cohort changes.** A node's held blobs are enumerable from its records, so the cohort comparison `RebalanceMonitor` (`packages/db-p2p/src/cluster/rebalance-monitor.ts`) makes for blocks is made for blobs too, by giving it the routing key rule rather than a second copy of its logic (`RebalanceMonitorDeps` in `packages/db-p2p/src/cluster/rebalance-monitor.ts` is where the rule and the set of ids to watch are supplied). A member that joins a held blob's cohort is announced to. A node that leaves a blob's cohort drops its `responsible` hold only after confirming that enough current members hold the blob.
 
 **Readers repair.** A node that is responsible for a blob, accepts blobs, finds it referenced and fetches it for a read keeps it under a `responsible` hold.
 

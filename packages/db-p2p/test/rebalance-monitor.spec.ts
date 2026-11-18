@@ -195,6 +195,26 @@ describe('RebalanceMonitor', () => {
 			expect(event!.newOwners.get('block-1')).to.include(peerId3.toString());
 		});
 
+		it('re-reports a lost id once per retainLost call', async () => {
+			mockFret.setCohort('*', [selfId.toString(), peerId2.toString()]);
+
+			const monitor = new RebalanceMonitor(deps, { minRebalanceIntervalMs: 0 });
+			monitor.trackBlock('block-1');
+			await monitor.checkNow();
+
+			mockFret.setCohort('*', [peerId2.toString()]);
+			expect((await monitor.checkNow())!.lost).to.deep.equal(['block-1']);
+
+			// The release could not be confirmed; the cohort has moved on again since.
+			monitor.retainLost('block-1');
+			mockFret.setCohort('*', [peerId3.toString()]);
+			const retried = await monitor.checkNow();
+			expect(retried!.lost).to.deep.equal(['block-1']);
+			expect(retried!.newOwners.get('block-1')).to.deep.equal([peerId3.toString()]);
+
+			expect(await monitor.checkNow(), 'no further retainLost, no further report').to.be.null;
+		});
+
 		it('returns null when responsibility has not changed', async () => {
 			mockFret.setCohort('*', [selfId.toString()]);
 

@@ -2,13 +2,11 @@ import type { Startable, Libp2p } from '@libp2p/interface'
 import { hashKey } from 'p2p-fret'
 import type { FretService } from 'p2p-fret'
 import { routingKeyForBlock } from '@optimystic/db-core'
-import type { IKeyNetwork } from '@optimystic/db-core'
+import type { IKeyNetwork, RoutingKey } from '@optimystic/db-core'
 import type { PartitionDetector } from './partition-detector.js'
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../storage/arachnode-fret-adapter.js'
-import { createLogger } from '../logger.js'
+import { createLogger, type Logger } from '../logger.js'
 import { unrefTimer } from '../unref-timer.js'
-
-const log = createLogger('rebalance-monitor')
 
 export interface RebalanceEvent {
 	/**
@@ -126,9 +124,10 @@ export interface RebalanceMonitorConfig {
 	growthMaxAttempts?: number
 	/**
 	 * Self-arming re-check timer for outstanding growth work (reported-but-unconfirmed peers, or
-	 * blocks deferred by `growthBlockBudget`). Checks otherwise fire only on libp2p connection
+	 * blocks deferred by `growthBlockBudget`) and for releases retained by
+	 * {@link RebalanceMonitor.retainLost}. Checks otherwise fire only on libp2p connection
 	 * events, so a failed push on a then-quiet network would never be retried. Armed at the end of a
-	 * check only while work is outstanding; fires `maybeRebalance()` so the existing
+	 * check (or by `retainLost`) only while work is outstanding; fires `maybeRebalance()` so the existing
 	 * `minRebalanceIntervalMs` throttle still bounds the push rate. `0` disables.
 	 * Default: `minRebalanceIntervalMs`
 	 */
@@ -146,9 +145,18 @@ export interface RebalanceMonitorDeps {
 	 * so it stays in lock-step with the `SpreadOnChurnMonitor` that shares it. Omit for standalone
 	 * construction (unit tests) — a fresh private `Set` preserves all existing behavior. Note: only
 	 * `trackedBlocks` is shared; `responsibilitySnapshot` stays per-monitor (it is rebalance's own
-	 * was-responsible memory, not owned-block tracking).
+	 * was-responsible memory, not owned-block tracking). The ids are whatever
+	 * {@link RebalanceMonitorDeps.routingKeyOf} places — block ids by default.
 	 */
 	trackedBlocks?: Set<string>
+	/**
+	 * The routing key an id is placed by. Default `routingKeyForBlock`. A blob instance passes
+	 * `id => routingKeyForBlob(id as BlobRef)` (`packages/db-core/src/network/routing-key.ts`); the ids it
+	 * tracks are blob reference strings, which `routingKeyForBlob` takes as a branded `BlobRef`.
+	 */
+	routingKeyOf?: (id: string) => RoutingKey
+	/** Logger sub-namespace. Default `'rebalance-monitor'`. The blob instance passes `'blob:copy'`. */
+	logName?: string
 	/**
 	 * The node's key network. When provided, a block's cohort is `findCluster` on its routing key —
 	 * the rule the writer routes by, the coordinator refuses writes by, and `RepoService` redirects
@@ -186,6 +194,11 @@ interface BlockGrowthState {
 	 * until they leave the cohort and rejoin (each check intersects this with the current cohort).
 	 */
 	abandonedPeers: Set<string>
+	/**
+	 * Set by {@link RebalanceMonitor.retainLost} on a non-responsible id: report it `lost` again on the
+	 * next check. Every check that builds this id's state clears it, so one call buys one re-report.
+	 */
+	releasePending: boolean
 }
 
 const emptyGrowthState = (responsible: boolean): BlockGrowthState => ({
@@ -193,7 +206,8 @@ const emptyGrowthState = (responsible: boolean): BlockGrowthState => ({
 	cohortPeers: new Set<string>(),
 	pendingPeers: new Set<string>(),
 	growthAttempts: 0,
-	abandonedPeers: new Set<string>()
+	abandonedPeers: new Set<string>(),
+	releasePending: false
 })
 
 const intersect = (remembered: Set<string> | undefined, current: Set<string>): Set<string> =>
@@ -218,7 +232,8 @@ const carryGrowthState = (
 		cohortPeers: intersect(confirmed, currentPeers),
 		pendingPeers: new Set<string>(),
 		growthAttempts: prior?.growthAttempts ?? 0,
-		abandonedPeers: intersect(prior?.abandonedPeers, currentPeers)
+		abandonedPeers: intersect(prior?.abandonedPeers, currentPeers),
+		releasePending: false
 	}
 }
 
@@ -261,6 +276,7 @@ export class RebalanceMonitor implements Startable {
 	private readonly growthBlockBudget: number
 	private readonly growthMaxAttempts: number
 	private readonly growthRecheckIntervalMs: number
+	private readonly log: Logger
 
 	private readonly onConnectionOpen: () => void
 	private readonly onConnectionClose: () => void
@@ -279,6 +295,7 @@ export class RebalanceMonitor implements Startable {
 		this.growthBlockBudget = config.growthBlockBudget ?? 64
 		this.growthMaxAttempts = config.growthMaxAttempts ?? 5
 		this.growthRecheckIntervalMs = config.growthRecheckIntervalMs ?? this.minRebalanceIntervalMs
+		this.log = createLogger(deps.logName ?? 'rebalance-monitor')
 
 		this.onConnectionOpen = () => this.handleTopologyChange()
 		this.onConnectionClose = () => this.handleTopologyChange()
@@ -291,7 +308,7 @@ export class RebalanceMonitor implements Startable {
 		this.deps.libp2p.addEventListener('connection:open', this.onConnectionOpen)
 		this.deps.libp2p.addEventListener('connection:close', this.onConnectionClose)
 
-		log('started, tracking %d blocks', this.trackedBlocks.size)
+		this.log('started, tracking %d blocks', this.trackedBlocks.size)
 	}
 
 	async stop(): Promise<void> {
@@ -316,7 +333,7 @@ export class RebalanceMonitor implements Startable {
 
 		this.pendingTopologyChange = false
 		this.holderEvidence.clear()
-		log('stopped')
+		this.log('stopped')
 	}
 
 	onRebalance(handler: RebalanceHandler): void {
@@ -378,13 +395,29 @@ export class RebalanceMonitor implements Startable {
 				for (const peerId of state.pendingPeers) {
 					state.abandonedPeers.add(peerId)
 				}
-				log('growth give-up: block=%s abandoning %d unsatisfied peer(s) after %d attempts',
+				this.log('growth give-up: block=%s abandoning %d unsatisfied peer(s) after %d attempts',
 					blockId, state.pendingPeers.size, state.growthAttempts)
 				state.pendingPeers.clear()
 				state.growthAttempts = 0
 			}
 		}
 
+		this.updateRecheckTimer()
+	}
+
+	/**
+	 * The reaction could not confirm a `lost` id's release: report it in `lost` again (with its current
+	 * `newOwners`) on the next check while it stays tracked and this node stays outside its cohort. One call
+	 * buys one re-report; a reaction that still cannot confirm calls it again. Arms the re-check timer, as
+	 * outstanding growth does, so the re-report happens on a quiet network. Ignored for an id with no state
+	 * (never checked, or untracked since) or one this node is responsible for again.
+	 */
+	retainLost(id: string): void {
+		const state = this.responsibilitySnapshot.get(id)
+		if (!state || state.responsible) return
+		state.releasePending = true
+		// The reaction runs after the check that reported the id has already evaluated the timer and
+		// found nothing outstanding, so the timer has to be re-evaluated here.
 		this.updateRecheckTimer()
 	}
 
@@ -462,11 +495,15 @@ export class RebalanceMonitor implements Startable {
 		return { blocksAwaitingConfirmation, abandonedPairs, recheckArmed: this.recheckTimer !== null }
 	}
 
-	/** Growth work is outstanding while any reported peer is unconfirmed or blocks were budget-deferred. */
-	private hasOutstandingGrowthWork(): boolean {
+	/**
+	 * Work is outstanding while growth is owed — a reported peer unconfirmed, or blocks budget-deferred
+	 * or left by a failed lookup — or while a tracked id's release is retained ({@link retainLost}).
+	 */
+	private hasOutstandingWork(): boolean {
 		if (this.lastGrowthDeferred > 0) return true
 		for (const [blockId, state] of this.responsibilitySnapshot) {
-			if (state.responsible && state.pendingPeers.size > 0 && this.trackedBlocks.has(blockId)) {
+			if (!this.trackedBlocks.has(blockId)) continue
+			if (state.responsible ? state.pendingPeers.size > 0 : state.releasePending) {
 				return true
 			}
 		}
@@ -482,7 +519,7 @@ export class RebalanceMonitor implements Startable {
 	private updateRecheckTimer(): void {
 		if (this.growthRecheckIntervalMs <= 0) return
 
-		if (!this.running || !this.hasOutstandingGrowthWork()) {
+		if (!this.running || !this.hasOutstandingWork()) {
 			if (this.recheckTimer) {
 				clearTimeout(this.recheckTimer)
 				this.recheckTimer = null
@@ -495,7 +532,7 @@ export class RebalanceMonitor implements Startable {
 		this.recheckTimer = setTimeout(() => {
 			this.recheckTimer = null
 			void this.maybeRebalance()
-				.catch(err => { log('recheck error: %O', err) })
+				.catch(err => { this.log('recheck error: %O', err) })
 				.finally(() => this.updateRecheckTimer())
 		}, this.growthRecheckIntervalMs)
 		unrefTimer(this.recheckTimer)
@@ -522,7 +559,7 @@ export class RebalanceMonitor implements Startable {
 		// founder's blocks, re-check when FRET reports the peer instead of on this timer alone.
 		this.debounceTimer = setTimeout(() => {
 			this.debounceTimer = null
-			void this.maybeRebalance().catch(err => { log('topology check error: %O', err) })
+			void this.maybeRebalance().catch(err => { this.log('topology check error: %O', err) })
 		}, this.debounceMs)
 	}
 
@@ -581,11 +618,11 @@ export class RebalanceMonitor implements Startable {
 	 * full-scan throttle.
 	 */
 	private deferCheck(delayMs: number): void {
-		log('throttled, check deferred %dms to the end of the interval', delayMs)
+		this.log('throttled, check deferred %dms to the end of the interval', delayMs)
 		if (this.deferredCheckTimer) return
 		this.deferredCheckTimer = setTimeout(() => {
 			this.deferredCheckTimer = null
-			void this.maybeRebalance().catch(err => { log('deferred check error: %O', err) })
+			void this.maybeRebalance().catch(err => { this.log('deferred check error: %O', err) })
 		}, delayMs)
 		unrefTimer(this.deferredCheckTimer)
 	}
@@ -596,7 +633,7 @@ export class RebalanceMonitor implements Startable {
 			// connection event (or outstanding growth's re-check timer) is what runs one. The detector's
 			// goodbye window ages out on its own, with no event, so a node whose last event met a
 			// partition flag reports nothing until the next one. If that shows up, defer on suppression.
-			log('partition detected, suppressing rebalance')
+			this.log('partition detected, suppressing rebalance')
 			return null
 		}
 
@@ -626,7 +663,7 @@ export class RebalanceMonitor implements Startable {
 			} catch (err) {
 				// Responsibility is undetermined: leave this block's state untouched (never guess lost or
 				// gained off a failed lookup) and count it as outstanding so the re-check timer retries it.
-				log('cohort lookup failed: block=%s %o', blockId, err)
+				this.log('cohort lookup failed: block=%s %o', blockId, err)
 				lookupFailed++
 				continue
 			}
@@ -643,7 +680,7 @@ export class RebalanceMonitor implements Startable {
 
 			if (isResponsible && !wasResponsible && !evidence) {
 				gained.push(blockId)
-			} else if (!isResponsible && wasResponsible) {
+			} else if (!isResponsible && (wasResponsible || prior?.releasePending === true)) {
 				lost.push(blockId)
 				// The cohort members are the new owners
 				newOwners.set(blockId, cohort.filter(id => id !== selfId))
@@ -675,7 +712,8 @@ export class RebalanceMonitor implements Startable {
 			} else {
 				// Not responsible: clear ALL growth state (seen set, attempts, abandoned peers), so a
 				// later regain re-pushes to the whole cohort (benign when the local data is gone — the
-				// push finds nothing and no-ops).
+				// push finds nothing and no-ops). A retained release is cleared too: this check has just
+				// re-reported it, and only another retainLost call buys the next re-report.
 				state = emptyGrowthState(false)
 			}
 
@@ -712,7 +750,7 @@ export class RebalanceMonitor implements Startable {
 			// Deferred blocks drain one budget-full per check. Checks fire on libp2p connection events
 			// AND — while growth work is outstanding — on the growthRecheckIntervalMs timer armed
 			// below, so a backlog drains even on a quiet network.
-			log('growth budget reached: %d blocks deferred to the next check (budget=%d)',
+			this.log('growth budget reached: %d blocks deferred to the next check (budget=%d)',
 				growthDeferred, this.growthBlockBudget)
 		}
 
@@ -722,7 +760,7 @@ export class RebalanceMonitor implements Startable {
 			return null
 		}
 
-		log('rebalance check: gained=%d lost=%d grown=%d', gained.length, lost.length, grown.size)
+		this.log('rebalance check: gained=%d lost=%d grown=%d', gained.length, lost.length, grown.size)
 
 		return { gained, lost, newOwners, grown, floor: this.getCohortSize(), triggeredAt }
 	}
@@ -737,7 +775,7 @@ export class RebalanceMonitor implements Startable {
 	 * blocks ever show up as slow, share the lookup with the coordinator's responsibility cache.
 	 */
 	private async cohortFor(blockId: string): Promise<string[]> {
-		const key = routingKeyForBlock(blockId)
+		const key = (this.deps.routingKeyOf ?? routingKeyForBlock)(blockId)
 		if (this.deps.keyNetwork) {
 			return Object.keys(await this.deps.keyNetwork.findCluster(key))
 		}
@@ -766,7 +804,7 @@ export class RebalanceMonitor implements Startable {
 			try {
 				handler(event)
 			} catch (err) {
-				log('handler error: %O', err)
+				this.log('handler error: %O', err)
 			}
 		}
 	}
