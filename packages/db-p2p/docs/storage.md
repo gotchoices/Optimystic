@@ -769,6 +769,10 @@ log in the background, and on the last close. The constructor is synchronous; th
 operation takes the directory's lock and replays. How the log holds Invariant 6
 is under *The file backend* there. See "Shared KV Kernel" below.
 
+Beside the block tree, `FilePieceStore` (`packages/db-p2p-storage-fs/src/file-piece-store.ts`)
+keeps blob pieces under `optimystic-pieces/`, one file per piece, outside the write-ahead log. The
+block listing skips that directory, and the block store's byte figure counts it.
+
 ### 5. Shared KV Kernel (`KvRawStorage` + `RawStoreDriver`)
 
 `KvRawStorage` implements the full `IRawStorage` surface once, on top of a

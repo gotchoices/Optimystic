@@ -4,6 +4,7 @@ import type { BlockId, ActionId } from '@optimystic/db-core';
 import { NODE_KV_NAMESPACES, type BatchBackend, type BatchEntry, type CommittedBatch, type SinkCommitOptions, type StoreDurability, type StoreIdentity, type StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
+import { PIECE_DIRECTORY } from './file-piece-store.js';
 
 const log = createLogger('storage:file');
 
@@ -84,8 +85,16 @@ const ROOT_KV_NAMESPACES: ReadonlySet<string> = new Set(NODE_KV_NAMESPACES);
  */
 const COMMIT_PROOFS_DIR = 'commit-proofs';
 
-/** The directories at the root that hold no blocks: the KV namespaces and the commit proofs store. */
-const ROOT_NON_BLOCK_DIRS: ReadonlySet<string> = new Set([...ROOT_KV_NAMESPACES, COMMIT_PROOFS_DIR]);
+/**
+ * The directories at the root that hold no blocks: the KV namespaces, the commit proofs store, and
+ * `FilePieceStore`'s piece directory (`PIECE_DIRECTORY`), which holds no `meta.json` and so would
+ * never be listed as a block, but would otherwise be descended, a thousand fan directories, on every
+ * startup listing.
+ * NOTE: a block whose id is `optimystic-pieces` or starts `optimystic-pieces/` is hidden from
+ * `listBlockIds` and keeps its records inside the piece directory — the same accepted limit
+ * `COMMIT_PROOFS_DIR` carries. If such ids ever occur, encode block-id segments in the layout.
+ */
+const ROOT_NON_BLOCK_DIRS: ReadonlySet<string> = new Set([...ROOT_KV_NAMESPACES, COMMIT_PROOFS_DIR, PIECE_DIRECTORY]);
 
 /**
  * `commit-proofs/<messageHash>.json`. A base58 hash, which every message hash is, is a file name

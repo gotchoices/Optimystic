@@ -139,7 +139,8 @@ export class FileKVStore implements IKVStore {
 		// namespace with FileRawStorage's <blockId>/ dirs. Safe while no block id's first segment
 		// (a block id containing `/` nests too) equals a key's first segment — the node's keys all start with a fixed word (`under-replicated`,
 		// `coordinator`, `participant`, `executed`, `hlc`, and the Quereus plugin's offline journal's `optimystic-offline`) — and if one ever could, give the two stores
-		// separate basePaths (see README Usage). FileRawStorage.listBlockIds walks the tree but skips
+		// separate basePaths (see README Usage). Nor may a block id's or a key's first segment equal
+		// `optimystic-pieces`, the root directory FilePieceStore keeps its pieces in (PIECE_DIRECTORY). FileRawStorage.listBlockIds walks the tree but skips
 		// these root namespaces (db-p2p's NODE_KV_NAMESPACES — a new namespace must be added there),
 		// so a KV key whose last segment is `meta` is never enumerated as a block. Their bytes do
 		// count toward FileRawStorage.getApproximateBytesUsed.

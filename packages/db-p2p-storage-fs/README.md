@@ -10,8 +10,12 @@ Node.js filesystem storage backend for Optimystic peers. Provides:
   survive a restart: the under-replication ledger (which blocks the node
   acknowledged before every cohort member held them), and the persistent
   transaction state used to recover crashed two-phase commits.
+- **`FilePieceStore`** — implements `IPieceStore` for the pieces large values
+  ("blobs") are cut into: one file per piece, under `optimystic-pieces/`
+  (below).
 
-Both write through one write-ahead log per directory (below).
+The first two write through one write-ahead log per directory (below); the
+piece store bypasses it.
 
 This package targets plain Node.js. Use the sibling adapter for other
 environments:
@@ -29,11 +33,12 @@ yarn add @optimystic/db-p2p-storage-fs @optimystic/db-p2p @optimystic/db-core
 ## Usage
 
 ```ts
-import { FileRawStorage, FileKVStore } from '@optimystic/db-p2p-storage-fs';
+import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
 import { createLibp2pNode } from '@optimystic/db-p2p';
 
-const rawStorage = new FileRawStorage('/var/lib/my-peer/data');
-const kvStore    = new FileKVStore('/var/lib/my-peer/data');
+const rawStorage   = new FileRawStorage('/var/lib/my-peer/data');
+const kvStore      = new FileKVStore('/var/lib/my-peer/data');
+const pieceStorage = new FilePieceStore('/var/lib/my-peer/data');
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
@@ -44,11 +49,16 @@ const libp2p = await createLibp2pNode({
 
 // … and on shutdown, after the node has stopped:
 await libp2p.stop();
+await pieceStorage.close();
 await kvStore.close();
 await rawStorage.close();
 ```
 
-The node never closes a store it was handed, so close both after `stop()`.
+The node does not take a piece store yet: `pieceStorage` is passed to it once
+the node gains that option (`pieceStorage` on `NodeOptions`). Until then a host
+can use the store directly.
+
+The node never closes a store it was handed, so close each after `stop()`.
 Closing flushes what the store still holds and, for the last store over the
 directory, checkpoints the write-ahead log and removes the lock. A store that is
 never closed loses nothing it flushed, but leaves a log for the next open to
@@ -107,6 +117,9 @@ high-water mark, are then lost on restart.
     <messageHash>.json       — BlockCommitProof stored once under its consensus message's base58 hash
   <key-segment>/
     <key-segment>.json       — FileKVStore value; key "/" separators become subdirectories
+  optimystic-pieces/         — FilePieceStore; skipped by the block listing
+    incoming/<hex>.tmp       — a piece being written; deleted on the next open
+    <xx>/<piece id>          — one piece's bytes; <xx> is the two characters before the id's last
   write-ahead.log            — groups written since the last checkpoint
   write-ahead.log.sealed     — the log a checkpoint is syncing the tree under; present only during one, or after a crash in one
   store.lock                 — { pid, hostname } of the process holding the store
@@ -116,6 +129,28 @@ Action ids that contain a colon (e.g. `tx:abcd1234`) are percent-encoded in
 filenames (`tx%3Aabcd1234.json`) for Windows compatibility; the storage layer
 encodes and decodes transparently so callers always work with the canonical
 id form.
+
+## Piece store
+
+`FilePieceStore` keeps each piece as one file named by its id (a lowercase
+base32 CIDv1, which it checks before building any path, refusing anything else
+with `RangeError`) and holding exactly its bytes. The files are spread over up
+to 1024 subdirectories named by two digest characters of the id, so a store of
+a million pieces holds about a thousand files per directory.
+
+It does not go through the write-ahead log: a put writes the piece to
+`incoming/`, syncs the file, and renames it into place, so after a crash a
+piece is whole or absent. `flush()` syncs the directories whose entries changed
+(skipped on Windows, as for the log's checkpoint), after which a put survives a
+power cut. A put of a piece already stored writes nothing. The store takes no
+lock and holds no handle between calls; two stores over one directory are not
+supported, since the second's open deletes the first's temps.
+
+It reports the same store identity as a `FileRawStorage` over the same
+`basePath`, whose byte count already includes the piece directory, so the
+node's storage monitor does not count the pieces twice. Its log lines are on
+`optimystic:db-p2p-storage-fs:pieces:file` (`incoming:cleared`,
+`rename:raced`).
 
 ## Write-ahead log
 
@@ -234,7 +269,7 @@ yarn test          # mocha, minimal reporter
 yarn test:verbose  # mocha, spec reporter
 ```
 
-Two layers run here, both over a per-test `fs.mkdtemp` fixture with `afterEach`
+Three layers run here, all over a per-test `fs.mkdtemp` fixture with `afterEach`
 cleanup:
 
 - **Shared conformance suite** — `runRawStorageConformance('FileSystem', …)` from
@@ -254,6 +289,9 @@ cleanup:
   raw-colon fallback, the directory-based `listBlockIds` meta-gate, `FileKVStore`
   listings over unflushed writes and the log it shares with `FileRawStorage`,
   and the under-replication ledger over `FileKVStore`.
+- **Piece store** — `runPieceStoreConformance('FilePieceStore', …)` from the same
+  subpath, with the flush-then-reopen case, plus `test/file-piece-store.spec.ts`
+  for a temp left in `incoming/` and the refusal of an id that is not a piece id.
 
 ## Known limitations
 
