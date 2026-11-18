@@ -163,6 +163,10 @@ export class Chain<TEntry> {
 	 * new block afterwards (the log's `priorHash`) nor what a caller writes into an entry after the add
 	 * (the log's `blockIds`) — both small against the gap between the target and the most a block may
 	 * hold.
+	 *
+	 * Nothing is measured that cannot change the answer, since for a large write each measure is a
+	 * whole pass over row data: a lone entry for an empty block, which takes it whatever its size, and
+	 * an entry offered to a block already at the target, which takes nothing more.
 	 */
 	private takenBy(block: ChainDataNode<TEntry>, entries: readonly TEntry[], start: number): number {
 		const room = Math.max(0, Math.min(EntriesPerBlock - block.entries.length, entries.length - start));
@@ -170,13 +174,21 @@ export class Chain<TEntry> {
 		if (target === undefined || room === 0) {
 			return room;
 		}
-		// NOTE: serializes the whole tail block once per append, the same order of cost as the commit
-		// path's digest of every touched block. If appends to large logs ever show this in a profile,
-		// keep a running byte count for the tail instead of re-measuring it.
+		if (block.entries.length === 0 && room === 1) {
+			return 1;
+		}
+		// NOTE: serializes the whole tail block once per append — for a large write, usually the
+		// previous large entry — the same order of cost as the commit path's digest of every touched
+		// block. If appends to large logs ever show this in a profile, keep a running byte count for the
+		// tail instead of re-measuring it.
 		let bytes = jsonEncodedBytes(block);
 		let held = block.entries.length;
 		let taken = 0;
 		for (; taken < room; ++taken) {
+			// Any entry adds at least its separating comma, so a block holding one at the target is full.
+			if (held > 0 && bytes >= target) {
+				break;
+			}
 			// Each entry after the first adds its own JSON plus the separating comma.
 			const grown = bytes + jsonEncodedBytes(entries[start + taken]) + (held > 0 ? 1 : 0);
 			if (held > 0 && grown > target) {

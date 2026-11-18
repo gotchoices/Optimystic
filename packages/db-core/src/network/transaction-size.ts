@@ -61,9 +61,11 @@ export class TransactionTooLargeError extends Error {
  * What `requests` — one transaction's pends that ride in one consensus record — encode to together,
  * the measure {@link MAX_TRANSACTION_BYTES} is judged by.
  *
- * NOTE: encodes every request once more than sending it does, on the writer and again on the
- * coordinator. Negligible for an ordinary write; if pend encoding ever shows in a profile of large
- * writes, measure once on the writer and hand the size along instead.
+ * NOTE: encodes every request once more than sending it does, once per machine: on the writer, and on
+ * a coordinator that received the pend from another machine, which cannot take a remote writer's
+ * measure on trust. A coordinator does not measure again a pend from its own node's transactor
+ * (`MessageOptions.localWriter`), which measured it before sending. If the writer's measure ever shows
+ * in a profile of large writes, take it from the encoding the pend is sent in rather than a separate one.
  */
 export function transactionBytes(requests: readonly PendRequest[]): number {
 	let bytes = 0;
@@ -74,7 +76,7 @@ export function transactionBytes(requests: readonly PendRequest[]): number {
 /**
  * Throws {@link TransactionTooLargeError} when `requests` together encode to more than
  * {@link MAX_TRANSACTION_BYTES} ({@link transactionBytes}). The one rule both the writer (before
- * sending) and the coordinator (on receipt) apply.
+ * sending) and the coordinator (on receipt of a pend from another machine) apply.
  */
 export function assertTransactionFits(requests: readonly PendRequest[]): void {
 	if (requests.length === 0) return;

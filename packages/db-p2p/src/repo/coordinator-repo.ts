@@ -2797,7 +2797,11 @@ export class CoordinatorRepo implements IRepo {
 		// (a custom transactor, a direct repo client). Every collection's request rides in the one
 		// record, so they are judged together. Solo cohorts too: the limit must not depend on how many
 		// machines the cohort has, or a write that commits alone fails once a second machine joins.
-		assertTransactionFits(requests);
+		// Skipped for this node's own transactor (`localWriter`, set only by `NetworkTransactor` and
+		// never carried on the wire): its `pend` measured the whole pend, and its `pendMany` the batch's
+		// sum, before sending, and these requests are that pend or a share of it, so measuring them
+		// again would serialize the same row data a second time on the same machine.
+		if (options?.localWriter !== true) assertTransactionFits(requests);
 		await this.verifyResponsibility(batch.blockIds);
 		const result = await this.pendThroughCluster(batch, options);
 		// A pend the blocks ACCEPTED is the proof that no reservation is holding them any more — the
