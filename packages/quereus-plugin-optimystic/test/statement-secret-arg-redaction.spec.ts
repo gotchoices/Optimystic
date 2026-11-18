@@ -83,13 +83,18 @@ async function enableSessionMode(db: Database, optimystic: ReturnType<typeof reg
 	return engine;
 }
 
-/** The statements the session records for `insert`, run in a transaction that is then rolled back. */
+/** The statements a session-mode transaction records for `insert`, run in a transaction that is then rolled back. */
 async function recordedStatements(db: Database, optimystic: ReturnType<typeof registerOptimystic>, insert: string): Promise<readonly string[]> {
-	await db.exec('BEGIN');
-	await db.exec(insert);
-	const statements = [...optimystic.txnBridge.getSession()!.getStatements()];
-	await db.exec('ROLLBACK');
-	return statements;
+	const engine = await enableSessionMode(db, optimystic);
+	try {
+		await db.exec('BEGIN');
+		await db.exec(insert);
+		const statements = [...optimystic.txnBridge.getSession()!.getStatements()];
+		await db.exec('ROLLBACK');
+		return statements;
+	} finally {
+		engine.dispose();
+	}
 }
 
 describe('replicated statement record: secret function-argument redaction', () => {
@@ -103,11 +108,9 @@ describe('replicated statement record: secret function-argument redaction', () =
 			) USING optimystic('tree://test/signatures')
 		`);
 
-		const engine = await enableSessionMode(db, optimystic);
 		const statements = await recordedStatements(db, optimystic,
 			`INSERT INTO signatures (id, sig) VALUES (1, probe_sign('hello', '${SECRET}'))`
 		);
-		engine.dispose();
 
 		expect(statements.length, 'a statement should be recorded').to.be.greaterThan(0);
 		const joined = statements.join('\n');
@@ -125,9 +128,7 @@ describe('replicated statement record: secret function-argument redaction', () =
 			) USING optimystic('tree://test/keys')
 		`);
 
-		const engine = await enableSessionMode(db, optimystic);
 		const statements = await recordedStatements(db, optimystic, `INSERT INTO keys (id, priv) VALUES (1, '${SECRET}')`);
-		engine.dispose();
 
 		// EXPECTED to contain the secret: any persisted column value is replicated,
 		// independent of literal-vs-bound. This pins the true exposure boundary so a
