@@ -34,11 +34,9 @@ import {
 	type PieceSink,
 } from '../src/index.js';
 import { selectBlobDigest, type SubtleDigest } from '../src/blob/digest.js';
+import { content, contentAt } from './blob-content.js';
 
 use(chaiAsPromised);
-
-const PERIOD = 251;
-const FEED_CHUNK = 100_003;
 
 const VECTORS: readonly { size: number; ref: string }[] = [
 	{ size: 0, ref: 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku' },
@@ -48,22 +46,6 @@ const VECTORS: readonly { size: number; ref: string }[] = [
 	{ size: 174 * 262_144, ref: 'bafybeihpe5snhzneq7xs53nivmsopto5lrogo3wjynauqylqeym5a3irbm' },
 	{ size: 175 * 262_144 + 1, ref: 'bafybeihzhgkxa5ea4r5cr73r73tsf3ppwpstcxnsuyqxio3vy7xpikkhmi' },
 ];
-
-/** One period-aligned pattern long enough to cut any feed chunk from. */
-const PATTERN = Uint8Array.from({ length: Math.max(FEED_CHUNK, BLOB_PIECE_BYTES) + PERIOD }, (_, i) => i % PERIOD);
-
-/** `length` bytes of the content starting at byte `offset`. */
-function contentAt(offset: number, length: number): Uint8Array {
-	const start = offset % PERIOD;
-	return PATTERN.subarray(start, start + length);
-}
-
-/** The content of a `size`-byte file in `FEED_CHUNK`-byte chunks. */
-async function* content(size: number): AsyncIterable<Uint8Array> {
-	for (let offset = 0; offset < size; offset += FEED_CHUNK) {
-		yield contentAt(offset, Math.min(FEED_CHUNK, size - offset));
-	}
-}
 
 /** Remembers what was put, and every list piece put before a piece it names. */
 class RecordingSink implements PieceSink {
