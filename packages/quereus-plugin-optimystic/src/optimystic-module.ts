@@ -936,8 +936,17 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.txnBridge = txnBridge;
     this.schemaManager = schemaManager;
 
-    // Enable statement capture for replication/transaction logging
-    this.wantStatements = true;
+    // The engine builds a statement for each written row only while the bridge will read it (session
+    // mode; see recordsStatements). Quereus declares `wantStatements` as a class field and compiles for
+    // ES2022, so its constructor defines an own property that would shadow a getter on this class's
+    // prototype: the getter goes on the instance. The engine reads it per row (dml-executor), so a
+    // host that configures session mode after this table opened gets statements from its next
+    // transaction.
+    Object.defineProperty(this, 'wantStatements', {
+      get: () => this.txnBridge.recordsStatements(),
+      configurable: true,
+      enumerable: true,
+    });
     // Every update() of the statement's own write carries its description (UpdateArgs.writeScope), from
     // which the arms record which staged elements came from a fresh source (recordWriteFacts) for the
     // offline outlook (docs/offline-sync.md §Judging each guard).

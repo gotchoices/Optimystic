@@ -48,6 +48,8 @@ import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { KeyRange, TransactionCoordinator } from '@optimystic/db-core';
+import type { ITransactor } from '@optimystic/db-core';
+import { MemoryRawStorage, StorageRepo } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import register from '../dist/plugin.js';
 import { QuereusEngine } from '../dist/index.js';
@@ -576,4 +578,61 @@ describe('Staging-refactor unit gaps (Tree.restore no-op + bridge collection reg
 		}
 	});
 
+});
+
+describe('Session-mode statement record', function () {
+	this.timeout(20000);
+
+	/** A `local` transactor over `storage`, so a second `Database` reads the first one's commits. */
+	function storageTransactor(storage: MemoryRawStorage): ITransactor {
+		const repo = new StorageRepo(storage);
+		return {
+			get: blockGets => repo.get(blockGets),
+			getStatus: () => { throw new Error('getStatus is not used here'); },
+			pend: request => repo.pend(request),
+			commit: request => repo.commit(request),
+			cancel: actionRef => repo.cancel(actionRef),
+		};
+	}
+
+	function databaseOver(transactor: ITransactor): { db: Database; plugin: Plugin } {
+		const db = new Database();
+		const plugin = register(db, { default_transactor: 'local', default_key_network: 'test', enable_cache: false });
+		plugin.collectionFactory.registerTransactor('local:test', transactor);
+		for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
+		for (const func of plugin.functions) db.registerFunction(func.schema);
+		return { db, plugin };
+	}
+
+	// The engine is asked for each row's statement before the vtab's update(), and when the table's
+	// first touch in this Database was a committed read, which registers no connection, it is that
+	// update() which joins the connection and so begins the bridge's transaction and its session.
+	it('records the row on which the table joins the transaction', async () => {
+		const transactor = storageTransactor(new MemoryRawStorage());
+		const writer = databaseOver(transactor);
+		await writer.db.exec(`create table Notes (id integer primary key, v text) using optimystic('tree://session-statements/notes')`);
+		await writer.db.exec(`insert into Notes (id, v) values (1, 'a')`);
+
+		const { db, plugin } = databaseOver(transactor);
+		await plugin.hydrate(db);
+		const coordinator = new TransactionCoordinator(transactor, plugin.txnBridge.getCollectionRegistry());
+		const engine = new QuereusEngine(db, coordinator);
+		try {
+			await engine.getSchemaHash();
+			plugin.txnBridge.configureTransactionMode(coordinator, engine, () => engine.getSchemaHash());
+			expect(await selectCount(db, 'select count(*) as c from committed.Notes')).to.equal(1);
+
+			await db.exec('begin');
+			await db.exec(`insert into Notes (id, v) values (2, 'b'), (3, 'c')`);
+			expect(plugin.txnBridge.getSession()!.getStatements()).to.deep.equal([
+				`insert into Notes (id, v) values (2, 'b')`,
+				`insert into Notes (id, v) values (3, 'c')`,
+			]);
+			await db.exec('rollback');
+		} finally {
+			engine.dispose();
+			await db.close();
+			await writer.db.close();
+		}
+	});
 });

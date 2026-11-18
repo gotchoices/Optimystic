@@ -579,6 +579,14 @@ already-evaluated row values after the DML executor runs each row (see
 `@quereus/quereus/src/util/mutation-statement.ts`, called from
 `@quereus/quereus/src/runtime/emit/dml-executor.ts`).
 
+The plugin asks the engine for that rebuild only while a session-mode transaction is open,
+or while none is and session mode is configured, since only a session replicates it
+(`TransactionBridge.recordsStatements` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/txn-bridge.ts`, read by the
+vtab's `wantStatements` before every row). A legacy-mode commit pends bare transforms, so
+its statements were never read, and building them spelled every blob out in hex, two
+characters per byte: about an eighth of the CPU of a commit of eight 256 KiB blobs.
+
 A function's arguments are evaluated and discarded before the rebuild. So a statement
 like:
 

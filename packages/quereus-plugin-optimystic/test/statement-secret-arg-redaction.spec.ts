@@ -14,6 +14,10 @@
  * record holds only the function's RESULT. The ONLY value that lands in the
  * record is one that becomes a persisted COLUMN value.
  *
+ * The record is built only for a session-mode transaction (`TransactionBridge.recordsStatements`),
+ * which is the one that replicates it, so both tests run in session mode and read the session's own
+ * record.
+ *
  * The first test uses an inline `probe_sign(data, secret)` function (a stand-in
  * for the crypto plugin's real `sign()`, kept hermetic so this suite does not
  * depend on the crypto package being built first). The mechanism it exercises —
@@ -25,7 +29,9 @@
 import { expect } from 'chai';
 import { Database, FunctionFlags, TEXT_TYPE } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
+import { TransactionCoordinator } from '@optimystic/db-core';
 import registerOptimystic from '../dist/plugin.js';
+import { QuereusEngine } from '../dist/index.js';
 
 const SECRET = 'THIS-IS-A-SECRET-KEY-abcdef0123456789';
 
@@ -59,6 +65,33 @@ function createEnv() {
 	return { db, optimystic };
 }
 
+/** Wires session mode once the table exists, as session-mode-commit.spec.ts does: a coordinator over the
+ * bridge's own collection registry, and the engine's schema hash warmed outside any statement. */
+async function enableSessionMode(db: Database, optimystic: ReturnType<typeof registerOptimystic>): Promise<QuereusEngine> {
+	const transactor = await optimystic.collectionFactory.getOrCreateTransactor({
+		collectionUri: 'tree://unused',
+		transactor: 'test',
+		keyNetwork: 'test',
+		libp2pOptions: {},
+		cache: false,
+		encoding: 'json',
+	});
+	const coordinator = new TransactionCoordinator(transactor, optimystic.txnBridge.getCollectionRegistry());
+	const engine = new QuereusEngine(db, coordinator);
+	await engine.getSchemaHash();
+	optimystic.txnBridge.configureTransactionMode(coordinator, engine, () => engine.getSchemaHash());
+	return engine;
+}
+
+/** The statements the session records for `insert`, run in a transaction that is then rolled back. */
+async function recordedStatements(db: Database, optimystic: ReturnType<typeof registerOptimystic>, insert: string): Promise<readonly string[]> {
+	await db.exec('BEGIN');
+	await db.exec(insert);
+	const statements = [...optimystic.txnBridge.getSession()!.getStatements()];
+	await db.exec('ROLLBACK');
+	return statements;
+}
+
 describe('replicated statement record: secret function-argument redaction', () => {
 	it('a secret passed as a function ARGUMENT does not reach the recorded statement', async () => {
 		const { db, optimystic } = createEnv();
@@ -70,13 +103,11 @@ describe('replicated statement record: secret function-argument redaction', () =
 			) USING optimystic('tree://test/signatures')
 		`);
 
-		// Inspect the accumulated statement BEFORE commit clears it.
-		await db.exec('BEGIN');
-		await db.exec(
+		const engine = await enableSessionMode(db, optimystic);
+		const statements = await recordedStatements(db, optimystic,
 			`INSERT INTO signatures (id, sig) VALUES (1, probe_sign('hello', '${SECRET}'))`
 		);
-		const statements = optimystic.txnBridge.getStatements();
-		await db.exec('ROLLBACK');
+		engine.dispose();
 
 		expect(statements.length, 'a statement should be recorded').to.be.greaterThan(0);
 		const joined = statements.join('\n');
@@ -94,10 +125,9 @@ describe('replicated statement record: secret function-argument redaction', () =
 			) USING optimystic('tree://test/keys')
 		`);
 
-		await db.exec('BEGIN');
-		await db.exec(`INSERT INTO keys (id, priv) VALUES (1, '${SECRET}')`);
-		const statements = optimystic.txnBridge.getStatements();
-		await db.exec('ROLLBACK');
+		const engine = await enableSessionMode(db, optimystic);
+		const statements = await recordedStatements(db, optimystic, `INSERT INTO keys (id, priv) VALUES (1, '${SECRET}')`);
+		engine.dispose();
 
 		// EXPECTED to contain the secret: any persisted column value is replicated,
 		// independent of literal-vs-bound. This pins the true exposure boundary so a

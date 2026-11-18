@@ -1857,8 +1857,26 @@ export class TransactionBridge {
   }
 
   /**
+   * Whether the engine should build a statement for each row a write touches: only a session-mode
+   * transaction reads them, as the replicated record a validating member re-executes. Building one
+   * spells every blob out in hex, so a transaction that will not read it asks for none. Read by the
+   * vtab's `wantStatements` before every row.
+   *
+   * While no transaction is open, the answer is the mode the next one will begin in: a row can reach
+   * `update()` before the bridge's transaction has begun, when it is that call's
+   * `ensureConnectionRegistered` that joins the table's connection to the engine's transaction (a
+   * table whose first touch this `Database` was a committed read registers no connection), and the
+   * session that begin creates must still record that row. A transaction already open keeps the mode
+   * it began in, so one open when session mode is configured records nothing.
+   */
+  recordsStatements(): boolean {
+    return this.currentTransaction?.isActive ? this.session !== null : this.isTransactionModeEnabled();
+  }
+
+  /**
    * Add a SQL statement to the accumulated statements for the current transaction.
-   * Statements are only accumulated when a transaction is active.
+   * Statements are only accumulated when a transaction is active, and are built only when
+   * {@link recordsStatements} says so — in legacy mode none arrive.
    *
    * In transaction mode, this also forwards the statement to the TransactionSession
    * for distributed consensus tracking. This MUST be awaited: `session.execute`

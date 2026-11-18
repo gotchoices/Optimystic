@@ -3,8 +3,8 @@
  * (`QuereusEngine.laneCeiling` over `replicatedCeilingOf`; docs/transactions.md §What a member
  * verifies). A member never sees the statement the writer ran: it sees Quereus's rebuild of each
  * row's write, and a rebuilt UPDATE assigns every column, the key included. So every case captures
- * the real rebuild through the bridge (as the session would record it) rather than hand-writing one,
- * and checks the property the member's rule exists to keep — a writer whose lane is `convergent` is
+ * the real rebuild as a session-mode transaction records it (the only mode the engine builds one in)
+ * rather than hand-writing one, and checks the property the member's rule exists to keep — a writer whose lane is `convergent` is
  * never answered `serializable` — beside the answer itself.
  */
 
@@ -15,8 +15,8 @@ import {
 	createTransactionId,
 	createTransactionStamp,
 	type Lane,
-	type Transaction,
-	type TransactionCoordinator
+	TransactionCoordinator,
+	type Transaction
 } from '@optimystic/db-core';
 import { QuereusEngine, QUEREUS_ENGINE_ID, createQuereusStatement } from '../dist/index.js';
 import register from '../dist/plugin.js';
@@ -46,8 +46,16 @@ describe('lane: the ceiling a member computes from replicated statements', () =>
 			insert into plain (Id, Title) values ('k', 'a');
 			insert into audited (Id, Title) values ('k', 'a');
 		`);
-		// The engine reads only the catalog; the coordinator it is built with is never touched here.
-		engine = new QuereusEngine(db, {} as TransactionCoordinator);
+		// One engine plays both parts: the writer's, committing in session mode so the statements are
+		// built, and the member's, whose `laneCeiling` reads only the catalog. Its schema hash is warmed
+		// outside any statement, as a session-mode host must.
+		const transactor = await plugin.collectionFactory.getOrCreateTransactor({
+			collectionUri: 'tree://unused', transactor: 'test', keyNetwork: 'test', libp2pOptions: {}, cache: false, encoding: 'json'
+		});
+		const coordinator = new TransactionCoordinator(transactor, plugin.txnBridge.getCollectionRegistry());
+		engine = new QuereusEngine(db, coordinator);
+		await engine.getSchemaHash();
+		plugin.txnBridge.configureTransactionMode(coordinator, engine, () => engine.getSchemaHash());
 	});
 
 	after(async () => {
@@ -55,12 +63,12 @@ describe('lane: the ceiling a member computes from replicated statements', () =>
 		await db.close();
 	});
 
-	/** `sql` run in a transaction that is then rolled back, as the member receives it: the bridge's
+	/** `sql` run in a transaction that is then rolled back, as the member receives it: the session's
 	 * rebuilt statements, claiming `convergent`. */
 	async function replicated(sql: string): Promise<Transaction> {
 		await db.exec('begin');
 		await db.exec(sql);
-		const statements = plugin.txnBridge.getStatements().map(statement => createQuereusStatement(statement));
+		const statements = plugin.txnBridge.getSession()!.getStatements().map(statement => createQuereusStatement(statement));
 		await db.exec('rollback');
 		expect(statements, `the rebuild of ${sql}`).to.not.be.empty;
 		const stamp = await createTransactionStamp('writer', Date.now(), 'schema', QUEREUS_ENGINE_ID);

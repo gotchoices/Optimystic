@@ -592,20 +592,17 @@ describe('TransactionBridge (TEST-7.3.1)', () => {
 	});
 
 	describe('statement accumulation', () => {
-		it('should accumulate statements during active transaction', async () => {
-			const { plugin } = createTestEnv();
+		it('records no statement for a legacy-mode transaction\'s writes, since nothing reads them', async () => {
+			const { db, plugin } = createTestEnv();
 			const bridge = plugin.txnBridge;
+			await db.exec(`create table users (id integer primary key, name text) using optimystic('tree://test/legacy-statements')`);
 
-			await bridge.beginTransaction(defaultOptions);
-
-			await bridge.addStatement('INSERT INTO users VALUES (1, "Alice")');
-			await bridge.addStatement('INSERT INTO users VALUES (2, "Bob")');
-
-			expect(bridge.getStatements()).to.deep.equal([
-				'INSERT INTO users VALUES (1, "Alice")',
-				'INSERT INTO users VALUES (2, "Bob")',
-			]);
-			expect(bridge.getStatementCount()).to.equal(2);
+			await db.exec('begin');
+			await db.exec(`insert into users (id, name) values (1, 'Alice'), (2, 'Bob')`);
+			await db.exec(`update users set name = 'Carol' where id = 2`);
+			expect(bridge.recordsStatements(), 'the engine is asked for no statement').to.be.false;
+			expect(bridge.getStatementCount()).to.equal(0);
+			await db.exec('commit');
 		});
 
 		it('should NOT accumulate statements outside a transaction', async () => {
