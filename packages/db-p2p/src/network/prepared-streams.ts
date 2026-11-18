@@ -54,6 +54,8 @@
  * than one request was considered and declined (GitHub #40); libp2p/js-libp2p#3692 fixes it upstream
  * by merging each protocol once per connection, and until a libp2p release carries it
  * `protocol-merge-throttle.ts` lets one such merge per peer and protocol reach the store per minute.
+ * For the repo and cluster protocols the merge never reaches the store: `storage-claim-filter.ts`
+ * drops it and reads the record instead.
  * An unchanged merge emits no `peer:update`, so it does not invalidate the key network's cached
  * records (`peer-record-cache.ts`).
  *

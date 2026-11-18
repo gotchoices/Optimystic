@@ -1,7 +1,8 @@
 /**
- * The libp2p-level premise behind `src/network/protocol-merge-throttle.ts`, pinned as an executable
- * fact: libp2p merges a stream's protocol into the remote peer's peerStore record on EVERY stream, on
- * both ends, through `peerStore.merge(remotePeer, { protocols: [protocol] })`.
+ * The libp2p-level premise behind `src/network/protocol-merge-throttle.ts` and
+ * `src/network/storage-claim-filter.ts`, pinned as an executable fact: libp2p merges a stream's
+ * protocol into the remote peer's peerStore record on EVERY stream, on both ends, through
+ * `peerStore.merge(remotePeer, { protocols: [protocol] })`.
  *
  * Two plain libp2p nodes over loopback TCP open two streams of one protocol, with each node's
  * `peerStore.merge` wrapped to record what it is called with. No throttle is installed.
@@ -11,8 +12,12 @@
  *   each protocol once per connection, has landed. Delete `protocol-merge-throttle.ts` and its
  *   installation in `createLibp2pNodeBase`, then this spec.
  * - **The merges are not in the shape `isProtocolOnlyMerge` matches, or go somewhere other than
- *   `peerStore.merge`**: libp2p moved the call, so the throttle no longer intercepts it and the
- *   per-stream cost is back. Re-aim the throttle at the new call, or delete it if the cost went with it.
+ *   `peerStore.merge`**: libp2p moved the call, so neither wrapper intercepts it. The per-stream cost
+ *   is back, and a peer that only sends this node storage requests is recorded as serving storage
+ *   again. Re-aim both at the new call; delete the throttle if the cost went with it, but not the
+ *   storage-claim filter unless libp2p stopped recording a dialer's protocols on the receiving end.
+ *
+ * When the throttle is deleted, keep this spec's shape assertion for the storage-claim filter.
  *
  * The counterpart for third-party address learning is `relay-third-party-address-gap.spec.ts`.
  */
@@ -24,7 +29,7 @@ import { yamux } from '@chainsafe/libp2p-yamux';
 import type { PeerData } from '@libp2p/interface';
 import { openProtocolStream } from '../src/network/open-protocol-stream.js';
 import { registerProtocolHandler } from '../src/network/register-protocol-handler.js';
-import { isProtocolOnlyMerge } from '../src/network/protocol-merge-throttle.js';
+import { isProtocolOnlyMerge } from '../src/network/storage-claim-filter.js';
 
 const PROTOCOL = '/optimystic-test/merge-per-stream/1.0.0';
 const STREAMS = 2;
@@ -73,7 +78,7 @@ describe('libp2p merges a stream\'s protocol into the peerStore on every stream'
 		await listener?.stop();
 	});
 
-	it('once per stream on each end, in the shape the throttle intercepts', async () => {
+	it('once per stream on each end, in the shape the throttle and the storage-claim filter intercept', async () => {
 		let handled = 0;
 		await registerProtocolHandler(listener, PROTOCOL, async stream => {
 			handled++;
@@ -93,7 +98,7 @@ describe('libp2p merges a stream\'s protocol into the peerStore on every stream'
 		expect(dialerMerges, 'dialer: one merge per stream').to.have.length(STREAMS);
 		expect(listenerMerges, 'listener: one merge per stream').to.have.length(STREAMS);
 		for (const data of [...dialerMerges, ...listenerMerges]) {
-			expect(isProtocolOnlyMerge(data), `throttle predicate matches ${JSON.stringify(data)}`).to.equal(true);
+			expect(isProtocolOnlyMerge(data), `merge-shape predicate matches ${JSON.stringify(data)}`).to.equal(true);
 		}
 	});
 });

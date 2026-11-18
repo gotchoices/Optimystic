@@ -14,6 +14,7 @@ import type { BootstrapContact } from './network/bootstrap-contact.js'
 import { admittedBy, type NetworkMembershipGate } from './network-membership-gate.js'
 import { PeerRecordCache, readPeerStoreRecord, type PeerStoreRecord } from './network/peer-record-cache.js'
 import { ConnectionRuns } from './network/connection-runs.js'
+import { storageServingProtocols } from './network/storage-protocols.js'
 
 interface WithFretService { services?: { fret?: FretService } }
 
@@ -377,6 +378,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		this.setupSelfAddressTracking();
 		this.peerRecords = new PeerRecordCache(this.libp2p, { log: this.log });
 		this.connectionRuns = new ConnectionRuns(this.libp2p);
+		// Empty on the unscoped path, which classifies nobody and so never asks.
+		this.storageProtocols = protocolPrefix == null ? [] : storageServingProtocols(protocolPrefix);
 	}
 
 	/**
@@ -426,6 +429,8 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	private readonly peerRecords: PeerRecordCache
 	/** The connection run each connected peer is on, for {@link connectedCohort}. */
 	private readonly connectionRuns: ConnectionRuns
+	/** This network's storage protocols ({@link servesThisNetwork}), named once by `storageServingProtocols`. */
+	private readonly storageProtocols: readonly string[]
 
 	private toCacheKey(key: Uint8Array): string { return u8ToString(key, 'base64url') }
 
@@ -1416,8 +1421,7 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * or `repo` protocol? The one test behind every membership verdict, self's included.
 	 */
 	private servesThisNetwork(protocols: readonly string[]): boolean {
-		return protocols.includes(`${this.protocolPrefix}/cluster/1.0.0`)
-			|| protocols.includes(`${this.protocolPrefix}/repo/1.0.0`)
+		return this.storageProtocols.some(protocol => protocols.includes(protocol))
 	}
 
 	/**
@@ -1478,7 +1482,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * re-admitted peer reads correctly on its next lookup.
 	 *
 	 * NOTE: a non-empty list is not necessarily identify's list. libp2p adds every protocol a
-	 * stream negotiates with a peer, in either direction, to that peer's list, so between a
+	 * stream negotiates with a peer, in either direction, to that peer's list (except this network's
+	 * storage protocols, which `filterStorageClaimMerges` in `network/storage-claim-filter.ts` keeps
+	 * out, so a peer that only sends this node requests never reads `serves`), so between a
 	 * connection opening and identify landing a peer of this network can show a partial list and
 	 * read `foreign` here. The next reading corrects it, and the cost is one cohort assembly that
 	 * leaves the peer out. Anything that must not act on that moment reads identify's outcome
@@ -1489,16 +1495,16 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 *
 	 * NOTE: what neither covers is an identify that FAILS (a timeout, a reset) on a peer of this
 	 * network whose list stayed partial: it then reads `foreign`, sits in FRET's band where
-	 * {@link absentCohortMembers} does not look, and the gate reads this node alone. If a fork is ever
-	 * traced to an `identify:failed` line, treat a band member whose latest identify failed as
-	 * not-alone.
+	 * {@link absentCohortMembers} does not look, and the gate reads this node alone. Storage streams
+	 * exchanged with it do not rescue it into `serves`: only identify writes the storage protocols.
+	 * If a fork is ever traced to an `identify:failed` line, treat a band member whose latest identify
+	 * failed as not-alone.
 	 */
 	private membershipOf(idStr: string, protocols: readonly string[] | undefined): NetworkMembership {
 		if (this.protocolPrefix == null) return 'serves'
 		if (idStr === this.libp2p.peerId.toString()) return this.selfServes() ? 'serves' : 'foreign'
 		// Both the protocol list and the remembered verdict below can be put there by any peer that
-		// opens a stream or advertises this network's protocols; overruling them is the predicate's
-		// whole purpose.
+		// advertises this network's protocols; overruling them is the predicate's whole purpose.
 		if (this.refusedMembership(idStr)) return 'foreign'
 		if (protocols == null || protocols.length === 0) {
 			// NOTE: accepted tradeoff — a remembered peer that never comes back keeps this node's
@@ -1575,13 +1581,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * that its predicate permanently refuses can neither create a collection nor read a block it
 	 * lacks, since every such absence is flagged `'cohort-unreachable'`. The remedy is to take that
 	 * peer out of the bootstrap configuration, or admit it; ruling absence on a view the predicate
-	 * emptied is the failure this rule exists to prevent.
-	 *
-	 * NOTE: the list read here is the peerStore's, which a refused bootstrap peer can also fill by
-	 * opening a stream on this network's `cluster` protocol, holding this node in the state above
-	 * for as long as it does so. Only configured bootstrap peers are read, so that takes a hostile
-	 * peer the operator chose to join through; if one is ever seen doing it, judge on identify's
-	 * own list (captured in `identifyOnConnectionOpen`) rather than the peerStore's.
+	 * emptied is the failure this rule exists to prevent. A peer's list names those protocols only
+	 * when its own identify advertised them: a stream on one does not write them
+	 * (`filterStorageClaimMerges` in `network/storage-claim-filter.ts`).
 	 */
 	private heardFromBootstrapPeer(idStr: string, protocols: readonly string[] | undefined): boolean {
 		const answer = this.bootstrap?.contact.answerOf(idStr)

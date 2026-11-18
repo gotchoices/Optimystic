@@ -4,11 +4,10 @@
  *
  * Without it, a node decides that a remote peer serves its network from the peer's libp2p
  * peerStore protocol list, and any connected peer can put this network's protocols into that list
- * — by opening a stream on one (libp2p records the negotiated protocol before the handler lookup,
- * so even a stream `authorizeInboundStream` then resets has already written it) or by advertising
- * them through identify. An application whose membership is decided elsewhere (an enrollment
- * record, an invitation) supplies this predicate so a stranger cannot be chosen as a cohort member
- * or coordinator. `docs/internals.md` § Network Membership Predicate has the full account.
+ * by advertising them through identify. (Opening a stream on one does not: the storage-claim filter,
+ * `network/storage-claim-filter.ts`, drops the merge libp2p makes for it.) An application whose
+ * membership is decided elsewhere (an enrollment record, an invitation) supplies this predicate so
+ * a stranger cannot be chosen as a cohort member or coordinator. `docs/internals.md` § Network Membership Predicate has the full account.
  *
  * Contract:
  *

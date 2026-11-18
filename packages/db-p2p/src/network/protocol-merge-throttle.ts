@@ -20,15 +20,17 @@
  * staler than it was, far inside the 6 h.
  *
  * Behaviour change: a protocol that identify removes from a record within the interval is put back by
- * a later stream up to one interval later instead of at once. That re-add is also the path by which a
- * stranger puts this network's protocols into its own record (docs/internals.md §Network Membership
- * Predicate), so delaying it loses nothing.
+ * a later stream up to one interval later instead of at once. This network's `repo` and `cluster`
+ * protocols are never put back by a stream at all: the storage-claim filter installed outside this
+ * wrapper drops those merges (`network/storage-claim-filter.ts`), and stays when this module goes.
  *
  * Remove on upgrade. libp2p/js-libp2p#3692 merges each protocol once per connection and keeps
  * `updated` fresh from the connection itself. On the libp2p release that carries it,
  * `test/libp2p-merges-protocol-per-stream.spec.ts` fails, which is the signal to delete this module
  * and its installation in `createLibp2pNodeBase`. The same spec fails if libp2p stops making this
- * call through `peerStore.merge` in this shape, which would otherwise bypass the throttle silently.
+ * call through `peerStore.merge` in this shape ({@link isProtocolOnlyMerge}, which lives with the
+ * storage-claim filter because that filter outlives this module), which would otherwise bypass the
+ * throttle silently.
  *
  * Imports here are type-only or pure: `libp2p-node-base.ts` is reachable from the react-native entry.
  */
@@ -36,6 +38,7 @@
 import type { AbortOptions, Peer, PeerData, PeerId, PeerStore } from '@libp2p/interface';
 import { LruMap } from '@optimystic/db-core';
 import { createLogger } from '../logger.js';
+import { isProtocolOnlyMerge } from './storage-claim-filter.js';
 
 const log = createLogger('protocol-merge-throttle');
 
@@ -44,21 +47,6 @@ export const PROTOCOL_MERGE_INTERVAL_MS = 60_000;
 
 /** How many peers' merge times are remembered; a forgotten peer's next merge reaches the store. */
 export const PROTOCOL_MERGE_TRACKED_PEERS = 256;
-
-/** The data libp2p's per-stream merge passes: one key, `protocols`, naming one protocol. */
-export interface ProtocolOnlyMerge extends PeerData {
-	protocols: [string];
-}
-
-/**
- * Whether `data` is the per-stream merge's shape. Every other merge (identify's, the dial queue's,
- * circuit relay's, `peer-address-book.ts`'s address merges) carries other keys or more protocols and
- * goes straight through.
- */
-export function isProtocolOnlyMerge(data: PeerData): data is ProtocolOnlyMerge {
-	const keys = Object.keys(data);
-	return keys.length === 1 && keys[0] === 'protocols' && data.protocols?.length === 1 && typeof data.protocols[0] === 'string';
-}
 
 export interface ProtocolMergeThrottleOptions {
 	/** Default {@link PROTOCOL_MERGE_INTERVAL_MS}. */

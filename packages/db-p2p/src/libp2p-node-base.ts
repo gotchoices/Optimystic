@@ -47,6 +47,8 @@ import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstr
 import { combineIdentifyObservers, identifyOnConnectionOpen, type IdentifyOnOpenHost } from './network/identify-on-open.js';
 import { IdentifyProgress } from './network/identify-progress.js';
 import { throttleProtocolMerges } from './network/protocol-merge-throttle.js';
+import { filterStorageClaimMerges } from './network/storage-claim-filter.js';
+import { storageServingProtocols } from './network/storage-protocols.js';
 import { KeyNetworkCohortReachability } from './network/cohort-reachability.js';
 import { holePunchingWanted } from './network/hole-punching.js';
 import type { SpreadOnChurnConfig, SpreadOnChurnMonitor } from './cluster/spread-on-churn.js';
@@ -512,15 +514,16 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * Optional predicate answering "is this peer a member of this node's network?", consulted
 	 * wherever this node chooses peers to hold or coordinate its writes. Without it, a peer counts
 	 * as serving this network when its peerStore protocol list names this network's `cluster` or
-	 * `repo` protocol — a list any connected peer can fill, by opening a stream on one of them
-	 * (even a stream {@link NodeOptions.authorizeInboundStream} then refuses) or by advertising
-	 * them. Supplied, a remote peer it refuses is never a cohort member and never a coordinator,
-	 * whatever its protocol list says.
+	 * `repo` protocol — a list any connected peer can fill by advertising them in its own identify.
+	 * (A stream on one does not write them: `network/storage-claim-filter.ts`.) Supplied, a remote
+	 * peer it refuses is never a cohort member and never a coordinator, whatever its protocol list
+	 * says.
 	 *
 	 * A separate option from {@link NodeOptions.authorizeInboundStream}, which answers who may SEND
 	 * to this node; this one answers who this node sends TO. An embedder whose database is private
-	 * needs both: with only the authorization predicate, any peer that opens a stream can still be
-	 * chosen as a cohort member and sent every write to the blocks it lands near.
+	 * needs both: with only the authorization predicate, any connected peer that advertises this
+	 * network's storage protocols can still be chosen as a cohort member and sent every write to
+	 * the blocks it lands near.
 	 *
 	 * Synchronous — it runs inside every cohort assembly's per-peer loop, so keep it an in-memory
 	 * lookup. Fail closed: only a literal `true` admits; a throw or a non-boolean refuses, logged.
@@ -855,8 +858,7 @@ function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collec
  */
 function preparedStreamProtocols(protocolPrefix: string): string[] {
 	return [
-		`${protocolPrefix}/repo/1.0.0`,
-		`${protocolPrefix}/cluster/1.0.0`,
+		...storageServingProtocols(protocolPrefix),
 		buildSyncProtocol(protocolPrefix),
 		buildBlockTransferProtocol(protocolPrefix)
 	];
@@ -1342,10 +1344,20 @@ export async function createLibp2pNodeBase(
 	// while one is in flight may be about to widen, which the cohort reachability gate reads.
 	const identifyProgress = new IdentifyProgress();
 	identifyOnConnectionOpen(node as unknown as IdentifyOnOpenHost, combineIdentifyObservers(bootstrapContact, identifyProgress));
+	// Network-namespaced protocol prefix, threaded into the key network so coordinator/
+	// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
+	// A peer that only belongs to another network sharing the same physical nodes/
+	// bootstraps registers a different (network-namespaced) identify protocol, so it is
+	// never selected and can't drag this network's super-majority below quorum.
+	const protocolPrefix = `/optimystic/${options.networkName}`;
 	// libp2p merges a stream's protocol into the remote peer's record on every stream, both ends, at a
 	// cost that showed up on phones (GitHub #40). Until libp2p/js-libp2p#3692 ships, cap that at once a
 	// minute per peer and protocol; the module says when to delete this.
 	throttleProtocolMerges(node.peerStore, node.peerId);
+	// The same merge would record a peer that merely sends this node a storage request as serving
+	// storage; only the peer's own identify may say that. Installed outside the throttle, so a dropped
+	// merge never reaches its bookkeeping, and kept when the throttle goes.
+	filterStorageClaimMerges(node.peerStore, node.peerId, protocolPrefix);
 
 	// A relay-naming listen address with no circuit-relay transport can never be reserved on. Checked
 	// here, before start(), so the caller sees the omission by name rather than libp2p's generic
@@ -1393,12 +1405,6 @@ export async function createLibp2pNodeBase(
 		const bootstrap: BootstrapContactOptions | undefined = bootstrapContact.peerIds.length > 0
 			? { contact: bootstrapContact, contactTimeoutMs: bootstrapContactTimeoutMs }
 			: undefined;
-		// Network-namespaced protocol prefix, threaded into the key network so coordinator/
-		// cohort selection is scoped to peers that serve THIS network's cluster/repo protocol.
-		// A peer that only belongs to another network sharing the same physical nodes/
-		// bootstraps registers a different (network-namespaced) identify protocol, so it is
-		// never selected and can't drag this network's super-majority below quorum.
-		const protocolPrefix = `/optimystic/${options.networkName}`;
 		// Built once, here, and handed to every peer-selection path that must obey it (`undefined`
 		// without a predicate, which every consumer skips): the key network, and the four senders that
 		// take peers from FRET directly — spread-on-churn, the ring-shift confirm, restoration and the
