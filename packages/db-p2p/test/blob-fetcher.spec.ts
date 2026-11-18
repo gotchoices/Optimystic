@@ -9,7 +9,7 @@ import { randomBytes } from 'node:crypto';
 import { expect } from 'chai';
 import { multiaddr } from '@multiformats/multiaddr';
 import { peerIdFromString } from '@libp2p/peer-id';
-import { BlobUnavailableError, readBlob, walkBlobPieces, type BlobRef, type PieceId } from '@optimystic/db-core';
+import { BlobUnavailableError, readBlob, rootPieceId, walkBlobPieces, type BlobRef, type PieceId } from '@optimystic/db-core';
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
@@ -173,6 +173,35 @@ describe('blob fetcher', function () {
 		const readBack = await concat(readBlob(ref, { get: id => bPieces.get(id) }));
 		expect(Buffer.compare(readBack, content)).to.equal(0);
 		expect(penalties).to.deep.equal([{ peer: a.peerId.toString(), reason: PenaltyReason.InvalidRestoration }]);
+	});
+
+	it('requests each piece once when two sessions fetch one blob at once', async () => {
+		const aPieces = new ServingPieceStore();
+		const cPieces = new ServingPieceStore();
+		const bPieces = new MemoryPieceStore();
+		const { a, b, c } = await startMesh({ a: aPieces, b: bPieces, c: cPieces });
+		const content = randomBytes(3 * PIECE + 1000);
+		const { ref } = await a.blobs.put(streamOf(content));
+		await c.blobs.put(streamOf(content));
+		const data = await dataPiecesOf(ref, aPieces.inner);
+		const [aId, cId] = [a.peerId.toString(), c.peerId.toString()];
+
+		const { fetcher, stored } = fetcherOnB(b);
+		try {
+			// Each session asks a different holder first, so both reach the batch choice at once.
+			await Promise.all([
+				fetcher.start(ref, { priority: 'foreground', knownHolders: [aId, cId] }).done,
+				fetcher.start(ref, { priority: 'background', knownHolders: [cId, aId] }).done,
+			]);
+		} finally {
+			await fetcher.stop();
+		}
+
+		// The list piece is left out of the serving counts: each holder's start-up sweep reads it too.
+		expect(data.map(id => (aPieces.gets.get(id) ?? 0) + (cPieces.gets.get(id) ?? 0))).to.deep.equal(data.map(() => 1));
+		expect(stored.map(event => event.id).sort()).to.deep.equal([rootPieceId(ref), ...data].sort());
+		const readBack = await concat(readBlob(ref, { get: id => bPieces.get(id) }));
+		expect(Buffer.compare(readBack, content)).to.equal(0);
 	});
 
 	it('keeps what an interrupted fetch stored and asks only for the rest', async () => {

@@ -202,7 +202,7 @@ One new protocol, `<prefix>/db-p2p/blob/1.0.0` (`buildBlobProtocol` in `packages
 | some wrong, every other one not held | `BlobCorruptError`, `digest-mismatch` |
 | every one not held | `BlobUnavailableError`, `not-held` |
 
-**Resumption** follows from the pieces: each one is verified and stored as it arrives, so a fetch that is interrupted asks only for what is still missing, from the same peer or another. A session that fails or is cancelled keeps its hold and every piece it stored, and the next session plans against them. `packages/db-p2p/test/blob-fetcher.spec.ts` pins resumption and the penalty for a wrong piece.
+**Resumption** follows from the pieces: each one is verified and stored as it arrives, so a fetch that is interrupted asks only for what is still missing, from the same peer or another. A session that fails or is cancelled keeps its hold and every piece it stored, and the next session plans against them. `packages/db-p2p/test/blob-fetcher.spec.ts` pins resumption, the penalty for a wrong piece, and one request per piece for two sessions fetching one blob at once.
 
 **One request per piece.** A fetcher's sessions share one record of the pieces in flight (`PieceTraffic` in `packages/db-p2p/src/blob/blob-piece-traffic.ts`). A piece another session is fetching is awaited, not asked for again, and is asked for when that attempt ends without it, so two reads of one blob request each piece once. A session chooses its pieces only once it holds a stream (below), so a session waiting for a stream holds up no other session's pieces. A request already sent finishes even when its session is cancelled, since another session may be waiting on its pieces and what it stores is kept; only stopping the node aborts it.
 

@@ -198,7 +198,9 @@ export class FetchSession implements BlobFetchSession {
 		let stored: PieceId[] = [];
 		try {
 			this.checkAborted();
-			const batch = await this.batchFor(round, peer);
+			// Filtered again with no await before `fetchBatch` claims it: another session may have claimed
+			// one of these pieces while `batchFor` checked which are here.
+			const batch = (await this.batchFor(round, peer)).filter(id => !this.ctx.traffic.isInFlight(id));
 			if (batch.length > 0) {
 				stored = await this.fetchBatch(round, peer, batch);
 			}
@@ -209,9 +211,10 @@ export class FetchSession implements BlobFetchSession {
 	}
 
 	/**
-	 * Frontier pieces, in tree order, that `peer` has not answered and no session has in flight, up to
-	 * one request. Pieces that arrived while this session waited for the slot (another session's batch
-	 * ended in that time) are dropped rather than requested again.
+	 * Frontier pieces, in tree order, that `peer` has not answered and no session had in flight when the
+	 * choice began, up to one request. Pieces that arrived while this session waited for the slot
+	 * (another session's batch ended in that time) are dropped rather than requested again. The caller
+	 * drops what was claimed during the presence check.
 	 */
 	private async batchFor(round: Round, peer: string): Promise<PieceId[]> {
 		const wanted: PieceId[] = [];
