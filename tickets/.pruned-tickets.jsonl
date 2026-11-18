@@ -343,3 +343,4 @@
 {"slug":"allow-downsize-docs-match-the-lone-write-path","file":"5-allow-downsize-docs-match-the-lone-write-path.md","completedAt":"2026-10-15","commit":"ed3a1a6f4f5a5f32cc3ee7b9c42670fabfad67f4","prunedAt":"2026-11-17T18:48:39.689Z"}
 {"slug":"debt-require-the-fret-release-that-takes-a-dial-budget","file":"debt-require-the-fret-release-that-takes-a-dial-budget.md","completedAt":"2026-10-15","commit":"5ed8e4abef7585660c4fdafc94cef9787b5eb4c4","prunedAt":"2026-11-17T18:48:39.689Z"}
 {"slug":"ping-handler-timeout-below-the-monitor-deadline","file":"ping-handler-timeout-below-the-monitor-deadline.md","completedAt":"2026-10-17","commit":"5e982a85dd761c6263086f442282f55c1d328869","prunedAt":"2026-11-17T18:48:39.689Z"}
+{"slug":"quereus-apply-schema-creates-indexes-before-added-columns","file":"quereus-apply-schema-creates-indexes-before-added-columns.md","completedAt":"2026-10-19","commit":"af053cfa3cd718a0e9c540629abbf13d780901e9","prunedAt":"2026-11-18T14:38:45.019Z"}
