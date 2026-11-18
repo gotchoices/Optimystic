@@ -999,8 +999,11 @@ export class TransactionBridge {
    * dropped (`judgeTableDescriptions` in table-description-check.ts): one fresh catalog read for all
    * of them, before any route sends anything. A route of the offline queue (`route` set) leaves its
    * tables unchecked when the catalog cannot be reached, since such a transaction is acknowledged
-   * without the cohort; every other commit fails with the read's error, as it would at its first
-   * network step.
+   * without the cohort; every other commit fails with the read's error.
+   *
+   * NOTE: the catalog's blocks have their own cohort, so a network commit now also needs the
+   * catalog's cohort reachable, not only its tables'. If writes are seen failing on an unreachable
+   * catalog while the tables' cohorts answer, skip the check there too, as the offline routes do.
    */
   private async staleDescriptions(route: OfflineRoute | undefined): Promise<StaleJudgement[]> {
     if (this.descriptionChecks.size === 0) {

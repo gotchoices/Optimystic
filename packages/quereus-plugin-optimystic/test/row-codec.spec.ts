@@ -77,6 +77,16 @@ describe('RowCodec', () => {
 		});
 	});
 
+	describe('encodeRow over a stored entry (an UPDATE)', () => {
+		it('carries over the values of columns this codec does not name, and rewrites those it does', () => {
+			// The stored row was written by a machine whose description has `y`; this one's does not.
+			const codec = new RowCodec(makeSchema([{ name: 'id', affinity: 'INTEGER' }, { name: 'a', affinity: 'INTEGER' }]));
+			const prior = JSON.stringify({ id: 1, a: 5, y: 'kept' });
+
+			expect(JSON.parse(codec.encodeRow([1, 9], prior) as string)).to.deep.equal({ id: 1, a: 9, y: 'kept' });
+		});
+	});
+
 	describe('bigint handling (HUNT-7.4.3 bug)', () => {
 		it('should encode small bigints without precision loss', () => {
 			const schema = makeSchema([{ name: 'id', affinity: 'INTEGER' }]);
