@@ -1191,6 +1191,14 @@ Semantics worth knowing:
   the memory driver already holds the same byte references, so the cache is
   pure bookkeeping overhead (tests do wrap it, to prove semantics match).
 
+### 7. Blob pieces and records
+
+A node keeps large values ("blobs") outside the block store, in two places: their pieces in an `IPieceStore` (`NodeOptions.pieceStorage`; `FilePieceStore` on a Node host, `MemoryPieceStore` by default), and one record per held blob in the node's key-value store (`NodeOptions.kvStore`, keys under `optimystic-blobs/`). `LocalBlobService` in `packages/db-p2p/src/blob/local-blob-service.ts` writes both and is the node's `node.blobs`, on a serving node and a client alike. The design, and what each store must promise, is [docs/blobs.md §The local store](../../../docs/blobs.md#the-local-store).
+
+A put keeps one ordering across the two stores: every piece is stored and the piece store flushed, and only then is the record naming the pieces written and the key-value store flushed. So a record that survives a crash never names a piece the crash lost, and pieces a crash left without a record are removed by the sweep the service runs after it starts. The piece store keeps no prefix rule of its own (pieces are independent), which is why the ordering is the caller's.
+
+The node never closes the piece store, as it never closes the block store or the key-value store it was handed: a host closes it after `stop()`. On a serving node, the Arachnode storage monitor counts its bytes toward the node's use, once (`blockStoreCountsPieces` in `packages/db-p2p/src/storage/storage-monitor.ts`).
+
 ## Data Structures
 
 ### Block Metadata

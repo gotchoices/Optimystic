@@ -24,6 +24,9 @@ import type { IKVStore } from './storage/i-kv-store.js';
 import { MemoryKVStore } from './storage/memory-kv-store.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
+import type { IPieceStore } from './blob/piece-store.js';
+import { MemoryPieceStore } from './blob/memory-piece-store.js';
+import { LocalBlobService } from './blob/local-blob-service.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -39,7 +42,7 @@ import { Libp2pKeyPeerNetwork, type BootstrapContactOptions, type NetworkStatePe
 import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticClientNode, OptimysticClientNodeAttachments, OptimysticNode, OptimysticNodeAttachments, OptimysticNodeAttachmentsBase } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier, BlobDigest } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations, type RelayReservationSupervisorOptions } from './network/relay-reservation.js';
@@ -189,6 +192,9 @@ export type RawStorageProvider = IRawStorage | (() => IRawStorage);
 /** Factory function or instance for the node's durable key-value store; see {@link NodeOptions.kvStore}. */
 export type KVStoreProvider = IKVStore | (() => IKVStore);
 
+/** Factory function or instance for the node's store of blob pieces; see {@link NodeOptions.pieceStorage}. */
+export type PieceStoreProvider = IPieceStore | (() => IPieceStore);
+
 /**
  * `ClusterPolicyOptions` is intersected in, not restated: `resolveClusterPolicy` consumes those
  * fields structurally, so a second copy of the shape here would let a newly added knob compile and
@@ -307,14 +313,32 @@ export type NodeOptions = ClusterPolicyOptions & {
 	/**
 	 * Durable key-value store for node-local state that must survive a restart — today, the
 	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
-	 * is still missing each) and the HLC clock's high-water mark (`hlc/high-water`). An instance or a
-	 * factory, the same shape as {@link NodeOptions.storage}.
-	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger and the clock still work,
-	 * but what they record is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
+	 * is still missing each), the HLC clock's high-water mark (`hlc/high-water`) and the blob records
+	 * (`optimystic-blobs/`, docs/blobs.md §The local store). An instance or a factory, the same shape
+	 * as {@link NodeOptions.storage}.
+	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger, the clock and the blob
+	 * records still work, but what they record is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
 	 * `FileRawStorage`'s base path; see its README. Like the raw storage, the node never closes it:
 	 * a host that supplies one closes it after `stop()`.
 	 */
 	kvStore?: KVStoreProvider;
+	/**
+	 * The store of blob pieces behind `node.blobs` (docs/blobs.md §The local store). An instance or a
+	 * factory, the same shape as {@link NodeOptions.kvStore}; a factory that throws fails node
+	 * construction. Used on a client too, which keeps the blobs its own host puts.
+	 * Absent → a `MemoryPieceStore`, with a `node-wiring` warning: pieces are lost on restart while
+	 * their records in {@link NodeOptions.kvStore} may survive, so such blobs then read as not here.
+	 * `FilePieceStore` from `@optimystic/db-p2p-storage-fs` shares `FileRawStorage`'s base path; see its
+	 * README. The node never closes it: a host that supplies one closes it after `stop()`.
+	 */
+	pieceStorage?: PieceStoreProvider;
+	/**
+	 * The blob service's settings. `digest` is the hashing port that names every piece (docs/blobs.md
+	 * §References and pieces), default `defaultBlobDigest()`. A supplied digest is used as given:
+	 * checking it against the known answers (`checkBlobDigest` in `@optimystic/db-core`) before handing
+	 * it over is the host's call.
+	 */
+	blobs?: { digest?: BlobDigest };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -851,9 +875,21 @@ function resolveKvStore(provider: KVStoreProvider | undefined, servesBlocks: boo
 		return typeof provider === 'function' ? provider() : provider;
 	}
 	wiringLog(servesBlocks
-		? 'WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent, and neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep both.'
-		: 'WARN: no kvStore supplied — using an in-memory store. The high-water mark of the HLC clock, the one thing a client keeps, will NOT survive a restart, so a client restarted with its wall clock behind can stamp new changes below ones it stamped before. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep it.');
+		? 'WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent; neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this node held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.'
+		: 'WARN: no kvStore supplied — using an in-memory store. The high-water mark of the HLC clock will NOT survive a restart, so a client restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this client held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.');
 	return new MemoryKVStore();
+}
+
+/**
+ * Resolve the node's store of blob pieces, beside {@link resolveKvStore}, on either role. The memory
+ * fallback is loud for the same reason: the blob records may be durable while the pieces are not.
+ */
+function resolvePieceStore(provider: PieceStoreProvider | undefined): IPieceStore {
+	if (provider !== undefined) {
+		return typeof provider === 'function' ? provider() : provider;
+	}
+	wiringLog('WARN: no pieceStorage supplied — using an in-memory piece store. Blob pieces this node stores will NOT survive a restart, while their records in the key-value store may, so such blobs then read as not here. Supply NodeOptions.pieceStorage (e.g. FilePieceStore) to keep them.');
+	return new MemoryPieceStore();
 }
 
 /**
@@ -1165,12 +1201,17 @@ export async function createLibp2pNodeBase(
 	if (!servesBlocks) logIgnoredServingOptions(options);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const kvStore = resolveKvStore(options.kvStore, servesBlocks);
+	// The node's blob service (`node.blobs`), on both roles: the machine a blob is put on holds its
+	// only copy until its reference commits, and a client is often that machine (docs/blobs.md §The
+	// node's blob service). Started once it is attached, below.
+	const pieceStore = resolvePieceStore(options.pieceStorage);
+	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
 
 	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 	// The node's one HLC clock (docs/crdt-sync.md §Migration Path, Stage 1), its mark loaded before
 	// anything can write: a serving node's storage repo raises it to every pend it stores, and a
 	// transactor a host builds over the node mints from it (`node.hlcClock`). Kept in `kvStore`, which
-	// on a client holds nothing else.
+	// on a client holds nothing else but the blob records.
 	const hlcClock = await HlcClock.start({
 		nodeId: peerIdFromPrivateKey(nodePrivateKey).toString(),
 		store: new KvHlcClockStore(kvStore),
@@ -1591,7 +1632,7 @@ export async function createLibp2pNodeBase(
 		const served = serving
 			? await wireServingRole({
 				node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager
+				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore
 			})
 			: undefined;
 
@@ -1615,6 +1656,7 @@ export async function createLibp2pNodeBase(
 			linkDeadlines,
 			cohortReachability,
 			hlcClock,
+			blobs,
 		};
 		const attachments: OptimysticNodeAttachments | OptimysticClientNodeAttachments = served
 			? {
@@ -1632,6 +1674,20 @@ export async function createLibp2pNodeBase(
 			}
 			: { ...shared, servesBlocks: false };
 		Object.assign(node, attachments);
+
+		// The start-up sweep removes the pieces of a put a crash interrupted. Its stop wrapper follows at
+		// once, so the rollback below stops the service too.
+		blobs.start();
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await blobs.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
 
 		// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
 		// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
@@ -2121,6 +2177,8 @@ interface ServingRoleContext {
 	onCommitCertificate: CommitCertificateSink | undefined;
 	membership: NetworkMembershipGate | undefined;
 	networkManager: NetworkManagerService | undefined;
+	/** The blob service's piece store, whose bytes the Arachnode storage monitor counts toward this node's use. */
+	pieceStore: IPieceStore;
 }
 
 /** What the rest of the factory reads back from the serving role. */
@@ -2144,7 +2202,7 @@ interface ServingRole {
 async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	const {
 		node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager
+		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore
 	} = ctx;
 	const { storageRepo, rawStorage, underReplicationLedger, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
@@ -2610,7 +2668,9 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			// a move-out is unsafe without the confirm/release path.
 			let ringShift: RingShiftCoordinator | undefined;
 
-			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {});
+			// Piece bytes count toward this node's use once: added here unless the block store already
+			// measures them (`blockStoreCountsPieces`).
+			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {}, pieceStore);
 			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
 				minCapacity: 100 * 1024 * 1024,
 				thresholds: {

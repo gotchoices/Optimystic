@@ -3731,9 +3731,10 @@ A node built with `NodeOptions.servesBlocks: false` is a **client**: it reads an
 |---|---|
 | Link deadlines, cluster policy, bootstrap targets | yes — the key network reads `clusterSize` and the deadlines |
 | Raw block store and its read-cache lease, the durability-window policy, the storage start-up line | no |
-| Key-value store (`NodeOptions.kvStore`) | yes — it holds the HLC clock's high-water mark, the only thing a client persists |
+| Key-value store (`NodeOptions.kvStore`) | yes — it holds the HLC clock's high-water mark and the blob records, the only things a client persists |
 | Under-replication ledger | no |
 | HLC clock (`node.hlcClock`) | yes — it mints the HLC of every write the client sends |
+| Piece store (`NodeOptions.pieceStorage`) and the local blob service (`node.blobs`) | yes — the machine a blob is put on holds its only copy until a row referencing it commits, and a client is often that machine ([blobs.md §The node's blob service](blobs.md#the-nodes-blob-service)); it holds only the blobs its own host pinned |
 | `StorageRepo`, and the repo and cluster proxies the protocol services answer through | no |
 | libp2p services `cluster`, `repo`, `sync`, `blockTransfer` | not registered |
 | libp2p services `identify`, `identifyPush`, `ping`, `dcutr` (by the hole-punching rule), `autoNAT`, `relay` (with `relay: true`), `networkManager`, `fret` | yes, unchanged; FRET joins the ring at `fretProfile` |

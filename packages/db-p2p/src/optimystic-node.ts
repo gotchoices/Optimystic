@@ -1,5 +1,5 @@
 import type { Libp2p, PrivateKey } from '@libp2p/interface';
-import type { BlockId, HlcClock, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
+import type { BlobService, BlockId, HlcClock, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import type { NodeCohortReachability } from './network/cohort-reachability.js';
@@ -74,6 +74,14 @@ export interface OptimysticNodeAttachmentsBase {
 	 * observes nothing the node stores. On a client, the clock mints the HLC of every write it sends.
 	 */
 	hlcClock: HlcClock;
+	/**
+	 * The node's blob service (docs/blobs.md §The node's blob service), over `NodeOptions.pieceStorage`
+	 * and the blob records in `NodeOptions.kvStore`. On a client too: the machine a blob is put on holds
+	 * its only copy until a row referencing it commits. Today it answers from this machine alone
+	 * (`LocalBlobService`); fetching from other holders, announcing and copying are later work, behind
+	 * the same interface.
+	 */
+	blobs: BlobService;
 }
 
 /**

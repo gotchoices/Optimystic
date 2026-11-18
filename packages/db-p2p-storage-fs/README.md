@@ -45,6 +45,7 @@ const libp2p = await createLibp2pNode({
   networkName: 'my-network',
   storage: rawStorage,
   kvStore,
+  pieceStorage,
 });
 
 // … and on shutdown, after the node has stopped:
@@ -54,9 +55,11 @@ await kvStore.close();
 await rawStorage.close();
 ```
 
-The node does not take a piece store yet: `pieceStorage` is passed to it once
-the node gains that option (`pieceStorage` on `NodeOptions`). Until then a host
-can use the store directly.
+The node keeps blob pieces in `pieceStorage` and their records in `kvStore`,
+and serves both through `libp2p.blobs` (`docs/blobs.md` in the repository
+root). Without `pieceStorage` it keeps pieces in memory and logs a warning: a
+restart then loses the pieces while `kvStore` keeps their records, and those
+blobs read as not here.
 
 The node never closes a store it was handed, so close each after `stop()`.
 Closing flushes what the store still holds and, for the last store over the
@@ -95,8 +98,8 @@ toward `FileRawStorage.getApproximateBytesUsed` when the path is shared. Over
 one `basePath` the two share one log, one lock and one checkpoint.
 
 Without a `kvStore`, the node falls back to an in-memory store and logs a
-`node-wiring` warning: what the ledger records, and the HLC clock's
-high-water mark, are then lost on restart.
+`node-wiring` warning: what the ledger records, the HLC clock's high-water
+mark and the blob records are then lost on restart.
 
 ## On-disk layout
 
