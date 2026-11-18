@@ -111,6 +111,8 @@ export class FilePieceStore implements IPieceStore {
 	private readonly identity: StoreIdentity;
 	/** Directories whose entries changed since the last flush; the flush's work list. */
 	private readonly dirty = new Set<string>();
+	/** The last flush called; the next one starts after it. */
+	private flushing: Promise<void> = Promise.resolve();
 	private opened: Promise<void> | undefined;
 
 	/** Pieces go in `<basePath>/optimystic-pieces/`. Synchronous; the directories are created on first use. */
@@ -185,10 +187,19 @@ export class FilePieceStore implements IPieceStore {
 
 	/**
 	 * Syncs every directory whose entries a resolved put or delete changed. A put synced its file's
-	 * bytes before it resolved, so the directory entries are all a flush owes. `fsyncDir` swallows its
-	 * errors, so a flush cannot reject on its own.
+	 * bytes before it resolved, so the directory entries are all a flush owes. Flushes run one after
+	 * another: a flush called while an earlier one is still syncing the directories it took finds the
+	 * work list empty, and must not resolve before those syncs have finished.
 	 */
-	async flush(): Promise<void> {
+	flush(): Promise<void> {
+		const flushed = this.flushing.then(() => this.syncDirtyDirectories());
+		// The caller of this flush sees its rejection; the next flush still runs.
+		this.flushing = flushed.catch(() => undefined);
+		return flushed;
+	}
+
+	/** `fsyncDir` swallows its errors, so this cannot reject on its own. */
+	private async syncDirtyDirectories(): Promise<void> {
 		const directories = [...this.dirty].sort(deepestFirst);
 		this.dirty.clear();
 		// NOTE: one directory at a time; if a flush after a large blob's put ever shows up slow on

@@ -150,7 +150,7 @@ It reports the same store identity as a `FileRawStorage` over the same
 `basePath`, whose byte count already includes the piece directory, so the
 node's storage monitor does not count the pieces twice. Its log lines are on
 `optimystic:db-p2p-storage-fs:pieces:file` (`incoming:cleared`,
-`rename:raced`).
+`rename:raced`, `temp:close-failed`, `temp:unlink-failed`; see `docs/debugging.md`).
 
 ## Write-ahead log
 
