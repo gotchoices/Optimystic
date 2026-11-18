@@ -27,6 +27,7 @@ import {
 import { createLogger } from '../logger.js';
 import { armUnrefTimer } from '../unref-timer.js';
 import type { BlobFetcher, BlobFetchRequest, BlobFetchSession, PieceStoredEvent } from './blob-fetcher.js';
+import { forwardAborts } from './blob-fetch-session.js';
 import { blobHolderCandidates, type BlobHolderDeps } from './blob-holders.js';
 import type { BlobLocalHolding } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
@@ -141,7 +142,9 @@ export class NodeBlobService implements BlobService {
 	 * Called after each piece a fetch this service started stores, with the counts so far for that
 	 * reference across every such fetch still running; a reference's counts start again once its last
 	 * fetch has ended. `size` is reported once the root piece is here. A throwing listener is logged and
-	 * does not stop the others. Fetches started on the fetcher directly report nothing.
+	 * does not stop the others. Pieces are told apart only by reference, so while a fetch this service
+	 * started runs, a piece of the same blob stored by a fetch started on the fetcher directly is counted
+	 * too; with none running, such a fetch reports nothing.
 	 */
 	onProgress(listener: (event: BlobProgressEvent) => void): () => void {
 		this.progressListeners.add(listener);
@@ -161,7 +164,7 @@ export class NodeBlobService implements BlobService {
 
 	private async *readFetching(ref: BlobRef, options: BlobReadOptions): AsyncIterable<Uint8Array> {
 		const readController = new AbortController();
-		const detach = forwardAbort(options.signal, readController);
+		const detach = forwardAborts(readController, [options.signal]);
 		let session: BlobFetchSession | undefined;
 		const missing: MissingPiece = async id => {
 			// `fetcher.start` is synchronous, so a later miss of this read finds the session already set.
@@ -189,7 +192,14 @@ export class NodeBlobService implements BlobService {
 		}
 	}
 
-	/** A piece the fetch reported stored. Its absence is an invariant violation, not a retryable condition: nothing may remove a piece under the blob's `cached` hold or a pin. */
+	/**
+	 * A piece the fetch reported stored. Its absence is an invariant violation, not a retryable condition:
+	 * nothing may remove a piece under the blob's `cached` hold or a pin.
+	 */
+	// NOTE: a fetch that found nothing missing (a put or another fetch stored the piece between the read's
+	// miss and the fetch's walk) takes no hold, so a piece with no record — a crashed put's orphan — could
+	// be swept between `stored` and this read, the same exposure any local read of an unheld blob has; if
+	// this error is ever seen, have the read take the `cached` hold before its first miss.
 	private async storedPiece(ref: BlobRef, id: PieceId): Promise<Uint8Array> {
 		const bytes = await this.local.fetchStore().source.get(id);
 		if (bytes === undefined) {
@@ -309,7 +319,7 @@ export class NodeBlobService implements BlobService {
 	/** One peer's holding of `ref`, or undefined when it did not answer within the probe budget, failed, or the probe settled first. Never rejects. */
 	private async askOne(ref: BlobRef, peer: string, settled: AbortSignal): Promise<BlobLocalHolding | undefined> {
 		const controller = new AbortController();
-		const detach = forwardAbort(settled, controller);
+		const detach = forwardAborts(controller, [settled]);
 		const cancelTimer = armUnrefTimer(() => controller.abort(new Error(`no stat answer within ${this.probeTimeoutMs} ms`)), this.probeTimeoutMs);
 		try {
 			const [holding] = await this.client.stat(peerIdFromString(peer), [ref], { signal: controller.signal });
@@ -324,23 +334,6 @@ export class NodeBlobService implements BlobService {
 			detach();
 		}
 	}
-}
-
-/**
- * Aborts `target` with `source`'s reason when it aborts (at once when it already has); returns the
- * detach. By hand because Hermes has no `AbortSignal.any`.
- */
-function forwardAbort(source: AbortSignal | undefined, target: AbortController): () => void {
-	if (source === undefined) {
-		return () => undefined;
-	}
-	if (source.aborted) {
-		target.abort(source.reason);
-		return () => undefined;
-	}
-	const listener = (): void => target.abort(source.reason);
-	source.addEventListener('abort', listener, { once: true });
-	return () => source.removeEventListener('abort', listener);
 }
 
 function describe(error: unknown): string {

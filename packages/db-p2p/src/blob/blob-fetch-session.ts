@@ -523,7 +523,7 @@ class CorruptServers {
  * Aborts `target` with the reason of whichever source aborts first; returns the detach. Combined by
  * hand because Hermes has no `AbortSignal.any` (`RepoClient.get` says why `any-signal` is not used).
  */
-function forwardAborts(target: AbortController, sources: readonly (AbortSignal | undefined)[]): () => void {
+export function forwardAborts(target: AbortController, sources: readonly (AbortSignal | undefined)[]): () => void {
 	const present = sources.filter((source): source is AbortSignal => source !== undefined);
 	const already = present.find(source => source.aborted);
 	if (already !== undefined) {
