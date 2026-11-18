@@ -78,6 +78,7 @@ export interface BlockFloorCheck {
  * forfeits the check for that block, it never serves anything wrong by itself. */
 export class BlockFloors implements BlockFloorCheck {
 	private readonly floors = new Map<BlockId, BlockFloor>();
+	private belowFloorCount = 0;
 
 	/** @param onBelowFloor told about every below-floor answer, from any source sharing these floors
 	 * — the collection reports them as `collection:block-below-floor`. */
@@ -117,6 +118,7 @@ export class BlockFloors implements BlockFloorCheck {
 		if (floor === undefined) {
 			return false;
 		}
+		++this.belowFloorCount;
 		this.onBelowFloor?.({ blockId, floor, servedRev });
 		return true;
 	}
@@ -131,6 +133,14 @@ export class BlockFloors implements BlockFloorCheck {
 	private unmetFloor(blockId: BlockId, context: ActionContext | undefined, servedRev: number): BlockFloor | undefined {
 		const floor = this.applicableTo(blockId, context);
 		return floor !== undefined && servedRev < floor.rev ? floor : undefined;
+	}
+
+	/** How many below-floor answers {@link answeredBelowFloor} has reported, from every read source
+	 * sharing these floors, for the life of the handle ({@link clear} does not reset it). A below-floor
+	 * answer is handed to its reader unflagged, so this is how a reader that must not act on one —
+	 * the blob readers in `packages/db-core/src/blob/committed-read.ts` — learns that it got one. */
+	get belowFloorAnswers(): number {
+		return this.belowFloorCount;
 	}
 
 	/** How many blocks have a floor. */

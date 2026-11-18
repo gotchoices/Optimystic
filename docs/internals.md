@@ -593,7 +593,9 @@ are true of it:
   a loud refusal and a retry.
 - **It is reported**, as `collection:block-below-floor` (fields in
   [debugging.md](debugging.md#did-a-re-read-come-back-older-than-the-log-says)), which is the only
-  trace it leaves.
+  trace it leaves. `BlockFloors` also counts below-floor answers for the life of the handle, and
+  `Collection.belowFloorAnswerCount` exposes the count, for a reader that must not act on such an
+  answer (the blob readers, [blobs.md §Registering references](blobs.md#registering-references)).
 
 **An open floors what its log tail names.** An open walks no entries, but it has read the log tail
 block, and each action entry there names the blocks that action changed at its revision.
@@ -834,6 +836,21 @@ now-committed blocks with stale structure (an invented collection's pre-commit
 header/root making the whole tree read empty being the observed case). With a sealed
 segment in place it replays instead, which a reset would have dropped (see
 [Staged actions are segments](#staged-actions-are-segments)).
+
+#### Blob reference trees and the scope registry carry no guards
+
+A reference tree's elements and the scope registry's are unguarded (`blobReferenceAction` in
+`packages/db-core/src/blob/reference-tree.ts`, `blobScopeAction` in
+`packages/db-core/src/blob/scope-registry.ts`), and replaying them is idempotent: an add or a
+registration upserts a key whose value is a fixed function of the key, and a removal deletes a fixed
+key, which does nothing when the key is absent. So conflict replay and the offline queue's replay of a
+sealed segment, which re-run them over newer committed state, leave the state each change describes,
+and two machines registering one scope both commit one entry. Being unguarded, they are not counted in
+the already-applied tally (`countsWrite` in `packages/db-core/src/collections/tree/tree.ts`), which is
+what is wanted: a reference entry restates what its row implies, the row carries the guard that decides
+the race, and an entry with a registration a rival already made beside reference entries that landed
+must not read `already-applied`. See
+[docs/blobs.md §Registering references](blobs.md#registering-references).
 
 #### Committed reads are pinned, not shared-cache
 

@@ -2387,6 +2387,14 @@ export class Collection<TAction> implements ICollection<TAction> {
 		return context === undefined ? undefined : actionIdAt(context, context.rev);
 	}
 
+	/** How many below-floor answers this handle's read sources have received, for the life of the
+	 * handle — {@link BlockFloors.belowFloorAnswers}. Such an answer is handed to the reader unflagged
+	 * (the accepted-tradeoff `NOTE:` at `TransactorSource.mayRetain`), so a reader that must not act
+	 * on one reads this count after it has finished reading. Diagnostic otherwise. */
+	belowFloorAnswerCount(): number {
+		return this.floors.belowFloorAnswers;
+	}
+
 	/** Fold a just-committed set of transforms into this collection's read cache
 	 * so subsequent reads (and stages) through THIS instance observe the committed
 	 * state, mirroring what {@link sync} does inline after a successful transact.
