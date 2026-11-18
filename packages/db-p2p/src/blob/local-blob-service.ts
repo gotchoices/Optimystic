@@ -2,6 +2,7 @@ import {
 	BlobUnavailableError,
 	buildBlob,
 	defaultBlobDigest,
+	parseBlobRef,
 	readBlob,
 	rootPieceId,
 	walkBlobPieces,
@@ -234,8 +235,13 @@ export class LocalBlobService implements BlobService {
 		};
 	}
 
-	/** The one path every record change takes; a record's deletion schedules a sweep. */
+	/**
+	 * The one path every record change takes; a record's deletion schedules a sweep. A string that is
+	 * not a canonical reference throws BlobRefError before it is noted, since a running sweep re-reads
+	 * every noted ref and would fail on it.
+	 */
 	private async changeRecord(ref: BlobRef, change: (current: BlobRecord | undefined) => BlobRecord | undefined): Promise<BlobRecordChange> {
+		parseBlobRef(ref);
 		const result = await this.gate.shared(() => {
 			this.sweeper.noteRecordChange(ref);
 			return this.records.update(ref, change);

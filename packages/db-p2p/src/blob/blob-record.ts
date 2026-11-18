@@ -24,7 +24,7 @@ export interface BlobRecord {
 	readonly ref: BlobRef;
 	/** The blob's byte size, once known. */
 	readonly size?: number;
-	/** Whether every piece was here when last checked. A hint: `stat` checks the pieces. */
+	/** Whether every piece was here when last checked. A hint: `stat` trusts it while the root piece is here, and a read that finds a piece missing clears it. */
 	readonly whole: boolean;
 	/** When the blob was last read here, ms since the epoch; at most `LAST_READ_RESOLUTION_MS` stale. */
 	readonly lastReadAt?: number;

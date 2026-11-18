@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { BlobUnavailableError, buildBlob, rootPieceId, walkBlobPieces, type BlobRef, type PieceId } from '@optimystic/db-core';
+import { BlobRefError, BlobUnavailableError, buildBlob, rootPieceId, walkBlobPieces, type BlobRef, type PieceId } from '@optimystic/db-core';
 import { BLOB_RECORD_KEY_PREFIX, DEFAULT_BLOB_OWNER, type BlobRecord } from '../src/blob/blob-record.js';
 import { BlobRecordStore } from '../src/blob/blob-record-store.js';
 import { LocalBlobService } from '../src/blob/local-blob-service.js';
@@ -217,6 +217,35 @@ describe('LocalBlobService', () => {
 		// re-walk of records changed during the sweep keeps the two pieces.
 		expect(await sweep).to.deep.include({ kind: 'swept', deleted: 0 });
 		expect(await readAll(service.read(ref))).to.deep.equal(content);
+	});
+
+	it('a change refused for a string that is not a reference leaves a running sweep unharmed', async () => {
+		const releaseList = gate();
+		const kv = new HeldListKVStore(new MemoryKVStore(), releaseList.promise);
+		const service = serviceOver(new MemoryPieceStore(), kv);
+
+		const sweep = service.sweep();
+		await kv.listWaiting;
+		const pinned = await service.pin('not-a-reference' as BlobRef, 'a').catch((error: unknown) => error);
+		releaseList.open();
+
+		expect(pinned).to.be.instanceOf(BlobRefError);
+		expect(await sweep).to.deep.include({ kind: 'swept' });
+	});
+
+	it('deleting a record schedules a sweep that removes its pieces, and stop waits for it', async () => {
+		const pieces = new MemoryPieceStore();
+		const timers: Array<() => void> = [];
+		const service = new LocalBlobService({ pieces, kv: new MemoryKVStore(), setTimer: fn => { timers.push(fn); return () => undefined; } });
+		const { ref } = await service.put(streamOf(bytesOf(PIECE + 1000, 14)));
+		expect(timers).to.have.length(0);
+
+		await service.unpin(ref, DEFAULT_BLOB_OWNER);
+		expect(timers).to.have.length(1);
+		timers[0]!();
+		await service.stop();
+
+		expect(await listed(pieces)).to.deep.equal([]);
 	});
 
 	it('an aborted put leaves pieces the next sweep removes', async () => {
