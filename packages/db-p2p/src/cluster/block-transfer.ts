@@ -463,6 +463,11 @@ export class BlockTransferCoordinator {
 
 	// --- Semaphore for concurrency limiting ---
 
+	// NOTE: the limit is node-wide, so up to `maxConcurrency` pushes may target one peer at once, each queuing
+	// up to one yamux window (256 KiB at least) ahead of every other request to that peer on the shared
+	// connection. If reads waiting behind pushes are ever measured on a relayed link, limit pushes in flight to
+	// one per destination peer, keeping this node-wide limit for different peers.
+
 	private async acquireSemaphore(): Promise<void> {
 		if (this.concurrency < this.maxConcurrency) {
 			this.concurrency++;
