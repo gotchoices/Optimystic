@@ -277,6 +277,7 @@ export class RebalanceMonitor implements Startable {
 	private readonly growthMaxAttempts: number
 	private readonly growthRecheckIntervalMs: number
 	private readonly log: Logger
+	private readonly routingKeyOf: (id: string) => RoutingKey
 
 	private readonly onConnectionOpen: () => void
 	private readonly onConnectionClose: () => void
@@ -296,6 +297,7 @@ export class RebalanceMonitor implements Startable {
 		this.growthMaxAttempts = config.growthMaxAttempts ?? 5
 		this.growthRecheckIntervalMs = config.growthRecheckIntervalMs ?? this.minRebalanceIntervalMs
 		this.log = createLogger(deps.logName ?? 'rebalance-monitor')
+		this.routingKeyOf = deps.routingKeyOf ?? routingKeyForBlock
 
 		this.onConnectionOpen = () => this.handleTopologyChange()
 		this.onConnectionClose = () => this.handleTopologyChange()
@@ -775,7 +777,7 @@ export class RebalanceMonitor implements Startable {
 	 * blocks ever show up as slow, share the lookup with the coordinator's responsibility cache.
 	 */
 	private async cohortFor(blockId: string): Promise<string[]> {
-		const key = (this.deps.routingKeyOf ?? routingKeyForBlock)(blockId)
+		const key = this.routingKeyOf(blockId)
 		if (this.deps.keyNetwork) {
 			return Object.keys(await this.deps.keyNetwork.findCluster(key))
 		}
