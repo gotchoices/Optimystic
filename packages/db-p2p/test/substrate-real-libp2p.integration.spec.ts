@@ -1185,6 +1185,44 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 	};
 }
 
+/** What {@link wokeByDeliveredNotification} watches and how it commits. */
+interface NotificationWakeProbe {
+	/** Commits allowed before giving up. */
+	readonly attempts: number;
+	readonly reads: { readonly started: number; readonly finished: number };
+	/** Times the watch's `onChange` has fired. */
+	readonly wakes: () => number;
+	/** Frames the watcher's subscriber registry has received for the topic. */
+	readonly delivered: () => number;
+	/** One commit on the writer; `attempt` counts from 0. */
+	readonly commit: (attempt: number) => Promise<void>;
+}
+
+/**
+ * Commits until one commit both wakes the watch and delivers a frame to the watcher, with no tail read on the
+ * watcher started in between, and says whether one did within `attempts`. Both are awaited because a watcher
+ * that stores any of the collection is woken by its own storage, usually before the notification lands; the
+ * frame is what shows the notify socket carried the commit. An attempt with no frame within 10 s moves on.
+ */
+async function wokeByDeliveredNotification(probe: NotificationWakeProbe): Promise<boolean> {
+	for (let attempt = 0; attempt < probe.attempts; attempt++) {
+		await waitFor(() => probe.reads.started === probe.reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
+		const readsBefore = probe.reads.started;
+		const wakesBefore = probe.wakes();
+		const deliveredBefore = probe.delivered();
+		await probe.commit(attempt);
+		try {
+			await waitFor(() => probe.wakes() > wakesBefore && probe.delivered() > deliveredBefore, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke and the notification arrived' });
+		} catch {
+			continue;
+		}
+		if (probe.reads.started === readsBefore) {
+			return true;
+		}
+	}
+	return false;
+}
+
 /**
  * **The collection watch service over a real network.** The cases above each fake one end of reactivity — a
  * hand-built commit certificate fed to `onLocalCommit`, a membership certificate cached by hand, a registration
@@ -1294,20 +1332,13 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 			// retry) proves nothing and is repeated. So is an attempt with no frame at all: the announcing node
 			// verifies its own notification against the topic cohort's membership certificate, which a newly formed
 			// cohort publishes on its next gossip round.
-			let wokeByNotification = false;
-			for (let attempt = 0; attempt < 4 && !wokeByNotification; attempt++) {
-				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
-				const readsBeforeCommit = reads.started;
-				const wakesBeforeCommit = wakes;
-				const deliveredBeforeCommit = delivered;
-				await tree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
-				try {
-					await waitFor(() => wakes > wakesBeforeCommit && delivered > deliveredBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke and the notification arrived' });
-				} catch {
-					continue;
-				}
-				wokeByNotification = reads.started === readsBeforeCommit;
-			}
+			const wokeByNotification = await wokeByDeliveredNotification({
+				attempts: 4,
+				reads,
+				wakes: () => wakes,
+				delivered: () => delivered,
+				commit: async (attempt) => { await tree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]); },
+			});
 			expect(wokeByNotification, 'a commit on another node woke the watch and reached it over the notify socket, with no tail read in between').to.equal(true);
 		} finally {
 			offCount();
@@ -1327,15 +1358,13 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
  * by that member, and the notification reaches the watcher over the notify socket and verifies against
  * the group's membership at `ceil(3 × 0.75) = 3` signatures.
  *
- * An attempt counts when the watch woke, the watcher's subscriber registry received a frame for the topic,
- * and no tail read ran on the watcher between the commit and both of those. The watcher is outside the log
- * tail's storage group, but it may store the collection's other blocks (the tree's leaf is placed by its own
- * id), so its own storage can wake it before the notification lands; the delivered frame is what shows the
- * notify socket carried the commit, as in the describe above. The first commit after a registration reaches
- * the announcing member can go unannounced (docs/reactivity.md, "A commit right after a registration can reach
- * nobody"): its attempt times out waiting for the frame, and the next attempt is disqualified, correctly, by
- * the tail read the subscription manager's gap recovery makes. The cohort-topic options are the production defaults (`wantK` 16, `minSigs` 14): neither governs a
- * root-placed root, which is the point.
+ * An attempt counts as {@link wokeByDeliveredNotification} judges it. The watcher is outside the log tail's
+ * storage group, but it may store the collection's other blocks (the tree's leaf is placed by its own id), so
+ * its own storage can wake it before the notification lands. The first commit after a registration reaches
+ * the announcing member can go unannounced (docs/reactivity.md, "A commit right after a registration can
+ * reach nobody"): its attempt times out waiting for the frame, and the next attempt is disqualified,
+ * correctly, by the tail read the subscription manager's gap recovery makes. The cohort-topic options are
+ * the production defaults (`wantK` 16, `minSigs` 14): neither governs a root-placed root, which is the point.
  *
  * NOTE: this reproduces the threshold arm of the defect, not the disjoint-group arm. With `wantK` 16 on six
  * machines the FRET cohort around any coordinate is still the whole mesh, so the old announcing rule would
@@ -1444,24 +1473,16 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 			}, { timeoutMs: 60_000, intervalMs: 250, description: "the watcher's registration replicated to the announcing group member" });
 			expect(wakes, 'only the first tail read has woken the watch: nothing has changed since it opened').to.equal(1);
 
-			// An attempt waits for the wake AND the frame, since the watcher's own storage can wake it first, and
-			// counts only if no tail read ran in between. A commit that goes unannounced costs two attempts: its own,
-			// by timeout, and the next, whose notification arrives with a revision gap and is disqualified by the
-			// gap-recovery tail read. Six attempts leave room for two such losses.
-			let wokeByNotification = false;
-			for (let attempt = 0; attempt < 6 && !wokeByNotification; attempt++) {
-				await waitFor(() => reads.started === reads.finished, { timeoutMs: 30_000, intervalMs: 50, description: 'no tail read in flight' });
-				const readsBeforeCommit = reads.started;
-				const wakesBeforeCommit = wakes;
-				const deliveredBeforeCommit = delivered;
-				await writerTree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
-				try {
-					await waitFor(() => wakes > wakesBeforeCommit && delivered > deliveredBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke and the notification arrived' });
-				} catch {
-					continue;
-				}
-				wokeByNotification = reads.started === readsBeforeCommit;
-			}
+			// A commit that goes unannounced costs two attempts: its own, by timeout, and the next, whose
+			// notification arrives with a revision gap and is disqualified by the gap-recovery tail read. Six
+			// attempts leave room for two such losses.
+			const wokeByNotification = await wokeByDeliveredNotification({
+				attempts: 6,
+				reads,
+				wakes: () => wakes,
+				delivered: () => delivered,
+				commit: async (attempt) => { await writerTree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]); },
+			});
 			expect(wokeByNotification, 'a commit coordinated inside the storage group woke a watcher outside it by a delivered notification, with no tail read in between').to.equal(true);
 		} finally {
 			offCount();
