@@ -2,8 +2,8 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type IRawStorage, type IKVStore } from '@optimystic/db-p2p';
-import { FileRawStorage, FileKVStore } from '@optimystic/db-p2p-storage-fs';
+import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, MemoryPieceStore, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type IRawStorage, type IKVStore, type IPieceStore } from '@optimystic/db-p2p';
+import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
@@ -53,32 +53,39 @@ interface NetworkSession {
 interface NodeStores {
 	storage: IRawStorage;
 	kvStore: IKVStore;
+	pieceStore: IPieceStore;
 	/** For file storage, checkpoints the shared write-ahead log and removes the directory's lock. */
 	close(): Promise<void>;
 }
 
 /**
- * The block store, and the node-local state that must survive a restart (the under-replication
- * ledger). File storage puts both over one base path, where they share one write-ahead log and one
+ * The block store, the node-local state that must survive a restart (the under-replication
+ * ledger, the blob records) and the blob pieces. File storage puts all three over one base path, where they share one write-ahead log and one
  * lock: FileRawStorage.listBlockIds yields only directories that hold a meta.json, so the ledger's
- * `under-replicated/` directory is never read as a block. Memory storage gets a memory key-value
- * store explicitly — the node's own fallback would warn about losing state across a restart, which a
- * memory-storage peer loses anyway.
+ * `under-replicated/` directory is never read as a block, nor is `optimystic-pieces/`. Memory storage
+ * gets a memory key-value store and piece store explicitly — the node's own fallbacks would warn
+ * about losing state across a restart, which a memory-storage peer loses anyway.
  */
 function openStores(options: { storage?: 'memory' | 'file'; storagePath?: string }): NodeStores {
 	if (options.storage !== 'file') {
-		return { storage: new MemoryRawStorage(), kvStore: new MemoryKVStore(), close: async () => { } };
+		return { storage: new MemoryRawStorage(), kvStore: new MemoryKVStore(), pieceStore: new MemoryPieceStore(), close: async () => { } };
 	}
 	const storage = new FileRawStorage(options.storagePath!);
 	const kvStore = new FileKVStore(options.storagePath!);
+	const pieceStore = new FilePieceStore(options.storagePath!);
 	return {
 		storage,
 		kvStore,
+		pieceStore,
 		close: async () => {
 			try {
-				await kvStore.close();
+				await pieceStore.close();
 			} finally {
-				await storage.close();
+				try {
+					await kvStore.close();
+				} finally {
+					await storage.close();
+				}
 			}
 		},
 	};
@@ -442,6 +449,7 @@ class PeerSession {
 			fretProfile: options.fretProfile,
 			storage: stores.storage,
 			kvStore: stores.kvStore,
+			pieceStorage: stores.pieceStore,
 			clusterSize,
 			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
 				|| repairCorroborationClusterSize !== undefined
