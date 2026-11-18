@@ -9,6 +9,7 @@ import { createLogger } from '../logger.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_BLOCK_MESSAGE_BYTES } from '../protocol-limits.js';
 import { readCarriedOutcomes } from './carried-records.js';
+import { buildClusterProtocol } from '../network/storage-protocols.js';
 
 const log = createLogger('cluster-client');
 
@@ -67,7 +68,7 @@ export class ClusterClient extends ProtocolClient implements ICluster {
 		// protocol id (`/optimystic/<network>/cluster/1.0.0`); the bare
 		// `/db-p2p/cluster/1.0.0` is never registered, so there is no legacy
 		// fallback to attempt — a single dial whose error propagates directly.
-		const protocol = (this.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
+		const protocol = buildClusterProtocol(this.protocolPrefix ?? '/db-p2p');
 		// Apply the client-level dial/response deadline so a silent cluster peer
 		// can't hang the coordinator forever; an explicit caller override wins.
 		// A pend record carries the transaction's transforms, and the member answers with that record

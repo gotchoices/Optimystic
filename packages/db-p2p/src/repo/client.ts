@@ -7,6 +7,7 @@ import { blockIdsForTransforms } from "@optimystic/db-core";
 import { ProtocolClient } from "../protocol-client.js";
 import { pickRedirectTarget, type RedirectPayload } from "./redirect.js";
 import { MAX_BLOCK_MESSAGE_BYTES } from "../protocol-limits.js";
+import { buildRepoProtocol } from "../network/storage-protocols.js";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { commitBatchOf, pendBatchOf } from "./request-batch.js";
 import { narrowBlockGets, readGetReply, type RepoBlockGets, type RepoGetReply } from "./get-reply.js";
@@ -113,7 +114,7 @@ export class RepoClient extends ProtocolClient implements IRepo {
 		const correlationId = this.extractCorrelationId(operations);
 		const deadline = options.expiration ?? (Date.now() + 30_000)
 		const deadlineMs = Math.max(1, deadline - Date.now())
-		const preferred = (this.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
+		const preferred = buildRepoProtocol(this.protocolPrefix ?? '/db-p2p')
 
 		// Drive the remaining `expiration` budget through an AbortController whose
 		// abort *reason* is the caller-facing `'RepoClient timeout'` Error, combined

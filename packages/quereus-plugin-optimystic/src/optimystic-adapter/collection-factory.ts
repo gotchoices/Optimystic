@@ -648,6 +648,12 @@ export class CollectionFactory {
         // in its key network rather than have one guessed from defaults here. If a real host
         // ever needs a cluster size other than the default, widen `registerLibp2pNode` to take
         // the node's own key network (or its cluster size) rather than growing more guesses.
+        //
+        // NOTE: such a node carries no storage-claim filter (`filterStorageClaimMerges`, installed by
+        // `createLibp2pNodeBase`), so a peer that sends it a repo or cluster request is recorded in its
+        // peerStore as serving and this key network will select it. Harmless while such a node registers
+        // neither protocol, so nobody sends it one; if a host's foreign node ever serves storage, install
+        // the filter on it in `registerLibp2pNode`.
         // The node's own deadlines where it carries them (a db-p2p node attaches `linkDeadlines`); the
         // key network falls back to the undeclared defaults otherwise.
         return new Libp2pKeyPeerNetwork(libp2pNode, DEFAULT_CLUSTER_SIZE, undefined, undefined, undefined, undefined, protocolPrefix, libp2pNode.linkDeadlines);

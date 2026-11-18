@@ -327,6 +327,11 @@ option (the default) serve all four to anyone who can connect.
 - **`foreign`** — advertises protocols, but neither of those (it belongs to some other network)
 - **`unknown`** — advertises nothing yet (identify has not completed)
 
+Only the peer's own identify can make it `serves`: libp2p also records a stream's protocol in the
+remote peer's list, but `filterStorageClaimMerges` (`packages/db-p2p/src/network/storage-claim-filter.ts`)
+drops that write for the two storage protocols, so a machine that only sends this node requests is
+never classified as serving.
+
 Coordinator and cohort selection route work only to peers confirmed `serves`. A peer built to speak
 the repo protocol therefore becomes routable the moment its identify exchange completes; a peer whose
 ids are misspelled stays `foreign` forever and is silently skipped. The list is read from a per-peer

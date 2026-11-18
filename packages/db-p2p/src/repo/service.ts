@@ -14,6 +14,7 @@ import { createInboundStreamAuthorization, type InboundStreamAuthorization, type
 import { registerProtocolHandler } from '../network/register-protocol-handler.js'
 import type { OptimysticNodeAttachments } from '../optimystic-node.js'
 import { RESPONSIBILITY_TTL_MS } from './responsibility.js'
+import { buildRepoProtocol } from '../network/storage-protocols.js'
 import { batchShapeFault, getAffectedBlockIds } from '../cluster/record-operations.js'
 
 // Define Components interface
@@ -120,7 +121,7 @@ export class RepoService implements Startable {
 
 	constructor(components: RepoServiceComponents, init: RepoServiceInit = {}) {
 		this.components = components
-		const computed = init.protocol ?? (init.protocolPrefix ?? '/db-p2p') + '/repo/1.0.0'
+		const computed = init.protocol ?? buildRepoProtocol(init.protocolPrefix ?? '/db-p2p')
 		this.protocol = computed
 		this.maxInboundStreams = init.maxInboundStreams ?? 32
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64

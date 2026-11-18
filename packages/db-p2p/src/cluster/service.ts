@@ -12,6 +12,7 @@ import { createLogger, type Logger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import { applyCarriedRecords } from './carried-records.js';
+import { buildClusterProtocol } from '../network/storage-protocols.js';
 
 /**
  * One request on the cluster protocol. `carried` holds decided records the coordinator still owes this
@@ -108,7 +109,7 @@ export class ClusterService implements Startable {
 
 	constructor(components: ClusterServiceComponents, init: ClusterServiceInit = {}) {
 		this.components = components;
-		this.protocol = init.protocol ?? (init.protocolPrefix ?? '/db-p2p') + '/cluster/1.0.0';
+		this.protocol = init.protocol ?? buildClusterProtocol(init.protocolPrefix ?? '/db-p2p');
 		this.maxInboundStreams = init.maxInboundStreams ?? 32;
 		this.maxOutboundStreams = init.maxOutboundStreams ?? 64;
 		this.log = createLogger(init.logPrefix ?? 'cluster-service');
