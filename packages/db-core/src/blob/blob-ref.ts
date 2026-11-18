@@ -43,7 +43,16 @@ export function rootPieceId(ref: BlobRef): PieceId {
 /** The canonical piece id of a CID that has already passed `isPieceCid`; version 0 is re-spelt as version 1. */
 export function pieceIdOfCid(cid: CID): PieceId {
 	// toV1 keeps the multihash and the codec, so the re-spelt id names the same bytes.
-	return cid.toV1().toString(base32) as PieceId;
+	return canonicalSpelling(cid.toV1()) as PieceId;
+}
+
+/**
+ * Encoded from the CID's bytes, never through `CID.toString`: a CID that `CID.parse` made answers
+ * `toString` with the very string it was parsed from, so a padded spelling (trailing `=`, which the
+ * base32 decoder strips) would come back as itself.
+ */
+function canonicalSpelling(cid: CID): string {
+	return base32.encode(cid.bytes);
 }
 
 /** Codec raw or dag-pb, multihash sha2-256 with a 32-byte digest. Version not checked (a link inside a list piece may be CIDv0). */
@@ -90,8 +99,8 @@ function judgeCanonical(text: unknown): CanonicalVerdict {
 	if (!isPieceCid(cid)) {
 		return { problem: describeNonPieceCid(cid) };
 	}
-	// Rejects every alternative spelling the decoder tolerates (padding, trailing bits).
-	if (cid.toString(base32) !== text) {
+	// Rejects every alternative spelling the decoder tolerates (trailing `=` padding).
+	if (canonicalSpelling(cid) !== text) {
 		return { problem: 'not the canonical spelling of its CID' };
 	}
 	return decoded;

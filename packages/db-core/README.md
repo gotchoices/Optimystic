@@ -190,6 +190,15 @@ Concrete implementation for peer-to-peer networks:
 - **Failure-aware retry**: Handle peer failures and network partitions
 - **Cluster-aware batching**: Group operations by responsible peers
 
+### [Blobs](../../docs/blobs.md) - Large Values Outside Transactions
+
+Formats and pure logic for large immutable values, stored as IPFS-compatible pieces rather than inside blocks (`src/blob/`; the design, and what is still to be built, is in [docs/blobs.md](../../docs/blobs.md)):
+
+- **References**: `BlobRef`, the CIDv1 of a blob's root piece in one canonical spelling (`parseBlobRef`)
+- **Builder**: `buildBlob` cuts a stream into 256 KiB pieces and gives the reference `ipfs add --cid-version 1` gives the same bytes
+- **Hashing port**: `defaultBlobDigest`, and `checkBlobDigest` for a host-supplied digest
+- **Service types**: `BlobService`, which db-p2p implements
+
 ## Key Features
 
 ### Distributed ACID Transactions
@@ -331,6 +340,7 @@ await eventLog.append(eventData);
 - **[Collections](docs/collections.md)** - High-level abstractions with conflict resolution
 - **[Transactors](docs/transactor.md)** - Distributed transaction coordination
 - **[Network](docs/network.md)** - Peer-to-peer implementation architecture
+- **[Blobs](../../docs/blobs.md)** - Large values stored as pieces outside transactions
 
 ### Internal Architecture
 

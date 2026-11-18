@@ -1,6 +1,7 @@
 import { expect } from 'chai'
 import { routingKeyForBlob, routingKeyForBlock } from '../src/network/routing-key.js'
-import { cidOfPiece, parseBlobRef, rootPieceId } from '../src/index.js'
+import { base32 } from 'multiformats/bases/base32'
+import { parseBlobRef } from '../src/index.js'
 import type { ClusterPeers, IKeyNetwork, PeerId } from '../src/index.js'
 
 describe('routingKeyForBlock', () => {
@@ -31,7 +32,8 @@ describe('routingKeyForBlob', () => {
 	it('is the 32-byte digest inside the reference, not hashed again', () => {
 		const ref = parseBlobRef('bafybeiexg2oqkfnj56l7fcmawswqbijt5shq4b5rg6a546uwpkqqzwjioi')
 		const key = routingKeyForBlob(ref)
+		// A dag-pb sha2-256 CIDv1 is version, codec, hash code and digest length, one byte each, then the digest.
+		expect([...key]).to.deep.equal([...base32.decode(ref).subarray(4)])
 		expect(key.byteLength).to.equal(32)
-		expect([...key]).to.deep.equal([...cidOfPiece(rootPieceId(ref)).multihash.digest])
 	})
 })

@@ -34,6 +34,7 @@ describe('parseBlobRef', () => {
 			'dag-cbor': CID.createV1(DAG_CBOR_CODEC, raw.multihash).toString(base32),
 			'last character removed': RAW_REF.slice(0, -1),
 			'trailing space': `${RAW_REF} `,
+			'base32 padding': `${RAW_REF}=`,
 			'200 characters': `b${'a'.repeat(199)}`,
 		};
 		for (const [label, text] of Object.entries(rejected)) {

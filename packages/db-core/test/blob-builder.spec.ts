@@ -16,6 +16,7 @@ import chaiAsPromised from 'chai-as-promised';
 import * as dagPb from '@ipld/dag-pb';
 import { CID } from 'multiformats/cid';
 import * as Digest from 'multiformats/hashes/digest';
+import { equals } from 'uint8arrays/equals';
 import {
 	BLOB_PIECE_BYTES,
 	BlobDigestError,
@@ -76,6 +77,16 @@ class RecordingSink implements PieceSink {
 		}
 		this.pieces.set(id, bytes);
 	}
+
+	/** Pieces whose kept bytes no longer hash to their id: a builder that reused an array it had put. */
+	async changedSincePut(): Promise<PieceId[]> {
+		const digest = defaultBlobDigest();
+		const changed: PieceId[] = [];
+		for (const [id, bytes] of this.pieces) {
+			if (!equals(await digest(bytes), cidOfPiece(id).multihash.digest)) changed.push(id);
+		}
+		return changed;
+	}
 }
 
 describe('buildBlob', () => {
@@ -85,6 +96,7 @@ describe('buildBlob', () => {
 			const result = await buildBlob(content(vector.size), sink);
 			expect(result).to.deep.equal({ ref: vector.ref, size: vector.size });
 			expect(sink.putBeforeChildren, 'list pieces put before a piece they name').to.deep.equal([]);
+			expect(await sink.changedSincePut(), 'pieces changed after they were put').to.deep.equal([]);
 		});
 	}
 
