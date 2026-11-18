@@ -9,6 +9,7 @@ import { peerIdFromString } from "@libp2p/peer-id";
 import { publicKeyFromRaw } from "@libp2p/crypto/keys";
 import { fromString as uint8ArrayFromString } from "uint8arrays/from-string";
 import { toString as uint8ArrayToString } from "uint8arrays/to-string";
+import { VerdictMemo } from "./proof-votes-memo.js";
 
 /**
  * A durable, self-contained proof that a cluster cohort agreed on a commit — everything an offline
@@ -135,10 +136,46 @@ export async function mintSoloCommitProof(
 	};
 }
 
+/** What {@link verifyProofVotes} decides: everything a verdict depends on except the claim. */
+type VotesVerdict = { ok: true } | { ok: false; reason: ProofFailure };
+
+/**
+ * Passing votes verdicts, keyed by thresholds and the proof's JSON text, shared by every node in the
+ * process: the verdict is a pure function of its key (see {@link judgeProofVotes}), so sharing is
+ * sound, and an in-process test mesh behaves as production does.
+ */
+const proofVotesMemo = new VerdictMemo<VotesVerdict>();
+
 /**
  * Verify that `proof` certifies the CLAIM — `claim.blockId` at `claim.rev` under `claim.actionId` —
  * without needing the block bytes. Pure and total on hostile input: never throws; every failure is a
  * distinguishable {@link ProofFailure}.
+ *
+ * **What is judged, and what is remembered.** Everything but the claim step depends on the proof and
+ * the thresholds alone: the version, structure, duplicate signers, membership digest, message hash,
+ * both rounds' signatures and both thresholds. That half is judged on a copy of the proof decoded
+ * from its own JSON text (`JSON.parse(JSON.stringify(proof))`), and a passing verdict is remembered
+ * by that text, so an identical proof — the same answer sent again by a peer on the next consult, or
+ * by several peers in one — is not verified again. The claim step always runs, on the proof as given,
+ * so a remembered proof presented for another claim still fails `claim-not-in-message`. The votes are
+ * judged first, so a forged proof for the wrong claim reports the non-attributable
+ * `malformed-signature`, never the attributable `claim-not-in-message`.
+ *
+ * Judging the decoded copy changes nothing for a proof that came off a wire or out of storage, both of
+ * which decode JSON: for such an object `JSON.parse(JSON.stringify(x))` differs only by `±Infinity`
+ * becoming `null` and `-0` becoming `0`, which no check here can tell apart. A proof built in process
+ * holding values JSON cannot carry faithfully (a wrapper object, a `toJSON`, a getter answering
+ * differently on each read) is judged as it would be once sent — the artifact a peer receives, which
+ * is what certification is about. No production path builds one: {@link buildBlockCommitProof} and
+ * {@link mintSoloCommitProof} produce plain data. A proof JSON cannot encode at all (a cycle, a BigInt,
+ * a throwing getter) is verified as given and not remembered.
+ *
+ * Measured on Node 24.2.0 on Windows, for a 3-signer proof of 1.7 KB decoded from JSON before each
+ * call (medians of 400 calls after 100 to warm up, three runs): a miss costs 1.44 to 1.53 ms, of which
+ * the added encode and decode are 0.011 ms; a hit costs 0.008 ms. A hit is one native
+ * `JSON.stringify` of the proof, a `Map` lookup and the claim step — no JavaScript replacer and no
+ * JavaScript hash, the two things that make a hashed key cost about as much as the verification it
+ * saves on Hermes (GitHub #68). Hermes itself was not measured here.
  *
  * Mirrors the outcome discipline of `ClusterMember.verifySignature`: a malformed or unbound signer is
  * a verification failure that must NEVER be turned into a reputation penalty, because the identity
@@ -167,13 +204,73 @@ export async function mintSoloCommitProof(
  *    `feat-cluster-membership-threshold-cert-anchoring`). Both repair paths do this via
  *    `cluster/certified-claims.ts`, whose layer 2 logs the overlap and surfaces the unanchored
  *    residual; the anchor itself is still open.
- * 2. **Cost is attacker-chosen.** This performs one Ed25519 verify per approve vote and hashes the
- *    whole message; nothing here caps `peerIds`, the vote maps, or the message. A caller reading a
- *    proof off the wire must bound its size and cohort count BEFORE calling.
+ * 2. **Cost is attacker-chosen.** A proof not remembered costs one Ed25519 verify per approve vote,
+ *    hashes of the whole message, and a JSON encode and decode of the proof; even a remembered one is
+ *    JSON-encoded on every call. Nothing here caps `peerIds`, the vote maps, or the message, and a
+ *    failing verdict is never remembered, so a peer sending junk pays this node the full cost every
+ *    time. A caller reading a proof off the wire must bound its size and cohort count BEFORE calling.
  */
 export async function verifyBlockCommitProofClaim(
 	proof: BlockCommitProof, claim: ProofClaim, thresholds: ProofThresholds
 ): Promise<ProofVerdict> {
+	try {
+		const votes = await judgeProofVotes(proof, thresholds);
+		if (!votes.ok) {
+			return votes;
+		}
+		const op = findClaimedCommitOp(proof.message, claim);
+		if (!op) {
+			return { ok: false, reason: 'claim-not-in-message' };
+		}
+		return { ok: true, declaredDigest: op.blockDigests?.[claim.blockId]?.digest };
+	} catch {
+		return { ok: false, reason: 'malformed-proof' };
+	}
+}
+
+/**
+ * The votes verdict for `proof`, through {@link proofVotesMemo}. The key is the thresholds and the
+ * proof's own JSON text, and a miss verifies `JSON.parse` of that text, never the object passed in,
+ * so the remembered verdict is a function of the key alone: a hit returns exactly what verifying the
+ * key would. The key binds everything the verdict reads — the message, both vote maps with every
+ * signature, the peer list, the declared digest and hashes — because it is all of them; in
+ * particular it never trusts the self-reported `messageHash`, so a changed message under an unchanged
+ * hash is another key, whose verification recomputes the hash and fails. A proof changed while it is
+ * being verified cannot affect the verdict, which reads a private copy; one changed afterwards is
+ * another key on its next call. Only passes are retained (see `proof-votes-memo.ts`).
+ *
+ * The `JSON.parse` cannot fail on text `JSON.stringify` produced; were it to, the rejection reaches
+ * {@link verifyBlockCommitProofClaim}'s catch as `malformed-proof`.
+ */
+function judgeProofVotes(proof: BlockCommitProof, thresholds: ProofThresholds): Promise<VotesVerdict> {
+	const body = proofText(proof);
+	if (body === undefined) {
+		return verifyProofVotes(proof, thresholds);
+	}
+	const key = `${thresholds.superMajorityThreshold}|${thresholds.simpleMajorityThreshold}|${body}`;
+	return proofVotesMemo.judge(
+		key,
+		() => verifyProofVotes(JSON.parse(body) as BlockCommitProof, thresholds),
+		verdict => verdict.ok
+	);
+}
+
+/** `proof`'s JSON text, or `undefined` when JSON cannot encode it (a cycle, a BigInt, a throwing
+ *  getter) or encodes it as nothing (`undefined`, a function). */
+function proofText(proof: unknown): string | undefined {
+	try {
+		const body: unknown = JSON.stringify(proof);
+		return typeof body === 'string' ? body : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Every check of {@link verifyBlockCommitProofClaim} except the claim step, in its order. Total:
+ * anything thrown on hostile input reads as `malformed-proof`.
+ */
+async function verifyProofVotes(proof: BlockCommitProof, thresholds: ProofThresholds): Promise<VotesVerdict> {
 	try {
 		if (proof === null || typeof proof !== 'object') {
 			return { ok: false, reason: 'malformed-proof' };
@@ -232,12 +329,7 @@ export async function verifyBlockCommitProofClaim(
 		if (!(commitRound.approves > proof.peerIds.length * thresholds.simpleMajorityThreshold)) {
 			return { ok: false, reason: commitRound.sawUnknownSigner ? 'unknown-signer' : 'commit-threshold' };
 		}
-
-		const op = findClaimedCommitOp(proof.message, claim);
-		if (!op) {
-			return { ok: false, reason: 'claim-not-in-message' };
-		}
-		return { ok: true, declaredDigest: op.blockDigests?.[claim.blockId]?.digest };
+		return { ok: true };
 	} catch {
 		return { ok: false, reason: 'malformed-proof' };
 	}
@@ -248,6 +340,10 @@ export async function verifyBlockCommitProofClaim(
  * for `claim.blockId` must be present (`no-digest-declared`) and equal `canonicalBlockHash(block)`
  * (`digest-mismatch`). Total like the claim half; a block shape that `canonicalBlockHash` cannot
  * digest reads as `digest-mismatch` — the received bytes provably are not the declared content.
+ *
+ * The claim half shares the votes memo; the digest step is never remembered. A key binding the block
+ * would cost about what hashing it does, and this path (reconcile, a certified push) is not the one a
+ * quiet node repeats.
  */
 export async function verifyBlockCommitProofContent(
 	proof: BlockCommitProof, claim: ProofClaim, block: IBlock, thresholds: ProofThresholds

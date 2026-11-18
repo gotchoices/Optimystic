@@ -307,6 +307,32 @@ describe('BlockCommitProof', () => {
 			await expectFailure(verifyBlockCommitProofClaim(proof, claimFor(commit), THRESHOLDS), 'commit-threshold');
 		});
 
+		it('a remembered pass is never reused for a changed proof or another claim', async () => {
+			// Every copy below is decoded from JSON, the shape a proof has off the wire, and each change
+			// leaves the self-reported messageHash alone — a key built on that hash would alias them.
+			const commit = commitWithDigest();
+			const { proof } = await makeSignedProof(3, commit);
+			const claim = claimFor(commit);
+			const copy = (): BlockCommitProof => JSON.parse(JSON.stringify(proof)) as BlockCommitProof;
+			expect(await verifyBlockCommitProofClaim(proof, claim, THRESHOLDS)).to.deep.equal({ ok: true, declaredDigest: DIGEST });
+
+			const changedMessage = copy();
+			changedMessage.message = { ...changedMessage.message, expiration: (changedMessage.message.expiration ?? 0) + 1 };
+			await expectFailure(verifyBlockCommitProofClaim(changedMessage, claim, THRESHOLDS), 'message-hash-mismatch');
+
+			// The first character, because the last one of base64url can carry only padding bits.
+			const changedSignature = copy();
+			const [signerId] = Object.keys(changedSignature.promises);
+			const vote = changedSignature.promises[signerId!]!;
+			const flipped = (vote.signature[0] === 'A' ? 'B' : 'A') + vote.signature.slice(1);
+			changedSignature.promises[signerId!] = { ...vote, signature: flipped };
+			await expectFailure(verifyBlockCommitProofClaim(changedSignature, claim, THRESHOLDS), 'malformed-signature');
+
+			await expectFailure(verifyBlockCommitProofClaim(copy(), { ...claim, rev: claim.rev + 1 }, THRESHOLDS), 'claim-not-in-message');
+
+			expect(await verifyBlockCommitProofClaim(copy(), claim, THRESHOLDS)).to.deep.equal({ ok: true, declaredDigest: DIGEST });
+		});
+
 		it('rejects structurally-invalid input as malformed-proof, never throwing', async () => {
 			const commit = commitWithDigest();
 			const { proof } = await makeSignedProof(2, commit);

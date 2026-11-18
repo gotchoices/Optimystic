@@ -2365,12 +2365,13 @@ export class CoordinatorRepo implements IRepo {
 		// in the claim set UNCERTIFIED: it still corroborates by distinct-peer count exactly as a
 		// proof-less claim does — a peer that could fabricate a bad proof could equally have sent no
 		// proof, so dropping the vote would buy nothing.
-		// NOTE: cost is one verification pass per proof-carrying answer per consult, each bounded by
-		// MAX_PROOF_SIGNERS (256) signature checks. In `lazy` mode consults are rate-limited by the
-		// read-repair window; in `paranoid` mode every read of every block pays cohort-width
-		// verifications. Fine at deployment cohort sizes (~10) — if paranoid readers ever show CPU
-		// time in `certifyClaim`, cache verdicts per (blockId, rev, actionId, proof hash) rather than
-		// skipping verification.
+		// NOTE: a passing votes verdict is remembered by the proof's JSON text (`verifyBlockCommitProofClaim`
+		// in `commit-proof.ts`), so the answers of one consult carrying the same proof share one
+		// verification, and a later consult that is sent it again checks no signature. Every
+		// proof-carrying answer still costs, per call, a native JSON encode of its proof, the claim step
+		// and the anchoring layer; a proof not yet remembered, and every failing one, costs the full pass,
+		// bounded by MAX_PROOF_SIGNERS (256) signature checks. If `certifyClaim` ever shows in profiles
+		// again with the memo hitting, the per-call encode is what is left to remove.
 		await Promise.all(claims.map(async claim => {
 			if (!claim.proof) return;
 			const verdict = await certifyClaim(
