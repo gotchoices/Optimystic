@@ -12,6 +12,7 @@ import { secp256k1 } from '@noble/curves/secp256k1.js';
 import { p256 } from '@noble/curves/nist.js';
 import { ed25519 } from '@noble/curves/ed25519.js';
 import { hexToBytes, bytesToHex } from '@noble/curves/utils.js';
+import type { ECDSA, ECDSAVerifyOpts } from '@noble/curves/abstract/weierstrass.js';
 import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
 
 // Type definitions
@@ -99,9 +100,13 @@ function fromBytes(bytes: Uint8Array, encoding: Encoding = 'base64url'): string 
  * `digest`, `cid` and `set_commit` are `replicable`, and their outputs are signed
  * and persisted. {@link setCryptoBackend} checks each supplied member against
  * @noble before installing it. A member handed a malformed key or signature must
- * throw or return false, as @noble does; that is not checked. Each returned array
- * must be freshly allocated: under the `bytes` encoding it reaches the caller
- * uncopied, so a native library's reused output buffer would rewrite earlier results.
+ * throw or return false, as @noble does; beyond the ECDSA inputs listed on
+ * `p256Verify`, that is not checked. Each returned array must be freshly allocated:
+ * under the `bytes` encoding it reaches the caller uncopied, so a native library's
+ * reused output buffer would rewrite earlier results.
+ *
+ * There is no ECDSA signing member: a native ECDSA signer draws a random nonce unless it
+ * implements RFC 6979, so its signature could not be checked byte for byte against @noble's.
  */
 export interface CryptoBackend {
 	sha256?(data: Uint8Array): Uint8Array;
@@ -110,6 +115,17 @@ export interface CryptoBackend {
 	ed25519Verify?(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean;
 	/** Message, raw 32-byte secret seed (the form noble and generatePrivateKey('ed25519') use). Returns the raw 64-byte signature. */
 	ed25519Sign?(message: Uint8Array, secretKey: Uint8Array): Uint8Array;
+	/**
+	 * 64-byte compact r‖s signature (big-endian, 32 bytes each), message, 33- or 65-byte SEC 1
+	 * public key. The member hashes the message with SHA-256 itself; it is never handed a digest.
+	 * It must decide exactly as @noble/curves' verify does: reject a high-S signature (s > n/2),
+	 * r or s outside [1, n−1], and any key but 0x02/0x03 with 33 bytes or 0x04 with 65. OpenSSL
+	 * accepts high-S signatures and hybrid 0x06/0x07 keys, so an adapter over it must refuse both
+	 * itself. Returns false, or throws, for an invalid signature or key.
+	 */
+	p256Verify?(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean;
+	/** As `p256Verify`, over secp256k1. */
+	secp256k1Verify?(signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean;
 }
 
 type BackendMember = keyof CryptoBackend;
@@ -161,6 +177,8 @@ function snapshotBackend(backend: CryptoBackend): CryptoBackend {
 		sha512: backend.sha512?.bind(backend),
 		ed25519Verify: backend.ed25519Verify?.bind(backend),
 		ed25519Sign: backend.ed25519Sign?.bind(backend),
+		p256Verify: backend.p256Verify?.bind(backend),
+		secp256k1Verify: backend.secp256k1Verify?.bind(backend),
 	});
 }
 
@@ -173,6 +191,8 @@ function selfCheckBackend(backend: CryptoBackend): void {
 	if (backend.sha512) checkHash('sha512', backend.sha512, sha512);
 	if (backend.ed25519Sign) checkEd25519Sign(backend.ed25519Sign);
 	if (backend.ed25519Verify) checkEd25519Verify(backend.ed25519Verify);
+	if (backend.p256Verify) checkEcdsaVerify('p256Verify', p256, backend.p256Verify);
+	if (backend.secp256k1Verify) checkEcdsaVerify('secp256k1Verify', secp256k1, backend.secp256k1Verify);
 }
 
 function checkHash(member: BackendMember, native: DigestHasher, noble: DigestHasher): void {
@@ -197,15 +217,83 @@ function checkEd25519Verify(native: NonNullable<CryptoBackend['ed25519Verify']>)
 	if (accepted !== true) {
 		throw backendRefused('ed25519Verify', 'did not accept a valid signature over a raw 32-byte public key');
 	}
-	const tampered = CHECK_MESSAGE.slice();
-	tampered[0]! ^= 0x01;
-	if (rejectsOrThrows(() => native(offsetView(signature), offsetView(tampered), offsetView(publicKey)))) {
+	if (rejectsOrThrows(() => native(offsetView(signature), offsetView(tamperedCheckMessage()), offsetView(publicKey)))) {
 		return;
 	}
 	throw backendRefused('ed25519Verify', 'accepted a signature over a different message');
 }
 
-/** For the tampered vector a throw is a rejection, as the interface allows. */
+type EcdsaVerifyMember = 'p256Verify' | 'secp256k1Verify';
+type EcdsaVerifier = NonNullable<CryptoBackend['p256Verify']>;
+
+/** One verify input @noble/curves rejects, named for the refusal that reports a member accepting it. */
+interface EcdsaRejection {
+	readonly what: string;
+	readonly signature: Uint8Array;
+	readonly message: Uint8Array;
+	readonly publicKey: Uint8Array;
+}
+
+/**
+ * The expected answers are @noble's under {@link ECDSA_VERIFY_OPTS}, written down rather than
+ * asked of @noble: its verify costs tens of milliseconds a call under Hermes, where this runs at
+ * app start. Signing is deterministic (RFC 6979), so the valid signature is fixed too.
+ */
+function checkEcdsaVerify(member: EcdsaVerifyMember, curve: ECDSA, native: EcdsaVerifier): void {
+	const signature = curve.sign(CHECK_MESSAGE, CHECK_SEED, { lowS: true });
+	const compressed = curve.getPublicKey(CHECK_SEED);
+	const uncompressed = curve.getPublicKey(CHECK_SEED, false);
+	checkEcdsaAccepts(member, native, signature, compressed, '33-byte compressed');
+	checkEcdsaAccepts(member, native, signature, uncompressed, '65-byte uncompressed');
+	for (const vector of ecdsaRejections(curve, signature, compressed, uncompressed)) {
+		if (!rejectsOrThrows(() => native(offsetView(vector.signature), offsetView(vector.message), offsetView(vector.publicKey)))) {
+			throw backendRefused(member, `accepted ${vector.what}, which @noble/curves rejects`);
+		}
+	}
+}
+
+function checkEcdsaAccepts(
+	member: EcdsaVerifyMember,
+	native: EcdsaVerifier,
+	signature: Uint8Array,
+	publicKey: Uint8Array,
+	keyForm: string
+): void {
+	const accepted = runCheck(member, () => native(offsetView(signature), offsetView(CHECK_MESSAGE), offsetView(publicKey)));
+	if (accepted !== true) {
+		throw backendRefused(member, `did not accept a valid signature over a ${keyForm} public key`);
+	}
+}
+
+/**
+ * OpenSSL accepts the high-S copy and the hybrid key; it rejects the others, which guard
+ * native libraries that check less. Every one is reachable by anyone who can write a row:
+ * flipping s to n − s, or re-encoding a key, needs no secret.
+ */
+function ecdsaRejections(curve: ECDSA, signature: Uint8Array, compressed: Uint8Array, uncompressed: Uint8Array): EcdsaRejection[] {
+	const order = curve.Point.Fn.ORDER;
+	const width = signature.length / 2;
+	const r = signature.subarray(0, width);
+	const s = signature.subarray(width);
+	const scalar = (value: bigint): Uint8Array => hexToBytes(value.toString(16).padStart(width * 2, '0'));
+	const hybrid = uncompressed.slice();
+	hybrid[0] = 0x06 | (uncompressed[uncompressed.length - 1]! & 0x01);
+	return [
+		{ what: 'a signature over a different message', signature, message: tamperedCheckMessage(), publicKey: compressed },
+		{ what: 'a high-S signature', signature: concatBytes(r, scalar(order - BigInt(`0x${bytesToHex(s)}`))), message: CHECK_MESSAGE, publicKey: compressed },
+		{ what: 'a signature with r = 0', signature: concatBytes(new Uint8Array(width), s), message: CHECK_MESSAGE, publicKey: compressed },
+		{ what: 'a signature with r equal to the curve order', signature: concatBytes(scalar(order), s), message: CHECK_MESSAGE, publicKey: compressed },
+		{ what: 'a hybrid-encoded (0x06/0x07) public key', signature, message: CHECK_MESSAGE, publicKey: hybrid },
+	];
+}
+
+function tamperedCheckMessage(): Uint8Array {
+	const tampered = CHECK_MESSAGE.slice();
+	tampered[0]! ^= 0x01;
+	return tampered;
+}
+
+/** For an input @noble rejects, a throw is a rejection, as the interface allows. */
 function rejectsOrThrows(attempt: () => boolean): boolean {
 	try {
 		return attempt() === false;
@@ -265,6 +353,25 @@ function ed25519Verify(signature: Uint8Array, message: Uint8Array, publicKey: Ui
 	// signature could verify on a machine with a backend and not on one without. Switching noble to
 	// `zip215: false` was rejected: it changes existing results and still differs on small-order keys.
 	return native ? native(signature, message, publicKey) : ed25519.verify(signature, message, publicKey);
+}
+
+/**
+ * What a native ECDSA member is checked against, spelled out rather than left to @noble's
+ * defaults (which equal it today), so a change of default cannot move @noble away from the
+ * semantics its self-check vectors encode: SHA-256 the message, reject high-S, take only the
+ * 64-byte compact r‖s form.
+ */
+const ECDSA_VERIFY_OPTS: ECDSAVerifyOpts = Object.freeze({ prehash: true, lowS: true, format: 'compact' });
+
+function ecdsaVerify(
+	member: EcdsaVerifyMember,
+	curve: ECDSA,
+	signature: Uint8Array,
+	message: Uint8Array,
+	publicKey: Uint8Array
+): boolean {
+	const native = currentBackend()?.[member];
+	return native ? native(signature, message, publicKey) : curve.verify(signature, message, publicKey, ECDSA_VERIFY_OPTS);
 }
 
 // --- Algorithm / encoding resolution (selection done once, no per-call switching) --- //
@@ -644,10 +751,10 @@ export function verify(
 
 		switch (curve) {
 			case 'secp256k1': {
-				return secp256k1.verify(sigBytes, dataBytes, keyBytes);
+				return ecdsaVerify('secp256k1Verify', secp256k1, sigBytes, dataBytes, keyBytes);
 			}
 			case 'p256': {
-				return p256.verify(sigBytes, dataBytes, keyBytes);
+				return ecdsaVerify('p256Verify', p256, sigBytes, dataBytes, keyBytes);
 			}
 			case 'ed25519': {
 				return ed25519Verify(sigBytes, dataBytes, keyBytes);

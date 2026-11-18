@@ -9,8 +9,9 @@
  * - verify: ECC signature verification
  * - hashMod: Hash with modulo for fixed-size outputs
  * - randomBytes: Generate cryptographically secure random bytes
- * - setCryptoBackend: Route SHA-256, SHA-512 and Ed25519 to a synchronous native
- *   implementation for the whole process (checked against @noble when set)
+ * - setCryptoBackend: Route SHA-256, SHA-512, Ed25519, and P-256 and secp256k1 verify
+ *   to a synchronous native implementation for the whole process (checked against
+ *   @noble when set)
  *
  * All functions use base64url encoding by default for SQL compatibility.
  */

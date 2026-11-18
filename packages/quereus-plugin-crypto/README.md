@@ -13,7 +13,7 @@ Quereus plugin providing cryptographic functions for SQL queries with base64url 
 - **Verification Functions**: Signature verification for all supported curves
 - **Key Generation**: Generate and derive cryptographic keys
 - **Multiple Encodings**: Support for base64url, base64, hex, utf8, and raw bytes
-- **Native Crypto Backend**: Optionally route SHA-256, SHA-512 and Ed25519 to a native library, checked against the JavaScript results when set
+- **Native Crypto Backend**: Optionally route SHA-256, SHA-512, Ed25519, and P-256 and secp256k1 verification to a native library, checked against the JavaScript results when set
 
 ## Installation
 
@@ -355,18 +355,23 @@ By default every hash and signature runs in JavaScript (`@noble/hashes`, `@noble
 phone that already has fast native crypto, that is the slow part: on a Galaxy S7, one SQL `verify`
 took 408 ms, 366 ms of it in JavaScript Ed25519, and every `digest` hashed with JavaScript SHA-256
 even after the app routed `crypto.subtle.digest` to native code (this plugin never calls
-`crypto.subtle`). `setCryptoBackend` routes SHA-256, SHA-512 and Ed25519 to a synchronous native
-implementation for the whole process:
+`crypto.subtle`). On a Pixel 8 emulator under Hermes, a P-256 `verify` took 47 ms in JavaScript
+against 0.13 ms in OpenSSL, and a secp256k1 one 29 ms against 0.24 ms, paid on every row a schema
+`CHECK` constraint verifies. `setCryptoBackend` routes SHA-256, SHA-512, Ed25519, and P-256 and
+secp256k1 verification to a synchronous native implementation for the whole process:
 
 ```ts
 import { setCryptoBackend } from '@optimystic/quereus-plugin-crypto';
 
-setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every member optional
+// every member optional
+setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify, p256Verify, secp256k1Verify });
 ```
 
 - **What it speeds up.** `digest`, `cid`, `hash_mod`, `set_commit` and `set_verify` whenever they
-  hash with sha256 or sha512, and `sign` / `verify` with `'ed25519'`. BLAKE3, secp256k1 and P-256
-  stay on `@noble`, and so does any member the backend omits.
+  hash with sha256 or sha512, `sign` / `verify` with `'ed25519'`, and `verify` with `'p256'` and
+  `'secp256k1'`. BLAKE3 and ECDSA `sign` stay on `@noble`, and so does any member the backend omits.
+  There is no native ECDSA signing member because OpenSSL signs ECDSA with a random nonce unless asked
+  for RFC 6979, so its signature could not be checked byte for byte against `@noble`'s deterministic one.
 - **Set it once, at startup, for the whole process.** One call reaches the JS API and every
   `Database`'s SQL functions, including those loaded from `@optimystic/quereus-plugin-crypto/plugin`
   and those registered *before* the call: each hash and signature reads the installed backend when
@@ -377,7 +382,10 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every membe
   inputs: a hash must equal the `@noble/hashes` one; `ed25519Sign` must produce exactly the
   `@noble/curves` signature for a fixed raw 32-byte seed (Ed25519 signing is deterministic);
   `ed25519Verify` must accept that signature and reject it once one byte of the message is flipped.
-  The inputs are views at a non-zero offset into a larger buffer, so an adapter that hands the native
+  `p256Verify` and `secp256k1Verify` must accept a fixed signature under both the 33-byte compressed
+  and the 65-byte uncompressed key, and reject five inputs `@noble` rejects: the message with one byte
+  flipped, the high-S copy of the signature (s replaced by n − s), r = 0, r = n, and the uncompressed
+  key re-prefixed as hybrid (0x06 or 0x07). The inputs are views at a non-zero offset into a larger buffer, so an adapter that hands the native
   side `data.buffer` instead of the view fails too. On any failure `setCryptoBackend` throws, naming
   the member, and the previously installed backend (or `@noble`) stays in place, so the mistake shows
   at app start rather than as wrong signatures persisted and replicated.
@@ -390,6 +398,16 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every membe
   or signature must throw or return `false`, as `@noble` does. Every array a member returns must be
   newly allocated: a raw-bytes result reaches the caller uncopied, so a library that reuses one output
   buffer would rewrite results already returned.
+- **ECDSA verify must match `@noble`'s rules.** `@noble` hashes the message with SHA-256 itself,
+  takes only the 64-byte compact r‖s form (never DER), and rejects a high-S signature (s > n/2), r or
+  s outside [1, n−1], and any public key but a 33-byte one prefixed 0x02 or 0x03 or a 65-byte one
+  prefixed 0x04. OpenSSL, and so `node:crypto`, accepts high-S signatures and hybrid-encoded keys.
+  Both are reachable by anyone who can write a row: replacing s by n − s turns an honest signature
+  into one OpenSSL accepts and `@noble` refuses, and so does re-encoding the key as hybrid. `verify`
+  runs inside `CHECK` constraints on replicated rows, so a member that accepted either would let a
+  machine with the backend accept a row every other machine rejects. The self-check refuses an
+  adapter missing either guard, naming the member and the input it accepted; the adapter below has
+  both.
 - **Ed25519 strictness differs on crafted input.** `@noble` verifies under the ZIP-215 rule, which
   accepts some non-canonical point encodings and small-order components that an RFC 8032-strict
   library such as OpenSSL rejects. Honest signatures verify identically either way. A deliberately
@@ -397,8 +415,9 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify }); // every membe
   only where peers re-execute a statement whose outcome depends on `verify`, which no Optimystic
   deployment does today.
 
-A working adapter for Node.js, on `node:crypto`. Raw Ed25519 keys are wrapped as DER (PKCS#8 for the
-32-byte seed, SPKI for the 32-byte public key) because that is the form the Node API takes:
+A working adapter for Node.js, on `node:crypto`. Raw keys are wrapped as DER (PKCS#8 for the Ed25519
+32-byte seed, SPKI for every public key) because that is the form the Node API takes, and the ECDSA
+members refuse the two inputs OpenSSL would otherwise accept:
 
 ```ts
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
@@ -407,6 +426,31 @@ import { setCryptoBackend } from '@optimystic/quereus-plugin-crypto';
 const PKCS8_ED25519_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
 const SPKI_ED25519_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
 
+type EcdsaCurve = 'p256' | 'secp256k1';
+// SPKI DER prefix for a raw SEC 1 point, by key length: id-ecPublicKey, the curve's OID, the BIT STRING header.
+const SPKI_EC_PREFIX: Record<EcdsaCurve, Record<number, string>> = {
+  p256: { 33: '3039301306072a8648ce3d020106082a8648ce3d030107032200', 65: '3059301306072a8648ce3d020106082a8648ce3d030107034200' },
+  secp256k1: { 33: '3036301006072a8648ce3d020106052b8104000a032200', 65: '3056301006072a8648ce3d020106052b8104000a034200' },
+};
+const CURVE_ORDER: Record<EcdsaCurve, bigint> = {
+  p256: 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n,
+  secp256k1: 0xfffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141n,
+};
+
+const ecdsaVerify = (curve: EcdsaCurve) => (signature: Uint8Array, message: Uint8Array, publicKey: Uint8Array): boolean => {
+  if (signature.length !== 64) return false;
+  const prefixOk = (publicKey.length === 33 && (publicKey[0] === 0x02 || publicKey[0] === 0x03))
+    || (publicKey.length === 65 && publicKey[0] === 0x04);
+  if (!prefixOk) return false; // OpenSSL accepts hybrid 0x06/0x07 keys; @noble does not
+  const n = CURVE_ORDER[curve];
+  const r = BigInt('0x' + Buffer.from(signature.subarray(0, 32)).toString('hex'));
+  const s = BigInt('0x' + Buffer.from(signature.subarray(32)).toString('hex'));
+  if (r === 0n || s === 0n || r >= n || s > n / 2n) return false; // OpenSSL accepts high-S
+  const prefix = Buffer.from(SPKI_EC_PREFIX[curve][publicKey.length]!, 'hex');
+  const key = createPublicKey({ key: Buffer.concat([prefix, publicKey]), format: 'der', type: 'spki' });
+  return verify('sha256', message, { key, dsaEncoding: 'ieee-p1363' }, signature);
+};
+
 setCryptoBackend({
   sha256: (data) => createHash('sha256').update(data).digest(),
   sha512: (data) => createHash('sha512').update(data).digest(),
@@ -414,12 +458,14 @@ setCryptoBackend({
     createPrivateKey({ key: Buffer.concat([PKCS8_ED25519_PREFIX, secretKey]), format: 'der', type: 'pkcs8' })),
   ed25519Verify: (signature, message, publicKey) => verify(null, message,
     createPublicKey({ key: Buffer.concat([SPKI_ED25519_PREFIX, publicKey]), format: 'der', type: 'spki' }), signature),
+  p256Verify: ecdsaVerify('p256'),
+  secp256k1Verify: ecdsaVerify('secp256k1'),
 });
 ```
 
 `react-native-quick-crypto` mirrors this API, so the same shape is the starting point on a phone.
-Whether its synchronous Ed25519 accepts these keys unchanged has not been confirmed; if it does not,
-`setCryptoBackend` throws at startup rather than producing wrong signatures.
+Whether its synchronous Ed25519 and ECDSA accept these keys and options unchanged has not been
+confirmed; if they do not, `setCryptoBackend` throws at startup rather than producing wrong results.
 
 ## Supported Algorithms
 
@@ -579,7 +625,7 @@ Derive the public key from a private key.
 
 ## Security Notes
 
-- All cryptographic operations use audited libraries (@noble/*), unless a [native crypto backend](#native-crypto-backend) is installed, in which case SHA-2 and Ed25519 run in that library
+- All cryptographic operations use audited libraries (@noble/*), unless a [native crypto backend](#native-crypto-backend) is installed, in which case SHA-2, Ed25519, and P-256 and secp256k1 verification run in that library
 - Private keys should be handled securely and never exposed
 - Random number generation uses platform CSPRNG (crypto.getRandomValues)
 - Signatures use deterministic k-generation (RFC 6979)
@@ -592,7 +638,8 @@ These functions run on React Native without any native module. By default they u
 - `@noble/hashes` for hashing
 - `crypto.getRandomValues()` for secure randomness (polyfill required for React Native)
 
-An app that has native crypto can route SHA-256, SHA-512 and Ed25519 to it; see
+An app that has native crypto can route SHA-256, SHA-512, Ed25519, and P-256 and secp256k1
+verification to it; see
 [Native crypto backend](#native-crypto-backend).
 
 ## License

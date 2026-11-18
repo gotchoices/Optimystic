@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased — native ECDSA verify
+
+- `CryptoBackend` takes two more optional members, `p256Verify` and `secp256k1Verify`, which SQL and
+  JS `verify` use for `'p256'` and `'secp256k1'` (GitHub #59: 47 ms and 29 ms a call in JavaScript
+  under Hermes, against well under 1 ms in OpenSSL). Each takes the 64-byte compact r‖s signature,
+  the message (which it hashes with SHA-256), and a 33- or 65-byte SEC 1 public key.
+- `setCryptoBackend` checks each against `@noble` on a valid signature under both key forms and on
+  five inputs `@noble` rejects, among them the high-S copy of a signature and a hybrid-encoded
+  (0x06/0x07) key, which OpenSSL accepts by default. An adapter over OpenSSL without both guards is
+  refused, naming the member and the input. The README's Node adapter shows both guards.
+- ECDSA `sign` stays on `@noble`: a native signer's random nonce could not be checked byte for byte.
+- `verify` now passes `@noble` its ECDSA options explicitly (`prehash`, `lowS`, `compact`); they
+  equal the defaults, so no result changes.
+
 ## 1.21.0 — native crypto backend
 
 - New `setCryptoBackend(backend)` and `CryptoBackend` exports. An application can route SHA-256,
