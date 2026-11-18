@@ -3781,10 +3781,12 @@ export class OptimysticVirtualTable extends VirtualTable {
             const oldKeyTuple = this.rowCodec.asPrimaryKeyTuple(args.oldKeyValues);
             const oldKey = this.rowCodec.createPrimaryKey(oldKeyTuple);
             const newKey = this.rowCodec.extractPrimaryKey(values);
-            const encodedRow = this.rowCodec.encodeRow(values);
 
             // Must precede every collection.stage() below — see requirePreWriteRow.
             const { row: oldRow, entry: oldEntry } = await this.requirePreWriteRow('UPDATE', oldKey, oldKeyTuple);
+            // Over the stored entry, so a column this machine's description does not name
+            // keeps its value; the `unchanged` guards below hold that entry still.
+            const encodedRow = this.rowCodec.encodeRow(values, oldEntry[1]);
 
             // Decide the PK move FIRST when the key changes: its outcome is an
             // input to the secondary-UNIQUE probe below. A REPLACE removes the row

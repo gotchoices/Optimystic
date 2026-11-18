@@ -954,6 +954,10 @@ any other layout would have rows misread. It takes the record's indexes over tho
 An index over a column this machine does not know is left out, and goes unmaintained here
 until the machine restarts or re-applies the schema (backlog
 `bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced`).
+An UPDATE this machine makes keeps the values the stored row holds for columns the view does not
+name: `RowCodec.encodeRow` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` is given
+the stored entry and carries its other keys over, and the `unchanged` guard on that entry refuses
+the write if a rival changed the row after it was read.
 A `create index` works from the same view for its maintenance, and names its columns in the
 record by column name, since the record's column list can differ from this machine's.
 

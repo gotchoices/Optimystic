@@ -100,6 +100,17 @@ describe('a machine holding an older copy of a table description', function () {
 		expect(record.indexes).to.deep.equal({ t_partial: ['a'], t_y: ['y'] });
 	});
 
+	it('keeps the value of a column it does not know when it updates a row', async () => {
+		const { a, b } = await twoMachines('');
+		expect(await queryAll(b.db, 'select id from main.t')).to.deep.equal([{ id: 1 }]);
+		await a.db.exec('alter table main.t add column y text null');
+		await a.db.exec(`update main.t set y = 'kept' where id = 1`);
+
+		await b.db.exec('update main.t set a = 9 where id = 1');
+
+		expect(await queryAll(a.db, 'select a, y from main.t where id = 1')).to.deep.equal([{ a: 9, y: 'kept' }]);
+	});
+
 	it('does not bring back a table the other machine dropped by creating an index on it', async () => {
 		const { store, a, b } = await twoMachines();
 		await a.db.exec('drop table main.t');

@@ -38,11 +38,17 @@ export class RowCodec {
 	) {}
 
 	/**
-	 * Encode a row for storage in the tree
+	 * Encode a row for storage in the tree.
+	 *
+	 * `prior` is the stored entry this row rewrites, for an UPDATE: every key it holds
+	 * that names no column of this codec is carried over unchanged. Another machine may
+	 * have added that column after this machine loaded the table's description, or the
+	 * column may have been dropped and its values kept for a re-add; writing only the
+	 * columns this machine knows would erase them.
 	 */
-	encodeRow(row: Row): EncodedRow {
+	encodeRow(row: Row, prior?: EncodedRow): EncodedRow {
 		// Convert Row (array) to object format for storage
-		const rowObj: Record<string, SqlValue> = {};
+		const rowObj: Record<string, SqlValue> = prior === undefined ? {} : this.unknownColumnsOf(prior);
 
 		for (let i = 0; i < this.schema.columns.length; i++) {
 			const col = this.schema.columns[i];
@@ -59,18 +65,30 @@ export class RowCodec {
 		return JSON.stringify(rowObj);
 	}
 
+	/** The keys of a stored row that name no column of this codec, as stored. */
+	private unknownColumnsOf(encoded: EncodedRow): Record<string, SqlValue> {
+		const stored = this.parseStored(encoded);
+		const known = new Set(this.schema.columns.map(col => col.name));
+		const carried: Record<string, SqlValue> = {};
+		for (const [key, value] of Object.entries(stored)) {
+			if (!known.has(key)) carried[key] = value;
+		}
+		return carried;
+	}
+
+	private parseStored(encoded: EncodedRow): Record<string, SqlValue> {
+		if (this.encoding === 'msgpack') {
+			// TODO: Add msgpack support when dependency is added
+			throw new Error('msgpack decoding not yet implemented');
+		}
+		return JSON.parse(encoded as string) as Record<string, SqlValue>;
+	}
+
 	/**
 	 * Decode a row from storage format
 	 */
 	decodeRow(encoded: EncodedRow): Row {
-		let rowObj: Record<string, SqlValue>;
-
-		if (this.encoding === 'msgpack') {
-			// TODO: Add msgpack support when dependency is added
-			throw new Error('msgpack decoding not yet implemented');
-		} else {
-			rowObj = JSON.parse(encoded as string);
-		}
+		const rowObj = this.parseStored(encoded);
 
 		// Convert object back to Row (array) format
 		const row: Row = [];
