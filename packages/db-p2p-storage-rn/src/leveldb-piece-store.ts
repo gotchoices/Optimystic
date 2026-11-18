@@ -89,6 +89,10 @@ export class LevelDBPieceStore implements IPieceStore {
 	}
 
 	/** Both adapters return a fresh array per read (`rn-opener.ts` over the buffer the native read allocated, the test driver a copy), which no one else holds. */
+	// NOTE: an empty blob is a zero-length piece. `classic-level` reads a zero-length value back as an
+	// empty array; whether `rn-leveldb`'s `getBuf` does, or answers `null` as for an absent key, has not
+	// been run on a device. If it answers `null`, `get` reads an empty piece as absent while `has` says
+	// present: answer an empty array here when the size key holds 0.
 	async get(id: PieceId): Promise<Uint8Array | undefined> {
 		return this.db.get(pieceKey(id));
 	}

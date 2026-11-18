@@ -14,7 +14,7 @@ It is private and never published.
 4. reads back every row of the table, looks rows up through the unique column and the declared index, and runs the plugin's `verifyIndexes` over both index trees;
 5. checks that a duplicate of a unique value the older build wrote is still refused;
 6. reads the diary, reads back the blob the older build stored when its manifest records one, then commits the append that was in flight when the older build stopped — its pending record written by the older build, its commit by this one;
-7. writes on top: new rows, edits and a delete of old rows, reuse of the deleted row's unique value, another diary append, and a 600 KiB blob through `node.blobs.put`, after which the storage lists exactly the blocks it listed before;
+7. writes on top: new rows, edits and a delete of old rows, reuse of the deleted row's unique value, another diary append, and a 300 KiB blob through `node.blobs.put`, after which the storage lists exactly the blocks it listed before;
 8. stops, starts again, and reads everything back, the blob from this node's pieces by its SHA-256.
 
 Steps run in order over one data directory, each building on the last, so run the file whole rather than one `it` at a time.
@@ -31,7 +31,7 @@ Steps run in order over one data directory, each building on the last, so run th
 | a diary of 35 entries | more than one chain block holds (`EntriesPerBlock` in `packages/db-core/src/chain/chain.ts`), so its log spans two blocks |
 | one more append whose pend landed and whose commit was never sent | a pending record with whatever the older build kept beside it; the commit request is in the manifest |
 | all of it on a solo node with a persistent key-value store | the commit proofs a solo node signs, and the under-replication ledger (1.0.0 and later; earlier builds have no `kvStore` option) |
-| a 600 KiB blob through `node.blobs.put`, before the in-flight append, for releases whose node has `blobs` | pieces in the backend's piece store and a blob record in the key-value store; the manifest records its reference, length and SHA-256 as `blob`. No checked-in fixture has one yet: the first is the fixture recorded for the first release that ships blob storage |
+| a 300 KiB blob of numbered text lines (`writer/blob-content.mjs`) through `node.blobs.put`, before the in-flight append, for releases whose node has `blobs` | two data pieces and a list piece in the backend's piece store and a blob record in the key-value store; the manifest records its reference, length and SHA-256 as `blob`. No checked-in fixture has one yet: the first is the fixture recorded for the first release that ships blob storage |
 
 There is one fixture per storage backend a deployment runs on:
 
