@@ -27,12 +27,22 @@
  * `[TAG_JOURNAL, TAG_JOURNAL + 1)`, ends exactly where this one begins. Only the
  * whole-database byte sum (`approximateBytesUsed`) counts these keys.
  *
+ * Blob pieces (`TAG_PIECES`) have no `blockId` envelope: the byte after the tag
+ * says which of two keys a piece has, and the UTF-8 of the piece id follows.
+ * `TAG_PIECES || 0x00 || id` holds the piece's bytes; `TAG_PIECES || 0x01 || id`
+ * holds its length, 4 bytes big-endian. `LevelDBPieceStore` writes and deletes
+ * the two in one batch, so they are present together or not at all, and nothing
+ * that measures or lists pieces reads a piece's bytes: it reads the size keys.
+ * The commit-proof range, `[TAG_COMMIT_PROOFS, TAG_COMMIT_PROOFS + 1)`, ends
+ * exactly where this one begins.
+ *
  * `kv` and `identity` keys are flat — no `blockId` envelope — under their
  * own tag bytes (`TAG_KV`, `TAG_IDENTITY`) and use UTF-8 of the full key.
  *
  * The tag bytes are deliberately spaced (`0x01`, `0x02`, …, `0x10`, `0x20`)
  * so a future logical store can slot in between without colliding with
- * existing prefix scans.
+ * existing prefix scans; `0x01` to `0x09` are taken, so the next one is `0x0A`.
+ * Every tag's range is `[tag, tag + 1)`, and none straddles another.
  */
 
 export const TAG_METADATA = 0x01;
@@ -43,6 +53,7 @@ export const TAG_MATERIALIZED = 0x05;
 export const TAG_PROOFS = 0x06;
 export const TAG_JOURNAL = 0x07;
 export const TAG_COMMIT_PROOFS = 0x08;
+export const TAG_PIECES = 0x09;
 export const TAG_KV = 0x10;
 export const TAG_IDENTITY = 0x20;
 
@@ -222,6 +233,52 @@ export function isJournalMarkKey(key: Uint8Array): boolean {
 /** The `seq` a record key names, or `undefined` for a key of another shape. */
 export function seqFromJournalKey(key: Uint8Array): number | undefined {
 	return decodeSeq(key.subarray(1));
+}
+
+// --- blob pieces ---
+
+/** The byte after `TAG_PIECES` that marks a key holding a piece's bytes. */
+const PIECE_BYTES = 0x00;
+/** The byte after `TAG_PIECES` that marks a key holding a piece's length. */
+const PIECE_SIZE = 0x01;
+const PIECE_SIZE_BYTES = 4;
+
+/** `TAG_PIECES || 0x00 || id UTF-8`: the key of the piece's bytes. */
+export function pieceKey(id: string): Uint8Array {
+	return concat(Uint8Array.of(TAG_PIECES, PIECE_BYTES), textEncoder.encode(id));
+}
+
+/** `TAG_PIECES || 0x01 || id UTF-8`: the key of the piece's length. */
+export function pieceSizeKey(id: string): Uint8Array {
+	return concat(Uint8Array.of(TAG_PIECES, PIECE_SIZE), textEncoder.encode(id));
+}
+
+/** Every size key: `[TAG_PIECES, 0x01]` up to `[TAG_PIECES, 0x02]`. */
+export function pieceSizeRange(): { gte: Uint8Array; lt: Uint8Array } {
+	return { gte: Uint8Array.of(TAG_PIECES, PIECE_SIZE), lt: Uint8Array.of(TAG_PIECES, PIECE_SIZE + 1) };
+}
+
+/** Every key under the tag, both kinds: `[TAG_PIECES]` up to `[TAG_PIECES + 1]`. */
+export function pieceRange(): { gte: Uint8Array; lt: Uint8Array } {
+	return { gte: Uint8Array.of(TAG_PIECES), lt: Uint8Array.of(TAG_PIECES + 1) };
+}
+
+/** The id a size key names. */
+export function pieceIdFromSizeKey(key: Uint8Array): string {
+	return textDecoder().decode(key.subarray(2));
+}
+
+/** A piece's length as a size value: 4 bytes big-endian unsigned. A piece is at most 1 MiB (`MAX_BLOB_PIECE_BYTES`). */
+export function encodePieceSize(size: number): Uint8Array {
+	const out = new Uint8Array(PIECE_SIZE_BYTES);
+	new DataView(out.buffer).setUint32(0, size, false);
+	return out;
+}
+
+/** The length a size value holds, or `undefined` when it is not 4 bytes. */
+export function decodePieceSize(value: Uint8Array): number | undefined {
+	if (value.byteLength !== PIECE_SIZE_BYTES) return undefined;
+	return new DataView(value.buffer, value.byteOffset, value.byteLength).getUint32(0, false);
 }
 
 export function kvKey(key: string): Uint8Array {

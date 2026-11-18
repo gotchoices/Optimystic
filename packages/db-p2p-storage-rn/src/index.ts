@@ -1,5 +1,6 @@
 export { LevelDBRawStorage, LevelDBJournalStore, type LevelDBRawStorageOptions } from './leveldb-storage.js';
 export { LevelDBKVStore, type LevelDBKVStoreOptions } from './leveldb-kv-store.js';
+export { LevelDBPieceStore } from './leveldb-piece-store.js';
 export { loadOrCreateRNPeerKey, DEFAULT_PEER_KEY_NAME } from './identity.js';
 export {
 	openOptimysticRNDb,

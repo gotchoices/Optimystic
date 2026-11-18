@@ -10,14 +10,16 @@
  */
 
 import { expect } from 'chai';
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Database } from '@quereus/quereus';
-import { Diary, type CommitResult } from '@optimystic/db-core';
+import { Diary, parseBlobRef, type BlobRef, type CommitResult } from '@optimystic/db-core';
 import { proofClaimsCommit } from '@optimystic/db-p2p';
 import { holdsRevisionProofs, loadFixtures, unpackFixture, type DiaryEntry, type Fixture, type TableRow } from './fixture.js';
 import { startCurrentBuild, type CurrentBuild } from './current-build.js';
+import { BLOB_BYTES, blobContent } from '../writer/blob-content.mjs';
 
 /**
  * What a host is documented to do after upgrading over data a particular release wrote, because the
@@ -64,6 +66,9 @@ const writesOnTop = (table: string): string[] => [
 
 const NEW_DIARY_ENTRY: DiaryEntry = { n: 1_000, text: 'written by the current build' };
 
+/** The seed of the blob this build stores over the older data; the writer's is another, so the two blobs share no piece. */
+const NEW_BLOB_SEED = 2;
+
 const fixtures = await loadFixtures();
 
 describe('an upgrade over data an older build wrote', () => {
@@ -81,6 +86,8 @@ for (const fixture of fixtures) {
 		const table = manifest.table.name;
 		let dataDir: string;
 		let current: CurrentBuild | undefined;
+		/** The blob "writes on top" stores, read back after the restart. */
+		let newBlob: { ref: BlobRef; sha256: string } | undefined;
 
 		before(async () => {
 			dataDir = await mkdtemp(join(tmpdir(), `optimystic-upgrade-check-${fixture.version}-${fixture.manifest.storage.backend}-`));
@@ -148,6 +155,14 @@ for (const fixture of fixtures) {
 			});
 		}
 
+		// Only a release whose node has `blobs` records one; no fixture before the first such release does.
+		const olderBlob = manifest.blob;
+		if (olderBlob) {
+			it('reads back the blob the older build stored', async () => {
+				await expectBlob(running(), parseBlobRef(olderBlob.ref), olderBlob);
+			});
+		}
+
 		it('lands the append that was in flight, pended by the older build and committed by this one', async () => {
 			const { commit } = manifest.diary.inFlight;
 			const pendingClaim = () => running().node.storageRepo.pendingClaimOf(commit.tailId, commit.actionId);
@@ -168,6 +183,14 @@ for (const fixture of fixtures) {
 			await expectTable(db, table, rowsAfterWritesOnTop(manifest.table.rows));
 			await expectIndexesAgree(running(), table);
 			expect(await readDiary(running(), manifest.diary.id)).to.deep.equal(diaryAfterWritesOnTop(fixture));
+
+			// A blob beside the older blocks: its pieces and its record must not read as blocks.
+			const blocksBefore = await listBlockIds(running());
+			const content = blobContent(NEW_BLOB_SEED);
+			const { ref, size } = await running().node.blobs.put(once(content));
+			expect(size).to.equal(BLOB_BYTES);
+			expect(await listBlockIds(running()), 'the blocks after storing a blob').to.deep.equal(blocksBefore);
+			newBlob = { ref, sha256: sha256Hex(content) };
 		});
 
 		it('reads the older data and the new writes back after restarting again', async () => {
@@ -177,6 +200,8 @@ for (const fixture of fixtures) {
 			await expectTable(running().db, table, rowsAfterWritesOnTop(manifest.table.rows));
 			await expectIndexesAgree(running(), table);
 			expect(await readDiary(running(), manifest.diary.id)).to.deep.equal(diaryAfterWritesOnTop(fixture));
+			expect(newBlob, 'the blob was not stored').to.not.equal(undefined);
+			await expectBlob(running(), newBlob!.ref, { size: BLOB_BYTES, sha256: newBlob!.sha256 });
 		});
 	});
 }
@@ -232,6 +257,38 @@ async function captureError(action: () => Promise<unknown>): Promise<string> {
 		return err instanceof Error ? err.message : String(err);
 	}
 	throw new Error('expected the statement to be refused, but it succeeded');
+}
+
+async function* once(bytes: Uint8Array): AsyncIterable<Uint8Array> {
+	yield bytes;
+}
+
+function sha256Hex(bytes: Uint8Array): string {
+	return createHash('sha256').update(bytes).digest('hex');
+}
+
+/** Every block id the node's storage lists, sorted. */
+async function listBlockIds({ storage }: CurrentBuild): Promise<string[]> {
+	if (!storage.listBlockIds) {
+		throw new Error('the block storage cannot list its blocks');
+	}
+	const ids: string[] = [];
+	for await (const id of storage.listBlockIds()) {
+		ids.push(id);
+	}
+	return ids.sort();
+}
+
+/** Reads the blob from this node's pieces alone and checks its length and SHA-256. */
+async function expectBlob({ node }: CurrentBuild, ref: BlobRef, expected: { size: number; sha256: string }): Promise<void> {
+	const hash = createHash('sha256');
+	let length = 0;
+	for await (const chunk of node.blobs.read(ref, { from: 'here' })) {
+		hash.update(chunk);
+		length += chunk.byteLength;
+	}
+	expect(length, "the blob's length").to.equal(expected.size);
+	expect(hash.digest('hex'), "the blob's SHA-256").to.equal(expected.sha256);
 }
 
 async function openDiary({ transactor }: CurrentBuild, id: string): Promise<Diary<DiaryEntry>> {

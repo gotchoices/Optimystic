@@ -1,8 +1,8 @@
 /**
  * Package-private LevelDB driver surface.
  *
- * The storage classes (`LevelDBRawStorage`, `LevelDBKVStore`) and the identity
- * helper (`loadOrCreateRNPeerKey`) only depend on the interfaces declared here
+ * The storage classes (`LevelDBRawStorage`, `LevelDBKVStore`, `LevelDBPieceStore`)
+ * and the identity helper (`loadOrCreateRNPeerKey`) only depend on the interfaces declared here
  * — never on `rn-leveldb` directly. That lets the suite run under Node mocha
  * against `classic-level`, matching the pattern `db-p2p-storage-ns` uses with
  * `node:sqlite` and `db-p2p-storage-web` uses with `fake-indexeddb`.
@@ -17,6 +17,15 @@
  * a new one, so a later synced write does not cover it — exactly the write the
  * journal under `LevelDBRawStorage` exists to keep out of the store.
  */
+
+/**
+ * The scheme of the `StoreIdentity` every store over one `LevelDBLike` reports
+ * (`identityForHandle(LEVELDB_HANDLE_SCHEME, db)`): `LevelDBJournalStore`, and so
+ * `LevelDBRawStorage.getStoreIdentity`, and `LevelDBPieceStore`. One handle, one
+ * identity, which is how `StorageMonitor` knows the block store's byte count
+ * already includes the pieces (`blockStoreCountsPieces`).
+ */
+export const LEVELDB_HANDLE_SCHEME = 'leveldb-handle';
 
 /** Range options for a `LevelDBLike.iterator` scan. */
 export interface LevelDBIteratorOptions {

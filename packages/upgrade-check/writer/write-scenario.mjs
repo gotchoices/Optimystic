@@ -12,9 +12,11 @@
  * solo node over the named storage backend; a SQL table with a unique column and a declared index,
  * enough rows to split its B-tree, and an update and a delete over them; a diary long enough that
  * its log spans two chain blocks; and one more diary append whose pend landed and whose commit never
- * did — the node is stopped with that write in flight. The manifest records what a reader must find.
+ * did — the node is stopped with that write in flight. A build whose node has `blobs` also stores a
+ * blob ahead of that append. The manifest records what a reader must find.
  */
 
+import { createHash } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import process from 'node:process';
@@ -22,9 +24,12 @@ import { Database } from '@quereus/quereus';
 import register from '@optimystic/quereus-plugin-optimystic/plugin';
 import { Diary, NetworkTransactor } from '@optimystic/db-core';
 import { createLibp2pNode, RepoClient } from '@optimystic/db-p2p';
-import { FileKVStore, FileRawStorage } from '@optimystic/db-p2p-storage-fs';
-import { LevelDBKVStore, LevelDBRawStorage } from '@optimystic/db-p2p-storage-rn';
+// Namespace imports: a named import of an export an older build lacks (its piece store) fails the
+// whole module at link time, where an absent member of a namespace is only `undefined`.
+import * as storageFs from '@optimystic/db-p2p-storage-fs';
+import * as storageRn from '@optimystic/db-p2p-storage-rn';
 import { generateKeyPair, privateKeyToProtobuf } from '@libp2p/crypto/keys';
+import { blobContent } from './blob-content.mjs';
 import { openClassicLevel } from './classic-level.mjs';
 
 const NETWORK_NAME = 'upgrade-check';
@@ -39,10 +44,13 @@ const TABLE_DDL = [
 const INITIAL_ROWS = 80;
 /** Above `EntriesPerBlock` (32) in `db-core/src/chain/chain.ts`, so the diary's log spans two blocks. */
 const DIARY_ENTRIES = 35;
+/** The seed of the blob a build with `blobs` stores; the reader stores its own under another. */
+const BLOB_SEED = 1;
 
 /**
  * The storage a deployment runs on, opened under the data directory. `layout` goes into the manifest
  * and is how the reader finds the same files; `close` releases what the node does not own.
+ * `pieceStorage` is `undefined` on a build that has no piece store for the backend.
  */
 const BACKENDS = {
 	// The filesystem backend `reference-peer` runs on.
@@ -50,15 +58,18 @@ const BACKENDS = {
 		const layout = { backend: 'fs', blocks: 'blocks', kv: 'kv' };
 		mkdirSync(join(dir, layout.blocks), { recursive: true });
 		mkdirSync(join(dir, layout.kv), { recursive: true });
-		const storage = new FileRawStorage(join(dir, layout.blocks));
-		const kvStore = new FileKVStore(join(dir, layout.kv));
+		const storage = new storageFs.FileRawStorage(join(dir, layout.blocks));
+		const kvStore = new storageFs.FileKVStore(join(dir, layout.kv));
+		const pieceStorage = storageFs.FilePieceStore ? new storageFs.FilePieceStore(join(dir, layout.blocks)) : undefined;
 		return {
 			layout,
 			storage: () => storage,
 			kvStore,
+			pieceStorage,
 			// A build with a write-ahead log checkpoints it and removes the directory's lock on close, so
 			// the fixture holds an empty log and no `store.lock`. Older builds have no `close` on either.
 			close: async () => {
+				await pieceStorage?.close?.();
 				await kvStore.close?.();
 				await storage.close?.();
 			},
@@ -68,16 +79,19 @@ const BACKENDS = {
 	leveldb: async dir => {
 		const layout = { backend: 'leveldb', path: 'leveldb' };
 		const db = await openClassicLevel(join(dir, layout.path));
-		const storage = new LevelDBRawStorage(db);
-		const kvStore = new LevelDBKVStore(db);
+		const storage = new storageRn.LevelDBRawStorage(db);
+		const kvStore = new storageRn.LevelDBKVStore(db);
+		const pieceStorage = storageRn.LevelDBPieceStore ? new storageRn.LevelDBPieceStore(db) : undefined;
 		return {
 			layout,
 			storage: () => storage,
 			kvStore,
+			pieceStorage,
 			// A build that holds a group's writes until a flush applies what it still holds on close, so
 			// the fixture holds every write and no journal record. Older builds have no `close` on either.
 			close: async () => {
 				try {
+					await pieceStorage?.close?.();
 					await kvStore.close?.();
 				} finally {
 					try {
@@ -114,6 +128,7 @@ for (let n = 1; n <= DIARY_ENTRIES; n++) {
 	await diary.append(diaryEntry(n));
 }
 const entries = await readDiary(diary);
+const blob = await storeBlob(node);
 
 const inFlightEntry = diaryEntry(DIARY_ENTRIES + 1);
 const inFlightCommit = await pendWithoutCommitting(transactor, inFlightEntry);
@@ -126,12 +141,13 @@ writeFileSync(manifestPath, JSON.stringify({
 	storage: backend.layout,
 	table: { name: TABLE, ddl: TABLE_DDL, rows },
 	diary: { id: DIARY_ID, entries, inFlight: { entry: inFlightEntry, commit: inFlightCommit } },
+	...(blob && { blob }),
 }, null, '\t') + '\n');
-console.log(`wrote ${rows.length} rows, ${entries.length} diary entries and one in-flight append`);
+console.log(`wrote ${rows.length} rows, ${entries.length} diary entries${blob ? ', a blob' : ''} and one in-flight append`);
 // A pend whose commit never returns leaves a promise nothing will settle; exit rather than wait.
 process.exit(0);
 
-async function startNode({ storage, kvStore }, key) {
+async function startNode({ storage, kvStore, pieceStorage }, key) {
 	return await createLibp2pNode({
 		port: 0,
 		networkName: NETWORK_NAME,
@@ -143,6 +159,8 @@ async function startNode({ storage, kvStore }, key) {
 		storage,
 		// Builds before 1.0.0 have no `kvStore` option and ignore it.
 		kvStore,
+		// Builds before blob storage have no `pieceStorage` option, and nothing to pass for it.
+		pieceStorage,
 		privateKey: key,
 	});
 }
@@ -204,6 +222,23 @@ async function readRows(db) {
 		throw new Error(`the writer read back ${rows.length} rows, expected ${INITIAL_ROWS}`);
 	}
 	return rows;
+}
+
+/**
+ * On a build whose node has `blobs`, stores the blob and resolves with what the manifest records of
+ * it; on any other, resolves with `undefined`.
+ */
+async function storeBlob(node) {
+	if (typeof node.blobs?.put !== 'function') {
+		return undefined;
+	}
+	const content = blobContent(BLOB_SEED);
+	const { ref, size } = await node.blobs.put(once(content));
+	return { ref, size, sha256: createHash('sha256').update(content).digest('hex') };
+}
+
+async function* once(bytes) {
+	yield bytes;
 }
 
 function diaryEntry(n) {

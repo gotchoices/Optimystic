@@ -19,7 +19,8 @@ import {
 	type StoreKey,
 	type WriteGroupOptions,
 } from '@optimystic/db-p2p';
-import { drain, type LevelDBLike, type LevelDBWriteBatchLike } from './leveldb-like.js';
+import { LEVELDB_HANDLE_SCHEME, drain, type LevelDBIteratorOptions, type LevelDBLike, type LevelDBWriteBatchLike } from './leveldb-like.js';
+import { measurePieces } from './leveldb-piece-store.js';
 import {
 	TAG_PENDING,
 	actionIdFromKey,
@@ -36,6 +37,7 @@ import {
 	metadataKey,
 	metadataRange,
 	pendingKey,
+	pieceRange,
 	proofKey,
 	revisionFromKey,
 	revisionKey,
@@ -100,8 +102,8 @@ function keyBytes(key: StoreKey): Uint8Array {
  * applies each group at once as one unsynced batch, never journaling: a group lands whole or not
  * at all, and the ordering half of the contract arrives with the binding change and nothing here.
  *
- * The handle is shared with `LevelDBKVStore` and `loadOrCreateRNPeerKey`, so there is no `close`
- * here: the host closes the handle after `storage.close()` has resolved.
+ * The handle is shared with `LevelDBKVStore`, `LevelDBPieceStore` and `loadOrCreateRNPeerKey`, so
+ * there is no `close` here: the host closes the handle after `storage.close()` has resolved.
  */
 export class LevelDBJournalStore implements JournalStore<string> {
 	// NOTE: `'process-crash'` holds only while the handle cannot sync (flush contract rule 3 is then
@@ -118,7 +120,7 @@ export class LevelDBJournalStore implements JournalStore<string> {
 
 	constructor(private readonly db: LevelDBLike) {
 		this.durability = db.canSync ? 'power-loss' : 'process-crash';
-		this.identity = identityForHandle('leveldb-handle', db);
+		this.identity = identityForHandle(LEVELDB_HANDLE_SCHEME, db);
 	}
 
 	storeIdentity(): StoreIdentity {
@@ -161,28 +163,43 @@ export class LevelDBJournalStore implements JournalStore<string> {
 		}
 	}
 
-	// NOTE: full-scan byte sum — O(total bytes) per call. Fine as an advisory
-	// StorageMonitor input at current sizes; if a StorageMonitor ever polls this
-	// on a large db, replace with the kernel's incremental write-path counter
-	// (see the seam NOTE in kv-raw-storage.ts's saveMetadata).
+	/**
+	 * The whole database: every key and value below the piece range and above it, and the pieces'
+	 * lengths from their size keys (`measurePieces`), so the blob pieces sharing the handle are
+	 * counted once, here, without reading their bytes — `LevelDBPieceStore` reports this store's
+	 * identity, which tells `StorageMonitor` not to add them again.
+	 */
+	// NOTE: full-scan byte sum of everything but the pieces — O(block-store bytes) per call. Fine as an
+	// advisory StorageMonitor input at current sizes; if a StorageMonitor ever polls this on a large
+	// db, replace with the kernel's incremental write-path counter (see the seam NOTE in
+	// kv-raw-storage.ts's saveMetadata). The piece range is measured from its size keys, 4 bytes per
+	// piece, so blob bytes never pass through the binding here.
 	async approximateBytesUsed(): Promise<number> {
 		try {
-			let total = 0;
-			const iter = this.db.iterator();
-			try {
-				while (true) {
-					const entry = await iter.next();
-					if (!entry) break;
-					total += entry[0].byteLength + entry[1].byteLength;
-				}
-			} finally {
-				await iter.close();
-			}
-			return total;
+			const pieces = pieceRange();
+			const below = await this.sumEntryBytes({ lt: pieces.gte });
+			const above = await this.sumEntryBytes({ gte: pieces.lt });
+			return below + above + await measurePieces(this.db);
 		} catch (err) {
 			log('approximateBytesUsed iterator failed: %o', err);
 			return 0;
 		}
+	}
+
+	/** The key and value lengths of every entry in `range`, summed as one scan is read, never held. */
+	private async sumEntryBytes(range: LevelDBIteratorOptions): Promise<number> {
+		let total = 0;
+		const iter = this.db.iterator(range);
+		try {
+			for (;;) {
+				const entry = await iter.next();
+				if (!entry) break;
+				total += entry[0].byteLength + entry[1].byteLength;
+			}
+		} finally {
+			await iter.close();
+		}
+		return total;
 	}
 
 	// --- the journal ---
@@ -259,9 +276,9 @@ export class LevelDBJournalStore implements JournalStore<string> {
 	}
 
 	// NOTE: intentionally NO close(). The `LevelDBLike` handle is shared with
-	// `LevelDBKVStore` and `loadOrCreateRNPeerKey` (one db per RN peer — see the
-	// README usage), so the store must not own its lifecycle; closing it here
-	// would break the other two. Same rationale as the IndexedDB store.
+	// `LevelDBKVStore`, `LevelDBPieceStore` and `loadOrCreateRNPeerKey` (one db per
+	// RN peer — see the README usage), so the store must not own its lifecycle;
+	// closing it here would break the others. Same rationale as the IndexedDB store.
 }
 
 /** The record's entries onto the batch, in order: a put stores the value, a delete removes the key. */

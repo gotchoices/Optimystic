@@ -9,13 +9,13 @@ It is private and never published.
 `yarn test` — from this directory, or the root `yarn test` and therefore `yarn check` — runs `test/upgrade-over-older-data.spec.ts` once for every fixture under `fixtures/`. It needs no network: a fixture is the data itself, checked in. Each run takes a few seconds. For each fixture it:
 
 1. writes the older build's stored bytes back into a temporary directory;
-2. starts one node from the working tree's build over them — the same identity, `clusterSize: 1`, the same storage backend — with a Quereus database over the node;
+2. starts one node from the working tree's build over them — the same identity, `clusterSize: 1`, the same storage backend, and a piece store over the same location, which no fixture's build wrote into — with a Quereus database over the node;
 3. takes any documented upgrade step that applies to that version (below);
 4. reads back every row of the table, looks rows up through the unique column and the declared index, and runs the plugin's `verifyIndexes` over both index trees;
 5. checks that a duplicate of a unique value the older build wrote is still refused;
-6. reads the diary, then commits the append that was in flight when the older build stopped — its pending record written by the older build, its commit by this one;
-7. writes on top: new rows, edits and a delete of old rows, reuse of the deleted row's unique value, another diary append;
-8. stops, starts again, and reads everything back.
+6. reads the diary, reads back the blob the older build stored when its manifest records one, then commits the append that was in flight when the older build stopped — its pending record written by the older build, its commit by this one;
+7. writes on top: new rows, edits and a delete of old rows, reuse of the deleted row's unique value, another diary append, and a 600 KiB blob through `node.blobs.put`, after which the storage lists exactly the blocks it listed before;
+8. stops, starts again, and reads everything back, the blob from this node's pieces by its SHA-256.
 
 Steps run in order over one data directory, each building on the last, so run the file whole rather than one `it` at a time.
 
@@ -31,11 +31,12 @@ Steps run in order over one data directory, each building on the last, so run th
 | a diary of 35 entries | more than one chain block holds (`EntriesPerBlock` in `packages/db-core/src/chain/chain.ts`), so its log spans two blocks |
 | one more append whose pend landed and whose commit was never sent | a pending record with whatever the older build kept beside it; the commit request is in the manifest |
 | all of it on a solo node with a persistent key-value store | the commit proofs a solo node signs, and the under-replication ledger (1.0.0 and later; earlier builds have no `kvStore` option) |
+| a 600 KiB blob through `node.blobs.put`, before the in-flight append, for releases whose node has `blobs` | pieces in the backend's piece store and a blob record in the key-value store; the manifest records its reference, length and SHA-256 as `blob`. No checked-in fixture has one yet: the first is the fixture recorded for the first release that ships blob storage |
 
 There is one fixture per storage backend a deployment runs on:
 
-- **`fs`** — `FileRawStorage` and `FileKVStore` from `@optimystic/db-p2p-storage-fs`, what `reference-peer` runs on. Packed as `files`, keyed by path. A release with the write-ahead log leaves a `write-ahead.log` in each directory: empty after the writer's clean close, and still readable if it holds records, since the reader's open replays them. It must never leave a `store.lock`, which only a store that was not closed leaves behind, and the generator refuses to pack one.
-- **`leveldb`** — `LevelDBRawStorage` and `LevelDBKVStore` from `@optimystic/db-p2p-storage-rn` over one LevelDB database, what a React Native app runs on. Written through `classic-level` (`writer/classic-level.mjs`, the binding that package's own suite uses) rather than `rn-leveldb`: the keys and values come from the package, not from the binding. Packed as `entries`, in key order, each key in hex.
+- **`fs`** — `FileRawStorage` and `FileKVStore` from `@optimystic/db-p2p-storage-fs`, what `reference-peer` runs on, and the `FilePieceStore` the reader opens over the block directory (`optimystic-pieces/` inside it), as a writer whose build has one does. Packed as `files`, keyed by path. A release with the write-ahead log leaves a `write-ahead.log` in each directory: empty after the writer's clean close, and still readable if it holds records, since the reader's open replays them. It must never leave a `store.lock`, which only a store that was not closed leaves behind, and the generator refuses to pack one.
+- **`leveldb`** — `LevelDBRawStorage` and `LevelDBKVStore` from `@optimystic/db-p2p-storage-rn` over one LevelDB database, what a React Native app runs on, and the `LevelDBPieceStore` the reader opens over the same database, as a writer whose build has one does. Written through `classic-level` (`writer/classic-level.mjs`, the binding that package's own suite uses) rather than `rn-leveldb`: the keys and values come from the package, not from the binding. Packed as `entries`, in key order, each key in hex.
 
 Each stored value is packed as parsed JSON when that gives back exactly its bytes, else as UTF-8 text, else base64, and is unpacked to those same bytes.
 

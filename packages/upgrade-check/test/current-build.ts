@@ -3,9 +3,9 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '@optimystic/quereus-plugin-optimystic/plugin';
 import { NetworkTransactor, type IRepo, type PeerId } from '@optimystic/db-core';
-import { createLibp2pNode, RepoClient, type IKVStore, type IRawStorage, type OptimysticNode } from '@optimystic/db-p2p';
-import { FileKVStore, FileRawStorage } from '@optimystic/db-p2p-storage-fs';
-import { LevelDBKVStore, LevelDBRawStorage } from '@optimystic/db-p2p-storage-rn';
+import { createLibp2pNode, RepoClient, type IKVStore, type IPieceStore, type IRawStorage, type OptimysticNode } from '@optimystic/db-p2p';
+import { FileKVStore, FilePieceStore, FileRawStorage } from '@optimystic/db-p2p-storage-fs';
+import { LevelDBKVStore, LevelDBPieceStore, LevelDBRawStorage } from '@optimystic/db-p2p-storage-rn';
 import { privateKeyFromProtobuf } from '@libp2p/crypto/keys';
 import { openClassicLevel } from '../writer/classic-level.mjs';
 import type { FixtureManifest, StorageLayout } from './fixture.js';
@@ -37,6 +37,7 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 		arachnode: { enableRingZulu: true },
 		storage: backend.storage,
 		kvStore: backend.kvStore,
+		pieceStorage: backend.pieceStorage,
 		privateKey: privateKeyFromProtobuf(Buffer.from(manifest.peerKey, 'base64')),
 	});
 	const transactor = nodeTransactor(node, manifest.networkName);
@@ -62,7 +63,9 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 interface OpenBackend {
 	storage: () => IRawStorage;
 	kvStore: IKVStore;
-	/** Releases what the node does not own: the two stores, and for LevelDB the handle they share, which neither store closes. */
+	/** Over the same location as `storage`, which no fixture's build wrote a piece into. */
+	pieceStorage: IPieceStore;
+	/** Releases what the node does not own: the three stores, and for LevelDB the handle they share, which no store closes. */
 	close(): Promise<void>;
 }
 
@@ -75,14 +78,21 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 			// below reopen it from disk.
 			const storage = new FileRawStorage(join(dataDir, layout.blocks));
 			const kvStore = new FileKVStore(join(dataDir, layout.kv));
+			// `<blocks>/optimystic-pieces/`, which `FileRawStorage`'s listing skips and its byte count includes.
+			const pieceStorage = new FilePieceStore(join(dataDir, layout.blocks));
 			return {
 				storage: () => storage,
 				kvStore,
+				pieceStorage,
 				close: async () => {
 					try {
-						await kvStore.close();
+						await pieceStorage.close();
 					} finally {
-						await storage.close();
+						try {
+							await kvStore.close();
+						} finally {
+							await storage.close();
+						}
 					}
 				},
 			};
@@ -90,13 +100,16 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 		case 'leveldb': {
 			// One storage and one key-value store over the handle, kept and closed here as the `fs`
 			// case keeps its two: each holds a group's writes until a flush, and closing is what
-			// applies what it still holds and disarms its timers before the handle goes away.
+			// applies what it still holds and disarms its timers before the handle goes away. The
+			// piece store holds nothing in memory and has no `close`.
 			const db = await openClassicLevel(join(dataDir, layout.path));
 			const storage = new LevelDBRawStorage(db);
 			const kvStore = new LevelDBKVStore(db);
+			const pieceStorage = new LevelDBPieceStore(db);
 			return {
 				storage: () => storage,
 				kvStore,
+				pieceStorage,
 				close: async () => {
 					try {
 						await kvStore.close();

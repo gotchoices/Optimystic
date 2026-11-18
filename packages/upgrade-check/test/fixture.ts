@@ -46,6 +46,11 @@ export interface FixtureManifest {
 		/** One more append whose pend landed and whose commit, recorded here, was never sent. */
 		inFlight: { entry: DiaryEntry; commit: CommitRequest };
 	};
+	/**
+	 * A blob the older build stored through `node.blobs.put`, recorded only by a build whose node has
+	 * `blobs`: its reference, its length and the SHA-256 of its bytes in lowercase hex.
+	 */
+	blob?: { ref: string; size: number; sha256: string };
 	/** Package name → installed version for the build that wrote the data, plus `node`. */
 	writtenBy: Record<string, string>;
 	writtenOn: string;

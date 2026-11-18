@@ -9,6 +9,8 @@ on-device LevelDB. Provides:
   commit proofs, and materialized blocks.
 - **`LevelDBKVStore`** — implements `IKVStore` for the persistent
   transaction state used to recover crashed two-phase commits.
+- **`LevelDBPieceStore`** — implements `IPieceStore`, the node's store of
+  blob pieces (`node.blobs`), in the same LevelDB.
 - **`loadOrCreateRNPeerKey`** — generates an Ed25519 libp2p private key on
   first run and persists it in the same LevelDB, giving the RN peer a
   stable, restart-surviving identity.
@@ -33,6 +35,7 @@ import {
   openOptimysticRNDb,
   LevelDBRawStorage,
   LevelDBKVStore,
+  LevelDBPieceStore,
   loadOrCreateRNPeerKey,
 } from '@optimystic/db-p2p-storage-rn';
 import { LevelDB, LevelDBWriteBatch } from 'rn-leveldb';
@@ -44,6 +47,7 @@ const db = openOptimysticRNDb({
 });
 const rawStorage = new LevelDBRawStorage(db);   // → IRawStorage
 const kvStore = new LevelDBKVStore(db);         // → IKVStore (txn recovery)
+const pieceStorage = new LevelDBPieceStore(db); // → IPieceStore (blob pieces)
 const privateKey = await loadOrCreateRNPeerKey(db);
 
 const libp2p = await createLibp2pNode({
@@ -52,14 +56,16 @@ const libp2p = await createLibp2pNode({
   privateKey,
   storage: rawStorage,
   kvStore,
+  pieceStorage,
 });
 ```
 
 Use the Node-free `/rn` entry point of `@optimystic/db-p2p` so the Node-only
 TCP transport doesn't get bundled into the React Native app.
 
-The same handle is shared by all three consumers. Close the storage and the
-key-value store before the handle, and the handle last:
+The same handle is shared by all four consumers. Close the storage and the
+key-value store before the handle, and the handle last; the piece store holds
+nothing in memory and has no `close`:
 
 ```ts
 await rawStorage.close();   // releases its read cache, applies what it still holds, disarms its timers
@@ -105,6 +111,7 @@ applies nothing.
 | `0x06` | `proofs` | `blockId`, rev (8 bytes big-endian) | `StoredProofEntry`: a reference to a `0x08` entry (a whole `BlockCommitProof` when an earlier build wrote it) |
 | `0x07` | `journal` | the record's sequence (8 bytes big-endian), or nothing for the applied-through mark | a journal record as bytes, or the number of the last record applied — owned by `LevelDBJournalStore` |
 | `0x08` | `commitProofs` | the proof's `messageHash`, UTF-8, with no `blockId` envelope | `BlockCommitProof` |
+| `0x09` | `pieces` | `0x00` then the piece id, UTF-8, for the piece; `0x01` then the piece id for its length | the piece's raw bytes; its length, 4 bytes big-endian — owned by `LevelDBPieceStore` |
 | `0x10` | `kv` | the key, UTF-8 | a string (not kernel-backed) |
 | `0x20` | `identity` | the key name, UTF-8 | raw protobuf bytes of the private key |
 
@@ -116,17 +123,26 @@ in that group's batch, so the move is atomic across crashes.
 
 ## Reads decode text in native code
 
-Every stored value is JSON text or an action id, written as `TextEncoder`
-output (native in Hermes). Every read — a block, a transform, metadata, a
-proof, a revision's action id, a key-value record — asks `rn-leveldb` for the
-value as a string (`getStr`, and `valueStr` on an iterator), which the binding
-decodes from UTF-8 in native code. No read reaches a JavaScript `TextDecoder`,
-which Hermes provides only as a polyfill and which a device profile of an
-offline save on an older phone measured as the largest single cost of the save
-(GitHub #51). Values are held as text all the way up: the read cache and the
+Every stored value but a blob piece is JSON text or an action id, written as
+`TextEncoder` output (native in Hermes). Every read of one — a block, a
+transform, metadata, a proof, a revision's action id, a key-value record — asks
+`rn-leveldb` for the value as a string (`getStr`, and `valueStr` on an
+iterator), which the binding decodes from UTF-8 in native code. No read reaches
+a JavaScript `TextDecoder`, which Hermes provides only as a polyfill and which a
+device profile of an offline save on an older phone measured as the largest
+single cost of the save (GitHub #51). Values are held as text all the way up: the read cache and the
 write group's in-memory overlay hold the string, so a cache hit is the string
 and one `JSON.parse`, and text becomes bytes only when a group is written to
 LevelDB.
+
+Blob pieces are the exception. A piece is raw bytes, not text, even when its
+bytes happen to be valid UTF-8, so `LevelDBPieceStore` reads one with
+`getBuf`, and nothing else reads a piece at all: `has`, the listing and the
+byte count read the 4-byte length key stored beside each piece. The block
+store's byte count (`getApproximateBytesUsed`) measures the piece range the same
+way, so it covers the whole database without reading a blob through the
+binding, and the two stores report one identity, so the node counts the pieces
+once.
 
 The read cache is part of the storage, not something to add: the node's own
 cache (`withReadCache`) would front the storage through an adapter that carries
@@ -208,6 +224,18 @@ A failed batch latches the storage: every later write, flush and
 the last flush as one batch, synced where the handle can — every flush of this
 store is strict, so nothing of it is ever journaled. `whenDurable()` and
 `close()` are the group's.
+
+`LevelDBPieceStore` holds nothing in memory: each `put` is one batch, the
+piece and its length together, synced where the handle can sync, and `flush()`
+has nothing left to do. LevelDB syncs only the log file a synced write lands
+in, and at a 4 MiB write buffer a run of 256 KiB pieces moves to a new log file
+every few pieces, so one synced write at the flush would not cover the pieces
+before it. `rn-leveldb` cannot sync yet, so on a phone the piece store reports
+`'process-crash'` and a stored piece survives the app crashing, not the phone
+losing power, exactly as the block store. A `delete` is never synced: one a
+power cut undoes leaves a piece no blob names, which the blob service's next
+sweep removes. The piece store has not run on a device; its suite runs over
+`classic-level`.
 
 ## Identity
 

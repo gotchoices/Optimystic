@@ -26,7 +26,7 @@ import { openClassicLevel } from '../writer/classic-level.mjs';
 
 const PACKAGE_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 const WRITER_DIR = join(PACKAGE_DIR, 'writer');
-const WRITER_FILES = ['write-scenario.mjs', 'classic-level.mjs'];
+const WRITER_FILES = ['write-scenario.mjs', 'classic-level.mjs', 'blob-content.mjs'];
 const FIXTURES_DIR = join(PACKAGE_DIR, 'fixtures');
 const RN_BACKEND_MANIFEST = join(PACKAGE_DIR, '..', 'db-p2p-storage-rn', 'package.json');
 
