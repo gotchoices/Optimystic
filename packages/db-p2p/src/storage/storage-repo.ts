@@ -8,7 +8,7 @@ import type {
 	StaleFailure, HlcClock, SkewLedger
 } from "@optimystic/db-core";
 import {
-	transformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
+	sharedTransformForBlockId, applyTransform, groupBy, concatTransform, emptyTransforms,
 	blockIdsForTransforms, transformsFromTransform, highestStaleAt, isOwnRevision, canonicalBlockHash, localDurability,
 	ValidityRejectedError
 } from "@optimystic/db-core";
@@ -25,7 +25,7 @@ import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-pr
 import { RevisionNotCoveredError } from "./i-block-storage.js";
 import { acquireBlockWriteLatches, withBlockWriteLatch, type BlockWriteLatch } from "./block-latch.js";
 import { createLogger } from "../logger.js";
-import { cloneDecoded } from "./raw-store-codec.js";
+import { PreviewedDigests, digestBaseOf, type DigestBase } from "./previewed-digests.js";
 import { checkPendValidation } from "../pend-validation.js";
 import { ActionChangeHold, type PendGroup } from "./action-change-hold.js";
 import { armUnrefTimer } from "../unref-timer.js";
@@ -375,6 +375,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	private readonly holdTimers = new Map<ActionId, () => void>();
 	/** What this repo does with each pend's HLC; `undefined` without a clock. */
 	private readonly pendHlcs: PendHlcIntake | undefined;
+	/** The promise round's digests of the content each commit will store (see {@link previewCommitDigest}). */
+	private readonly previewedDigests = new PreviewedDigests();
 	/**
 	 * Per issuing node, how far the HLCs of the pends this repo received sat from local time — the
 	 * measurement Stage 2 of docs/crdt-sync.md decides from, for a host or a test to read. Nothing
@@ -1193,7 +1195,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			// --- Pass 1: classify. Every read below runs under the hold. ---
 			for (const blockId of blockIds) {
 				const blockStorage = this.createBlockStorage(blockId);
-				const transforms = transformForBlockId(request.transforms, blockId);
+				const transforms = sharedTransformForBlockId(request.transforms, blockId);
 
 				// Handle any conflicting revisions FIRST: a block this same action already committed at
 				// exactly the requested revision is satisfied, and skips both this check and the
@@ -1336,13 +1338,16 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				if (satisfied.has(blockId)) {
 					continue;
 				}
-				const blockTransform = transformForBlockId(request.transforms, blockId);
+				// Shared, not copied: storage encodes the transform to JSON and keeps nothing of it.
+				const blockTransform = sharedTransformForBlockId(request.transforms, blockId);
 				const baseRev = declaredBaseFor(request.baseRevs, blockId, blockTransform);
 				await blockStorage.savePendingTransaction(request.actionId, blockTransform, {
 					...(request.rev === undefined ? {} : { rev: request.rev }),
 					...(baseRev === undefined ? {} : { baseRev }),
 					...(localRun === undefined ? {} : { localRun })
 				}, latch);
+				// After the save, so a preview that read the record this one replaced keeps no digest of it.
+				this.previewedDigests.forget(blockId, request.actionId);
 				saved.push(blockId);
 			}
 
@@ -1822,8 +1827,24 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 *
 	 * Returns `undefined` when this node holds no pending transform for the action (it never saw the
 	 * pend) — distinct from a defined preview with `digest: undefined` (see {@link CommitDigestPreview}).
+	 *
+	 * A digest is also kept for the commit that follows ({@link PreviewedDigests}), which takes it in
+	 * place of hashing the same content again when neither the pending record nor the base has changed.
 	 */
 	async previewCommitDigest(blockId: BlockId, actionId: ActionId, rev: number): Promise<CommitDigestPreview | undefined> {
+		// Before the first read of storage, so a pend that replaces the record meanwhile voids it.
+		const reservation = this.previewedDigests.reserve(blockId, actionId);
+		const materialized = await this.materializePreview(blockId, actionId, rev);
+		const digest = materialized?.preview.digest;
+		const base = materialized?.base;
+		this.previewedDigests.settle(reservation, digest === undefined || base === undefined ? undefined : { rev, base, digest });
+		return materialized?.preview;
+	}
+
+	/** {@link previewCommitDigest}'s answer, with the base its digest was computed over. */
+	private async materializePreview(
+		blockId: BlockId, actionId: ActionId, rev: number
+	): Promise<{ preview: CommitDigestPreview, base: DigestBase | undefined } | undefined> {
 		const storage = this.createBlockStorage(blockId);
 		const transform = await storage.getPendingTransaction(actionId);
 		if (!transform) {
@@ -1834,12 +1855,11 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// every member no matter what base it holds — do not read a base at all (the block may even be
 		// locally wedged/unmaterializable, which must not degrade a base-independent preview).
 		const baseIndependent = transform.insert !== undefined;
+		let latest: ActionRev | undefined;
 		let base: IBlock | undefined;
-		let baseRev: number | undefined;
 		if (!baseIndependent) {
-			const latest = await storage.getLatest();
+			latest = await storage.getLatest();
 			if (latest) {
-				baseRev = latest.rev;
 				try {
 					base = (await storage.getBlock(latest.rev))?.block;
 				} catch (err) {
@@ -1849,24 +1869,25 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 					// pending record or throw: preview is read-only and runs before any commit exists.
 					log('previewCommitDigest:unmaterializable-base blockId=%s baseRev=%d rev=%d error=%s',
 						blockId, latest.rev, rev, err instanceof Error ? err.message : String(err));
-					return { baseIndependent: false, baseRev, digest: undefined };
+					return { preview: { baseIndependent: false, baseRev: latest.rev, digest: undefined }, base: undefined };
 				}
 			}
 		}
 
-		// Clone both: applyTransform assigns `transform.insert` into the result by reference and
-		// applyOperations mutates the block in place, so materializing on live storage/pending objects
-		// would corrupt them for the real commit that follows. `cloneDecoded` (a JSON round-trip) rather
-		// than `structuredClone`, which Hermes lacks; lossless here because both values were just decoded
-		// from JSON by the store (every `IRawStorage` in this repo is the JSON-coded `KvRawStorage`).
-		// NOTE: if an `IRawStorage` that hands out live, never-serialized objects is ever wired in, this
-		// preview can drift from internalCommit (which applies to the uncloned values): an update op
-		// setting a field to `undefined` clones to `null`, which canonical JSON hashes differently.
-		const newBlock = applyTransform(cloneDecoded(base), cloneDecoded(transform));
+		// Materialized on the values themselves, with no copy: applyTransform puts `transform.insert`
+		// into the result and applyOperations changes the block in place, but both values were decoded
+		// for this preview alone. Every `IRawStorage` hands out a fresh object on every read — the
+		// `KvRawStorage` kernel decodes one per read, and `CachedRawStorage` is that kernel over a cache
+		// of encoded values — so nothing else holds them, and a later read decodes the stored bytes
+		// again (docs/internals.md "Storage Returns References"). It also makes the preview apply to the
+		// same kind of values `internalCommit` does, so the two cannot drift.
+		// NOTE: an `IRawStorage` that hands out a held object would have its stored content changed here;
+		// such a store breaks the contract the raw-storage conformance suite pins, not just this preview.
+		const newBlock = applyTransform(base, transform);
 		// `undefined` covers the tombstone (delete transform) and updates-with-no-base (applyTransform
 		// drops updates when there is no block to apply them to) — both materialize nothing.
 		const digest = newBlock ? await canonicalBlockHash(newBlock) : undefined;
-		return { digest, baseRev, baseIndependent };
+		return { preview: { digest, baseRev: latest?.rev, baseIndependent }, base: digestBaseOf(transform, latest) };
 	}
 
 	/**
@@ -1997,13 +2018,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// not built on what this node held before (see BlockMetadata.lineageFloor).
 		await storage.setLatest({ actionId, rev }, transform.insert === undefined, latch);
 
+		// The promise round's digest of `newBlock`, when this node previewed this record over this base;
+		// taken whether or not there is a proof, since nothing can use it once the record is promoted.
+		const previewedDigest = this.previewedDigests.take(blockId, actionId, rev, digestBaseOf(transform, latest));
+
 		// Persist the cohort's commit proof AFTER the commit is durably latest — the proof is
 		// evidence about a landed revision, never a precondition of landing it. The retention rule
 		// (persist only when the LOCAL materialization matches the digest the commit op declared)
 		// and its failure logging live in the shared helper; a proof-persist fault must not fail a
 		// commit that already landed, so the helper never throws.
 		if (proof !== undefined) {
-			await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, newBlock, latch);
+			await this.persistProofIfContentMatches(blockId, actionId, rev, storage, proof, newBlock, latch, previewedDigest);
 		}
 
 		// Prune the now-superseded prior materialization (checkpoint retention). Runs LAST — after the
@@ -2198,6 +2223,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * The proof, which lists every block of its commit, is stored once per node under its
 	 * `messageHash`, and each revision it covers holds a reference to it (`KvRawStorage.saveBlockProof`),
 	 * so a commit of N blocks retains one proof and N references rather than N copies.
+	 *
+	 * @param blockDigest `block`'s {@link canonicalBlockHash} when the caller already holds it — the
+	 * fresh commit's, from the promise round's preview ({@link PreviewedDigests}) — so it is not hashed
+	 * twice. The back-fill passes none.
 	 */
 	private async persistProofIfContentMatches(
 		blockId: BlockId,
@@ -2206,7 +2235,8 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		storage: IBlockStorage,
 		proof: BlockCommitProof,
 		block: IBlock | undefined,
-		latch: BlockWriteLatch
+		latch: BlockWriteLatch,
+		blockDigest?: string
 	): Promise<void> {
 		try {
 			const declaredDigest = proofDeclaredDigest(proof, { blockId, rev, actionId });
@@ -2216,7 +2246,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			}
 			// A digest was declared but this node materialized nothing (tombstone / unmaterializable
 			// read on the back-fill path): the local content provably is not the declared content.
-			const localDigest = block === undefined ? undefined : await canonicalBlockHash(block);
+			const localDigest = block === undefined ? undefined : blockDigest ?? await canonicalBlockHash(block);
 			if (localDigest !== declaredDigest) {
 				log('commit:proof-digest-mismatch blockId=%s rev=%d actionId=%s declared=%s local=%s',
 					blockId, rev, actionId, declaredDigest, localDigest);

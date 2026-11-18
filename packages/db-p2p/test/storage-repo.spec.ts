@@ -10,6 +10,8 @@ import type { BlockArchive, RestoreCallback, RevisionRange } from '../src/storag
 import type { BlockId, ActionId, ActionRev, ActionTransforms, BlockContentDigest, CommitResult, PendRequest, PendSuccess, StaleFailure, Transform, Transforms, IBlock, BlockHeader, CollectionChangeEvent } from '@optimystic/db-core';
 import { isBlockChangeNotifier, Latches, canonicalBlockHash } from '@optimystic/db-core';
 import { delay, waitFor } from '@optimystic/db-core/test';
+import { makeSignedProof } from './support/commit-proof-fixtures.js';
+import { captureLog, hasTag } from './support/capture-log.js';
 
 const makeHeader = (id: string): BlockHeader => ({
 	id: id as BlockId,
@@ -3250,7 +3252,7 @@ describe('StorageRepo', () => {
 			const commit = await repo.commit({ actionId: 'a2' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 2 });
 			expect(commit.success).to.equal(true);
 			expect(await storedDigest(2)).to.equal(preview!.digest);
-			// Preview cloned before materializing: the base rev 1 must still hold the pre-update content.
+			// The preview changed only the copy it decoded: rev 1 must still hold the pre-update content.
 			expect(await storedDigest(1), 'the base materialization was not mutated by the preview')
 				.to.not.equal(preview!.digest);
 		});
@@ -3320,6 +3322,45 @@ describe('StorageRepo', () => {
 			expect(preview!.digest).to.be.a('string');
 			expect(preview!.digest, 'digest is of the insert content')
 				.to.equal(await canonicalBlockHash(makeBlock(BLOCK, { items: ['fresh'] })));
+		});
+
+		/**
+		 * The commit takes the digest its record's preview computed instead of hashing the same content
+		 * again. A writer that rebuilt its attempt re-pends the action at the same revision with other
+		 * content; the preview's digest is then of content this node will not commit, and must not decide
+		 * whether the commit's proof is kept.
+		 */
+		describe('after the action is re-pended with other content', () => {
+			const ACTION = 'a1' as ActionId;
+			const previewed = makeBlock(BLOCK, { items: ['previewed'] });
+			const repended = makeBlock(BLOCK, { items: ['re-pended'] });
+
+			/** Pend and preview `previewed`, re-pend `repended`, then commit with a proof declaring `declared`'s digest. */
+			const previewThenRepend = async (declared: IBlock): Promise<unknown[][]> => {
+				await repo.pend({ actionId: ACTION, rev: 1, transforms: makeInsertTransforms(BLOCK, previewed), policy: 'c' });
+				expect((await repo.previewCommitDigest(BLOCK, ACTION, 1))?.digest).to.equal(await canonicalBlockHash(previewed));
+				await repo.pend({ actionId: ACTION, rev: 1, transforms: makeInsertTransforms(BLOCK, repended), policy: 'c' });
+				const request = {
+					actionId: ACTION, blockIds: [BLOCK], tailId: BLOCK, rev: 1,
+					blockDigests: { [BLOCK]: { digest: await canonicalBlockHash(declared) } }
+				};
+				const { proof } = await makeSignedProof(1, request);
+				return await captureLog('storage-repo', async () => {
+					expect((await repo.commit(request, undefined, { proof })).success).to.equal(true);
+				});
+			};
+
+			it('keeps the proof when the declaration is of the re-pended content', async () => {
+				const log = await previewThenRepend(repended);
+				expect(await repo.getBlockProof(BLOCK, 1), 'the committed content matches the declaration').to.not.equal(undefined);
+				expect(hasTag(log, 'commit:proof-digest-mismatch')).to.equal(false);
+			});
+
+			it('withholds the proof when the declaration is of the previewed content', async () => {
+				const log = await previewThenRepend(previewed);
+				expect(await repo.getBlockProof(BLOCK, 1), 'this node does not hold the declared content').to.equal(undefined);
+				expect(hasTag(log, 'commit:proof-digest-mismatch')).to.equal(true);
+			});
 		});
 
 		it('single-peer fast path: StorageRepo.commit accepts a request carrying blockDigests', async () => {

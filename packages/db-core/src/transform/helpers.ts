@@ -162,8 +162,9 @@ export function concatTransforms(...transforms: Transforms[]): Transforms {
  * when `updates` ride along) to affect the original Transforms.
  * @see docs/internals.md "Shallow Copy of Transforms" pitfall
  *
- * NOTE: clones unconditionally, even for read-only callers (e.g. StorageRepo.pend's classify pass);
- * if large inserts ever show up in a pend/commit profile, add a non-cloning variant for those callers.
+ * NOTE: clones unconditionally, even for read-only callers (the reservation reads in
+ * `ClusterMember.reservationRequestOf` and `CoordinatorRepo.corroborateHeldBlocks`, both in cohorts of
+ * four and up); if they ever show up in a pend profile, give them {@link sharedTransformForBlockId}.
  */
 export function transformForBlockId(transform: Transforms, blockId: BlockId): Transform {
 	return {
@@ -171,6 +172,22 @@ export function transformForBlockId(transform: Transforms, blockId: BlockId): Tr
 		...(transform.inserts && blockId in transform.inserts ? { insert: structuredClone(transform.inserts[blockId]) } : {}),
 		// Clone updates array to prevent shared references
 		...(transform.updates && blockId in transform.updates ? { updates: structuredClone(transform.updates[blockId]) } : {}),
+		...(transform.deletes?.includes(blockId) ? { delete: true } : {})
+	};
+}
+
+/**
+ * The transform for one block, SHARING `transform`'s inserted block and update list rather than
+ * copying them: for a caller that only reads the result, or serializes it at once, and keeps nothing
+ * of it. `StorageRepo.pend` reads it to classify a block and hands it to storage, which encodes it to
+ * JSON before returning. Anything that applies, changes or holds on to the result takes
+ * {@link transformForBlockId}, whose copy is what makes that safe.
+ * @see docs/internals.md "Functions That Share"
+ */
+export function sharedTransformForBlockId(transform: Transforms, blockId: BlockId): Transform {
+	return {
+		...(transform.inserts && blockId in transform.inserts ? { insert: transform.inserts[blockId]! } : {}),
+		...(transform.updates && blockId in transform.updates ? { updates: transform.updates[blockId]! } : {}),
 		...(transform.deletes?.includes(blockId) ? { delete: true } : {})
 	};
 }

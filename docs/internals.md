@@ -1286,6 +1286,20 @@ super-majority, regardless of its own promise vote (`getTransactionPhase`). Prom
 approvals are therefore the only votes that carry "I checked this", and downstream verification
 depends on that placement.
 
+**The commit reuses the preview's digest.** What a commit stores is a function of the pending record
+and the base it is applied over, so when the proof retention rule (next section) compares the
+stored content with the declared digest, `internalCommit` takes the digest this node's preview
+computed rather than hashing the same content again: only for the same `(block, action)` record and
+revision, over the same base (`latest`'s revision and action id, or an insert, whose result needs no
+base). The digests are kept in memory, bounded, by `PreviewedDigests` in
+`packages/db-p2p/src/storage/previewed-digests.ts`. A preview reserves its key before its first read
+of storage and keeps its digest only if the key still holds that reservation; a pend removes the key
+right after it saves the record; so a preview of a record a re-pend replaced keeps nothing. Every
+other case — no preview here, a moved base, an evicted entry, the back-fill of a proof onto a
+revision already held — hashes as before, and comparing with the declaration is unchanged. The
+preview itself applies the transform to the values the store decoded for it, with no copy, since the
+store decodes a fresh object on every read ([Storage Returns References](#2-storage-returns-references)).
+
 Residual: a false declaration commits only if the declarer lies AND enough of the cohort is
 simultaneously unable to check (lagging on update-only blocks, missed pends) that no honest
 checker remains — any single caught-up honest member rejects. That is strictly stronger than
@@ -1927,6 +1941,7 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
 |----------|---------|-------|
 | `Tracker.shareTransforms()` | new outer maps and `deletes` over the same staged values | The capture behind `Collection.snapshotPending`. The tracker gives up owning every value, so it copies each before changing it again |
 | `shallowCopyTransforms(transforms)` | the same, without touching any tracker | `Collection.restorePending`'s verbatim arm and `Collection.createReadTracker`, over a snapshot's values. The new maps are what let one snapshot be restored twice; a tracker handed them owns none of the values |
+| `sharedTransformForBlockId(transforms, blockId)` | one block's transform over the same inserted block and update list | For a caller that only reads the result, or serializes it at once, and keeps nothing of it: `StorageRepo.pend`, which classifies each block and hands its transform to storage to encode. Anything that applies or keeps the result takes `transformForBlockId`, which copies |
 
 ### Storage Clone Requirements
 **Memory storage MUST clone on get/save** to prevent cross-revision contamination:
@@ -1945,7 +1960,7 @@ saveMaterializedBlock(block): store(structuredClone(block));
 - `rev` = revision number, monotonically increasing per block
 
 ### Transform Ownership
-- `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers. The one exception is a staged-state snapshot and what is built from it ([Functions That Share](#functions-that-share)), safe because `Tracker` is the only thing that changes those values and it copies one before changing it
+- `Transforms.updates[blockId]` arrays and `Transforms.inserts[blockId]` blocks must NOT be shared between consumers. The exceptions are in [Functions That Share](#functions-that-share): a staged-state snapshot and what is built from it, safe because `Tracker` is the only thing that changes those values and it copies one before changing it; and one block's transform for a caller that reads or serializes it at once and keeps nothing (`sharedTransformForBlockId`)
 - `copyTransforms()` and `transformForBlockId()` must deep-clone both `insert` and `updates`
 - JSON serialization over network creates implicit deep copies
 
@@ -3835,6 +3850,8 @@ do today). The optional write-through cache (`cached-store-driver.ts`) and the w
 overlay sit inside that boundary for the same reason: each holds the encoded value, never a
 decoded object, so the kernel still decodes a fresh object per read and needs no cloning above
 it. The conformance suite runs against the cached compositions too, the text one included.
+`StorageRepo.previewCommitDigest` relies on this: it applies a pending transform to the base it read,
+changing both in place with no copy, because both were decoded for it alone.
 
 ### 3. Independent Node Storage
 **Bug**: Each node has its own storage. Consensus doesn't automatically sync data.

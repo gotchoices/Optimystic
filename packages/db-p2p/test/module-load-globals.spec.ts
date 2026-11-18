@@ -2,7 +2,6 @@ import { expect } from 'chai';
 import { spawnSync } from 'node:child_process';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { cloneDecoded } from '../src/storage/raw-store-codec.js';
 
 // Regression guard: loading the React Native entry must not make first-party code touch the globals
 // Hermes (React Native's JavaScript engine) lacks.
@@ -107,30 +106,5 @@ describe('React Native entry: globals Hermes lacks, at module load', function ()
 			{ n: 1, list: ['a', 'b'] },
 		]);
 		expect(result.actionId).to.equal('probe-action');
-	});
-});
-
-describe('cloneDecoded (the structuredClone replacement on the commit-preview path)', () => {
-	it('returns an independent deep copy', () => {
-		const original = { header: { id: 'b1' }, items: [['k', 1], ['j', 2]] };
-		const copy = cloneDecoded(original);
-		expect(copy).to.deep.equal(original);
-		copy.header.id = 'changed';
-		(copy.items[0] as unknown[]).push('extra');
-		expect(original).to.deep.equal({ header: { id: 'b1' }, items: [['k', 1], ['j', 2]] });
-	});
-
-	it('passes undefined through (a preview with no base block)', () => {
-		expect(cloneDecoded(undefined)).to.equal(undefined);
-	});
-
-	it('does not call structuredClone', () => {
-		const native = globalThis.structuredClone;
-		globalThis.structuredClone = () => { throw new Error('structuredClone called'); };
-		try {
-			expect(cloneDecoded({ a: [1, 2] })).to.deep.equal({ a: [1, 2] });
-		} finally {
-			globalThis.structuredClone = native;
-		}
 	});
 });

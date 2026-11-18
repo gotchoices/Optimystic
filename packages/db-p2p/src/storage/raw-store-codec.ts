@@ -53,22 +53,6 @@ export function decodeActionId(bytes: Uint8Array): ActionId {
 }
 
 /**
- * Deep-copy a value this codec decoded (`IBlock` / `Transform`), by the same JSON round-trip the
- * store applies. Used where a caller must mutate a stored value without touching the original, in
- * place of `structuredClone` — which Hermes (React Native) does not provide.
- *
- * Lossless for exactly the values this module hands out: anything `decodeJson` returned is already
- * JSON-shaped, so it carries none of what a JSON round-trip drops or rewrites (an `undefined` array
- * slot, an `undefined`-valued property, a `Date`, a `Uint8Array`) — those were already rewritten when
- * the value was stored. It is NOT a general-purpose `structuredClone` replacement: a live object
- * that never crossed this codec can come back different. `undefined` passes through, since
- * `JSON.parse(JSON.stringify(undefined))` throws.
- */
-export function cloneDecoded<T>(value: T): T {
-	return value === undefined ? value : JSON.parse(JSON.stringify(value)) as T;
-}
-
-/**
  * How a driver holds a stored value in memory: the UTF-8 bytes written to disk, or the text those
  * bytes decode to. Both are the same logical value. A composition is homogeneous — its kernel, its
  * cache, its write group and its backend's reads all use one representation — and nothing branches
