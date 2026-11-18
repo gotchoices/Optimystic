@@ -1103,7 +1103,10 @@ export class CoordinatorRepo implements IRepo {
 		// Only an expired window can be answered by a quiet span: a sample is an operator's request for a
 		// consult, and an unstamped block has no span to extend.
 		const stamp = windowOnly && windowDemand === 'expired' ? this.lastSeenCommitMs.get(blockId) : undefined;
-		const reserved = stamp?.quiet ? round?.join(blockGets.context) : undefined;
+		const background = windowOnly && !this.awaitWindowConsults;
+		// A consult that will run in the shared background round takes no seat in this read's round, so
+		// reserving one here would only hold back the read's other consults across the quiet-span await.
+		const reserved = stamp?.quiet && !(background && this.backgroundRounds) ? round?.join(blockGets.context) : undefined;
 		if (stamp?.quiet && await this.quietCohortStillVouches(blockId, stamp, stamp.quiet, localRev)) {
 			reserved?.ready();
 			// Served exactly as a read inside the window is, and the stamp is left as it is, so the span
@@ -1111,7 +1114,6 @@ export class CoordinatorRepo implements IRepo {
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			return;
 		}
-		const background = windowOnly && !this.awaitWindowConsults;
 		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
 		if (background) {
 			// The trigger line is logged only when a consult actually starts: a read that lands while the
@@ -1728,9 +1730,9 @@ export class CoordinatorRepo implements IRepo {
 	 * the pass measures its outcome against and what the consult tells each peer this node holds.
 	 *
 	 * A pass that starts joins the shared background round ({@link backgroundRounds}), so its questions
-	 * ride in the requests of the consults other reads start meanwhile; a seat the read reserved in its own
-	 * round (`reserved`, see {@link readRepairBlock}) is then left unused. With coalescing off the pass
-	 * joins the read's `round` instead, taking `reserved` when there is one, and the read leaves `reserved`
+	 * ride in the requests of the consults other reads start meanwhile; the read reserves no seat in its
+	 * own round then ({@link readRepairBlock}). With coalescing off the pass joins the read's `round`
+	 * instead, taking the seat the read `reserved` there when there is one, and the read leaves `reserved`
 	 * only when no pass starts.
 	 *
 	 * NOTE: accepted tradeoff — a read that waits on one consult and starts another behind it (a refresh
@@ -1745,6 +1747,8 @@ export class CoordinatorRepo implements IRepo {
 		// Joins only a pass that starts: a read that finds one running, or the slots full, asks nobody.
 		const outcome = this.heldBlockConsults.start(blockId, passRound, () =>
 			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), seatFor()));
+		// A pass in the shared round never takes `reserved`, so it is released whenever that round is in
+		// use: a seat left unready would hold the read's own round, and the read, forever.
 		if (this.backgroundRounds || outcome.kind !== 'started') reserved?.ready();
 		if (outcome.kind === 'deferred') {
 			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: outcome.inFlight, slotsInUse: outcome.slotsInUse });
