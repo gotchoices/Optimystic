@@ -154,6 +154,8 @@ Rules the recording follows:
 
 `UnderReplicationDrain` in `packages/db-p2p/src/repo/under-replication-drain.ts` is the sending half. It is a `Startable` beside the other resilience monitors, constructed in `createLibp2pNodeBase` outside the arachnode/FRET gate (it needs the key network, the node's own store and dialer, and libp2p's connection events — nothing from arachnode), so it runs on every node unless `NodeOptions.underReplicationDrain` is `{ enabled: false }`.
 
+The scheduling — what wakes a pass, the debounce and interval throttle, the per-pass budget, the give-up rule and which connected peers are eligible — is `DrainScheduler` in `packages/db-p2p/src/repo/drain-scheduler.ts`, shared with the blob copy drain ([docs/blobs.md §Placement, copying and durability](../../../docs/blobs.md#placement-copying-and-durability)). The drain supplies the ledger as the entry source and the push for one entry, and its log lines, the scheduler's included, keep the `under-replication-drain` namespace.
+
 **What wakes a pass.** The node starting — the entries the ledger carried across a restart, the case no in-memory retry ever covered; a peer connecting or completing identify, debounced (`debounceMs`) and throttled to one pass per `minIntervalMs`, a trigger inside the window being deferred to its end rather than dropped; and a re-check timer (`recheckIntervalMs`) armed while any entry is outstanding, cheap while nothing can be pushed (a tick with no pushable peer costs one connection scan and one in-memory count, `IUnderReplicationLedger.size`).
 
 **What one pass does**, per entry, over at most `blockBudget` entries (rotating, oldest-recorded first, so a backlog wider than the budget is swept in full and nothing starves):

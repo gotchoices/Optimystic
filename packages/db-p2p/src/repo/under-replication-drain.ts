@@ -1,13 +1,13 @@
-import type { Connection, Libp2p, PeerId, Startable } from '@libp2p/interface';
+import type { Startable } from '@libp2p/interface';
 import type { BlockId, CollectionId, IKeyNetwork } from '@optimystic/db-core';
 import type { PartitionDetector } from '../cluster/partition-detector.js';
 import type { PushBlockOutcome } from '../cluster/block-transfer-service.js';
 import { buildBlockTransferProtocol } from '../cluster/block-transfer-service.js';
 import type { IUnderReplicationLedger, SatisfyOutcome, UnderReplicatedEntry } from './i-under-replication-ledger.js';
 import { resolveOwedPeers, takeConfirmedCopies, type BlockDurabilitySink, type Owed } from './owed-copies.js';
-import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
+import type { NetworkMembershipGate } from '../network-membership-gate.js';
+import { DrainScheduler, type DrainEntryContext, type DrainLibp2p, type DrainPassReport, type DrainTrigger } from './drain-scheduler.js';
 import { createLogger } from '../logger.js';
-import { unrefTimer } from '../unref-timer.js';
 
 const log = createLogger('under-replication-drain');
 
@@ -52,17 +52,14 @@ export const DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG: UnderReplicationDrainConfig
 
 // Defined beside the shared confirmed-copy rule; re-exported so the package barrel still publishes it.
 export type { BlockDurabilitySink } from './owed-copies.js';
+// Defined beside the shared scheduling; re-exported so this module's surface is unchanged.
+export type { DrainLibp2p, DrainTrigger } from './drain-scheduler.js';
 
 /**
  * The push primitive, already bound to this node's own store, dialer and protocol prefix — the
  * node binds `pushBlockToPeers` (`cluster/block-transfer-service.ts`); a unit test binds a double.
  */
 export type BoundBlockPusher = (blockId: BlockId, peerIds: readonly string[]) => Promise<PushBlockOutcome>;
-
-/** The slice of libp2p the drain uses: identity, the connection events, and who is connected. */
-export type DrainLibp2p = Pick<Libp2p, 'peerId' | 'addEventListener' | 'removeEventListener' | 'getConnections'> & {
-	peerStore: Pick<Libp2p['peerStore'], 'get'>;
-};
 
 export interface UnderReplicationDrainDeps {
 	libp2p: DrainLibp2p;
@@ -79,9 +76,6 @@ export interface UnderReplicationDrainDeps {
 	 *  is never pushable, whatever its protocol list says. Absent → no check. */
 	membership?: NetworkMembershipGate;
 }
-
-/** What woke a pass. */
-export type DrainTrigger = 'start' | 'connection' | 'identify' | 'recheck' | 'manual';
 
 /** What one pass did. Counts are per ledger ENTRY (one per block). */
 export interface DrainPassResult {
@@ -109,9 +103,17 @@ export interface DrainPassResult {
 	abandoned: number;
 }
 
-const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
-	trigger, entries: 0, examined: 0, deferred: 0, solo: 0, waiting: 0, pushed: 0, cleared: 0, dropped: 0, abandoned: 0
-});
+/** The per-entry outcomes the block drain counts, in the order `pass:done` prints them. */
+const BLOCK_DRAIN_TALLIES = ['solo', 'waiting', 'pushed', 'cleared', 'dropped'] as const;
+type BlockDrainTally = typeof BLOCK_DRAIN_TALLIES[number];
+type BlockDrainContext = DrainEntryContext<BlockDrainTally>;
+
+function toPassResult(report: DrainPassReport<BlockDrainTally>): DrainPassResult {
+	const { trigger, skipped, entries, examined, deferred, abandoned, tallies } = report;
+	const result: DrainPassResult = { trigger, entries, examined, deferred, ...tallies, abandoned };
+	if (skipped !== undefined) result.skipped = skipped === 'no-eligible-peer' ? 'no-pushable-peer' : skipped;
+	return result;
+}
 
 /**
  * Sends the copies the under-replication ledger says this node still owes, and says when a block
@@ -124,6 +126,10 @@ const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
  * outstanding, it walks the ledger and pushes each block to the owed peers that are reachable right
  * now. A peer that confirms is removed from the entry; when the entry empties it is deleted and ONE
  * {@link BlockDurabilityReachedEvent} fires through the sink — after the deletion, never before.
+ *
+ * When a pass runs, which peers are reachable, the per-pass budget and the give-up rule are
+ * {@link DrainScheduler}'s, shared with the blob copy drain; this class supplies the ledger as the
+ * entry source and the push for one entry.
  *
  * What it deliberately does not do:
  * - **Dial the world.** A copy goes only to a peer that is connected and identified as serving this
@@ -145,240 +151,71 @@ const zeroCounts = (trigger: DrainTrigger): DrainPassResult => ({
  * consider draining newest-first so a host's most recent pending writes settle before old ones.
  */
 export class UnderReplicationDrain implements Startable {
-	private running = false;
-	private readonly config: UnderReplicationDrainConfig;
-	private readonly blockTransferProtocol: string;
-	private debounceTimer: ReturnType<typeof setTimeout> | null = null;
-	private timer: ReturnType<typeof setTimeout> | null = null;
-	private timerDueAt = 0;
-	private lastPassAt = 0;
-	private passInFlight: Promise<DrainPassResult> | null = null;
-	private pendingTrigger: DrainTrigger | null = null;
-	/** Rotation cursor into the oldest-first entry list, so a backlog wider than the budget is
-	 *  swept in full over successive passes rather than the same oldest slice every time. */
-	private cursor = 0;
-	/** Consecutive unconfirmed rounds per (block, peer) — the give-up counter. */
-	private readonly failures = new Map<BlockId, Map<string, number>>();
-	/** Peers given up on per block; excluded from pushes until they reconnect. */
-	private readonly abandoned = new Map<BlockId, Set<string>>();
-
-	private readonly onConnectionOpen: (event: CustomEvent<Connection>) => void;
-	private readonly onPeerIdentify: () => void;
+	private readonly scheduler: DrainScheduler<UnderReplicatedEntry, BlockDrainTally>;
 
 	constructor(
 		private readonly deps: UnderReplicationDrainDeps,
 		config: Partial<UnderReplicationDrainConfig> = {}
 	) {
-		this.config = { ...DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG, ...config };
-		this.blockTransferProtocol = buildBlockTransferProtocol(deps.protocolPrefix ?? '');
-		this.onConnectionOpen = (event) => this.handleConnectionOpen(event);
-		this.onPeerIdentify = () => this.schedule('identify');
+		const { blockBudget, ...schedule } = { ...DEFAULT_UNDER_REPLICATION_DRAIN_CONFIG, ...config };
+		// The ledger and the partition detector are read through `deps` on every pass, so a member the
+		// owner replaces after construction is the one the next pass uses.
+		this.scheduler = new DrainScheduler<UnderReplicatedEntry, BlockDrainTally>({
+			libp2p: deps.libp2p,
+			partitionDetector: { detectPartition: () => this.deps.partitionDetector.detectPartition() },
+			membership: deps.membership,
+			...(deps.protocolPrefix === undefined ? {} : { protocol: buildBlockTransferProtocol(deps.protocolPrefix) }),
+			source: {
+				list: () => this.deps.ledger.list(),
+				size: () => this.deps.ledger.size(),
+				keyOf: entry => entry.blockId
+			},
+			drainEntry: (entry, context) => this.drainEntry(entry, context),
+			tallies: BLOCK_DRAIN_TALLIES,
+			entryLabel: 'block',
+			log
+		}, { ...schedule, entryBudget: blockBudget });
 	}
 
 	// ── Startable ────────────────────────────────────────────────────
 
+	/** Starts listening, and runs one pass off the start path: the entries the ledger carried across
+	 *  a restart, the one case no in-memory mechanism ever covered. */
 	async start(): Promise<void> {
-		if (this.running) return;
-		this.running = true;
-		this.deps.libp2p.addEventListener('connection:open', this.onConnectionOpen);
-		this.deps.libp2p.addEventListener('peer:identify', this.onPeerIdentify);
-		log('started');
-		// The one case no in-memory mechanism ever covered: entries the ledger carried across a
-		// restart. Off the start path so a slow scan never blocks the node coming up.
-		void this.run('start').catch(err => { log('start pass error: %o', err); });
+		await this.scheduler.start();
 	}
 
 	async stop(): Promise<void> {
-		if (!this.running) return;
-		this.running = false;
-		this.deps.libp2p.removeEventListener('connection:open', this.onConnectionOpen);
-		this.deps.libp2p.removeEventListener('peer:identify', this.onPeerIdentify);
-		this.clearDebounce();
-		this.clearTimer();
-		this.pendingTrigger = null;
-		// An in-flight pass checks `running` between entries and bails; it is not awaited here so a
-		// stop never waits out a push deadline.
-		log('stopped');
+		await this.scheduler.stop();
 	}
 
 	// ── Public API ───────────────────────────────────────────────────
 
 	/** Run one pass now, bypassing the debounce and the interval throttle. Waits for an in-flight pass first. */
 	async checkNow(): Promise<DrainPassResult> {
-		if (this.passInFlight) await this.passInFlight.catch(() => undefined);
-		return this.run('manual');
+		return toPassResult(await this.scheduler.checkNow());
 	}
 
 	/** Observability: given-up (block, peer) pairs, whether a timer is armed, and the last pass. */
 	getDiagnostics(): { abandonedPairs: number; timerArmed: boolean; lastPassAt: number } {
-		let abandonedPairs = 0;
-		for (const peers of this.abandoned.values()) abandonedPairs += peers.size;
-		return { abandonedPairs, timerArmed: this.timer !== null, lastPassAt: this.lastPassAt };
+		return this.scheduler.getDiagnostics();
 	}
 
-	// ── Scheduling ───────────────────────────────────────────────────
+	// ── One entry ────────────────────────────────────────────────────
 
-	private handleConnectionOpen(event: CustomEvent<Connection>): void {
-		if (!this.running) return;
-		// A peer that comes back is retried from scratch: its abandonment and give-up counts go.
-		// Only a FRESH connection counts — libp2p opens parallel connections to one peer, and a second
-		// one must not wipe the record of a peer that never went away.
-		// NOTE: "fresh" is read as "this is the peer's only connection", which relies on libp2p's
-		// connection manager having registered the new connection before this listener runs. True on
-		// libp2p 3.x: the manager subscribes to `connection:open` at its own start (before any user
-		// listener) and stores the connection synchronously, before its first await. If a libp2p
-		// upgrade ever defers that store, every parallel connection would look fresh and an abandoned
-		// peer would be retried on each one — cheap, not wrong — and the check would want the
-		// `peer:connect` event instead, which fires only for a peer's first connection.
-		const remotePeer = event?.detail?.remotePeer;
-		if (remotePeer !== undefined && this.deps.libp2p.getConnections(remotePeer).length <= 1) {
-			this.forgetPeer(remotePeer.toString());
-		}
-		this.schedule('connection');
-	}
-
-	private schedule(trigger: DrainTrigger): void {
-		if (!this.running) return;
-		this.clearDebounce();
-		this.debounceTimer = setTimeout(() => {
-			this.debounceTimer = null;
-			this.maybeRun(trigger);
-		}, this.config.debounceMs);
-		unrefTimer(this.debounceTimer);
-	}
-
-	/** Run now, or defer to the end of the minimum interval — a trigger is never dropped. */
-	private maybeRun(trigger: DrainTrigger): void {
-		if (!this.running) return;
-		const wait = this.lastPassAt + this.config.minIntervalMs - Date.now();
-		if (wait > 0) {
-			log('throttled trigger=%s wait=%dms', trigger, wait);
-			this.armTimer(wait, trigger);
-			return;
-		}
-		void this.run(trigger).catch(err => { log('pass error trigger=%s: %o', trigger, err); });
-	}
-
-	/** Arm the one timer, pulling an already-armed one EARLIER when `delayMs` asks for sooner. */
-	private armTimer(delayMs: number, trigger: DrainTrigger): void {
-		if (!this.running) return;
-		const dueAt = Date.now() + delayMs;
-		if (this.timer !== null) {
-			if (this.timerDueAt <= dueAt) return;
-			this.clearTimer();
-		}
-		this.timerDueAt = dueAt;
-		this.timer = setTimeout(() => {
-			this.timer = null;
-			this.maybeRun(trigger);
-		}, delayMs);
-		unrefTimer(this.timer);
-	}
-
-	private clearTimer(): void {
-		if (this.timer !== null) {
-			clearTimeout(this.timer);
-			this.timer = null;
-		}
-	}
-
-	private clearDebounce(): void {
-		if (this.debounceTimer !== null) {
-			clearTimeout(this.debounceTimer);
-			this.debounceTimer = null;
-		}
-	}
-
-	/** Arm the re-check while anything is outstanding; otherwise let the timer lapse. */
-	private async rearmRecheck(): Promise<void> {
-		if (!this.running || this.config.recheckIntervalMs <= 0) return;
-		const outstanding = await this.deps.ledger.size();
-		if (outstanding > 0) this.armTimer(this.config.recheckIntervalMs, 'recheck');
-	}
-
-	// ── The pass ─────────────────────────────────────────────────────
-
-	/** One pass, never overlapping another: a trigger that lands mid-pass runs one more afterwards. */
-	private run(trigger: DrainTrigger): Promise<DrainPassResult> {
-		if (this.passInFlight) {
-			this.pendingTrigger = trigger;
-			return this.passInFlight;
-		}
-		const pass = this.performPass(trigger).finally(() => {
-			this.passInFlight = null;
-			const pending = this.pendingTrigger;
-			this.pendingTrigger = null;
-			if (pending !== null) this.maybeRun(pending);
-		});
-		this.passInFlight = pass;
-		return pass;
-	}
-
-	private async performPass(trigger: DrainTrigger): Promise<DrainPassResult> {
-		const counts = zeroCounts(trigger);
-		// A pass that scanned counts for the throttle however it ends — a ledger fault mid-pass must
-		// not make the next trigger an unthrottled retry. A skipped pass is free and does not count.
-		let scanned = false;
-		try {
-			if (this.deps.partitionDetector.detectPartition()) {
-				log('pass:skip trigger=%s reason=partition', trigger);
-				return { ...counts, skipped: 'partition' };
-			}
-			const pushable = await this.pushablePeers();
-			this.forgetDisconnected(pushable);
-			if (pushable.size === 0) {
-				return { ...counts, skipped: 'no-pushable-peer' };
-			}
-
-			const entries = await this.deps.ledger.list();
-			scanned = true;
-			this.pruneState(entries);
-			counts.entries = entries.length;
-			const examined = this.takeBudget(entries);
-			counts.examined = examined.length;
-			counts.deferred = entries.length - examined.length;
-
-			for (const entry of examined) {
-				if (!this.running) break;
-				await this.drainEntry(entry, pushable, counts);
-			}
-			log('pass:done trigger=%s entries=%d examined=%d deferred=%d solo=%d waiting=%d pushed=%d cleared=%d dropped=%d abandoned=%d',
-				trigger, counts.entries, counts.examined, counts.deferred, counts.solo, counts.waiting,
-				counts.pushed, counts.cleared, counts.dropped, counts.abandoned);
-			return counts;
-		} finally {
-			if (scanned) this.lastPassAt = Date.now();
-			await this.rearmRecheck();
-		}
-	}
-
-	/** The next `blockBudget` entries from the rotation cursor, wrapping; the cursor advances past them. */
-	private takeBudget(entries: UnderReplicatedEntry[]): UnderReplicatedEntry[] {
-		const budget = Math.max(1, this.config.blockBudget);
-		if (entries.length <= budget) {
-			this.cursor = 0;
-			return entries;
-		}
-		const start = this.cursor % entries.length;
-		const taken = [...entries.slice(start, start + budget), ...entries.slice(0, Math.max(0, start + budget - entries.length))];
-		this.cursor = (start + budget) % entries.length;
-		return taken;
-	}
-
-	private async drainEntry(entry: UnderReplicatedEntry, pushable: Set<string>, counts: DrainPassResult): Promise<void> {
+	private async drainEntry(entry: UnderReplicatedEntry, context: BlockDrainContext): Promise<void> {
 		const owed = await resolveOwedPeers(entry, this.deps.libp2p.peerId.toString(), this.deps.keyNetwork);
 		if (owed.kind === 'solo') {
-			counts.solo++;
+			context.tally('solo');
 			return;
 		}
 		if (owed.kind === 'unresolved') {
-			counts.waiting++;
+			context.tally('waiting');
 			return;
 		}
-		const abandoned = this.abandoned.get(entry.blockId);
-		const reachable = owed.peerIds.filter(peerId => pushable.has(peerId) && !abandoned?.has(peerId));
+		const reachable = this.pushablePeers(owed, context);
 		if (reachable.length === 0) {
-			counts.waiting++;
+			context.tally('waiting');
 			return;
 		}
 
@@ -388,42 +225,60 @@ export class UnderReplicationDrain implements Startable {
 			// makes when a tracked block has left local storage.
 			log('entry:dropped block=%s rev=%d (no local data)', entry.blockId, entry.rev);
 			await this.deps.ledger.delete(entry.blockId);
-			this.forgetBlock(entry.blockId);
-			counts.dropped++;
+			context.forgetEntry();
+			context.tally('dropped');
 			return;
 		}
 		if (outcome.status === 'unavailable') {
 			// Could not find out what this node holds — not "holds nothing". Keep the entry, count nothing.
 			log('entry:unavailable block=%s rev=%d reason=%s (keeping)', entry.blockId, entry.rev, outcome.reason);
-			counts.waiting++;
+			context.tally('waiting');
 			return;
 		}
-		counts.pushed++;
+		context.tally('pushed');
 		const heldRev = outcome.latest?.rev ?? entry.rev;
 		for (const peerId of outcome.confirmed) {
 			log('push:ok block=%s peer=%s rev=%d', entry.blockId, peerId, heldRev);
-			this.failures.get(entry.blockId)?.delete(peerId);
+			context.noteSuccess(peerId);
 		}
 
 		if (outcome.confirmed.length > 0) {
 			const status = await this.recordConfirmed(entry, owed, outcome.confirmed, heldRev, outcome.collectionId);
 			if (status === 'cleared') {
-				counts.cleared++;
-				this.forgetBlock(entry.blockId);
+				context.tally('cleared');
+				context.forgetEntry();
 				return;
 			}
 			if (status === 'absent') {
 				// Removed while the copy was in flight — by a `full` commit, whose coordinator fired the
 				// event when it removed the entry (firing here too would announce the block twice), or by
 				// the ledger's size cap, which owes no event: the block was never confirmed held.
-				this.forgetBlock(entry.blockId);
+				context.forgetEntry();
 				return;
 			}
 		}
 		if (outcome.refusals.length > 0) {
 			await this.deps.ledger.noteAttempt(entry.blockId);
-			counts.abandoned += this.noteRefusals(entry, outcome);
+			this.noteRefusals(entry, outcome, context);
 		}
+	}
+
+	/**
+	 * The owed peers a push can land on now: those the scheduler finds connected, admitted by the
+	 * membership gate and identified as serving this network's block-transfer protocol, less those
+	 * abandoned for this block.
+	 *
+	 * NOTE: an entry NAMING a peer the gate has since refused waits for it, so that block's
+	 * full-replication event does not fire while the peer stays refused — the drain has no notion of a
+	 * named member leaving the cohort, refused or otherwise. The same holds for a named member that has
+	 * since been rebuilt as a client (`NodeOptions.servesBlocks: false`) under the same peer id: once its
+	 * identify replaces the old protocol list it names no `block-transfer`, so it is never pushable and
+	 * the entry waits for it, never settling. If a removed
+	 * member's entries are seen never clearing, drop refused and non-serving peers from the named set
+	 * (and settle an entry left empty by that).
+	 */
+	private pushablePeers(owed: Owed & { kind: 'peers' }, context: BlockDrainContext): string[] {
+		return context.reachable(owed.peerIds);
 	}
 
 	/**
@@ -445,8 +300,7 @@ export class UnderReplicationDrain implements Startable {
 	}
 
 	/** Log each refusal so "cannot place" reads differently from "cannot reach", and count the round. */
-	private noteRefusals(entry: UnderReplicatedEntry, outcome: PushBlockOutcome & { status: 'pushed' }): number {
-		let abandoned = 0;
+	private noteRefusals(entry: UnderReplicatedEntry, outcome: PushBlockOutcome & { status: 'pushed' }, context: BlockDrainContext): void {
 		for (const refusal of outcome.refusals) {
 			if (refusal.reason === 'rejected') {
 				// Uncertified means this node retained no proof for the revision: the receiver's
@@ -456,105 +310,7 @@ export class UnderReplicationDrain implements Startable {
 			} else {
 				log('push:unreachable block=%s peer=%s err=%s', entry.blockId, refusal.peerId, refusal.error);
 			}
-			if (this.countFailure(entry.blockId, refusal.peerId)) abandoned++;
-		}
-		return abandoned;
-	}
-
-	/** Count one unconfirmed round for a peer; abandon it at the bound. @returns whether it was abandoned now. */
-	private countFailure(blockId: BlockId, peerId: string): boolean {
-		let perPeer = this.failures.get(blockId);
-		if (!perPeer) {
-			perPeer = new Map();
-			this.failures.set(blockId, perPeer);
-		}
-		const count = (perPeer.get(peerId) ?? 0) + 1;
-		if (count < this.config.maxAttempts) {
-			perPeer.set(peerId, count);
-			return false;
-		}
-		perPeer.delete(peerId);
-		let peers = this.abandoned.get(blockId);
-		if (!peers) {
-			peers = new Set();
-			this.abandoned.set(blockId, peers);
-		}
-		peers.add(peerId);
-		log('peer:abandoned block=%s peer=%s after=%d rounds (until it reconnects)', blockId, peerId, count);
-		return true;
-	}
-
-	/**
-	 * Connected peers identified as serving this network's block-transfer protocol — the only peers a
-	 * push can land on. Identify fills the peer store's protocol list, so a peer that just connected
-	 * is not yet pushable; the `peer:identify` trigger brings it in. With no prefix configured every
-	 * connected peer counts. A peer the membership gate refuses never counts: that protocol list is
-	 * one any connected peer can write.
-	 *
-	 * NOTE: an entry NAMING a peer the gate has since refused waits for it, so that block's
-	 * full-replication event does not fire while the peer stays refused — the drain has no notion of a
-	 * named member leaving the cohort, refused or otherwise. The same holds for a named member that has
-	 * since been rebuilt as a client (`NodeOptions.servesBlocks: false`) under the same peer id: once its
-	 * identify replaces the old protocol list it names no `block-transfer`, so it is never pushable and
-	 * the entry waits for it, never settling. If a removed
-	 * member's entries are seen never clearing, drop refused and non-serving peers from the named set
-	 * (and settle an entry left empty by that).
-	 */
-	private async pushablePeers(): Promise<Set<string>> {
-		const seen = new Set<string>();
-		const pushable = new Set<string>();
-		for (const connection of this.deps.libp2p.getConnections()) {
-			const peerId = connection.remotePeer;
-			const peerIdStr = peerId.toString();
-			if (seen.has(peerIdStr)) continue;
-			seen.add(peerIdStr);
-			if (!admittedBy(this.deps.membership, peerIdStr)) continue;
-			if (this.deps.protocolPrefix === undefined || await this.servesBlockTransfer(peerId)) {
-				pushable.add(peerIdStr);
-			}
-		}
-		return pushable;
-	}
-
-	private async servesBlockTransfer(peerId: PeerId): Promise<boolean> {
-		try {
-			const peer = await this.deps.libp2p.peerStore.get(peerId);
-			return peer.protocols.includes(this.blockTransferProtocol);
-		} catch {
-			// Not in the peer store (not yet identified) or a store fault: not pushable this pass.
-			return false;
-		}
-	}
-
-	// ── In-memory state upkeep ───────────────────────────────────────
-
-	private forgetPeer(peerId: string): void {
-		for (const peers of this.failures.values()) peers.delete(peerId);
-		for (const [blockId, peers] of this.abandoned) {
-			if (peers.delete(peerId) && peers.size === 0) this.abandoned.delete(blockId);
-		}
-	}
-
-	/** An abandoned peer that has gone is forgotten: when it returns it is retried from scratch. */
-	private forgetDisconnected(pushable: Set<string>): void {
-		for (const [blockId, peers] of this.abandoned) {
-			for (const peerId of peers) {
-				if (!pushable.has(peerId)) peers.delete(peerId);
-			}
-			if (peers.size === 0) this.abandoned.delete(blockId);
-		}
-	}
-
-	private forgetBlock(blockId: BlockId): void {
-		this.failures.delete(blockId);
-		this.abandoned.delete(blockId);
-	}
-
-	/** Drop state for blocks the ledger no longer lists (settled by a `full` commit, evicted, dropped). */
-	private pruneState(entries: UnderReplicatedEntry[]): void {
-		const listed = new Set(entries.map(entry => entry.blockId));
-		for (const blockId of [...this.failures.keys(), ...this.abandoned.keys()]) {
-			if (!listed.has(blockId)) this.forgetBlock(blockId);
+			context.noteFailure(refusal.peerId);
 		}
 	}
 }

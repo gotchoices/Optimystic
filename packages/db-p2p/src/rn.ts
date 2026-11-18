@@ -44,6 +44,7 @@ export * from './repo/client.js';
 export * from './repo/cluster-coordinator.js';
 export * from './repo/consult-round.js';
 export * from './repo/coordinator-repo.js';
+export * from './repo/drain-scheduler.js';
 export * from './repo/i-under-replication-ledger.js';
 export * from './repo/kv-under-replication-ledger.js';
 export * from './repo/under-replication-drain.js';
