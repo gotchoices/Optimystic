@@ -25,6 +25,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { expectIndexAgreesWithScan, queryAll } from './query-helpers.js';
+import { CommitGate, commitPastIndexBuild, gateTransactor } from './commit-gate.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -315,15 +316,17 @@ describe('index backfill correctness around the empty-table skip', function () {
 		const ddl = ddlFor('detached', uri);
 		const indexUri = `${uri}/index/detached_by_token`;
 
-		const a = newSession(shared);
+		const gate = new CommitGate();
+		const a = newSession(gateTransactor(shared, gate, { gateOn: 'pend' }));
 		await a.db.exec(ddl);
 
 		const b = newSession(shared);
 		await b.db.exec(ddl);
-		await b.db.exec(`create index detached_by_token on detached(token)`);
 
-		// A is detached from the index and commits a row past it.
-		await a.db.exec(`insert into detached (id, token) values (1, 'tok-a')`);
+		// A commits a row past B's index build, so it is detached from the index.
+		await commitPastIndexBuild(gate,
+			() => a.db.exec(`insert into detached (id, token) values (1, 'tok-a')`),
+			() => b.db.exec(`create index detached_by_token on detached(token)`));
 		expect(await countTreeEntries(a.plugin, indexUri), 'the detached write left no index entry')
 			.to.equal(0);
 

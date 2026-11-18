@@ -27,6 +27,8 @@ const log = createLogger('plugin');
 // that they do anyway). The db-core classes are safe to re-export: db-core is `external` in
 // tsup.config.ts, so this package never bundles its own copy of them.
 export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
+export { StaleTableDescriptionError } from './optimystic-adapter/table-description-check.js';
+export type { StaleTableDescription } from './optimystic-adapter/table-description-check.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 // The predicate an `onCommitDurability` listener tests "saved" with, so a host needs no db-core import for it.
 export { isFullyDurable } from '@optimystic/db-core';

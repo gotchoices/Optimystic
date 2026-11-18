@@ -22,6 +22,22 @@ import { NetworkTransactor } from '@optimystic/db-core';
 import { waitForValue, delay } from '@optimystic/db-core/test';
 import { queryAll, queryGet } from './query-helpers.js';
 import register from '../dist/plugin.js';
+import { StaleTableDescriptionError } from '../dist/index.js';
+
+/**
+ * Run `sql` on `db`, and once more if its commit was refused because another node changed the table's
+ * description since `db` read it: the refusal leaves `db` holding the new description, so the retry
+ * is written under it. Whether the first attempt is refused depends on whether this node's read of
+ * the catalog already sees the other node's change.
+ */
+async function execUnderCurrentDescription(db: Database, sql: string): Promise<void> {
+	try {
+		await db.exec(sql);
+	} catch (error) {
+		if (!(error instanceof StaleTableDescriptionError)) throw error;
+		await db.exec(sql);
+	}
+}
 
 interface TestNode {
 	node: any;
@@ -313,8 +329,9 @@ describe('Distributed Transaction Validation', function () {
 		}
 		console.log('✅ All nodes have 3 orders');
 
-		// Update (modifies index if customer changes)
-		await nodes[1]!.db.exec(`UPDATE ${tableName} SET customer = 'Charlie' WHERE id = 'ord2'`);
+		// Update (modifies index if customer changes). Node 2 has not seen the index Node 1 created, so
+		// its first attempt may be refused and retried under the description that lists it.
+		await execUnderCurrentDescription(nodes[1]!.db, `UPDATE ${tableName} SET customer = 'Charlie' WHERE id = 'ord2'`);
 		console.log('✅ Updated ord2 customer (index re-keyed)');
 
 		// Verify update replicated — poll past the stale 'Bob' until 'Charlie' lands.
@@ -330,8 +347,8 @@ describe('Distributed Transaction Validation', function () {
 		}
 		console.log('✅ Update replicated to all nodes');
 
-		// Delete (removes from both table and index)
-		await nodes[2]!.db.exec(`DELETE FROM ${tableName} WHERE id = 'ord3'`);
+		// Delete (removes from both table and index); Node 3 has not seen the index either.
+		await execUnderCurrentDescription(nodes[2]!.db, `DELETE FROM ${tableName} WHERE id = 'ord3'`);
 		console.log('✅ Deleted ord3');
 
 		// Verify deletion replicated — poll past the stale 3-row state until 2 remain.
@@ -526,18 +543,6 @@ describe('Distributed Transaction Validation', function () {
 
 		console.log(`\n📝 Test: Local schema enforcement for "${tableName}"`);
 
-		// Create table on Node 1 with EXTRA column
-		await nodes[0]!.db.exec(`
-			CREATE TABLE ${tableName} (
-				id TEXT PRIMARY KEY,
-				name TEXT NOT NULL,
-				extra_field TEXT
-			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
-		`);
-		console.log('   Node 1: Table created WITH extra_field column');
-
-		await delay(2000);
-
 		// Create table on Node 2 WITHOUT extra column
 		await nodes[1]!.db.exec(`
 			CREATE TABLE ${tableName} (
@@ -546,6 +551,20 @@ describe('Distributed Transaction Validation', function () {
 			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
 		`);
 		console.log('   Node 2: Table created WITHOUT extra_field column');
+
+		await delay(2000);
+
+		// Create table on Node 1 with EXTRA column. Declared last, so the catalog record carries it and
+		// Node 1's writes are made under the record's description; a node writing under a description
+		// a later declaration replaced is refused at commit (stale-hydrated-table.spec.ts).
+		await nodes[0]!.db.exec(`
+			CREATE TABLE ${tableName} (
+				id TEXT PRIMARY KEY,
+				name TEXT NOT NULL,
+				extra_field TEXT
+			) USING optimystic('${collectionUri}', transactor='network', networkName='${NETWORK_NAME}')
+		`);
+		console.log('   Node 1: Table created WITH extra_field column');
 
 		await delay(2000);
 

@@ -17,7 +17,7 @@ import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { PredicateExpression } from './index-predicate.js';
 import type { CatalogBatchCheckpoint, CatalogEntry } from './catalog-batch.js';
-import { catalogKey, identityVtabArgs, namesOfCatalogKey, sessionBindingVtabArgs } from './table-identity.js';
+import { catalogKey, identityVtabArgs, namesOfCatalogKey, qualifiedTableName, sessionBindingVtabArgs } from './table-identity.js';
 import type { QualifiedTableName } from './table-identity.js';
 import { copyTags, withTagsAt } from './tag-overlay.js';
 import type { TagSlots } from './tag-overlay.js';
@@ -915,11 +915,22 @@ export function mergePersistedSchemas(
 }
 
 /**
+ * What the catalog holds for one table ({@link SchemaManager.readRecordsFresh}): its live record, a
+ * gravestone (another machine dropped it), or neither.
+ */
+export type CatalogRecordState =
+	| { readonly kind: 'live'; readonly record: StoredTableSchema }
+	| { readonly kind: 'dropped' }
+	| { readonly kind: 'absent' };
+
+/**
  * Manages schema storage and retrieval in Optimystic trees
  */
 export class SchemaManager {
 	/** Resolved live schemas by catalog key ({@link catalogKey}). */
 	private schemaCache = new Map<string, StoredTableSchema>();
+	/** {@link recordReader}'s open catalog trees, by the transactor each reads through. */
+	private readonly recordReaders = new Map<ITransactor | undefined, Tree<string, any>>();
 	/**
 	 * The open `APPLY SCHEMA` catalog batch, if any. While set, every catalog read and write
 	 * below routes through it (see {@link beginBatch}); the unbatched paths are untouched.
@@ -1140,9 +1151,10 @@ export class SchemaManager {
 	 * An index the record lists over a column `candidate` lacks, in its key or in its WHERE clause, is
 	 * left out, since it can be neither resolved nor evaluated against these columns.
 	 *
-	 * NOTE: such an index is unmaintained on this machine, so a row this machine writes has no entry
-	 * in it; `bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced`
-	 * owns following the newer description.
+	 * Such an index is unmaintained on this machine, so a write this machine makes is refused at
+	 * commit, as is one made after any other change to the record: the commit compares the
+	 * instance's description with a fresh read of the record (`judgeTableDescriptions` in
+	 * `optimystic-adapter/table-description-check.ts`), and the machine then follows the record.
 	 */
 	viewOverRecord(candidate: StoredTableSchema, persisted: StoredTableSchema | undefined): StoredTableSchema {
 		if (!persisted) {
@@ -1295,6 +1307,71 @@ export class SchemaManager {
 			return undefined;
 		}
 		return this.schemaCache.get(key);
+	}
+
+	/**
+	 * What the catalog holds for each of `tables`, read fresh for all of them in one refresh of the
+	 * catalog tree: the live record (resolved, and cached as {@link getSchemaFresh} caches it), a
+	 * gravestone (`dropped`, and the cached copy forgotten), or neither (`absent`: no entry, a bare
+	 * tombstone, or no catalog at all — which, as for {@link getSchema}, is not proof the catalog holds
+	 * nothing). Keyed by `qualifiedTableName`. For the commit-time description check
+	 * (`judgeTableDescriptions` in `optimystic-adapter/table-description-check.ts`), which asks about
+	 * every table a transaction wrote and pays one catalog read for them. A read that cannot reach the
+	 * catalog throws, as {@link getSchemaFresh} does.
+	 */
+	async readRecordsFresh(tables: readonly QualifiedTableName[], transactor?: ITransactor): Promise<Map<string, CatalogRecordState>> {
+		const states = new Map<string, CatalogRecordState>();
+		const tree = this.batch ? undefined : await this.recordReader(transactor);
+		await tree?.update();
+		for (const table of tables) {
+			const key = catalogKey(table.schemaName, table.tableName);
+			const entry = this.batch
+				? await this.batch.readEntry(key, transactor)
+				: tree && await this.entryAt(tree, key);
+			states.set(qualifiedTableName(table), this.recordStateOf(key, entry));
+		}
+		return states;
+	}
+
+	/**
+	 * The catalog tree {@link readRecordsFresh} reads through for `transactor`, kept open from one call
+	 * to the next, so each call costs one refresh of the tree — one request when nothing has changed —
+	 * rather than an open (the header, then the log tail) and a descent through a cold cache. Kept
+	 * beyond a transaction safely because nothing is ever staged into it. Not kept while the catalog
+	 * does not exist yet.
+	 */
+	private async recordReader(transactor?: ITransactor): Promise<Tree<string, any> | undefined> {
+		const kept = this.recordReaders.get(transactor);
+		if (kept) {
+			return kept;
+		}
+		const tree = await this.getSchemaTree(transactor);
+		if (tree) {
+			this.recordReaders.set(transactor, tree);
+		}
+		return tree;
+	}
+
+	/** The entry filed under `key` in `tree`, which the caller has brought up to date; undefined when none is. */
+	private async entryAt(tree: Tree<string, any>, key: string): Promise<unknown> {
+		const path = await tree.find(key);
+		return tree.isValid(path) ? tree.at(path) : undefined;
+	}
+
+	/** {@link readRecordsFresh}'s answer for one entry, keeping the cache as {@link getSchemaFresh} keeps it. */
+	private recordStateOf(key: string, entry: unknown): CatalogRecordState {
+		if (this.batch) {
+			const live = this.livePersistedEntry(entry);
+			if (live) return { kind: 'live', record: toStoredSchema(live) };
+		} else {
+			const record = this.resolveAndCache(entry);
+			if (record) return { kind: 'live', record };
+		}
+		if (this.droppedPersistedEntry(entry)) {
+			this.schemaCache.delete(key);
+			return { kind: 'dropped' };
+		}
+		return { kind: 'absent' };
 	}
 
 	/**

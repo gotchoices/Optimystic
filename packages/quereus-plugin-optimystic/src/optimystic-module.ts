@@ -10,6 +10,7 @@ import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { announceExternalChange } from './optimystic-adapter/external-change.js';
 import { OptimysticVirtualTableConnection } from './optimystic-adapter/vtab-connection.js';
 import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './optimystic-adapter/offline-mode.js';
+import type { DescriptionVerdict, StaleVerdict, TableDescriptionCheck } from './optimystic-adapter/table-description-check.js';
 import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
 import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow } from './optimystic-adapter/write-description.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
@@ -21,7 +22,8 @@ import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
-import type { PersistedIndexSchema, PersistedTableSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
+import type { CatalogRecordState, PersistedIndexSchema, PersistedTableSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
+import { descriptionDifference } from './schema/description-difference.js';
 import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers, dropColumnRefusal, findNamed, positionOfNamed, tagsToSave, withoutNamed } from './schema/catalog-only-change.js';
 import type { CatalogObject, CatalogObjectKind, CatalogOnlyVerdict } from './schema/catalog-only-change.js';
 import { RowCodec, type EncodedRow } from './schema/row-codec.js';
@@ -49,6 +51,12 @@ const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
  *  factory should reuse (`CollectionFactory.createOrGetCollection`) outside any SQL transaction. */
 function transactorOnlyState(transactor: ITransactor): TransactionState {
   return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: emptyWriteFacts() };
+}
+
+/** The collection handles a re-initialization reuses ({@link OptimysticVirtualTable.adoptCatalogEntry}). */
+interface KeptHandles {
+  readonly collection: Tree<string, any>;
+  readonly indexTrees: ReadonlyMap<string, Tree<string, IndexEntry>>;
 }
 
 /** A UNIQUE constraint that binds a row, with the index tree enforcing it
@@ -900,6 +908,15 @@ export class OptimysticVirtualTable extends VirtualTable {
   private readonly unknownMergeLogged = new Set<string>();
   /** Keys the delete arm removed, per open transaction. See {@link removedEarlierInTransaction}. */
   private readonly removedKeys = new WeakMap<TransactionState, Set<string>>();
+  /** Handed to the bridge on every write ({@link markDirtyTrees}); built on the first. */
+  private descriptionCheck?: TableDescriptionCheck;
+  /**
+   * The collection handles the next full {@link doInitialize} reuses instead of opening new ones, set
+   * by {@link adoptCatalogEntry}: the main tree and each index tree by name. Kept so offline-queued
+   * transactions sealed into those handles stay visible to this machine's reads, and their caches
+   * stay warm.
+   */
+  private handlesToKeep?: KeptHandles;
   /** What the offline-mode controller asks to judge a transaction's checks on this table's trees,
    * published beside the policy ({@link publishOfflinePolicy}) and read at call time. */
   private readonly outlookSource: TableOutlookSource = {
@@ -1111,8 +1128,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       //
       // Opened together with the catalog read: neither reads the other's result, and each
       // waits on its own network round trips.
+      const kept = readOnly ? undefined : this.handlesToKeep;
       const [collection, persistedSchema] = await Promise.all([
-        this.collectionFactory.createOrGetCollection(this.options, txnState || undefined),
+        kept?.collection ?? this.collectionFactory.createOrGetCollection(this.options, txnState || undefined),
         this.schemaManager.getSchema(this.schemaName, this.tableName, txnState?.transactor),
       ]);
 
@@ -1266,7 +1284,7 @@ export class OptimysticVirtualTable extends VirtualTable {
       // Create and initialize index manager
       const indexManager = new IndexManager(
         storedSchema,
-        (indexName, transactor) => this.openIndexTree(indexName, transactor)
+        async (indexName, transactor) => kept?.indexTrees.get(indexName) ?? await this.openIndexTree(indexName, transactor)
       );
 
       // Give every point-enforceable secondary UNIQUE constraint a backing index tree
@@ -1307,6 +1325,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       // registerCollections). Must happen before any DML so the coordinator
       // captures their pre-stage state at the next applyActions barrier.
       this.registerCollections();
+      if (kept) {
+        this.forgetUnmaintainedTrees(kept, indexManager);
+      }
       this.followForMaterializedViews(replaced, collection);
       // A journaled offline transaction deferred because this table could not be reached is put back
       // now that it can (docs/offline-sync.md §Restore after a restart); scheduled, never awaited here.
@@ -1604,9 +1625,65 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * Release what this instance registered beyond its own fields, for a table that is gone from this
+   * machine: on DROP TABLE, on a refused CREATE, and when the catalog shows another machine dropped
+   * it ({@link OptimysticModule.followCatalog}). The change subscription and network watch, the
+   * materialized-view follower's registration, the bridge's naming of the table in commit reports,
+   * and its offline policy. Nothing in storage or the catalog is touched, and the collections stay
+   * registered with the bridge, as a DROP has always left them. Idempotent.
+   */
+  releaseRegistrations(): void {
+    this.teardownChangeSubscription();
+    this.forgetInCommitReports();
+    this.withdrawOfflinePolicy();
+  }
+
+  /**
+   * Take `entry`, the engine's catalog entry rebuilt from the catalog's record after another machine
+   * changed the table's description ({@link OptimysticModule.followCatalog}), as this instance's
+   * description. The next touch re-runs {@link doInitialize}, which views the record (the instance
+   * owes nothing) and rebuilds the row codec and index maintenance from it, the indexes another
+   * machine created included, whose trees that machine has populated.
+   *
+   * Re-initialized in place rather than replaced by a new instance, as a failed `apply schema`
+   * re-initializes one ({@link oweCatalogRecord}): the change subscription, network watch,
+   * materialized-view registration (with any signal it holds), offline policy and commit-report
+   * naming stay as they are, and the tag-derived state follows through {@link followSchemaTags} when
+   * the module announces the new entry. The open collection handles are reused too
+   * ({@link handlesToKeep}): a transaction the offline queue holds is sealed into them.
+   */
+  adoptCatalogEntry(entry: TableSchema): void {
+    if (this.collection && this.indexManager) {
+      const manager = this.indexManager;
+      const indexTrees = new Map<string, Tree<string, IndexEntry>>();
+      for (const { name } of manager.getAllMaintainedIndexes()) {
+        const tree = manager.getIndexTree(name);
+        if (tree) indexTrees.set(name, tree);
+      }
+      this.handlesToKeep = { collection: this.collection, indexTrees };
+    }
+    this.tableSchema = entry;
+    this.isInitialized = false;
+    this.isProvisionallyInitialized = false;
+  }
+
+  /**
+   * After a re-initialization that reused `kept`: the index trees the new description no longer
+   * maintains (an index another machine dropped) leave the transaction bridge, as a `DROP INDEX`
+   * through this instance takes them out ({@link removeIndex}), and the handles are no longer kept.
+   */
+  private forgetUnmaintainedTrees(kept: KeptHandles, manager: IndexManager): void {
+    for (const [name, tree] of kept.indexTrees) {
+      if (manager.getIndexTree(name) !== tree) {
+        this.txnBridge.forgetTree(tree);
+      }
+    }
+    this.handlesToKeep = undefined;
+  }
+
+  /**
    * Tear down the collection-change subscription and the materialized-view
-   * follower's registration (idempotent). Called from
-   * OptimysticModule.destroy (DROP TABLE / module teardown).
+   * follower's registration (idempotent). Part of {@link releaseRegistrations}.
    *
    * Deliberately NOT called from disconnect(): in this vtab, disconnect() is a
    * per-statement no-op that intentionally keeps the table initialized across
@@ -1614,7 +1691,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * reactivity after the first scan. The storage listener therefore lives for
    * the table's lifetime and is released on destroy.
    */
-  teardownChangeSubscription(): void {
+  private teardownChangeSubscription(): void {
     if (this.changeUnsubscribe) {
       try {
         this.changeUnsubscribe();
@@ -1810,8 +1887,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     }
   }
 
-  /** Withdraw this table's offline policy from the controller; on DROP and on a refused CREATE. */
-  withdrawOfflinePolicy(): void {
+  /** Withdraw this table's offline policy from the controller. Part of {@link releaseRegistrations}. */
+  private withdrawOfflinePolicy(): void {
     this.txnBridge.getOfflineMode()?.withdrawTablePolicy(this.qualifiedTable);
   }
 
@@ -2737,6 +2814,66 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.txnBridge.markDirty(tree);
       }
     }
+    this.descriptionCheck ??= this.buildDescriptionCheck();
+    this.txnBridge.noteTableWrite(this.descriptionCheck);
+  }
+
+  /**
+   * This table's part in the commit-time check that a write was made under the description the
+   * catalog holds now (`judgeTableDescriptions` in optimystic-adapter/table-description-check.ts).
+   * Reads the instance's state when the commit runs, so one object serves every transaction.
+   */
+  private buildDescriptionCheck(): TableDescriptionCheck {
+    return {
+      table: this.qualifiedTable,
+      catalog: this.schemaManager,
+      staged: () => this.hasStagedWrites(),
+      judge: state => this.judgeDescription(state),
+      follow: verdict => this.followCatalog(verdict),
+    };
+  }
+
+  /** Whether any of this table's trees holds something not yet committed. */
+  private hasStagedWrites(): boolean {
+    return (this.collection?.hasUnsyncedChanges() ?? false)
+      || (this.indexManager?.getIndexTrees().some(tree => tree.hasUnsyncedChanges()) ?? false);
+  }
+
+  /**
+   * How this instance's description stands against what the catalog holds for the table. An instance
+   * owing its record is current: its description is the one about to be written, and its
+   * initialization, which writes it, runs before anything stages.
+   */
+  private judgeDescription(state: CatalogRecordState): DescriptionVerdict {
+    if (this.owesRecord) {
+      return { kind: 'current' };
+    }
+    switch (state.kind) {
+      case 'absent':
+        return { kind: 'unknown' };
+      case 'dropped':
+        return { kind: 'dropped' };
+      case 'live': {
+        const difference = descriptionDifference(this.writtenDescription(), state.record);
+        return difference === undefined ? { kind: 'current' } : { kind: 'replaced', difference, record: state.record };
+      }
+    }
+  }
+
+  /**
+   * The description this instance's writes honour: its own schema, which the engine plans and checks
+   * every statement against, with the indexes it maintains — those its writes stage entries into, not
+   * those the engine lists.
+   */
+  private writtenDescription(): StoredTableSchema {
+    const manager = this.indexManager;
+    const maintained = manager?.getDeclaredIndexes().filter(idx => manager.getIndexTree(idx.name) !== undefined) ?? [];
+    return { ...this.schemaManager.tableSchemaToStored(this.tableSchema), indexes: maintained };
+  }
+
+  /** Follow the catalog after a refused commit ({@link OptimysticModule.followCatalog}). */
+  private followCatalog(verdict: StaleVerdict): void {
+    (this.module as OptimysticModule).followCatalog(this, verdict);
   }
 
   /**
@@ -2789,8 +2926,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedTable);
   }
 
-  /** Stop the bridge naming this table in commit reports; on DROP and on a refused CREATE. */
-  forgetInCommitReports(): void {
+  /** Stop the bridge naming this table in commit reports. Part of {@link releaseRegistrations}. */
+  private forgetInCommitReports(): void {
     this.txnBridge.forgetTable(this.qualifiedTable);
   }
 
@@ -6114,9 +6251,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // which the has-check above would reject as "already exists" if the failed
       // instance stayed cached. Nothing was registered with Quereus yet.
       this.tables.delete(tableKey);
-      table.teardownChangeSubscription();
-      table.forgetInCommitReports();
-      table.withdrawOfflinePolicy();
+      table.releaseRegistrations();
       throw error;
     }
 
@@ -7080,6 +7215,55 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
   }
 
   /**
+   * After a commit was refused because the catalog describes `table` differently, or holds its
+   * gravestone (`judgeTableDescriptions` in optimystic-adapter/table-description-check.ts): take what
+   * the catalog holds into the engine's catalog and the instance, writing nothing, so the next
+   * statement is planned under it.
+   *
+   * - **replaced** — the engine's entry is rebuilt from the record as {@link hydrateCatalog} builds one,
+   *   keeping the entry's own module, aux data and session binding, registered, and announced as
+   *   `table_modified`. Quereus re-plans every prepared statement that reads the table, and this
+   *   module's listener ({@link followTableTags}) hands the instance the new tags and saves none, since
+   *   the record already holds them. The instance re-initializes from the record on its next touch
+   *   ({@link OptimysticVirtualTable.adoptCatalogEntry}).
+   * - **dropped** — the instance is released and forgotten, and the engine's entry removed and
+   *   announced as `table_removed`, so the next statement on the table fails as on a machine that never
+   *   had it.
+   *
+   * A materialized view over the table is left to Quereus's own handling of those events. A no-op for
+   * an instance this module no longer holds under the table's name.
+   */
+  followCatalog(table: OptimysticVirtualTable, verdict: StaleVerdict): void {
+    const tableKey = `${table.schemaName}.${table.tableName}`.toLowerCase();
+    if (this.tables.get(tableKey) !== table) {
+      return;
+    }
+    const engine = table.db.schemaManager;
+    const entry = engine.getTable(table.schemaName, table.tableName);
+    const schema = entry && engine.getSchema(entry.schemaName);
+    if (verdict.kind === 'dropped') {
+      this.tables.delete(tableKey);
+      table.releaseRegistrations();
+      if (entry && schema?.removeTable(entry.name)) {
+        engine.getChangeNotifier().notifyChange({ type: 'table_removed', schemaName: entry.schemaName, objectName: entry.name, oldObject: entry });
+      }
+      return;
+    }
+    if (!entry || !schema) {
+      return;
+    }
+    // NOTE: the rebuilt entry carries no statistics, as a hydrated one carries none, so the planner
+    // sizes the table by its defaults until the next `analyze`; if a followed table plans badly, carry
+    // `entry.statistics` over (`Schema.addTable` prunes those of columns the record no longer has).
+    const rebuilt = table.catalogManager.storedToTableSchema(verdict.record, entry.vtabModule ?? this, entry.vtabAuxData, entry.vtabArgs ?? {});
+    const registered = schema.addTable(rebuilt);
+    table.adoptCatalogEntry(registered);
+    engine.getChangeNotifier().notifyChange({
+      type: 'table_modified', schemaName: registered.schemaName, objectName: registered.name, oldObject: entry, newObject: registered,
+    });
+  }
+
+  /**
    * Destroys the underlying persistent representation of the virtual table.
    * Removes the table from the internal registry so the name can be re-used,
    * and gravestones the persisted schema entry so a subsequent CREATE TABLE with
@@ -7114,9 +7298,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (table) {
       // Release the collection-change → watch bridge before forgetting the table
       // so the storage listener doesn't leak past the table's lifetime.
-      table.teardownChangeSubscription();
-      table.forgetInCommitReports();
-      table.withdrawOfflinePolicy();
+      table.releaseRegistrations();
       try {
         await this.underBatchCheckpoint(table.catalogManager, 'dropped', tableKey, () => table.deleteOwnSchema());
       } catch (error) {

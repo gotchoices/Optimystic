@@ -33,6 +33,7 @@ import type { ITransactor } from '@optimystic/db-core';
 import { KeyRange } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { expectIndexAgreesWithScan } from './query-helpers.js';
+import { CommitGate, commitPastIndexBuild, gateTransactor } from './commit-gate.js';
 
 type Row = Record<string, SqlValue>;
 type Plugin = ReturnType<typeof register>;
@@ -187,15 +188,17 @@ describe('Index maintenance must track the declared index set', function () {
 	it('re-attaching to an index backfills the rows written while detached from it', async () => {
 		// Ticket `index-reattach-leaves-rows-unindexed`. Same two-connection shape as the
 		// first spec, but the divergent write happens BEFORE the re-declare rather than
-		// after: A commits a row while it is detached from an index B already built. Wiring
+		// after: A commits a row past an index B builds, its commit check having passed before
+		// the record listed the index (a write checked after that is refused at commit). Wiring
 		// A back onto the index (descriptor + tree + bridge) does nothing for that row —
 		// only a populate pass does. Without the backfill the row is committed and visible
 		// to a full scan while every index-driven seek misses it, on BOTH connections,
 		// with no error anywhere.
 		const storage = new MemoryRawStorage();
 		const shared = buildSharedLocalTransactor(storage);
+		const gate = new CommitGate();
 		const dbA = new Database();
-		const pluginA = registerWithSharedTransactor(dbA, shared);
+		const pluginA = registerWithSharedTransactor(dbA, gateTransactor(shared, gate, { gateOn: 'pend' }));
 		const dbB = new Database();
 		const pluginB = registerWithSharedTransactor(dbB, shared);
 
@@ -207,14 +210,14 @@ describe('Index maintenance must track the declared index set', function () {
 		await dbA.exec(ddl);
 		await dbA.exec(`insert into backfill (id, token) values (1, 'tok-a')`);
 
-		// B declares the index and populates it from row 1.
+		// B declares the index and populates it from row 1, while A commits row 2 past the build:
+		// A's commit check ran before the record listed the index, so row 2 gets no entry.
 		await dbB.exec(ddl);
-		await dbB.exec(`create index backfill_by_token on backfill(token)`);
+		await commitPastIndexBuild(gate,
+			() => dbA.exec(`insert into backfill (id, token) values (2, 'tok-b')`),
+			() => dbB.exec(`create index backfill_by_token on backfill(token)`));
 		expect(await countTreeEntries(pluginB, indexUri), 'B populated from the pre-existing row')
 			.to.equal(1);
-
-		// A — still detached from the index — commits row 2. Its index entry is skipped.
-		await dbA.exec(`insert into backfill (id, token) values (2, 'tok-b')`);
 		expect(await countTreeEntries(pluginA, indexUri), 'the detached write left no index entry')
 			.to.equal(1);
 

@@ -11,7 +11,7 @@ import * as pluginEntry from '../dist/plugin.js';
 // The classes callers classify commit and write failures by (docs/transactions.md). Both entries
 // promise all of them, so the identity check below cannot pass vacuously by one entry dropping a name.
 const errorClassNames = [
-	'PartialCommitError', 'ConcurrentModificationError',
+	'PartialCommitError', 'ConcurrentModificationError', 'StaleTableDescriptionError',
 	'CoordinatorPartialCommitError', 'SyncRetryExhaustedError', 'TornActionError',
 ] as const;
 

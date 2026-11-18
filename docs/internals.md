@@ -951,11 +951,16 @@ Every other instance with a record or a gravestone in the catalog works from a v
 writes nothing. The view has the engine's columns, because Quereus plans column positions
 from its own catalog entry and the statement causing the first touch is already planned, so
 any other layout would have rows misread. It takes the record's indexes over those columns.
-An index over a column this machine does not know is left out, and goes unmaintained here
-until the machine restarts or re-applies the schema (backlog
-`bug-optimystic-a-machine-keeps-acting-on-a-table-description-another-machine-replaced`).
-An UPDATE this machine makes keeps the values the stored row holds for columns the view does not
-name: `RowCodec.encodeRow` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` is given
+An index over a column this machine does not know is left out, and a change another machine
+makes later is not seen at all; this machine learns of both at its next write. A transaction
+that wrote the table compares the instance's description with a fresh read of the record when
+it commits, and one the record no longer matches — an index left out, or created since, a
+column or CHECK added or dropped, the table dropped — is refused with `StaleTableDescriptionError`, after which the machine takes the record's
+description into its engine and the instance, so the retried statement is planned and
+maintained under it ([transactions.md §A write is checked against the table's current description](transactions.md#a-write-is-checked-against-the-tables-current-description)).
+An UPDATE this machine commits in the window that check leaves (its check ran just before the
+other machine's change landed) still keeps the values the stored row holds for columns the view
+does not name: `RowCodec.encodeRow` in `packages/quereus-plugin-optimystic/src/schema/row-codec.ts` is given
 the stored entry and carries its other keys over, and the `unchanged` guard on that entry refuses
 the write if a rival changed the row after it was read.
 A `create index` works from the same view for its maintenance, and names its columns in the

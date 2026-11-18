@@ -11,13 +11,14 @@
  */
 
 import { expect } from 'chai';
-import { Database } from '@quereus/quereus';
+import { ConstraintError, Database, StatusCode } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
-import { buildSharedLocalTransactor, refusingCommits } from './shared-local-transactor.js';
-import { captureThrowMessage, queryAll } from './query-helpers.js';
+import { StaleTableDescriptionError } from '../dist/index.js';
+import { buildSharedLocalTransactor, countingTransactor, refusingCommits } from './shared-local-transactor.js';
+import { captureThrown, captureThrowMessage, countIndexScans, queryAll } from './query-helpers.js';
 
 type PluginHandle = ReturnType<typeof register>;
 
@@ -39,6 +40,22 @@ async function hydratedSession(store: ITransactor): Promise<{ db: Database; plug
 	const session = await openSession(store);
 	await session.plugin.hydrate(session.db);
 	return session;
+}
+
+/** Assert that `refusal` is the commit-time refusal of a write made under a description another machine replaced or dropped. */
+function expectStaleDescription(refusal: Error, why: string): void {
+	const detail = `${refusal.name} (code=${(refusal as { code?: unknown }).code}): ${refusal.message}`;
+	expect(refusal, `${why}: expected StaleTableDescriptionError, got ${detail}`).to.be.instanceOf(StaleTableDescriptionError);
+	expect((refusal as StaleTableDescriptionError).code, `${why}: ${detail}`).to.equal(StatusCode.SCHEMA);
+}
+
+/** Every index of `t` agrees with its rows, as a session that only hydrates finds them. */
+async function expectIndexesComplete(store: ITransactor, table = 't'): Promise<void> {
+	const third = await hydratedSession(store);
+	for (const report of await third.plugin.verifyIndexes(third.db, table)) {
+		expect(report.missing, `${report.index}: no missing entries`).to.deep.equal([]);
+		expect(report.orphaned, `${report.index}: no orphaned entries`).to.deep.equal([]);
+	}
 }
 
 /** The table as a session that only hydrates finds it in the record. */
@@ -100,13 +117,15 @@ describe('a machine holding an older copy of a table description', function () {
 		expect(record.indexes).to.deep.equal({ t_partial: ['a'], t_y: ['y'] });
 	});
 
-	it('keeps the value of a column it does not know when it updates a row', async () => {
+	it('keeps the value of a column it does not know when its update, refused for the new column, is retried', async () => {
 		const { a, b } = await twoMachines('');
 		expect(await queryAll(b.db, 'select id from main.t')).to.deep.equal([{ id: 1 }]);
 		await a.db.exec('alter table main.t add column y text null');
 		await a.db.exec(`update main.t set y = 'kept' where id = 1`);
 
-		await b.db.exec('update main.t set a = 9 where id = 1');
+		const update = 'update main.t set a = 9 where id = 1';
+		expectStaleDescription(await captureThrown(() => b.db.exec(update)), 'the update was planned without y');
+		await b.db.exec(update);
 
 		expect(await queryAll(a.db, 'select a, y from main.t where id = 1')).to.deep.equal([{ a: 9, y: 'kept' }]);
 	});
@@ -138,15 +157,14 @@ describe('a machine holding an older copy of a table description', function () {
 		await b.db.exec('create index t_c on main.t (c)');
 
 		expect((await saved(store)).indexes).to.deep.equal({ t_c: ['c'] });
-		// `b`'s own maintenance keys on the column too, against `b`'s row layout.
-		await b.db.exec(`insert into main.t (id, c, d) values (2, 'y', 'q')`);
+		// `b` still has `a`, so its insert is refused once and then written under the record's columns.
+		const insert = `insert into main.t (id, c, d) values (2, 'y', 'q')`;
+		expectStaleDescription(await captureThrown(() => b.db.exec(insert)), 'the insert was planned with the dropped column');
+		await b.db.exec(insert);
 		expect(await queryAll(b.db, `select id from main.t where c = 'y'`)).to.deep.equal([{ id: 2 }]);
 		const third = await hydratedSession(store);
 		expect(await queryAll(third.db, `select id from main.t where c = 'y'`)).to.deep.equal([{ id: 2 }]);
-		for (const report of await third.plugin.verifyIndexes(third.db, 't')) {
-			expect(report.missing, `${report.index}: no missing entries`).to.deep.equal([]);
-			expect(report.orphaned, `${report.index}: no orphaned entries`).to.deep.equal([]);
-		}
+		await expectIndexesComplete(store);
 	});
 
 	it('refuses an index on a column the other machine dropped, and leaves the record alone', async () => {
@@ -158,6 +176,80 @@ describe('a machine holding an older copy of a table description', function () {
 		const record = await saved(store);
 		expect(record.columns).to.deep.equal(['id', 'a', 'd']);
 		expect(record.indexes).to.deep.equal({});
+	});
+
+	describe('a write committed under a description the other machine replaced', () => {
+		/**
+		 * Machine `a` created `t` with one row; `b` hydrated that and read the table, so its instance is
+		 * built. `b` reaches storage through `counted`, which counts what it sends.
+		 */
+		async function bothReading() {
+			const store = buildSharedLocalTransactor(new MemoryRawStorage());
+			const a = await openSession(store);
+			await a.db.exec(`create table main.t (id integer primary key, a integer null); insert into main.t (id, a) values (1, 5);`);
+			const counted = countingTransactor(store);
+			const b = await hydratedSession(counted.transactor);
+			expect(await queryAll(b.db, 'select id from main.t')).to.deep.equal([{ id: 1 }]);
+			return { store, a, b, counts: counted.counts };
+		}
+
+		it('is refused when the other machine created an index, and its retry maintains the index', async () => {
+			const { store, a, b, counts } = await bothReading();
+			await a.db.exec('create index t_a on main.t (a)');
+			await a.db.exec('alter table main.t set tags (x = 1)');
+			await a.plugin.whenCatalogPersisted();
+
+			const insert = 'insert into main.t (id, a) values (2, 7)';
+			counts.reset();
+			expectStaleDescription(await captureThrown(() => b.db.exec(insert)), 'the insert would leave its row out of t_a');
+			await b.plugin.whenCatalogPersisted();
+			expect({ pend: counts.pend, commit: counts.commit }, 'neither the refused write nor following the record sends anything')
+				.to.deep.equal({ pend: 0, commit: 0 });
+			await b.db.exec(insert);
+
+			expect(await queryAll(a.db, 'select id from main.t where a = 7')).to.deep.equal([{ id: 2 }]);
+			let found: Record<string, unknown>[] = [];
+			expect(await countIndexScans(async () => { found = await queryAll(b.db, 'select id from main.t where a = 7'); }),
+				'b plans through the index it now maintains').to.equal(1);
+			expect(found).to.deep.equal([{ id: 2 }]);
+			await expectIndexesComplete(store);
+		});
+
+		it('is refused when the other machine added a CHECK, and its retry is held to the CHECK', async () => {
+			const { a, b } = await bothReading();
+			await a.db.exec('alter table main.t add constraint small check (a < 100)');
+
+			const insert = 'insert into main.t (id, a) values (2, 200)';
+			expectStaleDescription(await captureThrown(() => b.db.exec(insert)), 'the insert was planned without small');
+			const retry = await captureThrown(() => b.db.exec(insert));
+			expect(retry, `${retry.name}: ${retry.message}`).to.be.instanceOf(ConstraintError);
+			expect(retry.message).to.include('small');
+			expect(await queryAll(a.db, 'select id from main.t')).to.deep.equal([{ id: 1 }]);
+		});
+
+		it('is refused when the other machine dropped the table, which this machine then no longer has', async () => {
+			const { store, a, b } = await bothReading();
+			await a.db.exec('drop table main.t');
+
+			const insert = 'insert into main.t (id, a) values (2, 7)';
+			expectStaleDescription(await captureThrown(() => b.db.exec(insert)), 'the insert targets a dropped table');
+
+			const third = await hydratedSession(store);
+			expect(third.db.schemaManager.findTable('t', 'main'), 'nothing brought the table back').to.equal(undefined);
+			expect(await captureThrowMessage(() => b.db.exec(insert)))
+				.to.equal(await captureThrowMessage(() => third.db.exec(insert)));
+		});
+
+		it('is committed when the other machine changed only the table\'s tags', async () => {
+			const { store, a, b } = await bothReading();
+			await a.db.exec('alter table main.t set tags (x = 1)');
+			await a.plugin.whenCatalogPersisted();
+
+			await b.db.exec('insert into main.t (id, a) values (2, 7)');
+
+			expect(await queryAll(a.db, 'select id from main.t order by id')).to.deep.equal([{ id: 1 }, { id: 2 }]);
+			expect((await saved(store)).tags).to.deep.equal({ x: 1 });
+		});
 	});
 
 	describe('after a failed apply schema', () => {
@@ -196,7 +288,9 @@ describe('a machine holding an older copy of a table description', function () {
 				expect((await saved(store)).checks, 'the failed apply took nothing with it').to.have.members(['pos', 'small']);
 
 				await refreshCache(b);
-				await b.db.exec(`insert into t (id, a) values (2, 6)`);
+				const insert = `insert into t (id, a) values (2, 6)`;
+				expectStaleDescription(await captureThrown(() => b.db.exec(insert)), 'b never took small into its engine');
+				await b.db.exec(insert);
 				expect((await saved(store)).checks, 'nor did the next touch').to.have.members(['pos', 'small']);
 			});
 		}

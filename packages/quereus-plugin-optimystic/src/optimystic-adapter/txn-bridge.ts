@@ -23,6 +23,8 @@ import type { EntryFacts } from './commit-outlook.js';
 import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
 import { laneOf, transactionLaneOf } from './lane.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
+import { StaleTableDescriptionError, followStaleDescriptions, judgeTableDescriptions, staleTables } from './table-description-check.js';
+import type { StaleJudgement, TableDescriptionCheck } from './table-description-check.js';
 import { generateStampId } from '../util/generate-stamp-id.js';
 import { qualifiedTableName, type QualifiedTableName } from '../schema/table-identity.js';
 import { createLogger, revisionToken } from '../logger.js';
@@ -371,6 +373,12 @@ export class TransactionBridge {
    * throwaway txnState, so neither reliably lands in that map.
    */
   private dirtyTrees = new Map<DirtyTree, unknown>();
+  /**
+   * The description check of each table the current transaction wrote ({@link noteTableWrite}), by its
+   * `schema.table` rendering; run at commit ahead of every route ({@link staleDescriptions}).
+   * Cleared with {@link dirtyTrees}.
+   */
+  private descriptionChecks = new Map<string, TableDescriptionCheck>();
   /**
    * Live registry of every collection the vtab stages into (main table + each
    * index tree), keyed by collection id. Maintained unconditionally as tables
@@ -874,6 +882,7 @@ export class TransactionBridge {
     // Clear any previously accumulated statements + staged-tree tracking
     this.accumulatedStatements = [];
     this.dirtyTrees.clear();
+    this.descriptionChecks.clear();
     this.savepoints.clear();
 
     // Create TransactionSession if transaction mode is enabled
@@ -937,7 +946,12 @@ export class TransactionBridge {
 
     let durability: TransactionDurability | undefined;
     let queued = false;
+    let stale: StaleJudgement[] = [];
     try {
+      stale = await this.staleDescriptions(route);
+      if (stale.length > 0) {
+        throw new StaleTableDescriptionError(staleTables(stale));
+      }
       if (this.session) {
         durability = await this.commitSession(this.session, lane);
       } else if (route !== undefined) {
@@ -962,7 +976,10 @@ export class TransactionBridge {
         durability = await this.commitDirtyTreesLegacy(lane);
       }
     } catch (error) {
-      throw await this.afterFailedCommit(error);
+      const failure = await this.afterFailedCommit(error);
+      // After the rollback, so the refused tables' trees are restored before their instances follow.
+      followStaleDescriptions(stale);
+      throw failure;
     }
 
     if (route?.kind === 'behind-queue' && queued) {
@@ -975,6 +992,22 @@ export class TransactionBridge {
     // nothing: the latch is left as it was.
     if (route?.kind !== 'local') this.degradedReason = null;
     if (durability !== undefined) this.reportCommitDurability(transactionId, durability);
+  }
+
+  /**
+   * The tables this transaction wrote whose catalog record another machine has since replaced or
+   * dropped (`judgeTableDescriptions` in table-description-check.ts): one fresh catalog read for all
+   * of them, before any route sends anything. A route of the offline queue (`route` set) leaves its
+   * tables unchecked when the catalog cannot be reached, since such a transaction is acknowledged
+   * without the cohort; every other commit fails with the read's error, as it would at its first
+   * network step.
+   */
+  private async staleDescriptions(route: OfflineRoute | undefined): Promise<StaleJudgement[]> {
+    if (this.descriptionChecks.size === 0) {
+      return [];
+    }
+    return await judgeTableDescriptions(
+      this.descriptionChecks.values(), this.currentTransaction!.transactor, route === undefined ? 'throw' : 'skip');
   }
 
   /**
@@ -1040,6 +1073,7 @@ export class TransactionBridge {
     this.accumulatedStatements = [];
     this.session = null;
     this.dirtyTrees.clear();
+    this.descriptionChecks.clear();
     this.savepoints.clear();
     this.settleIdleWaiters();
   }
@@ -1685,6 +1719,7 @@ export class TransactionBridge {
       throw error;
     } finally {
       this.dirtyTrees.clear();
+      this.descriptionChecks.clear();
       this.savepoints.clear();
       transaction.collections.clear();
       transaction.isActive = false;
@@ -1807,6 +1842,16 @@ export class TransactionBridge {
     if (!this.dirtyTrees.has(tree)) {
       this.dirtyTrees.set(tree, tree.snapshot());
     }
+  }
+
+  /**
+   * Have the current transaction's commit check `check`'s table against the catalog's record of it
+   * ({@link staleDescriptions}). Called by the vtab beside {@link markDirty}, as a statement is about
+   * to stage into the table, and kept and cleared with the dirty trees; a later call for the same
+   * table replaces the earlier one.
+   */
+  noteTableWrite(check: TableDescriptionCheck): void {
+    this.descriptionChecks.set(qualifiedTableName(check.table), check);
   }
 
   /**

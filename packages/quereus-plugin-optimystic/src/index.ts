@@ -24,6 +24,8 @@ export { OptimysticModule, OptimysticVirtualTable } from './optimystic-module.js
 // db-core errors callers classify commit failures by are exported from `./plugin`
 // too; test/entry-identity.spec.ts holds both entries to the same objects.
 export { PartialCommitError, ConcurrentModificationError } from './optimystic-adapter/txn-bridge.js';
+export { StaleTableDescriptionError } from './optimystic-adapter/table-description-check.js';
+export type { StaleTableDescription } from './optimystic-adapter/table-description-check.js';
 export { CoordinatorPartialCommitError, SyncRetryExhaustedError, TornActionError } from '@optimystic/db-core';
 // The predicate an `onCommitDurability` listener tests "saved" with, so a host needs no db-core import for it.
 export { isFullyDurable } from '@optimystic/db-core';

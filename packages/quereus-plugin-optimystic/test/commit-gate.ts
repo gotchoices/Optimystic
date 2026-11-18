@@ -183,3 +183,25 @@ export function parkingPends(repo: IRepo, gateFor: () => CommitGate | undefined)
 		...(commitMany ? { commitMany } : {}),
 	};
 }
+
+/**
+ * Run `write` on one machine and `build` (a `CREATE INDEX`) on another so that the write commits past
+ * the build: `write`'s commit is parked at `gate` (armed here) after its commit-time description check
+ * has passed, `build` runs to completion while it is parked, and the write is then released. The
+ * check ran before the record listed the index, and the build read the table before the row landed,
+ * so the row has no entry in the new index — the window the description check leaves open
+ * (`bug-optimystic-a-write-during-another-machines-index-build-can-miss-the-index`), and the way a
+ * spec gets a row written while its machine was detached from an index. The writer's transactor
+ * must be wrapped by {@link gateTransactor} with `gateOn: 'pend'` or `'both'`.
+ */
+export async function commitPastIndexBuild(gate: CommitGate, write: () => Promise<unknown>, build: () => Promise<unknown>): Promise<void> {
+	gate.arm();
+	const writing = write();
+	await gate.entered;
+	try {
+		await build();
+	} finally {
+		gate.release();
+	}
+	await writing;
+}
