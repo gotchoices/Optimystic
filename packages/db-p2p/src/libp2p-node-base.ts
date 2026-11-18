@@ -28,6 +28,9 @@ import type { IPieceStore } from './blob/piece-store.js';
 import { MemoryPieceStore } from './blob/memory-piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
+import { BlobProtocolClient } from './blob/blob-protocol-client.js';
+import { BlobFetcher } from './blob/blob-fetcher.js';
+import { buildBlobProtocol } from './blob/blob-protocol.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -1715,6 +1718,8 @@ export async function createLibp2pNodeBase(
 				}
 			};
 		}
+		// Kept for `feat-blob-pieces-move-between-machines`, which builds `node.blobs`' network paths on them.
+		const _blobTransfer = wireBlobFetcher({ node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs });
 
 		// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
 		// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
@@ -2187,6 +2192,48 @@ function remoteClusterLatest(
  */
 function clientClusterLatest(self: PeerId, remote: ClusterLatestCallback): ClusterLatestCallback {
 	return async (peerId, blockId, context?, held?) => peerId.equals(self) ? undefined : await remote(peerId, blockId, context, held);
+}
+
+/**
+ * The node's blob protocol client and the fetcher over it (docs/blobs.md §Moving pieces between
+ * machines), on both roles: a client fetches too. Candidates are chosen by the node's own key network,
+ * membership gate and reputation, and fetched pieces are checked with the digest the blob service names
+ * them by. The stop wrapper is installed at once, so a startup rollback stops the fetcher too; it runs
+ * before the blob service's own stop, which was installed earlier, so no fetched piece is stored after it.
+ */
+function wireBlobFetcher(ctx: {
+	node: Libp2p;
+	protocolPrefix: string;
+	linkDeadlines: LinkDeadlines;
+	keyNetwork: Libp2pKeyPeerNetwork;
+	membership: NetworkMembershipGate | undefined;
+	reputation: PeerReputationService;
+	blobs: LocalBlobService;
+}): { client: BlobProtocolClient; fetcher: BlobFetcher } {
+	const { node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs } = ctx;
+	const client = new BlobProtocolClient({ peerNetwork: keyNetwork, protocolPrefix, deadlines: linkDeadlines });
+	const fetcher = new BlobFetcher({
+		client,
+		holders: {
+			selfPeerId: node.peerId.toString(),
+			blobProtocol: buildBlobProtocol(protocolPrefix),
+			keyNetwork,
+			membership,
+			reputation,
+			isConnected: id => node.getConnections(peerIdFromString(id)).length > 0,
+		},
+		reputation,
+		store: blobs.fetchStore(),
+	});
+	const previousStop = node.stop.bind(node);
+	node.stop = async () => {
+		try {
+			await fetcher.stop();
+		} finally {
+			await previousStop();
+		}
+	};
+	return { client, fetcher };
 }
 
 /** What {@link wireServingRole} reads from the factory: the started node and the pieces every role builds. */

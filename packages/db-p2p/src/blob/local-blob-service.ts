@@ -45,6 +45,8 @@ const log = createLogger('blob:store');
 export interface BlobFetchStore {
 	/** This node's pieces, `verified` (`localPieceSource`). */
 	readonly source: PieceSource;
+	/** The hashing port this store's pieces are named with; the fetcher checks every fetched piece with it, so the two cannot differ. */
+	readonly digest: BlobDigest;
 	/** Adds a `cached` hold to the record, creating it (`whole: false`) when there is none; a record already holding `cached` is unchanged. Not flushed. */
 	holdCached(ref: BlobRef): Promise<void>;
 	/**
@@ -112,6 +114,7 @@ export class LocalBlobService implements BlobService {
 		this.sweeper = new PieceSweeper({ pieces: this.pieces, records: this.records, gate: this.gate, inProgress: this.inProgress, digest: this.digest });
 		this.fetchDoor = {
 			source: this.source,
+			digest: this.digest,
 			holdCached: ref => this.holdCached(ref),
 			storePiece: (ref, id, bytes) => this.storeFetchedPiece(ref, id, bytes),
 			markWhole: (ref, size) => this.correctRecord(ref, true, size),
