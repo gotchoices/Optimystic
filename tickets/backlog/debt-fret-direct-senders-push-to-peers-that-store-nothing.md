@@ -1,0 +1,12 @@
+description: When a machine leaves, its neighbours copy their data to nearby machines chosen straight from the peer-discovery ring without checking that those machines store data for this network. Machines on another network sharing the ring, and the new client machines that store nothing, refuse every such copy, so the effort is wasted and the extra copies the mechanism exists for never get made.
+files: packages/db-p2p/src/cluster/spread-on-churn.ts (the `targets` filter beside `admittedBy`), packages/db-p2p/src/storage/restoration-coordinator.ts (the `assembleCohort(blockCoord, 10)` fallback), packages/db-p2p/src/libp2p-key-network.ts (`membershipOf`, which already classifies peers as serving), packages/db-p2p/src/libp2p-node-base.ts (where both are built with `membership`)
+tradeoffs: Spread-on-churn is an extra resilience layer beside the rebalance growth push and the under-replication drain, both of which already choose targets from storage groups that only contain serving peers, so the waste costs failed dials rather than lost copies; a maintainer may defer it until a deployment with many non-serving ring members shows the churn pushes in its logs.
+----
+
+# FRET-direct senders push to peers that store nothing
+
+Spread-on-churn picks its expansion targets from `fret.assembleCohort` and filters them only by the network-membership predicate (`admittedBy(this.deps.membership, id)` in `packages/db-p2p/src/cluster/spread-on-churn.ts`), not by whether the peer serves this network's storage. The restoration coordinator's fallback cohort (`assembleCohort(blockCoord, 10)` in `packages/db-p2p/src/storage/restoration-coordinator.ts`) is the same shape. A peer that serves another network sharing the ring, or a client-only node (`servesBlocks: false`, implement ticket `client-only-node`), registers no `block-transfer` or `sync` handler, so every push or archive request to it fails at protocol negotiation.
+
+The ring-shift confirm (Arachnode info required) and the ring-based restoration path (Arachnode ring required) already exclude such peers, since neither announces an Arachnode ring; the under-replication drain checks the block-transfer protocol in the peer's record.
+
+Expected: these senders choose only among peers the key network classifies as serving this network, by the one classification `membershipOf` applies (expose it as a method on the key network rather than re-reading protocol lists), so a non-serving ring member is neither dialled nor counted as a spread target.

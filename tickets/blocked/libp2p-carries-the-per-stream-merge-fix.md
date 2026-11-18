@@ -31,3 +31,7 @@ If upstream never takes the fix, the stopgap stays; it is self-contained and cos
 - Delete or invert `libp2p-merges-protocol-per-stream.spec.ts`: either remove it, or keep it asserting the record is written once per connection, if that premise is worth guarding.
 - Remove the throttle paragraph from `docs/internals.md` §Third-Party Address Learning (and its "only other code in front of the peerStore's writes" aside), the row in `docs/debugging.md`, and the throttle sentence in the `PreparedStreams` doc comment in `packages/db-p2p/src/network/prepared-streams.ts`.
 - Optionally re-measure on a phone that the per-stream rewrite is gone.
+
+## Arm (2026-11-17): the storage-claim filter is not part of the stopgap
+
+Implement ticket `a-peer-is-judged-serving-only-by-its-own-identify` adds a second wrapper over `peerStore.merge` that drops a per-stream merge of this network's `cluster` or `repo` protocol into a remote peer's record, because libp2p's `onIncomingStream` merge makes a peer that merely sends a request read as serving storage. #3692 still merges once per connection on the receiving end, so that filter stays when the throttle is deleted. When deleting `libp2p-merges-protocol-per-stream.spec.ts`, keep a pin of the merge shape the filter intercepts (`isProtocolOnlyMerge`) in a spec of the filter's own, and move `isProtocolOnlyMerge` out of `protocol-merge-throttle.ts` with it.
