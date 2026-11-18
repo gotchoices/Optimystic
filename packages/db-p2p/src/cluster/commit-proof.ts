@@ -170,12 +170,10 @@ const proofVotesMemo = new VerdictMemo<VotesVerdict>();
  * {@link mintSoloCommitProof} produce plain data. A proof JSON cannot encode at all (a cycle, a BigInt,
  * a throwing getter) is verified as given and not remembered.
  *
- * Measured on Node 24.2.0 on Windows, for a 3-signer proof of 1.7 KB decoded from JSON before each
- * call (medians of 400 calls after 100 to warm up, three runs): a miss costs 1.44 to 1.53 ms, of which
- * the added encode and decode are 0.011 ms; a hit costs 0.008 ms. A hit is one native
- * `JSON.stringify` of the proof, a `Map` lookup and the claim step — no JavaScript replacer and no
- * JavaScript hash, the two things that make a hashed key cost about as much as the verification it
- * saves on Hermes (GitHub #68). Hermes itself was not measured here.
+ * A hit is one native `JSON.stringify` of the proof, a `Map` lookup and the claim step — no
+ * JavaScript replacer and no JavaScript hash, the two things that make a hashed key cost about as
+ * much as the verification it saves on Hermes (GitHub #68). The measured costs are in
+ * docs/internals.md §Durable commit proof.
  *
  * Mirrors the outcome discipline of `ClusterMember.verifySignature`: a malformed or unbound signer is
  * a verification failure that must NEVER be turned into a reputation penalty, because the identity

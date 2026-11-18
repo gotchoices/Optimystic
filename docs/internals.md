@@ -1357,8 +1357,10 @@ The key is sound because it *is* everything the verdict reads — the message, b
 
 Measured on Node 24.2.0 on Windows, for a 3-signer proof of 1.7 KB decoded from JSON before each call (medians of 400 calls after 100 to warm up, three runs): a miss costs 1.44 to 1.53 ms, of which 0.011 ms is the added encode and decode, and a hit 0.008 ms. A hit is one native `JSON.stringify`, a lookup and the claim step, with no JavaScript replacer and no JavaScript hash — the two things that made a hashed key cost about as much as the verification it saved on Hermes. Hermes was not measured here.
 
-Failures return a distinguishable `ProofFailure` reason and are never a reputation signal — a
-malformed or unbound signer means the identity was not proven, mirroring
+Failures return a distinguishable `ProofFailure` reason. Only a reason that proves the artifact
+contradicts itself or the claim it was served for is held against the serving peer
+(`isAttributableProofFailure` in `packages/db-p2p/src/cluster/certified-claims.ts`); a malformed or
+unbound signer never is, because the identity was not proven, mirroring
 `ClusterMember.verifySignature`'s discipline.
 
 Besides the two repair paths, the reactivity trust anchor consumes proofs: `CommitLogTrustAnchor`
