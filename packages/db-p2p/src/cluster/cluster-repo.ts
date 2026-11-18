@@ -2,7 +2,7 @@ import type { IRepo, ClusterRecord, ClusterPeers, Signature, ClusterVote, RepoMe
 import type { ICluster } from "@optimystic/db-core";
 import type { IPeerNetwork } from "@optimystic/db-core";
 import { blockIdsForTransforms, canonicalJson, transformForBlockId, isOwnRevision, isConflictFailure, DEFAULT_SUPER_MAJORITY_THRESHOLD, localDurability, formatInstant, LruMap, SlotHoldAfterLosses } from "@optimystic/db-core";
-import { computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
+import { canonicalMessageBytes, computeClusterCommitHash, computeClusterMessageHash, computeClusterPromiseHash, membershipDigest, recordMembershipDigest, clusterVoteSigningPayload, clusterVoteVerificationPayload } from "@optimystic/db-core";
 import { verifyInvalidationCertificate, type ArbitratorSetRecompute } from "../dispute/invalidation.js";
 import { buildCommitCert, committedTailIds, invalidationActionId } from "./commit-cert.js";
 import { ClusterClient } from "./client.js";
@@ -10,7 +10,7 @@ import type { PeerId, PrivateKey } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import { publicKeyFromRaw } from "@libp2p/crypto/keys";
 import { peerIdBindsPublicKey } from "./peer-key-binding.js";
-import { toString as uint8ArrayToString, fromString as uint8ArrayFromString } from 'uint8arrays';
+import { toString as uint8ArrayToString, fromString as uint8ArrayFromString, equals as uint8ArrayEquals } from 'uint8arrays';
 import { createLogger } from '../logger.js'
 import type { PartitionDetector } from "./partition-detector.js";
 import type { FretService } from "p2p-fret";
@@ -1109,7 +1109,8 @@ export class ClusterMember implements ICluster {
 		if (existing.messageHash !== incoming.messageHash) {
 			throw new Error('Message hash mismatch');
 		}
-		if (canonicalJson(existing.message) !== canonicalJson(incoming.message)) {
+		// The bytes every hash of the record already read, so the comparison serializes nothing again.
+		if (!uint8ArrayEquals(canonicalMessageBytes(existing.message), canonicalMessageBytes(incoming.message))) {
 			throw new Error('Message content mismatch');
 		}
 		if (existing.membershipVersion === 2 || incoming.membershipVersion === 2) {

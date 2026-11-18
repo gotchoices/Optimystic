@@ -3,6 +3,7 @@ import type { ClusterPeers, ClusterRecord, Signature } from "./structs.js";
 import { sha256 } from "multiformats/hashes/sha2";
 import { base58btc } from "multiformats/bases/base58";
 import { toString as uint8ArrayToString } from "uint8arrays/to-string";
+import { concat } from "uint8arrays/concat";
 import { canonicalJson } from "../utility/canonical-json.js";
 
 /**
@@ -50,17 +51,56 @@ export function recordMembershipDigest(record: Pick<ClusterRecord, 'membershipVe
 	return record.membershipVersion === 2 ? record.membershipDigest : undefined;
 }
 
+const encoder = new TextEncoder();
+const utf8 = (text: string): Uint8Array => encoder.encode(text);
+
+// NOTE: the memo is sound only because no `RepoMessage` is changed once it has been hashed: a message
+// mutated after its first hash would go on hashing as it was, and a signature would then cover content
+// the record no longer holds. Build a new message (`{ ...message, field }`) rather than assigning into one.
+// NOTE: holds one more copy of each message for as long as the message object lives, which on a member
+// is as long as it keeps the record; if member memory under large writes ever matters, drop the entry
+// once the record is decided. Weak, so it never outlives its message; and a message received off the
+// wire was bounded by the frame cap before it was decoded, so the memo costs no more than the record.
+const messageBytes = new WeakMap<RepoMessage, Uint8Array>();
+
+/**
+ * The UTF-8 bytes of `canonicalJson(message)`, computed once per message object. A record's `message`
+ * is the whole pend or commit, row data included, and one delivery of a record reads it several times —
+ * its message, promise and commit hashes, and `mergeRecords`' comparison — so each of those shares these
+ * bytes rather than serializing the message again. The bytes are shared: never write to them.
+ */
+export function canonicalMessageBytes(message: RepoMessage): Uint8Array {
+	const held = messageBytes.get(message);
+	if (held !== undefined) return held;
+	// A record off the wire is hashed before its shape is checked, so `message` may be no object at all;
+	// such a message is never memoized (a WeakMap refuses it as a key), and the template literal spells
+	// `canonicalJson`'s `undefined` for a value JSON cannot encode as the string preimage always did.
+	const bytes = utf8(`${canonicalJson(message)}`);
+	if (typeof message === 'object' && message !== null) messageBytes.set(message, bytes);
+	return bytes;
+}
+
+/**
+ * SHA-256 over the preimage `parts` spell, joined: the same bytes as encoding the joined string, so the
+ * signed layout of `docs/correctness.md` §2 is unchanged. UTF-8 encoding commutes with concatenation
+ * except where a part ending in a high surrogate meets one starting with a low surrogate (joined they
+ * are one character, apart two replacement characters). Every boundary in these preimages has a JSON
+ * text on one side, which begins and ends with an ASCII character, so that never happens — even for a
+ * hostile record whose `messageHash` or digest is not well-formed.
+ */
+async function hashParts(parts: Uint8Array[]): Promise<Uint8Array> {
+	return (await sha256.digest(concat(parts))).digest;
+}
+
 /**
  * `messageHash` = `base58btc(SHA256(canonicalJson(message) + digest))`.
  *
  * `digest` `undefined` → legacy v1 preimage (`canonicalJson(message)` only); passing the membership
- * digest folds the peer set in (v2). Empty-string concat means the v1 image is byte-identical to the
- * pre-binding implementation.
+ * digest folds the peer set in (v2). An absent digest contributes no bytes, so the v1 image is
+ * byte-identical to the pre-binding implementation.
  */
 export async function computeClusterMessageHash(message: RepoMessage, digest?: string): Promise<string> {
-	const bytes = new TextEncoder().encode(canonicalJson(message) + (digest ?? ''));
-	const hash = await sha256.digest(bytes);
-	return base58btc.encode(hash.digest);
+	return base58btc.encode(await hashParts([canonicalMessageBytes(message), utf8(digest ?? '')]));
 }
 
 /**
@@ -69,9 +109,8 @@ export async function computeClusterMessageHash(message: RepoMessage, digest?: s
  * `digest` `undefined` → legacy v1 preimage; passing it folds the peer set in (v2).
  */
 export async function computeClusterPromiseHash(messageHash: string, message: RepoMessage, digest?: string): Promise<string> {
-	const bytes = new TextEncoder().encode(messageHash + canonicalJson(message) + (digest ?? ''));
-	const hash = await sha256.digest(bytes);
-	return uint8ArrayToString(hash.digest, 'base64url');
+	const hash = await hashParts([utf8(messageHash), canonicalMessageBytes(message), utf8(digest ?? '')]);
+	return uint8ArrayToString(hash, 'base64url');
 }
 
 /**
@@ -81,7 +120,6 @@ export async function computeClusterPromiseHash(messageHash: string, message: Re
  * between the message and the promises image, matching the v2 layout in `docs/correctness.md`.
  */
 export async function computeClusterCommitHash(messageHash: string, message: RepoMessage, promises: Record<string, Signature>, digest?: string): Promise<string> {
-	const bytes = new TextEncoder().encode(messageHash + canonicalJson(message) + (digest ?? '') + canonicalJson(promises));
-	const hash = await sha256.digest(bytes);
-	return uint8ArrayToString(hash.digest, 'base64url');
+	const hash = await hashParts([utf8(messageHash), canonicalMessageBytes(message), utf8(digest ?? ''), utf8(canonicalJson(promises))]);
+	return uint8ArrayToString(hash, 'base64url');
 }
