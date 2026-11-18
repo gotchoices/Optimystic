@@ -2729,11 +2729,13 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
     *strictly higher* revision than the top certified one is selected over the proof, so a legacy
     uncertified tail written after the last proven revision stays readable. (A merely
     *uncorroborated* higher claim never outranks a proof — it is not evidence at all.)
-  - **Proof retention is per revision, and not retroactive.** A revision that first landed
-    proof-less keeps no proof even if a later certified heal of that same revision carries one.
-    Blocks written before proofs existed, or by a member whose materialization disagreed with the
-    declared digest, have none — those fall back to the table above. A repaired replica *does*
-    serve the proof onward, so a certified block's coverage grows with each heal.
+  - **Proof retention is per revision, and a proof-less revision gains one only by back-fill.** A
+    revision that first landed proof-less gets a proof when a later certified push names that same
+    `(rev, actionId)` and the proof's declared digest matches this node's own bytes (*Back-filling
+    onto an already-held revision*, under Durable commit proof above). Until then, blocks written
+    before proofs existed have none, and a member whose materialization disagreed with the declared
+    digest never gets one; both fall back to the table above. A repaired replica *does* serve the
+    proof onward, so a certified block's coverage grows with each heal.
   - **A verified proof says the listed signers signed, not that they are this block's cohort.**
     Anyone holding N keys can stand up their own N-peer cohort and self-certify. Closing that needs
     a membership anchor (`feat-cluster-membership-threshold-cert-anchoring`, open); until then the
