@@ -63,7 +63,7 @@ export interface PieceSweeperDeps {
 
 /**
  * Deletes every stored piece in no held blob's tree (docs/blobs.md §Holds), closed against the
- * three things that can make a piece live while it decides:
+ * four things that can make a piece live while it decides:
  *
  * - a put that has stored pieces but not yet written its record: its ids are in `inProgress` when
  *   the deletes are decided, because an id is added before its piece is stored and released only
@@ -72,7 +72,16 @@ export interface PieceSweeperDeps {
  * - a record written or changed after the records pass read it: `noteRecordChange` puts it in
  *   `changed`, and it is walked again under the exclusive gate, where no record can change;
  * - a put storing a piece the sweep has just decided to delete: it waits on the gate while the
- *   deletes run, then finds the piece absent and writes it.
+ *   deletes run, then finds the piece absent and writes it;
+ * - a fetch storing a list piece over a child already present as an orphan
+ *   (`BlobFetchStore.storePiece`): the fetch holds the blob before it stores anything and stores a
+ *   list piece before the pieces it names, so only such a child can be missed — skipped by the
+ *   records pass's walk while its parent was absent, and never stored again by the fetch, which
+ *   finds it present. Every fetched piece notes its blob in `changed` inside the same shared hold
+ *   as its `put`, so the decide step, which runs after every shared holder has finished, walks the
+ *   blob again with the parent present and keeps the child. A parent stored after the decide step
+ *   finds the child deleted, and the fetch's next plan asks for it. A fetch's ids need no
+ *   `inProgress`: its record exists before its first piece.
  */
 export class PieceSweeper {
 	private readonly pieces: IPieceStore;
@@ -94,7 +103,10 @@ export class PieceSweeper {
 		this.source = localPieceSource(deps.pieces);
 	}
 
-	/** Called by every record change, inside its shared hold, before the write. */
+	/**
+	 * Called by every record change, and by every piece a fetch stores under a held ref, inside its
+	 * shared hold, before the write.
+	 */
 	noteRecordChange(ref: BlobRef): void {
 		this.changed?.add(ref);
 	}
@@ -166,8 +178,8 @@ export class PieceSweeper {
 	// NOTE: accepted tradeoff — one blob whose tree cannot be read (disk damage under a held blob)
 	// stops every sweep until it is unpinned, which keeps data rather than guessing at what that tree
 	// covered. And a list piece that is missing leaves the pieces under it unwalked, so they are
-	// deleted; `feat-blob-pieces-move-between-machines` fetches list pieces before the pieces under
-	// them, which keeps this from deleting a fetch's progress.
+	// deleted; a fetch stores list pieces before the pieces under them and notes its blob with every
+	// piece (`BlobFetchStore.storePiece`), which keeps this from deleting a fetch's progress.
 	/** Adds every present piece of a held blob's tree to `live`; an abort when its record or tree cannot be read. A store fault reading the record propagates. */
 	private async walkRecord(ref: BlobRef, live: Set<PieceId>): Promise<SweepAbort | undefined> {
 		try {

@@ -136,6 +136,38 @@ class HeldListKVStore implements IKVStore {
 	}
 }
 
+/** A memory piece store whose next `get` of an armed id waits for a release the test holds. */
+class HeldGetPieceStore extends MemoryPieceStore {
+	/** Every id a `get` asked for, in order. */
+	readonly asked: PieceId[] = [];
+	private hold: { readonly id: PieceId; readonly reached: Gate; readonly release: Promise<void> } | undefined;
+
+	/** Arms the hold; the returned promise opens once a `get` of `id` is waiting on `release`. */
+	holdNextGet(id: PieceId, release: Promise<void>): Promise<void> {
+		const reached = gate();
+		this.hold = { id, reached, release };
+		return reached.promise;
+	}
+
+	override async get(id: PieceId): Promise<Uint8Array | undefined> {
+		this.asked.push(id);
+		const hold = this.hold;
+		if (hold?.id === id) {
+			this.hold = undefined;
+			hold.reached.open();
+			await hold.release;
+		}
+		return super.get(id);
+	}
+}
+
+/** Every piece of the blob `content` builds, by id, without storing any of them. */
+async function piecesOf(content: Uint8Array): Promise<{ ref: BlobRef; pieces: Map<PieceId, Uint8Array> }> {
+	const pieces = new Map<PieceId, Uint8Array>();
+	const { ref } = await buildBlob(streamOf(content), { put: async (id, bytes) => { pieces.set(id, bytes.slice()); } });
+	return { ref, pieces };
+}
+
 async function recordOf(kv: IKVStore, ref: BlobRef): Promise<BlobRecord | undefined> {
 	return new BlobRecordStore(kv).get(ref);
 }
@@ -217,6 +249,31 @@ describe('LocalBlobService', () => {
 		// re-walk of records changed during the sweep keeps the two pieces.
 		expect(await sweep).to.deep.include({ kind: 'swept', deleted: 0 });
 		expect(await readAll(service.read(ref))).to.deep.equal(content);
+	});
+
+	it('a piece present when a sweep first walked its held blob survives once its parent arrives', async () => {
+		const pieces = new HeldGetPieceStore();
+		const service = serviceOver(pieces, new MemoryKVStore());
+		const store = service.fetchStore();
+		const fetched = await piecesOf(bytesOf(2 * PIECE + 5000, 15));
+		const listPiece = rootPieceId(fetched.ref);
+		const orphan = [...fetched.pieces.keys()].find(id => id !== listPiece)!;
+		await pieces.put(orphan, fetched.pieces.get(orphan)!);
+		await store.holdCached(fetched.ref);
+		// Its record is written after the fetched blob's, so the records pass walks it second.
+		const other = await service.put(streamOf(bytesOf(PIECE + 1000, 16)));
+		const releaseWalk = gate();
+		const walkingOther = pieces.holdNextGet(rootPieceId(other.ref), releaseWalk.promise);
+
+		const sweep = service.sweep();
+		await walkingOther;
+		// The fetched blob's walk has ended at its absent list piece, without reaching the orphan.
+		expect(pieces.asked, 'the records pass walked the fetched blob first').to.include(listPiece);
+		await store.storePiece(fetched.ref, listPiece, fetched.pieces.get(listPiece)!);
+		releaseWalk.open();
+
+		expect(await sweep).to.deep.include({ kind: 'swept', deleted: 0 });
+		expect(await pieces.has(orphan)).to.equal(true);
 	});
 
 	it('a change refused for a string that is not a reference leaves a running sweep unharmed', async () => {

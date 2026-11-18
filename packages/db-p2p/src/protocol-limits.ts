@@ -117,3 +117,15 @@ export const MAX_BLOB_INBOUND_GETS_PER_PEER = 2;
 
 /** Most blob `get` streams this node serves at once in all. */
 export const MAX_BLOB_INBOUND_GETS = 16;
+
+/** Most background blob `get` streams this node has open at once. */
+export const MAX_BLOB_BACKGROUND_GET_STREAMS = 4;
+
+/** Most foreground blob `get` streams this node has open at once. */
+export const MAX_BLOB_FOREGROUND_GET_STREAMS = 8;
+
+/** First wait before a `waitMs` retry round of a blob fetch, doubling to {@link BLOB_WAIT_RETRY_MAX_MS}. */
+export const BLOB_WAIT_RETRY_INITIAL_MS = 500;
+
+/** Longest wait between `waitMs` retry rounds of a blob fetch. */
+export const BLOB_WAIT_RETRY_MAX_MS = 8_000;

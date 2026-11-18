@@ -34,6 +34,30 @@ import { SweepGate } from './sweep-gate.js';
 
 const log = createLogger('blob:store');
 
+/**
+ * What the blob fetcher may do to this node's store (docs/blobs.md §Holds): every piece and record
+ * change a fetch makes goes through the one record store, sweep gate and sweeper `LocalBlobService`
+ * owns, which is what keeps a running sweep from deleting a fetch's progress.
+ *
+ * Nothing here flushes. After a crash the stored pieces and the hold may or may not be on disk: the
+ * next sweep may remove pieces whose record did not survive, and the next fetch brings them again.
+ */
+export interface BlobFetchStore {
+	/** This node's pieces, `verified` (`localPieceSource`). */
+	readonly source: PieceSource;
+	/** Adds a `cached` hold to the record, creating it (`whole: false`) when there is none; a record already holding `cached` is unchanged. Not flushed. */
+	holdCached(ref: BlobRef): Promise<void>;
+	/**
+	 * Stores a piece of `ref`'s tree that the caller has checked against `id`: inside one shared hold
+	 * of the sweep gate, noting `ref` as changed for a running sweep, then `pieces.put`. Not flushed.
+	 * The caller holds `ref` (`holdCached`) before its first piece and stores a list piece before the
+	 * pieces it names, which is what the sweep relies on (`PieceSweeper`).
+	 */
+	storePiece(ref: BlobRef, id: PieceId, bytes: Uint8Array): Promise<void>;
+	/** Sets `whole: true` and `size` on the existing record; never creates a record, and a failure is logged, not thrown. Not flushed. */
+	markWhole(ref: BlobRef, size: number): Promise<void>;
+}
+
 /** How long after a trigger a scheduled sweep runs, by default. */
 export const DEFAULT_SWEEP_DELAY_MS = 5_000;
 
@@ -75,6 +99,7 @@ export class LocalBlobService implements BlobService {
 	private scheduledRun: Promise<void> | undefined;
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
 	private readonly durabilityListeners = new Set<(event: BlobDurabilityEvent) => void>();
+	private readonly fetchDoor: BlobFetchStore;
 
 	constructor(init: LocalBlobServiceInit) {
 		this.pieces = init.pieces;
@@ -85,6 +110,17 @@ export class LocalBlobService implements BlobService {
 		this.now = init.now ?? Date.now;
 		this.setTimer = init.setTimer ?? armUnrefTimer;
 		this.sweeper = new PieceSweeper({ pieces: this.pieces, records: this.records, gate: this.gate, inProgress: this.inProgress, digest: this.digest });
+		this.fetchDoor = {
+			source: this.source,
+			holdCached: ref => this.holdCached(ref),
+			storePiece: (ref, id, bytes) => this.storeFetchedPiece(ref, id, bytes),
+			markWhole: (ref, size) => this.correctRecord(ref, true, size),
+		};
+	}
+
+	/** The door `BlobFetcher` uses into this node's store; built once, the same object every call. */
+	fetchStore(): BlobFetchStore {
+		return this.fetchDoor;
 	}
 
 	/** Schedules the start-up sweep, which removes the orphans of a put a crash interrupted. */
@@ -219,6 +255,29 @@ export class LocalBlobService implements BlobService {
 	/** Nothing reports durability until `feat-a-referenced-blob-is-copied-to-its-cohort`. */
 	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void {
 		return subscribe(this.durabilityListeners, listener);
+	}
+
+	// NOTE: eviction of cached blobs (`feat-unreferenced-blobs-are-reclaimed`) must skip a blob with a
+	// fetch session in flight: a fetch stores pieces only under this hold, and a record deleted under
+	// it would leave the fetch's later pieces unprotected from the next sweep.
+	private async holdCached(ref: BlobRef): Promise<void> {
+		const at = this.now();
+		await this.changeRecord(ref, current => recordAfterCachedHold(current, ref, at));
+	}
+
+	/**
+	 * Noting `ref` inside the same shared hold as the `put` is what keeps a piece that was an orphan
+	 * when a sweep first walked `ref` (its parent list piece absent then) from being deleted once this
+	 * call stores the parent: the decide step runs after this hold ends and walks `ref` again. A
+	 * string that is not a canonical reference throws BlobRefError before it is noted, as in
+	 * `changeRecord`.
+	 */
+	private storeFetchedPiece(ref: BlobRef, id: PieceId, bytes: Uint8Array): Promise<void> {
+		parseBlobRef(ref);
+		return this.gate.shared(async () => {
+			this.sweeper.noteRecordChange(ref);
+			await this.pieces.put(id, bytes);
+		});
 	}
 
 	/** Where the builder puts a put's pieces: each id joins `inProgress` before its piece is stored, inside one shared hold. */
@@ -383,6 +442,15 @@ function recordAfterPin(current: BlobRecord | undefined, ref: BlobRef, owner: st
 		return { v: 1, ref, whole: false, holds: withPin([], owner, at) };
 	}
 	return pinnedBy(current, owner) ? current : { ...current, holds: withPin(current.holds, owner, at) };
+}
+
+/** With no record, a new one holding `cached` that knows nothing of the pieces yet; a record already holding `cached` unchanged. */
+function recordAfterCachedHold(current: BlobRecord | undefined, ref: BlobRef, at: number): BlobRecord {
+	const cached: BlobHold = { kind: 'cached', at };
+	if (current === undefined) {
+		return { v: 1, ref, whole: false, holds: [cached] };
+	}
+	return current.holds.some(hold => hold.kind === 'cached') ? current : { ...current, holds: [...current.holds, cached] };
 }
 
 function recordAfterUnpin(current: BlobRecord | undefined, owner: string): BlobRecord | undefined {
