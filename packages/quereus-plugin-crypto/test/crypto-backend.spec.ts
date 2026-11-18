@@ -21,11 +21,11 @@ const CURVE_ORDER: Record<EcdsaCurve, bigint> = {
 };
 
 /** OpenSSL's verify as is: it accepts high-S signatures and hybrid-encoded keys, which @noble rejects. */
-function openSslEcdsaVerify(curve: EcdsaCurve): EcdsaVerify {
+function openSslEcdsaVerify(curve: EcdsaCurve, dsaEncoding: 'ieee-p1363' | 'der' = 'ieee-p1363'): EcdsaVerify {
 	return (signature, message, publicKey) => {
 		const prefix = Buffer.from(SPKI_EC_PREFIX[curve][publicKey.length]!, 'hex');
 		const key = createPublicKey({ key: Buffer.concat([prefix, publicKey]), format: 'der', type: 'spki' });
-		return nodeVerify('sha256', message, { key, dsaEncoding: 'ieee-p1363' }, signature);
+		return nodeVerify('sha256', message, { key, dsaEncoding }, signature);
 	};
 }
 
@@ -146,7 +146,7 @@ describe('Native crypto backend', () => {
 		for (const { valid, tampered, highS } of expected.signatures) {
 			expect(valid).to.equal(true);
 			expect(tampered).to.equal(false);
-			expect(highS).to.not.equal(true);
+			if (highS !== undefined) expect(highS).to.equal(false);
 		}
 
 		const { backend, calls } = nodeBackend();
@@ -184,6 +184,14 @@ describe('Native crypto backend', () => {
 				scalarsInNobleRange('secp256k1', signature) && openSsl(signature, message, publicKey),
 		};
 		expect(() => setCryptoBackend(noPrefixGuard)).to.throw(/secp256k1Verify accepted a hybrid-encoded/);
+		// Both guards, but a signature that is not 64 bytes is retried as DER.
+		const guarded = guardedEcdsaVerify('p256');
+		const derFallback = openSslEcdsaVerify('p256', 'der');
+		const acceptsDer: CryptoBackend = {
+			p256Verify: (signature, message, publicKey) =>
+				signature.length === 64 ? guarded(signature, message, publicKey) : derFallback(signature, message, publicKey),
+		};
+		expect(() => setCryptoBackend(acceptsDer)).to.throw(/p256Verify accepted a DER-encoded/);
 
 		resetCalls(calls);
 		evaluate();

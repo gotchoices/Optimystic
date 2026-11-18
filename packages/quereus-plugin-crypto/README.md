@@ -383,9 +383,9 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify, p256Verify, secp2
   `@noble/curves` signature for a fixed raw 32-byte seed (Ed25519 signing is deterministic);
   `ed25519Verify` must accept that signature and reject it once one byte of the message is flipped.
   `p256Verify` and `secp256k1Verify` must accept a fixed signature under both the 33-byte compressed
-  and the 65-byte uncompressed key, and reject five inputs `@noble` rejects: the message with one byte
-  flipped, the high-S copy of the signature (s replaced by n − s), r = 0, r = n, and the uncompressed
-  key re-prefixed as hybrid (0x06 or 0x07). The inputs are views at a non-zero offset into a larger buffer, so an adapter that hands the native
+  and the 65-byte uncompressed key, and reject six inputs `@noble` rejects: the message with one byte
+  flipped, the high-S copy of the signature (s replaced by n − s), r = 0, r = n, the uncompressed
+  key re-prefixed as hybrid (0x06 or 0x07), and the signature re-encoded as DER. The inputs are views at a non-zero offset into a larger buffer, so an adapter that hands the native
   side `data.buffer` instead of the view fails too. On any failure `setCryptoBackend` throws, naming
   the member, and the previously installed backend (or `@noble`) stays in place, so the mistake shows
   at app start rather than as wrong signatures persisted and replicated.
@@ -407,7 +407,8 @@ setCryptoBackend({ sha256, sha512, ed25519Sign, ed25519Verify, p256Verify, secp2
   runs inside `CHECK` constraints on replicated rows, so a member that accepted either would let a
   machine with the backend accept a row every other machine rejects. The self-check refuses an
   adapter missing either guard, naming the member and the input it accepted; the adapter below has
-  both.
+  both. It also refuses one that verifies DER (`dsaEncoding: 'der'`, or a fallback to it), since an
+  honest signature re-encoded as DER needs no secret either; pass `'ieee-p1363'`, as below.
 - **Ed25519 strictness differs on crafted input.** `@noble` verifies under the ZIP-215 rule, which
   accepts some non-canonical point encodings and small-order components that an RFC 8032-strict
   library such as OpenSSL rejects. Honest signatures verify identically either way. A deliberately

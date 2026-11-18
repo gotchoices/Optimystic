@@ -118,8 +118,10 @@ export interface CryptoBackend {
 	/**
 	 * 64-byte compact r‖s signature (big-endian, 32 bytes each), message, 33- or 65-byte SEC 1
 	 * public key. The member hashes the message with SHA-256 itself; it is never handed a digest.
-	 * It must decide exactly as @noble/curves' verify does: reject a high-S signature (s > n/2),
-	 * r or s outside [1, n−1], and any key but 0x02/0x03 with 33 bytes or 0x04 with 65. OpenSSL
+	 * It must decide exactly as @noble/curves' verify does: reject any signature but the 64-byte
+	 * compact form (a DER one included: the caller's bytes are passed through unchecked), a high-S
+	 * signature (s > n/2), r or s outside [1, n−1], and any key but 0x02/0x03 with 33 bytes or 0x04
+	 * with 65. OpenSSL
 	 * accepts high-S signatures and hybrid 0x06/0x07 keys, so an adapter over it must refuse both
 	 * itself. Returns false, or throws, for an invalid signature or key.
 	 */
@@ -267,8 +269,9 @@ function checkEcdsaAccepts(
 
 /**
  * OpenSSL accepts the high-S copy and the hybrid key; it rejects the others, which guard
- * native libraries that check less. Every one is reachable by anyone who can write a row:
- * flipping s to n − s, or re-encoding a key, needs no secret.
+ * native libraries that check less, and an adapter that verifies DER (`dsaEncoding: 'der'`, or
+ * a fallback to it). Every one is reachable by anyone who can write a row: flipping s to n − s,
+ * or re-encoding a key or a signature, needs no secret.
  */
 function ecdsaRejections(curve: ECDSA, signature: Uint8Array, compressed: Uint8Array, uncompressed: Uint8Array): EcdsaRejection[] {
 	const order = curve.Point.Fn.ORDER;
@@ -284,6 +287,7 @@ function ecdsaRejections(curve: ECDSA, signature: Uint8Array, compressed: Uint8A
 		{ what: 'a signature with r = 0', signature: concatBytes(new Uint8Array(width), s), message: CHECK_MESSAGE, publicKey: compressed },
 		{ what: 'a signature with r equal to the curve order', signature: concatBytes(scalar(order), s), message: CHECK_MESSAGE, publicKey: compressed },
 		{ what: 'a hybrid-encoded (0x06/0x07) public key', signature, message: CHECK_MESSAGE, publicKey: hybrid },
+		{ what: 'a DER-encoded signature', signature: curve.Signature.fromBytes(signature, 'compact').toBytes('der'), message: CHECK_MESSAGE, publicKey: compressed },
 	];
 }
 
