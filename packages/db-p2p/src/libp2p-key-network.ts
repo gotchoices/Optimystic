@@ -1805,6 +1805,26 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 		return { members: [...cohort].sort(), runs }
 	}
 
+	/**
+	 * Of `peerIds`, in order, those other than this node whose peerStore protocol list includes
+	 * `protocol`, read through the peer record cache ({@link peerRecords}); a peer with no record is left
+	 * out. The network membership predicate is not applied here: a caller choosing among these applies it
+	 * at its own candidate filter, and two filters would be two places to keep in step.
+	 *
+	 * NOTE: the list can include a protocol a peer merely opened a stream on, since libp2p merges each
+	 * stream's protocol into the remote peer's record and only `repo` and `cluster` are kept out
+	 * (`filterStorageClaimMerges` in `network/storage-claim-filter.ts`). Harmless for the blob protocol,
+	 * the one caller: every build that opens a blob stream also registers its handler. Revisit if a build
+	 * ever sends on a protocol it does not serve.
+	 */
+	async peersServing(protocol: string, peerIds: readonly string[]): Promise<string[]> {
+		const selfId = this.libp2p.peerId.toString()
+		const others = peerIds.filter(id => id !== selfId)
+		if (others.length === 0) return []
+		const records = await this.peerRecords.records(others)
+		return others.filter(id => records[id]?.protocols.includes(protocol) === true)
+	}
+
 	/** Each peer's current connection run, or `undefined` when any of them has none. */
 	private connectionRunsOf(peers: readonly string[]): Record<string, number> | undefined {
 		const runs: Record<string, number> = {}

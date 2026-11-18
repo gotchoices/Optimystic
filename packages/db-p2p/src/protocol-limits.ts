@@ -19,7 +19,7 @@
  * reads the reply under, and `ProtocolClient` encodes a request under no cap beyond `maxRequestBytes`.
  */
 
-import { MAX_TRANSACTION_BYTES } from '@optimystic/db-core';
+import { MAX_BLOB_PIECE_BYTES, MAX_TRANSACTION_BYTES } from '@optimystic/db-core';
 
 /**
  * Max size (bytes) of a single framed message on a *control-plane* protocol: what carries a peer set,
@@ -89,3 +89,31 @@ export const CONSULT_RESPONSE_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES / 2
  * so nothing else needs the room {@link CONSULT_RESPONSE_CONTENT_BUDGET_BYTES} keeps back.
  */
 export const GET_REPLY_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES - TRANSACTION_ENVELOPE_RESERVE_BYTES;
+
+/**
+ * Largest header frame a blob stream reads: the JSON first frame in either direction
+ * (`readBlobFrames` in `blob/blob-frames.ts`). A `stat` of {@link MAX_BLOB_STAT_REFS} references is
+ * about 4 KB of JSON.
+ */
+export const MAX_BLOB_HEADER_BYTES = 16 * 1024;
+
+/** Largest piece frame a blob stream reads: the reader's bound on one piece, so a peer cannot make it allocate more. */
+export const MAX_BLOB_PIECE_FRAME_BYTES = MAX_BLOB_PIECE_BYTES;
+
+/**
+ * Most piece ids one blob `get` names. It is also the bound on what one `get` stream can queue on the
+ * receiving side, since nothing below the reader pauses the sender (the `NOTE:` at `readBlobFrames`).
+ */
+export const MAX_BLOB_GET_PIECES = 16;
+
+/** Most references one blob `stat` names. */
+export const MAX_BLOB_STAT_REFS = 64;
+
+/**
+ * Most blob `get` streams this node serves at once for one peer: a client opens one background and one
+ * foreground stream per peer (docs/blobs.md §Moving pieces between machines).
+ */
+export const MAX_BLOB_INBOUND_GETS_PER_PEER = 2;
+
+/** Most blob `get` streams this node serves at once in all. */
+export const MAX_BLOB_INBOUND_GETS = 16;

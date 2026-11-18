@@ -78,7 +78,7 @@ export type ProcessMessageOptions = {
 /** Whether any byte of the reply has arrived on a stream, which decides whether a request may be re-sent. */
 type ExchangeProgress = { replyStarted: boolean };
 
-const cidSuffix = (options?: ProcessMessageOptions): string =>
+const cidSuffix = (options?: { correlationId?: string }): string =>
 	options?.correlationId ? ` cid=${options.correlationId}` : '';
 
 const errorCode = (err: unknown): string => {
@@ -90,6 +90,79 @@ const errorLabel = (err: unknown): string => {
 	const message = err instanceof Error ? err.message : String(err);
 	return message.length > 200 ? message.slice(0, 200) + '…' : message;
 };
+
+/** What {@link openStreamWithin} bounds one stream's opening by. */
+export type OpenStreamOptions = {
+	/** The caller's cancellation; an abort rejects with its reason. */
+	signal?: AbortSignal;
+	/** The per-peer dial deadline; expiry rejects with {@link DialTimeoutError}. Absent or 0 means none. */
+	dialTimeoutMs?: number;
+	/** Suffixed to every log line, to follow one request across nodes. */
+	correlationId?: string;
+};
+
+/**
+ * Open a stream to `peerId` on `protocol`, under the per-peer dial deadline when one is set: an
+ * unreachable peer then fails fast so the caller can re-pick a different peer, independent of any
+ * overall budget the caller may also be enforcing. Expiry of the dial deadline rejects with
+ * {@link DialTimeoutError}, the caller's abort with the caller's own reason, and any other failure with
+ * libp2p's error unchanged.
+ *
+ * Shared by {@link ProtocolClient} and the blob protocol client, which carries several frames per
+ * stream and so cannot go through `ProtocolClient`'s single request and reply.
+ */
+export async function openStreamWithin(peerNetwork: IPeerNetwork, peerId: PeerId, protocol: string, options?: OpenStreamOptions): Promise<Libp2pStream> {
+	const peer = peerId.toString();
+	const cid = cidSuffix(options);
+	log('dial peer=%s protocol=%s%s', peer, protocol, cid);
+	const t0 = Date.now();
+
+	const dialTimeoutMs = options?.dialTimeoutMs;
+	const dialController = dialTimeoutMs && dialTimeoutMs > 0 ? new AbortController() : undefined;
+	let dialTimer: ReturnType<typeof setTimeout> | undefined;
+	const onParentAbort = () => dialController?.abort(options?.signal?.reason);
+	if (dialController) {
+		dialTimer = setTimeout(() => {
+			dialController.abort(new DialTimeoutError(peer, protocol, dialTimeoutMs!));
+		}, dialTimeoutMs);
+		if (options?.signal) {
+			if (options.signal.aborted) dialController.abort(options.signal.reason);
+			else options.signal.addEventListener('abort', onParentAbort, { once: true });
+		}
+	}
+	const dialSignal = dialController?.signal ?? options?.signal;
+
+	let stream: Libp2pStream;
+	try {
+		stream = await peerNetwork.connect(
+			peerId,
+			protocol,
+			{ signal: dialSignal }
+		) as unknown as Libp2pStream;
+	} catch (err) {
+		const elapsed = Date.now() - t0;
+		// If the dial AbortController fired due to our own timer, surface the
+		// dial-timeout error rather than the underlying AbortError so callers
+		// can distinguish "peer was slow" from "user/parent cancelled".
+		if (dialController?.signal.aborted && dialController.signal.reason instanceof DialTimeoutError) {
+			log('dial:timeout peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid);
+			throw dialController.signal.reason;
+		}
+		// A cancelled caller is owed its own reason — a whole-request budget's names the budget —
+		// not whichever error libp2p raised several layers down. Mirrors the read in `ProtocolClient`.
+		if (options?.signal?.aborted) {
+			log('dial:aborted peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid);
+			throw options.signal.reason;
+		}
+		log('dial:fail peer=%s protocol=%s ms=%d code=%s msg=%s%s', peer, protocol, elapsed, errorCode(err), errorLabel(err), cid);
+		throw err;
+	} finally {
+		if (dialTimer) clearTimeout(dialTimer);
+		if (options?.signal) options.signal.removeEventListener('abort', onParentAbort);
+	}
+	log('dial:ok peer=%s ms=%d prepared=%s%s', peer, Date.now() - t0, isPreparedStream(stream), cid);
+	return stream;
+}
 
 /** Base class for clients that communicate via a libp2p protocol */
 export class ProtocolClient {
@@ -141,7 +214,7 @@ export class ProtocolClient {
 	): Promise<T> {
 		const t0 = Date.now();
 		const request = this.encodeRequest(message, protocol, options);
-		const stream = await this.openRequestStream(protocol, options);
+		const stream = await openStreamWithin(this.peerNetwork, this.peerId, protocol, options);
 		// The response deadline starts once the first stream is open; a re-send runs inside what is left of it.
 		const responseTimeoutMs = options?.responseTimeoutMs;
 		const responseDeadline = responseTimeoutMs && responseTimeoutMs > 0 ? Date.now() + responseTimeoutMs : undefined;
@@ -151,7 +224,7 @@ export class ProtocolClient {
 		} catch (err) {
 			if (!this.mayResend(stream, progress, err, options)) throw err;
 			log('prepared:resend peer=%s protocol=%s reason=%s%s', this.peerId.toString(), protocol, errorLabel(err), cidSuffix(options));
-			const resendStream = await this.openRequestStream(protocol, options);
+			const resendStream = await openStreamWithin(this.peerNetwork, this.peerId, protocol, options);
 			return await this.exchange<T>(resendStream, request, protocol, options, t0, responseDeadline, { replyStarted: false });
 		}
 	}
@@ -181,64 +254,6 @@ export class ProtocolClient {
 		if (stream.status === 'reset') return false;
 		if (err instanceof ResponseTimeoutError) return false;
 		return options?.signal?.aborted !== true;
-	}
-
-	/**
-	 * Open the stream one request travels on, under the per-peer dial deadline when one is set: an
-	 * unreachable peer then fails fast so the caller can re-pick a different coordinator — independent
-	 * of any overall transaction budget the caller may also be enforcing.
-	 */
-	private async openRequestStream(protocol: string, options?: ProcessMessageOptions): Promise<Libp2pStream> {
-		const peer = this.peerId.toString();
-		const cid = cidSuffix(options);
-		log('dial peer=%s protocol=%s%s', peer, protocol, cid);
-		const t0 = Date.now();
-
-		const dialTimeoutMs = options?.dialTimeoutMs;
-		const dialController = dialTimeoutMs && dialTimeoutMs > 0 ? new AbortController() : undefined;
-		let dialTimer: ReturnType<typeof setTimeout> | undefined;
-		const onParentAbort = () => dialController?.abort(options?.signal?.reason);
-		if (dialController) {
-			dialTimer = setTimeout(() => {
-				dialController.abort(new DialTimeoutError(peer, protocol, dialTimeoutMs!));
-			}, dialTimeoutMs);
-			if (options?.signal) {
-				if (options.signal.aborted) dialController.abort(options.signal.reason);
-				else options.signal.addEventListener('abort', onParentAbort, { once: true });
-			}
-		}
-		const dialSignal = dialController?.signal ?? options?.signal;
-
-		let stream: Libp2pStream;
-		try {
-			stream = await this.peerNetwork.connect(
-				this.peerId,
-				protocol,
-				{ signal: dialSignal }
-			) as unknown as Libp2pStream;
-		} catch (err) {
-			const elapsed = Date.now() - t0;
-			// If the dial AbortController fired due to our own timer, surface the
-			// dial-timeout error rather than the underlying AbortError so callers
-			// can distinguish "peer was slow" from "user/parent cancelled".
-			if (dialController?.signal.aborted && dialController.signal.reason instanceof DialTimeoutError) {
-				log('dial:timeout peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid);
-				throw dialController.signal.reason;
-			}
-			// A cancelled caller is owed its own reason — a whole-request budget's names the budget —
-			// not whichever error libp2p raised several layers down. Mirrors the read below.
-			if (options?.signal?.aborted) {
-				log('dial:aborted peer=%s protocol=%s ms=%d%s', peer, protocol, elapsed, cid);
-				throw options.signal.reason;
-			}
-			log('dial:fail peer=%s protocol=%s ms=%d code=%s msg=%s%s', peer, protocol, elapsed, errorCode(err), errorLabel(err), cid);
-			throw err;
-		} finally {
-			if (dialTimer) clearTimeout(dialTimer);
-			if (options?.signal) options.signal.removeEventListener('abort', onParentAbort);
-		}
-		log('dial:ok peer=%s ms=%d prepared=%s%s', peer, Date.now() - t0, isPreparedStream(stream), cid);
-		return stream;
 	}
 
 	/**
