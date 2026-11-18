@@ -307,7 +307,10 @@ export class WriteGroup<K, V extends StoredValue = Uint8Array> {
 		if (!(withinMs >= 0) || !Number.isFinite(withinMs)) {
 			return Promise.reject(new RangeError(`withinMs must be a finite number of milliseconds at or above 0, got ${withinMs}`));
 		}
-		return this.settle({ deadline: Date.now() + withinMs, strict: withinMs === 0 });
+		// One clock reading for both the deadline and a seal this call makes, so a seal hands the sink
+		// exactly `withinMs` rather than whatever is left after the millisecond ticks between two reads.
+		const now = Date.now();
+		return this.settle({ deadline: now + withinMs, strict: withinMs === 0 }, now);
 	}
 
 	/**
@@ -346,12 +349,15 @@ export class WriteGroup<K, V extends StoredValue = Uint8Array> {
 		return value === null || value === undefined ? 0 : this.storedBytes(value);
 	}
 
-	/** Route one flush by what is open and in flight; the doc on {@link flush} lists the cases. */
-	private settle(request: FlushRequest): Promise<void> {
+	/**
+	 * Route one flush by what is open and in flight; the doc on {@link flush} lists the cases. `now`
+	 * is the clock reading a seal made here counts the time left to its deadline from.
+	 */
+	private settle(request: FlushRequest, now = Date.now()): Promise<void> {
 		if (this.fault) return Promise.reject(new StoreFailedError(this.fault.cause));
 		if (this.open.length > 0) {
 			if (this.inFlight) return this.joinNextSeal(request);
-			const sealed = this.sealAndCommit([request.deadline]);
+			const sealed = this.sealAndCommit([request.deadline], now);
 			return request.strict ? sealed.durable : sealed.committed;
 		}
 		const committed = this.inFlight?.committed;
@@ -362,12 +368,11 @@ export class WriteGroup<K, V extends StoredValue = Uint8Array> {
 		return committed ?? Promise.resolve();
 	}
 
-	/** Seal the open batch and commit it. Precondition: no commit in flight. */
-	private sealAndCommit(deadlines: readonly number[]): Settlement {
+	/** Seal the open batch at `now` and commit it. Precondition: no commit in flight. */
+	private sealAndCommit(deadlines: readonly number[], now: number): Settlement {
 		this.disarmIdleFlush();
 		const entries = this.open;
 		this.open = [];
-		const now = Date.now();
 		const batch: Batch = { seq: this.openSeq, deadline: this.deadlineFor(deadlines, now), settled: deferred() };
 		this.openSeq += 1;
 		const committed = this.runCommit(entries, batch, Math.max(0, batch.deadline - now));
@@ -518,7 +523,7 @@ export class WriteGroup<K, V extends StoredValue = Uint8Array> {
 	 */
 	private settleWaiters(waiters: readonly SealWaiter[]): void {
 		if (this.open.length > 0 && !this.inFlight && !this.fault) {
-			const sealed = this.sealAndCommit(waiters.map(({ request }) => request.deadline));
+			const sealed = this.sealAndCommit(waiters.map(({ request }) => request.deadline), Date.now());
 			for (const { request, waiter } of waiters) {
 				(request.strict ? sealed.durable : sealed.committed).then(waiter.resolve, waiter.reject);
 			}

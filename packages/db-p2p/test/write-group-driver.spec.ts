@@ -405,6 +405,23 @@ describe('WriteGroupDriver', () => {
 		expect(backend.committed.map(b => b.durable), 'the strict commit synced the earlier deferred batch too').to.deep.equal([true, true]);
 	});
 
+	it('a flush that seals at once commits with exactly its withinMs, however the clock moves during the call', async () => {
+		const backend = deferring();
+		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
+		await driver.putMetadata('b1' as BlockId, bytes('1'));
+		// Every read of the clock is a millisecond later than the last, so a flush that read it once for
+		// the deadline and again for the seal would hand the backend 4999.
+		const realNow = Date.now;
+		let tick = realNow();
+		Date.now = () => ++tick;
+		try {
+			await driver.flush({ withinMs: 5000 });
+		} finally {
+			Date.now = realNow;
+		}
+		expect(backend.committed.map(b => b.syncWithinMs)).to.deep.equal([5000]);
+	});
+
 	it('a strict and a relaxed flush sharing one seal commit it with syncWithinMs 0, and both resolve', async () => {
 		const { backend, park, release } = parkableBackend({ deferSync: true });
 		const driver = new WriteGroupDriver(backend, { setTimer: neverFires });
