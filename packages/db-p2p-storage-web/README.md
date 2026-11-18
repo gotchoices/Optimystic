@@ -8,6 +8,8 @@ IndexedDB-backed storage backend for Optimystic browser peers. Provides:
   writes journaled and applied as one transaction.
 - **`IndexedDBKVStore`** — implements `IKVStore` for the persistent transaction
   state used to recover crashed two-phase commits.
+- **`IndexedDBPieceStore`** — implements `IPieceStore`, keeping the pieces of
+  large values (blobs) in the same database, one transaction per piece.
 - **`loadOrCreateBrowserPeerKey`** — generates an Ed25519 libp2p private key on
   first run and persists it in the same IndexedDB database, giving the browser
   peer a stable, reload-surviving identity.
@@ -39,41 +41,49 @@ import {
   openOptimysticWebDb,
   IndexedDBRawStorage,
   IndexedDBKVStore,
+  IndexedDBPieceStore,
   loadOrCreateBrowserPeerKey,
 } from '@optimystic/db-p2p-storage-web';
 
-const db = await openOptimysticWebDb();          // single shared handle
-const rawStorage = new IndexedDBRawStorage(db);  // → IRawStorage
-const kvStore = new IndexedDBKVStore(db);        // → IKVStore (txn recovery)
+const db = await openOptimysticWebDb();             // single shared handle
+const rawStorage = new IndexedDBRawStorage(db);     // → IRawStorage
+const kvStore = new IndexedDBKVStore(db);           // → IKVStore (txn recovery)
+const pieceStorage = new IndexedDBPieceStore(db);   // → IPieceStore (blob pieces)
 const privateKey = await loadOrCreateBrowserPeerKey(db);
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
+  storage: rawStorage,
+  kvStore,
+  pieceStorage,
 });
 ```
 
-The same `IDBPDatabase` handle is shared by all three consumers — IndexedDB
+The same `IDBPDatabase` handle is shared by all four consumers — IndexedDB
 permits concurrent transactions across disjoint object stores, so the storage
-layer parallelises naturally.
+layer parallelises naturally. Passing the piece store the block store's handle
+is what makes the node count the pieces' bytes once: both report one store
+identity, and the block store's figure is the origin's estimate, which already
+includes them.
 
 Close the storage and the key-value store before the handle, and the handle last:
 
 ```ts
 await rawStorage.close();   // applies what it still holds, disarms its timers
 await kvStore.close();      // commits what it still holds, disarms its timer
-db.close();
+db.close();                 // the piece store has nothing to close or flush
 ```
 
-Neither `close()` closes the shared handle. A write a store still holds when the
+None of the `close()` calls closes the shared handle. A write a store still holds when the
 handle is closed under it is lost, and a timer it still has armed would fire on
 a closed handle.
 
 ## Persistence semantics
 
 The package opens a single IndexedDB database (`optimystic` by default) with
-nine object stores. `IndexedDBRawStorage` is the shared `KvRawStorage` kernel
+ten object stores. `IndexedDBRawStorage` is the shared `KvRawStorage` kernel
 over a `WriteGroupDriver` over a `JournalBatchBackend` over an
 `IndexedDBJournalStore`: the kernel owns all JSON/UTF-8 serialization, so the
 seven block-storage stores hold opaque kernel-encoded `Uint8Array` bytes rather
@@ -91,12 +101,25 @@ into are unchanged from earlier builds, so data written by one reads unchanged:
 | `materialized` | `[blockId, actionId]`| `Uint8Array` | `IBlock`               |
 | `journal`      | `seq` (a number), or `'applied-through'` | a `JournalRecord` by structured clone, or the number of the last record applied | — (owned by `IndexedDBJournalStore`) |
 | `kv`           | `key`                | `string` or `Uint8Array` | — (not kernel-backed) |
+| `pieces`       | `pieceId`            | `Uint8Array`, the piece's exact bytes, by structured clone | — (not kernel-backed; written by `IndexedDBPieceStore`) |
 
 `listRevisions` and `listPendingTransactions` use real IndexedDB range cursors
 — never `getAllKeys()` + JS filter — so list latency stays bounded as the store
 grows. `promotePendingTransaction` records two entries of one write group — the
 committed row's put and the pending row's delete — applied in that group's
 transaction, so the move is atomic across crashes.
+
+`pieces` holds blob pieces outside the journal: each put is one `readwrite`
+transaction that writes nothing when the id is present, a piece handed as a view
+into a larger buffer is copied first (structured clone would store the whole
+buffer), and `list()` reads the ids in pages of 1000.
+
+The database is at version 5 (`DEFAULT_DB_VERSION`), raised from 4 for
+`pieces`. A database an earlier build wrote gains the stores it lacks, empty,
+and keeps every record, since each store is created only when missing. A build
+that asks for an older version cannot open a version 5 database: the browser
+refuses the open with a `VersionError`. That is a downgrade, outside the promise
+that data an earlier build wrote reads on a later one.
 
 `getApproximateBytesUsed()` returns `(await navigator.storage.estimate()).usage`,
 which is **per-origin**, not per-database. That is adequate for `StorageMonitor`
@@ -113,7 +136,7 @@ put it on the disk) but promises nothing about the order relaxed transactions
 reach the disk, so the backend journals rather than committing groups directly:
 
 - a strict `flush()` (no `withinMs`, or 0) applies the group — and every group
-  journaled and not yet applied — as one strict transaction over the six data
+  journaled and not yet applied — as one strict transaction over the seven data
   stores and `journal`, and resolves once that transaction has completed;
 - a relaxed `flush({ withinMs })` — what a node uses for a write its cohort
   also holds, see [storage.md §How long a write may wait for its sync](../db-p2p/docs/storage.md#how-long-a-write-may-wait-for-its-sync) —
@@ -166,6 +189,12 @@ A failed transaction latches the storage: every later write, flush and
 the last flush as one `readwrite` transaction on `kv`, strict where the browser
 supports it — every flush of this store is strict, so nothing of it is ever
 journaled. `whenDurable()` and `close()` are the group's.
+
+`IndexedDBPieceStore` journals nothing. Each piece put is its own transaction,
+strict where the browser supports it, so once a put resolves the piece is on the
+disk and `flush()` has nothing to do; it reports the same `durability` as the
+block storage. A delete is not synced: a delete a power cut loses leaves a piece
+no blob names, which the node's sweep removes.
 
 ## Identity
 

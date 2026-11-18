@@ -1,5 +1,5 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
-import type { ActionId, BlockId } from '@optimystic/db-core';
+import type { ActionId, BlockId, PieceId } from '@optimystic/db-core';
 import type { JournalRecord } from '@optimystic/db-p2p';
 
 /**
@@ -40,6 +40,8 @@ export const JOURNAL_MARK_KEY = 'applied-through';
  *   identity helper. Identity keys are stored as raw `Uint8Array` blobs (under
  *   a separate logical store from string-only `IKVStore` data, but the same
  *   IndexedDB object store — IndexedDB stores typed arrays natively).
+ * - `pieces`: blob piece bytes keyed by the piece's id string, stored by structured clone. Written
+ *   and read only by `IndexedDBPieceStore`, one transaction per piece, never by the journal.
  */
 export interface OptimysticWebDB extends DBSchema {
 	metadata: {
@@ -78,23 +80,28 @@ export interface OptimysticWebDB extends DBSchema {
 		key: string;
 		value: string | Uint8Array;
 	};
+	pieces: {
+		key: PieceId;
+		value: Uint8Array;
+	};
 }
 
 export const DEFAULT_DB_NAME = 'optimystic';
-// Bumped to 2 when the `proofs` object store was added, to 3 for `journal`, and to 4 for
-// `commitProofs`. The `upgrade` hook is guarded by `objectStoreNames.contains`, so an existing
-// database gains only the stores it lacks (backlog
+// Bumped to 2 when the `proofs` object store was added, to 3 for `journal`, to 4 for
+// `commitProofs`, and to 5 for `pieces`. The `upgrade` hook is guarded by
+// `objectStoreNames.contains`, so an existing database gains only the stores it lacks (ticket
 // `debt-indexeddb-version-upgrade-is-untested-and-unhandled` owns testing that, and the open that
-// another tab's older connection blocks).
-export const DEFAULT_DB_VERSION = 4;
+// another tab's older connection blocks). A database at this version cannot be opened by a build
+// asking for an older one: the browser refuses the open with a `VersionError`.
+export const DEFAULT_DB_VERSION = 5;
 
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
 
 /**
  * Opens (and creates if necessary) the Optimystic IndexedDB database used by
- * `IndexedDBRawStorage`, `IndexedDBKVStore`, and `loadOrCreateBrowserPeerKey`.
+ * `IndexedDBRawStorage`, `IndexedDBKVStore`, `IndexedDBPieceStore` and `loadOrCreateBrowserPeerKey`.
  *
- * The same handle can be safely shared across all three — IndexedDB connections
+ * The same handle can be safely shared across all four — IndexedDB connections
  * support concurrent transactions across disjoint object stores.
  */
 export async function openOptimysticWebDb(
@@ -129,6 +136,9 @@ export async function openOptimysticWebDb(
 			}
 			if (!db.objectStoreNames.contains('kv')) {
 				db.createObjectStore('kv');
+			}
+			if (!db.objectStoreNames.contains('pieces')) {
+				db.createObjectStore('pieces');
 			}
 		},
 	});

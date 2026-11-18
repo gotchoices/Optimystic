@@ -20,6 +20,14 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('storage:indexeddb');
 
+/**
+ * The `identityForHandle` scheme of every store over an `OptimysticWebDBHandle`. `IndexedDBJournalStore`
+ * and `IndexedDBPieceStore` both report `identityForHandle(IDB_HANDLE_SCHEME, db)`, so over one handle
+ * the two report one identity and `blockStoreCountsPieces` counts the pieces once: the block store's
+ * figure is the origin's estimate, which includes them.
+ */
+export const IDB_HANDLE_SCHEME = 'idb-handle';
+
 /** The object stores an apply writes: the seven block-storage stores and the journal itself. */
 const APPLY_STORES = ['metadata', 'revisions', 'pending', 'transactions', 'proofs', 'commitProofs', 'materialized', 'journal'] as const;
 
@@ -134,7 +142,7 @@ export class IndexedDBJournalStore implements JournalStore {
 	constructor(private readonly db: OptimysticWebDBHandle, options: IndexedDBJournalStoreOptions = {}) {
 		this.strict = resolveStrictDurability(options);
 		this.durability = this.strict ? 'power-loss' : 'process-crash';
-		this.identity = identityForHandle('idb-handle', db);
+		this.identity = identityForHandle(IDB_HANDLE_SCHEME, db);
 	}
 
 	storeIdentity(): StoreIdentity {
