@@ -17,7 +17,6 @@ import {
 	type BlobScope,
 	type BlobService,
 	type BlobStat,
-	type BlobUnavailableReason,
 	type PieceId,
 	type PieceSink,
 	type PieceSource,
@@ -60,6 +59,9 @@ export interface BlobFetchStore {
 	markWhole(ref: BlobRef, size: number): Promise<void>;
 }
 
+/** Supplies a piece the local store lacks; resolves with its verified bytes or rejects with why it cannot. */
+export type MissingPiece = (id: PieceId) => Promise<Uint8Array>;
+
 /** How long after a trigger a scheduled sweep runs, by default. */
 export const DEFAULT_SWEEP_DELAY_MS = 5_000;
 
@@ -82,8 +84,10 @@ export interface LocalBlobServiceInit {
 /**
  * A `BlobService` that answers from this machine alone (docs/blobs.md §The node's blob service):
  * puts, describes, reads, pins and unpins blobs over the node's piece store and its blob records.
- * Fetching from other machines (`feat-blob-pieces-move-between-machines`), announcing and durability
- * (`feat-a-referenced-blob-is-copied-to-its-cohort`) are later tickets; their entry points say so.
+ * It is the single-machine service underneath `NodeBlobService`, which is what `node.blobs` is and
+ * which fetches from other machines through `readThrough` and `fetchStore`; used on its own it never
+ * asks another machine. Announcing and durability (`feat-a-referenced-blob-is-copied-to-its-cohort`)
+ * are a later ticket; their entry points say so.
  */
 export class LocalBlobService implements BlobService {
 	private readonly pieces: IPieceStore;
@@ -173,11 +177,11 @@ export class LocalBlobService implements BlobService {
 	}
 
 	/**
-	 * What this node holds of the blob, from its record and its pieces. `probe` is ignored until
-	 * `feat-blob-pieces-move-between-machines` can ask the blob's cohort, and `durability` is left
-	 * absent until `feat-a-referenced-blob-is-copied-to-its-cohort`. A record found wrong about
-	 * whether the blob is whole is corrected (`record:corrected`). A malformed tree throws
-	 * BlobCorruptError.
+	 * What this node holds of the blob, from its record and its pieces: `here`, `partial` or `unknown`,
+	 * never `elsewhere`. `probe` is ignored: asking the blob's cohort is `NodeBlobService.stat`'s, which
+	 * calls this first. `durability` is left absent until `feat-a-referenced-blob-is-copied-to-its-cohort`.
+	 * A record found wrong about whether the blob is whole is corrected (`record:corrected`). A malformed
+	 * tree throws BlobCorruptError.
 	 */
 	async stat(ref: BlobRef, _options: { probe?: boolean } = {}): Promise<BlobStat> {
 		const record = await this.records.get(ref);
@@ -199,16 +203,29 @@ export class LocalBlobService implements BlobService {
 	}
 
 	/**
-	 * The verified bytes, or a range of them, from this node's pieces. A piece that is not here fails
-	 * the read with BlobUnavailableError, reason `not-here` when `from` is `'here'` and otherwise
-	 * `cohort-unreachable`, since nobody can be asked until the transfer ticket; `waitMs` is accepted
-	 * and ignored until then. A set `signal` ends the read between chunks with `signal.reason`.
+	 * The verified bytes, or a range of them, from this node's pieces alone. A piece that is not here
+	 * fails the read with BlobUnavailableError, reason `not-here` when `from` is `'here'` and otherwise
+	 * `cohort-unreachable`, since this service asks nobody; `waitMs` is ignored. A set `signal` ends the
+	 * read between chunks with `signal.reason`. `NodeBlobService.read` is the read that fetches.
 	 */
-	async *read(ref: BlobRef, options: BlobReadOptions = {}): AsyncIterable<Uint8Array> {
+	read(ref: BlobRef, options: BlobReadOptions = {}): AsyncIterable<Uint8Array> {
+		const reason = options.from === 'here' ? 'not-here' : 'cohort-unreachable';
+		return this.readThrough(ref, options, async id => {
+			throw new BlobUnavailableError(ref, reason, id);
+		});
+	}
+
+	/**
+	 * `read`, with a piece that is not here asked of `missing` rather than failing the read. The bytes
+	 * `missing` supplies are taken as verified, as a local piece is, so it must supply only bytes the
+	 * fetcher has checked against their id. A BlobUnavailableError out of the read corrects the record
+	 * to not whole, as `read`'s does.
+	 */
+	async *readThrough(ref: BlobRef, options: BlobReadOptions, missing: MissingPiece): AsyncIterable<Uint8Array> {
 		const { signal } = options;
 		signal?.throwIfAborted();
 		void this.touchLastRead(ref);
-		const source = this.readSource(ref, options.from === 'here' ? 'not-here' : 'cohort-unreachable');
+		const source = this.readSource(missing);
 		try {
 			for await (const chunk of readBlob(ref, source, { offset: options.offset, length: options.length, digest: this.digest })) {
 				yield chunk;
@@ -222,7 +239,7 @@ export class LocalBlobService implements BlobService {
 		}
 	}
 
-	/** Resolves when the blob is whole here; nothing can be fetched from elsewhere until the transfer ticket. */
+	/** Resolves when the blob is whole here; this service asks nobody, so otherwise it rejects with `cohort-unreachable`. `NodeBlobService.fetch` fetches. */
 	async fetch(ref: BlobRef, _options: BlobFetchOptions = {}): Promise<void> {
 		if ((await this.stat(ref)).locality !== 'here') {
 			throw new BlobUnavailableError(ref, 'cohort-unreachable');
@@ -250,7 +267,7 @@ export class LocalBlobService implements BlobService {
 		throw new Error('announcing a blob to its cohort is not built yet (feat-a-referenced-blob-is-copied-to-its-cohort)');
 	}
 
-	/** Nothing reports progress until the transfer ticket. */
+	/** Never fires: this service fetches nothing. `NodeBlobService.onProgress` reports the fetches it starts. */
 	onProgress(listener: (event: BlobProgressEvent) => void): () => void {
 		return subscribe(this.progressListeners, listener);
 	}
@@ -336,18 +353,12 @@ export class LocalBlobService implements BlobService {
 		}
 	}
 
-	/** The local source, with `get` throwing BlobUnavailableError for a piece that is not here. */
-	private readSource(ref: BlobRef, reason: BlobUnavailableReason): PieceSource {
+	/** The local source, with a piece that is not here asked of `missing`. */
+	private readSource(missing: MissingPiece): PieceSource {
 		const local = this.source;
 		return {
 			verified: true,
-			get: async id => {
-				const bytes = await local.get(id);
-				if (bytes === undefined) {
-					throw new BlobUnavailableError(ref, reason, id);
-				}
-				return bytes;
-			},
+			get: async id => (await local.get(id)) ?? missing(id),
 		};
 	}
 

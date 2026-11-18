@@ -2,8 +2,8 @@
  * The blob fetcher's two contracts that need real peers (docs/blobs.md §Moving pieces between
  * machines): a peer that serves wrong bytes is penalized once and another holder supplies the piece,
  * and an interrupted fetch keeps what it stored and asks only for the rest. Three real nodes over
- * loopback TCP; the fetcher under test is built over node B's own parts, since the node keeps its
- * fetcher private until `feat-blob-pieces-move-between-machines` uses it.
+ * loopback TCP; the fetcher under test is built over node B's own parts rather than taken from the
+ * node, so it can record every penalty and every stored piece.
  */
 import { randomBytes } from 'node:crypto';
 import { expect } from 'chai';
@@ -14,12 +14,12 @@ import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
 import type { IPieceStore } from '../src/blob/piece-store.js';
-import { LocalBlobService } from '../src/blob/local-blob-service.js';
 import { localPieceSource } from '../src/blob/local-piece-source.js';
 import { BlobProtocolClient } from '../src/blob/blob-protocol-client.js';
 import { buildBlobProtocol } from '../src/blob/blob-protocol.js';
 import { BlobFetcher, type PieceStoredEvent } from '../src/blob/blob-fetcher.js';
 import { PenaltyReason } from '../src/reputation/types.js';
+import { concat, localTcpAddr, streamOf, until } from './support/blob-mesh.js';
 
 /** Distinct per-spec so concurrent specs on network-scoped protocol ids cannot cross-talk. */
 const NETWORK = 'blob-fetcher';
@@ -52,16 +52,6 @@ interface Mesh {
 	c: OptimysticNode;
 }
 
-async function* streamOf(bytes: Uint8Array): AsyncIterable<Uint8Array> {
-	yield bytes;
-}
-
-async function concat(chunks: AsyncIterable<Uint8Array>): Promise<Uint8Array> {
-	const parts: Uint8Array[] = [];
-	for await (const chunk of chunks) parts.push(chunk);
-	return Buffer.concat(parts);
-}
-
 /** The data pieces of `ref`'s tree, in order. */
 async function dataPiecesOf(ref: BlobRef, pieces: IPieceStore): Promise<PieceId[]> {
 	const ids: PieceId[] = [];
@@ -69,20 +59,6 @@ async function dataPiecesOf(ref: BlobRef, pieces: IPieceStore): Promise<PieceId[
 		if (entry.kind === 'data') ids.push(entry.id);
 	}
 	return ids;
-}
-
-function localTcpAddr(node: OptimysticNode): string {
-	const local = node.getMultiaddrs().map(a => a.toString()).find(a => a.startsWith('/ip4/127.0.0.1/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error('No loopback TCP multiaddr on node');
-	return local;
-}
-
-async function until(condition: () => Promise<boolean>, what: string, withinMs = 15_000): Promise<void> {
-	const deadline = Date.now() + withinMs;
-	while (!(await condition())) {
-		if (Date.now() > deadline) throw new Error(`timed out waiting until ${what}`);
-		await new Promise(resolve => setTimeout(resolve, 50));
-	}
 }
 
 describe('blob fetcher', function () {
@@ -122,7 +98,6 @@ describe('blob fetcher', function () {
 
 	/** A fetcher over B's parts, recording every penalty and every stored piece. */
 	function fetcherOnB(b: OptimysticNode): { fetcher: BlobFetcher; penalties: Array<{ peer: string; reason: PenaltyReason }>; stored: PieceStoredEvent[] } {
-		if (!(b.blobs instanceof LocalBlobService)) throw new Error('node.blobs is not a LocalBlobService');
 		const penalties: Array<{ peer: string; reason: PenaltyReason }> = [];
 		const fetcher = new BlobFetcher({
 			client: new BlobProtocolClient({ peerNetwork: b.keyNetwork, protocolPrefix: PREFIX, deadlines: b.linkDeadlines }),
@@ -140,7 +115,7 @@ describe('blob fetcher', function () {
 					b.reputation.reportPeer(peer, reason, context);
 				},
 			},
-			store: b.blobs.fetchStore(),
+			store: b.blobs.local.fetchStore(),
 		});
 		const stored: PieceStoredEvent[] = [];
 		fetcher.onPieceStored(event => stored.push(event));

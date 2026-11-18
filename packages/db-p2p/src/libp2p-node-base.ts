@@ -30,7 +30,9 @@ import { LocalBlobService } from './blob/local-blob-service.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
 import { BlobProtocolClient } from './blob/blob-protocol-client.js';
 import { BlobFetcher } from './blob/blob-fetcher.js';
+import type { BlobHolderDeps } from './blob/blob-holders.js';
 import { buildBlobProtocol } from './blob/blob-protocol.js';
+import { NodeBlobService } from './blob/node-blob-service.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -1218,9 +1220,9 @@ export async function createLibp2pNodeBase(
 	if (!servesBlocks) logIgnoredServingOptions(options);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
 	const kvStore = resolveKvStore(options.kvStore, servesBlocks);
-	// The node's blob service (`node.blobs`), on both roles: the machine a blob is put on holds its
+	// The node's single-machine blob service, on both roles: the machine a blob is put on holds its
 	// only copy until its reference commits, and a client is often that machine (docs/blobs.md §The
-	// node's blob service). Started once it is attached, below.
+	// node's blob service). Started once the node has, below, where `node.blobs` is built over it.
 	const pieceStore = resolvePieceStore(options.pieceStorage);
 	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
 	// Built once: it gates the four storage protocol services on a serving node and the blob protocol on both roles.
@@ -1666,6 +1668,31 @@ export async function createLibp2pNodeBase(
 			})
 			: undefined;
 
+		// The start-up sweep removes the pieces of a put a crash interrupted. Its stop wrapper follows at
+		// once, so the rollback below stops the service too.
+		blobs.start();
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await blobs.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		// Its stop wrapper runs before the blob service's, so no fetched piece is stored after that.
+		const blobTransfer = wireBlobFetcher({ node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs });
+		// `node.blobs`. The blob protocol service keeps answering from `blobs`: a peer's stat is about
+		// what this node holds, and must not start a probe of its own.
+		const nodeBlobs = new NodeBlobService({
+			local: blobs,
+			fetcher: blobTransfer.fetcher,
+			client: blobTransfer.client,
+			holders: blobTransfer.holders,
+			probeTimeoutMs: linkDeadlines.responseTimeoutMs,
+		});
+
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to
 		// `OptimysticNodeAttachmentsBase` (or to either role's shape) but never assigned here is a compile
@@ -1686,7 +1713,7 @@ export async function createLibp2pNodeBase(
 			linkDeadlines,
 			cohortReachability,
 			hlcClock,
-			blobs,
+			blobs: nodeBlobs,
 		};
 		const attachments: OptimysticNodeAttachments | OptimysticClientNodeAttachments = served
 			? {
@@ -1704,22 +1731,6 @@ export async function createLibp2pNodeBase(
 			}
 			: { ...shared, servesBlocks: false };
 		Object.assign(node, attachments);
-
-		// The start-up sweep removes the pieces of a put a crash interrupted. Its stop wrapper follows at
-		// once, so the rollback below stops the service too.
-		blobs.start();
-		{
-			const previousStop = node.stop.bind(node);
-			node.stop = async () => {
-				try {
-					await blobs.stop();
-				} finally {
-					await previousStop();
-				}
-			};
-		}
-		// Kept for `feat-blob-pieces-move-between-machines`, which builds `node.blobs`' network paths on them.
-		const _blobTransfer = wireBlobFetcher({ node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs });
 
 		// --- Cohort-topic origination activation (post-node: consumes the fully-assembled node + FRET) ---
 		// This is the only place that is after the node + FRET are assembled (node.start() done, fretSvc
@@ -2197,9 +2208,10 @@ function clientClusterLatest(self: PeerId, remote: ClusterLatestCallback): Clust
 /**
  * The node's blob protocol client and the fetcher over it (docs/blobs.md §Moving pieces between
  * machines), on both roles: a client fetches too. Candidates are chosen by the node's own key network,
- * membership gate and reputation, and fetched pieces are checked with the digest the blob service names
- * them by. The stop wrapper is installed at once, so a startup rollback stops the fetcher too; it runs
- * before the blob service's own stop, which was installed earlier, so no fetched piece is stored after it.
+ * membership gate and reputation, through one `BlobHolderDeps` the fetcher and `NodeBlobService`'s stat
+ * probe share, and fetched pieces are checked with the digest the blob service names them by. The stop
+ * wrapper is installed at once, so a startup rollback stops the fetcher too; it runs before the blob
+ * service's own stop, which was installed earlier, so no fetched piece is stored after it.
  */
 function wireBlobFetcher(ctx: {
 	node: Libp2p;
@@ -2209,22 +2221,18 @@ function wireBlobFetcher(ctx: {
 	membership: NetworkMembershipGate | undefined;
 	reputation: PeerReputationService;
 	blobs: LocalBlobService;
-}): { client: BlobProtocolClient; fetcher: BlobFetcher } {
+}): { client: BlobProtocolClient; fetcher: BlobFetcher; holders: BlobHolderDeps } {
 	const { node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs } = ctx;
 	const client = new BlobProtocolClient({ peerNetwork: keyNetwork, protocolPrefix, deadlines: linkDeadlines });
-	const fetcher = new BlobFetcher({
-		client,
-		holders: {
-			selfPeerId: node.peerId.toString(),
-			blobProtocol: buildBlobProtocol(protocolPrefix),
-			keyNetwork,
-			membership,
-			reputation,
-			isConnected: id => node.getConnections(peerIdFromString(id)).length > 0,
-		},
+	const holders: BlobHolderDeps = {
+		selfPeerId: node.peerId.toString(),
+		blobProtocol: buildBlobProtocol(protocolPrefix),
+		keyNetwork,
+		membership,
 		reputation,
-		store: blobs.fetchStore(),
-	});
+		isConnected: id => node.getConnections(peerIdFromString(id)).length > 0,
+	};
+	const fetcher = new BlobFetcher({ client, holders, reputation, store: blobs.fetchStore() });
 	const previousStop = node.stop.bind(node);
 	node.stop = async () => {
 		try {
@@ -2233,7 +2241,7 @@ function wireBlobFetcher(ctx: {
 			await previousStop();
 		}
 	};
-	return { client, fetcher };
+	return { client, fetcher, holders };
 }
 
 /** What {@link wireServingRole} reads from the factory: the started node and the pieces every role builds. */
