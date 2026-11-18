@@ -490,8 +490,9 @@ filesystem adapter stats the whole tree). Ring selection calls `getCapacity` sev
 operation, so the scan is memoized behind a short TTL (`usedBytesCacheTtlMs`, default 60s; `0`
 disables it). Within the window callers share the cached value; concurrent misses share a single
 in-flight scan; a supplied `usedBytes`/`availableBytes` override bypasses the scan (and the cache)
-entirely. Used bytes also include the node's blob piece store's own figure, read in the same scan,
-unless `blockStoreCountsPieces` in `packages/db-p2p/src/storage/storage-monitor.ts` says the block
+entirely. When the monitor is given a blob piece store (its optional third constructor argument;
+the node does not pass one yet), used bytes also include that store's own figure, read in the same
+scan, unless `blockStoreCountsPieces` in `packages/db-p2p/src/storage/storage-monitor.ts` says the block
 store already measured it ([blobs.md §The local store](blobs.md#the-local-store)).
 
 Consequence: the reported `used`/`available`/`usedPercent` may lag reality by up to the TTL. This
