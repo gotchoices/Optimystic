@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — native ECDSA verify
+## 1.28.0 — native ECDSA verify
 
 - `CryptoBackend` takes two more optional members, `p256Verify` and `secp256k1Verify`, which SQL and
   JS `verify` use for `'p256'` and `'secp256k1'` (GitHub #59: 47 ms and 29 ms a call in JavaScript
