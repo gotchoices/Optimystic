@@ -1,12 +1,15 @@
 import type { BlockId } from "../blocks/structs.js";
+import { cidOfPiece, rootPieceId, type BlobRef } from "../blob/blob-ref.js";
 
 declare const routingKeyBrand: unique symbol;
 
 /**
- * The bytes a block is routed on — what `IKeyNetwork.findCluster` and `IKeyNetwork.findCoordinator`
- * are handed for that block.
+ * The bytes a block or a blob is routed on — what `IKeyNetwork.findCluster` and
+ * `IKeyNetwork.findCoordinator` are handed for it.
  *
- * Branded so the only way to obtain one is {@link routingKeyForBlock}. Every party that asks "who is
+ * Branded so the only ways to obtain one are {@link routingKeyForBlock} and {@link routingKeyForBlob}.
+ * A block's key is its id's utf8 text and a blob's is 32 raw digest bytes; they never need telling
+ * apart, since an equal key only means the same placement. Every party that asks "who is
  * responsible for this block" (the writer's `NetworkTransactor`, a coordinator's responsibility check,
  * a cohort member re-deriving its cluster, `RepoService`'s redirect check) must land on the same ring
  * position, and they only do if they hand the key network the same bytes. When the writer pre-hashed
@@ -24,4 +27,9 @@ const utf8 = new TextEncoder();
  */
 export function routingKeyForBlock(blockId: BlockId): RoutingKey {
 	return utf8.encode(blockId) as RoutingKey;
+}
+
+/** A blob's routing key: the 32-byte SHA-256 digest inside its reference, not hashed again (the key network hashes once). */
+export function routingKeyForBlob(ref: BlobRef): RoutingKey {
+	return cidOfPiece(rootPieceId(ref)).multihash.digest as RoutingKey;
 }

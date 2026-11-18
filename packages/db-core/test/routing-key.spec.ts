@@ -1,5 +1,6 @@
 import { expect } from 'chai'
-import { routingKeyForBlock } from '../src/network/routing-key.js'
+import { routingKeyForBlob, routingKeyForBlock } from '../src/network/routing-key.js'
+import { cidOfPiece, parseBlobRef, rootPieceId } from '../src/index.js'
 import type { ClusterPeers, IKeyNetwork, PeerId } from '../src/index.js'
 
 describe('routingKeyForBlock', () => {
@@ -23,5 +24,14 @@ describe('routingKeyForBlock', () => {
 		// @ts-expect-error a pre-hashed digest is not a routing key
 		await net.findCoordinator(new Uint8Array(32))
 		expect(seen).to.have.length(3)
+	})
+})
+
+describe('routingKeyForBlob', () => {
+	it('is the 32-byte digest inside the reference, not hashed again', () => {
+		const ref = parseBlobRef('bafybeiexg2oqkfnj56l7fcmawswqbijt5shq4b5rg6a546uwpkqqzwjioi')
+		const key = routingKeyForBlob(ref)
+		expect(key.byteLength).to.equal(32)
+		expect([...key]).to.deep.equal([...cidOfPiece(rootPieceId(ref)).multihash.digest])
 	})
 })

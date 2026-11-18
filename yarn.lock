@@ -1200,6 +1200,15 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@ipld/dag-pb@npm:^4.2.0":
+  version: 4.2.0
+  resolution: "@ipld/dag-pb@npm:4.2.0"
+  dependencies:
+    multiformats: "npm:^14.0.0"
+  checksum: 10c0/f65427c32b08e35b0b0c4bb54110b145b492722824f4198d3c18c9983170e6b5d16aa33b033e643681e209c08f6773ef2680cafc8f94ee6ef4f2a54ba373b949
+  languageName: node
+  linkType: hard
+
 "@isaacs/balanced-match@npm:^4.0.1":
   version: 4.0.1
   resolution: "@isaacs/balanced-match@npm:4.0.1"
@@ -1806,6 +1815,7 @@ __metadata:
   version: 0.0.0-use.local
   resolution: "@optimystic/db-core@workspace:packages/db-core"
   dependencies:
+    "@ipld/dag-pb": "npm:^4.2.0"
     "@libp2p/crypto": "npm:^5.1.23"
     "@libp2p/interface": "npm:^3.3.0"
     "@libp2p/peer-id": "npm:^6.0.15"
@@ -1821,6 +1831,7 @@ __metadata:
     chai-as-promised: "npm:^8.0.2"
     debug: "npm:^4.4.3"
     fast-check: "npm:^4.7.0"
+    ipfs-unixfs: "npm:^13.1.2"
     mocha: "npm:^11.7.5"
     multiformats: "npm:^14.0.5"
     rimraf: "npm:^6.1.2"
@@ -4464,6 +4475,17 @@ __metadata:
   languageName: node
   linkType: hard
 
+"ipfs-unixfs@npm:^13.1.2":
+  version: 13.1.2
+  resolution: "ipfs-unixfs@npm:13.1.2"
+  dependencies:
+    protons-runtime: "npm:^8.0.1"
+    uint8arraylist: "npm:^3.0.2"
+    uint8arrays: "npm:^6.1.1"
+  checksum: 10c0/071d169c885ff17bbea1c9e0fbdb6281f415afef5bfab79b16d73cfd7d54f6a721c29c566b6a78a38380d4e3368eebde2df03db21984aad85bf4b92517ec4090
+  languageName: node
+  linkType: hard
+
 "is-buffer@npm:^2.0.5":
   version: 2.0.5
   resolution: "is-buffer@npm:2.0.5"
@@ -6098,6 +6120,17 @@ __metadata:
     uint8arraylist: "npm:^3.0.0"
     uint8arrays: "npm:^6.0.0"
   checksum: 10c0/134d5fd4949bf251ad0763ab1aa2c6687c907c920c5393ec261e3743313fa6e408353908c45ed07b09bac05fcfa4f7b1b57798ceb0785d0aba53605eaeb2efce
+  languageName: node
+  linkType: hard
+
+"protons-runtime@npm:^8.0.1":
+  version: 8.0.2
+  resolution: "protons-runtime@npm:8.0.2"
+  dependencies:
+    uint8-varint: "npm:^3.0.0"
+    uint8arraylist: "npm:^3.0.0"
+    uint8arrays: "npm:^6.0.0"
+  checksum: 10c0/b6e33ccfb671b6c489b02518060f8972c552f1e990543e399dca34a05395ac80fcc161d2b049614c969442ed5ae54735da498a1d4e4defdd73b23cd953316992
   languageName: node
   linkType: hard
 

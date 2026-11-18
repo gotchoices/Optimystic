@@ -1,3 +1,4 @@
+export * from "./blob/index.js";
 export * from "./blocks/index.js";
 export * from "./btree/index.js";
 export * from "./chain/index.js";

@@ -66,8 +66,10 @@
     "typescript": "^5.9.3"
   },
   "dependencies": {
+    "@ipld/dag-pb": "^4.2.0",
     "@noble/hashes": "^2.0.1",
     "debug": "^4.4.3",
+    "ipfs-unixfs": "^13.1.2",
     "multiformats": "^14.0.5",
     "uint8arrays": "^6.1.1"
   }
