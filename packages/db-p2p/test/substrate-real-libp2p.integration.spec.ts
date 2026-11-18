@@ -1419,6 +1419,8 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 		let delivered = 0;
 		const watcherRegistry = (watcher as unknown as { reactivitySubscribers: { register(topicId: Uint8Array, h: (n: NotificationV1) => void): () => void } }).reactivitySubscribers;
 		const offCount = watcherRegistry.register(topicId, () => { delivered++; });
+		const DIAG = { local: 0 };
+		watcher.blockChangeNotifier.onCollectionChange(COLLECTION, () => { DIAG.local++; });
 		const handle = watcher.reactivityWatch!.watch({
 			collectionId: COLLECTION,
 			tails: countedTailReader(watcherTransactor, reads),
@@ -1446,12 +1448,19 @@ function countedTailReader(transactor: ITransactor, reads: { started: number; fi
 				const wakesBeforeCommit = wakes;
 				const deliveredBeforeCommit = delivered;
 				await writerTree.replace([[attempt + 2, { key: attempt + 2, value: `after the watch, attempt ${attempt}` }]]);
+				const localBefore = DIAG.local;
 				try {
 					await waitFor(() => wakes > wakesBeforeCommit, { timeoutMs: 10_000, intervalMs: 50, description: 'the watch woke' });
 				} catch {
+					console.log('DIAG attempt', attempt, 'no wake');
 					continue;
 				}
+				const readsAtWake = reads.started - readsBeforeCommit;
+				const deliveredAtWake = delivered - deliveredBeforeCommit;
+				const localAtWake = DIAG.local - localBefore;
 				wokeByNotification = reads.started === readsBeforeCommit && delivered > deliveredBeforeCommit;
+				await new Promise((r) => setTimeout(r, 3000));
+				console.log('DIAG attempt', attempt, JSON.stringify({ wokeByNotification, readsAtWake, deliveredAtWake, localAtWake, deliveredLater: delivered - deliveredBeforeCommit, localLater: DIAG.local - localBefore, watcherStoresLocal: DIAG.local > 0 }));
 			}
 			expect(wokeByNotification, 'a commit coordinated inside the storage group woke a watcher outside it by a delivered notification, with no tail read in between').to.equal(true);
 		} finally {
