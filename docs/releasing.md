@@ -69,7 +69,8 @@ yarn release
 reports the working-tree and upstream state, and waits for you to type `release` to confirm — then
 `yarn bump` (interactive version prompt, commits, tags, pushes), then `yarn pub` (build + publish each
 package), then `yarn await-published` (waits until npm serves every package at its new version — see
-[When the release is finished](#when-the-release-is-finished)).
+[When the release is finished](#when-the-release-is-finished)), then `yarn gh-release` (creates the
+GitHub release page — see [step 5](#5-create-the-github-release)).
 
 The preflight is a **reminder, not a substitute**: it does not run `yarn check` for you. Publishing
 is irreversible for a given version number, so the confirmation is deliberate rather than a
@@ -159,11 +160,24 @@ scenario to each storage backend a deployment runs on, and packs the result into
 later build still reads what this release wrote. Needs the network, and the packages must already be
 on npm: run it after `yarn await-published` has reported them all visible.
 
-### 5. Create a GitHub release (optional)
+### 5. Create the GitHub release
 
 ```bash
-gh release create v{version} --generate-notes
+yarn gh-release              # yarn release runs this last
+yarn gh-release --dry-run    # print the title and body; change nothing
 ```
+
+`scripts/gh-release.mjs` creates the release page for the tag `v{version}`, taking the version from
+the root `package.json` and refusing a tag that does not exist (`--verify-tag`). The body is that
+version's section of `.release-notes.pending.md`: the section titled `# v{version}`, or else the
+first section when it is the cycle's `# Unreleased — since …` one. Its links to files in this
+repository are pointed at the tag, since a release page resolves no relative link. Once the page
+exists the section is removed from the file, and the removal is committed and pushed. With no
+section for the version, the page takes GitHub's generated notes and the file is left alone.
+
+It needs `gh` logged in with permission to create releases. If it fails after `yarn
+await-published`, the packages are published and only the page is missing: run `yarn gh-release`
+again once the cause is fixed.
 
 ## Prerelease / RC
 
@@ -191,4 +205,4 @@ All packages in the monorepo share the same version number. The `--recursive` fl
 - [ ] `yarn release` (or `yarn bump` + `yarn pub` + `yarn await-published` separately), ending with `all N packages published and visible on npm at {version}`
 - [ ] Only then: tell downstream repositories to upgrade
 - [ ] `yarn workspace @optimystic/upgrade-check write-fixture {version}`, and the new fixture committed
-- [ ] GitHub release created
+- [ ] GitHub release created (`yarn gh-release`, which `yarn release` runs)
