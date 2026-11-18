@@ -763,10 +763,11 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 			return target ? claimFromConsultAnswer(await consultAnswerOf(target, blockId, context, held)) : undefined;
 		};
 		// Serves each block as a real peer's sync service serves a batched consult, content budget included.
-		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks, context?) => {
+		const clusterLatestBatchCallback: ClusterLatestBatchCallback = async (peerId, asks) => {
 			const target = reachConsulted(peerId);
 			const served: Array<[BlockId, SyncBlockAnswer]> = [];
-			for (const { blockId, held } of asks) {
+			// Each question carries its own read's context: one request can gather the background consults of several reads.
+			for (const { blockId, held, context } of asks) {
 				served.push([blockId, target ? await consultAnswerOf(target, blockId, context, held) : {}]);
 			}
 			const fitted = fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES);

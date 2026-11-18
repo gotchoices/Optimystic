@@ -11,7 +11,7 @@ import type { ITransactionStateStore } from "../cluster/i-transaction-state-stor
 import { quorumSize, corroboratorCapacity, selectQuorumRev, certifiedEquivocation, CORROBORATION_FLOOR, type RevClaim, type QuorumRev } from "../cluster/quorum-restore.js";
 import { certifyClaim, isAttributableProofFailure, proofThresholds, type ProofAnchoring } from "../cluster/certified-claims.js";
 import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js";
-import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveReadRepairQuietWindowMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
+import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveReadRepairCoalesceMs, resolveReadRepairQuietWindowMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
@@ -28,6 +28,7 @@ import { askerStatementFor, type AskerStatement } from "./stated-holdings.js";
 import { SilentConsultHolds } from "./silent-consult-holds.js";
 import { commitBatchOf, pendBatchOf, refusesSolo, statedLane, type CommitBatch, type PendBatch, type RequestBatch } from "./request-batch.js";
 import { ConsultRound, leavingSeat, type ClusterLatestBatchCallback, type ConsultSeat } from "./consult-round.js";
+import { BackgroundConsultRounds } from "./background-consult-rounds.js";
 import { HeldBlockConsults } from "./held-block-consults.js";
 import { cohortCommitsNeedEveryMember, quietCohortFor, quietCohortHolds, type QuietCohort } from "./quiet-cohort.js";
 import { withDeadline } from "../with-deadline.js";
@@ -751,6 +752,13 @@ export class CoordinatorRepo implements IRepo {
 	 * test teardown measurably, give this class a stop that aborts the in-flight passes.
 	 */
 	private readonly heldBlockConsults = new HeldBlockConsults();
+	/**
+	 * The round the consults running behind reads share, so consults started by reads close together
+	 * ask each peer in one request ({@link BackgroundConsultRounds}). Absent when this node has no batch
+	 * callback (every pass asks each peer itself) or `readRepairCoalesceMs` is 0, and then each background
+	 * pass joins its read's own round, as before coalescing.
+	 */
+	private readonly backgroundRounds?: BackgroundConsultRounds;
 	/** Last sequence number handed out by {@link nextPassSeq}. */
 	private passSeq = 0;
 
@@ -799,6 +807,7 @@ export class CoordinatorRepo implements IRepo {
 			readRepairWindowMs: cfg?.readRepairWindowMs ?? 10000,
 			readRepairSampleRate: cfg?.readRepairSampleRate ?? 0,
 			readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(cfg?.readRepairQuietWindowMs),
+			readRepairCoalesceMs: resolveReadRepairCoalesceMs(cfg?.readRepairCoalesceMs),
 			// Through the shared resolver, not a second literal: a hand-wired coordinator and a node
 			// assembly given the same operator number must bound their per-peer reads identically, and
 			// a degenerate declaration must fail here exactly as it fails at node construction.
@@ -817,6 +826,13 @@ export class CoordinatorRepo implements IRepo {
 			: 0;
 		this.cohortQueryTimeoutMs = policy.cohortQueryTimeoutMs!;
 		this.reconcilePassTimeoutMs = reconcilePassTimeoutMs(this.cohortQueryTimeoutMs);
+		if (policy.readRepairCoalesceMs! > 0 && this.clusterLatestBatchCallback && this.clusterLatestCallback) {
+			this.backgroundRounds = new BackgroundConsultRounds({
+				open: () => this.openConsultRound()!,
+				delayMs: policy.readRepairCoalesceMs!,
+				log: this.log
+			});
+		}
 		// Only the `'lazy'` window ever reads a hold, so any other mode places none — and logs none.
 		this.silentConsultHolds = new SilentConsultHolds({
 			baseMs: this.readRepairMode === 'lazy' ? cfg?.retryBackoffBaseMs ?? 0 : 0,
@@ -1003,7 +1019,7 @@ export class CoordinatorRepo implements IRepo {
 			// one block never has two consults running against its own memo entries. The passes' questions
 			// to each peer go out together, as one request per peer (`ConsultRound`).
 			const blockIds = [...new Set(blockGets.blockIds)];
-			const round = this.openConsultRound(blockGets.context);
+			const round = this.openConsultRound();
 			const passes = blockIds.map(blockId => this.readRepairBlock(blockId, blockGets, localResult, options, round));
 			// Sound only because every pass decides whether to join the round before its first await
 			// (`readRepairBlock`): once `map` returns, every seat this read will have has joined, so
@@ -1040,12 +1056,13 @@ export class CoordinatorRepo implements IRepo {
 	 * span holds ({@link quietCohortStillVouches}): its last consult heard from every member of a cohort
 	 * in which every commit needs every member, and none of them has disconnected since.
 	 *
-	 * A consult this pass runs, blocking or behind the read, joins `round` (the read's
-	 * {@link ConsultRound}, when there is one) and asks each peer through it. It joins before this
-	 * method's first await — everything ahead of the join is synchronous — which is what lets `get`
+	 * A consult this pass waits on joins `round` (the read's {@link ConsultRound}, when there is one) and
+	 * asks each peer through it; one it starts behind the read joins the shared background round
+	 * instead, when coalescing is on ({@link startHeldBlockConsult}). It joins the read's round before
+	 * this method's first await — everything ahead of the join is synchronous — which is what lets `get`
 	 * close the round as soon as it has started every pass. The quiet-span check is the one await ahead
 	 * of a consult, so a pass that makes it joins first and hands that seat to the consult it then
-	 * starts, or leaves it unused when the span holds.
+	 * waits on, or leaves it unused when the span holds or the consult runs in the background round.
 	 */
 	private async readRepairBlock(blockId: BlockId, blockGets: BlockGets, results: GetBlockResults, options?: MessageOptions, round?: ConsultRound): Promise<void> {
 		const localEntry = results[blockId];
@@ -1086,7 +1103,7 @@ export class CoordinatorRepo implements IRepo {
 		// Only an expired window can be answered by a quiet span: a sample is an operator's request for a
 		// consult, and an unstamped block has no span to extend.
 		const stamp = windowOnly && windowDemand === 'expired' ? this.lastSeenCommitMs.get(blockId) : undefined;
-		const reserved = stamp?.quiet ? round?.join() : undefined;
+		const reserved = stamp?.quiet ? round?.join(blockGets.context) : undefined;
 		if (stamp?.quiet && await this.quietCohortStillVouches(blockId, stamp, stamp.quiet, localRev)) {
 			reserved?.ready();
 			// Served exactly as a read inside the window is, and the stamp is left as it is, so the span
@@ -1112,7 +1129,7 @@ export class CoordinatorRepo implements IRepo {
 		if (isStale) this.logRepairTriggered(blockId, localRev, floorDemands ? 'floor' : 'window', false, floor);
 
 		const passSeq = this.nextPassSeq();
-		const seat = reserved ?? round?.join();
+		const seat = reserved ?? round?.join(blockGets.context);
 		try {
 			const { absence, currency, heldBySilence } = await leavingSeat(seat, this.fetchBlockFromCluster(blockId, blockGets.context, held, floor, asker, seat));
 			// A missing block consults on every read whatever the hold says, so its silences place none.
@@ -1656,7 +1673,10 @@ export class CoordinatorRepo implements IRepo {
 		this.lastSeenCommitMs.set(blockId, { at: ts });
 	}
 
-	/** Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). */
+	/**
+	 * Test seam: resolve once no held-block consult is in flight ({@link heldBlockConsults}). A pass in an
+	 * open background round sends only when that round closes, so this waits up to `readRepairCoalesceMs`.
+	 */
 	settleHeldBlockConsults(): Promise<void> {
 		return this.heldBlockConsults.settled();
 	}
@@ -1671,19 +1691,19 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * The {@link ConsultRound} one `get`'s passes send their questions through, or `undefined` when
-	 * this node has no batch callback and every pass asks each peer itself. One round per read, never
-	 * shared across reads: coalescing concurrent reads would need a timer, and the barrier keeps a
-	 * one-block read at no added latency.
+	 * A new {@link ConsultRound}, or `undefined` when this node has no batch callback and every pass asks
+	 * each peer itself. `get` opens one per read for the consults the read waits on, and closes it once it
+	 * has started every pass, so the barrier adds no latency to a read. The consults that run behind reads
+	 * share rounds across reads instead ({@link backgroundRounds}), closed on a timer, since no read waits
+	 * on them; with coalescing off they join their read's round. Each seat carries its own read's context.
 	 */
-	private openConsultRound(context: ActionContext | undefined): ConsultRound | undefined {
+	private openConsultRound(): ConsultRound | undefined {
 		if (!this.clusterLatestBatchCallback || !this.clusterLatestCallback) return undefined;
 		return new ConsultRound({
 			batch: this.clusterLatestBatchCallback,
 			single: this.clusterLatestCallback,
 			deadlineMs: this.cohortQueryTimeoutMs,
 			selfId: this.localPeerId?.toString(),
-			context,
 			log: this.log
 		});
 	}
@@ -1698,28 +1718,50 @@ export class CoordinatorRepo implements IRepo {
 	 *
 	 * At most one pass per block: the block stays unstamped until the pass ends, so every read of it
 	 * meanwhile lands here, is served, and starts nothing. At most as many passes in all as fit in the
-	 * consult request slots ({@link HeldBlockConsults}), where the passes of one read share a slot per
-	 * request their round sends: past that the read is served, nothing starts, and the block stays
-	 * unstamped so a later read starts it. Returns whether a pass started, so the caller logs a trigger
-	 * only for one.
+	 * consult request slots ({@link HeldBlockConsults}), where the passes of one round share a slot per
+	 * request it sends: past that the read is served, nothing starts, and the block stays unstamped so a
+	 * later read starts it. Returns whether a pass started, so the caller logs a trigger only for one.
 	 *
 	 * `asker` and `floor` are captured from the triggering read — the floor only so the stamp records
 	 * the floor consulted under, as the blocking path's would ({@link FreshnessStamp}); the window asked
 	 * for this consult, not the floor — and `held` is what that read loaded, which is the baseline
 	 * the pass measures its outcome against and what the consult tells each peer this node holds.
-	 * A pass that starts joins the read's `round`, so its questions ride in that read's requests. A
-	 * read that already took its seat (`reserved`, see {@link readRepairBlock}) hands it to the pass, and
-	 * leaves it when no pass starts.
+	 *
+	 * A pass that starts joins the shared background round ({@link backgroundRounds}), so its questions
+	 * ride in the requests of the consults other reads start meanwhile; a seat the read reserved in its own
+	 * round (`reserved`, see {@link readRepairBlock}) is then left unused. With coalescing off the pass
+	 * joins the read's `round` instead, taking `reserved` when there is one, and the read leaves `reserved`
+	 * only when no pass starts.
+	 *
+	 * NOTE: accepted tradeoff — a read that waits on one consult and starts another behind it (a refresh
+	 * after a refused write: its tail read carries a floor while the header's window expired) now sends
+	 * the background block in the shared round rather than its own, so when no other background consult
+	 * is coalescing it costs two requests per peer instead of one. Rare on a cohort member, and the
+	 * shared round is what makes a restart's serial reads cheap; revisit if `cluster-fetch:background-round`
+	 * lines with `blocks: 1` appear beside blocking consults of the same read.
 	 */
 	private startHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, round: ConsultRound | undefined, reserved?: ConsultSeat): boolean {
+		const { passRound, seatFor } = this.backgroundSeating(context, round, reserved);
 		// Joins only a pass that starts: a read that finds one running, or the slots full, asks nobody.
-		const outcome = this.heldBlockConsults.start(blockId, round, () =>
-			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), reserved ?? round?.join()));
-		if (outcome.kind !== 'started') reserved?.ready();
+		const outcome = this.heldBlockConsults.start(blockId, passRound, () =>
+			this.runHeldBlockConsult(blockId, context, held, floor, asker, this.nextPassSeq(), seatFor()));
+		if (this.backgroundRounds || outcome.kind !== 'started') reserved?.ready();
 		if (outcome.kind === 'deferred') {
 			this.log('cluster-tx:read-repair-deferred', { blockId, inFlight: outcome.inFlight, slotsInUse: outcome.slotsInUse });
 		}
 		return outcome.kind === 'started';
+	}
+
+	/**
+	 * Where a pass {@link startHeldBlockConsult} starts takes its seat: the shared background round when
+	 * coalescing is on, else the read's `round` (through the seat the read `reserved` there, if any).
+	 * `seatFor` must be called in the same synchronous step that read {@link BackgroundConsultRounds.current}.
+	 */
+	private backgroundSeating(context: ActionContext | undefined, round: ConsultRound | undefined, reserved: ConsultSeat | undefined): { passRound: ConsultRound | undefined; seatFor: () => ConsultSeat | undefined } {
+		const shared = this.backgroundRounds;
+		if (!shared) return { passRound: round, seatFor: () => reserved ?? round?.join(context) };
+		const passRound = shared.current();
+		return { passRound, seatFor: () => shared.join(passRound, context) };
 	}
 
 	/**

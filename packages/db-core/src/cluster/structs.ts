@@ -450,6 +450,17 @@ export interface ClusterConsensusConfig {
 	 */
 	readRepairQuietWindowMs?: number;
 	/**
+	 * For 'lazy' mode: how long, in milliseconds, a consult started behind a read waits for the
+	 * consults started by other reads, so that all of them ask each cohort peer in one request. The
+	 * shared round sends this long after its first block joins, or at once when it names 32 blocks
+	 * (one request's worth). Default 250 (`DEFAULT_READ_REPAIR_COALESCE_MS` in db-p2p); `0` sends each
+	 * read's background consults on their own, as before. No read waits for it: only consults the read
+	 * was already answered without join the shared round. It adds up to this long to how soon what a
+	 * consult learns reaches the reads after it. See docs/transactions.md § Lazy read-repair window. On
+	 * a node, set through `clusterPolicy.readRepairCoalesceMs`.
+	 */
+	readRepairCoalesceMs?: number;
+	/**
 	 * How long ONE cohort peer gets to answer ONE read-path request, in milliseconds (default
 	 * {@link DEFAULT_COHORT_QUERY_TIMEOUT_MS} = 1000). It sets BOTH per-peer deadlines on the read
 	 * path — the latest-revision query (`CoordinatorRepo.queryClusterForLatest`) and the archive

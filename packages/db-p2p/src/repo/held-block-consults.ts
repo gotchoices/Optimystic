@@ -5,15 +5,16 @@ import type { ConsultRound } from "./consult-round.js";
 /**
  * How many consult requests the held-block consults running behind reads may have put to each cohort
  * peer at once ({@link HeldBlockConsults}). A consult request is one sync-protocol stream to the peer.
- * A running pass is a seat in its read's {@link ConsultRound}, and the round sends each peer ONE
- * request per {@link MAX_CONSULT_BATCH_BLOCKS} (32) blocks it names, so a round of up to 32 blocks is
- * one request per peer however many of its passes run; a pass with no round asks each peer on a
- * request of its own. The sync protocol is registered under libp2p's defaults
+ * A running pass is a seat in a {@link ConsultRound} — the round the background consults of reads close
+ * together share (`BackgroundConsultRounds`), or, with `readRepairCoalesceMs` at 0, its own read's — and
+ * the round sends each peer ONE request per {@link MAX_CONSULT_BATCH_BLOCKS} (32) blocks it names, so a
+ * round of up to 32 blocks is one request per peer however many of its passes run; a pass with no round
+ * asks each peer on a request of its own. The sync protocol is registered under libp2p's defaults
  * (`registerProtocolHandler`: 32 inbound streams per connection on the answering peer, 64 outbound
  * here), so 16 leaves the answering peer half its inbound allowance for its other readers and for the
- * archive fetches that acquisition runs over the same protocol. A read naming one block takes one slot
- * per pass, so for unbatched reads — every read before batching, and still the common shape — the
- * bound is 16 passes, as it always was.
+ * archive fetches that acquisition runs over the same protocol. A shared round closes at 32 blocks, so
+ * with coalescing on the bound is up to 16 such rounds in flight, each one request per peer. With it
+ * off, a read naming one block takes one slot per pass, and the bound for such reads is 16 passes.
  *
  * Counting requests rather than passes is what lets one read naming many window-expired blocks — a
  * scan, or a batched tail read across collections — start a consult for every one of them. Counted
@@ -22,8 +23,9 @@ import type { ConsultRound } from "./consult-round.js";
  * consulted at all.
  *
  * NOTE: a conservative bound, not a measured one. If `cluster-tx:read-repair-deferred` lines show
- * steadily under normal load, raise it. Do not queue the deferred blocks instead: a queued pass would
- * run outside its read's round and cost one request per block, undoing the batching.
+ * steadily under normal load, raise it. Do not queue the deferred blocks instead unless a queued pass
+ * still joins a round: with coalescing off it would run outside its read's round and cost one request
+ * per block, undoing the batching.
  *
  * NOTE: the slots bound the CONSULT requests only. A pass that finds the cohort ahead goes on to an
  * acquisition, so a large round whose blocks are all behind can start many at once; in the common case
@@ -34,10 +36,13 @@ import type { ConsultRound } from "./consult-round.js";
  * NOTE: the slots count the requests a round sends a peer that answers batched. A peer on a build that
  * predates `SyncRequest.held` answers only a chunk's first block, and the round asks it each remaining
  * block on a request of its own, all at once (`ConsultRound.askEachSingly`), so against such a peer one
- * large read can open more streams than the slots admit. If mixed-version deployments show stream-limit
- * resets there, bound how many single-block requests a round sends such a peer at once.
+ * large read can open more streams than the slots admit. A round never names more than 32 blocks to a
+ * peer per request, so that is at most 31 extra requests per round, and at most 16 rounds run;
+ * coalescing concentrates the fallback into fewer, fuller rounds without raising that ceiling. If
+ * mixed-version deployments show stream-limit resets there, bound how many single-block requests a
+ * round sends such a peer at once.
  *
- * NOTE: one read can start at most 16 × 32 = 512 passes, and past that defers the tail of its
+ * NOTE: at most 16 × 32 = 512 passes run at once, so one read naming more defers the tail of its
  * `blockIds` in the same order on every such read, the starvation this count fixed below 512. No reader
  * names that many blocks today; if one does, rotate which blocks a read starts first.
  */
@@ -67,7 +72,9 @@ function chunksFor(passes: number): number {
  * briefly count fewer slots than it has requests still unanswered.
  *
  * A pass's slot share is final by the time its round sends only because every pass that joins a round
- * does so synchronously, before `CoordinatorRepo.get` closes it.
+ * does so synchronously, before the round closes: `CoordinatorRepo.get` closes a read's round once it
+ * has started every pass, and `BackgroundConsultRounds` closes a shared round on its timer or when its
+ * 32nd pass joins.
  */
 export class HeldBlockConsults {
 	private readonly running = new Map<BlockId, Promise<void>>();

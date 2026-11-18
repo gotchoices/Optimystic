@@ -40,7 +40,8 @@
  *    read-repair window lapses its reads serve its own older copy of the tail without asking anyone. A long
  *    absence outlasts that window too (10 s by default), and this arm waits it out.
  *    What does it then, observed under full debug logging: C's first read of the tail consults the cohort,
- *    A and B corroborate the newer revision, and C restores it (`cluster-tx:read-repair-applied`). The data
+ *    behind the read, A and B corroborate the newer revision, and C restores it (`cluster-tx:read-repair-applied`)
+ *    for the reads after it; the phase waits for that consult before reading every row. The data
  *    blocks need no fetch: C still holds the pending records it stored when it promised the write, and a read
  *    carrying the collection context the restored tail provides promotes them in C's own storage (the
  *    read-driven promotion in `StorageRepo.get`).
@@ -295,7 +296,12 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 					expect(await holdersOf(missed), 'C is still behind when it returns').to.deep.equal(['A', 'B']);
 
 					// Reading is all C does: no repair call, no write. See the module header for what these reads trigger.
+					// C's first read is served from its own copy and starts the consult behind it, which waits up to
+					// `readRepairCoalesceMs` to share its request with other reads' consults; what it restores reaches
+					// the reads after it. So wait for the consults C's own read started, then read every row.
 					const startedReads = Date.now();
+					await read(c, acknowledged.keys().next().value!);
+					await c.coordinatorRepo.settleHeldBlockConsults();
 					await expectReadable([c], acknowledged, 'C on its return');
 					const readsMs = Date.now() - startedReads;
 					// Not merely served: C's OWN storage holds the write now.

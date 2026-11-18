@@ -6,10 +6,15 @@ import type { Logger } from "../logger.js";
 import { withDeadline } from "../with-deadline.js";
 import type { ClusterLatestAnswer, ClusterLatestCallback } from "./coordinator-repo.js";
 
-/** One block a consult asks a peer about, with what this node holds of it, when it holds anything. */
+/**
+ * One block a consult asks a peer about, with what this node holds of it, when it holds anything, and
+ * the context of the read that asked. Questions in one request can come from reads of different
+ * collections (`BackgroundConsultRounds`), so the context belongs to the question, not the request.
+ */
 export interface ConsultAsk {
 	blockId: BlockId;
 	held?: ActionRev;
+	context?: ActionContext;
 }
 
 /**
@@ -37,8 +42,7 @@ export interface ConsultBatchAnswer {
  */
 export type ClusterLatestBatchCallback = (
 	peerId: PeerId,
-	asks: ReadonlyArray<ConsultAsk>,
-	context?: ActionContext
+	asks: ReadonlyArray<ConsultAsk>
 ) => Promise<ConsultBatchAnswer>;
 
 /** One pass's place in a {@link ConsultRound}. */
@@ -63,7 +67,6 @@ export interface ConsultRoundDeps {
 	 */
 	deadlineMs: number;
 	selfId?: string;
-	context?: ActionContext;
 	log: Logger;
 }
 
@@ -72,25 +75,34 @@ interface Waiter {
 	reject(error: unknown): void;
 }
 
-/** One (peer, block) question waiting on the round's send, with every seat that asked it. */
+/**
+ * One (peer, block) question waiting on the round's send, with every seat that asked it. `held` and
+ * `context` are its first registrant's: every seat asking about one block in one round shares them, since
+ * a read's round carries one read's context and a background round holds one pass per block.
+ */
 interface PendingAsk {
 	held?: ActionRev;
+	context?: ActionContext;
 	waiters: Waiter[];
 }
 
 type AskEntry = [BlockId, PendingAsk];
 
 /**
- * The per-peer questions of one `CoordinatorRepo.get`, sent together: the passes that read starts —
- * one per block that consults the cohort — each join, register their (peer, block) questions instead
- * of sending them, and once every seat has registered its questions or left without asking, the round
- * sends ONE request per peer naming every block registered for it, chunked at
+ * Per-peer consult questions sent together: the passes that share a round — the consults one
+ * `CoordinatorRepo.get` waits on, or the background consults of reads close together
+ * (`BackgroundConsultRounds`) — each join, register their (peer, block) questions instead of sending
+ * them, and once the round is closed and every seat has registered its questions or left without
+ * asking, the round sends ONE request per peer naming every block registered for it, chunked at
  * {@link MAX_CONSULT_BATCH_BLOCKS}. So a read of a table's header and log tail costs one request per
  * peer, not two.
  *
  * A barrier rather than a coalescing timer: the passes reach their questions after an asynchronous
- * cohort lookup, so no fixed tick is sure to catch them all, and a timer would add latency to every
- * one-block read. The barrier adds none — a round of one seat sends the moment that seat is ready.
+ * cohort lookup, so no fixed tick is sure to catch them all. Who closes the round decides what it
+ * gathers. `get` closes a read's round once it has started every pass, so a round of one seat sends the
+ * moment that seat is ready and a read waits on no timer. `BackgroundConsultRounds` closes a shared
+ * round on a timer, because no read waits on the consults in it; the barrier still holds after that
+ * close, so a seat that joined before it is never sent without.
  *
  * Every question settles: from the peer's answer, as silence when the request failed, missed its
  * deadline or left its block out, or from the single-block callback for self and for the blocks an
@@ -99,7 +111,8 @@ type AskEntry = [BlockId, PendingAsk];
  * The cost of the barrier is that a seat still looking up its cohort holds back every other seat's
  * requests. The lookups are local and bounded — the longest is `findCluster`'s bounded wait for
  * bootstrap contact (`bootstrapContactImminent` in `libp2p-key-network.ts`) — and the per-peer
- * deadline starts at send, so the wait delays a read without making any peer read as silent.
+ * deadline starts at send, so the wait delays a read (or, in a background round, the other background
+ * consults) without making any peer read as silent.
  */
 export class ConsultRound {
 	private readonly byPeer = new Map<string, Map<BlockId, PendingAsk>>();
@@ -110,15 +123,18 @@ export class ConsultRound {
 
 	constructor(private readonly deps: ConsultRoundDeps) {}
 
-	/** A pass that will (or may) consult joins synchronously, before its first await. */
-	join(): ConsultSeat {
+	/**
+	 * A pass that will (or may) consult joins synchronously, before its first await. `context` is the
+	 * context of the read the pass serves; every question the seat asks carries it.
+	 */
+	join(context?: ActionContext): ConsultSeat {
 		if (this.closed) throw new Error('ConsultRound: a seat joined after the round was closed');
 		this.seats++;
 		let isReady = false;
 		return {
 			ask: (peerId, blockId, held) => {
 				if (isReady || this.sent) throw new Error(`ConsultRound: block ${blockId} was asked of ${peerId} after its seat was ready`);
-				return this.register(peerId, blockId, held);
+				return this.register(peerId, blockId, held, context);
 			},
 			ready: () => {
 				if (isReady) return;
@@ -135,13 +151,13 @@ export class ConsultRound {
 		this.sendWhenSettled();
 	}
 
-	private register(peerId: string, blockId: BlockId, held: ActionRev | undefined): Promise<ClusterLatestAnswer | undefined> {
+	private register(peerId: string, blockId: BlockId, held: ActionRev | undefined, context: ActionContext | undefined): Promise<ClusterLatestAnswer | undefined> {
 		return new Promise((resolve, reject) => {
 			let asks = this.byPeer.get(peerId);
 			if (!asks) this.byPeer.set(peerId, asks = new Map());
 			const pending = asks.get(blockId);
 			if (pending) pending.waiters.push({ resolve, reject });
-			else asks.set(blockId, { held, waiters: [{ resolve, reject }] });
+			else asks.set(blockId, { held, context, waiters: [{ resolve, reject }] });
 		});
 	}
 
@@ -165,8 +181,12 @@ export class ConsultRound {
 	private async askInOne(peerId: string, chunk: AskEntry[]): Promise<void> {
 		let reply: ConsultBatchAnswer;
 		try {
-			const asks = chunk.map(([blockId, { held }]): ConsultAsk => held ? { blockId, held } : { blockId });
-			reply = await this.withinDeadline(peerId, this.deps.batch(peerIdFromString(peerId), asks, this.deps.context));
+			const asks = chunk.map(([blockId, { held, context }]): ConsultAsk => ({
+				blockId,
+				...(held ? { held } : {}),
+				...(context ? { context } : {})
+			}));
+			reply = await this.withinDeadline(peerId, this.deps.batch(peerIdFromString(peerId), asks));
 		} catch (error) {
 			// The peer could not be asked: silent for every block it was asked about.
 			for (const [, pending] of chunk) void settle(pending, Promise.reject(error));
@@ -185,7 +205,7 @@ export class ConsultRound {
 	/** Ask `peerId` about each block of `entries` on its own request, all at once. */
 	private askEachSingly(peerId: string, entries: AskEntry[]): void {
 		for (const [blockId, pending] of entries) {
-			void settle(pending, (async () => this.withinDeadline(peerId, this.deps.single(peerIdFromString(peerId), blockId, this.deps.context, pending.held)))());
+			void settle(pending, (async () => this.withinDeadline(peerId, this.deps.single(peerIdFromString(peerId), blockId, pending.context, pending.held)))());
 		}
 	}
 

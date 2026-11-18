@@ -1,7 +1,7 @@
 import { expect } from 'chai';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import type { ActionRev, BlockId } from '@optimystic/db-core';
+import type { ActionContext, ActionRev, BlockId } from '@optimystic/db-core';
 import { ConsultRound, type ClusterLatestBatchCallback, type ConsultAsk, type ConsultBatchAnswer } from '../src/repo/consult-round.js';
 import type { ClusterLatestAnswer, ClusterLatestCallback } from '../src/repo/coordinator-repo.js';
 import { MAX_CONSULT_BATCH_BLOCKS } from '../src/protocol-limits.js';
@@ -21,7 +21,7 @@ const claim = (rev: number): ClusterLatestAnswer => ({ rev, actionId: `action-${
 interface Harness {
 	round: ConsultRound;
 	batchCalls: { peer: string; asks: ConsultAsk[] }[];
-	singleCalls: { peer: string; blockId: BlockId; held?: ActionRev }[];
+	singleCalls: { peer: string; blockId: BlockId; held?: ActionRev; context?: ActionContext }[];
 }
 
 /** A round whose batch answers from `reply(peer, asks)` and whose single answers every block at rev 1. */
@@ -32,8 +32,8 @@ const makeRound = (reply: (peer: string, asks: readonly ConsultAsk[]) => Consult
 		batchCalls.push({ peer: peerId.toString(), asks: [...asks] });
 		return await reply(peerId.toString(), asks);
 	};
-	const single: ClusterLatestCallback = async (peerId, blockId, _context, held) => {
-		singleCalls.push({ peer: peerId.toString(), blockId, ...(held ? { held } : {}) });
+	const single: ClusterLatestCallback = async (peerId, blockId, context, held) => {
+		singleCalls.push({ peer: peerId.toString(), blockId, ...(held ? { held } : {}), ...(context ? { context } : {}) });
 		return claim(1);
 	};
 	const round = new ConsultRound({ batch, single, deadlineMs, selfId, log: createLogger('coordinator-repo') });
@@ -152,18 +152,19 @@ describe('ConsultRound', () => {
 		expect(singleCalls).to.deep.equal([{ peer: p, blockId: 'block-b', held }, { peer: p, blockId: 'block-c' }]);
 	});
 
-	it('asks this node itself through the single-block callback', async () => {
+	it('asks this node itself through the single-block callback, with the context of the seat that asked', async () => {
 		const [self, p] = [await newPeer(), await newPeer()];
 		const { round, batchCalls, singleCalls } = makeRound(answerAll, self);
-		const seat = round.join();
+		const context: ActionContext = { rev: 4, committed: [] };
+		const seat = round.join(context);
 		round.close();
 
 		const asked = [seat.ask(self, 'block-a'), seat.ask(p, 'block-a')];
 		seat.ready();
 
 		expect(await Promise.all(asked)).to.deep.equal([claim(1), claim(7)]);
-		expect(singleCalls.map(c => c.peer)).to.deep.equal([self]);
-		expect(batchCalls.map(c => c.peer)).to.deep.equal([p]);
+		expect(singleCalls).to.deep.equal([{ peer: self, blockId: 'block-a', context }]);
+		expect(batchCalls).to.deep.equal([{ peer: p, asks: [{ blockId: 'block-a', context }] }]);
 	});
 
 	it('splits a peer\'s blocks past the batch cap into several requests', async () => {

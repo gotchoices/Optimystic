@@ -216,6 +216,15 @@ export interface ClusterPolicyOptions {
 		 * {@link resolveReadRepairQuietWindowMs}. See {@link ClusterConsensusConfig.readRepairQuietWindowMs}.
 		 */
 		readRepairQuietWindowMs?: number;
+		/**
+		 * How long, in milliseconds, a consult started behind a read waits to share one request per
+		 * cohort peer with the consults other reads start meanwhile (default
+		 * {@link DEFAULT_READ_REPAIR_COALESCE_MS} = 250; `'lazy'` mode only). `0` sends each read's
+		 * background consults on their own. A value that is not a finite number in `[0,
+		 * MAX_READ_REPAIR_WINDOW_MS]` throws at node construction — see
+		 * {@link resolveReadRepairCoalesceMs}. See {@link ClusterConsensusConfig.readRepairCoalesceMs}.
+		 */
+		readRepairCoalesceMs?: number;
 	};
 }
 
@@ -476,6 +485,35 @@ export function resolveReadRepairQuietWindowMs(declared: number | undefined): nu
 }
 
 /**
+ * How long a background consult waits for others to share its requests, when nothing is declared.
+ * A serial table-by-table read on a phone starts a held block's consult every few to few tens of
+ * milliseconds, so 250 gathers a restart's reads into a handful of requests per peer (sereus#60: about
+ * 120 blocks over one to two seconds), while adding 2.5% to the default staleness bound of one
+ * 10 000 ms window plus one consult.
+ */
+export const DEFAULT_READ_REPAIR_COALESCE_MS = 250;
+
+/**
+ * The read-repair coalescing delay, in milliseconds: the declared `clusterPolicy.readRepairCoalesceMs`,
+ * or {@link DEFAULT_READ_REPAIR_COALESCE_MS} when none was declared. `0` is a declaration (each read's
+ * background consults go out on their own).
+ *
+ * Anything else that is not a finite number in `[0, MAX_READ_REPAIR_WINDOW_MS]` THROWS, as
+ * {@link resolveReadRepairQuietWindowMs} does and for its reason. The ceiling is a real one here: the
+ * delay is handed to `setTimeout`. `CoordinatorRepo` applies this same resolver to whatever it is
+ * handed, so a direct constructor and a node agree on the default.
+ */
+export function resolveReadRepairCoalesceMs(declared: number | undefined): number {
+	if (declared === undefined) return DEFAULT_READ_REPAIR_COALESCE_MS;
+	if (!Number.isFinite(declared) || declared < 0 || declared > MAX_READ_REPAIR_WINDOW_MS) {
+		throw new Error(
+			`clusterPolicy.readRepairCoalesceMs must be a finite number of milliseconds from 0 (0 disables) to ${MAX_READ_REPAIR_WINDOW_MS}; got ${String(declared)}`
+		);
+	}
+	return declared;
+}
+
+/**
  * Apply every cluster-policy default a node needs. Same options in, same numbers out, so the
  * composition root's behavior is unit-testable (`test/cluster-policy.spec.ts`). Its one side effect
  * is the `repair-fault-tolerance` advisory below, which lives here because this is the only place
@@ -717,9 +755,10 @@ export function resolveClusterPolicy(options: ClusterPolicyOptions): ResolvedClu
 		slotHoldWindowMs: resolveSlotHoldWindowMs(options.clusterPolicy?.slotHoldWindowMs),
 		// Read-repair knobs, passed through to `CoordinatorRepo` (which defaults an absent mode to
 		// `'lazy'` and an absent window to 10 000). The mode is a closed union and needs no validation;
-		// both windows throw on a degenerate declaration, as the cohort deadline does.
+		// both windows and the coalescing delay throw on a degenerate declaration, as the cohort deadline does.
 		readRepairMode: options.clusterPolicy?.readRepairMode,
 		readRepairWindowMs: resolveReadRepairWindowMs(options.clusterPolicy?.readRepairWindowMs),
-		readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(options.clusterPolicy?.readRepairQuietWindowMs)
+		readRepairQuietWindowMs: resolveReadRepairQuietWindowMs(options.clusterPolicy?.readRepairQuietWindowMs),
+		readRepairCoalesceMs: resolveReadRepairCoalesceMs(options.clusterPolicy?.readRepairCoalesceMs)
 	};
 }

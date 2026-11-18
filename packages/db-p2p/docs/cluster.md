@@ -1084,6 +1084,7 @@ interface ClusterConsensusConfig {
   readRepairMode?: 'off' | 'lazy' | 'paranoid'; // Default 'lazy' — whether a read of a block this node holds re-verifies it against the cohort behind the read (lazy), on every read and waiting (paranoid), or never (off)
   readRepairWindowMs?: number;        // Default 10000ms — how long a held block is served without starting a cohort consult (lazy only); must be a finite number above 0
   readRepairQuietWindowMs?: number;   // Default 300000ms; 0 disables — how long a held block goes without a consult while its whole cohort of two or three machines stays connected (lazy only); a value at or below readRepairWindowMs disables it in effect
+  readRepairCoalesceMs?: number;      // Default 250ms; 0 disables — how long a consult started behind a read waits so the consults other reads start meanwhile share its request to each peer (lazy only); a round of 32 blocks sends at once
 }
 ```
 

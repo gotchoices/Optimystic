@@ -5,8 +5,9 @@
  * answered from the local copy at once; the consult runs behind it (`startHeldBlockConsult`). These
  * specs pin what that makes true of a read: it does not wait on a cohort peer that never answers,
  * what the consult learns reaches the NEXT read, a pass that ends late cannot weaken a doubt memo a
- * pass that started after it recorded, and how many such passes may run at once (counted in consult
- * requests, `HeldBlockConsults`).
+ * pass that started after it recorded, how many such passes may run at once (counted in consult
+ * requests, `HeldBlockConsults`), and how the consults of reads close together share one request per
+ * peer (`BackgroundConsultRounds`).
  */
 
 import { expect } from 'chai';
@@ -21,6 +22,7 @@ import type {
 } from '@optimystic/db-core';
 import { CoordinatorRepo, type ClusterLatestCallback, type CoordinatorRepoConfig } from '../src/repo/coordinator-repo.js';
 import type { ClusterLatestBatchCallback } from '../src/repo/consult-round.js';
+import { MAX_CONSULT_BATCH_BLOCKS } from '../src/protocol-limits.js';
 import type { ClusterClient } from '../src/cluster/client.js';
 import { toString as u8ToString } from 'uint8arrays';
 import { captureLog, hasTag } from './support/capture-log.js';
@@ -286,7 +288,8 @@ describe('CoordinatorRepo held-block background consult', () => {
 			batchCalls.push({ peer: peerId.toString(), blockIds: asks.map(ask => ask.blockId) });
 			return answerHeld(asks);
 		};
-		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, ...peers]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 3 }, batch);
+		// Coalescing off: this pins the read's own round's accounting.
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, ...peers]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 3, readRepairCoalesceMs: 0 }, batch);
 
 		await repo.get({ blockIds });
 		await repo.settleHeldBlockConsults();
@@ -312,7 +315,8 @@ describe('CoordinatorRepo held-block background consult', () => {
 			await released;
 			return answerHeld(asks);
 		};
-		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 2, cohortQueryTimeoutMs: 5_000 }, batch);
+		// Coalescing off, so each read's round is its own request; with it on, the seventeen would share one.
+		const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 2, cohortQueryTimeoutMs: 5_000, readRepairCoalesceMs: 0 }, batch);
 
 		const captured = await captureLog('coordinator-repo', async () => {
 			for (const blockId of blockIds) await repo.get({ blockIds: [blockId] });
@@ -324,5 +328,88 @@ describe('CoordinatorRepo held-block background consult', () => {
 		const deferred = captured.filter(args => typeof args[0] === 'string' && args[0].includes('cluster-tx:read-repair-deferred'));
 		expect(deferred.map(args => args[1]), 'the seventeenth was deferred with every slot in use')
 			.to.deep.equal([{ blockId: blockIds[16], inFlight: 16, slotsInUse: 16 }]);
+	});
+
+	describe('consults started by reads close together', () => {
+		/** A batch callback recording each request's peer, blocks and arrival time since `startedAt()`. */
+		const recordingBatch = (startedAt: () => number) => {
+			const calls: { peer: string; blockIds: BlockId[]; atMs: number }[] = [];
+			const batch: ClusterLatestBatchCallback = async (peerId, asks) => {
+				calls.push({ peer: peerId.toString(), blockIds: asks.map(ask => ask.blockId), atMs: Date.now() - startedAt() });
+				return answerHeld(asks);
+			};
+			return { calls, batch };
+		};
+
+		it('ask each peer in one request, and each consult arms its block\'s window', async () => {
+			// sereus#60: a restarted member reads its tables one at a time, and no held block has a window
+			// stamp yet, so each read starts a background consult. Each in its read's own round, that was one
+			// request per peer per read.
+			const localPeer = await makePeerId();
+			const peers = [await makePeerId(), await makePeerId()];
+			const blockIds = ['block-table-a', 'block-table-b', 'block-table-c'];
+			const storageRepo = makeStorageHoldingAll(blockIds);
+			const { calls, batch } = recordingBatch(() => 0);
+			const repo = buildRepo(localPeer, makeClusterPeers([localPeer, ...peers]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 3, readRepairCoalesceMs: 50 }, batch);
+
+			for (const id of blockIds) await repo.get({ blockIds: [id] });
+			await repo.settleHeldBlockConsults();
+
+			for (const peer of peers) {
+				const toPeer = calls.filter(call => call.peer === peer.toString());
+				expect(toPeer, 'one request per peer for the three reads').to.have.length(1);
+				expect(toPeer[0]!.blockIds).to.have.members(blockIds);
+			}
+
+			for (const id of blockIds) await repo.get({ blockIds: [id] });
+			await repo.settleHeldBlockConsults();
+			expect(calls, 'the next reads started no consult').to.have.length(peers.length);
+		});
+
+		it('send at once when they reach one request\'s worth of blocks, without waiting for the delay', async () => {
+			const localPeer = await makePeerId();
+			const peer = await makePeerId();
+			const blockIds = Array.from({ length: MAX_CONSULT_BATCH_BLOCKS + 1 }, (_, i) => `block-serial-${i}`);
+			const storageRepo = makeStorageHoldingAll(blockIds);
+			const coalesceMs = 1_000;
+			let startedAt = 0;
+			const { calls, batch } = recordingBatch(() => startedAt);
+			const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 2, readRepairCoalesceMs: coalesceMs }, batch);
+
+			startedAt = Date.now();
+			for (const id of blockIds) await repo.get({ blockIds: [id] });
+			await repo.settleHeldBlockConsults();
+
+			expect(calls, 'the full round, then a round for the one block after it').to.have.length(2);
+			expect(calls[0]!.blockIds).to.have.members(blockIds.slice(0, MAX_CONSULT_BATCH_BLOCKS));
+			expect(calls[0]!.atMs, 'the full round did not wait for the delay').to.be.below(coalesceMs / 2);
+			expect(calls[1]!.blockIds).to.deep.equal([blockIds[MAX_CONSULT_BATCH_BLOCKS]]);
+		});
+
+		it('leave a read that waits on its own consult as prompt as before', async () => {
+			// Only consults the read was already answered without join the shared round. A block missing
+			// locally waits on its consult, which stays in the read's own round and sends at once.
+			const localPeer = await makePeerId();
+			const peer = await makePeerId();
+			const heldBlock: BlockId = 'block-consulted-behind-a-read';
+			const missingBlock: BlockId = 'block-missing-locally';
+			const storageRepo = makeStorageHoldingAll([heldBlock]);
+			const coalesceMs = 1_000;
+			const { calls, batch } = recordingBatch(() => 0);
+			const repo = buildRepo(localPeer, makeClusterPeers([localPeer, peer]), storageRepo, selfOnly(localPeer, storageRepo), { clusterSize: 2, readRepairCoalesceMs: coalesceMs }, batch);
+
+			await repo.get({ blockIds: [heldBlock] });
+			const started = Date.now();
+			const result = await repo.get({ blockIds: [missingBlock] });
+			const elapsedMs = Date.now() - started;
+
+			expect(elapsedMs, 'the read waited on no background round').to.be.below(coalesceMs / 2);
+			expect(result[missingBlock]?.state?.latest).to.equal(undefined);
+			expect(result[missingBlock]?.unavailable, 'the cohort answered "holds nothing"').to.equal(undefined);
+			expect(calls.map(call => call.blockIds), 'only the missing block was asked so far').to.deep.equal([[missingBlock]]);
+
+			await repo.settleHeldBlockConsults();
+			expect(calls.map(call => call.blockIds)).to.deep.equal([[missingBlock], [heldBlock]]);
+		});
 	});
 });
