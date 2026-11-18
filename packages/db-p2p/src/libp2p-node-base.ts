@@ -27,6 +27,7 @@ import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
 import type { IPieceStore } from './blob/piece-store.js';
 import { MemoryPieceStore } from './blob/memory-piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
+import { blobProtocolService } from './blob/blob-protocol-service.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
 import { createServedRepoProxy } from './repo/served-repo-proxy.js';
@@ -266,8 +267,9 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * serving machines. The options that configure only serving subsystems (`storage`,
 	 * `storageDurability`, `transactionStateStore`, `validator`, `onCommitCertificate`, `dispute`,
 	 * `blockTransfer`, `rebalance`, `spreadOnChurn`, `underReplicationDrain`, `arachnode`,
-	 * `authorizeInboundStream`, `authorizeInboundStreamTimeoutMs`, `responsibilityK`) are ignored on a
-	 * client, with one `node-wiring` line naming those it was given. See docs/internals.md §Client nodes.
+	 * `responsibilityK`) are ignored on a client, with one `node-wiring` line naming those it was given.
+	 * A client still registers the blob protocol, gated by `authorizeInboundStream`. See
+	 * docs/internals.md §Client nodes.
 	 */
 	servesBlocks?: boolean;
 	fretProfile?: 'edge' | 'core';
@@ -518,22 +520,23 @@ export type NodeOptions = ClusterPolicyOptions & {
 	privateKey?: PrivateKey;
 
 	/**
-	 * Optional predicate deciding whether a remote peer may open one of the four Optimystic
-	 * database protocols on this node (`repo`, `cluster`, `sync`, `block-transfer`). It is
-	 * consulted once per inbound stream, before any frame is decoded or any operation executed.
+	 * Optional predicate deciding whether a remote peer may open one of the Optimystic database
+	 * protocols on this node (`repo`, `cluster`, `sync`, `block-transfer`, and the blob protocol; on a
+	 * client node, which registers only the blob protocol of these, that one). It is consulted once per
+	 * inbound stream, before any frame is decoded or any operation executed.
 	 *
-	 * This is deliberately ONE node-level option threaded to all four services rather than four
-	 * per-service options: "is this peer allowed to talk to my database?" is a property of the
-	 * node, not of the protocol, and four independently-settable options make it easy to secure
-	 * three surfaces and silently miss the fourth. (Each service still accepts the same option in
-	 * its own init, so the services stay independently testable and usable outside this factory.)
+	 * This is deliberately ONE node-level option threaded to every gated service rather than one
+	 * option per service: "is this peer allowed to talk to my database?" is a property of the node,
+	 * not of the protocol, and independently-settable options make it easy to secure four surfaces and
+	 * silently miss the fifth. (Each service still accepts the same option in its own init, so the
+	 * services stay independently testable and usable outside this factory.)
 	 *
 	 * Absent → no check at all, and today's behavior exactly. Supplied → fail-closed: `false`, a
 	 * throw, a rejection, or a timeout all deny and abort the stream. `remotePeerId` is the
 	 * dialing peer's `PeerId.toString()`. See {@link AuthorizeInboundStream} and
 	 * `docs/internals.md` § Inbound Stream Authorization.
 	 *
-	 * NOTE: this covers the four database protocols only. The dispute, reactivity, matchmaking,
+	 * NOTE: this covers the database protocols named above only. The dispute, reactivity, matchmaking,
 	 * cohort-topic and libp2p built-in (identify/ping/…) protocols this node also registers are
 	 * NOT gated by it. To refuse a peer at the connection level instead — every protocol at once,
 	 * including identify — use {@link NodeOptions.connectionGater}.
@@ -773,8 +776,7 @@ export type ClientNodeOptions = NodeOptions & { servesBlocks: false };
 function logIgnoredServingOptions(options: NodeOptions): void {
 	const servingOnly = [
 		'storage', 'storageDurability', 'transactionStateStore', 'validator', 'onCommitCertificate', 'dispute',
-		'blockTransfer', 'rebalance', 'spreadOnChurn', 'underReplicationDrain', 'arachnode',
-		'authorizeInboundStream', 'authorizeInboundStreamTimeoutMs', 'responsibilityK'
+		'blockTransfer', 'rebalance', 'spreadOnChurn', 'underReplicationDrain', 'arachnode', 'responsibilityK'
 	] as const satisfies readonly (keyof NodeOptions)[];
 	const given = servingOnly.filter(name => options[name] !== undefined);
 	if (given.length > 0) {
@@ -930,6 +932,13 @@ function resolveCurrentServedRoot(forwarderHost: ReactivityForwarderHost, collec
  * and block-transfer, under the same ids the four services register. Dispute is left out — rare, and
  * off by default, so a prepared stream for it would almost always expire unused. A client node sends
  * steady requests on `repo` alone (its reads and writes); it runs no consensus, repair or pushes.
+ *
+ * The blob protocol is left out on both roles. A prepared stream saves one negotiation round trip on a
+ * small request, and `ProtocolClient` resends a request once when such a stream fails before its reply
+ * begins, which assumes a small idempotent request and a single reply. A blob `get` moves up to 16
+ * pieces, against which one round trip is negligible; the blob client does not go through
+ * `ProtocolClient`; and a pool would hold an idle blob stream open per peer for 30 s after every
+ * request. `Libp2pKeyPeerNetwork.connect` opens a fresh stream for a protocol the pool does not list.
  */
 function preparedStreamProtocols(protocolPrefix: string, servesBlocks: boolean): string[] {
 	if (!servesBlocks) return [buildRepoProtocol(protocolPrefix)];
@@ -1039,6 +1048,23 @@ function prepareServingStore(
 }
 
 /**
+ * The ONE authorization slice, spread verbatim into every gated protocol service's init: the four
+ * database services and the blob service. Building it once (rather than repeating two option reads per
+ * service) is what makes "secured four surfaces, missed the fifth" impossible: a new gated service is a
+ * spread of this object, and dropping it from one is visible at the call site. Absent
+ * `authorizeInboundStream` → every service constructs its gate as `undefined` and the inbound path is
+ * byte-for-byte what it was before this option existed.
+ */
+function inboundAuthorizationOf(options: NodeOptions): InboundStreamAuthorizationInit {
+	return {
+		...(options.authorizeInboundStream ? { authorizeInboundStream: options.authorizeInboundStream } : {}),
+		...(options.authorizeInboundStreamTimeoutMs !== undefined
+			? { authorizeInboundStreamTimeoutMs: options.authorizeInboundStreamTimeoutMs }
+			: {})
+	};
+}
+
+/**
  * The four storage protocol services a serving node registers — `cluster`, `repo`, `sync` and
  * `blockTransfer` — keyed as they appear in the libp2p services map. A client registers none of them,
  * which is what tells every other node it serves nothing.
@@ -1054,22 +1080,10 @@ function storageProtocolServices(
 	serving: ServingStore,
 	options: NodeOptions,
 	superMajorityThreshold: number,
+	inboundAuthorization: InboundStreamAuthorizationInit,
 	liveNode: () => Libp2p | undefined
 ): NonNullable<Libp2pInit['services']> {
 	const protocolPrefix = `/optimystic/${options.networkName}`;
-	// The ONE authorization slice, spread verbatim into all four database-protocol service inits
-	// below. Building it once (rather than repeating two option reads per service) is what makes
-	// "secured three surfaces, missed the fourth" impossible: adding a fifth protocol service is a
-	// spread of this object, and dropping it from one is visible at the call site.
-	// Absent `authorizeInboundStream` → every service constructs its gate as `undefined` and the
-	// inbound path is byte-for-byte what it was before this option existed.
-	const inboundAuthorization: InboundStreamAuthorizationInit = {
-		...(options.authorizeInboundStream ? { authorizeInboundStream: options.authorizeInboundStream } : {}),
-		...(options.authorizeInboundStreamTimeoutMs !== undefined
-			? { authorizeInboundStreamTimeoutMs: options.authorizeInboundStreamTimeoutMs }
-			: {})
-	};
-
 	return {
 		cluster: (components: any) => {
 			const addressLog: AddressLog = createLogger('peer-address-book', components.peerId?.toString());
@@ -1206,6 +1220,8 @@ export async function createLibp2pNodeBase(
 	// node's blob service). Started once it is attached, below.
 	const pieceStore = resolvePieceStore(options.pieceStorage);
 	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
+	// Built once: it gates the four storage protocol services on a serving node and the blob protocol on both roles.
+	const inboundAuthorization = inboundAuthorizationOf(options);
 
 	const nodePrivateKey = options.privateKey ?? await generateKeyPair('Ed25519');
 	// The node's one HLC clock (docs/crdt-sync.md §Migration Path, Stage 1), its mark loaded before
@@ -1387,7 +1403,18 @@ export async function createLibp2pNodeBase(
 
 			// The four storage protocol services, registered only by a node that stores blocks: their
 			// absence from a client's identify list is what keeps it out of every cohort.
-			...(serving ? storageProtocolServices(serving, options, consensusConfig.superMajorityThreshold, () => liveNode) : {}),
+			...(serving ? storageProtocolServices(serving, options, consensusConfig.superMajorityThreshold, inboundAuthorization, () => liveNode) : {}),
+
+			// The blob protocol, on both roles and gated like the storage protocols: a client holds the
+			// blobs its own host put, and until a row referencing one commits it holds the only copy, so
+			// readers fetch it from the writer (docs/blobs.md §Placement, copying and durability).
+			blob: (components: any) => blobProtocolService({
+				protocolPrefix: `/optimystic/${options.networkName}`,
+				blobs,
+				pieces: pieceStore,
+				progressTimeoutMs: linkDeadlines.responseTimeoutMs,
+				...inboundAuthorization
+			})({ registrar: components.registrar }),
 
 			networkManager: (components: any) => {
 				const svcFactory = networkManagerService({

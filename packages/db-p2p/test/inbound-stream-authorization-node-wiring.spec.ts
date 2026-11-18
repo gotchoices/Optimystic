@@ -1,10 +1,10 @@
 /**
  * Node-level wiring for the inbound-stream authorization hook.
  *
- * `createLibp2pNode` takes ONE `authorizeInboundStream` option and threads it to all four
- * database services. That single-option shape is the whole point of the feature — four
- * independently-settable options make it easy to secure three surfaces and silently miss the
- * fourth — so this spec asserts all four protocols individually, over real libp2p, rather than
+ * `createLibp2pNode` takes ONE `authorizeInboundStream` option and threads it to every gated
+ * service: repo, cluster, sync, block-transfer and blob. That single-option shape is the whole point
+ * of the feature — independently-settable options make it easy to secure four surfaces and silently
+ * miss the fifth — so this spec asserts each protocol individually, over real libp2p, rather than
  * inspecting the services' internals.
  *
  * Two real nodes over loopback TCP: B dials A once per protocol, A's predicate must be consulted
@@ -16,17 +16,19 @@ import { multiaddr } from '@multiformats/multiaddr';
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import { buildSyncProtocol } from '../src/sync/protocol.js';
 import { buildBlockTransferProtocol } from '../src/cluster/block-transfer-service.js';
+import { buildBlobProtocol } from '../src/blob/blob-protocol.js';
 
 /** Distinct per-spec so concurrent specs on network-scoped protocol ids cannot cross-talk. */
 const NETWORK = 'authz-node-wiring';
 const PREFIX = `/optimystic/${NETWORK}`;
 
-/** The four protocols the hook must cover, written out rather than derived from the code under test. */
+/** The protocols the hook must cover — repo, cluster, sync, block-transfer, blob — written out rather than derived from the code under test. */
 const GATED_PROTOCOLS = [
 	`${PREFIX}/repo/1.0.0`,
 	`${PREFIX}/cluster/1.0.0`,
 	buildSyncProtocol(PREFIX),
 	buildBlockTransferProtocol(PREFIX),
+	buildBlobProtocol(PREFIX),
 ];
 
 function localTcpAddr(node: Libp2p): string {
@@ -72,7 +74,7 @@ describe('inbound stream authorization — node-level wiring', function () {
 		await Promise.allSettled(toStop.map(n => n.stop()));
 	});
 
-	it('one node-level option reaches all four database services', async () => {
+	it('one node-level option reaches the repo, cluster, sync, block-transfer and blob services', async () => {
 		const seen: Array<[string, string]> = [];
 		a = await spawn({
 			authorizeInboundStream: (remotePeerId: string, protocol: string) => {
@@ -82,7 +84,7 @@ describe('inbound stream authorization — node-level wiring', function () {
 		});
 		b = await spawn();
 
-		// Precondition: A really does serve all four protocols, so a missing observation below is a
+		// Precondition: A really does serve every gated protocol, so a missing observation below is a
 		// missing *gate*, not a missing handler.
 		const served = a.getProtocols() as string[];
 		for (const protocol of GATED_PROTOCOLS) {
@@ -113,7 +115,7 @@ describe('inbound stream authorization — node-level wiring', function () {
 		}
 	});
 
-	it('no option → all four protocols are still registered and ungated (default behavior)', async () => {
+	it('no option → every gated protocol is still registered and ungated (default behavior)', async () => {
 		a = await spawn();
 		const served = a.getProtocols() as string[];
 		for (const protocol of GATED_PROTOCOLS) {

@@ -13,9 +13,12 @@
 import type { Stream } from '@libp2p/interface';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import * as lp from 'it-length-prefixed';
+import { createLogger } from '../logger.js';
 import { MAX_BLOB_HEADER_BYTES, MAX_BLOB_PIECE_FRAME_BYTES } from '../protocol-limits.js';
 import { BlobProtocolError } from './blob-protocol.js';
 import type { ProgressDeadline } from './progress-deadline.js';
+
+const log = createLogger('blob:protocol');
 
 /** What blob frames are read from: a libp2p 3 stream, or any iterable of the chunks one yields. */
 export type BlobFrameSource = AsyncIterable<Uint8Array | Uint8ArrayList>;
@@ -84,9 +87,54 @@ export async function sendBlobFrame(stream: BlobFrameSink, payload: Uint8Array, 
 	return frame.byteLength;
 }
 
-/** Close the write side of `stream`, cut off by `deadline`: `close` waits for unsent bytes to drain. */
+/**
+ * Close the write side of `stream`, cut off by `deadline`: `close` waits for unsent bytes to drain.
+ * A stream that ends while `close` waits makes libp2p reject with the stream's `close` event rather
+ * than an error; that is rethrown as the event's own error, so callers only ever see an `Error`.
+ */
 export async function closeBlobStream(stream: Pick<Stream, 'close'>, deadline: Pick<ProgressDeadline, 'signal'>): Promise<void> {
-	await stream.close({ signal: deadline.signal });
+	try {
+		await stream.close({ signal: deadline.signal });
+	} catch (err) {
+		throw errorOfCloseEvent(err) ?? err;
+	}
+}
+
+/** The error a stream `close` event carries, or a stand-in for a graceful one; `undefined` for anything that is not such an event. Duck-typed: Hermes has no `Event` global. */
+function errorOfCloseEvent(value: unknown): Error | undefined {
+	if (typeof value !== 'object' || value === null || value instanceof Error) return undefined;
+	const event = value as { type?: unknown; error?: unknown };
+	if (event.type !== 'close') return undefined;
+	return event.error instanceof Error ? event.error : new Error('the stream closed while its write side was closing');
+}
+
+/**
+ * Abort `stream` with the deadline's `BlobTransferStalledError` when the deadline fires, so a read
+ * waiting on the stream ends with the stall: {@link readBlobFrames} does not watch the deadline itself.
+ * Returns the detach, for when the stream is done.
+ */
+export function abortStreamOnStall(stream: Pick<Stream, 'abort'>, deadline: Pick<ProgressDeadline, 'signal'>): () => void {
+	const onStall = (): void => {
+		try {
+			stream.abort(deadline.signal.reason as Error);
+		} catch (err) {
+			// Thrown inside an event listener it would surface as an uncaught exception.
+			log.error('stall:abort-failed err=%s', err instanceof Error ? err.message : String(err));
+		}
+	};
+	deadline.signal.addEventListener('abort', onStall, { once: true });
+	return () => deadline.signal.removeEventListener('abort', onStall);
+}
+
+/**
+ * Stop reading `frames`: ends the chain down to the stream's own iterator, which removes its listener,
+ * so data still arriving is held by the stream under its read-buffer cap (`maxReadBufferLength`, past
+ * which libp2p resets the stream) rather than queued without bound.
+ */
+export function releaseBlobFrames(frames: AsyncIterator<Uint8Array>, peer: string): void {
+	void frames.return?.(undefined).catch((err: unknown) => {
+		log.error('frames:release-failed peer=%s err=%s', peer, err instanceof Error ? err.message : String(err));
+	});
 }
 
 async function* touchingEachChunk(source: BlobFrameSource, deadline: Pick<ProgressDeadline, 'touch'>): AsyncGenerator<Uint8Array | Uint8ArrayList> {

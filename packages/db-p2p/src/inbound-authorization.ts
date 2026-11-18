@@ -1,9 +1,9 @@
 /**
  * Optional, embedder-supplied authorization for inbound protocol streams.
  *
- * The `repo`, `cluster`, `sync` and `block-transfer` services otherwise go straight from
+ * The `repo`, `cluster`, `sync`, `block-transfer` and blob services otherwise go straight from
  * "stream opened" to "decode and execute", so any peer that can open a connection can issue
- * database operations. An application that owns a *private* database (only nodes it admitted
+ * database operations or fetch blob pieces. An application that owns a *private* database (only nodes it admitted
  * may read or write) needs a seam ahead of decoding; this is that seam.
  *
  * Contract:
@@ -15,16 +15,16 @@
  *   a throw, a rejection, a timeout, or an unidentifiable remote peer all deny, and denial
  *   aborts the stream *before* any frame is decoded or any operation executed.
  * - **Called once per inbound stream**, not once per operation — which is equivalent here
- *   because all four protocols are strictly one request per stream (each handler's generator
- *   `return`s after the first response, so a second queued frame is never read).
+ *   because every gated protocol is strictly one request per stream (each handler reads its first
+ *   request frame only, so a second queued frame is never read).
  * - **Peer id encoding**: the predicate receives `connection.remotePeer.toString()` — the
  *   libp2p base58btc/CIDv1 peer-id string (e.g. `12D3KooW…`), the same form
  *   `PeerId.toString()` produces everywhere else in this codebase. Compare against that,
  *   never against a multiaddr, a public-key hash, or a base64 encoding.
  * - **What a caller observes**: a stream reset. Denial is deliberately *not* reported on the
  *   wire — telling an unauthorized peer "you are not a member" confirms membership state to
- *   exactly the party the embedder decided not to trust, and the four protocols have four
- *   different response shapes with no common error frame. The denial is instead loud on the
+ *   exactly the party the embedder decided not to trust, and the gated protocols have different
+ *   response shapes with no common error frame. The denial is instead loud on the
  *   *denying* node: it is logged with the peer id, protocol and reason, and the stream is
  *   aborted with an {@link UnauthorizedInboundStreamError} carrying
  *   {@link INBOUND_STREAM_UNAUTHORIZED_CODE}, so local diagnostics can tell a denial apart
@@ -73,7 +73,7 @@ export class UnauthorizedInboundStreamError extends Error {
  */
 export const DEFAULT_INBOUND_AUTHORIZATION_TIMEOUT_MS = 5_000;
 
-/** The slice of a service's init that configures this gate. Mixed into all four service inits. */
+/** The slice of a service's init that configures this gate. Mixed into every gated service's init. */
 export interface InboundStreamAuthorizationInit {
 	/**
 	 * Optional predicate consulted once per inbound stream, before any decoding or execution.

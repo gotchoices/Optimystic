@@ -9,6 +9,8 @@ export * from "./blob/local-blob-service.js";
 export * from "./blob/blob-protocol.js";
 export * from "./blob/blob-frames.js";
 export * from "./blob/progress-deadline.js";
+export * from "./blob/blob-protocol-service.js";
+export * from "./blob/blob-protocol-client.js";
 export * from "./cluster/client.js";
 export * from "./cluster/client-signature-verifier.js";
 export * from "./cluster/cluster-repo.js";

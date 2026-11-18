@@ -40,6 +40,7 @@ import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
  *  - `ping` / `dcutr` / `autoNAT` — liveness, hole-punch upgrade of relayed connections, and
  *    public-reachability discovery.
  *  - `cluster` / `repo` / `sync` / `blockTransfer` — the Optimystic protocol handlers.
+ *  - `blob` — the blob protocol (`stat`/`get` of blob pieces), registered on every role.
  *  - `networkManager` / `fret` — cluster sizing policy and the FRET routing table.
  *
  * No `pubsub` key: the `gossipsub` registration was removed (gotchoices/Optimystic#9) because it
@@ -52,6 +53,7 @@ import { expectWellFormedProtocolIds } from './util/protocol-ids.js';
  */
 const EXPECTED_SERVICE_KEYS = [
 	'autoNAT',
+	'blob',
 	'blockTransfer',
 	'cluster',
 	'dcutr',
@@ -74,6 +76,7 @@ const EXPECTED_SERVICE_KEYS = [
  */
 const EXPECTED_UNDIALABLE_SERVICE_KEYS = [
 	'autoNAT',
+	'blob',
 	'blockTransfer',
 	'cluster',
 	'fret',
@@ -89,11 +92,12 @@ const EXPECTED_UNDIALABLE_SERVICE_KEYS = [
  * The service keys on a client (`servesBlocks: false`) with a directly dialable listen address: every
  * key in {@link EXPECTED_SERVICE_KEYS} except the four storage protocol services, `blockTransfer`,
  * `cluster`, `repo` and `sync`. Their absence from the client's identify list is what keeps it out of
- * every other node's cohorts (docs/internals.md §Client nodes). Written out, not derived, for the same
- * reason as the literal above.
+ * every other node's cohorts (docs/internals.md §Client nodes). `blob` stays: a client serves the
+ * blobs its own host put. Written out, not derived, for the same reason as the literal above.
  */
 const EXPECTED_CLIENT_SERVICE_KEYS = [
 	'autoNAT',
+	'blob',
 	'dcutr',
 	'fret',
 	'identify',
