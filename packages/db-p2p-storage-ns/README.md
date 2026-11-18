@@ -114,7 +114,7 @@ into; keys stay TEXT/INTEGER.
 | `revisions`       | `(block_id, rev)`                | `BLOB` (`action_id` col) | `ActionId`     |
 | `pending`         | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
 | `transactions`    | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
-| `proofs`          | `(block_id, rev)`                | `BLOB`       | `BlockCommitProof`     |
+| `proofs`          | `(block_id, rev)`                | `BLOB`       | `StoredProofEntry`: a reference to a `commit_proofs` row (a whole `BlockCommitProof` when an earlier build wrote it) |
 | `commit_proofs`   | `message_hash`                   | `BLOB`       | `BlockCommitProof`     |
 | `materialized`    | `(block_id, action_id)`          | `BLOB`       | `IBlock`               |
 | `kv`              | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) | — (not kernel-backed) |

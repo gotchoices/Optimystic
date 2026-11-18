@@ -2160,7 +2160,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		blockId: BlockId, storage: IBlockStorage, rev: number, actionId: ActionId, proof: BlockCommitProof | undefined,
 		latch: BlockWriteLatch
 	): Promise<void> {
-		if (proof === undefined || await storage.getBlockProof(rev) !== undefined) {
+		// A presence check, not `getBlockProof`, which would read and decode the shared proof only to
+		// test for it — on every duplicate certified push (`saveReplicatedBlock`'s NOTE counts that
+		// path's cost as one key lookup).
+		if (proof === undefined || await storage.hasBlockProof(rev)) {
 			return;
 		}
 		let committedBlock: IBlock | undefined;
@@ -2192,12 +2195,9 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * fault must not turn `commit()` into `success:false` for a landed commit — it is logged and
 	 * the proof simply is not retained (repair falls back to corroboration).
 	 *
-	 * NOTE: one commit of N blocks stores the SAME proof under each block's `(blockId, rev)` proofs-store key, and
-	 * the proof itself carries the commit op's N `blockIds`/`blockDigests` — so bytes retained per
-	 * commit grow with N². Measured base cost is ~4.6 KB for a 10-peer 2-block commit
-	 * (`test/commit-proof.spec.ts` "size"), and nothing today bounds `CommitRequest.blockIds`. Fine
-	 * at the handful-of-blocks batches the transactor produces now; if per-coordinator batches ever
-	 * grow large, store the proof once under its `messageHash` and key each revision to a pointer.
+	 * The proof, which lists every block of its commit, is stored once per node under its
+	 * `messageHash`, and each revision it covers holds a reference to it (`KvRawStorage.saveBlockProof`),
+	 * so a commit of N blocks retains one proof and N references rather than N copies.
 	 */
 	private async persistProofIfContentMatches(
 		blockId: BlockId,

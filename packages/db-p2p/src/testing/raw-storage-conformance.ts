@@ -360,6 +360,28 @@ export function runRawStorageConformance(
 			expect(stored!.messageHash).to.equal('hash-clone');
 		});
 
+		// One proof covers every block its commit changed, and lists them all; a copy per block grew
+		// a commit's stored bytes with the square of its size (GitHub #60).
+		it('a proof saved for several blocks is stored once, and each revision refers to it', async () => {
+			const proof = makeProof('shared');
+			const blockIds = ['shared-a', 'shared-b', 'shared-c'] as BlockId[];
+			for (const blockId of blockIds) await storage.saveBlockProof(blockId, 2, proof);
+
+			expect(await storage.getCommitProof(proof.messageHash), 'the proof is stored under its message hash')
+				.to.deep.equal(proof);
+			for (const blockId of blockIds) {
+				expect(await storage.getProofEntry(blockId, 2), `${blockId}'s entry`).to.deep.equal({ proofRef: proof.messageHash });
+				expect(await storage.getBlockProof(blockId, 2), `${blockId}'s proof`).to.deep.equal(proof);
+			}
+		});
+
+		it('an entry holding a whole proof, as an earlier build wrote it, reads back as that proof', async () => {
+			const blockId = 'proof-legacy' as BlockId;
+			const proof = makeProof('legacy');
+			await storage.saveProofEntry(blockId, 3, proof);
+			expect(await storage.getBlockProof(blockId, 3)).to.deep.equal(proof);
+		});
+
 		// --- Commit proofs by message hash (their own store, not scoped to a block) ---
 
 		it('getCommitProof returns undefined on a miss', async () => {

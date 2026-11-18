@@ -143,6 +143,10 @@ export class BlockStorage implements IBlockStorage {
 		return await this.storage.getBlockProof(this.blockId, rev);
 	}
 
+	async hasBlockProof(rev: number): Promise<boolean> {
+		return await this.storage.getProofEntry(this.blockId, rev) !== undefined;
+	}
+
 	async saveBlockProof(rev: number, proof: BlockCommitProof, latch: BlockWriteLatch): Promise<void> {
 		this.assertLatch(latch);
 		await this.storage.saveBlockProof(this.blockId, rev, proof);

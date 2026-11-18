@@ -4,6 +4,15 @@ import type { BlockMetadata } from "./struct.js";
 import type { StoreIdentity } from "./store-identity.js";
 import type { FlushOptions, StoreDurability } from "./store-durability.js";
 
+/** A revision's entry in the proofs store: the `messageHash` of the proof held in the commit proofs store. */
+export type ProofRef = { proofRef: string };
+
+/**
+ * What a proofs-store entry may hold: a {@link ProofRef}, or — written by a build before proofs were
+ * stored once per consensus message — the whole proof.
+ */
+export type StoredProofEntry = ProofRef | BlockCommitProof;
+
 export interface IRawStorage {
 	// Metadata operations
 	getMetadata(blockId: BlockId): Promise<BlockMetadata | undefined>;
@@ -31,9 +40,36 @@ export interface IRawStorage {
 	 * 60-second in-memory commit-cert TTL. Whatever deletes a revision record must delete its proof;
 	 * no such site exists today (`RawStoreDriver` has no revision delete at all — invalidations write
 	 * compensating FORWARD revisions), so this is a contract note, not a wired path.
+	 *
+	 * Composed: the revision's entry ({@link getProofEntry}) is usually a {@link ProofRef}, resolved
+	 * through {@link getCommitProof}; an entry holding a whole proof (an earlier build's) is returned
+	 * as it is. A reference whose target is missing answers `undefined`.
 	 */
 	getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined>;
+
+	/**
+	 * Retain `proof` for a revision. Composed: the proof is stored once under its `messageHash` in
+	 * the commit proofs store, before the revision's entry is written as a {@link ProofRef} to it, so
+	 * a reference never survives a crash without its target. A proof already stored under that hash
+	 * is kept, not replaced: the first proof stored for a message serves every revision naming it.
+	 *
+	 * Precondition: `proof.messageHash` is the hash of `proof.message`. Every proof reaching here was
+	 * built on this node from its own consensus record, minted by this node, or verified (which
+	 * recomputes the hash and refuses a mismatch); nothing here checks it. A stored proof is kept as
+	 * long as any revision refers to it — forever, since no revision-delete site exists. A site that
+	 * ever deletes revisions must count or sweep the commit proofs it leaves unreferenced.
+	 */
 	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void>;
+
+	/**
+	 * The proofs store's raw entry for a revision, undecoded beyond JSON: a {@link ProofRef}, a whole
+	 * proof an earlier build wrote, or `undefined`. For a caller that moves entries between stores
+	 * (`RawStorageDriverAdapter`) or only asks whether one exists (`IBlockStorage.hasBlockProof`);
+	 * everything else reads {@link getBlockProof}.
+	 */
+	getProofEntry(blockId: BlockId, rev: number): Promise<StoredProofEntry | undefined>;
+	/** Write a revision's proofs-store entry as given — no commit proof is stored. See {@link getProofEntry}. */
+	saveProofEntry(blockId: BlockId, rev: number, entry: StoredProofEntry): Promise<void>;
 
 	/**
 	 * The commit proof stored under a consensus message's hash (`BlockCommitProof.messageHash`), one

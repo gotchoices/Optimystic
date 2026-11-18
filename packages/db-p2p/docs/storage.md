@@ -42,8 +42,8 @@ methods are the one place every value write funnels through — the
 "single choke point" comment in `packages/db-p2p/src/storage/kv-raw-storage.ts`:
 
 > every value write funnels through the driver put/delete calls in the methods
-> below (saveMetadata / saveRevision / save*Transaction / saveBlockProof /
-> saveCommitProof / saveMaterializedBlock). This is the single choke point where an incremental
+> below (saveMetadata / saveRevision / save*Transaction /
+> saveProofEntry / saveCommitProof / storeCommitProofIfAbsent / saveMaterializedBlock). This is the single choke point where an incremental
 > byte counter would hook in…
 
 **Scope:** this holds only for writes issued *in this process*. It is not a
@@ -67,8 +67,12 @@ whole blob and over every record filed under the block, not over `latest` alone:
 > latch — the key `Block.write:<blockId>`
 > (`packages/db-p2p/src/storage/block-latch.ts`, `blockWriteLatchKey`).
 
-The commit proofs store keyed by message hash (*Shared KV Kernel*, under Core Components) is not filed under any one block, and nothing
-writes it yet; the change that gives it a writer states which latch that writer holds.
+The commit proofs store keyed by message hash (*Shared KV Kernel*, under Core Components) is not
+filed under any one block. Its writer, `KvRawStorage.saveBlockProof`, runs under the latch of the
+block whose revision it is saving a proof for, so two blocks of one commit — the commit's own apply
+and a certified push of another of its blocks — can save one message's record at once, under two
+latches. No latch orders them, and none needs to: the store's memo joins the second save onto the
+first, and a record already stored under a hash is kept, never replaced.
 
 That is ONE key per block, and it is the only one. `StorageRepo.commit` is not
 the only writer: `pend` and `cancel`, the read-driven promotion in
@@ -780,8 +784,22 @@ own: a map, a root `commit-proofs/` directory, a `commit_proofs` table, the Leve
 with no block envelope, a `commitProofs` object store. Like the proofs store it has no delete. The
 file backend names a file after the hash, which `computeClusterMessageHash` in
 `packages/db-core/src/cluster/membership.ts` writes in base58 and so needs no encoding; it
-percent-encodes any other character, so no key names a path outside the store. Nothing reads or
-writes the store yet; the change that stores each proof once makes the kernel use it.
+percent-encodes any other character, so no key names a path outside the store.
+
+The kernel composes the two proof stores. `saveBlockProof` stores the proof in the commit proofs
+store under its `messageHash` (keeping one already there), then writes the revision's proofs-store
+entry as a reference to it, `{ proofRef: messageHash }` (`ProofRef` in
+`packages/db-p2p/src/storage/i-raw-storage.ts`); target before reference, so a crash keeps no
+reference without its target. `getBlockProof` resolves the reference, answering no proof (and
+logging `proof-ref-dangling`) when the target is missing, and returns an entry holding a whole proof
+— every entry an earlier build wrote — as it is. A memo of up to 1024 message hashes the kernel has
+stored (`KvRawStorage.storedCommitProofs`) makes a commit of N blocks read and write the shared
+record once rather than N times. `getProofEntry` and `saveProofEntry` move a revision's entry as it
+is, with no commit proof read or written: `RawStorageDriverAdapter` maps the driver's proofs store
+onto them, so a cache composed over an `IRawStorage` passes references through rather than resolving
+and re-expanding them, and `IBlockStorage.hasBlockProof` answers presence from the entry alone. See
+[docs/internals.md §Durable commit proof](../../../docs/internals.md#durable-commit-proof-blockcommitproof)
+for why, and what it measured.
 
 **How a value is held in memory is a type parameter.** Values cross the driver as `V`
 (`RawStoreDriver<V>`, `StoredValue` in `packages/db-p2p/src/storage/raw-store-codec.ts`):
@@ -864,7 +882,7 @@ the driver does is under Invariant 6, *Writes that wait in memory*.
 │   │   ├── {actionId}.json # Committed actions
 │   │   └── ...
 │   ├── proofs/
-│   │   ├── {rev}.json      # Commit proof retained for that revision
+│   │   ├── {rev}.json      # Reference to the commit proof retained for that revision (a whole proof, if an earlier build wrote it)
 │   │   └── ...
 │   └── blocks/
 │       ├── {actionId}.json # Materialized blocks

@@ -36,7 +36,7 @@ import type {
 } from '@optimystic/db-core';
 import { CoordinatorPartialCommitError } from '@optimystic/db-core';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
-import type { BlockCommitProof, BlockMetadata, FlushOptions, StoreDurability } from '@optimystic/db-p2p';
+import type { BlockCommitProof, BlockMetadata, FlushOptions, StoreDurability, StoredProofEntry } from '@optimystic/db-p2p';
 import { createMesh, buildNetworkTransactors, type MeshOptions } from '@optimystic/db-p2p/testing';
 import { createMeshDbNode, type MeshDbNode } from './mesh-node-harness.js';
 
@@ -119,6 +119,12 @@ class LaggingRawStorage implements RawStorage {
 	}
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
 		if (!this.drop(blockId)) await this.inner.saveBlockProof(blockId, rev, proof);
+	}
+	async getProofEntry(blockId: BlockId, rev: number): Promise<StoredProofEntry | undefined> {
+		return this.hidden.has(blockId) ? undefined : this.inner.getProofEntry(blockId, rev);
+	}
+	async saveProofEntry(blockId: BlockId, rev: number, entry: StoredProofEntry): Promise<void> {
+		if (!this.drop(blockId)) await this.inner.saveProofEntry(blockId, rev, entry);
 	}
 	getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined> {
 		return this.inner.getCommitProof(messageHash);

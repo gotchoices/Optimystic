@@ -97,7 +97,8 @@ high-water mark, are then lost on restart.
     revs/<rev>.json          — ActionId for that revision number
     pend/<id>.json           — pending Transform (two-phase commit, before promotion)
     actions/<id>.json        — committed Transform
-    proofs/<rev>.json        — BlockCommitProof retained for that revision
+    proofs/<rev>.json        — StoredProofEntry: a reference to the BlockCommitProof retained for that revision,
+                               held under commit-proofs/ (an earlier build wrote the whole proof here)
     blocks/<id>.json         — materialized IBlock snapshot
   <seg>/<seg>/               — a block id containing "/" (e.g. `default/app/Ledger`) nests one directory per segment
     meta.json                — and holds the same files as above; it can contain another block's directory

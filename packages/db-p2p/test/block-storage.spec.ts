@@ -1416,7 +1416,8 @@ describe('commit-proof persistence on the replica path', () => {
 		raw = new MemoryRawStorage();
 	});
 
-	const proof = { v: 1 } as unknown as BlockCommitProof;
+	// A message hash, because storage files a proof under it (`IRawStorage.saveBlockProof`).
+	const proof = { v: 1, messageHash: 'hash-replica-path' } as unknown as BlockCommitProof;
 
 	it('saveReplicatedBlock persists a supplied proof, retrievable by (blockId, rev)', async () => {
 		const blockId = 'block-proof-kept' as BlockId;

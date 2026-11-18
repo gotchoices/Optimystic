@@ -17,6 +17,8 @@ import type { FixtureManifest, StorageLayout } from './fixture.js';
  */
 export interface CurrentBuild {
 	node: OptimysticNode;
+	/** The block storage the node was handed, over the older build's files. */
+	storage: IRawStorage;
 	transactor: NetworkTransactor;
 	db: Database;
 	plugin: ReturnType<typeof register>;
@@ -54,7 +56,7 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 		await stop();
 		throw err;
 	}
-	return { node, transactor, db, plugin, stop };
+	return { node, storage: backend.storage(), transactor, db, plugin, stop };
 }
 
 interface OpenBackend {

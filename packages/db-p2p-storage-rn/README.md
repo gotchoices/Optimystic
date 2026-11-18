@@ -102,7 +102,7 @@ applies nothing.
 | `0x03` | `pending` | `blockId`, `actionId` | `Transform` |
 | `0x04` | `transactions` | `blockId`, `actionId` | `Transform` |
 | `0x05` | `materialized` | `blockId`, `actionId` | `IBlock` |
-| `0x06` | `proofs` | `blockId`, rev (8 bytes big-endian) | `BlockCommitProof` |
+| `0x06` | `proofs` | `blockId`, rev (8 bytes big-endian) | `StoredProofEntry`: a reference to a `0x08` entry (a whole `BlockCommitProof` when an earlier build wrote it) |
 | `0x07` | `journal` | the record's sequence (8 bytes big-endian), or nothing for the applied-through mark | a journal record as bytes, or the number of the last record applied — owned by `LevelDBJournalStore` |
 | `0x08` | `commitProofs` | the proof's `messageHash`, UTF-8, with no `blockId` envelope | `BlockCommitProof` |
 | `0x10` | `kv` | the key, UTF-8 | a string (not kernel-backed) |

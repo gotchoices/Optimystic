@@ -86,7 +86,7 @@ into are unchanged from earlier builds, so data written by one reads unchanged:
 | `revisions`    | `[blockId, rev]`     | `Uint8Array` | `ActionId`             |
 | `pending`      | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
 | `transactions` | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
-| `proofs`       | `[blockId, rev]`     | `Uint8Array` | `BlockCommitProof`     |
+| `proofs`       | `[blockId, rev]`     | `Uint8Array` | `StoredProofEntry`: a reference to a `commitProofs` entry (a whole `BlockCommitProof` when an earlier build wrote it) |
 | `commitProofs` | `messageHash`        | `Uint8Array` | `BlockCommitProof`     |
 | `materialized` | `[blockId, actionId]`| `Uint8Array` | `IBlock`               |
 | `journal`      | `seq` (a number), or `'applied-through'` | a `JournalRecord` by structured clone, or the number of the last record applied | — (owned by `IndexedDBJournalStore`) |

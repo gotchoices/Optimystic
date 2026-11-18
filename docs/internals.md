@@ -1411,12 +1411,39 @@ deliberately NOT the action keyspace: an action id is chosen by whoever originat
 never re-derived or format-checked by the storing node, so no reserved action-id convention could
 survive a client or peer picking that exact id. Every `RawStoreDriver` backend carries the proofs
 store natively (its own map / subdirectory / table / tag byte / object store), and beside it a
-commit proofs store keyed by the proof's `messageHash` (`RawStoreDriver.getCommitProof`), which
-can hold a proof covering many blocks once; nothing uses it yet, so today a proof is still stored
-once per block it covers (GitHub #60). Proofs survive
-`pruneMaterialization` (which trims superseded materialized copies but retains
-revision records) and live exactly as long as the revision itself; no revision-delete site exists
-today. The landing paths that skip `internalCommit` — an idempotent re-commit of the same
+commit proofs store keyed by the proof's `messageHash` (`RawStoreDriver.getCommitProof`).
+
+**A proof is stored once per node, and each revision it covers refers to it.** A proof lists every
+block its commit changed, so a copy beside each block grew the bytes a commit retains with the
+square of its block count: a bulk import grew a file store to 7 GB, 94% of it duplicate proofs
+(GitHub #60). `KvRawStorage.saveBlockProof` in `packages/db-p2p/src/storage/kv-raw-storage.ts`
+writes the proof to the commit proofs store under its `messageHash`, then writes the revision's
+proofs-store entry as a reference to it (`ProofRef` in
+`packages/db-p2p/src/storage/i-raw-storage.ts`). Target before reference, so by the flush
+contract's prefix rule a reference never survives a crash without its target. A proof already
+stored under the hash is kept, so the first proof stored for a message serves every block of that
+commit (the accepted-tradeoff `NOTE:` at `KvRawStorage.storeCommitProofIfAbsent`), and a memo of
+the hashes a store has written makes a commit of N blocks read and write the shared record once.
+`getBlockProof` resolves the reference; an entry holding a whole proof, which is what every build
+before this change wrote, is read as it is and never rewritten. Nothing checks the hash against
+the proof's message on the way in: every proof that reaches storage was built on this node from its
+own consensus record, minted by it, or verified, which recomputes the hash; and a wrong reference
+would fail closed at `servableProof`, which checks that the proof's message names the revision it
+serves. Who gets a proof, and what the repair, push and claim paths read, are unchanged:
+`getBlockProof` returns the same artifact. Measured on one solo node with file storage (5 commits
+of 500 rows into one table of a key and eight text columns, with 4 secondary indexes): the proofs
+went from 834 files and 26.3 MB, 2.2 times the rest of the block store, to 834 references and 14
+proofs in 196 KB.
+
+Proofs survive `pruneMaterialization` (which trims superseded materialized copies but retains
+revision records), and a stored proof is kept as long as any revision refers to it. Revision
+records and their proofs are kept indefinitely: no revision-delete site exists today, so nothing
+counts references either. A sweep that drops revisions must count or sweep the commit proofs it
+leaves unreferenced, an arm of backlog `feat-cold-range-transform-offload`. On the wire nothing
+changed. Every push carries one block and the whole proof for it, and a proof cannot be cut down to
+one block's claim, because its signatures cover the whole message (`computeClusterMessageHash`,
+`computeClusterCommitHash`), so a commit of N blocks pushed to one peer still sends N copies
+(backlog `feat-a-commit-proof-crosses-the-wire-once-per-peer`). The landing paths that skip `internalCommit` — an idempotent re-commit of the same
 `(actionId, rev)`, a Crash-D3 block whose lost `setLatest` `recover()` redoes, and a certified push
 of a revision this node already holds — back-fill a missing proof under the same rule.
 `saveReplicatedBlock` persists a proof only when its caller verified it against the exact bytes

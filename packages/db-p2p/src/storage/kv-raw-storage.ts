@@ -1,11 +1,25 @@
-import type { BlockId, ActionId, ActionRev, Transform, IBlock } from "@optimystic/db-core";
+import { LruMap, type BlockId, type ActionId, type ActionRev, type Transform, type IBlock } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
+import { createLogger } from "../logger.js";
 import type { BlockMetadata } from "./struct.js";
-import type { IRawStorage } from "./i-raw-storage.js";
+import type { IRawStorage, ProofRef, StoredProofEntry } from "./i-raw-storage.js";
 import type { RawStoreDriver } from "./raw-store-driver.js";
 import type { StoreIdentity } from "./store-identity.js";
 import type { FlushOptions, StoreDurability } from "./store-durability.js";
 import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecArgument } from "./raw-store-codec.js";
+
+const log = createLogger('storage');
+
+/**
+ * How many message hashes one kernel remembers as stored in the commit proofs store. A commit of N
+ * blocks saves one proof N times in quick succession; the memo turns N reads of the shared record
+ * into one. A forgotten hash costs one read on its next save, nothing more.
+ */
+const KNOWN_COMMIT_PROOFS = 1024;
+
+function isProofRef(entry: StoredProofEntry): entry is ProofRef {
+	return typeof (entry as Partial<ProofRef>).proofRef === 'string';
+}
 
 /**
  * Shared ordered-KV storage kernel. Implements the full {@link IRawStorage}
@@ -49,6 +63,19 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 
 	private readonly codec: ValueCodec<V>;
 
+	/**
+	 * Message hash → the save that put (or found) its proof in the commit proofs store: in flight, or
+	 * settled. Joining an in-flight save is what keeps two concurrent saves of one message — a commit's
+	 * apply and a certified push of another of its blocks, under different block latches — to one write.
+	 * A save that rejects is dropped, so the next save of that message retries. An entry evicted while
+	 * still in flight (1024 other messages saved meanwhile) costs the next save of its message a second
+	 * read, and at worst a second write of that message's record; every reference still names it.
+	 *
+	 * Never stale: nothing deletes a commit proof, and a store that faults refuses every later write
+	 * until it is reopened, which builds a new kernel with an empty memo.
+	 */
+	private readonly storedCommitProofs = new LruMap<string, Promise<void>>(KNOWN_COMMIT_PROOFS);
+
 	constructor(private readonly driver: RawStoreDriver<V>, ...codec: ValueCodecArgument<V>) {
 		this.codec = resolveValueCodec(codec);
 		this.durability = driver.durability;
@@ -78,7 +105,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 
 	// NOTE: every value write funnels through the driver put/delete calls in the
 	// methods below (saveMetadata / saveRevision / save*Transaction /
-	// saveBlockProof / saveCommitProof / saveMaterializedBlock). This is the single choke point where an incremental
+	// saveProofEntry / saveCommitProof / storeCommitProofIfAbsent / saveMaterializedBlock). This is the single choke point where an incremental
 	// byte counter would hook in, replacing the per-driver full-scan
 	// getApproximateBytesUsed. The chosen capacity-estimate mechanism is instead a
 	// short-TTL cache over the full scan in StorageMonitor (see storage-monitor.ts
@@ -151,14 +178,77 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	// pending an action literally named `~proof:5`, or a peer's restore archive naming
 	// one, used to land on the same key as revision 5's proof and silently overwrite it
 	// (or be overwritten by it). Separate stores make that collision unrepresentable.
+	//
+	// A revision's entry names the proof by its message hash rather than holding it: one proof covers
+	// every block its commit changed and lists them all, so a copy per block grew a commit's stored
+	// bytes with the square of its block count (GitHub #60).
 
 	async getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined> {
-		const value = await this.driver.getProof(blockId, rev);
-		return value === undefined ? undefined : this.codec.decodeJson<BlockCommitProof>(value);
+		const entry = await this.getProofEntry(blockId, rev);
+		if (entry === undefined || !isProofRef(entry)) {
+			// NOTE: an entry holding a whole proof was written by a build before proofs were stored once
+			// per message. It is read, never rewritten as a reference; if a deployed store ever needs that
+			// space back, add a pass that rewrites such entries as references.
+			return entry;
+		}
+		const proof = await this.getCommitProof(entry.proofRef);
+		if (proof === undefined) {
+			// Unreachable while `saveBlockProof` writes the target first and a crash keeps a prefix of
+			// the writes in order. No proof is an answer every reader already handles.
+			log('proof-ref-dangling blockId=%s rev=%d messageHash=%s', blockId, rev, entry.proofRef);
+		}
+		return proof;
 	}
 
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
-		await this.driver.putProof(blockId, rev, this.codec.encodeJson(proof));
+		const ref: ProofRef = { proofRef: proof.messageHash };
+		// The shared record before the reference: by the flush contract's prefix rule (rule 3 at
+		// `RawStoreDriver.flush`) the reference then never survives a crash without its target.
+		await this.ensureCommitProof(proof);
+		await this.saveProofEntry(blockId, rev, ref);
+	}
+
+	async getProofEntry(blockId: BlockId, rev: number): Promise<StoredProofEntry | undefined> {
+		const value = await this.driver.getProof(blockId, rev);
+		return value === undefined ? undefined : this.codec.decodeJson<StoredProofEntry>(value);
+	}
+
+	async saveProofEntry(blockId: BlockId, rev: number, entry: StoredProofEntry): Promise<void> {
+		await this.driver.putProof(blockId, rev, this.codec.encodeJson(entry));
+	}
+
+	/** Resolves once the commit proofs store holds a proof under `proof.messageHash`; see {@link storedCommitProofs}. */
+	private ensureCommitProof(proof: BlockCommitProof): Promise<void> {
+		const messageHash = proof.messageHash;
+		const known = this.storedCommitProofs.get(messageHash);
+		if (known !== undefined) {
+			return known;
+		}
+		const storing = this.storeCommitProofIfAbsent(messageHash, this.codec.encodeJson(proof));
+		this.storedCommitProofs.set(messageHash, storing);
+		storing.catch(() => {
+			if (this.storedCommitProofs.peek(messageHash) === storing) {
+				this.storedCommitProofs.delete(messageHash);
+			}
+		});
+		return storing;
+	}
+
+	/**
+	 * First writer wins: a proof already stored under the hash is kept.
+	 *
+	 * NOTE: accepted tradeoff — two proofs of one message can carry different signature sets (this
+	 * node's own record, and a later verified push), and the first stored serves every block of that
+	 * commit; a later verified proof is not preferred over it. The only known way the first fails
+	 * verification is an older-build member whose own record carried a late promise (docs/internals.md,
+	 * *Mixed versions* under *Both consensus rounds carry the coordinator's own member's vote*), which
+	 * already makes that member's own proof its own loss — now also for a block whose entry was empty
+	 * and later back-filled. Revisit if such proofs are seen in the field.
+	 */
+	private async storeCommitProofIfAbsent(messageHash: string, encoded: V): Promise<void> {
+		if (await this.driver.getCommitProof(messageHash) === undefined) {
+			await this.driver.putCommitProof(messageHash, encoded);
+		}
 	}
 
 	// --- Commit proofs by message hash (see RawStoreDriver.getCommitProof) ---

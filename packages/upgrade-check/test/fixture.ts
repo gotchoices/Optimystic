@@ -82,6 +82,21 @@ export async function loadFixtures(): Promise<Fixture[]> {
 	return fixtures;
 }
 
+/**
+ * The LevelDB tag byte of the per-revision proofs store as the released builds wrote it
+ * (`TAG_PROOFS` in `packages/db-p2p-storage-rn/src/keys.ts`). Kept here as a literal: it is a fact
+ * about data already written, which a later change to the constant would not change.
+ */
+const LEVELDB_PROOFS_TAG = 0x06;
+
+/** Whether the older build stored any commit proof in its per-revision proofs store. */
+export function holdsRevisionProofs(fixture: Fixture): boolean {
+	if ('files' in fixture) {
+		return Object.keys(fixture.files).some(path => /(^|\/)proofs\//.test(path));
+	}
+	return fixture.entries.some(([keyHex]) => Buffer.from(keyHex, 'hex')[0] === LEVELDB_PROOFS_TAG);
+}
+
 /** Put back, under `dir`, exactly the bytes the older build left in its store. */
 export async function unpackFixture(fixture: Fixture, dir: string): Promise<void> {
 	if ('files' in fixture) {

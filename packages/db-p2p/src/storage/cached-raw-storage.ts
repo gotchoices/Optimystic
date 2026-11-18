@@ -126,17 +126,20 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 
 	// --- proofs, by revision and by message hash ---
 
-	// The inner storage owns both proof keyspaces (`IRawStorage.getBlockProof` and
-	// `getCommitProof`), so this adapter only re-encodes across the byte boundary the
-	// way its sibling methods do. Deliberately no delete — see RawStoreDriver.getProof.
+	// The inner storage owns both proof keyspaces, so this adapter only re-encodes across the
+	// byte boundary the way its sibling methods do. The proofs store maps onto the RAW entry
+	// (`IRawStorage.getProofEntry`), not onto `getBlockProof`: the kernel above composes a
+	// revision's reference with the commit proofs store itself, so resolving here would hand it a
+	// whole proof where it reads a reference, and `saveBlockProof` would store a reference as a
+	// proof. Deliberately no delete — see RawStoreDriver.getProof.
 
 	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
-		const proof = await this.inner.getBlockProof(blockId, rev);
-		return proof === undefined ? undefined : encodeJson(proof);
+		const entry = await this.inner.getProofEntry(blockId, rev);
+		return entry === undefined ? undefined : encodeJson(entry);
 	}
 
 	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
-		await this.inner.saveBlockProof(blockId, rev, decodeJson(value));
+		await this.inner.saveProofEntry(blockId, rev, decodeJson(value));
 	}
 
 	async getCommitProof(messageHash: string): Promise<Uint8Array | undefined> {

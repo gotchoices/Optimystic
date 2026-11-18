@@ -2,7 +2,7 @@ import { expect } from 'chai';
 import { Tree, type ITransactor, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transforms, type PendRequest, type CommitRequest, type Transform } from '@optimystic/db-core';
 import { createMesh, buildNetworkTransactor, type Mesh, type MeshOptions } from '../src/testing/mesh-harness.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import type { IRawStorage } from '../src/storage/i-raw-storage.js';
+import type { IRawStorage, StoredProofEntry } from '../src/storage/i-raw-storage.js';
 import type { FlushOptions, StoreDurability } from '../src/storage/store-durability.js';
 import type { BlockMetadata } from '../src/storage/struct.js';
 import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
@@ -131,6 +131,12 @@ class CrashingRawStorage implements IRawStorage {
 	}
 	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof) {
 		return this.invoke('saveBlockProof', [blockId, rev, proof], blockId, undefined, () => this.inner.saveBlockProof(blockId, rev, proof));
+	}
+	getProofEntry(blockId: BlockId, rev: number) {
+		return this.invoke('getProofEntry', [blockId, rev], blockId, undefined, () => this.inner.getProofEntry(blockId, rev));
+	}
+	saveProofEntry(blockId: BlockId, rev: number, entry: StoredProofEntry) {
+		return this.invoke('saveProofEntry', [blockId, rev, entry], blockId, undefined, () => this.inner.saveProofEntry(blockId, rev, entry));
 	}
 	getCommitProof(messageHash: string) {
 		return this.invoke('getCommitProof', [messageHash], undefined, undefined, () => this.inner.getCommitProof(messageHash));

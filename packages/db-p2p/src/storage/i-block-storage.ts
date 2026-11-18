@@ -84,6 +84,12 @@ export interface IBlockStorage {
     /** The commit proof stored for a revision, if one was retained (see IRawStorage.getBlockProof). */
     getBlockProof(rev: number): Promise<BlockCommitProof | undefined>;
 
+    /**
+     * Whether a proof is retained for a revision, answered from the revision's own entry without
+     * reading the proof it refers to (see IRawStorage.getProofEntry).
+     */
+    hasBlockProof(rev: number): Promise<boolean>;
+
     /** Persists the commit proof for a revision (see IRawStorage.saveBlockProof). */
     saveBlockProof(rev: number, proof: BlockCommitProof, latch: BlockWriteLatch): Promise<void>;
 

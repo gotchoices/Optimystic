@@ -15,7 +15,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { Database } from '@quereus/quereus';
 import { Diary, type CommitResult } from '@optimystic/db-core';
-import { loadFixtures, unpackFixture, type DiaryEntry, type Fixture, type TableRow } from './fixture.js';
+import { proofClaimsCommit } from '@optimystic/db-p2p';
+import { holdsRevisionProofs, loadFixtures, unpackFixture, type DiaryEntry, type Fixture, type TableRow } from './fixture.js';
 import { startCurrentBuild, type CurrentBuild } from './current-build.js';
 
 /**
@@ -130,6 +131,22 @@ for (const fixture of fixtures) {
 		it('reads the diary without the append that was in flight when the older build stopped', async () => {
 			expect(await readDiary(running(), manifest.diary.id)).to.deep.equal(manifest.diary.entries);
 		});
+
+		// Releases before proofs were stored once per consensus message kept the whole proof beside each
+		// revision; this build reads such an entry as it is. Before any write here, so the log tail's
+		// latest revision is still one the older build committed.
+		if (holdsRevisionProofs(fixture)) {
+			it('reads the commit proof the older build stored for the diary log tail it last committed', async () => {
+				const { storage } = running();
+				const { tailId } = manifest.diary.inFlight.commit;
+				const latest = (await storage.getMetadata(tailId))?.latest;
+				expect(latest, 'the older build committed no revision of the diary log tail').to.not.equal(undefined);
+				const proof = await storage.getBlockProof(tailId, latest!.rev);
+				expect(proof, `no proof read back for revision ${latest!.rev}`).to.not.equal(undefined);
+				expect(proofClaimsCommit(proof!, { blockId: tailId, rev: latest!.rev, actionId: latest!.actionId }),
+					'the proof names another block, revision or action').to.equal(true);
+			});
+		}
 
 		it('lands the append that was in flight, pended by the older build and committed by this one', async () => {
 			const { commit } = manifest.diary.inFlight;
