@@ -165,7 +165,8 @@ export class BlobProtocolService implements Startable {
 	/** A local stat that throws (a corrupt tree) is answered `none`: this node cannot serve that blob. */
 	private async holdingOf(ref: BlobRef, peer: string): Promise<BlobLocalHolding> {
 		try {
-			const { locality } = await this.init.blobs.stat(ref);
+			// Explicitly unprobed: a peer's stat must not make this node ask the blob's cohort on its behalf.
+			const { locality } = await this.init.blobs.stat(ref, { probe: false });
 			return locality === 'here' ? 'whole' : locality === 'partial' ? 'partial' : 'none';
 		} catch (err) {
 			log.error('serve:stat-failed peer=%s ref=%s err=%s', peer, ref, describe(err));
