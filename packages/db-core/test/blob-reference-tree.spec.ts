@@ -11,6 +11,7 @@ import {
 	buildBlob,
 	Tree,
 	type BlobRef,
+	type BlobReferenceEntry,
 	type BlockGets,
 	type GetBlockResults,
 	type IBlock,
@@ -117,6 +118,20 @@ describe('blob reference trees', () => {
 		await references.stageRemove(r1!, 'b');
 		await references.tree.sync();
 		expect(await BlobReferenceTree.listed(net, REFERENCES, [r1!])).to.deep.equal({ listed: new Set(), certain: true });
+	});
+
+	it('answers a listing whose references span many leaves', async () => {
+		const net = new TestTransactor();
+		const refs = (await Promise.all(Array.from({ length: 24 }, (_, i) => referenceTo(`blob ${i}`)))).sort();
+		// A fan-out of 4 spreads the entries over several leaves, so the pass crosses leaf ends both by
+		// a fresh descent and by moving its cursor on.
+		const tree = await Tree.createOrOpen<string, BlobReferenceEntry>(net, REFERENCES, entry => entry[0], undefined, 4);
+		const references = new BlobReferenceTree(tree);
+		const held = refs.filter((_, i) => i % 3 !== 0);
+		await references.stage(held.map(ref => ({ kind: 'add' as const, ref, referrer: 'a' })));
+		await references.tree.sync();
+
+		expect(await BlobReferenceTree.listed(net, REFERENCES, refs)).to.deep.equal({ listed: new Set(held), certain: true });
 	});
 
 	it('commits both of two racing first registrations of one scope as one entry', async () => {
