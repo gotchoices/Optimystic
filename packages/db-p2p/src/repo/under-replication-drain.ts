@@ -493,8 +493,12 @@ export class UnderReplicationDrain implements Startable {
 	 *
 	 * NOTE: an entry NAMING a peer the gate has since refused waits for it, so that block's
 	 * full-replication event does not fire while the peer stays refused — the drain has no notion of a
-	 * named member leaving the cohort, refused or otherwise. If a removed member's entries are seen
-	 * never clearing, drop refused peers from the named set (and settle an entry left empty by that).
+	 * named member leaving the cohort, refused or otherwise. The same holds for a named member that has
+	 * since been rebuilt as a client (`NodeOptions.servesBlocks: false`) under the same peer id: once its
+	 * identify replaces the old protocol list it names no `block-transfer`, so it is never pushable and
+	 * the entry waits for it, never settling. If a removed
+	 * member's entries are seen never clearing, drop refused and non-serving peers from the named set
+	 * (and settle an entry left empty by that).
 	 */
 	private async pushablePeers(): Promise<Set<string>> {
 		const seen = new Set<string>();

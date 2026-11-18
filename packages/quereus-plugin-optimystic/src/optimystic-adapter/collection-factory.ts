@@ -13,6 +13,7 @@ import {
 	withReadCache,
 	signPeer,
 	resolveLinkDeadlines,
+	type OptimysticClientNodeAttachments,
 	type OptimysticNodeAttachments,
 	type CollectionWatchHandle,
 	type CollectionTailReader,
@@ -29,11 +30,12 @@ const log = createLogger('collection-factory');
 
 /**
  * A libp2p node this factory holds. Nodes it builds itself (`createLibp2pNode`) carry the full
- * {@link OptimysticNodeAttachments} surface; nodes a host injects through `registerLibp2pNode`
- * may carry none of it — hence `Partial`, so every read of an attachment has to face the
- * possibility that this particular node does not have one.
+ * {@link OptimysticNodeAttachments} surface. A host injects nodes through `registerLibp2pNode`: a
+ * client node (`servesBlocks: false`, {@link OptimysticClientNodeAttachments}), which carries no repo,
+ * store or change notifier, or a node carrying none of the surface — hence every attachment optional,
+ * so every read of one has to face the possibility that this particular node does not have it.
  */
-type FactoryNode = Libp2p & Partial<OptimysticNodeAttachments>;
+type FactoryNode = Libp2p & Partial<Omit<OptimysticNodeAttachments, 'servesBlocks'>> & { servesBlocks?: boolean };
 
 /**
  * A short, whitespace-free identifier for one node, used only to label trace lines.
@@ -68,7 +70,8 @@ export class CollectionFactory {
   // still lands in `transactors` afterwards (as the old await-then-set did). If a host ever
   // disposes while a table is mid-initialization, drop in-flight results that settle after dispose.
   private transactorsInFlight = new Map<string, Promise<ITransactor>>();
-  private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
+  /** `coordinatedRepo` is absent exactly for a node that coordinates nothing: a client (`servesBlocks: false`). */
+  private libp2pNodes = new Map<string, { node: FactoryNode; coordinatedRepo?: IRepo; blockChangeNotifier?: IBlockChangeNotifier }>();
   private customTransactorCtors = new Map<string, new (...args: any[]) => ITransactor>();
   private customKeyNetworkCtors = new Map<string, new (...args: any[]) => IKeyNetwork>();
   /**
@@ -415,11 +418,15 @@ export class CollectionFactory {
     const protocolPrefix = `/optimystic/${options.libp2pOptions?.networkName ?? 'optimystic'}`;
     const keyNetwork = this.resolveKeyNetwork(options.keyNetwork, node, protocolPrefix);
 
-    // A node a host injected may carry no store; its reads then state nothing.
+    // A node a host injected may carry no store, and a client has none; its reads then state nothing.
     const localStore = node.storageRepo;
     const getRepo = (peerId: PeerId): IRepo => {
-      // If it's the local peer, return the coordinated repo
+      // This node itself: its coordinated repo. A client has none, and no transactor ever picks it, since
+      // a client is in no cohort and never coordinates; the throw is that assertion.
       if (peerId.toString() === node.peerId.toString()) {
+        if (!coordinatedRepo) {
+          throw new Error(`node ${node.peerId.toString()} stores no blocks (servesBlocks: false) yet was picked to coordinate; a client is in no cohort`);
+        }
         return coordinatedRepo;
       }
       // For remote peers, create a RepoClient. Its reads say what this node holds of each block, so a
@@ -460,8 +467,8 @@ export class CollectionFactory {
       getRepo,
       localChangeNotifier: blockChangeNotifier,
       // `getRepo` serves this node from its coordinated repo, so ties among a block's responsible
-      // peers go to this node and its own writes skip the network hop.
-      localPeerId: node.peerId,
+      // peers go to this node and its own writes skip the network hop. A client has nothing co-located.
+      localPeerId: coordinatedRepo ? node.peerId : undefined,
       // The node's own HLC clock, which its storage raises to every write it stores, so the writes
       // this transactor mints never sit below one the node holds. A node a host injected without
       // building it through `createLibp2pNode` carries none; its writes mint from the process-wide clock.
@@ -777,10 +784,11 @@ export class CollectionFactory {
   }
 
   /**
-   * Register an existing libp2p node for use by the factory.
-   * This allows tests to inject pre-created nodes instead of having the factory create new ones.
+   * Register an existing libp2p node for use by the factory, instead of having the factory create one.
+   * `coordinatedRepo` defaults to the node's own (`node.coordinatedRepo`). A client node
+   * (`servesBlocks: false`) has none and needs none: its reads and writes all go to serving machines.
    */
-  registerLibp2pNode(networkName: string, node: FactoryNode, coordinatedRepo: IRepo): void {
+  registerLibp2pNode(networkName: string, node: FactoryNode, coordinatedRepo: IRepo | undefined = node.coordinatedRepo): void {
     const nodeKey = `${networkName}:0`; // Use port 0 as default for registered nodes
     this.libp2pNodes.set(nodeKey, { node, coordinatedRepo, blockChangeNotifier: node.blockChangeNotifier });
   }

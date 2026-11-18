@@ -1766,8 +1766,9 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   when a `Database.watch` is added or removed, so the watch runs for the table's
   whole open life; the tag is the consent to that.
 - **Host requirement.** Without the tag, only nodes that host the collection's
-  blocks observe these commits; edge/client nodes that don't host blocks receive no
-  push subscription and still fetch/poll. A table declared `with tags
+  blocks observe these commits; edge and client nodes that don't host blocks receive no
+  push subscription and still fetch or poll ([§Client nodes](#client-nodes) says what a
+  client, which hosts none, wakes on). A table declared `with tags
   ("optimystic.network_watch" = true)` also subscribes through its node's
   `node.reactivityWatch` (`CollectionFactory.watchCollectionOverNetwork` in
   `packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`),
@@ -3707,6 +3708,67 @@ What it does not gate:
 - **Redirect targets**, which `RepoClient` and `ClusterClient` follow without asking the gate. A redirect comes from a cohort member applying its own predicate, so this matters only where members are configured differently; a coordinator hint the redirect records is re-checked on its next use (the `NOTE:` at the redirect branch in `packages/db-p2p/src/repo/client.ts`).
 
 **An embedder that supplies only `authorizeInboundStream` is still exposed.** Any peer that can open a stream to this node — refused or not — can be chosen as a cohort member and sent every write to the blocks near it on the ring. The two options are complementary: authorization keeps strangers from reading or writing through this node, membership keeps this node from handing them its writes.
+
+### Client nodes
+
+A node built with `NodeOptions.servesBlocks: false` is a **client**: it reads and writes through the network's serving machines, stores no blocks for anyone, and takes no part in agreeing on writes. The default, `true`, is a serving node, unchanged. A client is for a machine that should not sit on the path of other machines' writes: a phone that sleeps, a browser tab, a dashboard that mostly reads.
+
+**What keeps it out.** A client registers none of the four storage protocol services — `repo`, `cluster`, `sync` and `block-transfer` (`storageProtocolServices` in `packages/db-p2p/src/libp2p-node-base.ts`) — so its identify list names neither storage protocol. Every node on a build with the storage-claim filter ([Network Membership Predicate](#network-membership-predicate), above) classifies it from that list as not serving, with no configuration, and the client classifies itself by the same test (`selfServes` in `packages/db-p2p/src/libp2p-key-network.ts`). So it is in no cohort, neither `findCluster` nor `servingCohortAt` names it, and it is never a coordinator pick. Its reads and writes go to a coordinator in each block's cohort over `repo`, the one protocol a client sends steady requests on and the only one it keeps prepared streams for.
+
+**What it builds.** Every subsystem the node factory builds, and whether a client builds it:
+
+| Subsystem | Client |
+|---|---|
+| Link deadlines, cluster policy, bootstrap targets | yes — the key network reads `clusterSize` and the deadlines |
+| Raw block store and its read-cache lease, the durability-window policy, the storage start-up line | no |
+| Key-value store (`NodeOptions.kvStore`) | yes — it holds the HLC clock's high-water mark, the only thing a client persists |
+| Under-replication ledger | no |
+| HLC clock (`node.hlcClock`) | yes — it mints the HLC of every write the client sends |
+| `StorageRepo`, and the repo and cluster proxies the protocol services answer through | no |
+| libp2p services `cluster`, `repo`, `sync`, `blockTransfer` | not registered |
+| libp2p services `identify`, `identifyPush`, `ping`, `dcutr` (by the hole-punching rule), `autoNAT`, `relay` (with `relay: true`), `networkManager`, `fret` | yes, unchanged; FRET joins the ring at `fretProfile` |
+| Bootstrap contact, identify progress, identify on connection open, the protocol-merge throttle, the storage-claim filter, the relay supervisor | yes |
+| Reputation, the membership gate, the key network, the cohort reachability gate | yes — the client still chooses coordinators, and the offline queue still asks the gate |
+| Prepared streams | `repo` only |
+| Repair and restoration, `ClusterMember`, `CoordinatorRepo`, transaction-state recovery | no |
+| The cohort consult (`ClusterLatestCallback`) | only with `cohortTopic.enabled`, for the commit-log trust anchor, and it asks remote peers only (`clientClusterLatest`): a client is never in a root group, so the anchor never asks it about itself |
+| Owned-block feed and seed, spread-on-churn, the under-replication drain, Arachnode (ring announce, storage monitor, restoration, rebalance, block transfer, ring shift) | no — a client announces no Arachnode ring, so ring-based restoration and ring shifts never pick it |
+| `reportBlockHeld`, the dispute service | no |
+| Cohort-topic host, reactivity subscriber registry, forwarder host, rotation scheduler, push-state gossip, watch service, matchmaking handlers and arrival push | yes, with `cohortTopic.enabled` |
+| Cohort-topic commit-certificate store, origination manager and change bridge | no — a client applies no commits, so it announces none |
+| The watch service's local feed (`localChanges`) | omitted |
+
+What a serving node builds beyond this is two functions in `packages/db-p2p/src/libp2p-node-base.ts`, each skipped on a client by one test: `prepareServingStore`, before libp2p exists, and `wireServingRole`, after start, which installs each stop wrapper right after its resource as the factory's startup rollback requires. Sereus's own peer-join catch-up runs on the machine delivering blocks, which a client never is, and is Sereus's to gate.
+
+**Options a client ignores.** `storage`, `storageDurability`, `transactionStateStore`, `validator`, `onCommitCertificate`, `dispute`, `blockTransfer`, `rebalance`, `spreadOnChurn`, `underReplicationDrain`, `arachnode`, `authorizeInboundStream`, `authorizeInboundStreamTimeoutMs` and `responsibilityK` configure only serving subsystems, so a client ignores them, as a node without `relay` ignores `relayServerInit`. It logs one `node-wiring` line naming each it was given (`logIgnoredServingOptions`, which holds the one list), so a host that expected one to take effect can see why it did not. Refusing them was rejected: an embedder that sets the role per machine builds one options object and flips one flag, and a block store left on disk by a former serving role is harmless and still there if the role flips back.
+
+**The node's type.** `createLibp2pNode` returns an `OptimysticClientNode` for `servesBlocks: false`, an `OptimysticNode` for unset or `true`, and either for a plain `NodeOptions` (the option shapes are `ClientNodeOptions` and `ServingNodeOptions` in `packages/db-p2p/src/libp2p-node-base.ts`). Both attachment shapes extend `OptimysticNodeAttachmentsBase` in `packages/db-p2p/src/optimystic-node.ts` and are told apart by `servesBlocks`. A client has no `storageRepo`, `coordinatedRepo`, `blockChangeNotifier`, `disputeService` or `reportBlockHeld`. A host writes through it with a `NetworkTransactor` over `node.keyNetwork` whose `getRepo` hands back a `RepoClient` for every peer, with no `localPeerId` and no `localChangeNotifier` — nothing is co-located, and nothing lands in storage the client does not have — and with `clock: node.hlcClock`. The Quereus plugin builds exactly that for a client handed to `CollectionFactory.registerLibp2pNode` in `packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`; the node the plugin builds itself still serves. A client hears another machine's commit only through `node.reactivityWatch` (the `optimystic.network_watch` table tag in SQL), or by reading.
+
+**Who says a node does not serve.** Two statements, by two parties:
+
+- `servesBlocks: false` is a node saying of itself "I hold nothing". Every peer on a build with the storage-claim filter honours it from the client's identify list.
+- `isNetworkMember` is a node's own policy about others: of the peers that claim to serve, only these count. It exists to keep strangers out, and a node applies it to its own choices only.
+
+An embedder with a read-only role (a dashboard browser, voters' phones) sets `servesBlocks: false` on that machine and needs no refusal predicate for it, except while any serving machine of the network still runs a build without the storage-claim filter, which classifies a client by the requests it sends: keep the predicate refusing clients until every serving machine is upgraded.
+
+**When no serving machine is reachable.** A client write cannot commit locally, and does what a write whose cohort is unreachable already does. `NetworkTransactor.pend` resolves coordinators through `coordinatorCover`; `findCluster` returns an empty cohort, so the block falls to `findCoordinator`, which waits out its bounded retry window (and `assembleServingCohortAt`'s bounded wait while a bootstrap peer's contact is imminent) and throws `FindCoordinatorError` — `NO_NETWORK_COORDINATOR` when the only peers it saw were unconfirmed or foreign, `NO_COORDINATOR_AVAILABLE` otherwise. `Collection.sync` does not absorb it, since it is not a `StaleFailure`, so the write fails, retryably, and `Tree.replace` and `Diary.append` unstage what they staged. Under the offline queue the reachability gate (`KeyNetworkCohortReachability`) reads an empty cohort as closed, so a queued entry waits for a serving machine rather than failing.
+
+**Founding and opening a collection.** A client cannot found a network alone, and does not report a collection absent when it asked nobody. The header probe of `Collection.open` and `Collection.createOrOpen` resolves coordinators before it asks anyone (`createBatchesForPayload` in `packages/db-core/src/utility/batch-coordinator.ts`), so the `FindCoordinatorError` reaches the caller: `createOrOpen` rejects and invents nothing, and `open` rejects rather than resolving `undefined`. Bootstrap contact applies as on a serving node: a client configured with a bootstrap peer waits for it the same bounded time before its cohort is judged empty.
+
+**Declared membership.** A declared membership list must name serving machines only (backlog `feat-declared-membership-feeds-cohort-assembly`).
+
+**A machine switched from serving to client** under the same peer id reads, to peers that knew it, like an offline serving peer — a stale peerStore list and a remembered verdict — until its next connection's identify replaces the list, which also clears the remembered verdict and persists the clearing. Until then it can sit in their cohorts as a silent member: the cost of a serving peer that went offline, bounded the same way, by its reconnect or by FRET declaring it dead. The block store it left on disk is untouched, and is caught up through ordinary repair if the machine is rebuilt as serving.
+
+**What a client write costs.** A client coordinates nothing, so a write is requests to remote coordinators: the refresh, the pend and the commit. Measured on the fixture in `packages/db-p2p/test/client-only-node.integration.spec.ts` (two servers, `clusterSize: 2`), a write on a handle that has already read the leaf it changes made three requests, or four when the collection header and the log tail fell on different coordinators: a read goes out as one request per coordinator its blocks fall on, so the refresh is then two. The pend and the commit were one request each, since one coordinator covered every block. The first write on a freshly opened handle also reads that leaf, one request more. The cohort's own consensus rounds run between serving machines, not on the client's link. Reads are all remote: an idle poll costs one request per tree (two when the header and tail fall on different coordinators), where a serving machine in the cohort answers locally. No time per write is stated here; none was measured on a real link.
+
+**A watch on a client** registers with the collection's root group over the network, and its renewals and tail reads go there too: the tail reader a host passes (`committedTailReader` over the client's transactor) reads remotely. Once the registration has reached the server that announces a commit — one cohort gossip round after it lands on another member — the commit wakes the watch over the notify socket; until then the watch service's own tick does. The fixture above pins the notify path.
+
+**Limits that stay.**
+
+- **Clients still occupy the ring.** FRET is unchanged, so a client is a ring member, and the key network cuts each cohort from a band of `max(4 × clusterSize, clusterSize + 16)` ring members nearest the key (the `NOTE:` at `membershipOverfetch` in `packages/db-p2p/src/libp2p-key-network.ts`). At the default `clusterSize` of 10 a cohort is full only where at least 10 of the 40 ring members nearest the key serve, so a ring that is mostly clients leaves cohorts short or empty, and a wider band drawn from one node's own FRET table cannot fix that reliably. A client node serves a network with a minority of clients; a network of tens of thousands of phones needs blocked `clients-in-the-ring-crowd-out-serving-peers`.
+- **Cohort-topic tiers below a root** are FRET cohorts, so a client with `cohortTopic.enabled` can be a member of one (registrations, notification fan-out). Same blocked ticket.
+- **An under-replication ledger entry naming a machine that became a client** never settles (the `NOTE:` at `UnderReplicationDrain.pushablePeers` in `packages/db-p2p/src/repo/under-replication-drain.ts`).
+- **Spread-on-churn** pushes to FRET neighbours without checking they serve, so it wastes pushes on clients: backlog `debt-fret-direct-senders-push-to-peers-that-store-nothing`.
 
 ### Equivocation Detection
 

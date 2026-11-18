@@ -13,7 +13,9 @@
  * custom-transports node), plus the `@optimystic/db-p2p/rn` factory — which shares the same base
  * and therefore inherits the same services — and a `relay: true` node, the one branch of the
  * services map that adds a key. The browser-shaped and RN nodes listen on nothing, so they also
- * cover the branch that drops one: `dcutr` (see {@link EXPECTED_UNDIALABLE_SERVICE_KEYS}).
+ * cover the branch that drops one: `dcutr` (see {@link EXPECTED_UNDIALABLE_SERVICE_KEYS}). A client
+ * node (`servesBlocks: false`) covers the branch that drops the four storage protocol services (see
+ * {@link EXPECTED_CLIENT_SERVICE_KEYS}).
  *
  * Behavioral coverage lives elsewhere: hole-punching in `dcutr-direct-upgrade.spec.ts`, identify
  * protocol ids in `identify-protocol-id.spec.ts`, and identify/push address propagation in
@@ -83,6 +85,23 @@ const EXPECTED_UNDIALABLE_SERVICE_KEYS = [
 	'sync'
 ].sort();
 
+/**
+ * The service keys on a client (`servesBlocks: false`) with a directly dialable listen address: every
+ * key in {@link EXPECTED_SERVICE_KEYS} except the four storage protocol services, `blockTransfer`,
+ * `cluster`, `repo` and `sync`. Their absence from the client's identify list is what keeps it out of
+ * every other node's cohorts (docs/internals.md §Client nodes). Written out, not derived, for the same
+ * reason as the literal above.
+ */
+const EXPECTED_CLIENT_SERVICE_KEYS = [
+	'autoNAT',
+	'dcutr',
+	'fret',
+	'identify',
+	'identifyPush',
+	'networkManager',
+	'ping'
+].sort();
+
 function serviceKeysOf(node: Libp2p): string[] {
 	const services = (node as Libp2p & { services: Record<string, unknown> }).services;
 	return Object.keys(services).sort();
@@ -142,6 +161,21 @@ describe('node service set (createLibp2pNodeBase)', function () {
 			// reader can easily assume is a different node builder: it is not, and #7's fix reaches it.
 			expect(keys, 'the RN entrypoint inherits identifyPush (#7)').to.include('identifyPush');
 			expectWellFormedProtocolIds(node.getProtocols() as string[], 'RN-factory node');
+		} finally {
+			await node.stop();
+		}
+	});
+
+	it('a client (servesBlocks: false) registers the default set less the four storage protocol services', async () => {
+		const node = await createLibp2pNode({
+			bootstrapNodes: [],
+			networkName: 'test-service-set-client',
+			servesBlocks: false
+		});
+		try {
+			expect(serviceKeysOf(node), 'complete services key set on a client node')
+				.to.deep.equal(EXPECTED_CLIENT_SERVICE_KEYS);
+			expectWellFormedProtocolIds(node.getProtocols() as string[], 'client node');
 		} finally {
 			await node.stop();
 		}

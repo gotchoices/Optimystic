@@ -47,7 +47,7 @@ import {
 	type QueryV1,
 } from '@optimystic/db-core';
 import { Collection, Tree, routingKeyForBlock, type ITransactor } from '@optimystic/db-core';
-import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
+import { createLibp2pNode, type ServingNodeOptions } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { transactorFor } from './util/two-machine-lifecycle.js';
 import { peerIdToBytes, bytesToPeerIdString } from '../src/cohort-topic/peer-codec.js';
@@ -236,7 +236,7 @@ async function memberOf(key: PrivateKey, peerId: PeerId): Promise<Member> {
 	// cert stays SERVED on the primary's `/membership` handler, so every remote fetch below resolves it.
 	let coord0Cert: MembershipCertV1;
 
-	async function spawnNode(overrides: Partial<NodeOptions> = {}): Promise<RealNode> {
+	async function spawnNode(overrides: Partial<ServingNodeOptions> = {}): Promise<RealNode> {
 		const key = await generateKeyPair('Ed25519');
 		const peerId = peerIdFromPrivateKey(key);
 		const node = await createLibp2pNode({

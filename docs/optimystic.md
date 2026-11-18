@@ -22,7 +22,8 @@ You can access Optimystic through either a **native TypeScript API** or through 
 Every application needs at least one Optimystic peer. Roles are orthogonal — a single node may combine them:
 
 * **Solo / offline.** No bootstrap peers, no listen addresses. Common for mobile first launch, unit tests, and local development.
-* **Client-only.** Dials bootstrap peers but does not accept inbound connections.
+* **Dial-only.** Dials bootstrap peers but does not accept inbound connections.
+* **Client (holds no blocks).** Reads and writes through the network's serving machines, but stores no blocks for others and takes no part in agreeing on writes, so a sleeping phone or a browser tab is never on the path of another machine's write. Built with `servesBlocks: false`; see below.
 * **Full peer.** Participates in transaction routing, consensus, and (if configured) storage.
 * **Public gateway** or **bootstrap node.** Provides a stable public address for mobile and NAT'd clients.
 
@@ -50,6 +51,16 @@ const solo = await createLibp2pNode({
   listenAddrs: [],
   transports: [webSockets()],
   clusterSize: 1,
+});
+```
+
+A **client** sets `servesBlocks: false`. It registers none of the storage protocols, so every other node leaves it out of the groups that store and agree on blocks, and `createLibp2pNode` returns an `OptimysticClientNode`, which has no `storageRepo` or `coordinatedRepo`. A client cannot found a network alone: with no serving machine reachable, a write or a collection open fails, retryably, with `FindCoordinatorError`. What it builds, what it costs and its limits are in [internals.md §Client nodes](internals.md#client-nodes).
+
+```typescript
+const client = await createLibp2pNode({
+  networkName: 'myapp',
+  bootstrapNodes: ['/dns4/relay.example.com/tcp/443/wss/p2p/12D3...'],
+  servesBlocks: false,
 });
 ```
 

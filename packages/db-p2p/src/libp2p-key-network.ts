@@ -1412,6 +1412,12 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	// than the genuine members would shrink that key's cohort. Not reachable at a deployment's
 	// scale today; if it is ever seen, the remedy is FRET honouring the predicate (backlog
 	// `feat-fret-honours-the-network-membership-predicate`), not a wider band.
+	// NOTE: a client node (`NodeOptions.servesBlocks: false`) is a FRET ring member too, and takes an
+	// over-fetch slot the same way. At the default `clusterSize` of 10 a cohort is full only where at
+	// least 10 of the 40 ring members nearest the key serve, so a ring that is mostly clients leaves
+	// cohorts short or empty; a wider band drawn from this node's own FRET table cannot fix that
+	// reliably, since the table holds few peers far from this node. Fine for a network with a minority
+	// of clients; the ring-membership fix is `blocked/clients-in-the-ring-crowd-out-serving-peers`.
 	private membershipOverfetch(): number {
 		return Math.max(this.clusterSize * 4, this.clusterSize + 16)
 	}
@@ -1432,9 +1438,9 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * classified on exactly the same footing. A libp2p double with no `getProtocols` counts
 	 * as serving, the convention `getConnections?.()` already follows for mocks.
 	 *
-	 * Every production node registers both storage services today (`createLibp2pNode`), so the
-	 * `false` branch is defence in depth: it is what keeps a future client-only node out of every
-	 * cohort and away from every coordinator pick.
+	 * A node built with `NodeOptions.servesBlocks: false` registers neither, so for a client this is
+	 * `false`: that is what keeps it out of every cohort and away from every coordinator pick, on the
+	 * same test every other node applies to it from its identify list (docs/internals.md §Client nodes).
 	 */
 	private selfServes(): boolean {
 		if (this.protocolPrefix == null) return true

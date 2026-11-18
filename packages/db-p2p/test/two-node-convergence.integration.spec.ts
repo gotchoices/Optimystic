@@ -3,7 +3,7 @@ import type { Libp2p } from 'libp2p';
 import { BlockUnavailableError, Diary, Tree, routingKeyForBlock } from '@optimystic/db-core';
 import { waitFor } from '@optimystic/db-core/test';
 import { multiaddr } from '@multiformats/multiaddr';
-import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
+import { createLibp2pNode, type ServingNodeOptions } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 import { transactorFor } from './util/two-machine-lifecycle.js';
@@ -50,7 +50,7 @@ describe('Two-node convergence over real libp2p', function () {
 
 	const clusterPolicy = { allowDownsize: true, sizeTolerance: 1.0, superMajorityThreshold: 0.67 };
 
-	async function spawnNode(overrides: Partial<NodeOptions> = {}): Promise<OptimysticNode> {
+	async function spawnNode(overrides: Partial<ServingNodeOptions> = {}): Promise<OptimysticNode> {
 		const node = await createLibp2pNode({
 			port: 0,
 			networkName: NETWORK_NAME,

@@ -17,7 +17,7 @@ import type { BlockId, WriteDurability } from '@optimystic/db-core';
 import { NetworkTransactor, Tree, mergeDurability, routingKeyForBlock } from '@optimystic/db-core';
 import { delay, waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
-import { createLibp2pNode, type NodeOptions } from '../../src/libp2p-node.js';
+import { createLibp2pNode, type ServingNodeOptions } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
 import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
 import { MemoryKVStore } from '../../src/storage/memory-kv-store.js';
@@ -57,7 +57,7 @@ export function running(machine: Machine): OptimysticNode {
 }
 
 /** How a spec's machines reach each other. The cluster configuration is not part of it — see the module header. */
-export type NetworkShape = Omit<NodeOptions, 'networkName' | 'privateKey' | 'storage' | 'kvStore' | 'clusterSize' | 'clusterPolicy'>;
+export type NetworkShape = Omit<ServingNodeOptions, 'networkName' | 'privateKey' | 'storage' | 'kvStore' | 'clusterSize' | 'clusterPolicy'>;
 
 export async function startMachine(machine: Machine, shape: NetworkShape): Promise<OptimysticNode> {
 	const node = await createLibp2pNode({

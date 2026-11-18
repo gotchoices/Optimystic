@@ -3,16 +3,24 @@ import { webSockets } from '@libp2p/websockets';
 import { circuitRelayTransport } from '@libp2p/circuit-relay-v2';
 import {
 	createLibp2pNodeBase,
+	type ClientNodeOptions,
 	type Libp2pTransports,
 	type NodeOptions,
 	type RawStorageProvider,
 	type KVStoreProvider,
+	type ServingNodeOptions,
 } from './libp2p-node-base.js';
-import type { OptimysticNode } from './optimystic-node.js';
+import type { OptimysticClientNode, OptimysticNode } from './optimystic-node.js';
 
-export type { Libp2pTransports, NodeOptions, RawStorageProvider, KVStoreProvider };
+export type { ClientNodeOptions, Libp2pTransports, NodeOptions, RawStorageProvider, KVStoreProvider, ServingNodeOptions };
 
-export async function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode> {
+/** A client node (`servesBlocks: false`): no repo, no block store; see {@link OptimysticClientNode}. */
+export function createLibp2pNode(options: ClientNodeOptions): Promise<OptimysticClientNode>;
+/** A node that stores blocks for its network — the default. */
+export function createLibp2pNode(options: ServingNodeOptions): Promise<OptimysticNode>;
+/** Either, as `options.servesBlocks` decides at run time; narrow the result on its `servesBlocks`. */
+export function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode | OptimysticClientNode>;
+export async function createLibp2pNode(options: NodeOptions): Promise<OptimysticNode | OptimysticClientNode> {
 	const port = options.port ?? 0;
 	const wsHost = options.wsHost ?? '0.0.0.0';
 

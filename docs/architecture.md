@@ -265,6 +265,15 @@ after a relay restart, a dropped relay connection, or the routine renewal of the
 request every few minutes so a relay that forgot the slot while the connection stayed open holds it again
 (`superviseRelayReservation` in `packages/db-p2p/src/network/relay-reservation.ts`).
 
+### Machines that store nothing
+
+A machine in a group need not store anything. One built with `servesBlocks: false` is a **client**: it reads
+and writes through the group's storing machines but registers none of the storage protocols, so no machine puts
+it in a cohort or picks it to coordinate, and a client that sleeps never holds up another machine's write. It
+cannot found a group alone. A group may hold a minority of clients; one that is mostly clients needs FRET to stop
+counting them as ring members. What a client builds, what each of its writes costs and its limits are in
+[internals.md §Client nodes](internals.md#client-nodes).
+
 ### Arachnode — concentric storage rings
 
 Long-term storage is organized into nested DHTs where each outer ring partitions the keyspace on one more bit:

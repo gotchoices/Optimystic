@@ -461,6 +461,35 @@ host assembling a stack *without* `createLibp2pNode`. A standalone `CoordinatorR
 `Libp2pKeyPeerNetwork` must be told its cluster size; pass `DEFAULT_CLUSTER_SIZE` (exported from
 this package) to match what an unconfigured node resolves to.
 
+### Setting Up a Client Node
+
+A machine that should read and write without storing blocks for others — a phone that sleeps, a
+browser tab — is built with `servesBlocks: false`. It registers none of the storage protocols, so no
+other node puts it in a cohort or picks it to coordinate. `createLibp2pNode` then returns an
+`OptimysticClientNode`: no `storageRepo`, `coordinatedRepo` or `blockChangeNotifier`, since nothing
+lands in storage it does not have. Write through it with a `NetworkTransactor` whose every repo is a
+`RepoClient`:
+
+```typescript
+import { NetworkTransactor } from '@optimystic/db-core';
+import { createLibp2pNode, RepoClient } from '@optimystic/db-p2p';
+
+const client = await createLibp2pNode({ networkName: 'my-net', bootstrapNodes: ['...'], servesBlocks: false });
+const transactor = new NetworkTransactor({
+  timeoutMs: client.linkDeadlines.transactionTimeoutMs,
+  abortOrCancelTimeoutMs: Math.max(5_000, client.linkDeadlines.dialTimeoutMs),
+  dialTimeoutMs: client.linkDeadlines.dialTimeoutMs,
+  keyNetwork: client.keyNetwork,
+  getRepo: (peerId) => RepoClient.create(peerId, client.keyNetwork, '/optimystic/my-net'),
+  clock: client.hlcClock,
+});
+```
+
+Options that configure only storage (`storage`, `arachnode`, `rebalance` and the rest) are ignored on
+a client, with one log line naming them. With no serving machine reachable a write, or opening a
+collection, fails with a retryable `FindCoordinatorError`. What a client builds, what a write costs
+and its limits are in [docs/internals.md §Client nodes](../../docs/internals.md#client-nodes).
+
 ### How long a write may wait for its sync (`storageDurability`)
 
 A node may leave a storage write unsynced for a short window before forcing it onto disk; how long is computed per write from the size of the cohort the write's consensus ran on, as the longest wait for which every machine that would have to lose the write losing power within it stays less likely than the accepted loss chance (`durabilityWindowMs` in `src/storage/durability-window.ts`). A write only this machine holds — every solo pend and commit — is synced before it is reported. The formula, its table, and which writes carry a window are in [docs/storage.md §How long a write may wait for its sync](docs/storage.md#how-long-a-write-may-wait-for-its-sync); what an acknowledged write survives on each backend is in [§What an acknowledged write survives](docs/storage.md#what-an-acknowledged-write-survives).

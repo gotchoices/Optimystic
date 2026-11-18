@@ -604,6 +604,8 @@ plugin.collectionFactory.registerLibp2pNode('mynet', node, node.coordinatedRepo)
 
 A registered node is used by tables whose `networkName` matches and whose `port` resolves to `0`: the default when neither the table's `port` nor the plugin's `default_port` setting names another.
 
+A client node (`servesBlocks: false`, which stores no blocks; see [db-p2p §Setting Up a Client Node](../db-p2p/readme.md#setting-up-a-client-node)) is registered the same way, with no coordinated repo: `registerLibp2pNode('mynet', clientNode)`. Its reads and writes all go to serving machines, and its tables wake on another machine's commit only with the `optimystic.network_watch` tag.
+
 ## Quereus SQL Dialect
 
 Quereus is not SQLite — it is a distinct SQL engine with intentional departures from the SQL standard, aligned with [The Third Manifesto](https://www.dcs.warwick.ac.uk/~hugh/TTM/DTATRM.pdf). Key differences that affect schema design:
