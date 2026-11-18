@@ -186,6 +186,9 @@ export const DEFAULT_DB_VERSION = 1;
  * - `kv` → generic string keyspace shared by `IKVStore` (`s_val`) and the
  *   identity helper (`b_val`). NOT kernel-backed; unchanged. The two columns
  *   avoid a base64 round-trip for the libp2p private key.
+ * - `pieces` → blob piece bytes keyed by the piece id, written by `SqlitePieceStore` by autocommit
+ *   statements, outside the write group. A database file created before the table existed gains
+ *   it on its next open.
  * - `durability_mark` → one row, bumped by `syncSqliteDb` (`sqlite-sync.ts`) so a
  *   sync that has no rows of its own to write still has a frame to commit.
  *
@@ -252,6 +255,11 @@ CREATE TABLE IF NOT EXISTS kv (
 	key    TEXT PRIMARY KEY,
 	s_val  TEXT,
 	b_val  BLOB
+);
+
+CREATE TABLE IF NOT EXISTS pieces (
+	id    TEXT PRIMARY KEY,
+	bytes BLOB NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS durability_mark (

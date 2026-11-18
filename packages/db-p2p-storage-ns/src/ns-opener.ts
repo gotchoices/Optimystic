@@ -177,7 +177,11 @@ class NSPluginStatement implements SqliteStatement {
 		// Android allows 51,200 of those. This storage reaches that size with one block near
 		// or over 512 KiB per read (`get`, like this method) or `listBlockIds` over a large
 		// table. Fine now; if a node on NativeScript 8 ever reads thousands of such results
-		// between garbage collections, read them in smaller pieces.
+		// between garbage collections, read them in smaller pieces. `SqlitePieceStore.get` reads
+		// one blob piece per call; a piece this design writes is 256 KiB, and only a piece from a
+		// blob another IPFS tool made can exceed 512 KiB (the reader admits up to 1 MiB), so a node
+		// reading thousands of such pieces between garbage collections is a case this remedy would
+		// have to cover too.
 		const rows = await this.raw.select(this.sql, params);
 		return rows as SqliteRow[];
 	}

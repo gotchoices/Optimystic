@@ -1,3 +1,4 @@
+import { StoreFailedError } from '@optimystic/db-p2p';
 import type { SqliteDb, SqliteTransaction } from './db.js';
 
 const BUMP_MARK_SQL = 'INSERT INTO durability_mark (id, n) VALUES (1, 1) ON CONFLICT(id) DO UPDATE SET n = n + 1';
@@ -21,4 +22,42 @@ export async function bumpDurabilityMark(tx: SqliteTransaction): Promise<void> {
  */
 export async function syncSqliteDb(db: SqliteDb): Promise<void> {
 	await db.transaction(bumpDurabilityMark, { synced: true });
+}
+
+/**
+ * Tracks whether a store wrote since its last flush, and latches the store failed when a sync fails
+ * (rule 5 of the flush contract on `RawStoreDriver.flush`). Shared by the stores that write by
+ * autocommit statements and flush with one `syncSqliteDb` (`SqliteKVStore`, `SqlitePieceStore`).
+ */
+export class PendingSqliteSync {
+	/** Set once a write has resolved, cleared by the flush that syncs it. */
+	private dirty = false;
+	private fault: { cause: unknown } | undefined;
+
+	constructor(private readonly db: SqliteDb) {}
+
+	/** Throws `StoreFailedError` once a sync has failed. Writes call it first. */
+	throwIfFailed(): void {
+		if (this.fault) throw new StoreFailedError(this.fault.cause);
+	}
+
+	/** A write resolved; the next flush must sync. */
+	noteWrite(): void {
+		this.dirty = true;
+	}
+
+	/** One synced commit when a write resolved since the last flush, otherwise nothing; a failure latches and throws `StoreFailedError`. */
+	async flush(): Promise<void> {
+		this.throwIfFailed();
+		if (!this.dirty) return;
+		// Cleared before the sync, so a write resolving while the sync runs is covered by the next
+		// flush whether or not this sync's commit happened to come after it.
+		this.dirty = false;
+		try {
+			await syncSqliteDb(this.db);
+		} catch (err) {
+			this.fault ??= { cause: err };
+			throw new StoreFailedError(this.fault.cause);
+		}
+	}
 }

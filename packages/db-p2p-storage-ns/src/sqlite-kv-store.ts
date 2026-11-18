@@ -1,6 +1,6 @@
-import { StoreFailedError, type IKVStore } from '@optimystic/db-p2p';
+import type { IKVStore } from '@optimystic/db-p2p';
 import type { SqliteDb, SqliteStatement } from './db.js';
-import { syncSqliteDb } from './sqlite-sync.js';
+import { PendingSqliteSync } from './sqlite-sync.js';
 
 /**
  * SQLite-backed `IKVStore` adapter for NativeScript peers.
@@ -29,12 +29,11 @@ export class SqliteKVStore implements IKVStore {
 		list: SqliteStatement;
 	};
 	private readonly prefix: string;
-	/** Set once a write has resolved, cleared by the flush that syncs it. */
-	private dirty = false;
-	private fault: { cause: unknown } | undefined;
+	private readonly sync: PendingSqliteSync;
 
-	constructor(private readonly db: SqliteDb, prefix: string = 'optimystic:txn:') {
+	constructor(db: SqliteDb, prefix: string = 'optimystic:txn:') {
 		this.prefix = prefix;
+		this.sync = new PendingSqliteSync(db);
 		this.stmts = {
 			get: db.prepare('SELECT s_val FROM kv WHERE key = ?'),
 			set: db.prepare('INSERT INTO kv (key, s_val, b_val) VALUES (?, ?, NULL) ON CONFLICT(key) DO UPDATE SET s_val = excluded.s_val'),
@@ -51,15 +50,15 @@ export class SqliteKVStore implements IKVStore {
 	}
 
 	async set(key: string, value: string): Promise<void> {
-		this.throwIfFailed();
+		this.sync.throwIfFailed();
 		await this.stmts.set.run(this.prefix + key, value);
-		this.dirty = true;
+		this.sync.noteWrite();
 	}
 
 	async delete(key: string): Promise<void> {
-		this.throwIfFailed();
+		this.sync.throwIfFailed();
 		await this.stmts.delete.run(this.prefix + key);
-		this.dirty = true;
+		this.sync.noteWrite();
 	}
 
 	async list(prefix: string): Promise<string[]> {
@@ -75,21 +74,7 @@ export class SqliteKVStore implements IKVStore {
 	}
 
 	/** `IKVStore.flush`: one synced commit when this store wrote since its last flush, otherwise nothing. */
-	async flush(): Promise<void> {
-		this.throwIfFailed();
-		if (!this.dirty) return;
-		// Cleared before the sync, so a write resolving while the sync runs is covered by the next
-		// flush whether or not this sync's commit happened to come after it.
-		this.dirty = false;
-		try {
-			await syncSqliteDb(this.db);
-		} catch (err) {
-			this.fault ??= { cause: err };
-			throw new StoreFailedError(this.fault.cause);
-		}
-	}
-
-	private throwIfFailed(): void {
-		if (this.fault) throw new StoreFailedError(this.fault.cause);
+	flush(): Promise<void> {
+		return this.sync.flush();
 	}
 }

@@ -54,22 +54,26 @@ import {
   openOptimysticNSDb,
   SqliteRawStorage,
   SqliteKVStore,
+  SqlitePieceStore,
   loadOrCreateNSPeerKey,
 } from '@optimystic/db-p2p-storage-ns';
 
 const db = await openOptimysticNSDb();           // single shared handle
 const rawStorage = new SqliteRawStorage(db);     // → IRawStorage
 const kvStore = new SqliteKVStore(db);           // → IKVStore (txn recovery)
+const pieceStorage = new SqlitePieceStore(db);   // → IPieceStore (blob pieces)
 const privateKey = await loadOrCreateNSPeerKey(db);
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
+  kvStore,
+  pieceStorage,
 });
 ```
 
-The same handle is shared by all three consumers. The plugin runs every call on
+The same handle is shared by every consumer. The plugin runs every call on
 one native thread per database, in the order made, which orders single calls
 but does not keep a sequence of calls together, and SQLite allows at most one
 open transaction per connection. So the wrapper serializes every mutating
@@ -87,6 +91,7 @@ Close the storage before the handle, and the handle last:
 ```ts
 await rawStorage.close();   // flushes what it still holds, syncs it, disarms its timers
 await kvStore.flush();
+await pieceStorage.flush(); // the piece store has nothing to close
 await db.close();
 ```
 
@@ -98,7 +103,7 @@ still has armed would fire on a closed connection.
 
 The package opens a single SQLite database (`optimystic.sqlite` by default; a
 bare name goes in the app's databases folder on Android and its documents folder
-on iOS, and a full path is used as given) with nine tables. On Android the
+on iOS, and a full path is used as given) with ten tables. On Android the
 engine is the SQLite the plugin bundles; on iOS it is the process's. The seven
 block-storage tables keep their original columns and keys, but their value
 columns are **BLOB**: `SqliteBatchBackend` binds/reads the kernel's raw
@@ -118,6 +123,7 @@ into; keys stay TEXT/INTEGER.
 | `commit_proofs`   | `message_hash`                   | `BLOB`       | `BlockCommitProof`     |
 | `materialized`    | `(block_id, action_id)`          | `BLOB`       | `IBlock`               |
 | `kv`              | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) | — (not kernel-backed) |
+| `pieces`          | `id` (the piece id)              | `bytes` (BLOB), the piece's exact bytes | — (not kernel-backed; written by `SqlitePieceStore`) |
 | `durability_mark` | `id` (always 1)                  | `n` (INTEGER), a counter nothing reads | — (the row a sync commits when it has nothing else to write) |
 
 Pragmas: `journal_mode = WAL`, `synchronous = NORMAL`, `foreign_keys = OFF`.
@@ -129,6 +135,11 @@ so list latency stays bounded as the tables grow.
 `promotePendingTransaction` records two entries of one write group — the
 committed row's insert and the pending row's delete — applied in that group's
 transaction, so the move is atomic across crashes.
+
+`pieces` holds blob pieces outside the block store's write group: each put is
+one autocommit `INSERT … ON CONFLICT(id) DO NOTHING`, a zero-length piece is
+written as `zeroblob(0)`, and `list()` reads the ids in keyset pages of 1000. A
+database created before the table existed gains it, empty, on its next open.
 
 `getApproximateBytesUsed()` returns `page_count × page_size` from PRAGMAs.
 This is the SQLite database-file footprint; it is **not** a per-block figure.
@@ -170,7 +181,8 @@ too. `syncSqliteDb(db)` is a synced transaction that bumps the one-row
 commit; `SqliteKVStore.flush()` runs it when the store wrote since its last
 flush, and `loadOrCreateNSPeerKey` runs it after writing a newly generated key,
 so a power cut right after first start cannot give the node a different
-identity next time.
+identity next time. `SqlitePieceStore` reports `'power-loss'` too: it writes by
+autocommit statements and flushes as `SqliteKVStore` does.
 
 A failed commit or sync latches the storage: every later write, flush and
 `whenDurable()` rejects with `StoreFailedError` until the app reopens the store
@@ -223,4 +235,7 @@ NativeScript 8.9, so the plugin's JNI bridge.
 
 Not run by anyone yet: a long session with real network traffic; iOS; the
 Node-API binding NativeScript 9.1+ selects; a power cut (a force-stop kills the
-process only).
+process only); `SqlitePieceStore` at all — a 1 MiB piece read back over the JNI
+bridge, a zero-length piece read back (the `NOTE:` in `get`), and how the plugin
+binds a typed array that is a view into a larger buffer (`put` copies such a
+view first).

@@ -22,6 +22,13 @@ import { bumpDurabilityMark } from './sqlite-sync.js';
 
 const log = createLogger('storage:sqlite');
 
+/**
+ * The store-identity scheme of every store over one SQLite handle. `SqliteBatchBackend` and
+ * `SqlitePieceStore` both report `identityForHandle(SQLITE_HANDLE_SCHEME, db)`, so over one handle the
+ * block store's byte count (the whole database file) is known to include the pieces.
+ */
+export const SQLITE_HANDLE_SCHEME = 'sqlite-handle';
+
 type Store = StoreKey['store'];
 
 /** How a logical store is laid out: its table, with these key columns and this value column. */
@@ -151,7 +158,7 @@ export class SqliteBatchBackend implements BatchBackend {
 	private fault: { cause: unknown } | undefined;
 
 	constructor(private readonly db: SqliteDb, options: SqliteBatchBackendOptions = {}) {
-		this.identity = identityForHandle('sqlite-handle', db);
+		this.identity = identityForHandle(SQLITE_HANDLE_SCHEME, db);
 		this.reads = Object.fromEntries(STORES.map(store => [store, db.prepare(GET_SQL[store])])) as Record<Store, SqliteStatement>;
 		this.stmts = {
 			listRevisions: db.prepare('SELECT rev, action_id FROM revisions WHERE block_id = ? AND rev BETWEEN ? AND ? ORDER BY rev ASC'),
