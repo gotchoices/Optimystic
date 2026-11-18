@@ -78,10 +78,11 @@ export class IndexedDBPieceStore implements IPieceStore {
 		await Promise.all([write(), tx.done]);
 	}
 
-	/**
-	 * At the browser's default durability: a lost delete leaves an orphan piece the next sweep
-	 * removes, which is not worth a disk sync per deleted piece.
-	 */
+	// NOTE: accepted tradeoff — a delete runs at the browser's default durability, and `flush` does not
+	// make it durable, short of what `IPieceStore.flush` promises for deletes (a later strict
+	// transaction does not cover an earlier relaxed one). A lost delete leaves an orphan piece the next
+	// sweep removes, and no caller flushes a delete today (the sweep's deletes are unflushed by design),
+	// so a disk sync per deleted piece buys nothing; revisit if a caller ever needs a delete durable.
 	async delete(id: PieceId): Promise<void> {
 		await this.db.delete('pieces', id);
 	}
