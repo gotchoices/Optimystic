@@ -9,7 +9,7 @@ Android, native — not React Native). Provides:
   It is the shared `KvRawStorage` kernel over a `WriteGroupDriver` over
   `SqliteBatchBackend`: the kernel owns all JSON serialization, the driver
   holds each group of writes in memory until it is flushed, and the backend
-  applies the group as one SQLite transaction over the six tables.
+  applies the group as one SQLite transaction over the seven tables.
 - **`SqliteKVStore`** — implements `IKVStore` for the persistent transaction
   state used to recover crashed two-phase commits.
 - **`loadOrCreateNSPeerKey`** — generates an Ed25519 libp2p private key on
@@ -98,8 +98,8 @@ still has armed would fire on a closed connection.
 
 The package opens a single SQLite database (`optimystic.sqlite` by default; a
 bare name goes in the app's databases folder on Android and its documents folder
-on iOS, and a full path is used as given) with eight tables. On Android the
-engine is the SQLite the plugin bundles; on iOS it is the process's. The six
+on iOS, and a full path is used as given) with nine tables. On Android the
+engine is the SQLite the plugin bundles; on iOS it is the process's. The seven
 block-storage tables keep their original columns and keys, but their value
 columns are **BLOB**: `SqliteBatchBackend` binds/reads the kernel's raw
 `Uint8Array` bytes and the shared `KvRawStorage` kernel owns the JSON/UTF-8
@@ -115,6 +115,7 @@ into; keys stay TEXT/INTEGER.
 | `pending`         | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
 | `transactions`    | `(block_id, action_id)`          | `BLOB`       | `Transform`            |
 | `proofs`          | `(block_id, rev)`                | `BLOB`       | `BlockCommitProof`     |
+| `commit_proofs`   | `message_hash`                   | `BLOB`       | `BlockCommitProof`     |
 | `materialized`    | `(block_id, action_id)`          | `BLOB`       | `IBlock`               |
 | `kv`              | `key`                            | `s_val` (TEXT) or `b_val` (BLOB) | — (not kernel-backed) |
 | `durability_mark` | `id` (always 1)                  | `n` (INTEGER), a counter nothing reads | — (the row a sync commits when it has nothing else to write) |

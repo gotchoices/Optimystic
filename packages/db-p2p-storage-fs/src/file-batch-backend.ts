@@ -90,8 +90,8 @@ const ROOT_NON_BLOCK_DIRS: ReadonlySet<string> = new Set([...ROOT_KV_NAMESPACES,
 /**
  * `commit-proofs/<messageHash>.json`. A base58 hash, which every message hash is, is a file name
  * unchanged. Any other key has each character outside `[A-Za-z0-9_-]` percent-encoded as its UTF-8
- * bytes, `%` included, so no key can name a path outside the store and no two keys share a file
- * name. On a case-insensitive filesystem two hashes differing only in letter case share a file,
+ * bytes, `%` included, so no key can name a path outside the store and no two well-formed keys share
+ * a file name (a lone surrogate, which no hash holds, encodes as U+FFFD does). On a case-insensitive filesystem two hashes differing only in letter case share a file,
  * which needs a collision of SHA-256 outputs on about 200 bits, and is answered safely anyway: a
  * reader checks that the proof's message names the block it serves (`servableProof`).
  */

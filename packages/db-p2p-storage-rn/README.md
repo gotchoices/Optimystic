@@ -87,7 +87,7 @@ Everything lives in one LevelDB database (`optimystic` by default), one
 ordered byte keyspace partitioned by a leading tag byte (`src/keys.ts`).
 `LevelDBRawStorage` is the shared `KvRawStorage` kernel over a read cache
 (`CachedStoreDriver`) over a `WriteGroupDriver` over a `JournalBatchBackend`
-over a `LevelDBJournalStore`: the kernel owns all JSON serialization, so the six
+over a `LevelDBJournalStore`: the kernel owns all JSON serialization, so the seven
 block-storage stores hold opaque kernel-encoded values, written as UTF-8 bytes
 and read back as text (see *Reads decode text in native code* below). The keys,
 the bytes, and the logical types the kernel decodes them back into are
@@ -104,6 +104,7 @@ applies nothing.
 | `0x05` | `materialized` | `blockId`, `actionId` | `IBlock` |
 | `0x06` | `proofs` | `blockId`, rev (8 bytes big-endian) | `BlockCommitProof` |
 | `0x07` | `journal` | the record's sequence (8 bytes big-endian), or nothing for the applied-through mark | a journal record as bytes, or the number of the last record applied — owned by `LevelDBJournalStore` |
+| `0x08` | `commitProofs` | the proof's `messageHash`, UTF-8, with no `blockId` envelope | `BlockCommitProof` |
 | `0x10` | `kv` | the key, UTF-8 | a string (not kernel-backed) |
 | `0x20` | `identity` | the key name, UTF-8 | raw protobuf bytes of the private key |
 

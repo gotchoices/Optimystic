@@ -43,7 +43,7 @@ methods are the one place every value write funnels through — the
 
 > every value write funnels through the driver put/delete calls in the methods
 > below (saveMetadata / saveRevision / save*Transaction / saveBlockProof /
-> saveMaterializedBlock). This is the single choke point where an incremental
+> saveCommitProof / saveMaterializedBlock). This is the single choke point where an incremental
 > byte counter would hook in…
 
 **Scope:** this holds only for writes issued *in this process*. It is not a

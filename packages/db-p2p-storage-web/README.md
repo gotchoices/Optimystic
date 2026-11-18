@@ -73,10 +73,10 @@ a closed handle.
 ## Persistence semantics
 
 The package opens a single IndexedDB database (`optimystic` by default) with
-eight object stores. `IndexedDBRawStorage` is the shared `KvRawStorage` kernel
+nine object stores. `IndexedDBRawStorage` is the shared `KvRawStorage` kernel
 over a `WriteGroupDriver` over a `JournalBatchBackend` over an
 `IndexedDBJournalStore`: the kernel owns all JSON/UTF-8 serialization, so the
-six block-storage stores hold opaque kernel-encoded `Uint8Array` bytes rather
+seven block-storage stores hold opaque kernel-encoded `Uint8Array` bytes rather
 than live objects. The keys and the logical types the kernel decodes them back
 into are unchanged from earlier builds, so data written by one reads unchanged:
 
@@ -87,6 +87,7 @@ into are unchanged from earlier builds, so data written by one reads unchanged:
 | `pending`      | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
 | `transactions` | `[blockId, actionId]`| `Uint8Array` | `Transform`            |
 | `proofs`       | `[blockId, rev]`     | `Uint8Array` | `BlockCommitProof`     |
+| `commitProofs` | `messageHash`        | `Uint8Array` | `BlockCommitProof`     |
 | `materialized` | `[blockId, actionId]`| `Uint8Array` | `IBlock`               |
 | `journal`      | `seq` (a number), or `'applied-through'` | a `JournalRecord` by structured clone, or the number of the last record applied | — (owned by `IndexedDBJournalStore`) |
 | `kv`           | `key`                | `string` or `Uint8Array` | — (not kernel-backed) |
