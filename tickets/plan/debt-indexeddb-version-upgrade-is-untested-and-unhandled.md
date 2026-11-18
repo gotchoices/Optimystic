@@ -57,3 +57,7 @@ database exists in the wild. They become real at the first release.
 ## Arm: version 4 (commit proofs)
 
 `a-store-keeps-commit-proofs-by-message-hash` raises the version to 4 for a `commitProofs` object store; an existing version 3 database must gain it with every other record intact.
+
+## Arm: version 5 (blob pieces)
+
+`feat-blob-pieces-in-browser-indexeddb` raises the version to 5 for a `pieces` object store (blob pieces, written only by `IndexedDBPieceStore`), under the same `objectStoreNames.contains` guards. The upgrade test should open at an older version, write, reopen at the current version, and assert every store added since exists (`pieces` included) and the old value survived. The blocked-upgrade hang applies to this bump as to the others.
