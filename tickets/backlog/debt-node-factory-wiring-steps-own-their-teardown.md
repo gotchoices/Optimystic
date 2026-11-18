@@ -8,6 +8,8 @@ tradeoffs: This is a large, purely structural change to the single most load-bea
 
 # Node factory: wiring steps should own their own teardown
 
+**Update (review of `client-only-node`):** the client-node work split the factory once along the serving role: everything a client skips moved verbatim into `wireServingRole` (about 780 lines, still one function with its hand-written stop wrappers), and the pre-start storage half into `prepareServingStore`. `createLibp2pNodeBase` is now about 920 lines of a 2931-line file (measured with `wc -l packages/db-p2p/src/libp2p-node-base.ts` and `grep -n "^async function wireServingRole\|^export async function createLibp2pNodeBase"`). The line counts below predate that split; the problem they describe is unchanged in both functions.
+
 ## The shape of the problem
 
 `createLibp2pNodeBase` (`packages/db-p2p/src/libp2p-node-base.ts`) is **1283 lines in one function**

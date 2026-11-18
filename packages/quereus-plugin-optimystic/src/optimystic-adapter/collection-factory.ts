@@ -743,7 +743,8 @@ export class CollectionFactory {
    * `network` transactor: its `StorageRepo`, whose under-replication ledger records the copies a
    * write acknowledged below full replication still owes. `undefined` for every other transactor —
    * `local`, `test` and `mesh-test` keep no ledger and run no drain, so nothing would ever fire —
-   * and for an injected node built without a store.
+   * and for an injected node built without a store, a client (`servesBlocks: false`) among them: no
+   * ledger entry is ever recorded on a client, so a commit it writes is never followed to full here.
    */
   getBlockDurabilityNotifier(options: ParsedOptimysticOptions): IBlockDurabilityNotifier | undefined {
     if (options.transactor !== 'network') {

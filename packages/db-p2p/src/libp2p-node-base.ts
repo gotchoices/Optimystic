@@ -1362,6 +1362,9 @@ export async function createLibp2pNodeBase(
 				return svc;
 			},
 			fret: (components: any) => {
+				// NOTE: a client (`servesBlocks: false`) given bootstrap peers defaults to 'core' like any node, and so
+				// keeps core's larger neighbour sets and forwarding share. Fine while clients are a minority of the
+				// ring; if FRET maintenance shows up as a cost on client phones, default a client to 'edge' here.
 				const svcFactory = fretService({
 					k: 15,
 					m: 8,

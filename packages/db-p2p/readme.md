@@ -479,6 +479,7 @@ const transactor = new NetworkTransactor({
   timeoutMs: client.linkDeadlines.transactionTimeoutMs,
   abortOrCancelTimeoutMs: Math.max(5_000, client.linkDeadlines.dialTimeoutMs),
   dialTimeoutMs: client.linkDeadlines.dialTimeoutMs,
+  retryBackoffBaseMs: client.linkDeadlines.retryBackoffBaseMs,
   keyNetwork: client.keyNetwork,
   getRepo: (peerId) => RepoClient.create(peerId, client.keyNetwork, '/optimystic/my-net'),
   clock: client.hlcClock,
