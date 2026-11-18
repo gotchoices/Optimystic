@@ -24,19 +24,21 @@ const log = createLogger('storage:sqlite');
 
 type Store = StoreKey['store'];
 
-/** How a logical store is laid out: its table is named after it, with these key columns and this value column. */
+/** How a logical store is laid out: its table, with these key columns and this value column. */
 interface TableLayout {
+	readonly table: string;
 	readonly keyColumns: readonly string[];
 	readonly valueColumn: string;
 }
 
 const LAYOUTS: Record<Store, TableLayout> = {
-	metadata: { keyColumns: ['block_id'], valueColumn: 'value' },
-	revisions: { keyColumns: ['block_id', 'rev'], valueColumn: 'action_id' },
-	proofs: { keyColumns: ['block_id', 'rev'], valueColumn: 'value' },
-	pending: { keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
-	transactions: { keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
-	materialized: { keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
+	metadata: { table: 'metadata', keyColumns: ['block_id'], valueColumn: 'value' },
+	revisions: { table: 'revisions', keyColumns: ['block_id', 'rev'], valueColumn: 'action_id' },
+	proofs: { table: 'proofs', keyColumns: ['block_id', 'rev'], valueColumn: 'value' },
+	commitProofs: { table: 'commit_proofs', keyColumns: ['message_hash'], valueColumn: 'value' },
+	pending: { table: 'pending', keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
+	transactions: { table: 'transactions', keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
+	materialized: { table: 'materialized', keyColumns: ['block_id', 'action_id'], valueColumn: 'value' },
 };
 
 const STORES = Object.keys(LAYOUTS) as Store[];
@@ -46,16 +48,18 @@ const whereKey = (store: Store): string => LAYOUTS[store].keyColumns.map(column 
 const sqlByStore = (build: (store: Store) => string): Record<Store, string> =>
 	Object.fromEntries(STORES.map(store => [store, build(store)])) as Record<Store, string>;
 
-const GET_SQL = sqlByStore(store => `SELECT ${LAYOUTS[store].valueColumn} FROM ${store} WHERE ${whereKey(store)}`);
+const GET_SQL = sqlByStore(store => `SELECT ${LAYOUTS[store].valueColumn} FROM ${LAYOUTS[store].table} WHERE ${whereKey(store)}`);
 const PUT_SQL = sqlByStore(store => {
 	const columns = [...LAYOUTS[store].keyColumns, LAYOUTS[store].valueColumn];
-	return `INSERT OR REPLACE INTO ${store} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`;
+	return `INSERT OR REPLACE INTO ${LAYOUTS[store].table} (${columns.join(', ')}) VALUES (${columns.map(() => '?').join(', ')})`;
 });
-const DELETE_SQL = sqlByStore(store => `DELETE FROM ${store} WHERE ${whereKey(store)}`);
+const DELETE_SQL = sqlByStore(store => `DELETE FROM ${LAYOUTS[store].table} WHERE ${whereKey(store)}`);
 
 /** The key's bind parameters, in the order of its store's key columns. */
 function keyParams(key: StoreKey): SqliteParam[] {
 	switch (key.store) {
+		case 'commitProofs':
+			return [key.messageHash];
 		case 'metadata':
 			return [key.blockId];
 		case 'revisions':
@@ -74,9 +78,9 @@ export interface SqliteBatchBackendOptions {
 }
 
 /**
- * SQLite {@link BatchBackend}: the six logical block-storage stores mapped to the six relational
- * tables (`metadata`, `revisions`, `pending`, `transactions`, `proofs`, `materialized`) with their
- * original columns and keys, every batch applied as ONE SQLite transaction. The reads are the
+ * SQLite {@link BatchBackend}: the seven logical block-storage stores mapped to the seven relational
+ * tables (`metadata`, `revisions`, `pending`, `transactions`, `proofs`, `commit_proofs`,
+ * `materialized`) with their original columns and keys, every batch applied as ONE SQLite transaction. The reads are the
  * former per-write driver's statements unchanged, so the on-disk format did not change with the
  * move to batches.
  *

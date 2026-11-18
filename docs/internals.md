@@ -1410,7 +1410,10 @@ logical store, keyed by `(blockId, rev)` — the same key shape as the revisions
 deliberately NOT the action keyspace: an action id is chosen by whoever originates a write and is
 never re-derived or format-checked by the storing node, so no reserved action-id convention could
 survive a client or peer picking that exact id. Every `RawStoreDriver` backend carries the proofs
-store natively (its own map / subdirectory / table / tag byte / object store). Proofs survive
+store natively (its own map / subdirectory / table / tag byte / object store), and beside it a
+commit proofs store keyed by the proof's `messageHash` (`RawStoreDriver.getCommitProof`), which
+can hold a proof covering many blocks once; nothing uses it yet, so today a proof is still stored
+once per block it covers (GitHub #60). Proofs survive
 `pruneMaterialization` (which trims superseded materialized copies but retains
 revision records) and live exactly as long as the revision itself; no revision-delete site exists
 today. The landing paths that skip `internalCommit` — an idempotent re-commit of the same

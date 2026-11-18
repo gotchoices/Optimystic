@@ -5,10 +5,10 @@ import type { StoredValue } from "./raw-store-codec.js";
 
 /**
  * Per-logical-store driver surface. Each backend implements the
- * six block-storage stores (metadata, revisions, pending, transactions,
- * materialized, proofs) over its native mechanism (LevelDB tag-ranges, six SQLite
- * tables, six IndexedDB object stores, six filesystem subdirectories, six
- * in-memory maps). `KvRawStorage` layers all JSON serialization and call
+ * seven block-storage stores (metadata, revisions, pending, transactions,
+ * materialized, proofs, commit proofs) over its native mechanism (LevelDB tag-ranges,
+ * seven SQLite tables, seven IndexedDB object stores, filesystem subdirectories,
+ * seven in-memory maps). `KvRawStorage` layers all JSON serialization and call
  * orchestration on top — drivers never (de)serialize values and never see the
  * `BlockMetadata`/`Transform`/`IBlock` types. Drivers speak only
  * `V`/`BlockId`/`ActionId`/`number`.
@@ -84,6 +84,19 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	 */
 	getProof(blockId: BlockId, rev: number): Promise<V | undefined>;
 	putProof(blockId: BlockId, rev: number, value: V): Promise<void>;
+
+	/**
+	 * commit proofs store — one encoded `BlockCommitProof` per consensus message, keyed by the
+	 * proof's `messageHash` (the base58btc hash of the consensus message, `computeClusterMessageHash`
+	 * in `@optimystic/db-core`), so a proof covering many blocks is stored once rather than once per
+	 * block. The key is a hash the caller takes from the proof itself, which is trustworthy only
+	 * because every proof that reaches storage was built or verified locally.
+	 *
+	 * Deliberately NO delete, for the reason the proofs store has none: no revision-delete site
+	 * exists, so nothing could know when the last revision naming a proof is gone.
+	 */
+	getCommitProof(messageHash: string): Promise<V | undefined>;
+	putCommitProof(messageHash: string, value: V): Promise<void>;
 
 	// materialized store — keyed by (blockId, actionId)
 	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<V | undefined>;

@@ -120,6 +120,12 @@ class LaggingRawStorage implements RawStorage {
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
 		if (!this.drop(blockId)) await this.inner.saveBlockProof(blockId, rev, proof);
 	}
+	getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined> {
+		return this.inner.getCommitProof(messageHash);
+	}
+	saveCommitProof(messageHash: string, proof: BlockCommitProof): Promise<void> {
+		return this.inner.saveCommitProof(messageHash, proof);
+	}
 	async getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined> {
 		return this.hidden.has(blockId) ? undefined : this.inner.getMaterializedBlock(blockId, actionId);
 	}

@@ -35,6 +35,14 @@ export interface IRawStorage {
 	getBlockProof(blockId: BlockId, rev: number): Promise<BlockCommitProof | undefined>;
 	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void>;
 
+	/**
+	 * The commit proof stored under a consensus message's hash (`BlockCommitProof.messageHash`), one
+	 * per message however many blocks it covers. Raw access only: what to store here and when to read
+	 * it is the caller's, and no delete exists, for the reason {@link getBlockProof}'s store has none.
+	 */
+	getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined>;
+	saveCommitProof(messageHash: string, proof: BlockCommitProof): Promise<void>;
+
 	// Block materialization operations
 	getMaterializedBlock(blockId: BlockId, actionId: ActionId): Promise<IBlock | undefined>;
 	saveMaterializedBlock(blockId: BlockId, actionId: ActionId, block?: IBlock): Promise<void>;

@@ -25,6 +25,7 @@ import {
 	actionIdFromKey,
 	blockEnvelopeRange,
 	blockIdFromMetadataKey,
+	commitProofKey,
 	decodeJournalMark,
 	encodeJournalMark,
 	isJournalMarkKey,
@@ -54,6 +55,8 @@ function keyBytes(key: StoreKey): Uint8Array {
 			return revisionKey(key.blockId, key.rev);
 		case 'proofs':
 			return proofKey(key.blockId, key.rev);
+		case 'commitProofs':
+			return commitProofKey(key.messageHash);
 		case 'pending':
 			return pendingKey(key.blockId, key.actionId);
 		case 'transactions':
@@ -64,7 +67,7 @@ function keyBytes(key: StoreKey): Uint8Array {
 }
 
 /**
- * LevelDB {@link JournalStore}: the six logical block-storage stores mapped into a single ordered
+ * LevelDB {@link JournalStore}: the seven logical block-storage stores mapped into a single ordered
  * byte keyspace, partitioned by a leading tag byte (see `./keys.ts`), read exactly as the per-write
  * driver before it read them, so data an earlier build wrote reads unchanged; and the journal under
  * its own tag byte, which `JournalBatchBackend` drives.

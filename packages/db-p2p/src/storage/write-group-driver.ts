@@ -151,6 +151,16 @@ export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements Raw
 		this.group.put({ store: 'proofs', blockId, rev }, value);
 	}
 
+	// --- commit proofs ---
+
+	getCommitProof(messageHash: string): Promise<V | undefined> {
+		return this.read({ store: 'commitProofs', messageHash });
+	}
+
+	async putCommitProof(messageHash: string, value: V): Promise<void> {
+		this.group.put({ store: 'commitProofs', messageHash }, value);
+	}
+
 	// --- materialized ---
 
 	getMaterialized(blockId: BlockId, actionId: ActionId): Promise<V | undefined> {

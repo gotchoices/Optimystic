@@ -152,7 +152,7 @@ describe('IndexedDB sync by the window', () => {
 	const B = 'block-b' as BlockId;
 	const C = 'block-c' as BlockId;
 	const metaFor = (rev: number): BlockMetadata => ({ ranges: [[1, rev]], latest: { rev, actionId: `tx-${rev}` as ActionId } });
-	const DATA_AND_JOURNAL = ['journal', 'materialized', 'metadata', 'pending', 'proofs', 'revisions', 'transactions'];
+	const DATA_AND_JOURNAL = ['commitProofs', 'journal', 'materialized', 'metadata', 'pending', 'proofs', 'revisions', 'transactions'];
 	/** A write transaction as `[the stores it covered, the durability it asked for]`. */
 	const shape = (call: TransactionCall): [readonly string[], string | undefined] => [call.stores, call.durability];
 	const RELAXED_APPEND: [readonly string[], string | undefined] = [['journal'], 'relaxed'];

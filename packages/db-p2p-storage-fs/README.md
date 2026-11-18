@@ -4,8 +4,8 @@ Node.js filesystem storage backend for Optimystic peers. Provides:
 
 - **`FileRawStorage`** — implements `IRawStorage` so a Node peer persists block
   metadata, revisions, pending transactions, committed transactions, commit
-  proofs, and
-  materialized blocks durably across restarts.
+  proofs (per revision, and once per consensus message), and materialized
+  blocks durably across restarts.
 - **`FileKVStore`** — implements `IKVStore` for node-local state that must
   survive a restart: the under-replication ledger (which blocks the node
   acknowledged before every cohort member held them), and the persistent
@@ -102,6 +102,8 @@ high-water mark, are then lost on restart.
   <seg>/<seg>/               — a block id containing "/" (e.g. `default/app/Ledger`) nests one directory per segment
     meta.json                — and holds the same files as above; it can contain another block's directory
     index/<seg>/meta.json    —   (e.g. `default/app/Ledger/index/LedgerLatest`)
+  commit-proofs/
+    <messageHash>.json       — BlockCommitProof stored once under its consensus message's base58 hash
   <key-segment>/
     <key-segment>.json       — FileKVStore value; key "/" separators become subdirectories
   write-ahead.log            — groups written since the last checkpoint

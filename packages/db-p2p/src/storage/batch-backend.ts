@@ -5,14 +5,16 @@ import type { WriteGroupEntry, WriteGroupSink } from './write-group.js';
 import type { StoredValue } from './raw-store-codec.js';
 
 /**
- * One record of the six logical block-storage stores, addressed the way `RawStoreDriver`
+ * One record of the seven logical block-storage stores, addressed the way `RawStoreDriver`
  * addresses it: the metadata store by block, the revisions and proofs stores by block and
- * revision, the pending, transactions and materialized stores by block and action.
+ * revision, the pending, transactions and materialized stores by block and action, and the commit
+ * proofs store by the proof's message hash alone — the one store not scoped to a block.
  */
 export type StoreKey =
 	| { store: 'metadata'; blockId: BlockId }
 	| { store: 'revisions' | 'proofs'; blockId: BlockId; rev: number }
-	| { store: 'pending' | 'transactions' | 'materialized'; blockId: BlockId; actionId: ActionId };
+	| { store: 'pending' | 'transactions' | 'materialized'; blockId: BlockId; actionId: ActionId }
+	| { store: 'commitProofs'; messageHash: string };
 
 /** One write of a batch, its value always bytes whatever the driver above holds. `value` absent means delete. */
 export type BatchEntry = WriteGroupEntry<StoreKey>;
@@ -61,12 +63,14 @@ export interface BatchBackend<R extends StoredValue = Uint8Array> extends WriteG
  * One string per {@link StoreKey}, equal exactly when the keys name the same record. The driver's
  * overlay is keyed by it.
  *
- * The block id is length-prefixed so that no block id can run into the part after it: a header
- * block's id is its collection's name, and an action id is chosen by whoever originates a write,
- * so neither is free of any particular character. The store names are fixed literals with no
- * `/`, which is all the rest of the shape relies on.
+ * Every string starts with its store's name and a `/`; the store names are fixed literals with no
+ * `/`, so no two stores' strings can meet. Within a store, the block id is length-prefixed so that
+ * no block id can run into the part after it: a header block's id is its collection's name, and an
+ * action id is chosen by whoever originates a write, so neither is free of any particular
+ * character. A commit proof's message hash is the whole rest of its string, so it needs no prefix.
  */
 export function canonicalStoreKey(key: StoreKey): string {
+	if (key.store === 'commitProofs') return `commitProofs/${key.messageHash}`;
 	const block = `${key.blockId.length}:${key.blockId}`;
 	switch (key.store) {
 		case 'metadata':

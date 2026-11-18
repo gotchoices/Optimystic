@@ -2,7 +2,7 @@ import type { BlockId, ActionId } from '@optimystic/db-core';
 import { canonicalStoreKey, type BatchEntry, type StoreKey } from '../storage/batch-backend.js';
 
 /**
- * The six block-storage stores as one map keyed by `canonicalStoreKey`: the applied state the two
+ * The seven block-storage stores as one map keyed by `canonicalStoreKey`: the applied state the two
  * in-memory test doubles (`MemoryBatchBackend`, `MemoryJournalStore`) share, with the reads a
  * `BatchBackend` answers over it. Synchronous; the doubles wrap each call in their own promises.
  * Stores byte references directly, as `MemoryStoreDriver` does: the kernel above never mutates them.

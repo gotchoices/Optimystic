@@ -178,8 +178,8 @@ function idsContent(ids: Set<ActionId>): number {
  * NOTE: every cache hit still pays one JSON.parse in the kernel; if decode ever shows up hot
  * on large materialized blocks, cache decoded objects plus an explicit clone instead.
  *
- * **Proofs are a passthrough, not a cached store.** The proofs store is read only on repair
- * and archive-serving paths; see the NOTE at {@link getProof}.
+ * **Proofs are a passthrough, not a cached store.** The proofs and commit proofs stores are read
+ * only on repair and archive-serving paths; see the NOTE at {@link getProof}.
  *
  * **Do not wrap `MemoryStoreDriver`.** The memory driver already holds the same byte
  * references in maps; wrapping it duplicates every map entry (the bytes themselves are
@@ -819,6 +819,16 @@ export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements Ra
 
 	async putProof(blockId: BlockId, rev: number, value: V): Promise<void> {
 		await this.inner.putProof(blockId, rev, value);
+	}
+
+	// Commit proofs by message hash: a passthrough under the same NOTE as the proofs store above.
+
+	async getCommitProof(messageHash: string): Promise<V | undefined> {
+		return this.inner.getCommitProof(messageHash);
+	}
+
+	async putCommitProof(messageHash: string, value: V): Promise<void> {
+		await this.inner.putCommitProof(messageHash, value);
 	}
 
 	// --- materialized ---

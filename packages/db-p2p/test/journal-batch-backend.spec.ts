@@ -205,13 +205,14 @@ describe('JournalBatchBackend', () => {
 });
 
 describe('journal record codec', () => {
-	it('round-trips a record holding puts and a delete, with a seq above 32 bits', () => {
+	it('round-trips a record holding puts and a delete of every key shape, with a seq above 32 bits', () => {
 		const record: JournalRecord = {
 			seq: 2 ** 40 + 7,
 			entries: [
 				{ key: { store: 'metadata', blockId: block('b') }, value: bytes('meta') },
 				{ key: { store: 'revisions', blockId: block('b'), rev: 3 }, value: bytes('tx:a') },
 				{ key: { store: 'pending', blockId: block('b'), actionId: 'tx:a' as ActionId } },
+				{ key: { store: 'commitProofs', messageHash: 'zHash' }, value: bytes('proof') },
 			],
 		};
 		const decoded = decodeJournalRecord(encodeJournalRecord(record));

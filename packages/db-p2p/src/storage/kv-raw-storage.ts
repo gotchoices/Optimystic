@@ -10,7 +10,7 @@ import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecAr
 /**
  * Shared ordered-KV storage kernel. Implements the full {@link IRawStorage}
  * surface over a {@link RawStoreDriver}, owning all value (de)serialization and
- * call orchestration so each backend only has to expose its six logical stores
+ * call orchestration so each backend only has to expose its seven logical stores
  * as maps of stored values over its native mechanism.
  *
  * A store's values are `V`, the driver's representation, and every encode and decode goes through
@@ -22,8 +22,8 @@ import { resolveValueCodec, type StoredValue, type ValueCodec, type ValueCodecAr
  * codec for the value types, `listRevisions`' lo/hi/reverse bound computation,
  * `saveMaterializedBlock`'s put-or-delete branch, and the passthroughs. Key
  * layout / storage topology stays in the driver, because the backends do NOT
- * share one — LevelDB is a single ordered byte keyspace, SQLite six relational
- * tables, IndexedDB six object stores, the filesystem a directory tree.
+ * share one — LevelDB is a single ordered byte keyspace, SQLite seven relational
+ * tables, IndexedDB seven object stores, the filesystem a directory tree.
  */
 export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawStorage {
 	/**
@@ -78,7 +78,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 
 	// NOTE: every value write funnels through the driver put/delete calls in the
 	// methods below (saveMetadata / saveRevision / save*Transaction /
-	// saveBlockProof / saveMaterializedBlock). This is the single choke point where an incremental
+	// saveBlockProof / saveCommitProof / saveMaterializedBlock). This is the single choke point where an incremental
 	// byte counter would hook in, replacing the per-driver full-scan
 	// getApproximateBytesUsed. The chosen capacity-estimate mechanism is instead a
 	// short-TTL cache over the full scan in StorageMonitor (see storage-monitor.ts
@@ -159,6 +159,17 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
 		await this.driver.putProof(blockId, rev, this.codec.encodeJson(proof));
+	}
+
+	// --- Commit proofs by message hash (see RawStoreDriver.getCommitProof) ---
+
+	async getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined> {
+		const value = await this.driver.getCommitProof(messageHash);
+		return value === undefined ? undefined : this.codec.decodeJson<BlockCommitProof>(value);
+	}
+
+	async saveCommitProof(messageHash: string, proof: BlockCommitProof): Promise<void> {
+		await this.driver.putCommitProof(messageHash, this.codec.encodeJson(proof));
 	}
 
 	// --- Materialized blocks ---

@@ -72,6 +72,8 @@ class GatedStoreDriver implements RawStoreDriver {
 	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putTransaction(blockId, actionId, value); }
 	getProof(blockId: BlockId, rev: number) { return this.inner.getProof(blockId, rev); }
 	putProof(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putProof(blockId, rev, value); }
+	getCommitProof(messageHash: string) { return this.inner.getCommitProof(messageHash); }
+	putCommitProof(messageHash: string, value: Uint8Array) { return this.inner.putCommitProof(messageHash, value); }
 	getMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.getMaterialized(blockId, actionId); }
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }
@@ -121,6 +123,8 @@ class FaultyStoreDriver implements RawStoreDriver {
 	putTransaction(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putTransaction(blockId, actionId, value); }
 	getProof(blockId: BlockId, rev: number) { return this.inner.getProof(blockId, rev); }
 	putProof(blockId: BlockId, rev: number, value: Uint8Array) { return this.inner.putProof(blockId, rev, value); }
+	getCommitProof(messageHash: string) { return this.inner.getCommitProof(messageHash); }
+	putCommitProof(messageHash: string, value: Uint8Array) { return this.inner.putCommitProof(messageHash, value); }
 	getMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.getMaterialized(blockId, actionId); }
 	putMaterialized(blockId: BlockId, actionId: ActionId, value: Uint8Array) { return this.inner.putMaterialized(blockId, actionId, value); }
 	deleteMaterialized(blockId: BlockId, actionId: ActionId) { return this.inner.deleteMaterialized(blockId, actionId); }

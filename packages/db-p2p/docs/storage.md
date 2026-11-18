@@ -67,6 +67,9 @@ whole blob and over every record filed under the block, not over `latest` alone:
 > latch — the key `Block.write:<blockId>`
 > (`packages/db-p2p/src/storage/block-latch.ts`, `blockWriteLatchKey`).
 
+The commit proofs store keyed by message hash (*Shared KV Kernel*, under Core Components) is not filed under any one block, and nothing
+writes it yet; the change that gives it a writer states which latch that writer holds.
+
 That is ONE key per block, and it is the only one. `StorageRepo.commit` is not
 the only writer: `pend` and `cancel`, the read-driven promotion in
 `StorageRepo.get`, coverage restores (`restoreRevision`), replica persistence
@@ -266,7 +269,7 @@ store once its LevelDB binding can sync a batch (it cannot today, so there every
 | `FileBatchBackend` (`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | an append to the write-ahead log; a strict flush syncs it before resolving, a relaxed one resolves at once (or, while a checkpoint is behind, once its share of the checkpoint's syncs is done) and the log syncs by the earliest deadline among the batches waiting; the tree is written after the sync | honoured: one sync covers every batch appended since the last, made by the earliest deadline, or sooner by a strict flush, a checkpoint, or a commit that finds a deadline already passed | `'power-loss'` |
 | `JournalBatchBackend` (`packages/db-p2p/src/storage/journal-batch-backend.ts`), under `WriteGroupDriver`, over a `JournalStore` the engine implements | nothing: it is recorded in memory and served from there | over a store that can sync: a strict flush is one synced apply of every journal record held plus the group itself; a relaxed one appends the group as one unsynced journal record and resolves, and the held records are applied in one synced apply by the earliest deadline among them. Over a store that cannot sync: one atomic apply per group, never journaled | honoured over a store that can sync: one apply covers every record appended since the last, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed; ignored over one that cannot | the store's: `'power-loss'` when it can sync an apply, else what the engine gives |
 | `LevelDBJournalStore` (`packages/db-p2p-storage-rn/src/leveldb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the handle can sync a batch (`canSync` on the package's `LevelDBLike`, which `classic-level` reports and `rn-leveldb` cannot yet): as the journal backend's row, an append being one unsynced LevelDB batch putting the record under the journal's tag byte and an apply one batch over the data tags and the journal written with LevelDB's `sync` option. Where it cannot: one unsynced batch per group, never journaled | honoured where the handle can sync, as the journal backend's row; ignored where it cannot | `'power-loss'` where the handle can sync, else `'process-crash'`, which `rn-leveldb` is today |
-| `IndexedDBJournalStore` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the browser honours `durability: 'strict'` (every current release): as the journal backend's row, an append being one relaxed `readwrite` transaction on the `journal` object store and an apply one strict transaction over the six data stores and the journal, which completes only once the browser has put it on the disk. Where it does not: one relaxed transaction per group, never journaled | honoured where the browser honours strict transactions, as the journal backend's row; ignored where it does not | `'power-loss'` where the browser honours strict transactions, else `'process-crash'` |
+| `IndexedDBJournalStore` (`packages/db-p2p-storage-web/src/indexeddb-storage.ts`), under `JournalBatchBackend` under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | where the browser honours `durability: 'strict'` (every current release): as the journal backend's row, an append being one relaxed `readwrite` transaction on the `journal` object store and an apply one strict transaction over the seven data stores and the journal, which completes only once the browser has put it on the disk. Where it does not: one relaxed transaction per group, never journaled | honoured where the browser honours strict transactions, as the journal backend's row; ignored where it does not | `'power-loss'` where the browser honours strict transactions, else `'process-crash'` |
 | `SqliteBatchBackend` (`packages/db-p2p-storage-ns/src/sqlite-storage.ts`), under `WriteGroupDriver` | nothing: it is recorded in memory and served from there | one SQLite transaction applying the batch, committed in write-ahead-log mode (`applySchema` in `packages/db-p2p-storage-ns/src/db.ts`); a strict flush commits it under `synchronous = FULL`, which syncs the log before the flush resolves, a relaxed one under `NORMAL`, and the log syncs by the earliest deadline among the batches waiting | honoured: one `FULL` commit — a strict batch's own, or the one-row commit the timer makes — covers every batch committed since the last sync, made by the earliest deadline, or sooner by a strict flush or a commit that finds a deadline already passed | `'power-loss'` |
 
 The wrappers — `CachedStoreDriver`, `RawStorageDriverAdapter`, and `KvRawStorage` with every
@@ -279,7 +282,7 @@ write-through and holds no dirty state, so flushing it is flushing the driver un
 (`packages/db-p2p/src/storage/batch-backend.ts`): a backend with reads, listings and one write,
 `commit`, which applies a whole batch atomically and as durably as its `durability` says. Over
 this driver every write of every store — metadata, revisions, pending, transactions, proofs,
-materialized, and the two entries a promote records — resolves at once, recorded in an
+commit proofs, materialized, and the two entries a promote records — resolves at once, recorded in an
 in-memory overlay that point reads consult first and listings merge over the backend's rows.
 `flush()` seals the writes recorded so far into one batch and hands it to the backend's
 `commit`, which resolves once the batch is applied and survives a crash of this process and
@@ -406,7 +409,7 @@ one atomic unsynced write of the group as a journal record numbered by a sequenc
 applied to the stores reads come from; `applyJournal`, one atomic synced write that applies, in
 order, every record not yet applied — and, for a strict group, the group itself — sets the
 applied-through mark to the last of them, and deletes those records; and `readJournal`. The journal
-is a keyspace of the engine's own (an IndexedDB object store, a LevelDB tag byte) that the six
+is a keyspace of the engine's own (an IndexedDB object store, a LevelDB tag byte) that the seven
 block-storage stores never touch. When a group is applied is `SyncDeadlines`'s rules, the same as the
 file log's: a strict group, or one that finds its own or a held deadline already passed, is applied
 at once together with everything held; a relaxed one is appended and held with its deadline, counted
@@ -433,7 +436,7 @@ the sequence, then each entry's key as JSON, a put-or-delete flag and the value 
 cannot decode a record leaves it out of `readJournal`, which recovery treats as a gap. The browser
 store is `IndexedDBJournalStore` in `packages/db-p2p-storage-web/src/indexeddb-storage.ts`: an
 append is one relaxed `readwrite` transaction on its `journal` object store, an apply one strict
-transaction over the six data stores and the journal — strict where the browser honours
+transaction over the seven data stores and the journal — strict where the browser honours
 `durability: 'strict'`, which every current release does and which the store detects once at
 construction (`supportsStrictDurability` in `packages/db-p2p-storage-web/src/durability.ts`); where
 it does not, the store reports `'process-crash'` and the backend applies each group at once — and a
@@ -749,7 +752,7 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 
 `FileRawStorage` in `packages/db-p2p-storage-fs/src/file-storage.ts` is the shared
 `KvRawStorage` kernel over a `WriteGroupDriver` over a `FileBatchBackend`
-(`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), which lays out the six
+(`packages/db-p2p-storage-fs/src/file-batch-backend.ts`), which lays out the seven
 logical stores as filesystem subdirectories and commits each write group through
 the directory's write-ahead log (`FileWriteLog` in
 `packages/db-p2p-storage-fs/src/file-write-log.ts`). The kernel owns JSON
@@ -763,11 +766,22 @@ is under *The file backend* there. See "Shared KV Kernel" below.
 ### 5. Shared KV Kernel (`KvRawStorage` + `RawStoreDriver`)
 
 `KvRawStorage` implements the full `IRawStorage` surface once, on top of a
-`RawStoreDriver`. The driver exposes each backend's six logical stores
-(metadata, revisions, pending, transactions, materialized, proofs) as maps of stored values
-over its native mechanism; the kernel owns all value (de)serialization (JSON via
+`RawStoreDriver`. The driver exposes each backend's seven logical stores
+(metadata, revisions, pending, transactions, materialized, proofs, commit proofs) as maps of
+stored values over its native mechanism; the kernel owns all value (de)serialization (JSON via
 `raw-store-codec.ts`) and call orchestration. Backends therefore never
 (de)serialize values — they only lay out keys and move values.
+
+Six of the stores are filed under a block. The seventh, **commit proofs**
+(`RawStoreDriver.getCommitProof`, `IRawStorage.getCommitProof`), holds one `BlockCommitProof` per
+consensus message, keyed by the proof's `messageHash` alone, so a proof covering many blocks can be
+stored once rather than once per block in the proofs store. Each backend gives it a keyspace of its
+own: a map, a root `commit-proofs/` directory, a `commit_proofs` table, the LevelDB tag byte `0x08`
+with no block envelope, a `commitProofs` object store. Like the proofs store it has no delete. The
+file backend names a file after the hash, which `computeClusterMessageHash` in
+`packages/db-core/src/cluster/membership.ts` writes in base58 and so needs no encoding; it
+percent-encodes any other character, so no key names a path outside the store. Nothing reads or
+writes the store yet; the change that stores each proof once makes the kernel use it.
 
 **How a value is held in memory is a type parameter.** Values cross the driver as `V`
 (`RawStoreDriver<V>`, `StoredValue` in `packages/db-p2p/src/storage/raw-store-codec.ts`):
@@ -855,6 +869,9 @@ the driver does is under Invariant 6, *Writes that wait in memory*.
 │   └── blocks/
 │       ├── {actionId}.json # Materialized blocks
 │       └── ...
+├── commit-proofs/
+│   ├── {messageHash}.json  # Commit proof stored once under its consensus message's hash
+│   └── ...
 └── ...
 ```
 

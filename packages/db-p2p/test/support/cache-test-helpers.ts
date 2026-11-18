@@ -120,6 +120,14 @@ export class CountingStoreDriver implements RawStoreDriver {
 		this.bump('putProof');
 		return this.inner.putProof(blockId, rev, value);
 	}
+	async getCommitProof(messageHash: string): Promise<Uint8Array | undefined> {
+		this.bump('getCommitProof');
+		return this.inner.getCommitProof(messageHash);
+	}
+	async putCommitProof(messageHash: string, value: Uint8Array): Promise<void> {
+		this.bump('putCommitProof');
+		return this.inner.putCommitProof(messageHash, value);
+	}
 	async getMaterialized(blockId: BlockId, actionId: ActionId): Promise<Uint8Array | undefined> {
 		this.bump('getMaterialized');
 		return this.inner.getMaterialized(blockId, actionId);
@@ -149,9 +157,10 @@ export class CountingStoreDriver implements RawStoreDriver {
 	}
 }
 
-// `getProof`/`putProof` are deliberately absent from both lists: the proofs store is a
-// PASSTHROUGH in CachedStoreDriver (never cached), so counting it would make the cache-hit
-// ratio assertions measure a store the cache does not claim to serve.
+// The proof methods (`getProof`/`putProof`, `getCommitProof`/`putCommitProof`) are deliberately
+// absent from both lists: both proof stores are PASSTHROUGHS in CachedStoreDriver (never cached),
+// so counting them would make the cache-hit ratio assertions measure stores the cache does not
+// claim to serve.
 export const READ_METHODS = [
 	'getMetadata', 'getRevision', 'rangeRevisions', 'getPending',
 	'listPendingActionIds', 'getTransaction', 'getMaterialized'

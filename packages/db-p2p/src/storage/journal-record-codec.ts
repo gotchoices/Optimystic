@@ -130,28 +130,46 @@ class Reader {
 	}
 }
 
+/** The fields a `StoreKey` may carry, each still unchecked. */
+interface UncheckedStoreKey {
+	store?: unknown;
+	blockId?: unknown;
+	rev?: unknown;
+	actionId?: unknown;
+	messageHash?: unknown;
+}
+
 /** The JSON of a `StoreKey` back into one, keeping only the fields the key's store has. */
 function decodeStoreKey(bytes: Uint8Array): StoreKey {
 	const parsed = parseKeyJson(bytes);
-	if (typeof parsed !== 'object' || parsed === null || typeof (parsed as { blockId?: unknown }).blockId !== 'string') {
-		throw new JournalRecordDecodeError('a store key is not an object with a string blockId');
+	if (typeof parsed !== 'object' || parsed === null) {
+		throw new JournalRecordDecodeError('a store key is not an object');
 	}
-	const { store, blockId, rev, actionId } = parsed as { store?: unknown; blockId: string; rev?: unknown; actionId?: unknown };
+	const fields = parsed as UncheckedStoreKey;
+	const { store } = fields;
 	switch (store) {
+		case 'commitProofs':
+			if (typeof fields.messageHash !== 'string') throw new JournalRecordDecodeError(`a ${store} key's messageHash is not a string`);
+			return { store, messageHash: fields.messageHash };
 		case 'metadata':
-			return { store, blockId: blockId as BlockId };
+			return { store, blockId: blockIdOf(store, fields) };
 		case 'revisions':
 		case 'proofs':
-			if (!Number.isInteger(rev)) throw new JournalRecordDecodeError(`a ${store} key's rev is not an integer`);
-			return { store, blockId: blockId as BlockId, rev: rev as number };
+			if (!Number.isInteger(fields.rev)) throw new JournalRecordDecodeError(`a ${store} key's rev is not an integer`);
+			return { store, blockId: blockIdOf(store, fields), rev: fields.rev as number };
 		case 'pending':
 		case 'transactions':
 		case 'materialized':
-			if (typeof actionId !== 'string') throw new JournalRecordDecodeError(`a ${store} key's actionId is not a string`);
-			return { store, blockId: blockId as BlockId, actionId: actionId as ActionId };
+			if (typeof fields.actionId !== 'string') throw new JournalRecordDecodeError(`a ${store} key's actionId is not a string`);
+			return { store, blockId: blockIdOf(store, fields), actionId: fields.actionId as ActionId };
 		default:
 			throw new JournalRecordDecodeError(`a store key names no store (${String(store)})`);
 	}
+}
+
+function blockIdOf(store: string, { blockId }: UncheckedStoreKey): BlockId {
+	if (typeof blockId !== 'string') throw new JournalRecordDecodeError(`a ${store} key's blockId is not a string`);
+	return blockId as BlockId;
 }
 
 function parseKeyJson(bytes: Uint8Array): unknown {

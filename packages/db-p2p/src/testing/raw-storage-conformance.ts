@@ -360,6 +360,34 @@ export function runRawStorageConformance(
 			expect(stored!.messageHash).to.equal('hash-clone');
 		});
 
+		// --- Commit proofs by message hash (their own store, not scoped to a block) ---
+
+		it('getCommitProof returns undefined on a miss', async () => {
+			expect(await storage.getCommitProof('zCommitProofMiss')).to.equal(undefined);
+		});
+
+		// A real message hash is base58, but the store is keyed by any string, so a key holding path
+		// characters — and the spelling a backend might escape it to — are two keys like any others.
+		it('commit proof round-trips under its message hash, and distinct keys stay distinct', async () => {
+			const keys = ['zCommitProofRoundTrip', '../escape', '%2E%2E%2Fescape'];
+			for (const key of keys) await storage.saveCommitProof(key, { ...makeProof(key), messageHash: key });
+			for (const key of keys) {
+				expect(await storage.getCommitProof(key), key).to.deep.equal({ ...makeProof(key), messageHash: key });
+			}
+		});
+
+		// A message hash and a block id are both strings, so a block may share its id with a hash.
+		// The two proof stores must still be separate keyspaces.
+		it('a commit proof under hash X and the proof for a revision of block X do not see each other', async () => {
+			const shared = 'zCommitKeyspace';
+			await storage.saveCommitProof(shared, makeProof('by-hash'));
+			expect(await storage.getBlockProof(shared as BlockId, 1), 'no proof for the block').to.equal(undefined);
+
+			await storage.saveBlockProof(shared as BlockId, 1, makeProof('by-block'));
+			expect((await storage.getCommitProof(shared))!.messageHash, 'the commit proof is untouched').to.equal('hash-by-hash');
+			expect((await storage.getBlockProof(shared as BlockId, 1))!.messageHash, 'the block proof is stored').to.equal('hash-by-block');
+		});
+
 		// --- Materialized blocks ---
 
 		it('getMaterializedBlock returns undefined on a miss', async () => {
@@ -614,6 +642,7 @@ export function runRawStorageConformance(
 				const meta: BlockMetadata = { ranges: [[1]], latest: { rev: 1, actionId: committed } };
 				const block = makeBlock('flush-block', { items: ['kept'] });
 				const proof = makeProof('flush');
+				const commitProof = { ...makeProof('flush-commit'), messageHash: 'zFsyncCommitProof' };
 
 				await storage.saveMetadata(blockId, meta);
 				await storage.saveRevision(blockId, 1, committed);
@@ -623,6 +652,7 @@ export function runRawStorageConformance(
 				await storage.deletePendingTransaction(blockId, deleted);
 				await storage.saveTransaction(blockId, committed, { insert: block });
 				await storage.saveBlockProof(blockId, 1, proof);
+				await storage.saveCommitProof(commitProof.messageHash, commitProof);
 				await storage.saveMaterializedBlock(blockId, committed, block);
 				await storage.saveMaterializedBlock(blockId, removed, makeBlock('removed'));
 				await storage.saveMaterializedBlock(blockId, removed);
@@ -648,6 +678,7 @@ export function runRawStorageConformance(
 				expect(await collect(reopened.listPendingTransactions(blockId)), 'pending store is empty').to.deep.equal([]);
 				expect(await reopened.getTransaction(blockId, committed), 'committed transaction').to.deep.equal({ insert: block });
 				expect(await reopened.getBlockProof(blockId, 1), 'proof').to.deep.equal(proof);
+				expect(await reopened.getCommitProof(commitProof.messageHash), 'commit proof').to.deep.equal(commitProof);
 				expect(await reopened.getMaterializedBlock(blockId, committed), 'materialized block').to.deep.equal(block);
 				expect(await reopened.getMaterializedBlock(blockId, removed), 'deleted materialized block').to.equal(undefined);
 			});

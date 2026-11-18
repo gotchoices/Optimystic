@@ -15,10 +15,17 @@
  *   - transactions: actionId UTF-8 (terminal)
  *   - proofs:       rev (8-byte big-endian unsigned, same as revisions)
  *   - materialized: actionId UTF-8 (terminal)
+ *   - commit proofs: no envelope — `tag || messageHash UTF-8` (below)
  *
  * The journal (`TAG_JOURNAL`) has no `blockId` envelope: a record key is the
  * tag then its `seq` as 8 bytes big-endian, and the applied-through mark is the
  * bare tag, which sorts before every numbered key.
+ *
+ * Commit proofs (`TAG_COMMIT_PROOFS`) have no `blockId` envelope either: a key is
+ * the tag then the UTF-8 of the proof's message hash. No listing reaches this
+ * tag: each scans inside one tag of its own, and the journal's range,
+ * `[TAG_JOURNAL, TAG_JOURNAL + 1)`, ends exactly where this one begins. Only the
+ * whole-database byte sum (`approximateBytesUsed`) counts these keys.
  *
  * `kv` and `identity` keys are flat — no `blockId` envelope — under their
  * own tag bytes (`TAG_KV`, `TAG_IDENTITY`) and use UTF-8 of the full key.
@@ -35,6 +42,7 @@ export const TAG_TRANSACTIONS = 0x04;
 export const TAG_MATERIALIZED = 0x05;
 export const TAG_PROOFS = 0x06;
 export const TAG_JOURNAL = 0x07;
+export const TAG_COMMIT_PROOFS = 0x08;
 export const TAG_KV = 0x10;
 export const TAG_IDENTITY = 0x20;
 
@@ -126,6 +134,11 @@ export function transactionKey(blockId: string, actionId: string): Uint8Array {
  */
 export function proofKey(blockId: string, rev: number): Uint8Array {
 	return revScopedKey(TAG_PROOFS, blockId, rev);
+}
+
+/** `TAG_COMMIT_PROOFS || messageHash UTF-8`: one key per consensus message, not scoped to a block. */
+export function commitProofKey(messageHash: string): Uint8Array {
+	return concat(Uint8Array.of(TAG_COMMIT_PROOFS), textEncoder.encode(messageHash));
 }
 
 export function materializedKey(blockId: string, actionId: string): Uint8Array {

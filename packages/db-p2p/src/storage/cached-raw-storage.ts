@@ -124,10 +124,10 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 		await this.inner.saveTransaction(blockId, actionId, decodeJson(value));
 	}
 
-	// --- proofs ---
+	// --- proofs, by revision and by message hash ---
 
-	// The inner storage owns the proofs keyspace (`IRawStorage.getBlockProof` /
-	// `saveBlockProof`), so this adapter only re-encodes across the byte boundary the
+	// The inner storage owns both proof keyspaces (`IRawStorage.getBlockProof` and
+	// `getCommitProof`), so this adapter only re-encodes across the byte boundary the
 	// way its sibling methods do. Deliberately no delete — see RawStoreDriver.getProof.
 
 	async getProof(blockId: BlockId, rev: number): Promise<Uint8Array | undefined> {
@@ -137,6 +137,15 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 
 	async putProof(blockId: BlockId, rev: number, value: Uint8Array): Promise<void> {
 		await this.inner.saveBlockProof(blockId, rev, decodeJson(value));
+	}
+
+	async getCommitProof(messageHash: string): Promise<Uint8Array | undefined> {
+		const proof = await this.inner.getCommitProof(messageHash);
+		return proof === undefined ? undefined : encodeJson(proof);
+	}
+
+	async putCommitProof(messageHash: string, value: Uint8Array): Promise<void> {
+		await this.inner.saveCommitProof(messageHash, decodeJson(value));
 	}
 
 	// --- materialized ---

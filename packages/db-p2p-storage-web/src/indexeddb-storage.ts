@@ -20,14 +20,16 @@ import { createLogger } from './logger.js';
 
 const log = createLogger('storage:indexeddb');
 
-/** The object stores an apply writes: the six block-storage stores and the journal itself. */
-const APPLY_STORES = ['metadata', 'revisions', 'pending', 'transactions', 'proofs', 'materialized', 'journal'] as const;
+/** The object stores an apply writes: the seven block-storage stores and the journal itself. */
+const APPLY_STORES = ['metadata', 'revisions', 'pending', 'transactions', 'proofs', 'commitProofs', 'materialized', 'journal'] as const;
 
-/** The IndexedDB key a `StoreKey` addresses in its object store: the compound array keys the schema declares. */
-type IdbKey = BlockId | [BlockId, number] | [BlockId, ActionId];
+/** The IndexedDB key a `StoreKey` addresses in its object store: the keys the schema declares. */
+type IdbKey = string | [BlockId, number] | [BlockId, ActionId];
 
 function idbKeyOf(key: StoreKey): IdbKey {
 	switch (key.store) {
+		case 'commitProofs':
+			return key.messageHash;
 		case 'metadata':
 			return key.blockId;
 		case 'revisions':
@@ -60,18 +62,19 @@ function isBatchEntry(entry: unknown): entry is BatchEntry {
 
 function isStoreKey(key: unknown): key is StoreKey {
 	if (typeof key !== 'object' || key === null) return false;
-	const { store, blockId, rev, actionId } = key as { store?: unknown; blockId?: unknown; rev?: unknown; actionId?: unknown };
-	if (typeof blockId !== 'string') return false;
+	const { store, blockId, rev, actionId, messageHash } = key as { store?: unknown; blockId?: unknown; rev?: unknown; actionId?: unknown; messageHash?: unknown };
 	switch (store) {
+		case 'commitProofs':
+			return typeof messageHash === 'string';
 		case 'metadata':
-			return true;
+			return typeof blockId === 'string';
 		case 'revisions':
 		case 'proofs':
-			return Number.isInteger(rev);
+			return typeof blockId === 'string' && Number.isInteger(rev);
 		case 'pending':
 		case 'transactions':
 		case 'materialized':
-			return typeof actionId === 'string';
+			return typeof blockId === 'string' && typeof actionId === 'string';
 		default:
 			return false;
 	}
@@ -80,9 +83,9 @@ function isStoreKey(key: unknown): key is StoreKey {
 export type IndexedDBJournalStoreOptions = IndexedDBDurabilityOptions;
 
 /**
- * IndexedDB {@link JournalStore}: the six logical block-storage stores mapped to the six IndexedDB
- * object stores (`metadata`, `revisions`, `pending`, `transactions`, `proofs`, `materialized`)
- * with their compound array keys, read exactly as the per-write driver before it read them, so
+ * IndexedDB {@link JournalStore}: the seven logical block-storage stores mapped to the seven
+ * IndexedDB object stores (`metadata`, `revisions`, `pending`, `transactions`, `proofs`,
+ * `commitProofs`, `materialized`) with their keys, read exactly as the per-write driver before it read them, so
  * data an earlier build wrote reads unchanged; and the journal in the `journal` object store,
  * which `JournalBatchBackend` drives.
  *
@@ -98,7 +101,7 @@ export type IndexedDBJournalStoreOptions = IndexedDBDurabilityOptions;
  * transaction completes only once the browser has put it on the disk) but promises nothing about
  * the order relaxed transactions reach the disk, which is why the backend journals (see
  * `JournalBatchBackend`). Here an append is one relaxed transaction on `journal` alone, and an
- * apply is one strict transaction over the six stores and `journal`: every record's entries in
+ * apply is one strict transaction over the seven stores and `journal`: every record's entries in
  * order, the applied-through mark, and the delete of each record applied or discarded. The apply
  * carries every byte it applies, so its durability depends on no earlier transaction, and the
  * backend syncs each apply before the next starts — so what a power cut leaves is a prefix of the
@@ -210,7 +213,7 @@ export class IndexedDBJournalStore implements JournalStore {
 	}
 
 	/**
-	 * One transaction over the six stores and `journal`, strict where the browser supports it: each
+	 * One transaction over the seven stores and `journal`, strict where the browser supports it: each
 	 * record's entries in order, then the mark, then the delete of every numbered record. A number
 	 * with no record present (a strict group's, never appended) deletes nothing.
 	 * `JournalStore.applyJournal`'s contract.

@@ -86,12 +86,12 @@ import register from '../dist/plugin.js';
 /** Every read the driver surface offers. Split from writes so amplification is attributable. */
 const READ_METHODS = [
 	'getMetadata', 'getRevision', 'rangeRevisions', 'getPending',
-	'listPendingActionIds', 'getTransaction', 'getMaterialized', 'getProof',
+	'listPendingActionIds', 'getTransaction', 'getMaterialized', 'getProof', 'getCommitProof',
 ] as const;
 
 const WRITE_METHODS = [
 	'putMetadata', 'putRevision', 'putPending', 'deletePending', 'putTransaction',
-	'putProof', 'putMaterialized', 'deleteMaterialized', 'promote',
+	'putProof', 'putCommitProof', 'putMaterialized', 'deleteMaterialized', 'promote',
 ] as const;
 
 type Counts = Record<string, number>;

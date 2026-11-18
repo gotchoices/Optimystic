@@ -27,7 +27,7 @@ export interface JournalContents {
  * The engine under a {@link JournalBatchBackend}: the applied stores' reads, as `BatchBackend`'s,
  * and three journal writes in place of its `commit` and `sync`. The journal — the numbered records
  * and the applied-through mark — lives in a keyspace of the engine's own (an IndexedDB object
- * store, a LevelDB tag byte) that the six block-storage stores never touch, and reads never reflect
+ * store, a LevelDB tag byte) that the seven block-storage stores never touch, and reads never reflect
  * a record until an apply has applied it. `durability` says what an apply survives before it
  * resolves: `'power-loss'` for an engine that syncs the apply; anything less, and the backend
  * applies every group at once and never journals, since applying already meets all the store can

@@ -23,6 +23,8 @@ function makeStorage(overrides: Partial<IRawStorage> = {}): IRawStorage {
 		saveTransaction: reject as any,
 		getBlockProof: reject as any,
 		saveBlockProof: reject as any,
+		getCommitProof: reject as any,
+		saveCommitProof: reject as any,
 		getMaterializedBlock: reject as any,
 		saveMaterializedBlock: reject as any,
 		promotePendingTransaction: reject as any,

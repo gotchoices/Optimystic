@@ -132,6 +132,12 @@ class CrashingRawStorage implements IRawStorage {
 	saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof) {
 		return this.invoke('saveBlockProof', [blockId, rev, proof], blockId, undefined, () => this.inner.saveBlockProof(blockId, rev, proof));
 	}
+	getCommitProof(messageHash: string) {
+		return this.invoke('getCommitProof', [messageHash], undefined, undefined, () => this.inner.getCommitProof(messageHash));
+	}
+	saveCommitProof(messageHash: string, proof: BlockCommitProof) {
+		return this.invoke('saveCommitProof', [messageHash, proof], undefined, undefined, () => this.inner.saveCommitProof(messageHash, proof));
+	}
 	saveTransaction(blockId: BlockId, actionId: ActionId, transform: Transform) {
 		return this.invoke('saveTransaction', [blockId, actionId, transform], blockId, actionId, () => this.inner.saveTransaction(blockId, actionId, transform));
 	}

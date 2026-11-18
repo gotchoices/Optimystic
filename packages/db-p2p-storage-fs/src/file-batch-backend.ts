@@ -75,8 +75,38 @@ const BLOCK_STORE_DIRS: ReadonlySet<string> = new Set([...Object.values(ACTION_S
 const ROOT_KV_NAMESPACES: ReadonlySet<string> = new Set(NODE_KV_NAMESPACES);
 
 /**
- * Filesystem {@link BatchBackend}: the six logical block-storage stores mapped to six paths under
- * `basePath/<blockId>/` (`{meta.json,revs/,pend/,actions/,proofs/,blocks/}`), every batch committed
+ * The root directory of the commit proofs store, one `<messageHash>.json` per proof. It is the one
+ * store not kept under a block's directory, since a proof is keyed by its message hash alone.
+ * NOTE: the listing skips it at the root, so a block whose id is `commit-proofs` or starts
+ * `commit-proofs/` is hidden from `listBlockIds` and keeps its records inside this store's
+ * directory — the same accepted limit the KV namespaces carry. If such ids ever occur, encode
+ * block-id segments in the layout.
+ */
+const COMMIT_PROOFS_DIR = 'commit-proofs';
+
+/** The directories at the root that hold no blocks: the KV namespaces and the commit proofs store. */
+const ROOT_NON_BLOCK_DIRS: ReadonlySet<string> = new Set([...ROOT_KV_NAMESPACES, COMMIT_PROOFS_DIR]);
+
+/**
+ * `commit-proofs/<messageHash>.json`. A base58 hash, which every message hash is, is a file name
+ * unchanged. Any other key has each character outside `[A-Za-z0-9_-]` percent-encoded as its UTF-8
+ * bytes, `%` included, so no key can name a path outside the store and no two keys share a file
+ * name. On a case-insensitive filesystem two hashes differing only in letter case share a file,
+ * which needs a collision of SHA-256 outputs on about 200 bits, and is answered safely anyway: a
+ * reader checks that the proof's message names the block it serves (`servableProof`).
+ */
+function commitProofRelativePath(messageHash: string): string {
+	return `${COMMIT_PROOFS_DIR}/${messageHash.replace(/[^A-Za-z0-9_-]/gu, percentEncode)}.json`;
+}
+
+function percentEncode(character: string): string {
+	return Array.from(new TextEncoder().encode(character), byte => `%${byte.toString(16).toUpperCase().padStart(2, '0')}`).join('');
+}
+
+/**
+ * Filesystem {@link BatchBackend}: six of the seven logical block-storage stores mapped to six paths
+ * under `basePath/<blockId>/` (`{meta.json,revs/,pend/,actions/,proofs/,blocks/}`), and the commit
+ * proofs store to `basePath/commit-proofs/<messageHash>.json`, every batch committed
  * through the directory's {@link FileWriteLog}. The directory tree is a deliberate,
  * human-inspectable layout — it is NOT flattened into encoded-filename KV keys.
  *
@@ -134,6 +164,9 @@ export class FileBatchBackend implements BatchBackend {
 			// its revision record (see RawStoreDriver.getProof).
 			case 'proofs':
 				return this.readBytesIfExists(this.proofPath(key.blockId, key.rev), true);
+			// JSON-valued too, so the same guard; no delete, for the same reason.
+			case 'commitProofs':
+				return this.readBytesIfExists(path.join(this.basePath, commitProofRelativePath(key.messageHash)), true);
 			case 'pending':
 			case 'transactions':
 			case 'materialized':
@@ -233,7 +266,7 @@ export class FileBatchBackend implements BatchBackend {
 		if (isBlock) yield segments.join('/') as BlockId;
 		for (const name of await this.childDirectoryNames(dir)) {
 			if (isBlock && BLOCK_STORE_DIRS.has(name)) continue;
-			if (segments.length === 0 && ROOT_KV_NAMESPACES.has(name)) continue;
+			if (segments.length === 0 && ROOT_NON_BLOCK_DIRS.has(name)) continue;
 			yield* this.walkBlockDirectories([...segments, name]);
 		}
 	}
@@ -325,6 +358,8 @@ export class FileBatchBackend implements BatchBackend {
 				return `${key.blockId}/${REVISIONS_DIR}/${key.rev}.json`;
 			case 'proofs':
 				return `${key.blockId}/${PROOFS_DIR}/${key.rev}.json`;
+			case 'commitProofs':
+				return commitProofRelativePath(key.messageHash);
 			case 'pending':
 			case 'transactions':
 			case 'materialized':

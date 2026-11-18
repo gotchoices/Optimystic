@@ -12,7 +12,7 @@ export const JOURNAL_MARK_KEY = 'applied-through';
 /**
  * IndexedDB schema for the Optimystic browser storage backend.
  *
- * The six block-storage stores keep their original object stores and compound
+ * The seven block-storage stores keep their original object stores and compound
  * array keys, but their values are opaque `Uint8Array` blobs: the shared
  * `KvRawStorage` kernel owns JSON (de)serialization, so `IndexedDBJournalStore`
  * only ever hands IndexedDB kernel-encoded bytes. IndexedDB stores a
@@ -28,9 +28,11 @@ export const JOURNAL_MARK_KEY = 'applied-through';
  * - `proofs`: `BlockCommitProof` bytes keyed by `[blockId, rev]` — the same key shape
  *   as `revisions`, deliberately NOT the action keyspace (an action id is caller-chosen,
  *   so no reserved id could be relied on).
+ * - `commitProofs`: `BlockCommitProof` bytes keyed by the proof's `messageHash` string, one
+ *   per consensus message however many blocks it covers.
  * - `materialized`: materialized block bytes keyed by `[blockId, actionId]`. Deleting
  *   the row is an entry of a write group with no value, not a stored `undefined`.
- * - `journal`: the write groups appended and not yet applied to the six stores above, each a
+ * - `journal`: the write groups appended and not yet applied to the seven stores above, each a
  *   `JournalRecord` stored by structured clone under its `seq` (no codec: the record's keys are
  *   plain objects and its values `Uint8Array`s), and under {@link JOURNAL_MARK_KEY} the number of
  *   the last record applied. `IndexedDBJournalStore` owns both; nothing else touches the store.
@@ -60,6 +62,10 @@ export interface OptimysticWebDB extends DBSchema {
 		key: [BlockId, number];
 		value: Uint8Array;
 	};
+	commitProofs: {
+		key: string;
+		value: Uint8Array;
+	};
 	materialized: {
 		key: [BlockId, ActionId];
 		value: Uint8Array;
@@ -75,11 +81,12 @@ export interface OptimysticWebDB extends DBSchema {
 }
 
 export const DEFAULT_DB_NAME = 'optimystic';
-// Bumped to 2 when the `proofs` object store was added and to 3 for `journal`. The `upgrade` hook
-// is guarded by `objectStoreNames.contains`, so an existing database gains only the stores it
-// lacks (backlog `debt-indexeddb-version-upgrade-is-untested-and-unhandled` owns testing that, and
-// the open that another tab's older connection blocks).
-export const DEFAULT_DB_VERSION = 3;
+// Bumped to 2 when the `proofs` object store was added, to 3 for `journal`, and to 4 for
+// `commitProofs`. The `upgrade` hook is guarded by `objectStoreNames.contains`, so an existing
+// database gains only the stores it lacks (backlog
+// `debt-indexeddb-version-upgrade-is-untested-and-unhandled` owns testing that, and the open that
+// another tab's older connection blocks).
+export const DEFAULT_DB_VERSION = 4;
 
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
 
@@ -110,6 +117,9 @@ export async function openOptimysticWebDb(
 			}
 			if (!db.objectStoreNames.contains('proofs')) {
 				db.createObjectStore('proofs');
+			}
+			if (!db.objectStoreNames.contains('commitProofs')) {
+				db.createObjectStore('commitProofs');
 			}
 			if (!db.objectStoreNames.contains('materialized')) {
 				db.createObjectStore('materialized');
