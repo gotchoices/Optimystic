@@ -28,6 +28,7 @@ import type { IPieceStore } from './blob/piece-store.js';
 import { MemoryPieceStore } from './blob/memory-piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
+import { blobAcceptanceOf } from './blob/accepts-blobs.js';
 import { BlobProtocolClient } from './blob/blob-protocol-client.js';
 import { BlobFetcher } from './blob/blob-fetcher.js';
 import type { BlobHolderDeps } from './blob/blob-holders.js';
@@ -2241,10 +2242,16 @@ function wireBlobFetcher(ctx: {
 	blobs: LocalBlobService;
 }): { client: BlobProtocolClient; fetcher: BlobFetcher; holders: BlobHolderDeps } {
 	const { node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs } = ctx;
-	const client = new BlobProtocolClient({ peerNetwork: keyNetwork, protocolPrefix, deadlines: linkDeadlines });
+	const blobProtocol = buildBlobProtocol(protocolPrefix);
+	const client = new BlobProtocolClient({
+		peerNetwork: keyNetwork,
+		protocolPrefix,
+		deadlines: linkDeadlines,
+		acceptance: id => blobAcceptanceOf(keyNetwork, blobProtocol, [id]).then(answers => answers[id] ?? 'unknown'),
+	});
 	const holders: BlobHolderDeps = {
 		selfPeerId: node.peerId.toString(),
-		blobProtocol: buildBlobProtocol(protocolPrefix),
+		blobProtocol,
 		keyNetwork,
 		membership,
 		reputation,

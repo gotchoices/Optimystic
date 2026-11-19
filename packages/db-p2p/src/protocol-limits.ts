@@ -110,6 +110,12 @@ export const MAX_BLOB_GET_PIECES = 16;
 export const MAX_BLOB_STAT_REFS = 64;
 
 /**
+ * Longest scope a blob `announce` names, in UTF-16 code units (`scope.length`). A scope is a collection
+ * id; 1024 keeps the header far under {@link MAX_BLOB_HEADER_BYTES}.
+ */
+export const MAX_BLOB_SCOPE_CHARS = 1024;
+
+/**
  * Most blob `get` streams this node serves at once for one peer: a client opens one background and one
  * foreground stream per peer (docs/blobs.md §Moving pieces between machines).
  */

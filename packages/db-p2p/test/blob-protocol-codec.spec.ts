@@ -6,7 +6,7 @@ import * as lp from 'it-length-prefixed';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { BlobProtocolError, decodeBlobRequest, encodeBlobHeader } from '../src/blob/blob-protocol.js';
 import { readBlobFrames } from '../src/blob/blob-frames.js';
-import { MAX_BLOB_GET_PIECES, MAX_BLOB_HEADER_BYTES, MAX_BLOB_PIECE_FRAME_BYTES } from '../src/protocol-limits.js';
+import { MAX_BLOB_GET_PIECES, MAX_BLOB_HEADER_BYTES, MAX_BLOB_PIECE_FRAME_BYTES, MAX_BLOB_SCOPE_CHARS } from '../src/protocol-limits.js';
 
 const PEER = 'peer-under-test';
 
@@ -36,6 +36,20 @@ describe('blob protocol header and frames', () => {
 			expect(() => decodeBlobRequest(bytes, PEER), label).to.throw(BlobProtocolError);
 		}
 		expect(decodeBlobRequest(encodeBlobHeader({ kind: 'get', pieces: [piece] }), PEER)).to.deep.equal({ kind: 'get', pieces: [piece] });
+	});
+
+	it('bounds an announce scope: empty and over MAX_BLOB_SCOPE_CHARS are malformed, exactly the cap decodes', async () => {
+		const ref = await rawPieceId(2);
+		const cases: Array<[string, string, boolean]> = [
+			['empty', '', false],
+			['one over the cap', 'x'.repeat(MAX_BLOB_SCOPE_CHARS + 1), false],
+			['exactly the cap', 'x'.repeat(MAX_BLOB_SCOPE_CHARS), true],
+		];
+		for (const [label, scope, decodes] of cases) {
+			const bytes = json({ kind: 'announce', ref, scope });
+			if (decodes) expect(decodeBlobRequest(bytes, PEER), label).to.deep.equal({ kind: 'announce', ref, scope });
+			else expect(() => decodeBlobRequest(bytes, PEER), label).to.throw(BlobProtocolError);
+		}
 	});
 
 	it('refuses an oversized header from its length prefix alone, without waiting for its bytes', async () => {

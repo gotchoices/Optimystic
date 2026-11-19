@@ -88,6 +88,9 @@ export type FindCoordinatorErrorCode =
  */
 export type NetworkMembership = 'serves' | 'foreign' | 'unknown';
 
+/** What a peer's peerStore record says of one protocol (`Libp2pKeyPeerNetwork.protocolSupport`). */
+export type ProtocolSupport = 'listed' | 'unlisted' | 'unknown';
+
 export class FindCoordinatorError extends Error {
 	readonly code: FindCoordinatorErrorCode;
 	constructor(code: FindCoordinatorErrorCode, message: string) {
@@ -1818,11 +1821,31 @@ export class Libp2pKeyPeerNetwork implements IKeyNetwork, IPeerNetwork {
 	 * ever sends on a protocol it does not serve.
 	 */
 	async peersServing(protocol: string, peerIds: readonly string[]): Promise<string[]> {
+		const support = await this.protocolSupport(protocol, peerIds)
+		return peerIds.filter(id => support[id] === 'listed')
+	}
+
+	/**
+	 * What this node's peerStore says of each of `peerIds` (this node left out) running `protocol`, read
+	 * through the peer record cache ({@link peerRecords}): `listed` when the record's protocol list names
+	 * it; `unlisted` when the record holds a non-empty list that does not; `unknown` when there is no
+	 * record or its list is empty, i.e. the peer has not been identified. A non-empty list is taken as
+	 * the peer's statement, the same reading {@link membershipOf} gives one, so the two cannot disagree
+	 * about when a list counts. The same NOTE as {@link peersServing} applies to `listed`.
+	 */
+	async protocolSupport(protocol: string, peerIds: readonly string[]): Promise<Record<string, ProtocolSupport>> {
 		const selfId = this.libp2p.peerId.toString()
 		const others = peerIds.filter(id => id !== selfId)
-		if (others.length === 0) return []
+		const support: Record<string, ProtocolSupport> = {}
+		if (others.length === 0) return support
 		const records = await this.peerRecords.records(others)
-		return others.filter(id => records[id]?.protocols.includes(protocol) === true)
+		for (const id of others) {
+			const protocols = records[id]?.protocols
+			support[id] = protocols == null || protocols.length === 0 ? 'unknown'
+				: protocols.includes(protocol) ? 'listed'
+				: 'unlisted'
+		}
+		return support
 	}
 
 	/** Each peer's current connection run, or `undefined` when any of them has none. */

@@ -24,7 +24,7 @@ import {
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
 import { armUnrefTimer } from '../unref-timer.js';
-import { DEFAULT_BLOB_OWNER, type BlobHold, type BlobRecord } from './blob-record.js';
+import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobRecord } from './blob-record.js';
 import { BlobRecordStore, type BlobRecordChange } from './blob-record-store.js';
 import { localPieceSource } from './local-piece-source.js';
 import { InProgressPieces, PieceSweeper, type BlobSweepResult } from './piece-sweeper.js';
@@ -263,6 +263,42 @@ export class LocalBlobService implements BlobService {
 		await this.records.flush();
 	}
 
+	/**
+	 * Holds the blob because this node is responsible for it and found it referenced under `scope` (an
+	 * empty scope throws RangeError): adds the `responsible` hold, or replaces an existing one's scope
+	 * and `at`, creating the record (`whole: false`) when there is none. Every other hold is kept.
+	 * Flushed before it resolves: a lost hold would let a restart sweep a blob this node told an
+	 * announcer it is pulling.
+	 */
+	async holdResponsible(ref: BlobRef, scope: BlobScope): Promise<void> {
+		assertScope(scope);
+		const at = this.now();
+		await this.changeRecord(ref, current => recordAfterResponsibleHold(current, ref, scope, at));
+		await this.records.flush();
+	}
+
+	/** The scope of `ref`'s `responsible` hold, or undefined. A malformed record throws BlobRecordFormatError. */
+	async responsibleScope(ref: BlobRef): Promise<BlobScope | undefined> {
+		return responsibleHoldOf(await this.records.get(ref))?.scope;
+	}
+
+	/**
+	 * Every ref whose record holds `responsible`. A record that fails to decode is logged
+	 * (`record:unreadable`) and skipped.
+	 *
+	 * NOTE: reads every record, which is acceptable for the start-up enumeration this serves. If the
+	 * record count ever makes start-up slow, keep an index of the hold kinds each record carries.
+	 */
+	async responsibleRefs(): Promise<BlobRef[]> {
+		const refs: BlobRef[] = [];
+		for (const ref of await this.records.listRefs()) {
+			if (responsibleHoldOf(await this.readableRecord(ref)) !== undefined) {
+				refs.push(ref);
+			}
+		}
+		return refs;
+	}
+
 	async announce(_ref: BlobRef, _scope: BlobScope): Promise<void> {
 		throw new Error('announcing a blob to its cohort is not built yet (feat-a-referenced-blob-is-copied-to-its-cohort)');
 	}
@@ -329,6 +365,19 @@ export class LocalBlobService implements BlobService {
 			this.scheduleSweep();
 		}
 		return result;
+	}
+
+	/** The record of `ref`, or undefined when there is none or it does not decode (logged). */
+	private async readableRecord(ref: BlobRef): Promise<BlobRecord | undefined> {
+		try {
+			return await this.records.get(ref);
+		} catch (error) {
+			if (!(error instanceof BlobRecordFormatError)) {
+				throw error;
+			}
+			log('record:unreadable ref=%s error=%s', ref, error.message);
+			return undefined;
+		}
 	}
 
 	/** Sets an existing record's `whole` (and `size`, when given); never creates one. A failure is logged, not thrown: the record is a hint. */
@@ -429,6 +478,16 @@ function assertOwner(owner: string): void {
 	}
 }
 
+function assertScope(scope: BlobScope): void {
+	if (scope === '') {
+		throw new RangeError('A blob scope must be a non-empty string');
+	}
+}
+
+function responsibleHoldOf(record: BlobRecord | undefined): Extract<BlobHold, { kind: 'responsible' }> | undefined {
+	return record?.holds.find((hold): hold is Extract<BlobHold, { kind: 'responsible' }> => hold.kind === 'responsible');
+}
+
 function pinnedBy(record: BlobRecord, owner: string): boolean {
 	return record.holds.some(hold => hold.kind === 'pin' && hold.owner === owner);
 }
@@ -465,6 +524,15 @@ function recordAfterCachedHold(current: BlobRecord | undefined, ref: BlobRef, at
 		return { v: 1, ref, whole: false, holds: [cached] };
 	}
 	return current.holds.some(hold => hold.kind === 'cached') ? current : { ...current, holds: [...current.holds, cached] };
+}
+
+/** With no record, a new one holding `responsible` that knows nothing of the pieces yet; otherwise the `responsible` hold replaced, every other hold kept. */
+function recordAfterResponsibleHold(current: BlobRecord | undefined, ref: BlobRef, scope: BlobScope, at: number): BlobRecord {
+	const responsible: BlobHold = { kind: 'responsible', at, scope };
+	if (current === undefined) {
+		return { v: 1, ref, whole: false, holds: [responsible] };
+	}
+	return { ...current, holds: [...current.holds.filter(hold => hold.kind !== 'responsible'), responsible] };
 }
 
 function recordAfterUnpin(current: BlobRecord | undefined, owner: string): BlobRecord | undefined {

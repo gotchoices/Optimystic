@@ -1,6 +1,7 @@
 /**
  * The client side of the blob protocol: asks a peer what it holds of some blobs (`stat`), and for
- * pieces by id (`get`), handing the caller each piece's bytes as its frame completes (docs/blobs.md
+ * pieces by id (`get`), handing the caller each piece's bytes as its frame completes; tells a peer that
+ * a committed reference names a blob (`announce`) and that this node now has one (`held`) (docs/blobs.md
  * §Moving pieces between machines). Nothing here verifies or stores a piece; the fetcher does.
  *
  * One instance per node; per-peer state lives in callers.
@@ -9,21 +10,24 @@
  */
 
 import type { Stream } from '@libp2p/interface';
-import type { BlobRef, IPeerNetwork, PeerId, PieceId } from '@optimystic/db-core';
+import { parseBlobRef, type BlobRef, type BlobScope, type IPeerNetwork, type PeerId, type PieceId } from '@optimystic/db-core';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createLogger } from '../logger.js';
 import { openStreamWithin } from '../protocol-client.js';
 import { MAX_BLOB_GET_PIECES, MAX_BLOB_HEADER_BYTES, MAX_BLOB_STAT_REFS } from '../protocol-limits.js';
 import type { LinkDeadlines } from '../rpc-deadline.js';
+import { BlobPeerRefusesError, type BlobAcceptance } from './accepts-blobs.js';
 import { abortStreamOnStall, closeBlobStream, readBlobFrames, releaseBlobFrames, sendBlobFrame, type BlobFrameSource } from './blob-frames.js';
 import {
 	BlobPeerRefusedError,
 	BlobProtocolError,
 	BlobTransferStalledError,
+	blobScopeProblem,
 	buildBlobProtocol,
 	checkAnswerFits,
 	decodeBlobAnswer,
 	encodeBlobHeader,
+	type BlobAnnounceAnswer,
 	type BlobAnswer,
 	type BlobLocalHolding,
 	type BlobRequest,
@@ -37,6 +41,12 @@ export interface BlobProtocolClientInit {
 	peerNetwork: IPeerNetwork;
 	protocolPrefix: string;
 	deadlines: Pick<LinkDeadlines, 'dialTimeoutMs' | 'responseTimeoutMs'>;
+	/**
+	 * What this node knows of a peer running the blob protocol; `announce` and `held` ask it before
+	 * dialing. Absent: every peer is dialed. `stat` and `get` never ask it, since the fetcher already
+	 * filters its candidates through `peersServing`.
+	 */
+	acceptance?: (peerId: string) => Promise<BlobAcceptance>;
 }
 
 export interface BlobGetReply {
@@ -76,16 +86,9 @@ export class BlobProtocolClient {
 		requireRequestList('refs', refs, MAX_BLOB_STAT_REFS);
 		const request = { kind: 'stat', refs: [...refs] } satisfies BlobRequest;
 		const exchange = await this.open(peer, request, options.signal);
-		try {
-			const answer = await exchange.readAnswer(request);
-			await exchange.requireEnd();
-			log('client:stat peer=%s refs=%d ms=%d', exchange.peer, refs.length, exchange.elapsed());
-			return answer.holdings;
-		} catch (err) {
-			throw exchange.fail(err);
-		} finally {
-			exchange.finish();
-		}
+		const answer = await exchange.readSoleAnswer(request);
+		log('client:stat peer=%s refs=%d ms=%d', exchange.peer, refs.length, exchange.elapsed());
+		return answer.holdings;
 	}
 
 	/**
@@ -116,12 +119,51 @@ export class BlobProtocolClient {
 	}
 
 	/**
+	 * Tells `peer` that a committed reference in `scope` names `ref`; resolves with the peer's answer.
+	 * Throws BlobRefError, locally, for a ref that is not canonical; RangeError, locally, for an empty
+	 * scope or one over `MAX_BLOB_SCOPE_CHARS`; BlobPeerRefusesError for a peer known not to run the
+	 * blob protocol; BlobPeerRefusedError when the peer answers `refused`.
+	 */
+	async announce(peer: PeerId, ref: BlobRef, scope: BlobScope, options: BlobRequestOptions = {}): Promise<BlobAnnounceAnswer> {
+		parseBlobRef(ref);
+		const problem = blobScopeProblem(scope);
+		if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+		const request = { kind: 'announce', ref, scope } satisfies BlobRequest;
+		const exchange = await this.openAccepted(peer, request, options.signal);
+		const { answer } = await exchange.readSoleAnswer(request);
+		log('client:announce peer=%s ref=%s answer=%s ms=%d', exchange.peer, ref, answer, exchange.elapsed());
+		return answer;
+	}
+
+	/**
+	 * Tells `peer`, which announced `ref` to this node, that this node now holds it; resolves once the
+	 * peer's empty acknowledgement is read. Throws as `announce` does, less the scope check.
+	 */
+	async held(peer: PeerId, ref: BlobRef, options: BlobRequestOptions = {}): Promise<void> {
+		parseBlobRef(ref);
+		const request = { kind: 'held', ref } satisfies BlobRequest;
+		const exchange = await this.openAccepted(peer, request, options.signal);
+		await exchange.readSoleAnswer(request);
+		log('client:held peer=%s ref=%s ms=%d', exchange.peer, ref, exchange.elapsed());
+	}
+
+	/**
 	 * Cumulative bytes this client sent and received on blob streams: each sent frame with its length
 	 * prefix, and every chunk of bytes received, counted as it arrives (so a frame cut off part way counts
 	 * the part that arrived). Read by diagnostics and the transfer measurement.
 	 */
 	wireBytes(): { sent: number; received: number } {
 		return { sent: this.wire.sent, received: this.wire.received };
+	}
+
+	/** {@link open}, after refusing a peer whose protocol list says it does not run the blob protocol: dialing it would fail negotiation anyway, without saying why. */
+	private async openAccepted(peer: PeerId, request: BlobRequest, signal: AbortSignal | undefined): Promise<ClientExchange> {
+		const id = peer.toString();
+		if (this.init.acceptance !== undefined && await this.init.acceptance(id) === 'refuses') {
+			log('client:peer-refuses-blobs peer=%s kind=%s', id, request.kind);
+			throw new BlobPeerRefusesError(id);
+		}
+		return this.open(peer, request, signal);
 	}
 
 	/** A stream to `peer` carrying `request`, its write side closed once the request is flushed; reading continues. */
@@ -201,7 +243,7 @@ class ClientExchange {
 	}
 
 	/** The answer header, of the request's own kind; a refusal throws BlobPeerRefusedError. */
-	async readAnswer<R extends Extract<BlobRequest, { kind: 'stat' | 'get' }>>(request: R): Promise<Extract<BlobAnswer, { kind: R['kind'] }>> {
+	async readAnswer<R extends BlobRequest>(request: R): Promise<Extract<BlobAnswer, { kind: R['kind'] }>> {
 		const frame = await this.nextFrame();
 		if (frame === undefined) throw new BlobProtocolError(this.peer, 'the stream ended before an answer');
 		const answer = decodeBlobAnswer(frame, this.peer);
@@ -209,6 +251,19 @@ class ClientExchange {
 		checkAnswerFits(request, answer, this.peer);
 		// checkAnswerFits has refused every answer of another kind.
 		return answer as Extract<BlobAnswer, { kind: R['kind'] }>;
+	}
+
+	/** For a request answered by its header alone: the answer, with end of stream required. Finishes the exchange either way. */
+	async readSoleAnswer<R extends BlobRequest>(request: R): Promise<Extract<BlobAnswer, { kind: R['kind'] }>> {
+		try {
+			const answer = await this.readAnswer(request);
+			await this.requireEnd();
+			return answer;
+		} catch (err) {
+			throw this.fail(err);
+		} finally {
+			this.finish();
+		}
 	}
 
 	/** The next frame, or `undefined` at end of stream. */

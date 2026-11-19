@@ -21,6 +21,7 @@ export * from './blob/blob-frames.js';
 export * from './blob/progress-deadline.js';
 export * from './blob/blob-protocol-service.js';
 export * from './blob/blob-protocol-client.js';
+export * from './blob/accepts-blobs.js';
 export * from './blob/blob-get-slots.js';
 export * from './blob/blob-holders.js';
 export * from './blob/blob-fetcher.js';

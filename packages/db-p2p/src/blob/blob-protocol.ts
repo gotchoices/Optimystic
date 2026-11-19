@@ -16,10 +16,10 @@
  * Imports here are pure: this module is reachable from the react-native entry (`src/rn.ts`).
  */
 
-import { parseBlobRef, parsePieceId, type BlobRef, type PieceId } from '@optimystic/db-core';
+import { parseBlobRef, parsePieceId, type BlobRef, type BlobScope, type PieceId } from '@optimystic/db-core';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { toString as u8ToString } from 'uint8arrays/to-string';
-import { MAX_BLOB_GET_PIECES, MAX_BLOB_STAT_REFS } from '../protocol-limits.js';
+import { MAX_BLOB_GET_PIECES, MAX_BLOB_SCOPE_CHARS, MAX_BLOB_STAT_REFS } from '../protocol-limits.js';
 
 const BLOB_PROTOCOL_PATH = '/db-p2p/blob/';
 const BLOB_PROTOCOL_VERSION = '1.0.0';
@@ -29,15 +29,16 @@ export const buildBlobProtocol = (protocolPrefix: string = ''): string =>
 	`${protocolPrefix}${BLOB_PROTOCOL_PATH}${BLOB_PROTOCOL_VERSION}`;
 
 /**
- * First and only frame the requester sends. `announce` and `held` are reserved for copying a referenced
- * blob to its cohort; they are decoded and answered now so the wire does not change later.
+ * First and only frame the requester sends. `announce` and `held` serve copying a referenced blob to
+ * its cohort (docs/blobs.md §Placement, copying and durability).
  */
 export type BlobRequest =
 	/** 1..MAX_BLOB_STAT_REFS canonical references. */
 	| { kind: 'stat'; refs: BlobRef[] }
 	/** 1..MAX_BLOB_GET_PIECES canonical piece ids, no duplicates. */
 	| { kind: 'get'; pieces: PieceId[] }
-	| { kind: 'announce'; ref: BlobRef; scope: string }
+	/** `scope`: 1..MAX_BLOB_SCOPE_CHARS characters. */
+	| { kind: 'announce'; ref: BlobRef; scope: BlobScope }
 	| { kind: 'held'; ref: BlobRef };
 
 /** What the responder holds of one blob: all of it, some of its pieces, or none. */
@@ -199,10 +200,19 @@ function refField(header: Header, name: string, peer: string): BlobRef {
 	return canonical(parseBlobRef, header.fields[name], name, peer);
 }
 
-function scopeField(header: Header, peer: string): string {
+function scopeField(header: Header, peer: string): BlobScope {
 	const scope = header.fields.scope;
 	if (typeof scope !== 'string') throw new BlobProtocolError(peer, `'${header.kind}' has no 'scope' string`);
+	const problem = blobScopeProblem(scope);
+	if (problem !== undefined) throw new BlobProtocolError(peer, `'${header.kind}' has ${problem}`);
 	return scope;
+}
+
+/** Why `scope` cannot be announced, or `undefined`: the rule both ends apply, so the client refuses locally what the responder would call malformed. */
+export function blobScopeProblem(scope: BlobScope): string | undefined {
+	if (scope.length === 0) return 'an empty scope';
+	if (scope.length > MAX_BLOB_SCOPE_CHARS) return `a scope of ${scope.length} characters, over the cap of ${MAX_BLOB_SCOPE_CHARS}`;
+	return undefined;
 }
 
 function literalField<T extends string>(header: Header, name: string, allowed: readonly T[], peer: string): T {

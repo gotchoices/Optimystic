@@ -1,4 +1,4 @@
-import type { BlobRef } from '@optimystic/db-core';
+import type { BlobRef, BlobScope } from '@optimystic/db-core';
 
 /** Key prefix of every blob record in the node's IKVStore; one key per blob, `optimystic-blobs/<ref>`. */
 export const BLOB_RECORD_KEY_PREFIX = 'optimystic-blobs/';
@@ -13,7 +13,8 @@ export const DEFAULT_BLOB_OWNER = 'default';
 export type BlobHold =
 	| { readonly kind: 'pin'; readonly owner: string; readonly at: number }
 	| { readonly kind: 'owed'; readonly at: number }
-	| { readonly kind: 'responsible'; readonly at: number }
+	/** `scope`: the scope the reference was last verified under, which the cohort's copying re-announces with. */
+	| { readonly kind: 'responsible'; readonly at: number; readonly scope: BlobScope }
 	| { readonly kind: 'cached'; readonly at: number };
 
 export type BlobHoldKind = BlobHold['kind'];
@@ -124,6 +125,9 @@ function holdProblem(hold: unknown): string | undefined {
 	}
 	if (hold.kind === 'pin' && (typeof hold.owner !== 'string' || hold.owner === '')) {
 		return 'a pin with no owner';
+	}
+	if (hold.kind === 'responsible' && (typeof hold.scope !== 'string' || hold.scope === '')) {
+		return 'a responsible hold with no scope';
 	}
 	return undefined;
 }
