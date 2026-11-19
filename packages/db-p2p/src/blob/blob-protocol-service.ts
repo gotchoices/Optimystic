@@ -1,6 +1,6 @@
 /**
  * The server side of the blob protocol: answers `stat` and `get` from this node's own holdings, and
- * `announce` and `held` with placeholders until copying is built (docs/blobs.md §Moving pieces between
+ * hands `announce` and `held` to the node's announcement receiver (docs/blobs.md §Moving pieces between
  * machines). Registered on serving and client nodes alike, since the machine a blob was put on holds
  * its only copy until a row referencing it commits.
  *
@@ -41,9 +41,13 @@ export interface BlobProtocolServiceInit extends InboundStreamAuthorizationInit 
 	pieces: Pick<IPieceStore, 'has' | 'get'>;
 	/** LinkDeadlines.responseTimeoutMs of this node. */
 	progressTimeoutMs: number;
-	/** Set by feat-a-referenced-blob-is-copied-to-its-cohort. Absent: every announce is answered 'declined', as a node that takes no blobs would. */
+	/**
+	 * The node's decision about one announcement (`BlobAnnounceReceiver.decide` in `blob/announce-receiver.ts`).
+	 * Absent: every announce is answered 'declined', as a node that takes no blobs would. A rejection
+	 * resets the stream, which the announcer meets as a failure and asks about again.
+	 */
 	onAnnounce?: (fromPeer: string, ref: BlobRef, scope: BlobScope) => Promise<BlobAnnounceAnswer>;
-	/** Set by the same ticket. Absent: a `held` is acknowledged and ignored. */
+	/** Told that `fromPeer` now holds `ref`. Absent: a `held` is acknowledged and ignored. */
 	onHeld?: (fromPeer: string, ref: BlobRef) => void;
 }
 

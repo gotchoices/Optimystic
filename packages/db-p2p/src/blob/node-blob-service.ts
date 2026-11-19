@@ -43,6 +43,13 @@ export interface NodeBlobServiceDeps {
 	holders: BlobHolderDeps;
 	/** LinkDeadlines.responseTimeoutMs: the per-peer budget of a stat probe. */
 	probeTimeoutMs: number;
+	/**
+	 * Called once a session this service started has brought the blob whole here, so a node that is
+	 * responsible for it keeps what it read (`BlobAnnounceReceiver.keepAfterRead` in
+	 * `blob/announce-receiver.ts`, docs/blobs.md §Placement, copying and durability). Absent: nothing
+	 * is told, as a service built without a receiver wants.
+	 */
+	afterFetchedWhole?: (ref: BlobRef) => void;
 	/** Default Date.now (probe timing in the log line). */
 	now?: () => number;
 }
@@ -72,6 +79,7 @@ export class NodeBlobService implements BlobService {
 	private readonly client: Pick<BlobProtocolClient, 'stat' | 'wireBytes'>;
 	private readonly holders: BlobHolderDeps;
 	private readonly probeTimeoutMs: number;
+	private readonly afterFetchedWhole: ((ref: BlobRef) => void) | undefined;
 	private readonly now: () => number;
 	private readonly progress = new Map<BlobRef, ProgressCount>();
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
@@ -82,6 +90,7 @@ export class NodeBlobService implements BlobService {
 		this.client = deps.client;
 		this.holders = deps.holders;
 		this.probeTimeoutMs = deps.probeTimeoutMs;
+		this.afterFetchedWhole = deps.afterFetchedWhole;
 		this.now = deps.now ?? Date.now;
 		// Never unsubscribed: the fetcher lives exactly as long as the node, and so does this service.
 		this.fetcher.onPieceStored(event => this.pieceStored(event));
@@ -119,10 +128,16 @@ export class NodeBlobService implements BlobService {
 	}
 
 	/**
-	 * Brings the whole blob here, as a foreground fetch; resolves at once for a blob already whole here.
+	 * Brings the whole blob here, as a foreground fetch; resolves at once for a blob already whole here,
+	 * without starting a session, so `afterFetchedWhole` is not told of a fetch that moved nothing.
 	 * Rejects as the fetch's `done` does.
 	 */
 	async fetch(ref: BlobRef, options: BlobFetchOptions = {}): Promise<void> {
+		// Before the local stat, so a caller that cancelled still sees its own reason rather than a resolve.
+		options.signal?.throwIfAborted();
+		if ((await this.local.stat(ref)).locality === 'here') {
+			return;
+		}
 		await this.startSession(ref, { priority: 'foreground', waitMs: options.waitMs, signal: options.signal }).done;
 	}
 
@@ -214,8 +229,36 @@ export class NodeBlobService implements BlobService {
 		const count = this.progress.get(ref) ?? this.newCount(ref);
 		count.sessions++;
 		const settled = (): void => this.sessionSettled(ref, count);
-		void session.done.then(settled, settled);
+		void session.done.then(
+			() => {
+				settled();
+				this.fetchedWhole(ref);
+			},
+			settled,
+		);
 		return session;
+	}
+
+	/**
+	 * Tells `afterFetchedWhole` that a session this service started has ended with the blob whole here.
+	 * Every session it starts was started because something was missing (`readFetching` starts one only
+	 * on a miss, and `fetch` starts none for a blob already here), so a blob that is whole now is one
+	 * this fetch brought. A range read that resolved with the rest of the blob still missing is not
+	 * whole, and tells nothing.
+	 */
+	private fetchedWhole(ref: BlobRef): void {
+		const after = this.afterFetchedWhole;
+		if (after === undefined) {
+			return;
+		}
+		void this.local.stat(ref).then(
+			stat => {
+				if (stat.locality === 'here') {
+					after(ref);
+				}
+			},
+			(error: unknown) => log('fetched:stat-failed ref=%s err=%s', ref, describe(error)),
+		);
 	}
 
 	private newCount(ref: BlobRef): ProgressCount {

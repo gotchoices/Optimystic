@@ -32,9 +32,11 @@ import { blobAcceptanceOf } from './blob/accepts-blobs.js';
 import { BlobProtocolClient } from './blob/blob-protocol-client.js';
 import { BlobFetcher } from './blob/blob-fetcher.js';
 import type { BlobHolderDeps } from './blob/blob-holders.js';
-import { buildBlobProtocol } from './blob/blob-protocol.js';
+import { buildBlobProtocol, type BlobAnnounceAnswer } from './blob/blob-protocol.js';
 import { NodeBlobService } from './blob/node-blob-service.js';
 import { BlobReferenceCheck } from './blob/reference-check.js';
+import { BlobAnnounceReceiver, type BlobHoldPolicy } from './blob/announce-receiver.js';
+import { AnnounceLimiter } from './blob/announce-limiter.js';
 import { createNodeNetworkTransactor } from './node-network-transactor.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
 import type { BlockLineageAsk } from './cluster/solo-ahead.js';
@@ -136,7 +138,7 @@ import { createLogger } from './logger.js';
 import { PeerReputationService } from './reputation/peer-reputation.js';
 import type { IPeerReputation } from './reputation/types.js';
 import type { AuthorizeInboundStream, InboundStreamAuthorizationInit } from './inbound-authorization.js';
-import { createNetworkMembershipGate, type IsNetworkMember, type NetworkMembershipGate } from './network-membership-gate.js';
+import { admittedBy, createNetworkMembershipGate, type IsNetworkMember, type NetworkMembershipGate } from './network-membership-gate.js';
 import { DisputeService } from './dispute/dispute-service.js';
 import { DisputeClient } from './dispute/client.js';
 import { sampleArbitrators } from './dispute/arbitrator-selection.js';
@@ -180,6 +182,8 @@ type WiredServices = {
  * not fatal.
  */
 const wiringLog = createLogger('node-wiring');
+/** The blob protocol's own channel, for the `held` frames the node answers before anything acts on them. */
+const blobLog = createLogger('blob:protocol');
 
 /**
  * Factory function or instance for creating raw storage. The node puts the write-through read
@@ -347,8 +351,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * §References and pieces), default `defaultBlobDigest()`. A supplied digest is used as given:
 	 * checking it against the known answers (`checkBlobDigest` in `@optimystic/db-core`) before handing
 	 * it over is the host's call.
+	 *
+	 * `hold` is whether this node takes blobs it is merely responsible for (docs/blobs.md §Placement,
+	 * copying and durability), default `'eager'`. An `'on-demand'` node declines every announcement,
+	 * never takes a `responsible` hold, and still holds what it put, pinned or read. This is how a
+	 * phone joins a group without storing every file in it.
 	 */
-	blobs?: { digest?: BlobDigest };
+	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -1228,6 +1237,16 @@ export async function createLibp2pNodeBase(
 	// node's blob service). Started once the node has, below, where `node.blobs` is built over it.
 	const pieceStore = resolvePieceStore(options.pieceStorage);
 	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
+	// Read here, before the blob protocol service entry below closes over it: an on-demand node declines
+	// every announcement, including the ones that arrive before the receiver exists.
+	const blobHold: BlobHoldPolicy = options.blobs?.hold ?? 'eager';
+	// Bound after libp2p has started, below, since the receiver needs the node's key network and fetcher
+	// while the service entry is built before them.
+	let blobReceiver: BlobAnnounceReceiver | undefined;
+	// The membership check the `held` closure below applies, bound beside the receiver once the gate
+	// exists. Until then every `held` is dropped: nothing this node announced can have been fetched yet,
+	// so such a frame is unsolicited.
+	let blobPeerAdmitted: (peerId: string) => boolean = () => false;
 	// Built once: it gates the four storage protocol services on a serving node and the blob protocol on both roles.
 	const inboundAuthorization = inboundAuthorizationOf(options);
 
@@ -1421,6 +1440,16 @@ export async function createLibp2pNodeBase(
 				blobs,
 				pieces: pieceStore,
 				progressTimeoutMs: linkDeadlines.responseTimeoutMs,
+				// An announcement that arrives while the node is still starting is answered as a node whose
+				// responsibility is undetermined answers, which the announcer's drain asks about again.
+				onAnnounce: (peer, ref, scope) => blobReceiver
+					? blobReceiver.decide(peer, ref, scope)
+					: Promise.resolve<BlobAnnounceAnswer>(blobHold === 'on-demand' ? 'declined' : 'not-responsible'),
+				// Nothing acts on `held` until the owed-copies drain (`feat-blob-owed-copies-are-drained`)
+				// gives it the owed entry to settle; a non-member's is dropped unread, as its announce is.
+				onHeld: (peer, ref) => blobPeerAdmitted(peer)
+					? blobLog('held:received peer=%s ref=%s', peer, ref)
+					: blobLog('held:dropped-non-member peer=%s ref=%s', peer, ref),
 				...inboundAuthorization
 			})({ registrar: components.registrar }),
 
@@ -1694,6 +1723,9 @@ export async function createLibp2pNodeBase(
 			client: blobTransfer.client,
 			holders: blobTransfer.holders,
 			probeTimeoutMs: linkDeadlines.responseTimeoutMs,
+			// Reader repair (docs/blobs.md §Placement, copying and durability): the receiver is built a few
+			// lines below, before anything can read through this service.
+			afterFetchedWhole: ref => blobReceiver?.keepAfterRead(ref),
 		});
 		// The node's own reader of committed state, for deciding whether a blob is referenced (docs/blobs.md
 		// §Who may fetch and who may store). Built the way a host's transactor over the node is, but with no
@@ -1709,8 +1741,37 @@ export async function createLibp2pNodeBase(
 			linkDeadlines,
 			clock: hlcClock,
 		});
-		// Unused until the announce receiver (`feat-blob-announcements-are-answered`) takes it.
 		const blobReferences = new BlobReferenceCheck({ transactor: committedReader });
+		// The receiving half of `announce`, on both roles: a client is in no cohort, so it answers
+		// `not-responsible` to everything (and `declined` when it is on-demand), which is honest and
+		// costs no read. Its stop wrapper goes on at once, ahead of the fetcher's (installed earlier, so
+		// it runs after this one): a pull that ends after the receiver stops sends no `held`.
+		blobPeerAdmitted = peer => admittedBy(membership, peer);
+		blobReceiver = new BlobAnnounceReceiver({
+			selfId: node.peerId.toString(),
+			hold: blobHold,
+			keyNetwork,
+			membership,
+			limiter: new AnnounceLimiter(),
+			references: blobReferences,
+			local: blobs,
+			fetcher: blobTransfer.fetcher,
+			client: blobTransfer.client,
+			// Both ends abort a blob stream that moves no bytes for one response timeout, and nothing moves
+			// while the receiver reads committed state; the other half of the timeout is for the answer frame.
+			answerWithinMs: linkDeadlines.responseTimeoutMs / 2,
+		});
+		{
+			const receiver = blobReceiver;
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				receiver.stop();
+				await previousStop();
+			};
+		}
+		// Finishes the pulls a restart interrupted: the `responsible` hold is flushed before `fetching` is
+		// answered, so the references to resume are in this node's own blob records.
+		void blobReceiver.resume().catch(error => blobLog('resume:failed err=%s', error instanceof Error ? error.message : String(error)));
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to

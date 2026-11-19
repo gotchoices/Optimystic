@@ -130,6 +130,28 @@ export const MAX_BLOB_BACKGROUND_GET_STREAMS = 4;
 /** Most foreground blob `get` streams this node has open at once. */
 export const MAX_BLOB_FOREGROUND_GET_STREAMS = 8;
 
+/**
+ * Most blob `announce` requests this node acts on from one peer in a minute; the rest are answered
+ * `unreferenced` without reading committed state (`AnnounceLimiter` in `blob/announce-limiter.ts`,
+ * docs/blobs.md §Who may fetch and who may store).
+ *
+ * Well above what an honest announcer sends. Its owed-copies drain examines at most 64 entries a pass
+ * with at least 15 s between passes (the `UnderReplicationDrain` schedule it shares, `blockBudget` and
+ * `minIntervalMs` in `repo/under-replication-drain.ts`), so at most 256 announcements a minute, and the
+ * reaction to a cohort change announces at most 64 blobs a check with at least 60 s between checks.
+ */
+export const BLOB_ANNOUNCES_PER_PEER_PER_MINUTE = 600;
+
+/**
+ * Most reads of committed state this node runs at once to decide whether announced blobs are
+ * referenced, over every peer together, so no number of peers raises its read work. Reader repair
+ * draws on the same allowance.
+ */
+export const BLOB_REFERENCE_READS_IN_FLIGHT = 4;
+
+/** Most peers whose announcement allowance this node remembers at once; a new peer past this evicts the entry whose window started longest ago. */
+export const BLOB_ANNOUNCE_PEERS_TRACKED = 4096;
+
 /** First wait before a `waitMs` retry round of a blob fetch, doubling to {@link BLOB_WAIT_RETRY_MAX_MS}. */
 export const BLOB_WAIT_RETRY_INITIAL_MS = 500;
 

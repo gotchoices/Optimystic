@@ -17,6 +17,8 @@ export * from "./blob/blob-holders.js";
 export * from "./blob/blob-fetcher.js";
 export * from "./blob/node-blob-service.js";
 export * from "./blob/reference-check.js";
+export * from "./blob/announce-limiter.js";
+export * from "./blob/announce-receiver.js";
 export * from "./cluster/client.js";
 export * from "./cluster/client-signature-verifier.js";
 export * from "./cluster/cluster-repo.js";
