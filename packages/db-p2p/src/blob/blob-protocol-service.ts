@@ -8,7 +8,7 @@
  */
 
 import type { Connection, Startable, Stream } from '@libp2p/interface';
-import type { BlobRef, PieceId } from '@optimystic/db-core';
+import type { BlobRef, BlobScope, PieceId } from '@optimystic/db-core';
 import { createLogger } from '../logger.js';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
 import { registerProtocolHandler, type ProtocolRegistrar } from '../network/register-protocol-handler.js';
@@ -42,7 +42,7 @@ export interface BlobProtocolServiceInit extends InboundStreamAuthorizationInit 
 	/** LinkDeadlines.responseTimeoutMs of this node. */
 	progressTimeoutMs: number;
 	/** Set by feat-a-referenced-blob-is-copied-to-its-cohort. Absent: every announce is answered 'declined', as a node that takes no blobs would. */
-	onAnnounce?: (fromPeer: string, ref: BlobRef, scope: string) => Promise<BlobAnnounceAnswer>;
+	onAnnounce?: (fromPeer: string, ref: BlobRef, scope: BlobScope) => Promise<BlobAnnounceAnswer>;
 	/** Set by the same ticket. Absent: a `held` is acknowledged and ignored. */
 	onHeld?: (fromPeer: string, ref: BlobRef) => void;
 }

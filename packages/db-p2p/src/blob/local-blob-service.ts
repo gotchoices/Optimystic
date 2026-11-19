@@ -24,6 +24,7 @@ import {
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
 import { armUnrefTimer } from '../unref-timer.js';
+import { blobScopeProblem } from './blob-protocol.js';
 import { BlobRecordFormatError, DEFAULT_BLOB_OWNER, type BlobHold, type BlobRecord } from './blob-record.js';
 import { BlobRecordStore, type BlobRecordChange } from './blob-record-store.js';
 import { localPieceSource } from './local-piece-source.js';
@@ -264,11 +265,15 @@ export class LocalBlobService implements BlobService {
 	}
 
 	/**
-	 * Holds the blob because this node is responsible for it and found it referenced under `scope` (an
-	 * empty scope throws RangeError): adds the `responsible` hold, or replaces an existing one's scope
-	 * and `at`, creating the record (`whole: false`) when there is none. Every other hold is kept.
+	 * Holds the blob because this node is responsible for it and found it referenced under `scope`:
+	 * adds the `responsible` hold, or replaces an existing one's scope and `at`, creating the record
+	 * (`whole: false`) when there is none. Every other hold is kept. A scope `blobScopeProblem` refuses
+	 * throws RangeError, so a hold can never carry a scope the re-announce would refuse to send.
 	 * Flushed before it resolves: a lost hold would let a restart sweep a blob this node told an
 	 * announcer it is pulling.
+	 *
+	 * NOTE: `at` is "last verified", so every call writes and flushes even when the scope is unchanged.
+	 * If a caller ever re-verifies every responsible blob on a schedule, give it a way to skip the write.
 	 */
 	async holdResponsible(ref: BlobRef, scope: BlobScope): Promise<void> {
 		assertScope(scope);
@@ -478,9 +483,11 @@ function assertOwner(owner: string): void {
 	}
 }
 
+/** The wire's scope rule, applied at the store's entrance: a stored scope exists only to be re-announced. */
 function assertScope(scope: BlobScope): void {
-	if (scope === '') {
-		throw new RangeError('A blob scope must be a non-empty string');
+	const problem = blobScopeProblem(scope);
+	if (problem !== undefined) {
+		throw new RangeError(`A blob hold has ${problem}`);
 	}
 }
 

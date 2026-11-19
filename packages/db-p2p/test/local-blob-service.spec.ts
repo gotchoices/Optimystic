@@ -6,6 +6,7 @@ import { LocalBlobService } from '../src/blob/local-blob-service.js';
 import { localPieceSource } from '../src/blob/local-piece-source.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
 import type { IPieceStore } from '../src/blob/piece-store.js';
+import { MAX_BLOB_SCOPE_CHARS } from '../src/protocol-limits.js';
 import type { IKVStore } from '../src/storage/i-kv-store.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { PowerLossKVStore } from '../src/testing/power-loss-kv-store.js';
@@ -404,6 +405,35 @@ describe('LocalBlobService', () => {
 		expect(await readAll(restarted.read(ref))).to.deep.equal(content);
 		await restarted.unpin(ref, DEFAULT_BLOB_OWNER);
 		expect(await recordOf(reopenedKv, ref)).to.equal(undefined);
+	});
+
+	it('a responsible hold keeps the pin, replaces its scope, and is enumerated past an unreadable record', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		const content = bytesOf(1000, 20);
+		const { ref } = await service.put(streamOf(content));
+
+		await service.holdResponsible(ref, 'collection-a');
+		expect(await service.responsibleScope(ref)).to.equal('collection-a');
+		expect((await recordOf(kv, ref))?.holds.map(hold => hold.kind)).to.have.members(['pin', 'responsible']);
+
+		await service.holdResponsible(ref, 'collection-b');
+		expect(await service.responsibleScope(ref)).to.equal('collection-b');
+		expect((await recordOf(kv, ref))?.holds.filter(hold => hold.kind === 'responsible')).to.have.length(1);
+
+		// A reference nothing holds responsible, and one whose record no longer decodes: neither is listed.
+		const pinnedOnly = await refOf(bytesOf(1000, 21));
+		await service.pin(pinnedOnly, 'app');
+		const unreadable = await refOf(bytesOf(1000, 22));
+		await kv.set(BLOB_RECORD_KEY_PREFIX + unreadable, 'garbage');
+		expect(await service.responsibleRefs()).to.deep.equal([ref]);
+
+		const empty = await service.holdResponsible(ref, '').catch((error: unknown) => error);
+		expect(empty).to.be.instanceOf(RangeError);
+		const tooLong = await service.holdResponsible(ref, 'x'.repeat(MAX_BLOB_SCOPE_CHARS + 1)).catch((error: unknown) => error);
+		expect(tooLong).to.be.instanceOf(RangeError);
+		expect(await service.responsibleScope(ref)).to.equal('collection-b');
 	});
 
 	it('a malformed record stops the sweep', async () => {

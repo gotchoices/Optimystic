@@ -13,7 +13,11 @@ import type { Libp2pKeyPeerNetwork } from '../libp2p-key-network.js';
 /** What this node knows about whether a peer runs the blob protocol, from its protocol list. */
 export type BlobAcceptance = 'accepts' | 'refuses' | 'unknown';
 
-/** Thrown, before dialing, for a peer whose protocol list says it does not run the blob protocol (an older build: docs/blobs.md §Compatibility). */
+/**
+ * Thrown, before dialing, for a peer whose protocol list says it does not run the blob protocol (an
+ * older build: docs/blobs.md §Compatibility). Not `BlobPeerRefusedError` (`blob-protocol.ts`), one
+ * letter away, which a peer that DOES run it raises by answering `refused` to one request.
+ */
 export class BlobPeerRefusesError extends Error {
 	constructor(readonly peer: string) {
 		super(`peer ${peer} does not run the blob protocol`);

@@ -67,7 +67,10 @@ export class BlobTransferStalledError extends Error {
 	}
 }
 
-/** The responder answered `refused`. */
+/**
+ * The responder answered `refused` to one request. Not `BlobPeerRefusesError` (`accepts-blobs.ts`),
+ * one letter away, which is raised without asking, for a peer whose protocol list lacks this protocol.
+ */
 export class BlobPeerRefusedError extends Error {
 	constructor(readonly peer: string, readonly reason: BlobRefusalReason) {
 		super(`blob request refused: peer=${peer} reason=${reason}`);
