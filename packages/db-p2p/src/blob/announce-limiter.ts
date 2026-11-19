@@ -21,6 +21,14 @@ interface PeerWindow {
 	count: number;
 }
 
+/** One read waiting its turn; `settle(false)` is the wait being abandoned before a slot came free. */
+interface Waiter {
+	readonly settle: (gotSlot: boolean) => void;
+}
+
+/** What {@link AnnounceLimiter.readSlot} answers for a read abandoned in the queue, so it never ran. */
+export const READ_ABANDONED = Symbol('blob reference read abandoned before its turn came');
+
 export interface AnnounceLimiterOptions {
 	/** Default {@link BLOB_ANNOUNCES_PER_PEER_PER_MINUTE}. */
 	perPeerPerMinute?: number;
@@ -44,8 +52,8 @@ export class AnnounceLimiter {
 	private readonly windows = new Map<string, PeerWindow>();
 	/** Reads running now, counted against {@link readsInFlight}. */
 	private reading = 0;
-	/** Each waiting read's `takeSlot` resolver, oldest first. */
-	private readonly waiting: (() => void)[] = [];
+	/** The reads waiting their turn, oldest first. */
+	private readonly waiting: Waiter[] = [];
 
 	constructor(options: AnnounceLimiterOptions = {}) {
 		this.perPeerPerMinute = options.perPeerPerMinute ?? BLOB_ANNOUNCES_PER_PEER_PER_MINUTE;
@@ -70,12 +78,22 @@ export class AnnounceLimiter {
 
 	/**
 	 * Runs `read` once fewer than the node's limit of reads are running, waiting its turn otherwise
-	 * (first come, first served); never refuses. Resolves or rejects with `read`'s own outcome, and
-	 * gives the slot back either way — so a read the caller has stopped waiting for still holds its
-	 * slot until it finishes, which is what keeps a slow read counting against the node's read work.
+	 * (first come, first served). Resolves or rejects with `read`'s own outcome, and gives the slot back
+	 * either way — so a read the caller has stopped waiting for still holds its slot until it finishes,
+	 * which is what keeps a slow read counting against the node's read work.
+	 *
+	 * `abandonIf` is the caller saying its answer has a deadline: once that signal aborts, a read still
+	 * in the queue is dropped unrun and answered {@link READ_ABANDONED}. Without it the queue would
+	 * outlive every answer it was going to serve — announcements arriving faster than reads finish
+	 * would pile up reads nobody is waiting for, and the node would spend its whole read allowance on
+	 * decisions already answered. A read that has STARTED is never abandoned: it keeps its slot.
 	 */
-	async readSlot<T>(read: () => Promise<T>): Promise<T> {
-		await this.takeSlot();
+	readSlot<T>(read: () => Promise<T>): Promise<T>;
+	readSlot<T>(read: () => Promise<T>, abandonIf: AbortSignal): Promise<T | typeof READ_ABANDONED>;
+	async readSlot<T>(read: () => Promise<T>, abandonIf?: AbortSignal): Promise<T | typeof READ_ABANDONED> {
+		if (!await this.takeSlot(abandonIf)) {
+			return READ_ABANDONED;
+		}
 		try {
 			return await read();
 		} finally {
@@ -120,14 +138,41 @@ export class AnnounceLimiter {
 		}
 	}
 
-	private takeSlot(): Promise<void> {
+	/** Whether the caller now holds a slot; false only for a wait `abandonIf` ended first. */
+	private takeSlot(abandonIf: AbortSignal | undefined): Promise<boolean> {
 		if (this.reading < this.readsInFlight) {
 			this.reading++;
-			return Promise.resolve();
+			return Promise.resolve(true);
 		}
-		return new Promise<void>(resolve => {
-			this.waiting.push(resolve);
-		});
+		if (abandonIf?.aborted === true) {
+			return Promise.resolve(false);
+		}
+		let settle!: (gotSlot: boolean) => void;
+		const gotSlot = new Promise<boolean>(resolve => { settle = resolve; });
+		const waiter: Waiter = { settle };
+		this.waiting.push(waiter);
+		if (abandonIf !== undefined) {
+			const abandon = (): void => {
+				if (this.dropWaiter(waiter)) {
+					settle(false);
+				}
+			};
+			abandonIf.addEventListener('abort', abandon, { once: true });
+			// Taken off however the wait ended: the signal outlives this read, and a listener left on it
+			// would hold the waiter (and the read's closure) for as long as the signal's owner lives.
+			void gotSlot.finally(() => abandonIf.removeEventListener('abort', abandon));
+		}
+		return gotSlot;
+	}
+
+	/** Takes `waiter` out of the queue; false when the slot had already passed to it. */
+	private dropWaiter(waiter: Waiter): boolean {
+		const at = this.waiting.indexOf(waiter);
+		if (at < 0) {
+			return false;
+		}
+		this.waiting.splice(at, 1);
+		return true;
 	}
 
 	/** The slot passes straight to the oldest waiter, so `reading` stays at the cap while any waits. */
@@ -136,7 +181,7 @@ export class AnnounceLimiter {
 		if (next === undefined) {
 			this.reading--;
 		} else {
-			next();
+			next.settle(true);
 		}
 	}
 }

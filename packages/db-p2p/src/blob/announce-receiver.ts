@@ -13,7 +13,7 @@ import { routingKeyForBlob, type BlobRef, type BlobScope, type BlobStat, type IK
 import { createLogger } from '../logger.js';
 import { admittedBy, type NetworkMembershipGate } from '../network-membership-gate.js';
 import { armUnrefTimer } from '../unref-timer.js';
-import type { AnnounceLimiter } from './announce-limiter.js';
+import { READ_ABANDONED, type AnnounceLimiter } from './announce-limiter.js';
 import type { BlobFetcher } from './blob-fetcher.js';
 import type { BlobAnnounceAnswer } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
@@ -43,8 +43,14 @@ export interface BlobAnnounceReceiverDeps {
 	setTimer?: (fn: () => void, ms: number) => () => void;
 }
 
-/** What a read that ran out of its budget answers with, told apart from a verdict by identity. */
-const RAN_LATE = Symbol('blob reference read ran past the answer budget');
+/**
+ * A reference read that did not answer inside the budget, in place of a verdict: `started` says whether
+ * it had begun (and so still holds its read slot) or was still queued and was dropped unrun.
+ */
+interface RanLate {
+	readonly ranLate: true;
+	readonly started: boolean;
+}
 
 /**
  * One node's answer to the announcements it receives. The decision is made from committed state and
@@ -102,6 +108,10 @@ export class BlobAnnounceReceiver {
 		if (this.deps.hold === 'on-demand') {
 			return;
 		}
+		// NOTE: every interrupted pull is started at once. The fetcher's background `get` slots bound the
+		// streams, not the number of live sessions, so a node that crashed with thousands of pulls open
+		// walks thousands of local trees at once on its way up. If that is ever seen, start them in
+		// batches of the fetcher's slot count.
 		for (const ref of await this.deps.local.responsibleRefs()) {
 			if (await this.localityOf(ref) !== 'here') {
 				this.startPull(ref, undefined);
@@ -134,8 +144,8 @@ export class BlobAnnounceReceiver {
 			return 'unreferenced';
 		}
 		const verdict = await this.referenced(ref, scope, startedAt);
-		if (verdict === RAN_LATE) {
-			log('announce:read-slow peer=%s ref=%s ms=%d', announcer, ref, this.now() - startedAt);
+		if ('ranLate' in verdict) {
+			log('announce:read-slow peer=%s ref=%s ms=%d started=%s', announcer, ref, this.now() - startedAt, verdict.started);
 			return 'unreferenced';
 		}
 		if (verdict.kind !== 'listed') {
@@ -157,22 +167,36 @@ export class BlobAnnounceReceiver {
 	 * for a read slot counts: both ends of the exchange abort a stream that moves no bytes for one
 	 * response timeout, and nothing moves while this reads.
 	 *
-	 * A read that runs late keeps its slot until it finishes (so slow reads still bound the node's read
-	 * work) and its answer is discarded. `unreferenced` is also what the announcer gets for a read that
-	 * could not be trusted, and its drain asks again either way.
+	 * A read that has STARTED and runs late keeps its slot until it finishes (so slow reads still bound
+	 * the node's read work) and its answer is discarded. A read still waiting its turn when the budget
+	 * runs out is abandoned unrun, so announcements arriving faster than reads finish cannot pile up
+	 * reads for answers that have already been sent.
+	 *
+	 * `unreferenced` is also what the announcer gets for a read that could not be trusted, and its drain
+	 * asks again either way.
 	 */
-	private async referenced(ref: BlobRef, scope: BlobScope, startedAt: number): Promise<ReferenceVerdict | typeof RAN_LATE> {
-		const read = this.deps.limiter.readSlot(() => this.deps.references.inScope(ref, scope))
+	private async referenced(ref: BlobRef, scope: BlobScope, startedAt: number): Promise<ReferenceVerdict | RanLate> {
+		let started = false;
+		const budget = new AbortController();
+		const read = this.deps.limiter
+			.readSlot(() => {
+				started = true;
+				return this.deps.references.inScope(ref, scope);
+			}, budget.signal)
+			.then((answer): ReferenceVerdict | RanLate => answer === READ_ABANDONED ? { ranLate: true, started } : answer)
 			.catch((error: unknown): ReferenceVerdict => {
 				// `BlobReferenceCheck` answers an unreadable tree as uncertain rather than throwing, so this
 				// is a fault it does not model; absence is not established either way.
 				log.error('announce:read-failed ref=%s scope=%s err=%s', ref, scope, describe(error));
 				return { kind: 'uncertain', reason: describe(error) };
 			});
-		const left = Math.max(0, this.deps.answerWithinMs - (this.now() - startedAt));
 		let cancelTimer: (() => void) | undefined;
-		const ranLate = new Promise<typeof RAN_LATE>(resolve => {
-			cancelTimer = this.setTimer(() => resolve(RAN_LATE), left);
+		const ranLate = new Promise<RanLate>(resolve => {
+			const left = Math.max(0, this.deps.answerWithinMs - (this.now() - startedAt));
+			cancelTimer = this.setTimer(() => {
+				budget.abort();
+				resolve({ ranLate: true, started });
+			}, left);
 		});
 		try {
 			return await Promise.race([read, ranLate]);
