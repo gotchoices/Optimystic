@@ -79,6 +79,7 @@ describe('blob reference check', () => {
 		const check = new BlobReferenceCheck({ transactor: net });
 		net.staleHeader = REGISTERED;
 
-		expect((await check.inScope(ref, REGISTERED)).kind).to.equal('uncertain');
+		// `readCommittedTree` absorbs the error, so the uncertainty is the tree's, not a failed read's.
+		expect(await check.inScope(ref, REGISTERED)).to.deep.equal({ kind: 'uncertain', reason: 'tree-uncertain' });
 	});
 });
