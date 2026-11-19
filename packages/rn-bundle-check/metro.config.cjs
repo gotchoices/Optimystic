@@ -212,11 +212,27 @@ function packageEntries(nodeModules) {
 			: [path.join(nodeModules, name)]);
 }
 
-/** Where `entry` links to; `undefined` for a real directory. A dangling link throws, naming itself. */
+/**
+ * Where `entry` links to; `undefined` for a real directory. A dangling link throws, naming itself.
+ *
+ * Spelled the way the link itself spells it — `fs.realpathSync`, NOT `fs.realpathSync.native` — because
+ * that is the spelling Metro sees. metro-file-map stores a symlink's target verbatim as `readlink`
+ * reported it and relativizes that string against the project root by a case-sensitive segment
+ * comparison (`RootPathUtils.absoluteToNormal`), so the watch root derived from it has to carry the same
+ * segment spellings or the target lands under a key nothing crawled. `.native` asks the operating system
+ * for the canonical spelling instead, and on Windows the two differ whenever a link's target is spelled
+ * with a case the directory does not have: Yarn writes a portal's link with the case `package.json`
+ * spells (`portal:../quereus/packages/quereus`), while the checkout on disk is `C:\Projects\Quereus`, and
+ * `yarn check:rn` failed with "Unable to resolve module @quereus/quereus" from the plugin's own `dist/`
+ * — it watched `..\Quereus` while Metro looked up `..\quereus`. Which of the two spellings wins does not
+ * matter (`path.relative` settles the drive letter case-insensitively, and everything below the
+ * repository's parent is relativized the same way for the watch root and for the target); agreeing with
+ * the link does. `test/sibling-watch-root-case.test.mjs` fails when they drift apart again.
+ */
 function linkTarget(entry) {
 	if (!fs.lstatSync(entry).isSymbolicLink()) return undefined;
 	try {
-		return fs.realpathSync.native(entry);
+		return fs.realpathSync(entry);
 	} catch (error) {
 		throw new Error(`${entry} links to a path that no longer exists; run yarn install`, { cause: error });
 	}
