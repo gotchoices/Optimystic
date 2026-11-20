@@ -142,25 +142,36 @@ export class OwedBlobLedger {
 	/**
 	 * Drop the reclaim mark; no entry, or no mark, is a no-op.
 	 *
-	 * **Not flushed**, the one exception to this class's rule that every public write is durable before
-	 * it returns. A mark is advisory: one a crash loses costs a delay of one grace period and never a
-	 * lost copy, while flushing per entry would cost a node with thousands of them one store flush
-	 * each per pass. What the rule exists for is unchanged — every call that creates or deletes an
-	 * entry still flushes, because an entry a restart forgets is a copy nobody will ever send.
+	 * **Flushed when it dropped one**, unlike {@link markUnlisted}: losing a mark and losing a clear
+	 * are not equally cheap. A mark a crash loses the next pass makes again, costing a delay; a *clear*
+	 * a crash loses leaves a mark already older than the grace period on an entry whose scope lists
+	 * the blob again, so the first later pass that finds it unlisted drops the entry — and with it the
+	 * `owed` hold — having given no grace period at all. Only the write that actually drops a mark
+	 * flushes, once per entry per mark, so this keeps the class's rule for every write that changed
+	 * something.
 	 */
 	async clearUnlisted(ref: BlobRef): Promise<void> {
 		const key = keyFor(ref);
-		await this.queue.run(ref, async () => {
+		const wrote = await this.queue.run(ref, async () => {
 			const existing = await this.read(ref);
-			if (existing === undefined || existing.unlistedSince === undefined) return;
+			if (existing === undefined || existing.unlistedSince === undefined) return false;
 			await this.kv.set(key, JSON.stringify(withoutUnlistedSince(existing)));
+			return true;
 		});
+		if (wrote) await this.flushWrites();
 	}
 
 	/**
 	 * Set the reclaim mark to `at` while the entry exists; answers whether it wrote. Never creates an
-	 * entry (an entry deleted meanwhile stays deleted). Not flushed, for the reason
-	 * {@link clearUnlisted} gives.
+	 * entry (an entry deleted meanwhile stays deleted).
+	 *
+	 * **Not flushed**, the one exception to this class's rule that every public write is durable before
+	 * it returns. A mark is advisory in this direction: one a crash loses costs a delay of one grace
+	 * period and never a lost copy, while flushing here would cost one store flush per entry in the
+	 * pass that first marks them, thousands at once on a node whose scopes were all emptied together.
+	 * What the rule exists for is unchanged — every call that creates or deletes an entry still
+	 * flushes, because an entry a restart forgets is a copy nobody will ever send, and so does
+	 * {@link clearUnlisted}.
 	 */
 	async markUnlisted(ref: BlobRef, at: number): Promise<boolean> {
 		const key = keyFor(ref);
@@ -177,7 +188,7 @@ export class OwedBlobLedger {
 	 * wrote. An entry the drain deleted meanwhile reads as absent, so this answers `false` and the
 	 * pass leaves the `owed` hold to the drain, which released it with the entry.
 	 *
-	 * **Flushed**, unlike the two mark writes above. The pass deletes the entry and then releases the
+	 * **Flushed**, unlike {@link markUnlisted}. The pass deletes the entry and then releases the
 	 * `owed` hold, in that order, because a crash between the two leaves a hold with no entry —
 	 * storage kept, nothing lost — while the reverse leaves an entry whose drain announces a blob this
 	 * node no longer holds. That ordering only holds if the delete is durable before the release

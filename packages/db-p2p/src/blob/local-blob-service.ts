@@ -183,10 +183,18 @@ export interface BlobReclaimRecords {
 	 *  not decode is logged (`record:unreadable`) and skipped, as `responsibleRefs` does. */
 	responsibleMarks(): Promise<ResponsibleMark[]>;
 	/** Drop the mark. A record that is gone, holds no `responsible` hold, or carries no mark is a
-	 *  no-op. Not flushed: a mark a crash restores costs a delay of one grace period, never a copy. */
+	 *  no-op. Flushed when it dropped one, unlike {@link markUnreferenced}: the two directions are not
+	 *  equally safe to lose. A mark a crash loses the next pass makes again, costing a delay; a *clear*
+	 *  a crash loses leaves a mark already older than the grace period on a blob that is referenced
+	 *  again, so the first later pass that finds the blob listed nowhere releases it with no grace
+	 *  period at all. Only the write that actually drops a mark flushes — once per blob per mark, not
+	 *  once per blob per pass. */
 	clearUnreferenced(ref: BlobRef): Promise<void>;
 	/** Set the mark to `at` while the record still holds `responsible`; answers whether it wrote.
-	 *  Not flushed, for the reason {@link clearUnreferenced} gives.
+	 *  Not flushed: a mark a crash loses costs a delay of one grace period and never a copy, while
+	 *  flushing here would cost one store flush per blob in the pass that first marks them — thousands
+	 *  at once on a node whose references were all dropped together.
+	 *  {@link clearUnreferenced} says why the other direction does flush.
 	 *
 	 *  No expected-mark condition, unlike {@link releaseResponsibleIfMarked}'s: nothing but the pass
 	 *  writes a mark and passes never overlap, so the only thing that can change a mark under a
@@ -567,9 +575,11 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		return marks.sort((a, b) => a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0);
 	}
 
-	/** {@link BlobReclaimRecords.clearUnreferenced}. */
+	/** {@link BlobReclaimRecords.clearUnreferenced}. Flushed only when a mark was there to drop, so the pass pays a flush per mark rather than per reference it finds still listed. */
 	async clearUnreferenced(ref: BlobRef): Promise<void> {
-		await this.changeRecord(ref, recordWithoutUnreferencedMark);
+		if (await this.changeRecordIfDifferent(ref, recordWithoutUnreferencedMark)) {
+			await this.records.flush();
+		}
 	}
 
 	/**
@@ -578,36 +588,20 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 * a blob whose `responsible` hold went since the pass's enumeration is left alone.
 	 */
 	async markUnreferenced(ref: BlobRef, at: number): Promise<boolean> {
-		// Read off the change function rather than the change's before/after: the record survives a
-		// mark write either way, so presence cannot tell a write from a no-op. `BlobRecordStore.apply`
-		// calls the change function exactly once per update, which is what makes the flag sound.
-		let wrote = false;
-		await this.changeRecord(ref, current => {
-			const next = recordWithUnreferencedMark(current, at);
-			wrote = next !== current;
-			return next;
-		});
-		return wrote;
+		return this.changeRecordIfDifferent(ref, current => recordWithUnreferencedMark(current, at));
 	}
 
 	/**
 	 * {@link BlobReclaimRecords.releaseResponsibleIfMarked}. The change function is itself the
 	 * condition, for the reason `markUnreferenced` gives — and here it is the whole safety argument:
 	 * a hold released and taken again since the pass's enumeration carries no mark, so this writes
-	 * nothing and the live hold stands.
+	 * nothing and the live hold stands. The contract's other half needs no test of its own:
+	 * `recordAfterResponsibleRelease` answers a record with no such hold unchanged, so a stray mark on
+	 * a holdless record releases nothing and is reported as nothing written.
 	 */
 	async releaseResponsibleIfMarked(ref: BlobRef, mark: number): Promise<boolean> {
-		let wrote = false;
-		await this.changeRecord(ref, current => {
-			// The hold as well as the mark, though every write that removes the hold also clears the
-			// mark: a record written by a build that had the field and not that rule must not be read
-			// as a release that happened.
-			if (current === undefined || current.unreferencedSince !== mark || responsibleHoldOf(current) === undefined) {
-				return current;
-			}
-			wrote = true;
-			return recordAfterResponsibleRelease(current);
-		});
+		const wrote = await this.changeRecordIfDifferent(ref, current =>
+			current === undefined || current.unreferencedSince !== mark ? current : recordAfterResponsibleRelease(current));
 		await this.records.flush();
 		return wrote;
 	}
@@ -759,6 +753,25 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		}
 		this.emitHoldsChanged(ref, result);
 		return result;
+	}
+
+	/**
+	 * {@link changeRecord}, answering whether `change` returned a record other than the one it was
+	 * given: the write test the three mark writes need, since all three may leave the record in place.
+	 *
+	 * Read off the change function rather than the change's before/after, which cannot tell a mark
+	 * write from a no-op — the record survives either way. `BlobRecordStore.apply` calls the change
+	 * function exactly once per update, which is what makes the answer sound, and writes nothing for a
+	 * change that answered the record it was given, which is what makes it true.
+	 */
+	private async changeRecordIfDifferent(ref: BlobRef, change: (current: BlobRecord | undefined) => BlobRecord | undefined): Promise<boolean> {
+		let wrote = false;
+		await this.changeRecord(ref, current => {
+			const next = change(current);
+			wrote = next !== current;
+			return next;
+		});
+		return wrote;
 	}
 
 	/**
@@ -939,6 +952,10 @@ function withPin(holds: readonly BlobHold[], owner: string, at: number): readonl
 	return [...holds, { kind: 'pin', owner, at }];
 }
 
+// NOTE: from here to `cacheOnly` is the module's record-shaping block — pure `BlobRecord` in,
+// `BlobRecord` out, none of it touching the class. It is what has grown with each hold the service
+// learned, and the file is 1150 lines with it (`wc -l`). If it grows again, move the block to its own
+// `blob-record-changes.ts`; splitting it is a rename, since every function in it is module-private.
 /** The owner's pin added unless it already pins it, the size set and the blob whole; every other hold and field kept. */
 function recordAfterPut(current: BlobRecord | undefined, { ref, size }: BlobPutResult, owner: string, at: number): BlobRecord {
 	const holds = current?.holds ?? [];
