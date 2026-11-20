@@ -113,6 +113,12 @@ export class BlobCopyDrain implements Startable {
 	 * Peers that answered `declined` since they last connected. Per peer, not per blob: a node
 	 * declines because of its own `blobs.hold`, so one answer settles every blob. Cleared when the
 	 * peer's only connection opens, which is also when the scheduler retries an abandoned peer.
+	 *
+	 * NOTE: one string per peer that ever declined, and a peer that never reconnects is never
+	 * forgotten — unlike the scheduler's abandonment, which `forgetDisconnected` prunes each pass.
+	 * Bounded by the distinct peers this node has met, which is the order of its other per-peer state;
+	 * if a long-lived node in a large network ever shows this set growing, cap it with eviction as
+	 * `AnnounceLimiter` caps its windows (`BLOB_ANNOUNCE_PEERS_TRACKED`).
 	 */
 	private readonly declining = new Set<string>();
 	/** One durability transition at a time per ref — see {@link settleRef}. */
@@ -371,6 +377,13 @@ export class BlobCopyDrain implements Startable {
 	 * Every path that can change a blob's durability comes through here, serialized per ref: without a
 	 * single point, a `settle` driven by an incoming `held` and a pass classifying at the same time can
 	 * both decide the class changed and emit the same value twice.
+	 *
+	 * NOTE: the "changed" test reads the class back off the blob's record, and `setDurability` never
+	 * creates a record — so a blob whose record went while its entry stayed would read as changed on
+	 * every pass and emit the same class each time. The `owed` hold is what stops that pairing from
+	 * arising (a held record is not swept), and the entry is deleted the moment the class is `full`, so
+	 * there is no loop; if a store fault or a future reclaim pass ever does leave an entry without a
+	 * record, remember the last emitted class in memory beside the record rather than only on it.
 	 */
 	private settleRef(ref: BlobRef, view: BlobCohortView): Promise<BlobDurability | undefined> {
 		return this.transitions.run(ref, async () => {
