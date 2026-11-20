@@ -1,7 +1,8 @@
 /**
  * `node.blobs` over the network (docs/blobs.md §The node's blob service): a read on one machine
  * brings the pieces another machine holds, reporting progress as they arrive, a `stat` probe finds
- * the holder, and `waitMs` keeps a read alive until a holder appears. Two real nodes over loopback TCP.
+ * the holder, a read of a range of a blob leaves a record the cache budget can cost, and `waitMs`
+ * keeps a read alive until a holder appears. Two real nodes over loopback TCP.
  */
 import { expect } from 'chai';
 import { multiaddr } from '@multiformats/multiaddr';
@@ -98,6 +99,24 @@ describe('node blob service over the network', function () {
 		const last = events[events.length - 1]!;
 		expect(last).to.deep.equal({ ref, piecesFetched: 4, bytesFetched: pieceBytes, size: SIZE });
 		expect((await b.blobs.stat(ref)).locality).to.equal('here');
+	});
+
+	it('records the size of a blob it fetched only a range of, so the cache budget can cost it', async () => {
+		const aPieces = new MemoryPieceStore();
+		const { a, b } = await startPair(aPieces);
+		// Small enough to be one piece, whose root is the data itself: no list piece carries the blob's
+		// size, so only the end of the fetch can record one (docs/blobs.md §Lifetime).
+		const content = deterministicBytes(1024, 3);
+		const { ref } = await a.blobs.put(streamOf(content));
+		await untilCohortIncludes(b, a, ref);
+
+		expect(Buffer.compare(await concat(b.blobs.read(ref, { offset: 100, length: 200 })), content.subarray(100, 300))).to.equal(0);
+
+		// Awaited rather than asserted outright: the read returns as soon as its range is here, while
+		// the session behind it is still walking to confirm and writing the record.
+		await until(async () => (await b.blobs.local.cachedBlobs()).some(blob => blob.bytes === content.byteLength),
+			"B's record of the blob carries the blob's size");
+		expect((await b.blobs.local.cachedBlobs()).map(blob => blob.ref)).to.deep.equal([ref]);
 	});
 
 	it('keeps a read with waitMs alive until a holder has the blob', async () => {

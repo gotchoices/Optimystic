@@ -54,10 +54,11 @@ const NOTHING_ENFORCED: CacheEnforcement = { cachedBytes: 0, evicted: [], skippe
  * the walk: this node holds part of it and never learned how big the whole is, so it cannot bound
  * what it is spending there, and a cost it cannot bound is not one it keeps. Those go first, least
  * recently read among themselves, and then the walk over the sized blobs runs until their total is
- * within budget. A fetch writes the size as soon as its plan reads it off the root list piece
- * (`BlobFetchStore.markPartial`), so the blobs this reaches are the ones a crash caught between the
- * root piece arriving and that write. An unsized blob is not the same thing as an empty one: a 0-byte
- * blob's record says `size: 0` and it is counted and walked like any other.
+ * within budget. A fetch writes the size as soon as it knows it (`BlobFetchStore.markPartial`), so
+ * what this reaches is a fetch that never got the blob's root piece and so holds nothing worth
+ * keeping, or one a crash caught between that piece arriving and the write. An unsized blob is not
+ * the same thing as an empty one: a 0-byte blob's record says `size: 0` and it is counted and walked
+ * like any other.
  *
  * A budget the walk cannot reach because every remaining blob is in use leaves the cache over budget;
  * the next enforcement tries again, and nothing retries on a timer.
@@ -65,6 +66,7 @@ const NOTHING_ENFORCED: CacheEnforcement = { cachedBytes: 0, evicted: [], skippe
 export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: number, inUse: (ref: BlobRef) => boolean): CacheEvictionChoice {
 	const ordered = [...blobs].sort(leastRecentlyReadFirst);
 	const sized = ordered.filter(isSized);
+	const unsized = ordered.filter(blob => !isSized(blob));
 	// NOTE: a cache-only blob counts at the blob's full size whether or not every piece is here, which
 	// over-counts a partly held blob — the direction docs/blobs.md §Lifetime accepts for pieces shared
 	// between blobs, since it evicts sooner and so uses less storage, not more. While nothing asks for
@@ -85,10 +87,8 @@ export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: numbe
 		evict.push(blob.ref);
 		return true;
 	};
-	for (const blob of ordered) {
-		if (blob.bytes === undefined) {
-			choose(blob);
-		}
+	for (const blob of unsized) {
+		choose(blob);
 	}
 	let evictedBytes = 0;
 	for (const blob of sized) {

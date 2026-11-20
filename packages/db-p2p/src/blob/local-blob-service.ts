@@ -63,8 +63,10 @@ export interface BlobFetchStore {
 	 * Sets `size` on the existing record and the `whole` hint to false: the size of a blob this node
 	 * holds only part of. Never creates a record; a failure is logged, not thrown. Not flushed.
 	 *
-	 * The caller holds `ref` (`holdCached`) first. `whole: false` is the honest hint, since a fetch
-	 * that got this far found something missing; `markWhole` sets it back once every piece is here.
+	 * The caller holds `ref` (`holdCached`) first. `whole: false` is what the record already says, and
+	 * `markWhole` sets it back once every piece is here. A range that completed over a blob of one
+	 * piece is the case this leaves understating what is held — the safe direction {@link holdsWhole}
+	 * describes, corrected by the next read or `stat`.
 	 */
 	markPartial(ref: BlobRef, size: number): Promise<void>;
 }
