@@ -383,6 +383,8 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 			expect(requests[1]!.proofRefs, 'the second block names the proof instead').to.deep.equal({ [second!]: proof.messageHash });
 			expect(requests[1]!.blockProofs, 'and carries no proof at all').to.be.undefined;
 			expect(requests[1]!.blockMeta?.[second!], 'the revision metadata still travels').to.deep.equal(source);
+			expect((await received.responses())[1]!.unresolvedProofs,
+				'an answer to a request with references lists the unresolved ones, here none').to.deep.equal([]);
 
 			// Both revisions landed CERTIFIED on the receiver, which is what makes the reference a
 			// saving rather than a regression to proof-less replication.
@@ -432,6 +434,47 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 			expect(requests[2]!.blockProofs?.[second!], 'and the retry carries the proof itself').to.not.be.undefined;
 			expect(requests[2]!.proofRefs, 'naming nothing this time').to.be.undefined;
 
+			expect(await repo.getBlockProof(second as BlockId, source.rev),
+				'the block landed certified on the retry').to.deep.equal(proof);
+		} finally {
+			await service.stop();
+		}
+	});
+
+	it('a receiver that predates references gets the proof inline after refusing a named push', async function () {
+		this.timeout(10000);
+		const source = { rev: 8, actionId: 'rt-old-a8' as ActionId };
+		const [first, second] = ['rt-old-1', 'rt-old-2'];
+		const { repo: sourceRepo, proof } = await certifiedCommitSource(
+			{ [first!]: makeBlock(first!), [second!]: makeBlock(second!) }, source);
+
+		// A 1.28.0 receiver reads no `proofRefs` and answers no `unresolvedProofs`: here, a store that
+		// resolves no reference behind a handler whose answers drop the field.
+		const unresolving: IBlockReplicaStore = {
+			saveReplicatedBlock: (blockId, block, src, verifiedProof) =>
+				repo.saveReplicatedBlock(blockId, block, src, verifiedProof),
+			getCommitProof: async () => undefined,
+		};
+		const { service, peerNetwork, received } = makeWiredNetwork(unresolving, {});
+		const handlePush = (service as any).handlePush.bind(service);
+		(service as any).handlePush = async (...args: unknown[]) => {
+			const { unresolvedProofs: _dropped, ...answer } = await handlePush(...args) as BlockTransferResponse;
+			return answer;
+		};
+		await service.start();
+		try {
+			const peer = (await makePeerId()).toString();
+			await pushBlockToPeers(sourceRepo, peerNetwork as any, first as BlockId, [peer]);
+			const secondPush = await pushBlockToPeers(sourceRepo, peerNetwork as any, second as BlockId, [peer]);
+
+			expect(secondPush.status === 'pushed' && secondPush.confirmed,
+				'the inline retry places the block').to.deep.equal([peer]);
+			const requests = await received.requests();
+			const answers = await received.responses();
+			expect(requests.length, 'the named push, then one retry').to.equal(3);
+			expect(answers[1]!.unresolvedProofs, 'the old receiver says nothing about the reference').to.be.undefined;
+			expect(answers[1]!.missing, 'and refuses the block as uncertified').to.deep.equal([second]);
+			expect(requests[2]!.blockProofs?.[second!], 'so the retry carries the proof itself').to.not.be.undefined;
 			expect(await repo.getBlockProof(second as BlockId, source.rev),
 				'the block landed certified on the retry').to.deep.equal(proof);
 		} finally {

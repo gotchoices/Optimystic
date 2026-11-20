@@ -209,6 +209,11 @@ export interface BlockTransferResponse {
 	 * receiver could not resolve. Its presence is the sender's cue to re-push the affected block with
 	 * the proof inline; absence of a referenced hash from this list means the receiver resolved it.
 	 *
+	 * Present, empty when every reference resolved, on every answer to a request that carried
+	 * references, so its absence from such an answer says the receiver predates references (1.28.0
+	 * and earlier ignore `proofRefs` and refuse the block as uncertified); the sender then treats
+	 * every reference it sent as unresolved.
+	 *
 	 * Distinct from {@link missing}, which lists BLOCK ids. A block can be accepted and its reference
 	 * still unresolved (a receiver running `requirePushCertificate: false` takes the block
 	 * uncertified), so a sender must read this list independently of `missing`.
@@ -530,7 +535,7 @@ export class BlockTransferService implements Startable {
 		this.reportSenderHolds(accepted, senderPeerId);
 		return {
 			accepted, missing,
-			...(unresolvedProofs.size > 0 ? { unresolvedProofs: [...unresolvedProofs] } : {})
+			...(unresolvedProofs.size > 0 || request.proofRefs !== undefined ? { unresolvedProofs: [...unresolvedProofs] } : {})
 		};
 	}
 
@@ -827,8 +832,10 @@ export async function pushBlockToPeers(
 			const named = await client.pushBlocks(blocks, reason, reference.push, deadlines);
 			// Keyed off `unresolvedProofs` and never off `missing`, so a lenient receiver that took the
 			// block uncertified still gets the proof, which `StorageRepo.saveReplicatedBlock` back-fills
-			// onto the revision it just landed.
-			if (!named.unresolvedProofs?.includes(reference.hash)) return named;
+			// onto the revision it just landed. An answer with no `unresolvedProofs` at all comes from a
+			// receiver that predates references, which read none of this request's, so it counts as
+			// unresolved too.
+			if (named.unresolvedProofs !== undefined && !named.unresolvedProofs.includes(reference.hash)) return named;
 			shownProofs.recordUnresolved(peerIdStr, reference.hash);
 		}
 		const inline = await client.pushBlocks(blocks, reason, certification, deadlines);
