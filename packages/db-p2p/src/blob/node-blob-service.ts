@@ -29,7 +29,7 @@ import { armUnrefTimer } from '../unref-timer.js';
 import type { BlobFetcher, BlobFetchRequest, BlobFetchSession, PieceStoredEvent } from './blob-fetcher.js';
 import { forwardAborts } from './blob-fetch-session.js';
 import { blobHolderCandidates, type BlobHolderDeps } from './blob-holders.js';
-import type { BlobLocalHolding } from './blob-protocol.js';
+import { blobScopeProblem, type BlobLocalHolding } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
 import type { LocalBlobService, MissingPiece } from './local-blob-service.js';
 
@@ -50,6 +50,14 @@ export interface NodeBlobServiceDeps {
 	 * is told, as a service built without a receiver wants.
 	 */
 	afterFetchedWhole?: (ref: BlobRef) => void;
+	/**
+	 * `BlobCopyDrain.owe`, bound by the node (`packages/db-p2p/src/blob/blob-copy-drain.ts`): records
+	 * the durable owed entry for an announced blob, reports its first durability and wakes the drain.
+	 * Absent — a service built without a drain, which is what `NodeOptions.blobs`'s `copy.enabled:
+	 * false` builds — makes `announce` reject, rather than take a hold on a blob nothing will ever
+	 * announce.
+	 */
+	oweCopies?: (ref: BlobRef, scope: BlobScope) => Promise<void>;
 	/** Default Date.now (probe timing in the log line). */
 	now?: () => number;
 }
@@ -80,6 +88,7 @@ export class NodeBlobService implements BlobService {
 	private readonly holders: BlobHolderDeps;
 	private readonly probeTimeoutMs: number;
 	private readonly afterFetchedWhole: ((ref: BlobRef) => void) | undefined;
+	private readonly oweCopies: ((ref: BlobRef, scope: BlobScope) => Promise<void>) | undefined;
 	private readonly now: () => number;
 	private readonly progress = new Map<BlobRef, ProgressCount>();
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
@@ -91,6 +100,7 @@ export class NodeBlobService implements BlobService {
 		this.holders = deps.holders;
 		this.probeTimeoutMs = deps.probeTimeoutMs;
 		this.afterFetchedWhole = deps.afterFetchedWhole;
+		this.oweCopies = deps.oweCopies;
 		this.now = deps.now ?? Date.now;
 		// Never unsubscribed: the fetcher lives exactly as long as the node, and so does this service.
 		this.fetcher.onPieceStored(event => this.pieceStored(event));
@@ -105,7 +115,9 @@ export class NodeBlobService implements BlobService {
 	 * nothing of is asked of its cohort, in parallel, each peer within one response timeout: the first
 	 * that holds it whole or in part makes the answer `elsewhere`, and the others are no longer waited
 	 * for. Silence, failures and no candidates leave `unknown`. A local `partial` stays `partial`, since
-	 * asking could not change it; `size`, `heldBytes` and `durability` are always this node's.
+	 * asking could not change it; `size`, `heldBytes` and `durability` are always this node's — the
+	 * `durability` the copy drain last wrote on the blob's record, absent on a blob this node does not
+	 * owe (a blob that reached `full` released its `owed` hold, so its record may be gone entirely).
 	 */
 	async stat(ref: BlobRef, options: { probe?: boolean } = {}): Promise<BlobStat> {
 		const here = await this.local.stat(ref);
@@ -149,8 +161,26 @@ export class NodeBlobService implements BlobService {
 		return this.local.unpin(ref, owner);
 	}
 
-	announce(ref: BlobRef, scope: BlobScope): Promise<void> {
-		return this.local.announce(ref, scope);
+	/**
+	 * Tells the blob's cohort that a committed reference in `scope` names it: this node takes the
+	 * `owed` hold and owes the blob to every cohort member that accepts blobs until each one holds it
+	 * (docs/blobs.md §Placement, copying and durability). Resolves once the owed entry is durable and
+	 * the blob's first durability has been reported; it never waits for a copy, and the copying itself
+	 * is `BlobCopyDrain`'s.
+	 *
+	 * The hold is taken before the entry so a crash between them leaves a hold, never an entry
+	 * announcing a blob nothing keeps. Throws RangeError for an empty scope or one over
+	 * `MAX_BLOB_SCOPE_CHARS` — the same rule the wire and the receiver's `responsible` hold apply, so a
+	 * recorded scope is always one the drain can send.
+	 */
+	async announce(ref: BlobRef, scope: BlobScope): Promise<void> {
+		const problem = blobScopeProblem(scope);
+		if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+		if (this.oweCopies === undefined) {
+			throw new Error(`Blob ${ref} cannot be announced: this node was built without a blob copy drain`);
+		}
+		await this.local.holdOwed(ref);
+		await this.oweCopies(ref, scope);
 	}
 
 	/**
@@ -168,6 +198,11 @@ export class NodeBlobService implements BlobService {
 		};
 	}
 
+	/**
+	 * Called whenever an announced blob's durability changes — its class, or how many accepting members
+	 * hold it. `BlobCopyDrain` emits through the local service's listener set, which is this call, so a
+	 * listener registered here hears the first event `announce` fires as well as every later one.
+	 */
 	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void {
 		return this.local.onDurability(listener);
 	}

@@ -27,6 +27,7 @@ import { StorageRepo } from '../src/storage/storage-repo.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { buildBlockTransferProtocol, type PushBlockOutcome } from '../src/cluster/block-transfer-service.js';
 import { captureLog, hasLine, hasTag } from './support/capture-log.js';
+import { MockLibp2p } from './support/drain-libp2p.js';
 
 const PREFIX = '/optimystic/drain-test';
 const BLOCK_A = 'drain-block-a' as BlockId;
@@ -35,50 +36,6 @@ const BLOCK_C = 'drain-block-c' as BlockId;
 const COLLECTION = 'drain-collection' as BlockId;
 
 const makePeerId = async (): Promise<PeerId> => peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
-
-type EventHandler = (event: unknown) => void;
-
-/** The slice of libp2p the drain reads: identity, the two events, who is connected, who is identified. */
-class MockLibp2p {
-	peerId!: PeerId;
-	private readonly listeners = new Map<string, EventHandler[]>();
-	private readonly connected = new Map<string, PeerId>();
-	private readonly identified = new Set<string>();
-	readonly peerStore = {
-		get: async (peerId: PeerId): Promise<{ protocols: string[] }> => {
-			if (!this.identified.has(peerId.toString())) throw new Error('not found');
-			return { protocols: [buildBlockTransferProtocol(PREFIX)] };
-		}
-	};
-
-	addEventListener(event: string, handler: EventHandler): void {
-		this.listeners.set(event, [...(this.listeners.get(event) ?? []), handler]);
-	}
-	removeEventListener(event: string, handler: EventHandler): void {
-		this.listeners.set(event, (this.listeners.get(event) ?? []).filter(h => h !== handler));
-	}
-	listenerCount(event: string): number {
-		return (this.listeners.get(event) ?? []).length;
-	}
-	getConnections(peerId?: PeerId): Array<{ remotePeer: PeerId }> {
-		const all = [...this.connected.values()].map(remotePeer => ({ remotePeer }));
-		return peerId === undefined ? all : all.filter(c => c.remotePeer.equals(peerId));
-	}
-
-	/** A peer arrives: connected, identified (unless told otherwise), and `connection:open` fires. */
-	connect(peerId: PeerId, options: { identified?: boolean; emit?: boolean } = {}): void {
-		this.connected.set(peerId.toString(), peerId);
-		if (options.identified ?? true) this.identified.add(peerId.toString());
-		if (options.emit ?? true) this.emit('connection:open', { remotePeer: peerId });
-	}
-	disconnect(peerId: PeerId): void {
-		this.connected.delete(peerId.toString());
-		this.identified.delete(peerId.toString());
-	}
-	emit(event: string, detail?: unknown): void {
-		for (const handler of this.listeners.get(event) ?? []) handler({ detail });
-	}
-}
 
 /** `findCluster` by block id: the routing key is the id's utf8, so the fake decodes it back. */
 class FakeKeyNetwork {
@@ -172,7 +129,7 @@ describe('UnderReplicationDrain', () => {
 
 	beforeEach(async () => {
 		[self, peerX, peerY] = await Promise.all([makePeerId(), makePeerId(), makePeerId()]);
-		libp2p = new MockLibp2p();
+		libp2p = new MockLibp2p({ protocols: [buildBlockTransferProtocol(PREFIX)] });
 		libp2p.peerId = self;
 		keyNetwork = new FakeKeyNetwork();
 		ledger = new KvUnderReplicationLedger(new MemoryKVStore());

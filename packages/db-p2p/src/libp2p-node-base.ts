@@ -34,6 +34,8 @@ import { BlobFetcher } from './blob/blob-fetcher.js';
 import type { BlobHolderDeps } from './blob/blob-holders.js';
 import { buildBlobProtocol, type BlobAnnounceAnswer } from './blob/blob-protocol.js';
 import { NodeBlobService } from './blob/node-blob-service.js';
+import { BlobCopyDrain, type BlobCopyDrainConfig } from './blob/blob-copy-drain.js';
+import { OwedBlobLedger } from './blob/owed-blob-ledger.js';
 import { BlobReferenceCheck } from './blob/reference-check.js';
 import { BlobAnnounceReceiver, type BlobHoldPolicy } from './blob/announce-receiver.js';
 import { AnnounceLimiter } from './blob/announce-limiter.js';
@@ -53,7 +55,7 @@ import { Libp2pKeyPeerNetwork, type BootstrapContactOptions, type NetworkStatePe
 import { mergePeerAddresses, publishableAddrsForPeer, type AddressLog } from './peer-address-book.js';
 import type { OptimysticClientNode, OptimysticClientNodeAttachments, OptimysticNode, OptimysticNodeAttachments, OptimysticNodeAttachmentsBase } from './optimystic-node.js';
 import { ClusterClient } from './cluster/client.js';
-import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier, BlobDigest } from '@optimystic/db-core';
+import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier, BlobDigest, BlobRef, BlobScope } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations, type RelayReservationSupervisorOptions } from './network/relay-reservation.js';
@@ -356,8 +358,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * copying and durability), default `'eager'`. An `'on-demand'` node declines every announcement,
 	 * never takes a `responsible` hold, and still holds what it put, pinned or read. This is how a
 	 * phone joins a group without storing every file in it.
+	 *
+	 * `copy` is the drain that announces each blob this node owes to its cohort until every member
+	 * that accepts blobs holds it (`BlobCopyDrain` in `packages/db-p2p/src/blob/blob-copy-drain.ts`),
+	 * on serving and client nodes alike — a client is often the machine a blob was put on. Its fields
+	 * are `DrainScheduler`'s, defaulting as the under-replication drain's do. `enabled: false` builds
+	 * no drain at all, and then `node.blobs.announce` REJECTS rather than recording an entry nothing
+	 * would ever send; such a node still serves, fetches and holds blobs.
 	 */
-	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy };
+	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -1247,6 +1256,11 @@ export async function createLibp2pNodeBase(
 	// exists. Until then every `held` is dropped: nothing this node announced can have been fetched yet,
 	// so such a frame is unsolicited.
 	let blobPeerAdmitted: (peerId: string) => boolean = () => false;
+	// The owed-copies drain, built after the receiver below (so its stop runs before the receiver's)
+	// and bound here because `node.blobs` and the `held` closure both reach it. Read, not captured, on
+	// every use: both are only reachable after the factory has assigned it.
+	let blobCopies: BlobCopyDrain | undefined;
+	const blobCopyWanted = (options.blobs?.copy?.enabled ?? true) !== false;
 	// Built once: it gates the four storage protocol services on a serving node and the blob protocol on both roles.
 	const inboundAuthorization = inboundAuthorizationOf(options);
 
@@ -1445,11 +1459,17 @@ export async function createLibp2pNodeBase(
 				onAnnounce: (peer, ref, scope) => blobReceiver
 					? blobReceiver.decide(peer, ref, scope)
 					: Promise.resolve<BlobAnnounceAnswer>(blobHold === 'on-demand' ? 'declined' : 'not-responsible'),
-				// Nothing acts on `held` until the owed-copies drain (`feat-blob-owed-copies-are-drained`)
-				// gives it the owed entry to settle; a non-member's is dropped unread, as its announce is.
-				onHeld: (peer, ref) => blobPeerAdmitted(peer)
-					? blobLog('held:received peer=%s ref=%s', peer, ref)
-					: blobLog('held:dropped-non-member peer=%s ref=%s', peer, ref),
+				// A `held` adds its sender to the blob's owed entry and re-counts the blob's durability; a
+				// non-member's is dropped unread, as its announce is.
+				onHeld: (peer, ref) => {
+					if (!blobPeerAdmitted(peer)) {
+						blobLog('held:dropped-non-member peer=%s ref=%s', peer, ref);
+						return;
+					}
+					blobLog('held:received peer=%s ref=%s', peer, ref);
+					void blobCopies?.noteHeld(peer, ref).catch(error =>
+						blobLog('held:settle-failed peer=%s ref=%s err=%s', peer, ref, error instanceof Error ? error.message : String(error)));
+				},
 				...inboundAuthorization
 			})({ registrar: components.registrar }),
 
@@ -1653,6 +1673,11 @@ export async function createLibp2pNodeBase(
 		}
 		const keyNetwork = new Libp2pKeyPeerNetwork(node, consensusConfig.clusterSize, undefined, bootstrap, options.persistence, reputation, protocolPrefix, linkDeadlines, membership, preparedStreams);
 		await keyNetwork.initFromPersistedState();
+		// One detector per node, beside the key network: the serving role feeds it (goodbyes, failed
+		// consults) and both drains suppress their passes while it reports a partition. A client feeds
+		// it nothing, and an unfed detector counts no recent goodbye and no consecutively-failing peer,
+		// so it never reports a partition and never suppresses a client's blob passes.
+		const partitionDetector = new PartitionDetector();
 		// The offline queue's reachability gate (`node.cohortReachability`). Outside every optional
 		// subsystem's gate: it needs only the key network, the identify count and the node's events. Its
 		// stop wrapper is installed at once, so a startup rollback releases its event listeners too.
@@ -1696,7 +1721,8 @@ export async function createLibp2pNodeBase(
 		const served = serving
 			? await wireServingRole({
 				node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore
+				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore,
+				partitionDetector
 			})
 			: undefined;
 
@@ -1726,6 +1752,17 @@ export async function createLibp2pNodeBase(
 			// Reader repair (docs/blobs.md §Placement, copying and durability): the receiver is built a few
 			// lines below, before anything can read through this service.
 			afterFetchedWhole: ref => blobReceiver?.keepAfterRead(ref),
+			// Left off entirely when the drain is disabled, so `announce` rejects rather than taking a
+			// hold on a blob nothing would announce. Bound through the `let` above, as
+			// `afterFetchedWhole` is: the drain is built below, before the factory returns.
+			...(blobCopyWanted
+				? {
+					oweCopies: async (ref: BlobRef, scope: BlobScope): Promise<void> => {
+						if (blobCopies === undefined) throw new Error(`Blob ${ref} cannot be announced yet: its copy drain is still starting`);
+						await blobCopies.owe(ref, scope);
+					}
+				}
+				: {}),
 		});
 		// The node's own reader of committed state, for deciding whether a blob is referenced (docs/blobs.md
 		// §Who may fetch and who may store). Built the way a host's transactor over the node is, but with no
@@ -1772,6 +1809,46 @@ export async function createLibp2pNodeBase(
 		// Finishes the pulls a restart interrupted: the `responsible` hold is flushed before `fetching` is
 		// answered, so the references to resume are in this node's own blob records.
 		void blobReceiver.resume().catch(error => blobLog('resume:failed err=%s', error instanceof Error ? error.message : String(error)));
+
+		// --- The owed-copies drain: announce each owed blob until its cohort holds it ---
+		// On BOTH roles, unlike the block drain: a client (`servesBlocks: false`) is often the machine a
+		// blob was put on and the only holder of it until the cohort copies it, so it must announce and
+		// must report durability (docs/blobs.md §Placement, copying and durability). Built after the
+		// receiver so its stop wrapper runs BEFORE the receiver's and the fetcher's: no announcement goes
+		// out once the node has begun stopping. The ledger is built whatever the drain's setting — its
+		// index loads lazily, so an unused one costs a constructor — and exposed for diagnostics.
+		const owedBlobLedger = new OwedBlobLedger(kvStore);
+		if (blobCopyWanted) {
+			const { enabled: _blobCopyEnabled, ...blobCopyConfig } = options.blobs?.copy ?? {};
+			blobCopies = new BlobCopyDrain({
+				libp2p: node,
+				selfId: node.peerId.toString(),
+				hold: blobHold,
+				keyNetwork,
+				partitionDetector,
+				membership,
+				blobProtocol: blobTransfer.blobProtocol,
+				ledger: owedBlobLedger,
+				records: blobs,
+				announce: (peerId, ref, scope) => blobTransfer.client.announce(peerIdFromString(peerId), ref, scope),
+				acceptance: peerIds => blobAcceptanceOf(keyNetwork, blobTransfer.blobProtocol, peerIds),
+			}, blobCopyConfig);
+			{
+				const drain = blobCopies;
+				const previousStop = node.stop.bind(node);
+				node.stop = async () => {
+					try {
+						await drain.stop();
+					} finally {
+						await previousStop();
+					}
+				};
+			}
+			await blobCopies.start();
+		}
+		// Expose for tests/diagnostics, as the block drain and its ledger are exposed.
+		(node as any).blobCopyDrain = blobCopies;
+		(node as any).owedBlobLedger = owedBlobLedger;
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to
@@ -2301,7 +2378,7 @@ function wireBlobFetcher(ctx: {
 	membership: NetworkMembershipGate | undefined;
 	reputation: PeerReputationService;
 	blobs: LocalBlobService;
-}): { client: BlobProtocolClient; fetcher: BlobFetcher; holders: BlobHolderDeps } {
+}): { client: BlobProtocolClient; fetcher: BlobFetcher; holders: BlobHolderDeps; blobProtocol: string } {
 	const { node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs } = ctx;
 	const blobProtocol = buildBlobProtocol(protocolPrefix);
 	const client = new BlobProtocolClient({
@@ -2327,7 +2404,7 @@ function wireBlobFetcher(ctx: {
 			await previousStop();
 		}
 	};
-	return { client, fetcher, holders };
+	return { client, fetcher, holders, blobProtocol };
 }
 
 /** What {@link wireServingRole} reads from the factory: the started node and the pieces every role builds. */
@@ -2347,6 +2424,8 @@ interface ServingRoleContext {
 	networkManager: NetworkManagerService | undefined;
 	/** The blob service's piece store, whose bytes the Arachnode storage monitor counts toward this node's use. */
 	pieceStore: IPieceStore;
+	/** The node's one partition detector, built beside the key network; this role is the only half that feeds it. */
+	partitionDetector: PartitionDetector;
 }
 
 /** What the rest of the factory reads back from the serving role. */
@@ -2370,11 +2449,11 @@ interface ServingRole {
 async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	const {
 		node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore
+		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore,
+		partitionDetector
 	} = ctx;
 	const { storageRepo, rawStorage, underReplicationLedger, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
-	const partitionDetector = new PartitionDetector();
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by the same
 	// per-peer budget the latest-revision consult uses (`consensusConfig.cohortQueryTimeoutMs`,
