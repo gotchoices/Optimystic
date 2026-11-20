@@ -20,7 +20,7 @@ import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createBlobLocalityFunction, createBlobSizeFunction } from './functions/blob-functions.js';
 import { SqlBlobService } from './optimystic-adapter/sql-blob-service.js';
-import { SqlBlobPins } from './optimystic-adapter/blob-pins.js';
+import { SqlBlobPins, parseUnstagedHoldingMs } from './optimystic-adapter/blob-pins.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
@@ -72,6 +72,10 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	// default transactor's storage category (README § Plugin-Level Configuration). A bad value throws
 	// here, before anything is built.
 	const costProfile = moduleCostProfile(defaultTransactorOf(config), config.cost_profile);
+	// How long a blob put outside any transaction and never referenced keeps its `unstaged` pin
+	// (README § Plugin-Level Configuration). Read here, as `cost_profile` is, so a bad value throws
+	// before anything is built.
+	const unstagedHoldingMs = parseUnstagedHoldingMs(config);
 
 	// Global factory instances
 	const collectionFactory = new CollectionFactory();
@@ -89,10 +93,11 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	// The pins a committing transaction's blob references are held under, and their release once it
-	// lands or, for a queued transaction, once the queue has finished with it (README § Large values;
-	// docs/blobs.md §Committing a reference). Built AFTER the controller, which it reads, and attached
-	// to both before any table opens: a commit asks the bridge for them, and a terminal queue status
-	// settles the ones its transaction left behind.
+	// lands or, for a queued transaction, once the queue has finished with it — plus the holding
+	// period that expires the pin of a blob put outside any transaction and never referenced (README
+	// § Large values; docs/blobs.md §Committing a reference). Built AFTER the controller, which it
+	// reads, and attached to both before any table opens: a commit asks the bridge for them, and a
+	// terminal queue status settles the ones its transaction left behind.
 	const blobPins = new SqlBlobPins({
 		backendByKey: key => collectionFactory.blobBackendForKey(key),
 		registration: collectionFactory.blobScopes,
@@ -104,6 +109,9 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 			return (open?.isActive === true && open.stampId === transactionId) || offline.holdsTransaction(transactionId);
 		},
 		reconcileReady: () => offline.reconcileReady(),
+		openReferences: () => txnBridge.openBlobReferences(),
+		now: () => Date.now(),
+		unstagedHoldingMs,
 	});
 	txnBridge.attachBlobPins(blobPins);
 	offline.attachBlobPins(blobPins);
@@ -228,6 +236,11 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * `blobPins.settled()` is how a caller waits for those releases — and for the reconciliation
 		 * of the pins a previous process left behind, which {@link hydrate} triggers. Never await it
 		 * inside a transaction: the work it waits on waits for the transaction to end.
+		 *
+		 * `blobPins.sweepUnstaged(now?)` is the holding-period sweep, which otherwise runs on its own
+		 * interval: it releases the pin of every blob put outside any transaction and never
+		 * referenced, past `blob_unstaged_holding_ms`. A test drives it with an explicit `now` rather
+		 * than waiting for that interval.
 		 */
 		blobPins,
 		/**
@@ -239,10 +252,12 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * A blob put through this is PINNED, and the pin follows the transaction open when the put
 		 * started: it is released when that transaction commits (after the blob has been announced to
 		 * its cohort), rolls back, or is queued. A put made outside any transaction keeps an
-		 * `unstaged` pin until a transaction that references the blob commits. So a blob a committed
+		 * `unstaged` pin until a transaction that references the blob commits, or until that pin
+		 * passes the holding period `blob_unstaged_holding_ms` names (24 hours by default), after
+		 * which it is released and the bytes go with this machine's next sweep. So a blob a committed
 		 * row references is kept, and a blob put inside a transaction that never referenced it is
-		 * NOT — put it outside any transaction, or pass an explicit `owner`, to keep one no row
-		 * references.
+		 * NOT — put it outside any transaction and reference it within the holding period, or pass
+		 * an explicit `owner` and release that pin yourself, to keep one no row references.
 		 */
 		blobs,
 		/**

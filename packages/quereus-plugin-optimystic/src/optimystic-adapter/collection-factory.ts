@@ -475,7 +475,7 @@ export class CollectionFactory {
    * called, and then for each one that resolves later. Returns an idempotent unsubscribe.
    *
    * The replay of the already-resolved backends is what makes this safe to subscribe at any point:
-   * a listener that reconciles each network's pins (`feat-sql-columns-hold-blob-references`) must
+   * a listener that reconciles each network's pins (`SqlBlobPins.backendResolved`) must
    * see every network, not only the ones whose first table came after it subscribed. A listener
    * that throws is logged and does not disturb the resolution reporting to it.
    */

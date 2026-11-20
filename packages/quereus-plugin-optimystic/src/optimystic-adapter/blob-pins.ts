@@ -13,9 +13,8 @@
  * which is where docs/blobs.md §SQL words it. Nothing reached from the vtab's `update()` may call
  * the blob service at all: a validating member re-executes the same statements and has no bytes, so
  * it must neither pin nor announce. What the departure changes is bounded — a transaction left open
- * longer than the `unstaged` holding period — and `feat-sql-columns-hold-blob-references` closes
- * that by never expiring an `unstaged` pin whose reference an open or queued transaction has
- * staged.
+ * longer than the `unstaged` holding period — and {@link SqlBlobPins.sweepUnstaged} closes that by
+ * never expiring an `unstaged` pin whose reference an open or queued transaction has staged.
  *
  * Every settling arm takes the transaction as well as the pins it is holding, and reads the puts
  * off the transaction's own ledger rather than off {@link HeldPins}: one source of truth for the
@@ -35,9 +34,15 @@
  * — is judged from COMMITTED STATE: the reference tree the pin's own label names either lists the
  * reference or it does not. That is the whole of the durable bookkeeping; nothing is read from the
  * offline journal, and nothing has to be remembered across the restart.
+ *
+ * The one pin no transaction answers for is the `unstaged` pin of a put made OUTSIDE any transaction
+ * and then never referenced — the upload the user cancelled, the statement that failed, the process
+ * that stopped. {@link SqlBlobPins.sweepUnstaged} bounds those by a holding period
+ * (`blob_unstaged_holding_ms`, 24 hours by default), and is the one arm here that runs on a timer
+ * rather than off a transaction's exit.
  */
 
-import { BlobReferenceTree } from '@optimystic/db-core';
+import { BlobReferenceTree, unrefTimer } from '@optimystic/db-core';
 import type { BlobRef, BlobScope } from '@optimystic/db-core';
 import type { BlobBackend } from './collection-factory.js';
 import type { BlobScopeRegistration } from './blob-scope-registration.js';
@@ -73,6 +78,38 @@ export interface HeldPins {
 /** How a transaction ended, as the settling arms distinguish it. */
 export type BlobPinSettlement = 'queued' | 'abandoned' | { readonly committed: 'all' | ReadonlySet<string> };
 
+/** How long an unreferenced `unstaged` pin is kept when the registration declares nothing: 24 hours,
+ * the period docs/blobs.md §SQL names. */
+export const DEFAULT_UNSTAGED_HOLDING_MS = 86_400_000;
+
+/**
+ * The registration's `blob_unstaged_holding_ms`, or {@link DEFAULT_UNSTAGED_HOLDING_MS} when unset
+ * (README § Plugin-Level Configuration). Read in `register`, as `cost_profile` is, so a bad value
+ * throws before anything is built.
+ *
+ * `null` and `''` count as unset, as they do for `cost_profile`: a plugin loader's settings form
+ * sends an empty field as `''`. Anything else that is not a finite positive number throws, because
+ * ignoring it would silently keep every unreferenced put for a day when the host asked for a
+ * minute, or expire bytes it meant to hold.
+ */
+export function parseUnstagedHoldingMs(config: Readonly<Record<string, unknown>>): number {
+	const declared = config['blob_unstaged_holding_ms'];
+	if (declared === undefined || declared === null || declared === '') return DEFAULT_UNSTAGED_HOLDING_MS;
+	if (typeof declared !== 'number' || !Number.isFinite(declared) || declared <= 0) {
+		throw new Error(`blob_unstaged_holding_ms must be a finite, positive number of milliseconds; got ${typeof declared} ${String(declared)}`);
+	}
+	return declared;
+}
+
+/**
+ * How often {@link SqlBlobPins.sweepUnstaged} runs for a given holding period: a quarter of it,
+ * never more than an hour and never less than a minute. The floor is what keeps a host that
+ * configures a one-second holding period — a test, a tool — from arming a 250 ms interval.
+ */
+function unstagedSweepPeriodMs(holdingMs: number): number {
+	return Math.max(60_000, Math.min(holdingMs / 4, 3_600_000));
+}
+
 export interface SqlBlobPinsDeps {
 	/** `CollectionFactory.blobBackendForKey`: the backend of a transactor key the factory has seen. */
 	backendByKey(key: string): Promise<BlobBackend>;
@@ -92,6 +129,16 @@ export interface SqlBlobPinsDeps {
 	 * offline journal, until a restore pass has completed in this process; true with no journal
 	 * (`OfflineMode.reconcileReady`). */
 	reconcileReady(): boolean;
+	/** `TransactionBridge.openBlobReferences`: the references the OPEN transaction's ledger leaves
+	 * added, which no sweep may expire ({@link SqlBlobPins.sweepUnstaged}). Synchronous, because the
+	 * sweep asks it per pin it is about to drop rather than once per pass. */
+	openReferences(): ReadonlySet<BlobRef>;
+	/** The clock the `unstaged` holding period is measured on; `Date.now` from `register`, and a
+	 * spec's own where a spec drives {@link SqlBlobPins.sweepUnstaged} by hand. */
+	now(): number;
+	/** How long an `unstaged` pin is kept before a sweep may expire it: the registration's
+	 * `blob_unstaged_holding_ms` ({@link parseUnstagedHoldingMs}). */
+	unstagedHoldingMs: number;
 }
 
 /** One transaction pin a reconciliation pass found, with what its label named: a `scope` for a
@@ -105,6 +152,13 @@ interface FoundPin {
 
 /** A pin whose label named a scope, so it is a reference pin. */
 type ReferencePin = FoundPin & { readonly scope: BlobScope };
+
+/** One `unstaged` pin a sweep found past its holding period, with the time its label named. */
+interface ExpiringUnstagedPin {
+	readonly ref: BlobRef;
+	readonly owner: string;
+	readonly putAtMs: number;
+}
 
 /** The pins of one backend a pass has to settle, with every live transaction's already dropped. */
 interface StalePins {
@@ -162,6 +216,16 @@ export class SqlBlobPins {
 	/** The reconciliation chained and not yet started; a request before it starts gets the same one
 	 * (`OfflineRestore.run`'s `pendingPass` precedent). */
 	private pendingReconcile: Promise<void> | undefined;
+	/** The one interval behind {@link sweepUnstaged}, armed by the first backend to resolve
+	 * ({@link backendResolved}) and cleared by {@link dispose}. One per `SqlBlobPins`, however many
+	 * backends resolve, since each sweep walks every known backend. */
+	private sweepTimer: ReturnType<typeof setInterval> | undefined;
+	/**
+	 * Every `unstaged` label whose time this build could not read, so a stuck one is logged once
+	 * rather than on every sweep. Bounded by the number of such labels on the machine, which is zero
+	 * in a store only this build has written.
+	 */
+	private readonly unreadableUnstaged = new Set<string>();
 	private disposed = false;
 	/** Resolved by {@link dispose}, so a step parked on an open transaction is not what keeps a
 	 * disposing host waiting (`MaterializedViewFollower`'s `haltedPromise` precedent). */
@@ -215,7 +279,7 @@ export class SqlBlobPins {
 	 *
 	 * A reference whose scope is NOT committed, one whose scope cannot be confirmed in the network's
 	 * registry, and one whose announcement throws all KEEP their pin, logged with the reason: the
-	 * bytes stay here and `feat-sql-columns-hold-blob-references` retries the release.
+	 * bytes stay here and {@link reconcile} retries the release.
 	 */
 	async committed(held: HeldPins | undefined, transaction: TransactionState, committed: 'all' | ReadonlySet<string>): Promise<void> {
 		const landed: HeldReference[] = [];
@@ -287,7 +351,7 @@ export class SqlBlobPins {
 	 * reference that landed — where {@link committed} would drop it — because the two have different
 	 * remedies: an online commit is the pin's release, and a queued one is answered by the holding
 	 * period that expires an `unstaged` pin no open or queued transaction has staged
-	 * (`feat-sql-columns-hold-blob-references`). The bytes are kept either way.
+	 * ({@link sweepUnstaged}). The bytes are kept either way.
 	 */
 	settleQueued(transactionId: string, committed: 'all' | ReadonlySet<string>): Promise<void> {
 		return this.chained(() => this.releaseQueued(transactionId, committed));
@@ -344,6 +408,31 @@ export class SqlBlobPins {
 	backendResolved(_backend: BlobBackend): void {
 		this.mayHoldStalePins = true;
 		void this.reconcile();
+		this.startUnstagedSweep();
+	}
+
+	/**
+	 * Unpin every `unstaged` pin older than the holding period, except on a reference some live
+	 * transaction is relying on — the holding period docs/blobs.md §SQL promises for a blob put
+	 * outside any transaction and never referenced. Never throws.
+	 *
+	 * `now` is the moment the period is measured against; it defaults to the deps' clock, read when
+	 * the pass actually runs rather than when this is called, and a spec passes its own.
+	 *
+	 * Chained like {@link settleQueued} and {@link reconcile}, so a sweep never runs beside a
+	 * settlement or a reconciliation — the three read and write the same pins — and so it waits for
+	 * any open transaction to end before it looks. Armed on a timer by {@link backendResolved}.
+	 *
+	 * NOTE: that wait is for the transaction open when the step STARTS, and says nothing about the
+	 * next one, so a pass can run beside a statement that begins behind it. That is what
+	 * {@link SqlBlobPinsDeps.openReferences} is asked per expiring pin for; what is left unguarded is
+	 * the instant between that read and the `unpin`. If a host is ever seen losing the bytes of a
+	 * blob it referenced within the holding period, pin the reference when the statement stages it
+	 * rather than when the commit starts — which needs the vtab's `update()` path to be able to
+	 * reach the blob service, and it deliberately cannot (docs/blobs.md §Registering references).
+	 */
+	sweepUnstaged(now?: number): Promise<void> {
+		return this.chained(() => this.sweepUnstagedPass(now ?? this.deps.now()));
 	}
 
 	/**
@@ -360,6 +449,12 @@ export class SqlBlobPins {
 	 * stops waiting for it. Idempotent. */
 	async dispose(): Promise<void> {
 		this.disposed = true;
+		// Before the await, so a host that disposes while a sweep is chained does not then wait for an
+		// interval it has already stopped caring about; the chained step itself bails at `disposed`.
+		if (this.sweepTimer !== undefined) {
+			clearInterval(this.sweepTimer);
+			this.sweepTimer = undefined;
+		}
 		this.releaseChain();
 		await this.chain;
 	}
@@ -618,6 +713,120 @@ export class SqlBlobPins {
 				log('blob:pin-settle-failed transaction=%s ref=%s scope=%s %o', transactionId, ref, scope, error);
 			}
 		}
+	}
+
+	// ── the `unstaged` holding period ────────────────────────────────────────
+
+	/**
+	 * Arm the sweep: one pass now, for the backend that has just resolved, and the interval if it is
+	 * not already running. Called once per backend resolution, and the pass walks every KNOWN
+	 * backend, so a second resolution needs no second timer.
+	 */
+	private startUnstagedSweep(): void {
+		if (this.disposed) return;
+		void this.sweepUnstaged();
+		if (this.sweepTimer !== undefined) return;
+		this.sweepTimer = unrefTimer(setInterval(
+			() => { void this.sweepUnstaged(); },
+			unstagedSweepPeriodMs(this.deps.unstagedHoldingMs),
+		));
+	}
+
+	/** One sweep: every backend this process knows of, each isolated from the others. */
+	private async sweepUnstagedPass(now: number): Promise<void> {
+		for (const backend of await this.deps.knownBackends()) {
+			try {
+				await this.sweepBackendUnstaged(backend, now);
+			} catch (error) {
+				log('blob:pin-listing-failed key=%s reason=sweep-unstaged %o', backend.key, error);
+			}
+		}
+	}
+
+	/**
+	 * One backend's `unstaged` pins: each one past its holding period released, unless an unfinished
+	 * transaction is relying on its reference ({@link livePinnedReferences} and
+	 * {@link SqlBlobPinsDeps.openReferences}). Each release is isolated, so one store fault does not
+	 * hide the rest of the sweep.
+	 *
+	 * A label whose time this build cannot read is LEFT PINNED, for ever, and logged once: it was
+	 * written by a build that knows something this one does not, or it is corrupt, and releasing a
+	 * pin whose meaning is unknown drops somebody's bytes.
+	 *
+	 * A `putAtMs` in the FUTURE — the machine's clock was moved back — simply expires nothing until
+	 * the clock catches up. The holding period is measured on this machine's own clock, the same
+	 * limit docs/blobs.md §Lifetime already states for the reclaim pass.
+	 */
+	private async sweepBackendUnstaged(backend: BlobBackend, now: number): Promise<void> {
+		const expiring = await this.listExpiringUnstaged(backend, now);
+		if (expiring.length === 0) return;
+		// Listed only now that something is actually expiring, so a sweep that finds nothing past its
+		// period — the steady state — pays ONE listing of the machine's blob records rather than two.
+		const pinnedLive = await this.livePinnedReferences(backend);
+		for (const { ref, owner, putAtMs } of expiring) {
+			// The open transaction's ledger is asked here, per pin, rather than folded into `pinnedLive`:
+			// a statement can begin while this pass is running, and a reference it stages has no pin of
+			// its own until its commit starts, so a set built before the listing would miss it and this
+			// sweep would drop the bytes that commit is about to reference.
+			if (pinnedLive.has(ref) || this.deps.openReferences().has(ref)) continue;
+			try {
+				await backend.service.unpin(ref, owner);
+				log('blob:unstaged-expired ref=%s putAt=%d', ref, putAtMs);
+			} catch (error) {
+				// Unlike a transaction pin's release, this leaves nothing owed: the next sweep finds the
+				// pin again and is just as able to drop it, so `mayHoldStalePins` is not touched.
+				log('blob:pin-release-failed ref=%s owner=%s %o', ref, owner, error);
+			}
+		}
+	}
+
+	/**
+	 * Every `unstaged` pin on `backend` whose holding period has passed at `now`, collected before
+	 * anything is released — as {@link listStalePins} collects, and for the same reason: a store's
+	 * listing is not something to be written through while it is still being read.
+	 *
+	 * NOTE: that listing reads every blob record on the machine (the `NOTE:` at
+	 * `LocalBlobService.listPins`), and unlike {@link reconcile} a sweep has no flag that can tell it
+	 * the walk is pointless — any put could have aged past the period since the last one. At one pass
+	 * an hour that is a bounded cost; if a machine holding very many blobs is ever seen paying for it,
+	 * keep the earliest `putAtMs` a pass saw still inside the period and skip the next pass until then.
+	 */
+	private async listExpiringUnstaged(backend: BlobBackend, now: number): Promise<ExpiringUnstagedPin[]> {
+		const expiring: ExpiringUnstagedPin[] = [];
+		for await (const { ref, owner } of backend.service.listPins(UNSTAGED_PIN_PREFIX)) {
+			const parsed = parsePinLabel(owner);
+			if (parsed?.kind !== 'unstaged') {
+				if (!this.unreadableUnstaged.has(owner)) {
+					this.unreadableUnstaged.add(owner);
+					log('blob:unstaged-unreadable ref=%s owner=%s', ref, owner);
+				}
+				continue;
+			}
+			if (parsed.putAtMs + this.deps.unstagedHoldingMs <= now) {
+				expiring.push({ ref, owner, putAtMs: parsed.putAtMs });
+			}
+		}
+		return expiring;
+	}
+
+	/**
+	 * The references on `backend` carrying a reference pin whose transaction is still LIVE — the open
+	 * SQL transaction once its commit has started, and every QUEUED transaction, whose pins stay in
+	 * place until the queue finishes with it ({@link settleQueued}). A sweep must not expire the
+	 * `unstaged` pin of such a reference however old it is: an entry waiting in the queue can still
+	 * fail with nothing committed, so this machine is the only one holding its bytes.
+	 *
+	 * Read off the same `listPins(TRANSACTION_PIN_PREFIX)` listing {@link reconcile} makes, and
+	 * grouped by nothing: `isLive` is asked once per reference pin rather than once per transaction,
+	 * because the set a sweep needs is of references and a transaction holds few pins.
+	 */
+	private async livePinnedReferences(backend: BlobBackend): Promise<Set<BlobRef>> {
+		const references = new Set<BlobRef>();
+		for await (const { ref, owner } of backend.service.listPins(TRANSACTION_PIN_PREFIX)) {
+			const parsed = parsePinLabel(owner);
+			if (parsed?.kind === 'reference' && this.deps.isLive(parsed.stampId)) references.add(ref);
+		}
+		return references;
 	}
 
 	/**

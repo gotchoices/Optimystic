@@ -21,7 +21,7 @@ import type { MaterializedViewFollower } from './materialized-view-follower.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
 import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
-import { emptyBlobReferenceLedger } from './blob-reference-ledger.js';
+import { addedReferences, emptyBlobReferenceLedger } from './blob-reference-ledger.js';
 import type { BlobPinSettlement, HeldPins, SqlBlobPins } from './blob-pins.js';
 import type { ReferenceChange } from '../schema/blob-reference-maintainer.js';
 import { laneOf, transactionLaneOf } from './lane.js';
@@ -2317,6 +2317,25 @@ export class TransactionBridge {
     const transaction = this.currentTransaction;
     if (!transaction?.isActive) return;
     transaction.blobReferences.puts.push({ backendKey, ref });
+  }
+
+  /**
+   * The references the OPEN transaction's ledger leaves added ({@link addedReferences}), as a set;
+   * empty with no active transaction. What keeps a sweep of the `unstaged` holding period from
+   * expiring a pin whose reference a long-open transaction has already staged
+   * (`SqlBlobPins.sweepUnstaged`): a reference pin is not written until the commit starts, so until
+   * then the ledger is the only thing that knows the reference is coming.
+   *
+   * Deliberately NOT keyed by the network the reference belongs to. A reference protected on the
+   * wrong network only delays the expiry of an identically-addressed blob on another one, which
+   * fails toward keeping bytes and costs one extra holding period.
+   */
+  openBlobReferences(): ReadonlySet<BlobRef> {
+    const transaction = this.currentTransaction;
+    // `isActive` matters: a transaction that has ended stays on this bridge until the next one begins
+    // (only `cleanup()` clears it), and reading its ledger would protect its references for ever.
+    if (!transaction?.isActive) return new Set();
+    return new Set(addedReferences(transaction.blobReferences).map(added => added.ref));
   }
 
   /** Remember how many reference records were staged when the legacy savepoint at `depth` was

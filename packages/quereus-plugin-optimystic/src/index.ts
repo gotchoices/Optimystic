@@ -79,6 +79,10 @@ export {
 	unstagedPinLabel,
 } from './optimystic-adapter/blob-pin-labels.js';
 export type { ParsedPinLabel } from './optimystic-adapter/blob-pin-labels.js';
+// How long a blob put outside any transaction and never referenced keeps its `unstaged` pin, when
+// the registration declares no `blob_unstaged_holding_ms` — for a host reasoning about when
+// `plugin.blobPins.sweepUnstaged` would release one.
+export { DEFAULT_UNSTAGED_HOLDING_MS } from './optimystic-adapter/blob-pins.js';
 
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';

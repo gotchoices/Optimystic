@@ -73,8 +73,7 @@ export class SqlBlobService implements SqlBlobBackendService {
 	 *    recorded on that transaction, and its pin is released when the transaction settles —
 	 *    committed, queued or rolled back alike (`SqlBlobPins`).
 	 *  - A put that OUTLIVES its transaction records nothing, and so leaves a stray
-	 *    `sql/<stampId>/put` pin that `feat-sql-columns-hold-blob-references`' reconciliation
-	 *    removes.
+	 *    `sql/<stampId>/put` pin that `SqlBlobPins.reconcile` removes.
 	 *  - A put the caller gave an explicit `owner` for records nothing either: that pin is the host's
 	 *    own to release, through {@link unpin}.
 	 *  - A put made outside any transaction keeps its `sql-unstaged/<ms>` pin until a transaction

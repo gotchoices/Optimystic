@@ -17,9 +17,10 @@
  * of a few bytes), never fabricated references, so `stat` and the `owed` hold mean something.
  *
  * Not here: the two-node proof that the bytes reach the cohort before the row that shows them, which
- * is `two-node-blob-reference.integration.spec.ts`; the queued-transaction and restart arms
- * (`feat-sql-columns-hold-blob-references`); and the partial-commit routing, which is the commit
- * routes' own mechanism rather than this one's.
+ * is `two-node-blob-reference.integration.spec.ts`; the queued-transaction, restart and
+ * holding-period arms (`blob-pins-queued.spec.ts`, `blob-pins-reconcile.spec.ts`,
+ * `blob-pins-unstaged.spec.ts`); and the partial-commit routing, which is the commit routes' own
+ * mechanism rather than this one's.
  */
 
 import { expect } from 'chai';
