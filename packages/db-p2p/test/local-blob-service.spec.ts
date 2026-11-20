@@ -467,6 +467,44 @@ describe('LocalBlobService', () => {
 		expect(await service.responsibleScope(ref)).to.equal('collection-b');
 	});
 
+	it('the holds feed fires only when a record\'s set of hold kinds changes', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		const fired: { ref: BlobRef; kinds: string[] }[] = [];
+		let threw = 0;
+		const offThrowing = service.onHoldsChanged(() => { threw++; throw new Error('listener fault'); });
+		const off = service.onHoldsChanged((ref, holds) => { fired.push({ ref, kinds: holds.map(hold => hold.kind).sort() }); });
+
+		// The put's pin is the first kind this record carries, so the feed reports the record's holds after it.
+		const { ref } = await service.put(streamOf(bytesOf(1000, 60)), { owner: 'tx:a' });
+		expect(fired.map(event => event.kinds)).to.deep.equal([['pin']]);
+		expect(threw, 'a throwing listener is logged and does not stop the next one').to.equal(1);
+
+		// Kinds unchanged, so none of these fires: a `responsible` hold whose scope is replaced, a second
+		// owner's pin, and the `lastReadAt` a read writes. Only the first `responsible` hold is a new kind.
+		await service.holdResponsible(ref, 'collection-a');
+		await service.pin(ref, 'tx:b');
+		await service.holdResponsible(ref, 'collection-b');
+		await readAll(service.read(ref));
+		expect(fired.map(event => event.kinds)).to.deep.equal([['pin'], ['pin', 'responsible']]);
+
+		// Every hold that goes fires; the unpin that leaves the other owner's pin does not; and the one
+		// that takes the record's last hold deletes it, reported as no holds at all.
+		await service.releaseResponsible(ref);
+		await service.unpin(ref, 'tx:a');
+		await service.unpin(ref, 'tx:b');
+		// `['pin', 'pin']` is the two owners' pins: the listener is handed the record's holds, not their
+		// distinct kinds — which is why the second owner's pin above changed no KIND and did not fire.
+		expect(fired.map(event => event.kinds)).to.deep.equal([['pin'], ['pin', 'responsible'], ['pin', 'pin'], []]);
+		expect(fired.every(event => event.ref === ref), 'every event names the changed reference').to.equal(true);
+
+		off();
+		offThrowing();
+		await service.pin(ref, 'tx:c');
+		expect(fired, 'the unsubscribe stops the feed').to.have.length(4);
+	});
+
 	it('pins are read back by owner, filtered by prefix and past an unreadable record', async () => {
 		const pieces = new MemoryPieceStore();
 		const kv = new MemoryKVStore();

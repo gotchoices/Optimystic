@@ -29,6 +29,12 @@ const blockTransferProtocolFor = (networkName: string): string =>
  * blocks this node physically holds (every commit / received replica via
  * `StorageRepo.onAnyCollectionChange`), and tears it down on `node.stop()` before transports close.
  *
+ * A SECOND instance of the same class follows the cohorts of the blobs this node keeps for the network
+ * (`feat-a-held-blob-follows-its-cohort`), wired from the same `rebalance` settings and the same
+ * arachnode/FRET handles. It is asserted here rather than in a spec of its own: the same three gates
+ * decide both, so one booted node proves both. Its reaction is unit-tested in
+ * `blob-cohort-reaction.spec.ts`.
+ *
  * The monitor's detection logic (gained/lost/debounce/throttle/partition-suppress) is unit-tested in
  * `rebalance-monitor.spec.ts`; the coordinator's confirm/push reaction in `block-transfer.spec.ts`; and
  * the `onRebalance → handleRebalanceEvent` hop in `rebalance-reaction.spec.ts`. This spec proves the
@@ -92,6 +98,16 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			const coordinator = node.blockTransferCoordinator as BlockTransferCoordinator;
 			expect(coordinator, 'blockTransferCoordinator exposed on the node').to.exist;
 
+			// The blob cohort monitor (`feat-a-held-blob-follows-its-cohort`) is a SECOND instance of the
+			// same class, over the blob references this node keeps for the network. It is wired from the
+			// same `rebalance` settings and the same arachnode/FRET handles, so it is proven here rather
+			// than in a spec of its own — including that its tracked set is its own, not the shared
+			// owned-block set the block instance reads (the commit above tracked a block in that one).
+			const blobMonitor = node.blobRebalanceMonitor as RebalanceMonitor;
+			expect(blobMonitor, 'blobRebalanceMonitor exposed on the node').to.exist;
+			expect((blobMonitor as any).running, 'blob monitor was started').to.equal(true);
+			expect(blobMonitor.getTrackedBlockCount(), 'no blob held for the network, so nothing tracked').to.equal(0);
+
 			expect(monitor.getTrackedBlockCount(), 'no blocks tracked before any commit').to.equal(0);
 
 			// A commit through the coordinated repo lands in the local storageRepo, which emits
@@ -126,6 +142,8 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 		const node: any = await spawn('rebalance-wiring-stop');
 		const monitor = node.rebalanceMonitor as RebalanceMonitor;
 		expect(monitor, 'monitor exposed').to.exist;
+		const blobMonitor = node.blobRebalanceMonitor as RebalanceMonitor;
+		expect(blobMonitor, 'blob monitor exposed').to.exist;
 
 		// Spy the disposal: the node.stop wrapper must invoke monitor.stop() (the unit test proves
 		// stop() removes the connection listeners; here we prove the wrapper drives it).
@@ -136,6 +154,9 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 		await node.stop();
 		expect(stopCalls, 'node.stop() stopped the rebalance monitor').to.be.greaterThan(0);
 		expect((monitor as any).running, 'monitor no longer running after stop').to.equal(false);
+		// The blob instance has its own stop wrapper, which also unsubscribes its holds feed; a leak
+		// there would leave it running past teardown.
+		expect((blobMonitor as any).running, 'blob monitor no longer running after stop').to.equal(false);
 	});
 
 	it('rebalance: { enabled: false } skips wiring entirely (no monitor, no coordinator)', async () => {
@@ -143,6 +164,8 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 		try {
 			expect(node.rebalanceMonitor, 'no monitor wired when disabled').to.equal(undefined);
 			expect(node.blockTransferCoordinator, 'no coordinator wired when disabled').to.equal(undefined);
+			// One switch for both instances: the blob cohort monitor reads the same `rebalance` settings.
+			expect(node.blobRebalanceMonitor, 'no blob monitor wired when disabled').to.equal(undefined);
 
 			// A commit still succeeds, and the block-transfer RECEIVE handler is still registered
 			// regardless of the rebalance opt-out (it is independent of the reaction sender).
@@ -162,6 +185,10 @@ describe('rebalance-monitor / node wiring (real libp2p, solo arachnode node)', f
 			// stays inert (acceptable — rebalance is a resilience optimization).
 			expect(node.rebalanceMonitor, 'no monitor without arachnode/FRET adapter').to.equal(undefined);
 			expect(node.blockTransferCoordinator, 'no coordinator without arachnode').to.equal(undefined);
+			// The blob instance needs the same two handles, which the serving role only hands back from
+			// inside that gate, so it is inert here too — the blob copy drain still runs.
+			expect(node.blobRebalanceMonitor, 'no blob monitor without arachnode/FRET adapter').to.equal(undefined);
+			expect(node.blobCopyDrain, 'the blob copy drain is independent of the cohort monitor').to.exist;
 		} finally {
 			await node.stop();
 		}

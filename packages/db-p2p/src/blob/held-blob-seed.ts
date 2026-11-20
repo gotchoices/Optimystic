@@ -9,7 +9,7 @@ export interface HeldBlobSeedDeps {
 	/** The writer's owed entries, which carry both a reference to track and the holders already known for it. */
 	owed: Pick<OwedBlobLedger, 'list'>;
 	monitor: Pick<RebalanceMonitor, 'trackBlock' | 'recordBlockHolders'>;
-	/** Checked each reference so a long enumeration abandons promptly when the node is stopping. */
+	/** Checked each reference so the tracking loops abandon promptly when the node is stopping. */
 	isStopping: () => boolean;
 }
 
@@ -25,6 +25,14 @@ export interface HeldBlobSeedDeps {
  * independently caught by the feed (`trackBlock` is idempotent) and the holder evidence below is not
  * dropped as arriving while stopped.
  *
+ * NOTE: both enumerations are materialized before their loop — `responsibleRefs` reads and decodes
+ * every blob record, `owed.list` the whole owed index — so `isStopping` and the cooperative yield
+ * below bound only the tracking loops, not the scan that feeds them. Each record read awaits, so the
+ * scan yields to the event loop as it goes and holds up nothing but itself (this runs
+ * fire-and-forget); what it cannot do is abandon early, so a node stopping moments after start still
+ * pays for the whole scan in the background. If a machine ever holds enough blob records for that to
+ * matter, give the blob service a streaming enumeration of held references and consume it here.
+ *
  * A `responsible` holder has no holder memory to seed — the holders of a blob it is not the writer of
  * are recorded nowhere — so after a restart it announces once to its whole cohort, which receivers
  * answer `whole` cheaply, bounded by the monitor's `growthBlockBudget` references per check and its
@@ -32,7 +40,7 @@ export interface HeldBlobSeedDeps {
  */
 export async function seedHeldBlobs(deps: HeldBlobSeedDeps, yieldEvery = 1000): Promise<void> {
 	let seeded = 0;
-	/** Cooperative yield, as the owned-block seed's does: a long enumeration must not monopolize one event-loop tick. */
+	/** Cooperative yield, as the owned-block seed's does: a long tracking loop must not monopolize one event-loop tick. */
 	const breathe = async (): Promise<void> => {
 		if (++seeded % yieldEvery === 0) {
 			await new Promise<void>(resolve => setTimeout(resolve, 0));

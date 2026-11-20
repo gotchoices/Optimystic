@@ -7,7 +7,7 @@
  * (`packages/db-p2p/src/cluster/block-transfer.ts`): the same event in, the same shape of feedback
  * out, a different primitive — an announcement instead of a push, and a `stat` instead of a push
  * response. It touches no wiring: running a `RebalanceMonitor` over the blobs this node holds and
- * acting on what `handle` returns is the factory's.
+ * acting on what `handleRebalanceEvent` returns is the factory's.
  *
  * Imports here are type-only or pure: this module is reachable from the react-native entry
  * (`src/rn.ts`).
@@ -98,7 +98,7 @@ interface ReleasePlan {
 export class BlobCohortReaction {
 	constructor(private readonly deps: BlobCohortReactionDeps) { }
 
-	async handle(event: RebalanceEvent): Promise<BlobReactionResult> {
+	async handleRebalanceEvent(event: RebalanceEvent): Promise<BlobReactionResult> {
 		// Re-checked here even though the monitor suppresses its own checks during a partition: the
 		// event may have been emitted just before the flag went up.
 		if (this.deps.partitionDetector.detectPartition()) {

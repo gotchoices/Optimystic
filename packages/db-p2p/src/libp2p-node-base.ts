@@ -1924,6 +1924,10 @@ export async function createLibp2pNodeBase(
 		// failure is logged and non-fatal for the same reason: following a cohort is a resilience
 		// mechanism, and the drain still keeps a writer's copies moving without it.
 		if (served?.arachnode && (options.rebalance?.enabled ?? true) !== false) {
+			// Hoisted out of the `try` so the catch below can drop it: a failure after the feed is
+			// subscribed but before the stop wrapper is installed would otherwise leave a listener adding
+			// to a monitor nothing ever reads or tears down.
+			let offHoldsFeed: (() => void) | undefined;
 			try {
 				// Its own tracked set, never the shared owned-block set: these ids are blob references, placed
 				// by a different routing rule. Its was-responsible memory (`responsibilitySnapshot`) is
@@ -1951,7 +1955,16 @@ export async function createLibp2pNodeBase(
 				// Best-effort iteration safety, as the owned-block set's eviction already accepts: this can
 				// add to or delete from the set while a check is mid-`for...of` over it, which does not throw
 				// in JavaScript — entries are visited best-effort — so it is documented rather than locked.
-				const offHoldsFeed = blobs.onHoldsChanged((ref, holds) => {
+				//
+				// NOTE: tracking an `owed`-only reference buys little — the release arm skips it
+				// (`release:not-responsible`) and `BlobCopyDrain` already follows its cohort on every pass,
+				// so the growth arm only duplicates announcements the drain would send, at one `findCluster`
+				// per owed reference per check. Kept because it is the one thing that still announces a
+				// writer's owed blobs when `blobs.copy.enabled` is false while owed entries from an earlier
+				// run remain, and because `owed` is as much "kept for the network" as `responsible` is. If a
+				// node holding many owed references ever shows these checks or announcements as costly, feed
+				// only `responsible` here and leave owed blobs entirely to the drain.
+				offHoldsFeed = blobs.onHoldsChanged((ref, holds) => {
 					if (holds.some(hold => hold.kind === 'owed' || hold.kind === 'responsible')) {
 						monitor.trackBlock(ref);
 					} else {
@@ -1983,8 +1996,14 @@ export async function createLibp2pNodeBase(
 				// `AnnounceLimiter` is for, and two reactions over one snapshot agree on their outcomes. If
 				// overlapping reactions ever do show up, hold one in-flight promise here and skip a check
 				// that lands on top of it, as `BlockTransferCoordinator` does with its `inFlight` keys.
+				// (`RebalanceMonitor.recordGrowthOutcome`'s own NOTE already accepts the one effect two
+				// racing checks have on its state: one growth attempt double-counted.) A reaction still in
+				// flight when the node stops is the same shape and equally benign: `monitor.stop()` does not
+				// wait for it, so its remaining announcements go out while the transports are still up and
+				// its last record write either lands or rejects into the catch below — a hold left unreleased
+				// is the safe direction and is re-detected on the next run.
 				monitor.onRebalance((event) => {
-					reaction.handle(event).then(async (result) => {
+					reaction.handleRebalanceEvent(event).then(async (result) => {
 						// In turn: at most a cohort's worth per check, each one serialized record write. The feed
 						// above untracks the reference when the release leaves no `owed` hold behind.
 						for (const ref of result.released) await blobs.releaseResponsible(ref);
@@ -1999,7 +2018,7 @@ export async function createLibp2pNodeBase(
 					const previousStop = node.stop.bind(node);
 					node.stop = async () => {
 						seedStopping = true;
-						offHoldsFeed();
+						offHoldsFeed?.();
 						try {
 							await monitor.stop();
 						} finally {
@@ -2013,6 +2032,7 @@ export async function createLibp2pNodeBase(
 				void seedHeldBlobs({ records: blobs, owed: owedBlobLedger, monitor, isStopping: () => seedStopping })
 					.catch((err) => { wiringLog('held-blob-seed seed failed: %o', err); });
 			} catch (err) {
+				offHoldsFeed?.();
 				wiringLog('blob rebalance wiring init failed: %o', err);
 			}
 		}

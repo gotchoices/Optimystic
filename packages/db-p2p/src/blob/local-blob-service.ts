@@ -967,8 +967,12 @@ function sameHoldKinds(before: readonly BlobHold[], after: readonly BlobHold[]):
 	return was.size === now.size && [...was].every(kind => now.has(kind));
 }
 
-/** Generic in the listener type rather than in an event type: a feed may hand its listeners more than one argument. */
-function subscribe<L>(listeners: Set<L>, listener: L): () => void {
+/**
+ * Generic in the listener type rather than in an event type: a feed may hand its listeners more than
+ * one argument. Still constrained to a void-returning function, so a caller cannot pass a `Set` of
+ * something that is not callable and only find out when the feed emits.
+ */
+function subscribe<L extends (...args: never[]) => void>(listeners: Set<L>, listener: L): () => void {
 	listeners.add(listener);
 	return () => {
 		listeners.delete(listener);

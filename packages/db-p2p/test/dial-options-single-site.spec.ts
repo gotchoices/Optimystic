@@ -39,7 +39,10 @@ import ts from 'typescript';
  * every `.handle(` call under `src` is a libp2p registration, so the name is exact. If a genuinely
  * unrelated `.handle(` is ever introduced the guard fails loudly on it, and the fix is to rename
  * that method (preferred — this flag's failure mode is silence, so a noisy guard is the cheap side
- * to err on) rather than to weaken the match. A method *definition* named `handle`
+ * to err on) rather than to weaken the match. That has happened once: `BlobCohortReaction`'s entry
+ * point was `handle`, and the guard fired the moment the node factory first called it, so it was
+ * renamed `handleRebalanceEvent` after the block counterpart it mirrors. A method *definition* named
+ * `handle`
  * (`src/testing/cohort-topic-mesh-harness.ts` has one on its `MockNode`) is structurally distinct
  * from a call and does not trip it.
  */

@@ -132,7 +132,7 @@ describe('BlobCohortReaction', () => {
 
 		stat.answer('owner-a', 'whole');
 		stat.answer('owner-b', 'none');
-		const first = await reaction.handle(event);
+		const first = await reaction.handleRebalanceEvent(event);
 
 		expect(first.released).to.deep.equal([]);
 		expect(first.retained).to.deep.equal([ref]);
@@ -141,7 +141,7 @@ describe('BlobCohortReaction', () => {
 		expect(await blobs.responsibleScope(ref)).to.equal(SCOPE);
 
 		stat.answer('owner-b', 'whole');
-		const second = await reaction.handle(event);
+		const second = await reaction.handleRebalanceEvent(event);
 
 		expect(second.released).to.deep.equal([ref]);
 		expect(second.retained).to.deep.equal([]);
@@ -159,7 +159,7 @@ describe('BlobCohortReaction', () => {
 		announcer.answer('peer-declined', 'declined');
 		announcer.answer('peer-unreferenced', 'unreferenced');
 
-		const result = await reaction.handle(eventOf({
+		const result = await reaction.handleRebalanceEvent(eventOf({
 			grown: new Map([[ref, ['peer-whole', 'peer-fetching', 'peer-declined', 'peer-unreferenced']]]),
 		}));
 
@@ -178,7 +178,7 @@ describe('BlobCohortReaction', () => {
 		await blobs.releaseResponsible(ref);
 		const reaction = new BlobCohortReaction(deps);
 
-		const result = await reaction.handle(eventOf({ grown: new Map([[ref, ['peer-a', 'peer-b']]]) }));
+		const result = await reaction.handleRebalanceEvent(eventOf({ grown: new Map([[ref, ['peer-a', 'peer-b']]]) }));
 
 		expect(result.growth.has(ref)).to.equal(false);
 		expect(announcer.peersTold()).to.deep.equal([]);
