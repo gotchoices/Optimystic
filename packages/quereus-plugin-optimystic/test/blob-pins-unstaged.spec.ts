@@ -8,19 +8,24 @@
  * process stopped) would hold those bytes for ever. `SqlBlobPins.sweepUnstaged` bounds it: past
  * `blob_unstaged_holding_ms` the pin is released and the writer's piece sweep takes the bytes.
  *
- * Two cases, because the rule has two halves. The first is the period itself, driven on both sides
- * of the boundary. The second is the protection that is the whole reason the rule is not just "older
- * than the period": a reference some unfinished transaction is relying on is never expired, however
- * old its pin. It is driven through a QUEUED transaction, which is live for as long as it sits in
- * the queue with no SQL transaction open — the one way a spec can watch a sweep run while a
- * transaction still owes a reference, since the sweep's own work chain waits for an OPEN transaction
- * to end before it looks.
+ * Three cases. The first is the period itself, driven on both sides of the boundary. The second is
+ * the protection that is the whole reason the rule is not just "older than the period": a reference
+ * some unfinished transaction is relying on is never expired, however old its pin. It is driven
+ * through a QUEUED transaction, which is live for as long as it sits in the queue with no SQL
+ * transaction open — the one way a spec can watch a sweep run while a transaction still owes a
+ * reference, since the sweep's own work chain waits for an OPEN transaction to end before it looks.
  *
- * The ledger half of that protection — a reference a statement has staged and whose commit has not
- * yet pinned it — is by inspection for the same reason: no sweep can be observed running inside an
- * open transaction. So is the arm that leaves an `unstaged` label this build cannot read pinned for
- * ever, and the clock-moved-backwards arm, which is the boundary case below with the comparison the
- * other way round.
+ * That protection has a second half no spec can watch directly, for the same reason: the references
+ * a statement has staged and whose commit has not yet pinned them, which only the open transaction's
+ * own ledger knows (`TransactionBridge.openBlobReferences`). What the THIRD case drives is the half
+ * of it that can go wrong in the quiet direction — the `isActive` guard. The bridge keeps a
+ * transaction, and so its ledger, until the next `begin`, so without that guard a reference a
+ * rolled-back insert staged would read as still owed for ever and its pin could never expire, which
+ * is exactly the leak this sweep exists to close.
+ *
+ * By inspection: the arm that leaves an `unstaged` label this build cannot read pinned for ever, and
+ * the clock-moved-backwards arm, which is the boundary case below with the comparison the other way
+ * round.
  *
  * Every sweep here is driven by hand with an explicit `now`, so no case waits on the plugin's own
  * interval — which, at the default 24-hour holding period, is an hour.
@@ -148,6 +153,38 @@ describe('an unreferenced blob put outside a transaction is released after its h
 				.to.equal('local');
 			expect(await referencesInTree(await transactorOf(handle, stores), scopeOf(uri)),
 				'the committed row still holds the reference').to.deep.equal([referenced]);
+		} finally {
+			await closePlugin(handle);
+		}
+	});
+
+	it('expires the pin of a reference only a rolled-back transaction ever staged', async () => {
+		const uri = 'tree://blobpins-unstaged/rolled-back';
+		const stores = createStores();
+		const handle = openPlugin(stores);
+		try {
+			const { db, plugin } = handle;
+			await db.exec(TABLE_DDL(uri));
+			const ref = await putBlob(handle, 4);
+			const putAt = await unstagedPutAt(handle, ref);
+
+			await db.exec('begin');
+			await db.exec(`insert into T (Id, R) values (1, '${ref}')`);
+			await db.exec('rollback');
+			// The rollback leaves the put's own pin, so an application that retries the insert need
+			// not put the bytes again (`blob-pins-online.spec.ts` holds that rule); from there the
+			// holding period is the only thing that bounds it.
+			expect(await pinsOn(plugin, ref), 'the rollback left the application its own hold')
+				.to.deep.equal(['unstaged']);
+
+			await plugin.blobPins.sweepUnstaged(putAt + DEFAULT_UNSTAGED_HOLDING_MS + 1);
+
+			// The ledger of the ended transaction still records the add, and the bridge still holds
+			// that transaction: only `openBlobReferences`' `isActive` guard stops it from answering
+			// for a reference nothing owes any more.
+			expect(await pinsOn(plugin, ref),
+				'the transaction has ended, so nothing protects the pin from its period')
+				.to.deep.equal([]);
 		} finally {
 			await closePlugin(handle);
 		}

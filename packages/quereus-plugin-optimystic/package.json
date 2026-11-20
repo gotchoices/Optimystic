@@ -142,6 +142,12 @@
         "help": "Slowest round trip between any two nodes, relayed hops included; every network deadline is derived from it. Unset keeps the LAN deadlines"
       },
       {
+        "key": "blob_unstaged_holding_ms",
+        "label": "Unreferenced Blob Holding Period (ms)",
+        "type": "number",
+        "help": "How long a blob put with no transaction open is kept when no statement ever references it. Unset keeps 24 hours. A blob any unfinished transaction references is never let go"
+      },
+      {
         "key": "cost_profile",
         "label": "Read Cost Profile",
         "type": "select",
