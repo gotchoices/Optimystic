@@ -1888,10 +1888,13 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   statements) — doing so would kill reactivity after the first scan. Closing a
   `Database` without dropping its tables leaves the storage listener attached until
   the `CollectionFactory` is GC'd; its dispatch becomes a logged no-op once the
-  `Database` is closed. A tagged table's network watch has the same span — opened by
+  `Database` is closed. A tagged table's network watches have the same span — opened by
   full initialization (never by the provisional committed-read pass), closed by DROP
-  TABLE — and is also closed by `CollectionFactory.dispose` (so by `plugin.dispose()`),
-  which closes every network watch the factory opened. Quereus tells a vtab nothing
+  TABLE — and are also closed by `CollectionFactory.dispose` (so by `plugin.dispose()`),
+  which closes every network watch the factory opened. Within that span the SET of them
+  follows the table's collections, not the table's lifetime: `create index` opens one more
+  and `drop index` closes it, each reconciled off the bridge registration the DDL makes
+  (`reconcileNetworkWatch`). Quereus tells a vtab nothing
   when a `Database.watch` is added or removed, so the watch runs for the table's
   whole open life; the tag is the consent to that.
 - **Host requirement.** Without the tag, only nodes that host the collection's

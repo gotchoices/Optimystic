@@ -1972,16 +1972,29 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Coalesced: a step already queued and not yet started absorbs further requests, so the burst of
    * {@link registerTree} calls one initialization makes costs one or two reconciles rather than one
    * per index. Sound because a step reads the wanted set when it RUNS, not when it was queued.
+   *
+   * The chain is kept settled: a step that threw anyway — {@link applyNetworkWatch} catches each
+   * open and each close, so only the wanted-set read or the trace could — would otherwise leave
+   * `networkWatchSteps` rejected, and every later `.then` would skip its step, so the table would
+   * never reconcile its watches again (and the rejection would surface unhandled, nothing awaits
+   * this chain).
    */
   private reconcileNetworkWatch(): void {
     if (this.networkWatchStepQueued) {
       return;
     }
     this.networkWatchStepQueued = true;
-    this.networkWatchSteps = this.networkWatchSteps.then(() => {
-      this.networkWatchStepQueued = false;
-      return this.applyNetworkWatch();
-    });
+    this.networkWatchSteps = this.networkWatchSteps
+      .then(() => {
+        this.networkWatchStepQueued = false;
+        return this.applyNetworkWatch();
+      })
+      .catch(error => {
+        log(
+          `WARN: a network-watch reconcile step for '${this.tableName}' failed: ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+      });
   }
 
   /**

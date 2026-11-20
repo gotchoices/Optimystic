@@ -471,7 +471,7 @@ create table users (id integer primary key, name text)
 The key is quoted because Quereus reads an unquoted tag key as a single identifier.
 The value must be the boolean `true`; anything else, the string `'true'` included,
 leaves the table on local wakes only. `alter table users set tags (…)` (and an
-`apply schema` whose only change is the tag) starts or stops the network watch on
+`apply schema` whose only change is the tag) starts or stops the network watches on
 the running table, and is saved in the table's catalog record like any other tag
 change (see *Warm Restart* above).
 
