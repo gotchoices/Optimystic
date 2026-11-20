@@ -161,8 +161,11 @@ export class CollectionFactory {
    * This factory's blob-scope registrations, keyed by (transactor key, scope) — which reference
    * trees it has confirmed in which network's scope registry (docs/blobs.md §Registering
    * references). Public because the DDL paths that write the registry are on the module, not here,
-   * and they need no blob service: resolving one for a `network` transactor would build or reuse a
-   * libp2p node for a statement that only has to write one registry entry.
+   * and they reach it through {@link networkBinding} rather than {@link getBlobBackend}: a registry
+   * entry is written through the network's transactor alone, so a statement that writes one has no
+   * reason to resolve (and then remember) that network's piece store and blob records. It is NOT a
+   * saving on building the libp2p node — `networkBinding` resolves the transactor, which for
+   * `network` is what builds or reuses the node, exactly as the backend path does.
    */
   readonly blobScopes = new BlobScopeRegistration();
 
@@ -366,14 +369,6 @@ export class CollectionFactory {
    * through {@link getOrCreateTransactor} — the backend carries that transactor, and for `network`
    * it is also what builds or reuses the node.
    */
-  /**
-   * The transactor and key of `options`'s network, with NO blob service resolved — all the scope
-   * registry needs ({@link blobScopes}). Deliberately not {@link getBlobBackend}: see that field.
-   */
-  async networkBinding(options: ParsedOptimysticOptions): Promise<NetworkBinding> {
-    return { key: this.getTransactorKey(options), transactor: await this.getOrCreateTransactor(options) };
-  }
-
   async getBlobBackend(options: ParsedOptimysticOptions): Promise<BlobBackend> {
     const key = this.getTransactorKey(options);
     const resolved = this.blobBackends.get(key);
@@ -391,6 +386,14 @@ export class CollectionFactory {
       this.blobBackendsInFlight.set(key, inFlight);
     }
     return await inFlight;
+  }
+
+  /**
+   * The transactor and key of `options`'s network, with NO blob service resolved — all the scope
+   * registry needs ({@link blobScopes}). Deliberately not {@link getBlobBackend}: see that field.
+   */
+  async networkBinding(options: ParsedOptimysticOptions): Promise<NetworkBinding> {
+    return { key: this.getTransactorKey(options), transactor: await this.getOrCreateTransactor(options) };
   }
 
   /**

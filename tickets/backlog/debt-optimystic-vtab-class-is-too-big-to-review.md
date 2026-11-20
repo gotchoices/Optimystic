@@ -44,6 +44,8 @@ Re-measured 2026-09-15 while reviewing `refuse-concurrent-row-change-loser` (whi
 
 Re-measured 2026-09-15 while reviewing `index-seek-must-verify-its-entries` (which made the index seek check every entry against the row it resolves to): the same command now reports **4611**. That review's main correctness question — does a verified seek ever reject a HEALTHY entry — needed the seek, the trace probe, the access-plan arm that decides an index is usable, and the row codec's encode/decode round-trip held in mind together, and three of those four are private members of this one class.
 
+Re-measured 2026-11-19 while reviewing `feat-blob-reference-trees-follow-sql-rows` (which added a second kind of side tree a write has to keep in step with its rows): the same command now reports **7691**. The change itself is small and almost entirely mirror-image of the index-maintenance code, which is the point — checking it meant reading initialization, the catalog-only ALTER path, the transaction-bridge registration, the commit-route marking, the collection-description helper and all six DML arms of one class, because each of those is where the new tree had to be threaded. Nothing was wrong in any of them; the cost was that there was no smaller unit to check than the whole class.
+
 ## Why it matters
 
 Reviews of this file are the bottleneck, not the edits. Recent tickets touching it

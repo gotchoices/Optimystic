@@ -697,9 +697,10 @@ export class TransactionBridge {
     return this.collectionTables.get(id);
   }
 
-  /** The collections {@link registerCollection} recorded `table` as backing — its main tree and its
-   * index trees; empty for a table none was registered for. Read by the offline-mode controller to
-   * find the queued transactions that wrote a table (`OfflineMode.assertNoQueuedEntries`). */
+  /** The collections {@link registerCollection} recorded `table` as backing — its main tree, its
+   * index trees and, for a table with a `blobref` column, its blob reference tree; empty for a table
+   * none was registered for. Read by the offline-mode controller to find the queued transactions
+   * that wrote a table (`OfflineMode.assertNoQueuedEntries`). */
   collectionsOf(table: QualifiedTableName): CollectionId[] {
     const name = qualifiedTableName(table);
     return [...this.collectionTables].filter(([, tables]) => tables.has(name)).map(([id]) => id);
