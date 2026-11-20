@@ -1,17 +1,18 @@
 import { expect } from 'chai';
 import {
-	claimFromConsultAnswer, fitConsultContent, latestClaimFromArchive, servableProof, serveBlockArchive, serveConsultAnswer,
-	singleRevisionArchive, type ArchiveServingRepo
+	claimFromConsultAnswer, dedupeResponseProofs, fitConsultContent, hydrateResponseProofs, latestClaimFromArchive,
+	servableProof, serveBlockArchive, serveConsultAnswer, singleRevisionArchive, type ArchiveServingRepo
 } from '../src/storage/block-archive.js';
-import type { SyncBlockAnswer } from '../src/sync/protocol.js';
+import type { SyncBlockAnswer, SyncResponse } from '../src/sync/protocol.js';
 import type { BlockArchive } from '../src/storage/struct.js';
 import { verifyBlockCommitProofClaim, verifyBlockCommitProofContent, type BlockCommitProof } from '../src/cluster/commit-proof.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import { BlockStorage } from '../src/storage/block-storage.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
-import { MAX_BLOCK_MESSAGE_BYTES } from '../src/protocol-limits.js';
+import { CONSULT_RESPONSE_PROOF_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES } from '../src/protocol-limits.js';
 import { createMesh, type Mesh } from '../src/testing/mesh-harness.js';
 import { PROOF_THRESHOLDS, makeSignedProof } from './support/commit-proof-fixtures.js';
+import { syncWire } from './support/sync-wire.js';
 import { canonicalBlockHash } from '@optimystic/db-core';
 import type { ActionId, ActionRev, BlockId, CommitRequest, IBlock } from '@optimystic/db-core';
 
@@ -387,6 +388,126 @@ describe('block archive commit proof', () => {
 			expect(fitted[2], 'holds nothing passes through').to.deep.equal(answers[2]);
 
 			expect(fitConsultContent(answers, MAX_BLOCK_MESSAGE_BYTES), 'within budget, nothing is left out').to.deep.equal(answers);
+		});
+	});
+
+	describe('a commit proof crosses the repair wire once per response', () => {
+		/** A claim-only answer for `blockId` at rev 1, certified by `proof` — what a 'held' answer is. */
+		const claimAnswer = (blockId: BlockId, proof: BlockCommitProof): SyncBlockAnswer =>
+			({ archive: singleRevisionArchive(blockId, { rev: 1, actionId: ACTION }, undefined, proof), contentOmitted: 'held' });
+
+		/** The whole response as it would cross the wire, in bytes. */
+		const wireBytes = (response: SyncResponse): number => new TextEncoder().encode(JSON.stringify(response)).byteLength;
+
+		it('carries one commit\'s proof once however many of its blocks the response answers about', async () => {
+			const blockIds = [BLOCK, OTHER_BLOCK, 'block-3' as BlockId];
+			const { proof } = await makeSignedProof(3, makeCommit({ blockIds, tailId: BLOCK }));
+			// Three answers of one commit, in the three shapes a consult produces: bytes carried, bytes
+			// left out as 'held', and an archive beside a lineage answer. All three must come back whole.
+			const response: SyncResponse = {
+				success: true,
+				answers: {
+					[BLOCK]: { archive: singleRevisionArchive(BLOCK, { rev: 1, actionId: ACTION }, makeBlock(BLOCK), proof) },
+					[OTHER_BLOCK]: claimAnswer(OTHER_BLOCK, proof),
+					['block-3' as BlockId]: { ...claimAnswer('block-3' as BlockId, proof), lineage: 'contains' }
+				},
+				responderId: 'peer-1'
+			};
+
+			const deduped = dedupeResponseProofs(response, CONSULT_RESPONSE_PROOF_BUDGET_BYTES);
+
+			expect(Object.keys(deduped.proofs ?? {}), 'one table entry, keyed by the proof\'s own hash')
+				.to.deep.equal([proof.messageHash]);
+			for (const blockId of blockIds) {
+				const entry = soleEntry(deduped.answers![blockId]!.archive!);
+				expect(entry.proof, `${blockId}: the proof left the entry`).to.equal(undefined);
+				expect(entry.proofRef, `${blockId}: and is named instead`).to.equal(proof.messageHash);
+			}
+			// The point of the change, measured on the bytes: one copy of the proof on the wire, not one
+			// per answered block. A signature is unique to this proof, so counting it counts copies.
+			const signature = Object.values(proof.commits)[0]!.signature;
+			const copies = (text: string) => text.split(signature).length - 1;
+			expect(copies(JSON.stringify(response)), 'inline: one copy per answered block').to.equal(3);
+			expect(copies(JSON.stringify(deduped)), 'deduped: one copy for the response').to.equal(1);
+
+			// Read back as the asker reads it — through JSON, since that is what the wire does to it.
+			const hydrated = hydrateResponseProofs(JSON.parse(JSON.stringify(deduped)) as SyncResponse);
+
+			expect(hydrated.proofs, 'the table is consumed, not handed on').to.equal(undefined);
+			expect(hydrated, 'every answer is restored exactly as it was served')
+				.to.deep.equal(JSON.parse(JSON.stringify(response)));
+			// And a restored proof is still evidence for the block it was filed for — including the last
+			// block, whose own copy of the proof never crossed the wire.
+			const restored = soleEntry(hydrated.answers!['block-3' as BlockId]!.archive!).proof!;
+			expect(await verifyBlockCommitProofClaim(restored, { blockId: 'block-3' as BlockId, rev: 1, actionId: ACTION }, PROOF_THRESHOLDS))
+				.to.deep.include({ ok: true });
+		});
+
+		it('leaves out the proofs past its budget, keeping a response that could not be sent at all under the frame cap', async function () {
+			this.timeout(60_000);
+			// The liveness hole this pass closes. A proof carries its commit message verbatim, which
+			// lists every block id and declared digest of the commit, so one proof of a large commit is
+			// most of a megabyte — and proofs sit outside the content budget. Ten answers, each about a
+			// block of a DIFFERENT large commit (the worst case for deduping: nothing is shared), came to
+			// more than the 8 MiB frame both sides frame the response under, so the response could
+			// neither be encoded nor decoded and the whole consult failed.
+			const PROOFS = 10;
+			const BLOCKS_PER_COMMIT = 7_000;
+			const answers: Record<BlockId, SyncBlockAnswer> = {};
+			const hashes: string[] = [];
+			for (let i = 0; i < PROOFS; i++) {
+				const blockIds = Array.from({ length: BLOCKS_PER_COMMIT }, (_, n) => `blk-${i}-${String(n).padStart(32, '0')}` as BlockId);
+				const blockDigests = Object.fromEntries(blockIds.map(id => [id, { digest: `d-${id}` }]));
+				const { proof } = await makeSignedProof(3, makeCommit({ blockIds, tailId: blockIds[0]!, blockDigests }));
+				hashes.push(proof.messageHash);
+				answers[blockIds[0]!] = claimAnswer(blockIds[0]!, proof);
+			}
+			const response: SyncResponse = { success: true, answers, responderId: 'peer-1' };
+			expect(wireBytes(response), 'the fixture must reproduce an unsendable response')
+				.to.be.greaterThan(MAX_BLOCK_MESSAGE_BYTES);
+
+			const deduped = dedupeResponseProofs(response, CONSULT_RESPONSE_PROOF_BUDGET_BYTES);
+			const hydrated = hydrateResponseProofs(JSON.parse(JSON.stringify(deduped)) as SyncResponse);
+
+			expect(wireBytes(deduped), 'and a sendable one afterwards').to.be.lessThan(MAX_BLOCK_MESSAGE_BYTES);
+			const admitted = Object.keys(deduped.proofs ?? {});
+			expect(admitted.length, 'some proofs are admitted, not all').to.be.within(1, PROOFS - 1);
+			expect(admitted, 'admitted in answer order').to.deep.equal(hashes.slice(0, admitted.length));
+
+			for (const [index, hash] of hashes.entries()) {
+				const blockId = Object.keys(answers)[index]! as BlockId;
+				const entry = soleEntry(hydrated.answers![blockId]!.archive!);
+				if (index < admitted.length) {
+					expect(entry.proof?.messageHash, `${blockId}: an admitted proof hydrates`).to.equal(hash);
+				} else {
+					expect(entry.proof, `${blockId}: a proof past the budget is left out`).to.equal(undefined);
+				}
+				// Either way the claim itself survives — proof-less is the pre-proof shape, which the
+				// asker reads as a claim to corroborate rather than as silence.
+				expect(entry.proofRef, `${blockId}: no reference reaches a consumer`).to.equal(undefined);
+				expect(latestClaimFromArchive(hydrated.answers![blockId]!.archive!)?.rev, `${blockId}: still claims rev 1`).to.equal(1);
+			}
+		});
+
+		it('is relocated by the real service and restored by the real client, on both answer shapes', async () => {
+			// The two passes are applied on opposite sides of the wire, and a caller holding a response
+			// cannot see whether either ran. So this drives a real `SyncService` and `SyncClient` over a
+			// linked pair: if the server stopped deduping, or the client stopped hydrating, every repair
+			// answer would quietly lose its proof and fall back to corroboration with nothing failing.
+			const { repo } = makeRepo();
+			const proof = await landRevision(repo, { rev: 1, actionId: ACTION, block: makeBlock(), certified: true });
+			const { ask } = await syncWire(repo);
+
+			const consult = await ask({ blockId: BLOCK, blockIds: [BLOCK], rev: undefined, held: {} });
+			const fetched = await ask({ blockId: BLOCK, rev: undefined });
+
+			const served = [['consult', consult, consult.answers?.[BLOCK]?.archive], ['archive fetch', fetched, fetched.archive]] as const;
+			for (const [name, response, archive] of served) {
+				const entry = soleEntry(archive!);
+				expect(entry.proof, `${name}: the proof arrives inside the revision entry`).to.deep.equal(proof);
+				expect(entry.proofRef, `${name}: no reference reaches the caller`).to.equal(undefined);
+				expect(response.proofs, `${name}: nor the table it travelled in`).to.equal(undefined);
+			}
 		});
 	});
 

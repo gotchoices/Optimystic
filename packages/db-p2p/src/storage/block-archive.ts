@@ -1,5 +1,5 @@
 import type { ActionContext, ActionRev, BlockId, BlockLineage, IBlock, IRepo } from "@optimystic/db-core";
-import type { BlockArchive } from "./struct.js";
+import type { ArchiveRevisions, BlockArchive } from "./struct.js";
 import type { SyncBlockAnswer, SyncContentOmitted, SyncResponse } from "../sync/protocol.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { createLogger } from "../logger.js";
@@ -225,6 +225,165 @@ function withoutContent(blockId: BlockId, answer: SyncBlockAnswer, reason: SyncC
 	return { ...answer, archive: singleRevisionArchive(blockId, claim, undefined, claim.proof), contentOmitted: reason };
 }
 
+/** One revision entry of an archive, the unit both proof passes below rewrite. */
+type ArchiveRevision = ArchiveRevisions[number];
+
+/**
+ * Move every inline commit proof in `response` into one table keyed by `BlockCommitProof.messageHash`
+ * (`SyncResponse.proofs`), leaving each revision entry NAMING its proof by that hash
+ * (`ArchiveRevisions.proofRef`) — so a response answering several blocks of one commit carries that
+ * commit's proof once rather than once per block. The producing half of the pair; the asker runs
+ * {@link hydrateResponseProofs} as it reads the response, and nothing in between reads an archive.
+ *
+ * A proof carries its consensus message verbatim, and that message's commit operation lists every
+ * block id and declared digest of the commit — so a proof's size is linear in its commit's block
+ * count: one reported proof of 528 KB covered 3,383 blocks (GitHub #60). Repeating it per answered
+ * block cost bandwidth, and — because proofs sit outside the content budget — could put a 32-block
+ * consult answer past the 8 MiB frame both sides frame the response under, which fails the whole
+ * consult rather than one block of it.
+ *
+ * The table is built FROM the entries it rewrites, so this cannot mis-pair a proof with a revision it
+ * does not certify: an entry's reference is the hash of the proof that was in that entry.
+ *
+ * Proofs are admitted in answer order while the running total of their JSON-encoded size stays
+ * within `budgetBytes`, and the FIRST proof is always admitted — so a one-block answer is served as
+ * it is today, with its proof merely relocated. A proof past the budget is not admitted, and the
+ * entries that would have named it are served PROOF-LESS rather than inline: the pre-proof shape
+ * every consumer already tolerates (a pre-proof revision, a diverged member and an un-upgraded peer
+ * all legitimately answer without one). Leaving it inline instead would put back the bytes the
+ * budget exists to keep out of the frame.
+ */
+export function dedupeResponseProofs(response: SyncResponse, budgetBytes: number): SyncResponse {
+	const encoder = new TextEncoder();
+	const proofs: Record<string, BlockCommitProof> = {};
+	let spent = 0;
+	/**
+	 * The hash to name `proof` by, or `undefined` when it is not admitted — past the budget, or
+	 * (locally impossible: every producer sets it) carrying no usable `messageHash` to be keyed by,
+	 * which also means it could never have verified, since verification recomputes that hash and
+	 * compares it. Either way the entry naming it is served proof-less rather than inline: leaving
+	 * an unadmitted proof in place would put back the bytes this pass exists to keep out of the frame.
+	 */
+	const admit = (proof: BlockCommitProof): string | undefined => {
+		const hash = proof.messageHash;
+		if (typeof hash !== 'string' || hash.length === 0) return undefined;
+		// NOTE: a hash already admitted serves every later entry naming it, so two proofs of ONE
+		// message differing in which votes they carry would both be served as the first one's. Fine
+		// today: storage keeps one proof per `messageHash` (`KvRawStorage.storeCommitProofIfAbsent`),
+		// so every entry of a response reads the same object. If a store ever retains per-revision
+		// vote sets, compare the two before collapsing them.
+		if (proofs[hash]) return hash;
+		const size = encoder.encode(JSON.stringify(proof)).byteLength;
+		// The first proof always rides. Leaving it out would answer a claim proof-lessly where the
+		// pre-table build answered it certified, and a lone oversized proof is the only evidence this
+		// node has for that revision.
+		if (spent > 0 && spent + size > budgetBytes) return undefined;
+		proofs[hash] = proof;
+		spent += size;
+		return hash;
+	};
+	const deduped = mapResponseArchives(response, archive => mapRevisions(archive, entry => {
+		if (!entry.proof) return entry;
+		const ref = admit(entry.proof);
+		const { proof, ...rest } = entry;
+		return ref === undefined ? rest : { ...rest, proofRef: ref };
+	}));
+	return spent > 0 ? { ...deduped, proofs } : deduped;
+}
+
+/**
+ * Resolve every `ArchiveRevisions.proofRef` in `response` back into the entry's own `proof`, out of
+ * the response's table, and drop the table — the consuming half of {@link dedupeResponseProofs}. Run
+ * ONCE where a sync response crosses into this process (`SyncClient.requestBlock`), so no consumer of
+ * an archive ever sees a reference.
+ *
+ * Total on hostile input, and it does no cryptography: a table entry is used only when it is filed
+ * under its own `messageHash` — that is what makes "the key is the proof's hash" true at the one seam
+ * a reference crosses, rather than something a serving peer could choose — and a reference naming
+ * nothing usable simply leaves the entry proof-less, never mis-paired. Whether a resolved proof is
+ * evidence of anything stays the consumer's question, unchanged: `verifyBlockCommitProofClaim`
+ * re-derives the message hash and never memoizes the claim step, so a genuine proof presented for a
+ * revision it does not certify still fails `claim-not-in-message`.
+ *
+ * A response from a peer that predates the table carries inline proofs and no references, and comes
+ * back exactly as it was.
+ */
+export function hydrateResponseProofs(response: SyncResponse): SyncResponse {
+	// A response that is not an object at all — a peer framing `null`, say — is handed straight back.
+	// This pass is not where a malformed response is diagnosed: its callers already read one as a
+	// failed request, and throwing here would turn that into a different failure for no gain.
+	if (!response || typeof response !== 'object') return response;
+	const table = response.proofs;
+	const resolve = (ref: string): BlockCommitProof | undefined => {
+		const proof = table && typeof table === 'object' ? table[ref] : undefined;
+		if (!proof || typeof proof !== 'object') return undefined;
+		return proof.messageHash === ref ? proof : undefined;
+	};
+	const hydrated = mapResponseArchives(response, archive => mapRevisions(archive, entry => {
+		if (typeof entry.proofRef !== 'string') return entry;
+		const { proofRef, ...rest } = entry;
+		// An inline proof is what a reference is an ALTERNATIVE to, never an override: an entry
+		// carrying both — which no producer writes — keeps the proof it already carries.
+		if (rest.proof) return rest;
+		const proof = resolve(proofRef);
+		return proof ? { ...rest, proof } : rest;
+	}));
+	if (hydrated === response && table === undefined) return response;
+	const { proofs, ...rest } = hydrated;
+	return rest;
+}
+
+/**
+ * `response` with `fn` applied to its own archive and to each answer's archive — the two places a
+ * sync response carries one. Returns `response` itself when nothing changed, so a response with no
+ * proof to move and no reference to resolve passes through untouched.
+ *
+ * Rewrites rather than mutates: the hydrating side runs on a response a remote peer chose, where a
+ * half-applied pass would be worse than none.
+ */
+function mapResponseArchives(response: SyncResponse, fn: (archive: BlockArchive) => BlockArchive): SyncResponse {
+	let changed = false;
+	const archive = response.archive ? fn(response.archive) : undefined;
+	if (archive !== response.archive) changed = true;
+	let answers = response.answers;
+	if (answers && typeof answers === 'object') {
+		const mapped: Record<BlockId, SyncBlockAnswer> = {};
+		for (const [blockId, answer] of Object.entries(answers)) {
+			const next = answer?.archive ? fn(answer.archive) : undefined;
+			if (next === undefined || next === answer.archive) {
+				mapped[blockId] = answer;
+				continue;
+			}
+			changed = true;
+			// Spread first, so a lineage answer and the content-omitted reason survive the rewrite.
+			mapped[blockId] = { ...answer, archive: next };
+		}
+		answers = mapped;
+	}
+	if (!changed) return response;
+	return { ...response, ...(archive ? { archive } : {}), ...(answers ? { answers } : {}) };
+}
+
+/**
+ * `archive` with `fn` applied to each of its revision entries. Walks EVERY entry rather than assuming
+ * one: `singleRevisionArchive` is the only producer of an archive that crosses a wire today, so a
+ * multi-revision archive cannot arise — but a second producer must not silently leave entries behind
+ * these passes. Returns `archive` itself when no entry changed, and leaves an entry a remote peer
+ * sent as a non-object alone rather than handing it to `fn`.
+ */
+function mapRevisions(archive: BlockArchive, fn: (entry: ArchiveRevision) => ArchiveRevision): BlockArchive {
+	const revisions = archive.revisions;
+	if (!revisions || typeof revisions !== 'object') return archive;
+	let changed = false;
+	const mapped: Record<string, ArchiveRevision> = {};
+	for (const [key, entry] of Object.entries(revisions)) {
+		const next = entry && typeof entry === 'object' ? fn(entry) : entry;
+		if (next !== entry) changed = true;
+		mapped[key] = next;
+	}
+	return changed ? { ...archive, revisions: mapped } : archive;
+}
+
 /**
  * What {@link serveBlockArchive} needs of the repo it reads: `IRepo`, plus — OPTIONALLY — the
  * revision-keyed commit-proof accessor `StorageRepo` implements.
@@ -270,16 +429,20 @@ export type ProofRetainingRepo = IRepo & Required<Pick<ArchiveServingRepo, 'getB
  * certify. (A newer revision's proof over older bytes would pass `verifyBlockCommitProofClaim` and
  * fail `verifyBlockCommitProofContent` — strictly worse than no proof.)
  *
- * NOTE: a single-revision archive's proof is a rounding error against the wire cap. A sync
- * *response* is bounded by `MAX_BLOCK_MESSAGE_BYTES` (8 MiB — `SyncClient.requestBlock` sets the
- * response decoder's `maxDataLength`; the 1 MiB `MAX_CONTROL_MESSAGE_BYTES` bounds the inbound
- * REQUEST, not this). A proof's serialized size is dominated by two signatures plus a peer id per
- * cohort member: a whole proof-carrying single-revision archive measured 4801 bytes at a 10-peer
- * cohort and 8851 bytes at 20 (`test/block-archive-proof.spec.ts`, "far below the sync response
- * cap", which prints both), i.e. ~405 bytes per additional peer. Reaching 8 MiB would take a cohort in the tens of thousands, so
- * no plausible cluster size puts this near the cap — the block bytes the archive already carries
- * are the term that matters. Revisit only if a proof ever grows a per-peer payload beyond its two
- * signatures.
+ * NOTE: a proof's size is dominated by its COMMIT'S BLOCK COUNT, not by its cohort size. The proof
+ * carries its consensus message verbatim, whose commit operation lists every block id and declared
+ * digest of the commit, so size grows linearly in the blocks that commit touched: one reported proof
+ * of 528 KB covered 3,383 blocks (GitHub #60). The cohort term is the smaller one — two signatures
+ * plus a peer id per member, ~405 bytes each: a whole proof-carrying single-revision archive
+ * measured 4801 bytes at a 10-peer cohort and 8851 bytes at 20
+ * (`test/block-archive-proof.spec.ts`, "far below the sync response cap", which prints both), so no
+ * plausible cohort size approaches the cap on its own. A sync *response* is bounded by
+ * `MAX_BLOCK_MESSAGE_BYTES` (8 MiB — `SyncClient.requestBlock` sets the response decoder's
+ * `maxDataLength`; the 1 MiB `MAX_CONTROL_MESSAGE_BYTES` bounds the inbound REQUEST, not this), and
+ * what a response spends on proofs is bounded inside that by `CONSULT_RESPONSE_PROOF_BUDGET_BYTES`,
+ * since each distinct proof rides once per response ({@link dedupeResponseProofs}) and the admitted
+ * ones are measured against that budget. Before both, a 32-block consult answer about one large
+ * commit could exceed the frame and fail entirely.
  */
 export async function serveBlockArchive(repo: ArchiveServingRepo, blockId: BlockId, rev?: number): Promise<BlockArchive | undefined> {
 	const servable = await readServable(repo, blockId, rev);

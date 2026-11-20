@@ -78,6 +78,19 @@ export const MAX_CONSULT_BATCH_BLOCKS = 32;
 export const CONSULT_RESPONSE_CONTENT_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES / 2;
 
 /**
+ * How many bytes one sync response may spend on the proofs its archives reference
+ * (`SyncResponse.proofs`), measured as the JSON-encoded size of each proof admitted. Past it a
+ * proof is left out and the answers naming it are served proof-less — the pre-proof shape. The first
+ * proof is always admitted, so a one-block answer is unchanged.
+ *
+ * A quarter of {@link MAX_BLOCK_MESSAGE_BYTES}: with the content budget's half, that leaves a quarter
+ * of the frame for the claims, the lineage answers and the framing. A proof is kilobytes in ordinary
+ * use — the budget bites only on a commit touching thousands of blocks, which is exactly the case
+ * that used to make the response unsendable.
+ */
+export const CONSULT_RESPONSE_PROOF_BUDGET_BYTES = MAX_BLOCK_MESSAGE_BYTES / 4;
+
+/**
  * How many bytes one remote `get` reply may spend on its entries, measured as the JSON-encoded size of
  * each: past it, `RepoService` answers a block with a left-out entry and the asker's `RepoClient` asks
  * again for it (`fitGetReply` in `repo/get-reply.ts`). The first entry is always carried whole.

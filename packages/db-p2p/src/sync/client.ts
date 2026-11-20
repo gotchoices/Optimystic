@@ -4,6 +4,7 @@ import { ProtocolClient } from '../protocol-client.js';
 import { buildSyncProtocol, type SyncRequest, type SyncResponse } from './protocol.js';
 import { withRpcDeadlineDefaults, type RpcDeadlineDefaults, type RpcDeadlineOptions } from '../rpc-deadline.js';
 import { MAX_BLOCK_MESSAGE_BYTES, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { hydrateResponseProofs } from '../storage/block-archive.js';
 
 /**
  * Client for sending sync requests to remote peers.
@@ -31,18 +32,24 @@ export class SyncClient extends ProtocolClient {
 	 * @param request - Sync request specifying block and options
 	 * @param options - Optional per-call deadlines/cancellation. Absent keys fall
 	 *   back to the client's fallback deadlines so a silent peer can't hang the caller.
-	 * @returns Response with archive if successful
+	 * @returns Response with archive if successful — every commit proof resolved back into the
+	 *   revision entry that references it, so no caller ever sees a reference.
 	 * @throws Error if request fails or times out
 	 */
 	async requestBlock(request: SyncRequest, options?: RpcDeadlineOptions): Promise<SyncResponse> {
 		// Asymmetry: the *request* the server reads is a tiny SyncRequest (control cap
 		// on the server side), but the *response* read here is a BlockArchive carrying
 		// block data → block cap.
-		return await this.processMessage<SyncResponse>(request, this.protocol, {
+		const response = await this.processMessage<SyncResponse>(request, this.protocol, {
 			...withRpcDeadlineDefaults(options, this.rpcDeadlines),
 			maxDataLength: MAX_BLOCK_MESSAGE_BYTES,
 			maxRequestBytes: MAX_CONTROL_MESSAGE_BYTES,
 		});
+		// The ONE seam a sync response crosses into this process — `RestorationCoordinator` and all
+		// four consult/lineage/archive callbacks in `libp2p-node-base` come through here — so this is
+		// where a proof the response carried once, in its own table, becomes the proof of each
+		// revision entry that named it. Total on a hostile response; see `hydrateResponseProofs`.
+		return hydrateResponseProofs(response);
 	}
 
 	/**

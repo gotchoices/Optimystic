@@ -1,5 +1,6 @@
 import type { ActionRev, BlockId, BlockLineage } from '@optimystic/db-core';
 import type { BlockArchive } from '../storage/struct.js';
+import type { BlockCommitProof } from '../cluster/commit-proof.js';
 
 /**
  * Request to sync a specific block or revision from a peer.
@@ -125,6 +126,18 @@ export interface SyncResponse {
 	 * `blockId` alone without it.
 	 */
 	answers?: Record<BlockId, SyncBlockAnswer>;
+
+	/**
+	 * The proofs this response's archives reference (`ArchiveRevisions.proofRef`), keyed by
+	 * `BlockCommitProof.messageHash` — one entry however many of the answered blocks that commit
+	 * covers, which is what keeps a response about several blocks of one large commit sendable at all.
+	 *
+	 * Resolved into each referencing revision entry as the response is read
+	 * (`hydrateResponseProofs`, called by `SyncClient.requestBlock`); an entry filed under a key
+	 * that is not its own `messageHash`, and a reference naming nothing here, are both dropped,
+	 * leaving the archive proof-less — the pre-proof shape every consumer already tolerates.
+	 */
+	proofs?: Record<string, BlockCommitProof>;
 }
 
 /** Sync protocol prefix - namespaced under db-p2p */

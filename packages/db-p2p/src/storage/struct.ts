@@ -124,10 +124,28 @@ export type ArchiveRevisions = Record<number, {
 	 * un-upgraded build.
 	 *
 	 * Keyed INSIDE the revision entry on purpose: the proof and the `(rev, actionId)` it certifies
-	 * travel together, so a serving bug or a hostile peer cannot pair a genuine proof with a
-	 * different revision by construction of the wire shape alone.
+	 * travel together, so nothing has to carry the pairing separately. That is a convenience, not the
+	 * safeguard this comment once claimed: {@link ArchiveRevisions} now also lets a proof travel
+	 * OUTSIDE the entry (`proofRef` below), so the wire shape no longer forbids a mis-pairing. What
+	 * forbids it is that the only producer of a reference builds its table FROM the entries it
+	 * rewrites (`dedupeResponseProofs` in `storage/block-archive.ts`), that the reader checks a
+	 * table entry is filed under its own `messageHash` before resolving it, and that a proof is
+	 * evidence of nothing until a consumer verifies it against the claim it was served for
+	 * (`verifyBlockCommitProofClaim`, whose claim step is never memoized). Presence was never
+	 * evidence.
 	 */
 	proof?: BlockCommitProof;
+	/**
+	 * The `messageHash` of the proof for this revision, when the proof travels in the response's own
+	 * table (`SyncResponse.proofs`) instead of inside this entry — so a response answering several
+	 * blocks of one commit carries that commit's proof once rather than once per block.
+	 *
+	 * Resolved back into {@link proof} at ONE seam, as a response is read (`SyncClient.requestBlock`),
+	 * so no consumer of an archive ever sees a reference. Never stored: `BlockStorage.saveRestored`
+	 * copies a revision entry field by field (`RestoredRevision`) and so ignores both the proof and
+	 * this, which is why a remote archive's proof is never re-served as this node's own evidence.
+	 */
+	proofRef?: string;
 }>;
 
 export type BlockArchive = {

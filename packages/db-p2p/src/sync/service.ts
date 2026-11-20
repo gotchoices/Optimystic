@@ -4,10 +4,10 @@ import { buildSyncProtocol, type SyncBlockAnswer, type SyncRequest, type SyncRes
 import { pipe } from 'it-pipe';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import * as lp from 'it-length-prefixed';
-import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
+import { CONSULT_RESPONSE_CONTENT_BUDGET_BYTES, CONSULT_RESPONSE_PROOF_BUDGET_BYTES, MAX_BLOCK_MESSAGE_BYTES, MAX_CONSULT_BATCH_BLOCKS, MAX_CONTROL_MESSAGE_BYTES } from '../protocol-limits.js';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import { createInboundStreamAuthorization, type InboundStreamAuthorization, type InboundStreamAuthorizationInit } from '../inbound-authorization.js';
-import { fitConsultContent, serveBlockArchive, serveConsultAnswer, serveLineageAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
+import { dedupeResponseProofs, fitConsultContent, serveBlockArchive, serveConsultAnswer, serveLineageAnswer, type ArchiveServingRepo } from '../storage/block-archive.js';
 import { isActionRev } from '../repo/stated-holdings.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 import type { BlockArchive } from '../storage/struct.js';
@@ -146,8 +146,18 @@ export class SyncService implements Startable {
 			request.includePending,
 			request.maxRevisions
 		);
+		// Deduped too, though a single-archive answer carries at most one proof: one response shape for
+		// both answers, so neither this service nor the asker's hydration pass has a second shape to
+		// keep in step. The first proof is always admitted, so this only relocates it.
+		//
+		// NOTE: accepted tradeoff — the relocation costs an asker on a build that reads a revision
+		// entry's `proof` but not its `proofRef`, which sees a proof-less archive here and falls back
+		// to corroboration (the degradation the pre-proof path already defines). A narrow window:
+		// reading a proof off the repair wire at all is recent, and this request shape asks for no
+		// field a pre-reference build would not send. Weighed against two divergent answer shapes and
+		// kept; revisit if this protocol ever has to interoperate across a wider span of builds.
 		return archive
-			? { success: true, archive, responderId }
+			? dedupeResponseProofs({ success: true, archive, responderId }, CONSULT_RESPONSE_PROOF_BUDGET_BYTES)
 			: { success: false, error: 'Block not found in local storage' };
 	}
 
@@ -160,6 +170,11 @@ export class SyncService implements Startable {
 	 * the lineage question about also carries this node's `lineage`. `rev` is ignored: a consult is
 	 * always unpinned.
 	 *
+	 * Each distinct commit proof the answers carry rides ONCE, in the response's own table rather than
+	 * inside each revision entry that needs it (`dedupeResponseProofs`) — a proof's size grows with
+	 * its commit's block count, so a batched answer about several blocks of one large commit used to
+	 * repeat megabytes and could exceed the frame the response is sent under.
+	 *
 	 * The blocks are served one after another. A consult names a handful at most, each a local read.
 	 */
 	private async answerConsult(request: SyncRequest, responderId: string | undefined): Promise<SyncResponse> {
@@ -170,7 +185,13 @@ export class SyncService implements Startable {
 			served.push([blockId, lineage === undefined ? claim : { ...claim, lineage }]);
 		}
 		const answers = Object.fromEntries(fitConsultContent(served, CONSULT_RESPONSE_CONTENT_BUDGET_BYTES));
-		return { success: true, answers, responderId };
+		// NOTE: the content budget above measured each archive with its proof still INSIDE it, so a
+		// response carrying a large proof fits less content than it strictly could. Deliberate
+		// ordering: dedupe after the fit leaves `withoutContent` and `latestClaimFromArchive` seeing
+		// inline proofs, and over-counting errs the safe way — a block answered without its bytes is
+		// simply asked for again ('size' is documented as a reason the asker must follow up on),
+		// whereas an over-full frame loses the whole response.
+		return dedupeResponseProofs({ success: true, answers, responderId }, CONSULT_RESPONSE_PROOF_BUDGET_BYTES);
 	}
 
 	/** One block's consult answer; a local serve fault reads as "holds nothing", as {@link buildArchive}'s does. */
