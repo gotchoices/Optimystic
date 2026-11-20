@@ -1,4 +1,4 @@
-import type { BlobRef, BlobScope } from '@optimystic/db-core';
+import type { BlobDurability, BlobRef, BlobScope, DurabilityQuorum } from '@optimystic/db-core';
 
 /** Key prefix of every blob record in the node's IKVStore; one key per blob, `optimystic-blobs/<ref>`. */
 export const BLOB_RECORD_KEY_PREFIX = 'optimystic-blobs/';
@@ -31,6 +31,9 @@ export interface BlobRecord {
 	readonly lastReadAt?: number;
 	/** Never empty in a stored record: a record whose last hold goes is deleted. */
 	readonly holds: readonly BlobHold[];
+	/** How widely the blob is held, as last computed (docs/blobs.md §Placement, copying and durability).
+	 *  Stored so `stat` answers it and a restart does not re-emit an unchanged class. */
+	readonly durability?: BlobDurability;
 }
 
 /** The stored text under a record's key is not a record of that blob. */
@@ -42,6 +45,9 @@ export class BlobRecordFormatError extends Error {
 }
 
 const HOLD_KINDS: ReadonlySet<string> = new Set<BlobHoldKind>(['pin', 'owed', 'responsible', 'cached']);
+
+/** db-core declares `DurabilityQuorum` as a type with no runtime list; one local list in the one module that needs it beats a new cross-package export. */
+const DURABILITY_QUORUMS: ReadonlySet<string> = new Set<DurabilityQuorum>(['full', 'majority', 'local', 'unrouted']);
 
 /** The key a record of `ref` is stored under. */
 export function blobRecordKey(ref: BlobRef): string {
@@ -85,7 +91,7 @@ function recordProblem(ref: BlobRef, record: Record<string, unknown>): string | 
 	if (record.ref !== ref) {
 		return `names ${JSON.stringify(record.ref)}, not the blob its key names`;
 	}
-	if (record.size !== undefined && !isByteCount(record.size)) {
+	if (record.size !== undefined && !isCount(record.size)) {
 		return `size ${JSON.stringify(record.size)} is not a non-negative safe integer`;
 	}
 	if (typeof record.whole !== 'boolean') {
@@ -94,7 +100,36 @@ function recordProblem(ref: BlobRef, record: Record<string, unknown>): string | 
 	if (record.lastReadAt !== undefined && !isFiniteNumber(record.lastReadAt)) {
 		return '"lastReadAt" is not a finite number';
 	}
+	const durability = durabilityProblem(record.durability);
+	if (durability !== undefined) {
+		return durability;
+	}
 	return holdsProblem(record.holds);
+}
+
+/**
+ * Checked rather than kept as found, unlike the properties above it: `stat` hands a stored
+ * `durability` straight to its caller typed as a {@link BlobDurability}, so an unchecked one would be
+ * a lie in the type system rather than an extra property nothing reads.
+ */
+function durabilityProblem(durability: unknown): string | undefined {
+	if (durability === undefined) {
+		return undefined;
+	}
+	if (!isObject(durability)) {
+		return '"durability" is not an object';
+	}
+	if (typeof durability.quorum !== 'string' || !DURABILITY_QUORUMS.has(durability.quorum)) {
+		return `durability quorum ${JSON.stringify(durability.quorum)} is not a durability class`;
+	}
+	if (!isCount(durability.confirmed) || !isCount(durability.accepting)) {
+		return 'a durability count that is not a non-negative safe integer';
+	}
+	if (durability.unconfirmed !== undefined
+		&& !(Array.isArray(durability.unconfirmed) && durability.unconfirmed.every(peerId => typeof peerId === 'string'))) {
+		return '"unconfirmed" is not an array of peer ids';
+	}
+	return undefined;
 }
 
 function holdsProblem(holds: unknown): string | undefined {
@@ -140,6 +175,7 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value);
 }
 
-function isByteCount(value: unknown): boolean {
+/** A byte size, a count of peers: anything non-negative and exactly representable. */
+function isCount(value: unknown): boolean {
 	return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 }

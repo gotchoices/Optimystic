@@ -1,4 +1,5 @@
 import { BLOB_RECORD_KEY_PREFIX } from "../blob/blob-record.js";
+import { OWED_BLOB_KEY_PREFIX } from "../blob/owed-blob-ledger.js";
 import { UNDER_REPLICATED_KEY_PREFIX } from "../repo/kv-under-replication-ledger.js";
 import { HLC_CLOCK_KEY_PREFIX } from "./kv-hlc-clock-store.js";
 import { COORDINATOR_STATE_KEY_PREFIX, EXECUTED_KEY_PREFIX, PARTICIPANT_STATE_KEY_PREFIX } from "../cluster/persistent-transaction-state-store.js";
@@ -26,4 +27,5 @@ export const NODE_KV_NAMESPACES: readonly string[] = [
 	HLC_CLOCK_KEY_PREFIX,
 	OFFLINE_JOURNAL_KEY_PREFIX,
 	BLOB_RECORD_KEY_PREFIX,
+	OWED_BLOB_KEY_PREFIX,
 ].map(prefix => prefix.replace(/\/$/, ''));

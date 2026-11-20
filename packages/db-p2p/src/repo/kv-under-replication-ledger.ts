@@ -1,6 +1,7 @@
 import type { BlockId } from "@optimystic/db-core";
 import type { IKVStore } from "../storage/i-kv-store.js";
 import type { IUnderReplicationLedger, SatisfyOutcome, ShortfallQuorum, UnderReplicatedEntry } from "./i-under-replication-ledger.js";
+import { KeyedSerialQueue } from "../keyed-serial-queue.js";
 import { createLogger } from "../logger.js";
 
 const log = createLogger('under-replication-ledger');
@@ -42,8 +43,8 @@ const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unr
  * `PersistentTransactionStateStore` uses for its node-local state.
  *
  * Two pieces of in-memory state sit beside the store, neither authoritative:
- * - a per-block operation queue, so each read-compare-write is atomic against the others for the
- *   same block (`IKVStore` has no compare-and-set);
+ * - a per-block operation queue (`KeyedSerialQueue`), so each read-compare-write is atomic against
+ *   the others for the same block (`IKVStore` has no compare-and-set);
  * - an eviction index of recorded block ids in oldest-first order, loaded lazily from the store on
  *   the first mutation, so enforcing `maxEntries` costs neither a directory listing nor a read per
  *   record. It is only as good as this instance's ownership of the key prefix — the reason the
@@ -52,7 +53,7 @@ const SHORTFALL_QUORUMS: readonly ShortfallQuorum[] = ['majority', 'local', 'unr
 export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	private readonly maxEntries: number;
 	private readonly beforeRecord: (() => Promise<void>) | undefined;
-	private readonly queues = new Map<BlockId, Promise<void>>();
+	private readonly queue = new KeyedSerialQueue();
 	private indexLoad: Promise<Set<BlockId>> | undefined;
 
 	constructor(private readonly kv: IKVStore, options?: KvUnderReplicationLedgerOptions) {
@@ -68,7 +69,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		// Ahead of the block's queue, not inside it: the hook syncs another store, and a flush there
 		// need not hold this block's other ledger operations behind the disk.
 		await this.beforeRecord?.();
-		const wrote = await this.serialized(entry.blockId, async () => {
+		const wrote = await this.queue.run(entry.blockId, async () => {
 			const index = await this.index();
 			const existing = await this.read(entry.blockId);
 			if (existing !== undefined && existing.rev > entry.rev) {
@@ -92,7 +93,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	}
 
 	async settle(blockId: BlockId, rev: number): Promise<UnderReplicatedEntry | undefined> {
-		const settled = await this.serialized(blockId, async () => {
+		const settled = await this.queue.run(blockId, async () => {
 			// Every fully replicated commit settles each of its blocks, and almost none has an entry:
 			// answer those from the index instead of a store read. An entry missing from the index is
 			// one `read` would report absent anyway (malformed), so nothing is skipped that could be settled.
@@ -147,7 +148,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 
 	async satisfy(blockId: BlockId, peerIds: readonly string[], heldRev?: number): Promise<SatisfyOutcome> {
 		let wrote = false;
-		const outcome = await this.serialized(blockId, async (): Promise<SatisfyOutcome> => {
+		const outcome = await this.queue.run(blockId, async (): Promise<SatisfyOutcome> => {
 			const existing = await this.read(blockId);
 			if (existing === undefined) return { status: 'absent' };
 			if (heldRev !== undefined && existing.rev > heldRev) {
@@ -175,7 +176,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 
 	async name(blockId: BlockId, rev: number, missingPeerIds: readonly string[]): Promise<UnderReplicatedEntry | undefined> {
 		let wrote = false;
-		const named = await this.serialized(blockId, async () => {
+		const named = await this.queue.run(blockId, async () => {
 			const existing = await this.read(blockId);
 			if (existing === undefined) return undefined;
 			if (existing.rev !== rev) {
@@ -193,7 +194,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	}
 
 	async noteAttempt(blockId: BlockId): Promise<void> {
-		const wrote = await this.serialized(blockId, async () => {
+		const wrote = await this.queue.run(blockId, async () => {
 			const existing = await this.read(blockId);
 			if (existing === undefined) return false;
 			const updated: UnderReplicatedEntry = { ...existing, attempts: existing.attempts + 1 };
@@ -204,7 +205,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	}
 
 	async delete(blockId: BlockId): Promise<void> {
-		await this.serialized(blockId, () => this.remove(blockId));
+		await this.queue.run(blockId, () => this.remove(blockId));
 		await this.flushWrites();
 	}
 
@@ -250,7 +251,7 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 			const victim = index.values().next().value;
 			if (victim === undefined) return evicted;
 			try {
-				await this.serialized(victim, async () => {
+				await this.queue.run(victim, async () => {
 					if (!index.has(victim)) return;
 					await this.remove(victim);
 					evicted = true;
@@ -298,22 +299,6 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 		return raw === undefined ? undefined : parseEntry(blockId, raw);
 	}
 
-	/**
-	 * Run `operation` after every earlier operation queued for `blockId`, whatever their outcome.
-	 * The queue entry is dropped once nothing is waiting behind it, so the map holds only blocks with
-	 * work in flight.
-	 */
-	private async serialized<T>(blockId: BlockId, operation: () => Promise<T>): Promise<T> {
-		const previous = this.queues.get(blockId) ?? Promise.resolve();
-		const run = previous.then(operation);
-		const tail = run.then(() => undefined, () => undefined);
-		this.queues.set(blockId, tail);
-		try {
-			return await run;
-		} finally {
-			if (this.queues.get(blockId) === tail) this.queues.delete(blockId);
-		}
-	}
 }
 
 function keyFor(blockId: BlockId): string {

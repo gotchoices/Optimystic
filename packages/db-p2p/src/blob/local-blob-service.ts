@@ -7,6 +7,7 @@ import {
 	rootPieceId,
 	walkBlobPieces,
 	type BlobDigest,
+	type BlobDurability,
 	type BlobDurabilityEvent,
 	type BlobFetchOptions,
 	type BlobProgressEvent,
@@ -60,6 +61,35 @@ export interface BlobFetchStore {
 	markWhole(ref: BlobRef, size: number): Promise<void>;
 }
 
+/**
+ * What the blob copy drain needs of this node's blob records; `LocalBlobService` is it.
+ *
+ * A door rather than a second `BlobRecordStore` over the same `IKVStore`: two instances keep separate
+ * per-ref queues, so the drain's durability write and the service's hold write could lose one another,
+ * and the drain's writes would also bypass the sweep gate that `changeRecord` takes.
+ */
+export interface BlobOwedRecords {
+	/** Add the `owed` hold, creating the record (`whole: false`) when there is none. Every other hold is kept. Flushed: a lost hold would let a restart sweep a blob this node is announcing. */
+	holdOwed(ref: BlobRef): Promise<void>;
+	/** Remove the `owed` hold; a record left with no hold is deleted and the blob swept. No record, or no such hold, is a no-op. Flushed. */
+	releaseOwed(ref: BlobRef): Promise<void>;
+	/** Write the record's `durability`, flushed. Never creates a record: a record deleted meanwhile stays deleted. */
+	setDurability(ref: BlobRef, durability: BlobDurability): Promise<void>;
+	/** The record's stored `durability`, or undefined. */
+	durabilityOf(ref: BlobRef): Promise<BlobDurability | undefined>;
+	/**
+	 * Whether this node's record says every piece is here.
+	 *
+	 * The record's `whole` hint rather than a census, so a pass over many entries costs one `get` each.
+	 * The hint is corrected by every read and every `stat` (`correctRecord`). A stale `false` only
+	 * under-counts this node, which keeps the blob — the safe direction; a stale `true` is corrected by
+	 * the next read.
+	 */
+	holdsWhole(ref: BlobRef): Promise<boolean>;
+	/** Tell this service's `onDurability` listeners. Each listener is called in a `try`; a throw is logged (`durability:listener-threw`) and does not stop the others, as `NodeBlobService.emitProgress` does. */
+	emitDurability(event: BlobDurabilityEvent): void;
+}
+
 /** Supplies a piece the local store lacks; resolves with its verified bytes or rejects with why it cannot. */
 export type MissingPiece = (id: PieceId) => Promise<Uint8Array>;
 
@@ -87,10 +117,11 @@ export interface LocalBlobServiceInit {
  * puts, describes, reads, pins and unpins blobs over the node's piece store and its blob records.
  * It is the single-machine service underneath `NodeBlobService`, which is what `node.blobs` is and
  * which fetches from other machines through `readThrough` and `fetchStore`; used on its own it never
- * asks another machine. Announcing and durability (`feat-a-referenced-blob-is-copied-to-its-cohort`)
- * are a later ticket; their entry points say so.
+ * asks another machine. It owns the records the copy drain changes and the `onDurability` listeners it
+ * emits through ({@link BlobOwedRecords}); announcing is `NodeBlobService`'s, since this service has
+ * no cohort.
  */
-export class LocalBlobService implements BlobService {
+export class LocalBlobService implements BlobService, BlobOwedRecords {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -180,9 +211,9 @@ export class LocalBlobService implements BlobService {
 	/**
 	 * What this node holds of the blob, from its record and its pieces: `here`, `partial` or `unknown`,
 	 * never `elsewhere`. `probe` is ignored: asking the blob's cohort is `NodeBlobService.stat`'s, which
-	 * calls this first. `durability` is left absent until `feat-a-referenced-blob-is-copied-to-its-cohort`.
-	 * A record found wrong about whether the blob is whole is corrected (`record:corrected`). A malformed
-	 * tree throws BlobCorruptError.
+	 * calls this first. `durability` is the record's, as the copy drain last computed it. A record found
+	 * wrong about whether the blob is whole is corrected (`record:corrected`). A malformed tree throws
+	 * BlobCorruptError.
 	 */
 	async stat(ref: BlobRef, _options: { probe?: boolean } = {}): Promise<BlobStat> {
 		const record = await this.records.get(ref);
@@ -191,16 +222,16 @@ export class LocalBlobService implements BlobService {
 			if (record?.whole === true) {
 				await this.correctRecord(ref, false);
 			}
-			return { ref, size: record?.size, locality: 'unknown', heldBytes: 0 };
+			return { ref, size: record?.size, locality: 'unknown', heldBytes: 0, durability: record?.durability };
 		}
 		if (record?.whole === true && record.size !== undefined) {
-			return { ref, size: record.size, locality: 'here', heldBytes: record.size };
+			return { ref, size: record.size, locality: 'here', heldBytes: record.size, durability: record.durability };
 		}
 		const census = await this.census(ref, record?.size);
 		if (census.whole) {
 			await this.correctRecord(ref, true, census.size);
 		}
-		return { ref, size: census.size, locality: census.whole ? 'here' : 'partial', heldBytes: census.heldBytes };
+		return { ref, size: census.size, locality: census.whole ? 'here' : 'partial', heldBytes: census.heldBytes, durability: record?.durability };
 	}
 
 	/**
@@ -304,6 +335,47 @@ export class LocalBlobService implements BlobService {
 		return refs;
 	}
 
+	/** {@link BlobOwedRecords.holdOwed}. */
+	async holdOwed(ref: BlobRef): Promise<void> {
+		const at = this.now();
+		await this.changeRecord(ref, current => recordAfterOwedHold(current, ref, at));
+		await this.records.flush();
+	}
+
+	/** {@link BlobOwedRecords.releaseOwed}. */
+	async releaseOwed(ref: BlobRef): Promise<void> {
+		await this.changeRecord(ref, recordAfterOwedRelease);
+		await this.records.flush();
+	}
+
+	/** {@link BlobOwedRecords.setDurability}. */
+	async setDurability(ref: BlobRef, durability: BlobDurability): Promise<void> {
+		await this.changeRecord(ref, current => recordWithDurability(current, durability));
+		await this.records.flush();
+	}
+
+	/** {@link BlobOwedRecords.durabilityOf}. A record that does not decode reads as absent, so a drain pass is not failed by one. */
+	async durabilityOf(ref: BlobRef): Promise<BlobDurability | undefined> {
+		return (await this.readableRecord(ref))?.durability;
+	}
+
+	/** {@link BlobOwedRecords.holdsWhole}. A record that does not decode reads as absent, which under-counts this node — the safe direction. */
+	async holdsWhole(ref: BlobRef): Promise<boolean> {
+		return (await this.readableRecord(ref))?.whole === true;
+	}
+
+	/** {@link BlobOwedRecords.emitDurability}. */
+	emitDurability(event: BlobDurabilityEvent): void {
+		for (const listener of [...this.durabilityListeners]) {
+			try {
+				listener(event);
+			} catch (error) {
+				log('durability:listener-threw ref=%s error=%s', event.ref, describe(error));
+			}
+		}
+	}
+
+	/** This service has no cohort: announcing is `NodeBlobService.announce`'s, which drives the copy drain. */
 	async announce(_ref: BlobRef, _scope: BlobScope): Promise<void> {
 		throw new Error('announcing a blob to its cohort is not built yet (feat-a-referenced-blob-is-copied-to-its-cohort)');
 	}
@@ -313,7 +385,7 @@ export class LocalBlobService implements BlobService {
 		return subscribe(this.progressListeners, listener);
 	}
 
-	/** Nothing reports durability until `feat-a-referenced-blob-is-copied-to-its-cohort`. */
+	/** The blob copy drain emits through `emitDurability`, which is this set; `NodeBlobService.onDurability` is this call. */
 	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void {
 		return subscribe(this.durabilityListeners, listener);
 	}
@@ -540,6 +612,29 @@ function recordAfterResponsibleHold(current: BlobRecord | undefined, ref: BlobRe
 		return { v: 1, ref, whole: false, holds: [responsible] };
 	}
 	return { ...current, holds: [...current.holds.filter(hold => hold.kind !== 'responsible'), responsible] };
+}
+
+/** With no record, a new one holding `owed` that knows nothing of the pieces yet; a record already holding `owed` unchanged. */
+function recordAfterOwedHold(current: BlobRecord | undefined, ref: BlobRef, at: number): BlobRecord {
+	const owed: BlobHold = { kind: 'owed', at };
+	if (current === undefined) {
+		return { v: 1, ref, whole: false, holds: [owed] };
+	}
+	return current.holds.some(hold => hold.kind === 'owed') ? current : { ...current, holds: [...current.holds, owed] };
+}
+
+/** The current record unchanged when there is nothing to release, so `BlobRecordStore.apply` writes nothing. */
+function recordAfterOwedRelease(current: BlobRecord | undefined): BlobRecord | undefined {
+	if (current === undefined) {
+		return undefined;
+	}
+	const holds = current.holds.filter(hold => hold.kind !== 'owed');
+	return holds.length === current.holds.length ? current : { ...current, holds };
+}
+
+/** Never creates a record: a record deleted while the drain was classifying stays deleted. */
+function recordWithDurability(current: BlobRecord | undefined, durability: BlobDurability): BlobRecord | undefined {
+	return current === undefined ? undefined : { ...current, durability };
 }
 
 function recordAfterUnpin(current: BlobRecord | undefined, owner: string): BlobRecord | undefined {

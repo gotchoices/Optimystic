@@ -1,4 +1,5 @@
 import { isBlobRef, parseBlobRef, type BlobRef } from '@optimystic/db-core';
+import { KeyedSerialQueue } from '../keyed-serial-queue.js';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
 import { BLOB_RECORD_KEY_PREFIX, blobRecordKey, decodeBlobRecord, encodeBlobRecord, type BlobRecord } from './blob-record.js';
@@ -16,10 +17,10 @@ export interface BlobRecordChange {
  * key-value store under `BLOB_RECORD_KEY_PREFIX`.
  */
 export class BlobRecordStore {
-	// Its own per-ref promise chain rather than db-core's `Latches`: `block-latch.ts` documents that
-	// `Latches.acquire(` has exactly one call site in this package, and one node's one service needs
-	// no more than a per-instance chain. An entry is removed when its chain drains.
-	private readonly chains = new Map<BlobRef, Promise<unknown>>();
+	/** Its own per-ref promise chain rather than db-core's `Latches`: `block-latch.ts` documents that
+	 *  `Latches.acquire(` has exactly one call site in this package, and one node's one service needs
+	 *  no more than a per-instance chain. An entry is removed when its chain drains. */
+	private readonly queue = new KeyedSerialQueue();
 
 	constructor(private readonly kv: IKVStore) {}
 
@@ -53,16 +54,7 @@ export class BlobRecordStore {
 	 * sweep.
 	 */
 	update(ref: BlobRef, change: (current: BlobRecord | undefined) => BlobRecord | undefined): Promise<BlobRecordChange> {
-		const previous = this.chains.get(ref) ?? Promise.resolve();
-		const run = previous.then(() => this.apply(ref, keyOf(ref), change));
-		const settled = run.then(noop, noop);
-		this.chains.set(ref, settled);
-		void settled.then(() => {
-			if (this.chains.get(ref) === settled) {
-				this.chains.delete(ref);
-			}
-		});
-		return run;
+		return this.queue.run(ref, () => this.apply(ref, keyOf(ref), change));
 	}
 
 	/** `kv.flush?.()`; a store without `flush` is durable when its writes resolve. */
@@ -92,8 +84,4 @@ export class BlobRecordStore {
 /** The record key of `ref`, refusing a string that is not a reference: a record under such a key is one `listRefs` skips, so no sweep would see its holds. */
 function keyOf(ref: BlobRef): string {
 	return blobRecordKey(parseBlobRef(ref));
-}
-
-function noop(): void {
-	// A settled link of the chain: the next update runs whatever this one did.
 }
