@@ -222,11 +222,15 @@ export class RevisionStallWatch {
  * spent against silence (see {@link RivalHolders}, carried out on
  * {@link SyncRetryExhaustedError.rivals}).
  *
- * The coordinator's own corroborated rivals (`StaleFailure.pending`) win over the refusing members'
- * signed `held` votes (`StaleFailure.heldBy`) — not because either is better evidence, but because
- * `corroborated` has to say which one the ids came from, and a refusal carrying both carries the
- * same rival twice. Returns `undefined`, never an empty {@link RivalHolders}: an empty one would read
- * as "a rival was named" to anyone testing presence, which is the distinction this exists to draw.
+ * Both sources contribute their ids, because they are NOT reliably the same claim: `heldBy` is what
+ * the refusing members' storage holds, `StaleFailure.pending` is what the coordinator's own re-read
+ * found (`CoordinatorRepo.corroborateHeldBlocks`), and a member ahead of the coordinator can name a
+ * rival that re-read never saw. Taking one source over the other would silently drop such a rival
+ * from a list whose whole job is to name them; `corroborated` then says only what it claims to —
+ * whether at least one id came out of the coordinator's own storage.
+ *
+ * Returns `undefined`, never an empty {@link RivalHolders}: an empty one would read as "a rival was
+ * named" to anyone testing presence, which is the distinction this exists to draw.
  *
  * Deliberately module-private. The house pattern for reading a {@link WriteFailure} is the exported
  * predicates in `packages/db-core/src/network/stale-failure.ts`, and this belongs there as soon as a
@@ -234,17 +238,10 @@ export class RevisionStallWatch {
  * but there is none today, so exporting it now would be API nobody calls.
  */
 function rivalsFrom(refusal: WriteFailure): RivalHolders | undefined {
-	const corroborated = distinct(refusal.pending?.map(p => p.actionId));
-	if (corroborated.length > 0) {
-		return { actionIds: corroborated, corroborated: true };
-	}
-	const voted = distinct(refusal.heldBy === undefined ? undefined : Object.values(refusal.heldBy));
-	return voted.length === 0 ? undefined : { actionIds: voted, corroborated: false };
-}
-
-/** `ids` without repeats, order preserved; empty for `undefined`. */
-function distinct(ids: readonly ActionId[] | undefined): ActionId[] {
-	return ids === undefined ? [] : [...new Set(ids)];
+	const corroborated = refusal.pending?.map(p => p.actionId) ?? [];
+	const voted = refusal.heldBy === undefined ? [] : Object.values(refusal.heldBy);
+	const actionIds = [...new Set([...corroborated, ...voted])];
+	return actionIds.length === 0 ? undefined : { actionIds, corroborated: corroborated.length > 0 };
 }
 
 /** The sleep before the refresh that follows a write's `failures`-th consecutive loss: none while a

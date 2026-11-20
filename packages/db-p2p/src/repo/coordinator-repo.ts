@@ -3405,9 +3405,10 @@ export class CoordinatorRepo implements IRepo {
 	 * name" from "I spent my budget against silence" (`SyncRetryExhaustedError.rivals`, built by
 	 * `rivalsFrom` in `packages/db-core/src/collection/write-attempts.ts`), and the un-corroborated arm
 	 * is the common one, so carrying it only where the re-read succeeded would leave the usual failure
-	 * silent. It is still NOT folded into `pending`: the members' action ids and the rivals this node
-	 * read out of its own storage are different claims from different machines, and a consumer that
-	 * merged them would report one rival as two. Never recover the ids by parsing `reason`.
+	 * silent. It is still a field of its own rather than extra entries in `pending`: the members'
+	 * action ids and the rivals this node read out of its own storage are different claims from
+	 * different machines, and they need not name the same action — a member ahead of this node can
+	 * hold a rival {@link corroborateHeldBlocks} never saw. Never recover the ids by parsing `reason`.
 	 */
 	private async answerBlocksHeld(error: BlocksHeldError, batch: PendBatch, peerCount: number): Promise<StaleFailure> {
 		const pending = await this.corroborateHeldBlocks(batch, peerCount);

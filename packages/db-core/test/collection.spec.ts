@@ -1359,8 +1359,8 @@ describe('Collection', () => {
       }
 
       it('names the rivals, and says whether the coordinator read them itself', async () => {
-        // Both sources in one case: they are one behaviour — the summary's precedence — and the
-        // SETUP is what would be duplicated by splitting them, not the assertion.
+        // Both sources in one case: they are one behaviour — how the summary reads the two claims —
+        // and the SETUP is what would be duplicated by splitting them, not the assertion.
         // `pending` is the coordinator's own storage read, so the rivals are corroborated.
         const corroborated = await exhaustAgainst({
           success: false,
@@ -1383,6 +1383,19 @@ describe('Collection', () => {
         })
         expect(voted.rivals?.actionIds).to.deep.equal(['rival-b'])
         expect(voted.rivals?.corroborated, 'only the members named it, not our own storage').to.equal(false)
+
+        // Both claims at once, naming DIFFERENT actions — a member ahead of the coordinator holds a
+        // rival its re-read never saw. Neither source may be dropped for the other: each names a live
+        // rival, and the summary is the list of rivals, not the list from whichever source won.
+        const both = await exhaustAgainst({
+          success: false,
+          conflict: true,
+          reason: 'pending conflict: block(s) held by unresolved rival action(s) rival-a',
+          pending: [{ blockId: 'hot-block', actionId: 'rival-a' }],
+          heldBy: { 'peer-0': 'rival-c' }
+        })
+        expect(both.rivals?.actionIds).to.deep.equal(['rival-a', 'rival-c'])
+        expect(both.rivals?.corroborated, 'our own storage named one of them').to.equal(true)
       })
 
       it('leaves rivals ABSENT when no refusal named one', async () => {

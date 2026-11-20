@@ -2528,11 +2528,12 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   stuck-reservation naming falls to the members that hold the record
   (`cluster-member:stuck-reservation`, the same counter kept per member in
   `ClusterMember.validatePendOperations`). The action ids the `held` votes themselves named ride out
-  on **both** arms, as `StaleFailure.heldBy` (peer id → that member's holding action id). They are
-  not the same claim as `StaleFailure.pending` and are never folded into it: `heldBy` is what the
-  refusing members reported, `pending` is what this coordinator read out of its own storage, and a
-  consumer that merged the two lists would report one rival as two. A writer summarises whichever
-  arrived into `SyncRetryExhaustedError.rivals` (`rivalsFrom` in
+  on **both** arms, as `StaleFailure.heldBy` (peer id → that member's holding action id). They stay
+  their own field and are never folded into `StaleFailure.pending`: `heldBy` is what the refusing
+  members reported and `pending` is what this coordinator read out of its own storage, the two need
+  not name the same action — a member ahead of the coordinator can hold a rival the re-read never
+  saw — and only the separation lets a consumer tell which machine made which claim. A writer
+  summarises both into `SyncRetryExhaustedError.rivals` (`rivalsFrom` in
   `packages/db-core/src/collection/write-attempts.ts`), which is how a write that spends its whole
   retry budget says whether it lost to rivals it can name or spent the budget against silence — see
   [offline-sync.md §Classifying an attempt's outcome](offline-sync.md#classifying-an-attempts-outcome).

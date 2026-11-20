@@ -340,8 +340,8 @@ describe('CoordinatorRepo pend — blocks held by a rival unresolved action', ()
 		expect(result.success).to.equal(false);
 		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
 		expect((result as StaleFailure).pending).to.deep.equal([{ blockId: BLOCK, actionId: 'a-rival' }]);
-		// The members' own `held` votes ride out beside the corroborated list, never folded into it:
-		// two claims from two machines, and a writer that read them as one would count one rival twice.
+		// The members' own `held` votes ride out beside the corroborated list, in their own field: two
+		// claims from two machines, which need not name the same action.
 		expect((result as StaleFailure).heldBy).to.deep.equal(held.heldBy);
 	});
 

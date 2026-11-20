@@ -1804,12 +1804,17 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
  * action-level answer to "which members' storage named a holder, and which action did it name?"
  * ({@link StaleFailure.heldBy}).
  *
- * Keys are the REFUSING COHORT MEMBERS' peer ids, not the coordinators', so a key can repeat: two
- * batches' cohorts may share a member, and that member can hold a different rival on each batch's
- * blocks. The later response wins such a key — the field's shape is one action id per peer, so there
- * is nowhere to put the other. That can drop one of several named rivals; it can never turn a named
- * rival into silence, which is the distinction the field exists to carry, and the writer's summary
- * ({@link StaleFailure.heldBy} → `rivalsFrom`) deduplicates the action ids anyway.
+ * Keys are the REFUSING COHORT MEMBERS' peer ids, not the coordinators'. One member casts one `held`
+ * vote per record, so the shape is exact per batch; it is only this cross-batch merge that can see a
+ * key twice, when two batches' cohorts share a member that holds a different rival on each batch's
+ * blocks.
+ *
+ * NOTE: the later response wins such a key — the field's shape is one action id per peer, so there
+ * is nowhere to put the other — which can drop one of several named rivals. Acceptable because it
+ * can never turn a named rival into silence, the distinction the field exists to carry. If a
+ * diagnostic ever has to list every holder of a multi-collection write, widen the field to
+ * `Record<string, ActionId[]>` here and at `BlocksHeldError.heldBy`; do not key by batch, which the
+ * action-level aggregate has no identity for.
  */
 function mergedHeldBy(responses: WriteFailure[]): Record<string, ActionId> | undefined {
 	const merged: Record<string, ActionId> = {};

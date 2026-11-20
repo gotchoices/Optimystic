@@ -273,9 +273,11 @@ export type StaleFailure = {
 	 */
 	staleAt?: { blockId: BlockId; rev: number };
 	/** Peer id → the action id that member's storage says holds the blocks this pend needs, from the
-	 *  members' signed `held` votes (`BlocksHeldError.heldBy`). A SEPARATE claim from {@link pending}:
-	 *  these are what the refusing MEMBERS reported, `pending` is what the coordinator read out of its
-	 *  own storage, and the two must not be merged into one list. */
+	 *  members' signed `held` votes (`BlocksHeldError.heldBy`). A SEPARATE claim from {@link pending},
+	 *  kept in its own field rather than appended to it: these are what the refusing MEMBERS reported,
+	 *  `pending` is what the coordinator read out of its own storage, the two need not name the same
+	 *  action, and only keeping them apart lets a consumer tell which machine claimed what. A consumer
+	 *  that wants one list of rivals unions the two and deduplicates — see {@link RivalHolders}. */
 	heldBy?: Record<string, ActionId>;
 	/** Never set on a lost race — an expiry is its own failure shape, {@link ExpiredFailure}. */
 	expired?: never;
