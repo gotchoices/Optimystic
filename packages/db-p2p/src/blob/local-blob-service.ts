@@ -848,23 +848,22 @@ function recordAfterOwedHold(current: BlobRecord | undefined, ref: BlobRef, at: 
 	return current.holds.some(hold => hold.kind === 'owed') ? current : { ...current, holds: [...current.holds, owed] };
 }
 
-/** The current record unchanged when there is nothing to release, so `BlobRecordStore.apply` writes nothing. */
-function recordAfterOwedRelease(current: BlobRecord | undefined): BlobRecord | undefined {
-	if (current === undefined) {
-		return undefined;
-	}
-	const holds = current.holds.filter(hold => hold.kind !== 'owed');
-	return holds.length === current.holds.length ? current : { ...current, holds };
+/**
+ * Drop every hold of `kind`, answering the current record unchanged when there is none — so
+ * `BlobRecordStore.apply` writes nothing for a release that releases nothing.
+ */
+function recordAfterHoldRelease(kind: BlobHold['kind']): (current: BlobRecord | undefined) => BlobRecord | undefined {
+	return current => {
+		if (current === undefined) {
+			return undefined;
+		}
+		const holds = current.holds.filter(hold => hold.kind !== kind);
+		return holds.length === current.holds.length ? current : { ...current, holds };
+	};
 }
 
-/** `recordAfterOwedRelease` for the `responsible` hold: the current record unchanged when there is nothing to release. */
-function recordAfterResponsibleRelease(current: BlobRecord | undefined): BlobRecord | undefined {
-	if (current === undefined) {
-		return undefined;
-	}
-	const holds = current.holds.filter(hold => hold.kind !== 'responsible');
-	return holds.length === current.holds.length ? current : { ...current, holds };
-}
+const recordAfterOwedRelease = recordAfterHoldRelease('owed');
+const recordAfterResponsibleRelease = recordAfterHoldRelease('responsible');
 
 /** Held for reads and nothing else: the only blobs the cache budget counts and evicts (docs/blobs.md §Lifetime). */
 function cacheOnly(record: BlobRecord): boolean {

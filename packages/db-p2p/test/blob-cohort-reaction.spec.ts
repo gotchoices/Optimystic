@@ -169,4 +169,18 @@ describe('BlobCohortReaction', () => {
 		});
 		expect([...declining.declined]).to.deep.equal(['peer-declined']);
 	});
+
+	it('reports no outcome for a grown blob it no longer keeps for the network', async () => {
+		// The hold went between the check reading it and the reaction running. An outcome here would
+		// enter the reported peers in the monitor's seen set — peers confirmed to hold a replica, which
+		// only a departure from the cohort clears — for a blob none of them has been told about.
+		const ref = await heldBlob(3);
+		await blobs.releaseResponsible(ref);
+		const reaction = new BlobCohortReaction(deps);
+
+		const result = await reaction.handle(eventOf({ grown: new Map([[ref, ['peer-a', 'peer-b']]]) }));
+
+		expect(result.growth.has(ref)).to.equal(false);
+		expect(announcer.peersTold()).to.deep.equal([]);
+	});
 });

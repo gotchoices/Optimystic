@@ -87,9 +87,13 @@ interface ReleasePlan {
  * `event.gained` is not acted on, as for blocks: a tracked reference is one this node already holds.
  *
  * The two arms run concurrently, each handling at most {@link REACTION_CONCURRENCY} references at a
- * time. Within one reference the announcements go in turn, for the reason `BlobCopyDrain.announceTo`
- * documents — the receiver's `AnnounceLimiter` bounds announcements per peer per minute and its
- * reference read holds one of four read slots, so fanning out would mostly queue behind that.
+ * time, and within one reference the announcements go in turn. Cohorts overlap, so that still leaves
+ * up to {@link REACTION_CONCURRENCY} announcements in flight to one peer rather than one — the point
+ * of taking them in turn per reference is the reason `BlobCopyDrain.announceTo` documents, that the
+ * receiver's reference read holds one of four read slots (`BLOB_REFERENCE_READS_IN_FLIGHT`), so a full
+ * fan-out would mostly queue behind that. A small constant beats both one at a time, which would make
+ * a wide event take a round trip per (reference, peer) pair, and unbounded, which would open a stream
+ * per pair at once.
  */
 export class BlobCohortReaction {
 	constructor(private readonly deps: BlobCohortReactionDeps) { }
@@ -144,6 +148,19 @@ export class BlobCohortReaction {
 	/**
 	 * Whether `peerId` is owed nothing without a request being made: it will never hold the blob, so
 	 * announcing to it would be wasted and counting it owed would keep this node's hold for ever.
+	 *
+	 * NOTE: all three tests can be transient — `declining` is forgotten at the peer's next connection,
+	 * and a `refuses` may only be an unfinished identify (backlog
+	 * `debt-a-peer-read-as-refusing-may-only-be-unidentified`) — while the GROWTH arm's report of such
+	 * a peer is not: a satisfied peer enters `RebalanceMonitor`'s seen set, which only a departure from
+	 * the cohort clears. So a peer that declined some OTHER blob is recorded as holding this one and is
+	 * never announced to again for it. Left as it is because the alternative converges on the same end
+	 * state: reporting it unsatisfied makes the outcome incomplete, and `growthMaxAttempts` incomplete
+	 * outcomes later the monitor abandons the peer for that reference, cleared by the same departure
+	 * and nothing else. If transient refusals ever turn out to be common, the fix is in the monitor,
+	 * not here — a third `GrowthOutcome` state for "unsatisfiable now, ask again" that does not enter
+	 * the seen set. The RELEASE arm is unaffected: it drops such a peer from the numerator and the
+	 * denominator alike, which can only make a release harder to reach, never wrongly reached.
 	 */
 	private satisfiedWithoutRequest(peerId: string, acceptance: Record<string, BlobAcceptance>): boolean {
 		return !admittedBy(this.deps.membership, peerId)
@@ -162,23 +179,31 @@ export class BlobCohortReaction {
 		// complete, so it cannot be mistaken for growth that was satisfied.
 		const entries = [...grown.entries()].filter(([, peers]) => peers.length > 0);
 		await inParallel(entries, REACTION_CONCURRENCY, async ([ref, peers]) => {
-			growth.set(ref, await this.growOne(ref as BlobRef, peers, satisfiable));
+			const outcome = await this.growOne(ref as BlobRef, peers, satisfiable);
+			if (outcome !== undefined) growth.set(ref, outcome);
 		});
 		return growth;
 	}
 
+	/** `undefined` when the reaction learned nothing about `ref` — see {@link BlobReactionResult.growth}. */
 	private async growOne(
 		ref: BlobRef,
 		peers: readonly string[],
 		satisfiable: (peerId: string) => boolean
-	): Promise<GrowthOutcome> {
+	): Promise<GrowthOutcome | undefined> {
 		const reported = new Set(peers);
 		const scope = await this.scopeOf(ref);
 		if (scope === undefined) {
-			// The holds changed since the check read them. There is nothing to announce under, and an
-			// incomplete outcome would retry this reference on every check for ever.
+			// The holds changed since the check read them: this node no longer keeps the blob for the
+			// network, so there is nothing to announce under and nothing was learned about these peers. No
+			// outcome at all is the honest report, and the one `RebalanceMonitor.recordGrowthOutcome`
+			// documents for a reference the reaction had no information about. Reporting them satisfied
+			// instead would enter them in the monitor's seen set — peers CONFIRMED to hold a replica, which
+			// only a departure from the cohort clears — and so silence the growth arm for a reference that
+			// may be held again (a reader repair's `keepAfterRead`, say) while they hold nothing. Nothing
+			// re-checks for ever either way: a reference with neither hold leaves the tracked set with it.
 			log('grow:no-scope ref=%s', ref);
-			return { satisfiedPeers: [...reported], complete: true };
+			return undefined;
 		}
 		const satisfiedPeers: string[] = [];
 		for (const peerId of reported) {

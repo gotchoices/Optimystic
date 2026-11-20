@@ -150,8 +150,18 @@ export const MAX_BLOB_FOREGROUND_GET_STREAMS = 8;
  *
  * Well above what an honest announcer sends. Its owed-copies drain examines at most 64 entries a pass
  * with at least 15 s between passes (the `UnderReplicationDrain` schedule it shares, `blockBudget` and
- * `minIntervalMs` in `repo/under-replication-drain.ts`), so at most 256 announcements a minute, and the
- * reaction to a cohort change announces at most 64 blobs a check with at least 60 s between checks.
+ * `minIntervalMs` in `repo/under-replication-drain.ts`), so at most 256 announcements a minute, and
+ * the growth arm of the reaction to a cohort change announces at most `growthBlockBudget` (64)
+ * references a check with at least 60 s between checks.
+ *
+ * NOTE: the reaction's RELEASE arm is the one path not bounded by a budget — `RebalanceEvent.lost`
+ * carries every reference a check found this node outside the cohort of, and
+ * `BlobCohortReaction.announceForRelease` announces each to every new owner that did not answer
+ * `whole`. A node that sheds more than this many references in one check therefore has its later
+ * announcements answered `unreferenced`, which costs nothing but a reference retained one more check
+ * (the release count reads the `stat` answers, not the announcements). If a node is ever seen shedding
+ * a range that wide, cap the release arm the way `growthBlockBudget` caps growth rather than raising
+ * this, which is a receiver's defence against one peer.
  */
 export const BLOB_ANNOUNCES_PER_PEER_PER_MINUTE = 600;
 
