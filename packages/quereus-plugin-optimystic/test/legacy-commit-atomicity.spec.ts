@@ -49,6 +49,11 @@ function createDbWithInjected(dir: string) {
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	const injected = makeSelectiveFailureTransactor(new FileRawStorage(dir));
+	// The types too, not only the vtables and functions: a `blobref` column does not resolve
+	// without them. The type registry is process-wide, so re-registering is a no-op.
+	for (const type of plugin.types) {
+		db.registerType(type.name, type.definition);
+	}
 	// Pre-register under the transactor cache key the factory computes for
 	// (transactor='local', keyNetwork='test'), so getOrCreateTransactor returns
 	// our instance instead of building a plain local transactor.
@@ -158,6 +163,11 @@ function findCause<T>(error: unknown, cls: new (...args: never[]) => T): T | und
 const messageOf = (error: unknown): string => String((error as Error)?.message ?? error);
 const isIndexTree = (collectionId: string): boolean => collectionId.includes('/index/');
 
+/** A few real bytes, so the blob below has a record and a pin of its own. */
+async function* someBytes(): AsyncIterable<Uint8Array> {
+	yield Uint8Array.from([7, 11, 13, 17]);
+}
+
 describe('Legacy-mode commit atomicity across trees (local/FileRawStorage)', function () {
 	this.timeout(20000);
 
@@ -254,6 +264,46 @@ describe('Legacy-mode commit atomicity across trees (local/FileRawStorage)', fun
 		// row (split persistence), the index does not. This is the documented
 		// residual limitation, surfaced honestly rather than hidden.
 		expect(await reopenCount(dir, 'select count(*) as c from Item')).to.equal(2);
+	});
+
+	/**
+	 * A commit-phase split settles the transaction's blob pins by WHAT COMMITTED
+	 * (`TransactionBridge.afterFailedCommit`'s `CoordinatorPartialCommitError` arm, which hands
+	 * `SqlBlobPins.committed` the committed collection ids as the scopes that landed).
+	 *
+	 * The discriminating half: the reference tree DID commit, so its reference must be announced and
+	 * unpinned even though the commit as a whole failed and the bridge latched degraded. This passes
+	 * only if the collection ids the coordinator reports are the very strings a reference tree's
+	 * scope is — the claim the arm rests on, and the one an inspection cannot settle.
+	 */
+	it('a commit-phase split announces and releases a reference whose own tree committed', async () => {
+		const uri = 'tree://legacy/pinned';
+		const { db, plugin, injected } = createDbWithInjected(dir);
+		try {
+			await db.exec(`create table Doc (id integer primary key, cat text, r blobref null) using optimystic('${uri}')`);
+			await db.exec(`create index idx_doc_cat on Doc (cat)`);
+			// Put outside any transaction, so the blob starts under an `unstaged` pin.
+			const { ref } = await plugin.blobs.put(someBytes());
+
+			// The main table and the reference tree commit; only the index tree's commit is lost.
+			injected.arm({ phase: 'commit', matches: isIndexTree });
+			const err = await captureThrow(() => db.exec(`insert into Doc (id, cat, r) values (1, 'a', '${ref}')`));
+			injected.disarm();
+			expect(injected.tripped, 'the injected index-tree commit failure tripped').to.be.greaterThan(0);
+
+			const partial = findCause(err, CoordinatorPartialCommitError);
+			expect(partial, 'a commit-phase split surfaces as CoordinatorPartialCommitError').to.not.equal(undefined);
+			expect([...partial!.committedCollections], 'the reference tree is among the committed collections')
+				.to.include('legacy/pinned/blobrefs');
+
+			expect(await plugin.blobs.pinsOf(ref), 'announced, then both the reference and `unstaged` pins released')
+				.to.deep.equal([]);
+			expect((await plugin.blobs.stat(ref)).durability?.quorum, 'announced into the scope that committed')
+				.to.equal('local');
+		} finally {
+			db.close();
+			await plugin.dispose();
+		}
 	});
 
 	it('a successful multi-tree commit, after a history of single-tree commits, reopens to identical rows through a fresh handle', async () => {

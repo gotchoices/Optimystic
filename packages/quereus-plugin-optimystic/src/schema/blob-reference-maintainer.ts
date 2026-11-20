@@ -28,7 +28,8 @@ import type { BlobRefColumnShape } from './blobref-type.js';
 import { encodeKeyElement } from './key-encoding.js';
 import type { PrimaryKey } from './index-manager.js';
 
-/** A staged change to the reference tree, as the pin lifecycle consumes it (`feat-blob-pins-follow-sql-commits`). */
+/** A staged change to the reference tree, as the pin lifecycle consumes it (`SqlBlobPins` in
+ *  `../optimystic-adapter/blob-pins.ts`, through the transaction's `BlobReferenceLedger`). */
 export interface ReferenceChange {
 	readonly op: 'add' | 'remove';
 	readonly ref: BlobRef;
@@ -76,8 +77,10 @@ export function blobReferrer(primaryKey: PrimaryKey, column: string): string {
  *
  * `onStaged`, when given, is called with exactly what was staged, in the order it was staged, and
  * is not called when nothing was staged. It is here because the maintainer is the one place that
- * knows both; `feat-blob-pins-follow-sql-commits` wires the pin lifecycle to it. Nothing sets it
- * in this part.
+ * knows both. `OptimysticVirtualTable.buildBlobReferences` sets it, to record each change on the
+ * transaction so the COMMIT knows which references to pin and announce (docs/blobs.md §Committing
+ * a reference) — and it is the vtab rather than this class that asks whether the statements are a
+ * validating member's replay, since only the vtab holds the `Database` they run on.
  */
 export class BlobReferenceMaintainer {
 	/**

@@ -260,7 +260,7 @@ describe('a transaction\'s blob pins follow its commit', function () {
 
 	it('neither pins nor announces anything while re-executing a replicated transaction', async () => {
 		// A validating member derives the same reference-tree entries as the writer — that is the
-		// point — but has no bytes, so it must touch the blob service at all (docs/blobs.md
+		// point — but has no bytes, so it must not touch the blob service at all (docs/blobs.md
 		// §Registering references, "Members never check whether the bytes exist"). The guard is in
 		// `QuereusEngine.execute`, so the engine is driven directly: going through
 		// `createQuereusValidator` would add a schema-hash and operations-hash dance that tests

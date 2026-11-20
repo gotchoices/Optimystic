@@ -6591,8 +6591,8 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * registered by whichever machine created it. The remaining gap — a tree missing from the
    * registry, because it was created by a build that registered nothing, or dropped on another
    * machine while this one kept writing — is closed where it matters:
-   * `feat-blob-pins-follow-sql-commits` confirms the scope before any announcement names it, and a
-   * receiver only ever reads a scope it was told about.
+   * `SqlBlobPins` confirms the scope before any announcement names it, and a receiver only ever
+   * reads a scope it was told about.
    */
   private async registerBlobScope(tableSchema: TableSchema): Promise<void> {
     const { network, scope } = await this.blobScopeOf(tableSchema);
