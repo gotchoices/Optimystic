@@ -109,6 +109,8 @@ describe('CoordinatorRepo cohort-confirmed reads', () => {
 		awaitWindowConsults?: boolean;
 		/** While unresolved, every non-self member's answer waits on it. */
 		gate?: Promise<void>;
+		/** The declared link round trip, which is what turns silent-consult holds on at all. */
+		retryBackoffBaseMs?: number;
 	}) => {
 		const localPeer = await makePeerId();
 		const memberPeers = await Promise.all(opts.members.map(() => makePeerId()));
@@ -133,7 +135,10 @@ describe('CoordinatorRepo cohort-confirmed reads', () => {
 			makeKeyNetwork(cluster),
 			makeClusterClient,
 			opts.holds ? makePresentStorageRepo(blockId, LOCAL) : makeEmptyStorageRepo(),
-			{ clusterSize: 3, readRepairMode: 'lazy', readRepairWindowMs: WINDOW_MS, readRepairSampleRate: 0 },
+			{
+				clusterSize: 3, readRepairMode: 'lazy', readRepairWindowMs: WINDOW_MS, readRepairSampleRate: 0,
+				...(opts.retryBackoffBaseMs === undefined ? {} : { retryBackoffBaseMs: opts.retryBackoffBaseMs })
+			},
 			undefined,
 			localPeer,
 			undefined,
@@ -149,6 +154,8 @@ describe('CoordinatorRepo cohort-confirmed reads', () => {
 			/** Resolves once the cohort has been consulted for some read. */
 			consultStarted: consultStarted.promise,
 			advance: (ms: number) => { clock += ms; },
+			/** Change what one non-self member does from the next consult on. */
+			setMemberAnswer: (index: number, answer: MemberAnswer) => { answerOf.set(memberPeers[index]!.toString(), answer); },
 			/** Arm the window with an unvouched stamp, then step past it, so the next read is window-demanded. */
 			expireWindow: () => { repo.setLastSeenForTest(blockId, clock); clock += WINDOW_MS + 1; }
 		};
@@ -184,6 +191,27 @@ describe('CoordinatorRepo cohort-confirmed reads', () => {
 		expect(result[blockId]?.unavailable).to.equal(undefined);
 		expect(result[blockId]?.unconfirmedAheadRev, 'nobody claimed anything ahead of it').to.equal(undefined);
 		expect(result[blockId]?.cohortConfirmed, 'a partially silent consult does not vouch').to.equal(undefined);
+	});
+
+	it('stops vouching from a stamp that outlived the window, which a silent-consult hold lets happen', async () => {
+		// A consult that finds a member silent leaves the window unarmed and holds the next one
+		// (`SilentConsultHolds`), so read-repair reports "no consult" for the block whatever the stamp's
+		// age — and the stamp it then reads is the one from BEFORE that silence, which vouched.
+		const { repo, consulted, advance, setMemberAnswer } = await makeRepo({
+			holds: true, members: ['holds-local-rev', 'holds-local-rev'], retryBackoffBaseMs: 2_000
+		});
+		const confirmed = await repo.get({ blockIds: [blockId] });
+		expect(confirmed[blockId]?.cohortConfirmed, 'the whole cohort answered, so the stamp vouches').to.equal(true);
+
+		setMemberAnswer(1, 'silent');
+		advance(WINDOW_MS + 1);
+		const silenced = await repo.get({ blockIds: [blockId] });
+		expect(silenced[blockId]?.cohortConfirmed, 'a partially silent consult does not vouch').to.equal(undefined);
+
+		advance(1_000);
+		const underHold = await repo.get({ blockIds: [blockId] });
+		expect(consulted.length, 'the hold keeps this read from consulting again').to.equal(6);
+		expect(underHold[blockId]?.cohortConfirmed, 'and a stamp the window has outlived vouches for nothing').to.equal(undefined);
 	});
 
 	it('never marks a self-only view, whose answers are the ones a confirmed read was indistinguishable from', async () => {

@@ -1123,13 +1123,11 @@ export class CoordinatorRepo implements IRepo {
 			// serve the same content as confirmed — the exact silent lie this marker exists
 			// to end, re-opened for `readRepairWindowMs` at a time.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
-			// The stamp of the pass that armed this window says whether a cohort member vouched for it.
-			// Read from the map rather than the local `stamp` below, which exists only for an expired
-			// window. Gated on the mode because `readRepairMode: 'off'` never consults a held block, so
-			// an `'off'` node's stamp can be arbitrarily old; in `'lazy'` it is at most one
-			// `readRepairWindowMs` old, or a quiet span's length. Consequence, stated out loud: on an
-			// `'off'` node no held block is ever reported confirmed.
-			this.markCohortConfirmed(results, blockId, this.readRepairMode !== 'off' && this.lastSeenCommitMs.get(blockId)?.vouched === true);
+			// The stamp of the pass that armed this window says whether a cohort member vouched for it,
+			// and {@link stampVouchesNow} checks the stamp is still the window's rather than one an
+			// earlier pass left ({@link readRepairDemand} also reports "no consult" for a block under a
+			// silent-consult hold, whatever the window says).
+			this.markCohortConfirmed(results, blockId, this.stampVouchesNow(blockId));
 			return;
 		}
 
@@ -1312,6 +1310,28 @@ export class CoordinatorRepo implements IRepo {
 		const entry = results[blockId];
 		if (!entry || entry.unavailable !== undefined || entry.unconfirmedAheadRev !== undefined) return;
 		entry.cohortConfirmed = true;
+	}
+
+	/**
+	 * Whether the window stamp a read served WITHOUT a consult may rest on: its pass vouched, and the
+	 * stamp is still inside the window it armed.
+	 *
+	 * The age is checked rather than assumed, because "no consult this pass" is not only "the window is
+	 * fresh". {@link readRepairDemand} also answers it for a block under a silent-consult hold, whatever
+	 * the stamp's age ({@link SilentConsultHolds}) — and that hold is placed by exactly the pass whose
+	 * silence {@link consultVouches} refuses to vouch for, which leaves a vouching stamp from BEFORE
+	 * that silence standing. Without the age test such a read would report a silent cohort's answer as
+	 * confirmed, which is the one thing this marker exists to prevent. It also covers
+	 * `readRepairMode: 'off'`, which never consults a held block at all, so its stamp can be
+	 * arbitrarily old; the consequence, stated out loud, is that an `'off'` node reports no held block
+	 * confirmed after one window.
+	 *
+	 * A quiet span is NOT measured against the window here: a read under one takes the span's own exit
+	 * below, whose guarantee ({@link quietCohortStillVouches}) is what extends the cadence.
+	 */
+	private stampVouchesNow(blockId: BlockId): boolean {
+		const stamp = this.lastSeenCommitMs.get(blockId);
+		return stamp?.vouched === true && this.now() - stamp.at <= this.readRepairWindowMs;
 	}
 
 	/**

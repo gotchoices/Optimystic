@@ -134,7 +134,10 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 	 */
 	async aloneFor(blockIds: readonly BlockId[]): Promise<boolean> {
 		const distinct = [...new Set(blockIds)];
-		const judged = await Promise.all(distinct.map(async blockId => ({ blockId, reason: await this.judgeAlone(blockId) })));
+		const judged = await Promise.all(distinct.map(async blockId => ({
+			blockId,
+			reason: await this.judgeAlone(blockId).catch((): UnreachableReason => 'lookup-failed')
+		})));
 		const failed = judged.find(({ reason }) => reason !== undefined);
 		if (failed === undefined) return true;
 		this.log('reachability:not-alone reason=%s block=%s', failed.reason, failed.blockId);
@@ -170,42 +173,34 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 
 	private async judge(blockId: BlockId): Promise<BlockVerdict> {
 		try {
-			return await this.judgeCohort(blockId);
+			const reason = await this.judgeAlone(blockId);
+			// `'other-members'` is the one reason that OPENS this gate: `reachable` asks whether the
+			// cohort can be reached, and a cohort naming another machine can be.
+			return reason === undefined || reason === 'other-members' ? OPEN : { open: false, reason, blockId };
 		} catch (err) {
 			this.log('reachability:lookup-failed block=%s - %o', blockId, err);
 			return { open: false, reason: 'lookup-failed', blockId };
 		}
 	}
 
-	private async judgeCohort(blockId: BlockId): Promise<BlockVerdict> {
+	/**
+	 * Why this block's cohort is not this node alone, or `undefined` when it is ({@link aloneFor}).
+	 * Both gates read the cohort through here, so a change to how one assembles it cannot drift from
+	 * the other — they differ only in what they make of `'other-members'` ({@link judge}).
+	 *
+	 * Rejects when the lookup does, which {@link judge} logs with the error; `aloneFor` turns it into
+	 * a reason instead, so one bad block closes it without failing it.
+	 */
+	private async judgeAlone(blockId: BlockId): Promise<UnreachableReason | 'other-members' | undefined> {
 		const key = routingKeyForBlock(blockId);
 		const cohort = Object.keys(await this.deps.keyNetwork.findCluster(key));
 		// NOTE: FRET keeps a long-lived peer live for up to `maxDeadGraceMs` (5 min by default) after it
-		// departs, so through that grace a gone partner still makes this arm answer reachable and the
-		// drain meets shortfalls, with backoff. If drains are seen spinning on shortfalls during that
-		// grace, also require a live connection to that member.
-		if (cohort.some(peerId => peerId !== this.deps.selfId)) return OPEN;
-		if (cohort.length === 0) return { open: false, reason: 'no-cohort', blockId };
-		const reason = await this.whyNotAlone(key);
-		return reason === undefined ? OPEN : { open: false, reason, blockId };
-	}
-
-	/**
-	 * Why this block's cohort is not this node alone, or `undefined` when it is ({@link aloneFor}).
-	 * `'other-members'` is the one reason {@link judgeCohort} does not have: there it OPENS the gate.
-	 * A lookup that throws is a reason rather than a rejection, so one bad block closes `aloneFor`
-	 * without failing it.
-	 */
-	private async judgeAlone(blockId: BlockId): Promise<UnreachableReason | 'other-members' | undefined> {
-		try {
-			const key = routingKeyForBlock(blockId);
-			const cohort = Object.keys(await this.deps.keyNetwork.findCluster(key));
-			if (cohort.some(peerId => peerId !== this.deps.selfId)) return 'other-members';
-			if (cohort.length === 0) return 'no-cohort';
-			return await this.whyNotAlone(key);
-		} catch {
-			return 'lookup-failed';
-		}
+		// departs, so through that grace a gone partner still makes `reachable`'s cohort arm answer
+		// reachable and the drain meets shortfalls, with backoff. If drains are seen spinning on
+		// shortfalls during that grace, also require a live connection to that member.
+		if (cohort.some(peerId => peerId !== this.deps.selfId)) return 'other-members';
+		if (cohort.length === 0) return 'no-cohort';
+		return await this.whyNotAlone(key);
 	}
 
 	/** For a self-only view: what says it may not be the whole cohort, or `undefined` when this node is genuinely alone. */

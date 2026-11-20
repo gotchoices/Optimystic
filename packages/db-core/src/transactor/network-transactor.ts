@@ -390,6 +390,12 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		// between: it establishes that some of the cohort was reachable, without settling existence.
 		const unavailableRank = (reason: BlockUnavailableReason): number =>
 			reason === 'cohort-unreachable' ? 0 : reason === 'peers-unreachable' ? 1 : 2;
+		// NOTE: `cohortConfirmed` is deliberately NOT ranked, and must not be: the marker says who
+		// stood behind an answer, and ranking it would let it change which CONTENT a read returns.
+		// So whole entries compete on doubt and revision alone, and a confirmed entry losing an
+		// equal-rank tie to an unconfirmed one at a newer revision yields a merged answer carrying no
+		// marker — the fail-safe direction, since its one consumer (the blob reclaim pass) keeps the
+		// blob when the marker is absent.
 		const rankOf = (r: unknown): number => {
 			if (!r || typeof r !== 'object') return -1;
 			const entry = r as GetBlockResults[BlockId];
