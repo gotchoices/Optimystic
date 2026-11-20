@@ -178,12 +178,17 @@ describe('blob SQL functions and plugin.blobs', function () {
 			expect(stampId, 'a touched table gives the statement a stamp').to.be.a('string');
 
 			const { ref } = await plugin.blobs.put(twoPieces());
-			await db.exec('commit');
-
-			// The pin survives the commit: this release releases nothing (`feat-blob-pins-follow-sql-commits`).
 			const pins = await plugin.blobs.pinsOf(ref);
 			expect(pins, 'exactly the one pin the put took').to.have.lengthOf(1);
 			expect(parsePinLabel(pins[0]!), pins[0]).to.deep.equal({ kind: 'put', stampId });
+
+			// The footgun docs/blobs.md §SQL and `SqlBlobService.put` both state: a put inside a
+			// transaction is pinned under that transaction's identity, so one the transaction never
+			// references loses its hold when the transaction ends — here, at its commit. Keeping such
+			// a blob means putting it outside any transaction, or passing an explicit `owner`.
+			await db.exec('commit');
+			expect(await plugin.blobs.pinsOf(ref), 'no row referenced it, so the commit released it')
+				.to.deep.equal([]);
 		} finally {
 			db.close();
 			await plugin.dispose();

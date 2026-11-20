@@ -15,6 +15,7 @@ import type { SqlValue } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import type { TransactionState } from '../dist/index.js';
 import { emptyWriteFacts } from '../src/optimystic-adapter/write-description.js';
+import { emptyBlobReferenceLedger } from '../src/optimystic-adapter/blob-reference-ledger.js';
 import { captureTrace, commitTraces } from './trace-helpers.js';
 import { Collection } from '@optimystic/db-core';
 import type { ActionHandler, BlockId, BlockStore, CollectionInitOptions, IBlock } from '@optimystic/db-core';
@@ -131,6 +132,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			stampId: 'test-stamp',
 			acknowledgement: 'network',
 			writeFacts: emptyWriteFacts(),
+			blobReferences: emptyBlobReferenceLedger(),
 		};
 
 		const col1 = await factory.createOrGetCollection(options, txnState);
@@ -159,6 +161,7 @@ describe('CollectionFactory (TEST-7.3.1)', () => {
 			stampId: 'test-stamp',
 			acknowledgement: 'network',
 			writeFacts: emptyWriteFacts(),
+			blobReferences: emptyBlobReferenceLedger(),
 		};
 
 		await factory.createOrGetCollection(options, txnState);

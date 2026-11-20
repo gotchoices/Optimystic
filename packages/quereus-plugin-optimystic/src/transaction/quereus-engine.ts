@@ -10,6 +10,7 @@ import type {
 import { stricterLane } from '@optimystic/db-core';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { QUEREUS_VERSION } from './quereus-version.js';
+import { duringReplay } from './replay-scope.js';
 import { replicatedCeilingOf } from '../optimystic-adapter/lane.js';
 
 /**
@@ -100,19 +101,29 @@ export class QuereusEngine implements ITransactionEngine {
 		try {
 			const allActions: CollectionActions[] = [];
 
-			for (const statementJson of transaction.statements) {
-				const statement = parseStatement(statementJson);
+			// Every statement this engine runs is a REPLAY of a replicated transaction: the writer's
+			// own session records its statements rather than executing them here
+			// (`TransactionSession.execute` reaches the engine only when it is given no actions), and
+			// the two callers that do are `TransactionValidator.validate` and
+			// `TransactionCoordinator.execute`. So the whole loop is marked, which is what keeps the
+			// vtab from pinning or announcing blob references it has no bytes for (docs/blobs.md
+			// §Registering references, *Under transaction validation*). Inside the `try`, so a
+			// re-execution that throws still decrements before the catch arm below answers.
+			await duringReplay(this.db, async () => {
+				for (const statementJson of transaction.statements) {
+					const statement = parseStatement(statementJson);
 
-				// Execute SQL through Quereus
-				// The Optimystic virtual table module will:
-				// 1. Translate SQL mutations to actions
-				// 2. Call coordinator.applyActions() with the stampId
-				await this.db.exec(statement.sql, statement.params);
+					// Execute SQL through Quereus
+					// The Optimystic virtual table module will:
+					// 1. Translate SQL mutations to actions
+					// 2. Call coordinator.applyActions() with the stampId
+					await this.db.exec(statement.sql, statement.params);
 
-				// Note: Actions are collected by the coordinator's trackers,
-				// not returned directly from exec(). The coordinator tracks
-				// all actions applied during this transaction.
-			}
+					// Note: Actions are collected by the coordinator's trackers,
+					// not returned directly from exec(). The coordinator tracks
+					// all actions applied during this transaction.
+				}
+			});
 
 			return {
 				success: true,

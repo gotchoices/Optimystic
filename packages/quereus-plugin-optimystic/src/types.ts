@@ -1,6 +1,7 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
 import type { IKVStore, IPieceStore, IRawStorage, NodeOptions } from '@optimystic/db-p2p';
+import type { BlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
 import type { TransactionWriteFacts } from './optimystic-adapter/write-description.js';
 
 /**
@@ -135,4 +136,12 @@ export interface TransactionState {
    * commit and read live by `CommitOutlook()`.
    */
   writeFacts: TransactionWriteFacts;
+  /**
+   * What this transaction's statements staged into their tables' reference trees, and what it put
+   * through `plugin.blobs` while open (`BlobReferenceLedger`, recorded by the vtab through
+   * `TransactionBridge.noteBlobReferences` and by `SqlBlobService.put`);
+   * `emptyBlobReferenceLedger()` to begin with. Folded at commit into the pins the transaction's
+   * references are held under (`SqlBlobPins` in `./optimystic-adapter/blob-pins.ts`).
+   */
+  blobReferences: BlobReferenceLedger;
 }

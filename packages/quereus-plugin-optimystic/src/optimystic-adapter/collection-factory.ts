@@ -152,6 +152,17 @@ export class CollectionFactory {
   // flight across a dispose still lands in `blobBackends` and its service escapes the set dispose
   // stopped. Same remedy if hosts ever dispose mid-initialization: drop results that settle after.
   private blobBackendsInFlight = new Map<string, Promise<BlobBackend>>();
+  /**
+   * The options each transactor key was FIRST resolved from ({@link getOrCreateTransactor}), so a
+   * caller holding only a key can reach that network's blob store ({@link blobBackendForKey}).
+   * First options per key win, as the transactor itself and {@link getBlobBackend} are first-wins —
+   * and so that a transactor a host pre-registered through `registerTransactor` still gets its
+   * options remembered when a table resolves through it.
+   *
+   * Neither {@link clearCache} nor {@link dispose} forgets these: they are inert configuration, and
+   * keeping them lets a later resolution rebuild that network's store exactly the same way.
+   */
+  private transactorOptions = new Map<string, ParsedOptimysticOptions>();
   /** The single-machine services this factory BUILT, so {@link dispose} can stop them. A `network`
    * backend's service belongs to its node and is stopped by {@link shutdown}. */
   private singleMachineBlobServices = new Set<SingleMachineBlobService>();
@@ -331,6 +342,11 @@ export class CollectionFactory {
    */
   async getOrCreateTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const transactorKey = this.getTransactorKey(options);
+    // Ahead of the cache check, so a key whose transactor was pre-registered or already built is
+    // remembered too ({@link transactorOptions}).
+    if (!this.transactorOptions.has(transactorKey)) {
+      this.transactorOptions.set(transactorKey, options);
+    }
 
     if (this.transactors.has(transactorKey)) {
       return this.transactors.get(transactorKey)!;
@@ -386,6 +402,30 @@ export class CollectionFactory {
       this.blobBackendsInFlight.set(key, inFlight);
     }
     return await inFlight;
+  }
+
+  /** The transactor key of `options`, `${transactor}:${keyNetwork}` — what a {@link BlobBackend} is
+   *  keyed by, and what a recorded blob reference names its network with. */
+  transactorKeyOf(options: ParsedOptimysticOptions): string {
+    return this.getTransactorKey(options);
+  }
+
+  /**
+   * The blob backend of a transactor key this factory has already resolved options for
+   * ({@link transactorOptions}) — so a caller holding only the key a reference was recorded under
+   * reaches the same store, with the same de-duplication and in-flight sharing, as
+   * {@link getBlobBackend} does.
+   *
+   * Throws for a key this factory has never seen, which is a programming error rather than a
+   * configuration one: every key reaching here came from a table that opened, and every open path
+   * resolves that table's own options (`resolveTreeArgs`).
+   */
+  async blobBackendForKey(key: string): Promise<BlobBackend> {
+    const options = this.transactorOptions.get(key);
+    if (options === undefined) {
+      throw new Error(`No Optimystic options have been resolved for transactor key '${key}', so its blob store cannot be opened`);
+    }
+    return await this.getBlobBackend(options);
   }
 
   /**

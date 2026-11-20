@@ -1,5 +1,5 @@
 import type {
-  ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Lane, SyncOptions, Transaction, TransactionDurability,
+  BlobRef, ITransactionEngine, ITransactor, Collection, CollectionId, IBlockDurabilityNotifier, Lane, SyncOptions, Transaction, TransactionDurability,
   TreeGuardRefusedError, WriteDurability,
 } from '@optimystic/db-core';
 import {
@@ -21,6 +21,9 @@ import type { MaterializedViewFollower } from './materialized-view-follower.js';
 import type { TransactionOutcome } from './offline-status.js';
 import type { EntryFacts } from './commit-outlook.js';
 import { emptyWriteFacts, foldWriteFacts, uncheckedOf, type WriteFact } from './write-description.js';
+import { emptyBlobReferenceLedger } from './blob-reference-ledger.js';
+import type { BlobPinSettlement, HeldPins, SqlBlobPins } from './blob-pins.js';
+import type { ReferenceChange } from '../schema/blob-reference-maintainer.js';
 import { laneOf, transactionLaneOf } from './lane.js';
 import { NetworkCommitBoundMs } from './network-commit-bound.js';
 import { StaleTableDescriptionError, followStaleDescriptions, judgeTableDescriptions, staleTables } from './table-description-check.js';
@@ -30,6 +33,9 @@ import { qualifiedTableName, type QualifiedTableName } from '../schema/table-ide
 import { createLogger, revisionToken } from '../logger.js';
 
 const log = createLogger('txn-bridge');
+/** The blob pin lifecycle's own channel, shared with the rest of the plugin's blob lines
+ *  (docs/debugging.md §quereus-plugin sub-namespaces). */
+const blobLog = createLogger('blob');
 
 /**
  * Minimal tree surface the bridge needs to flush (at commit) or roll back (on
@@ -517,6 +523,21 @@ export class TransactionBridge {
    * `announceExternalChange` notes it, through here. Absent for a bridge built bare (tests).
    */
   private materializedViewFollower: MaterializedViewFollower | undefined;
+  /**
+   * The blob pins of this plugin registration ({@link attachBlobPins}): what pins a committing
+   * transaction's references and releases them when it settles. Absent on a bridge built bare
+   * (tests), which is what makes every spec that constructs `new TransactionBridge(factory)` keep
+   * working — and correct, since such a bridge has no plugin to resolve a blob backend through.
+   */
+  private blobPins: SqlBlobPins | undefined;
+  /** What the current transaction's {@link commitTransaction} pinned, until it is settled. */
+  private heldBlobPins: HeldPins | undefined;
+  /**
+   * Whether this transaction's blob pins have already been settled — the once-guard
+   * {@link settleBlobPins} needs, because two exits overlap: `afterFailedCommit`'s ordinary arm
+   * reaches `rollbackTransaction`, which settles in its `finally`.
+   */
+  private blobPinsSettled = false;
 
   constructor(collectionFactory: CollectionFactory) {
     this.collectionFactory = collectionFactory;
@@ -536,6 +557,16 @@ export class TransactionBridge {
    * to; `undefined` for a bridge built bare. */
   getOfflineMode(): OfflineMode | undefined {
     return this.offline;
+  }
+
+  /**
+   * Attach this registration's blob pins; set once by the plugin's `register`, as the offline-mode
+   * controller is. A bridge with none neither pins nor announces anything, which is what tests that
+   * build a bare bridge rely on.
+   */
+  attachBlobPins(pins: SqlBlobPins): void {
+    if (this.blobPins !== undefined) throw new Error('blob pins are already attached to this bridge');
+    this.blobPins = pins;
   }
 
   /** Attach the materialized-view follower; set once by the plugin's `register`, as the offline-mode controller is. */
@@ -891,6 +922,8 @@ export class TransactionBridge {
     this.dirtyTrees.clear();
     this.descriptionChecks.clear();
     this.savepoints.clear();
+    this.heldBlobPins = undefined;
+    this.blobPinsSettled = false;
 
     // Create TransactionSession if transaction mode is enabled
     if (this.coordinator && this.engine && this.schemaHashProvider) {
@@ -926,6 +959,7 @@ export class TransactionBridge {
       // which offline mode refuses to enter beside, and vice versa.
       acknowledgement: this.offline?.isEntered() === true ? 'local' : 'network',
       writeFacts: emptyWriteFacts(),
+      blobReferences: emptyBlobReferenceLedger(),
     };
 
     return this.currentTransaction;
@@ -945,7 +979,8 @@ export class TransactionBridge {
     if (!this.currentTransaction?.isActive) {
       throw new Error('No active transaction to commit');
     }
-    const transactionId = this.currentTransaction.stampId;
+    const transaction = this.currentTransaction;
+    const transactionId = transaction.stampId;
     const route = this.session ? undefined : this.offlineRoute();
     // One fold, read once here and handed to whichever route runs, so the four routes cannot disagree
     // on the lane the write carries.
@@ -959,6 +994,10 @@ export class TransactionBridge {
       if (stale.length > 0) {
         throw new StaleTableDescriptionError(staleTables(stale));
       }
+      // AFTER the stale check and before any route sends anything: a transaction refused on a stale
+      // table description writes no pin records at all, and a pin that fails to write fails the
+      // commit while nothing is durable (`SqlBlobPins.holdForCommit`).
+      this.heldBlobPins = await this.blobPins?.holdForCommit(transaction);
       if (this.session) {
         durability = await this.commitSession(this.session, lane);
       } else if (route !== undefined) {
@@ -983,22 +1022,64 @@ export class TransactionBridge {
         durability = await this.commitDirtyTreesLegacy(lane);
       }
     } catch (error) {
-      const failure = await this.afterFailedCommit(error);
+      const failure = await this.afterFailedCommit(transaction, error);
       // After the rollback, so the refused tables' trees are restored before their instances follow.
       followStaleDescriptions(stale);
       throw failure;
     }
 
     if (route?.kind === 'behind-queue' && queued) {
+      // Before the wait, not after: the entry is the queue's now, and its reference pins are settled
+      // with the queued transaction however this call ends (it throws for a failed or unanswered one).
+      await this.settleBlobPins(transaction, 'queued');
       await this.awaitQueuedCommit(this.offline!, transactionId);
       return;
     }
     this.endTransaction();
+    // Awaited before the commit returns, so a host's `await db.exec(…)` resolves only once every
+    // reference this transaction added has been announced and its durability reported to every
+    // `plugin.blobs.onDurability` listener — what the two-commit pattern of docs/blobs.md
+    // §Committing a reference waits on. A queue route that queued NOTHING abandoned the
+    // transaction, so its pins go.
+    await this.settleBlobPins(transaction, route === undefined ? { committed: 'all' } : queued ? 'queued' : 'abandoned');
     // A clean commit reconciles the local view — release the degraded latch so committed reads
     // answer again (see degradedReason). A local acknowledgement reaches no storage, so it reconciles
     // nothing: the latch is left as it was.
     if (route?.kind !== 'local') this.degradedReason = null;
     if (durability !== undefined) this.reportCommitDurability(transactionId, durability);
+  }
+
+  /**
+   * Settle the transaction's blob pins exactly ONCE, however it ended — announcing and releasing
+   * what committed, keeping what a queued transaction still owes, dropping what was abandoned
+   * (`SqlBlobPins`). Never throws: by the time this runs the write is durable or queued, and a
+   * failure here must not turn a successful commit into a failed one.
+   *
+   * The once-guard is what makes the overlapping exits safe: `afterFailedCommit`'s ordinary arm
+   * reaches {@link rollbackTransaction}, which settles in its `finally`, so one transaction is not
+   * settled twice. A bridge with no pins attached (tests) returns at once.
+   */
+  private async settleBlobPins(transaction: TransactionState, settlement: BlobPinSettlement): Promise<void> {
+    const pins = this.blobPins;
+    if (pins === undefined || this.blobPinsSettled) {
+      return;
+    }
+    this.blobPinsSettled = true;
+    const held = this.heldBlobPins;
+    this.heldBlobPins = undefined;
+    try {
+      if (settlement === 'queued') {
+        await pins.queued(held, transaction);
+      } else if (settlement === 'abandoned') {
+        await pins.abandoned(held, transaction);
+      } else {
+        await pins.committed(held, transaction, settlement.committed);
+      }
+    } catch (error) {
+      // Every arm already isolates each reference, so reaching here means the arm itself faulted.
+      blobLog('blob:pin-settle-failed transaction=%s error=%s',
+        transaction.stampId, error instanceof Error ? error.message : String(error));
+    }
   }
 
   /**
@@ -1023,8 +1104,13 @@ export class TransactionBridge {
   /**
    * After a commit route threw: clean up by what the failure left durable, and answer the error the
    * commit throws.
+   *
+   * `transaction` is the one the commit began on, because the blob pins of each arm settle by what
+   * that arm left durable: the two partial-commit arms announce only the references whose reference
+   * TREE committed and keep the rest pinned for the last part's reconciliation, and every other
+   * failure reaches {@link rollbackTransaction}, which settles as abandoned in its `finally`.
    */
-  private async afterFailedCommit(error: unknown): Promise<unknown> {
+  private async afterFailedCommit(transaction: TransactionState, error: unknown): Promise<unknown> {
     if (error instanceof PartialCommitError) {
       // The legacy fallback sweep already cleaned up: it restored the trees that
       // never touched storage and left the durably-committed trees alone (their
@@ -1034,6 +1120,9 @@ export class TransactionBridge {
       // degraded state (committed reads must refuse until the next clean
       // commit/rollback) and propagate.
       this.degradedReason = error.message;
+      // The sweep's labels ARE collection ids for a real tree: `treeLabel` answers `Tree.describe()`,
+      // which renders `collection.id`.
+      await this.settleBlobPins(transaction, { committed: new Set(error.persisted) });
       return error;
     }
     if (error instanceof CoordinatorPartialCommitError) {
@@ -1051,6 +1140,7 @@ export class TransactionBridge {
       // restoring, and propagate the structured signal for reconciliation.
       this.degradedReason = error.message;
       this.endTransaction();
+      await this.settleBlobPins(transaction, { committed: new Set(error.committedCollections) });
       return error;
     }
     // Nothing durably committed (a clean session-mode commit failure, a legacy
@@ -1739,6 +1829,12 @@ export class TransactionBridge {
       // tree's storage holds) — release the degraded latch (see degradedReason).
       if (restoreFailure === undefined) this.degradedReason = null;
       this.settleIdleWaiters();
+      // After the restores: nothing of this transaction is durable or queued, so every reference pin
+      // it took goes and every blob it put inside it loses its pin. An `unstaged` pin of a blob put
+      // BEFORE the transaction stays, so an application that retries the insert need not put the
+      // bytes again (`SqlBlobPins.abandoned`). Awaited inside the `finally`, so a rollback that
+      // throws still settles.
+      await this.settleBlobPins(transaction, 'abandoned');
     }
 
     // Note: We intentionally do NOT clear the collection factory cache here.
@@ -2022,6 +2118,13 @@ export class TransactionBridge {
     if (this.savepoints.has(depth)) {
       return;
     }
+    // Deliberately NOT beside markWriteFacts above, which marks in session mode too. What is
+    // recorded in the ledger has to follow what will COMMIT, and in session mode a statement
+    // savepoint rollback does not restore the trees (the documented gap below, and
+    // `debt-optimystic-session-mode-statement-savepoint-gap`) — so truncating the ledger there
+    // would leave a reference that WILL commit unpinned and unannounced. Legacy mode, where the
+    // bridge restores the trees itself, is the only mode where the two agree.
+    this.markBlobReferences(depth);
     const snapshots = new Map<Collection<any>, unknown>();
     for (const collection of this.collectionRegistry.values()) {
       snapshots.set(collection, collection.snapshotPending());
@@ -2054,6 +2157,8 @@ export class TransactionBridge {
     if (!snapshots) {
       return;
     }
+    // Legacy mode only, for the reason {@link createSavepoint} states at its own mark.
+    this.truncateBlobReferences(depth);
     // Every collection is restored even after one throws, and the deeper savepoints are
     // discarded either way: Quereus has already unwound its own savepoint stack to `depth`
     // before broadcasting, and a collection left un-restored would keep the statements the
@@ -2079,6 +2184,7 @@ export class TransactionBridge {
    */
   releaseSavepoint(depth: number): void {
     this.releaseWriteFactMarks(depth);
+    this.releaseBlobReferenceMarks(depth);
     for (const openDepth of this.savepoints.keys()) {
       if (openDepth >= depth) {
         this.savepoints.delete(openDepth);
@@ -2178,6 +2284,69 @@ export class TransactionBridge {
     if (facts === undefined) return;
     for (const openDepth of facts.marks.keys()) {
       if (openDepth >= depth) facts.marks.delete(openDepth);
+    }
+  }
+
+  /**
+   * Record what the executing statement just staged into a table's reference tree (`ReferenceChange`,
+   * reported by `BlobReferenceMaintainer`'s `onStaged` hook), under `backendKey` — the transactor key
+   * of the network whose blob store holds the bytes. Kept with the transaction in staging order and
+   * folded at commit into the pins its references are held under ({@link settleBlobPins}). A no-op
+   * with no active transaction or an empty list, as {@link noteWriteFacts} is.
+   *
+   * The vtab calls this only for its OWN writes: a validating member's re-execution runs under
+   * `duringReplay`, and the recording site asks `isReplaying` (docs/blobs.md §Registering
+   * references, *Under transaction validation*).
+   */
+  noteBlobReferences(backendKey: string, changes: readonly ReferenceChange[]): void {
+    const transaction = this.currentTransaction;
+    if (!transaction?.isActive || changes.length === 0) return;
+    for (const change of changes) {
+      transaction.blobReferences.records.push({ backendKey, change });
+    }
+  }
+
+  /**
+   * Record a blob `put` made through `plugin.blobs` while this transaction was open and pinned under
+   * its `put` label, so settling the transaction releases that pin (`SqlBlobService.put`). A no-op
+   * with no active transaction.
+   *
+   * Puts are never truncated by a savepoint rollback: a savepoint does not undo a put.
+   */
+  noteBlobPut(backendKey: string, ref: BlobRef): void {
+    const transaction = this.currentTransaction;
+    if (!transaction?.isActive) return;
+    transaction.blobReferences.puts.push({ backendKey, ref });
+  }
+
+  /** Remember how many reference records were staged when the legacy savepoint at `depth` was
+   *  created — once per depth, as {@link markWriteFacts} is. */
+  private markBlobReferences(depth: number): void {
+    const ledger = this.currentTransaction?.blobReferences;
+    if (ledger !== undefined && !ledger.marks.has(depth)) {
+      ledger.marks.set(depth, ledger.records.length);
+    }
+  }
+
+  /** Discard the reference records staged since the legacy savepoint at `depth`, and the marks
+   *  nested above it: a reference only a rolled-back statement staged will not commit, so it must
+   *  be neither pinned nor announced. The mark at `depth` stays, as the savepoint does. */
+  private truncateBlobReferences(depth: number): void {
+    const ledger = this.currentTransaction?.blobReferences;
+    const mark = ledger?.marks.get(depth);
+    if (ledger === undefined || mark === undefined) return;
+    ledger.records.length = mark;
+    for (const openDepth of ledger.marks.keys()) {
+      if (openDepth > depth) ledger.marks.delete(openDepth);
+    }
+  }
+
+  /** Drop the marks at and above `depth`: records staged under a released savepoint stay, as its rows do. */
+  private releaseBlobReferenceMarks(depth: number): void {
+    const ledger = this.currentTransaction?.blobReferences;
+    if (ledger === undefined) return;
+    for (const openDepth of ledger.marks.keys()) {
+      if (openDepth >= depth) ledger.marks.delete(openDepth);
     }
   }
 

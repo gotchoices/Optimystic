@@ -13,6 +13,8 @@ import type { OfflineMode, OfflineTablePolicy, StorageShapeChange } from './opti
 import type { DescriptionVerdict, StaleVerdict, TableDescriptionCheck } from './optimystic-adapter/table-description-check.js';
 import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
 import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow } from './optimystic-adapter/write-description.js';
+import { emptyBlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
+import { isReplaying } from './transaction/replay-scope.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
 import type { IKVStore, IPieceStore, IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
@@ -55,7 +57,10 @@ const EMPTY_INDEX_SET: ReadonlySet<string> = new Set<string>();
 /** A transaction state carrying nothing but `transactor`, for opening a collection on a transactor the
  *  factory should reuse (`CollectionFactory.createOrGetCollection`) outside any SQL transaction. */
 function transactorOnlyState(transactor: ITransactor): TransactionState {
-  return { transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network', writeFacts: emptyWriteFacts() };
+  return {
+    transactor, isActive: true, collections: new Map(), stampId: '', acknowledgement: 'network',
+    writeFacts: emptyWriteFacts(), blobReferences: emptyBlobReferenceLedger(),
+  };
 }
 
 /** The collection handles a re-initialization reuses ({@link OptimysticVirtualTable.adoptCatalogEntry}). */
@@ -5076,12 +5081,29 @@ export class OptimysticVirtualTable extends VirtualTable {
     return this.collectionFactory.getCollectionId(blobReferenceOptions(this.options));
   }
 
+  /**
+   * The maintainer for this table's reference tree, reporting everything it stages to the
+   * transaction bridge so a commit knows which references to pin and announce
+   * (docs/blobs.md §Committing a reference).
+   *
+   * Nothing on this path touches the blob service: `update()` only RECORDS what it staged, and the
+   * bridge pins at commit. A validating member re-executing the transaction's statements has no
+   * bytes, so it must neither pin nor announce — which is what `isReplaying` asks, over the
+   * `Database` the re-execution runs on (`duringReplay` in `./transaction/replay-scope.ts`).
+   *
+   * The backend key is read once, synchronously, because `onStaged` runs inside `update()`: it is a
+   * pure function of the table's `transactor` and `keyNetwork`, which its options fix at declaration.
+   */
   private buildBlobReferences(columns: readonly BlobRefColumn[], tree: BlobReferenceTree): BlobReferenceMaintainer {
+    const backendKey = this.collectionFactory.transactorKeyOf(this.options);
     return new BlobReferenceMaintainer(
       qualifiedTableName(this.qualifiedTable),
       columns,
       tree,
       this.blobReferenceScope(),
+      changes => {
+        if (!isReplaying(this.db)) this.txnBridge.noteBlobReferences(backendKey, changes);
+      },
     );
   }
 

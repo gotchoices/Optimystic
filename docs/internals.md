@@ -1056,6 +1056,49 @@ writes only what the table owes (above), and a hydrated table's tree was registe
 machine created it. Consulting the registry per table at every start would be a read per table for a
 case the pin lifecycle closes anyway, by confirming the scope before any announcement names it.
 
+##### Pinning what a commit references
+
+Nothing on the `update()` path calls the blob service. What the maintainer stages is reported through
+its `onStaged` hook to `TransactionBridge.noteBlobReferences`, which appends it to the transaction's
+`BlobReferenceLedger`
+(`packages/quereus-plugin-optimystic/src/optimystic-adapter/blob-reference-ledger.ts`) beside the
+write facts; the COMMIT is what pins, announces and releases
+([blobs.md §Committing a reference](blobs.md#committing-a-reference)). That split is forced by
+validation: a member re-executing the statements derives the same staged entries but has no bytes,
+so it must neither pin nor announce. The recording site asks `isReplaying(this.db)`
+(`packages/quereus-plugin-optimystic/src/transaction/replay-scope.ts`), a `WeakMap` counter per
+`Database` that `QuereusEngine.execute` holds raised around its whole statement loop — every
+execution through that engine is a replay, since the writer's own session records its statements
+rather than running them there. `QuereusEngine.laneCeiling` needs no guard: it prepares without
+executing, so no `update()` runs.
+
+A savepoint rolls the ledger back only in LEGACY mode, where the bridge restores the trees itself.
+In session mode a statement-level savepoint rollback does not reach the coordinator's staged
+transforms (the gap `TransactionBridge.savepoints` documents at its declaration, tracked by backlog
+`debt-optimystic-session-mode-statement-savepoint-gap`), so truncating the ledger there would leave
+a reference that WILL commit unpinned and unannounced. What is recorded follows what
+will commit. Puts are never truncated: a savepoint does not undo a put.
+
+The commit settles the pins through one private method, `TransactionBridge.settleBlobPins`, guarded
+to run once per transaction — which is what makes the two overlapping exits safe, since a failed
+commit's ordinary arm reaches `rollbackTransaction`, which settles in its `finally`. Where each
+route settles:
+
+| Exit | Settlement |
+|---|---|
+| session or legacy route returned | committed, every scope |
+| `local` offline route, entry queued | queued |
+| `behind-queue` offline route, entry queued | queued (before the wait, since the entry is the queue's now) |
+| a queue route that queued nothing | abandoned |
+| `PartialCommitError` (the legacy per-tree sweep split) | committed, the scopes in `persisted` |
+| `CoordinatorPartialCommitError` | committed, the scopes in `committedCollections` |
+| any other commit failure | nothing here: its `rollbackTransaction` settles as abandoned |
+| `rollbackTransaction` | abandoned |
+
+A partial commit's labels ARE collection ids: the sweep labels a tree by `Tree.describe()`, which
+renders its collection id, and a reference tree's scope IS that id. A reference whose scope did not
+commit keeps its pin for the reconciliation to retry, as does one whose announcement failed.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

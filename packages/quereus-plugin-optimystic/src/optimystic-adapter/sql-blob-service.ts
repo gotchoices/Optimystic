@@ -65,17 +65,39 @@ export class SqlBlobService implements SqlBlobBackendService {
 	 * The pin's owner label is the caller's `owner` when it gave one. Otherwise it names the
 	 * transaction open when the put STARTS — `sql/<stampId>/put` — and `sql-unstaged/<ms>` when none
 	 * is. Decided at the start, not when the put resolves: a put that outlives its transaction keeps
-	 * the label it began under, and reconciling such a stray pin is
-	 * `feat-sql-columns-hold-blob-references`' work.
+	 * the label it began under.
 	 *
-	 * Nothing in this release releases a pin, so a blob put here is held until something unpins it:
-	 * a rollback of the transaction the put was made in does NOT release it, and neither does a
-	 * commit. `feat-blob-pins-follow-sql-commits` closes that.
+	 * Who then releases the pin:
+	 *
+	 *  - A put labelled for a transaction that is STILL the open one when the put resolves is
+	 *    recorded on that transaction, and its pin is released when the transaction settles —
+	 *    committed, queued or rolled back alike (`SqlBlobPins`).
+	 *  - A put that OUTLIVES its transaction records nothing, and so leaves a stray
+	 *    `sql/<stampId>/put` pin that `feat-sql-columns-hold-blob-references`' reconciliation
+	 *    removes.
+	 *  - A put the caller gave an explicit `owner` for records nothing either: that pin is the host's
+	 *    own to release, through {@link unpin}.
+	 *  - A put made outside any transaction keeps its `sql-unstaged/<ms>` pin until a transaction
+	 *    that references the blob commits, or the holding period expires.
+	 *
+	 * **A blob put inside a transaction that the transaction never references loses its bytes when
+	 * the transaction ends.** `begin; put(a); put(b); insert … values (a); commit` releases `b`'s pin
+	 * and the sweep takes its pieces. That is the design — a put inside a transaction is pinned under
+	 * that transaction's identity (docs/blobs.md §SQL) — so to keep a blob no row references, put it
+	 * outside any transaction or pass an explicit `owner`.
 	 */
 	async put(source: AsyncIterable<Uint8Array>, options?: BlobPutOptions): Promise<BlobPutResult> {
-		const owner = options?.owner ?? this.defaultPinOwner();
-		const { service } = await this.backendNow();
-		return await service.put(source, { ...options, owner });
+		// Only a put whose label THIS defaulted to a transaction is that transaction's to release.
+		const defaulted = options?.owner === undefined ? this.defaultPinOwner() : undefined;
+		const owner = options?.owner ?? defaulted!.label;
+		const backend = await this.backendNow();
+		const result = await backend.service.put(source, { ...options, owner });
+		const open = this.bridge.getCurrentTransaction();
+		if (defaulted?.transactionId !== undefined
+			&& open?.isActive === true && open.stampId === defaulted.transactionId) {
+			this.bridge.noteBlobPut(backend.key, result.ref);
+		}
+		return result;
 	}
 
 	/** What THIS machine knows about a blob; `probe` asks the blob's cohort, on a network backend. */
@@ -159,12 +181,16 @@ export class SqlBlobService implements SqlBlobBackendService {
 		};
 	}
 
-	/** The transaction open NOW names the pin; see {@link put}. */
-	private defaultPinOwner(): string {
+	/**
+	 * The transaction open NOW names the pin; see {@link put}. Answers the `transactionId` beside the
+	 * label, because the put is that transaction's to release only while it is still the open one —
+	 * and only the label says nothing about which transaction it named.
+	 */
+	private defaultPinOwner(): { readonly label: string; readonly transactionId?: string } {
 		const current = this.bridge.getCurrentTransaction();
 		return current?.isActive === true
-			? transactionPutPinLabel(current.stampId)
-			: unstagedPinLabel(this.now());
+			? { label: transactionPutPinLabel(current.stampId), transactionId: current.stampId }
+			: { label: unstagedPinLabel(this.now()) };
 	}
 
 	/**

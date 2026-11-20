@@ -20,6 +20,7 @@ import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createBlobLocalityFunction, createBlobSizeFunction } from './functions/blob-functions.js';
 import { SqlBlobService } from './optimystic-adapter/sql-blob-service.js';
+import { SqlBlobPins } from './optimystic-adapter/blob-pins.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
@@ -84,6 +85,13 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	const offline = new OfflineMode(txnBridge, db, parseOfflineConfig(config.offline));
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
+	// The pins a committing transaction's blob references are held under, and their release once it
+	// lands (README § Large values; docs/blobs.md §Committing a reference). Attached before any table
+	// opens, as the offline queue is: a commit asks the bridge for them.
+	txnBridge.attachBlobPins(new SqlBlobPins({
+		backendByKey: key => collectionFactory.blobBackendForKey(key),
+		registration: collectionFactory.blobScopes,
+	}));
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge, costProfile);
 	// The restore after a restart initializes each journaled transaction's tables through the module.
 	offline.attachTableResolver(optimysticModule);
@@ -200,9 +208,13 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * get a reference a `blobref` column can hold, `read` it back, `stat` it. The network is
 		 * resolved on first use, so a host may still set the session's `default_vtab_args`.
 		 *
-		 * A blob put through this is PINNED and stays pinned: this release releases nothing, not on
-		 * rollback and not on commit (`feat-blob-pins-follow-sql-commits` closes that), so an
-		 * application that puts blobs here holds every one of them.
+		 * A blob put through this is PINNED, and the pin follows the transaction open when the put
+		 * started: it is released when that transaction commits (after the blob has been announced to
+		 * its cohort), rolls back, or is queued. A put made outside any transaction keeps an
+		 * `unstaged` pin until a transaction that references the blob commits. So a blob a committed
+		 * row references is kept, and a blob put inside a transaction that never referenced it is
+		 * NOT — put it outside any transaction, or pass an explicit `owner`, to keep one no row
+		 * references.
 		 */
 		blobs,
 		/**
