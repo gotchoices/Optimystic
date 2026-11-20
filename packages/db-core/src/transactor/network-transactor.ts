@@ -1308,9 +1308,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * budget is kept and re-sent for this transactor's life ({@link owedCancels}), so only a writer that
 	 * exits first leaves the record standing. A record the node applied alone for a writer in its own
 	 * process is stamped with that node run (`MessageOptions.localWriter`) and the node's next run drops
-	 * it on the next write to the block; on a larger cohort, or for a remote writer, it stays wedged
-	 * until a node-side backstop sweep exists (backlog:
-	 * `debt-unpromotable-pending-records-need-a-sweep`); and this covers only the sweep's abandonment
+	 * it on the next write to the block; on a larger cohort, or for a remote writer, the record is not
+	 * removed at all, and the block it holds is freed only when the record stops reserving at the end
+	 * of the node's pend lease (`hasLapsed` in
+	 * `packages/db-p2p/src/storage/pending-claim.ts`); and this covers only the abandonment judgement
 	 * — `StorageRepo.commit`'s genuine-fault arm deliberately KEEPS a failed batch's pendings for a
 	 * retry, so it is a second producer of the same durable state whenever that retry never comes.
 	 *
@@ -1578,8 +1579,10 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 	 * strands the record. The node reclaims it in one shape only: a record it applied alone, for a
 	 * writer in its own process (`MessageOptions.localWriter`), is stamped with the node run that
 	 * saved it, and the node's next run drops it on the next write to the block. A record on a larger
-	 * cohort, or a remote writer's, is reclaimed by nothing node-side; that residual is the backstop
-	 * tracked in backlog `debt-unpromotable-pending-records-need-a-sweep`.
+	 * cohort, or a remote writer's, is removed by nothing node-side; what is bounded is the RESERVATION
+	 * it makes, which ends one pend lease after the member stored it (`hasLapsed` in
+	 * `packages/db-p2p/src/storage/pending-claim.ts`), so the block takes writes again while the
+	 * record itself stays on file.
 	 *
 	 * @param seedBatches Batches to use for round 0 only (see {@link cancelBatch}). Omitted → round
 	 * 0 resolves coordinators live like every later round.

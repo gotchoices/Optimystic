@@ -128,12 +128,10 @@ export interface ReservationLease {
  *    claims reader with no `currentRun` judges nothing abandoned.
  *  - `claim.pendingSince` present → lapsed once more than `leaseMs` has passed since it. Strictly
  *    greater, so a record stored exactly `leaseMs` ago still reserves.
- *  - `claim.pendingSince` absent → judged from `lease.runStartedAt` on the same terms. A record
+ *  - `claim.pendingSince` absent → judged from `lease.runStartedAt` on the same terms
+ *    ({@link claimAgeMs}, where that fallback's deliberately lapsing direction is argued). A record
  *    written before the field existed gets exactly one lease of grace from the earliest moment this
- *    run could have known of it. This is the one case where the fallback is in the lapsing direction
- *    on purpose: such a record usually carries no `rev` either, which both the other rules treat as
- *    the strongest possible claim and neither can ever retire, so the alternative is the permanent
- *    wedge this rule exists to remove.
+ *    run could have known of it.
  *
  * Separate from {@link isAbandonedClaim} and {@link isReservationAgainst} on purpose, and asked in
  * that order at both rival scans (`StorageRepo.pendUnderLatches` at apply,
@@ -173,7 +171,17 @@ export function hasLapsed(claim: PendingClaim, lease: ReservationLease | undefin
 	// sweep). The accepted cost of never destroying state on a presumption; if leaked pending records
 	// ever show up as a storage cost, the cure is a sweep that can enumerate the blocks holding them,
 	// which raw storage cannot do today.
-	// NOTE: the fallback below lapses an unstamped record, which is the OPPOSITE direction from how
+	return claimAgeMs(claim, lease) > lease.leaseMs;
+}
+
+/**
+ * How long `claim` has stood on this node, by the lease's own clock: the age {@link hasLapsed}
+ * judges, and the one both rival scans report (`pend:lapsed-claim`,
+ * `cluster-member:validation-pending-lapsed`). One function so the verdict and the number logged
+ * beside it can never be measured from different anchors.
+ */
+export function claimAgeMs(claim: PendingClaim, lease: ReservationLease): number {
+	// NOTE: the fallback here lapses an unstamped record, which is the OPPOSITE direction from how
 	// `localRun`'s positive mark is read — deliberately. Such a record was written before the field
 	// existed and usually carries no `rev` either, which the other two rules treat as the strongest
 	// possible claim and neither can retire, so reading "no stamp" as "never lapses" would keep
@@ -181,8 +189,7 @@ export function hasLapsed(claim: PendingClaim, lease: ReservationLease | undefin
 	// NOTE: a node that restarts more often than its lease re-anchors that grace on every run, so an
 	// unstamped record never lapses there. Same one-time population, on a node that never stays up for
 	// one lease; no mechanism.
-	const since = claim.pendingSince ?? lease.runStartedAt;
-	return lease.now() - since > lease.leaseMs;
+	return lease.now() - (claim.pendingSince ?? lease.runStartedAt);
 }
 
 /**

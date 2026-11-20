@@ -169,8 +169,8 @@ export class TransactorSource<TBlock extends IBlock> implements BlockSource<TBlo
 			}
 			// NOTE: rival pendings in `state.pendings` are deliberately not remembered for a refresh
 			// before the next pend. It would save one doomed pend round only when the rival commits in
-			// between; the hint goes stale on a cache hit (which never re-reads), stuck records would
-			// trigger refreshes for nothing (backlog `debt-unpromotable-pending-records-need-a-sweep`),
+			// between; the hint goes stale on a cache hit (which never re-reads), a stranded record
+			// would trigger refreshes for nothing until its reservation lapses node-side,
 			// and while the rival is still pending a refresh changes nothing and the pend is refused
 			// `held` anyway. Revisit if lost pend rounds after a rival commit show up in measurements.
 			return block as TBlock;

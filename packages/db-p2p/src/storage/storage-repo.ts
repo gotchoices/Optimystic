@@ -19,7 +19,7 @@ import type { FlushOptions } from "./store-durability.js";
 import { BlockStorage } from "./block-storage.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 import { toString as uint8ArrayToString } from "uint8arrays";
-import { isReservationAgainst, isAbandonedClaim, hasLapsed, isBaseIndependent, declaredBaseFor, type PendingClaim, type ReservationLease } from "./pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, hasLapsed, claimAgeMs, isBaseIndependent, declaredBaseFor, type PendingClaim, type ReservationLease } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -54,10 +54,11 @@ export const PROCESS_RUN_ID = mintRunId();
  * member. MEASURED: `packages/db-p2p/test/a-lapsed-pend-stops-reserving-its-block.spec.ts` logs the
  * writer-side span of one healthy three-member coordinated write (the line `healthy pend-to-commit
  * span`), which is an upper bound on how long any one member holds that write's record. On the
- * in-process mesh, with no network between the machines, it is **41 ms** — so this default is about
- * **7300x** the measured span. That multiple is not the margin a deployment actually gets: the
- * figure a real link pays is set by the budgets the writer puts on each phase, which is what
- * {@link PEND_LEASE_BUDGETS} counts. The pend and the commit each carry one `transactionTimeoutMs`
+ * in-process mesh, with no network between the machines, it is **tens of milliseconds** (30-41 ms
+ * across runs), four orders of magnitude under this default. That margin is not the one a deployment
+ * actually gets, and the figure is not what sizes the default: a real link pays what the writer's own
+ * per-phase budgets allow, which is what {@link PEND_LEASE_BUDGETS} counts. The measurement is here
+ * to establish the magnitude of a healthy span, not to be divided into the lease. The pend and the commit each carry one `transactionTimeoutMs`
  * (`NetworkTransactor` stamps `expiration = Date.now() + this.timeoutMs` separately for each), 30 s
  * by default, and a sync cycle that exhausts its ten attempts of backoff takes roughly 21 s in total
  * (`Collection.syncAttempts`) while discharging its pend on every failed attempt. Nothing in the
@@ -70,10 +71,10 @@ export const PROCESS_RUN_ID = mintRunId();
  * its own pend, so a retrying sync does not accumulate — which puts the default at five times that
  * worst case and about an order of magnitude over a whole exhausted sync cycle's 21 s. It is 300_000
  * rather than some other round number because at the default `transactionTimeoutMs` (30 s) the floor
- * and the derived value agree exactly. RAISING it lengthens
- * how long a genuinely stranded record wedges a block, which is the harm this bound exists to cap;
- * LOWERING it toward one honest span risks lapsing a live record, which costs a lost race and a
- * retry — never a lost change, see `hasLapsed` for that argument.
+ * and the derived value agree exactly. RAISING it lengthens how long a genuinely stranded record
+ * wedges a block, which is the harm this bound exists to cap; LOWERING it toward one honest span
+ * risks lapsing a live record, which costs a lost race and a retry — never a lost change, see
+ * `hasLapsed` for that argument.
  */
 export const DEFAULT_PEND_LEASE_MS = 300_000;
 
@@ -1374,7 +1375,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 						// stops RESERVING and nothing else (`hasLapsed`). Its own commit still promotes it.
 						log('pend:lapsed-claim actionId=%s blockId=%s rival=%s claimedRev=%s ageMs=%d leaseMs=%d',
 							request.actionId, blockId, claim.actionId, claim.rev,
-							pendLease.now() - (claim.pendingSince ?? pendLease.runStartedAt), pendLease.leaseMs);
+							claimAgeMs(claim, pendLease), pendLease.leaseMs);
 					} else if (isReservationAgainst(claim, { rev: request.rev })) {
 						pendings.push({ blockId, actionId: claim.actionId });
 					} else {

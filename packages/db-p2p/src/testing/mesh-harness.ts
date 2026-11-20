@@ -164,7 +164,7 @@ export interface MeshOptions {
 	 * block on that node before it LAPSES and stops reserving (`hasLapsed` in
 	 * `../storage/pending-claim.ts`); `0` disables lapsing. Omitted → the production default
 	 * (`DEFAULT_PEND_LEASE_MS`, five minutes), so no spec that does not ask for a lease sees different
-	 * behaviour. A spec that wants to observe a lapse sets a short lease and drives {@link MeshConfig.now}
+	 * behaviour. A spec that wants to observe a lapse sets a short lease and drives {@link MeshOptions.now}
 	 * past it, rather than waiting on a real timer.
 	 */
 	pendLeaseMs?: number;

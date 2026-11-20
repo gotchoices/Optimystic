@@ -3845,6 +3845,25 @@ describe('StorageRepo.pend — a record that has stood past its lease stops rese
 		expect((await repo.pendingClaimOf(B, 'a-stranded' as ActionId))?.rev,
 			'nor is its claim dropped, so its own commit can still promote it').to.equal(2);
 	});
+
+	// The branch ORDER, which is the one thing the two cases above cannot see: a record that is both
+	// abandoned and lapsed must take the ABANDONED arm and be deleted, not the lapsed arm and be kept.
+	// Read the other way round, a provably-dead writer's record would never be reclaimed by anything —
+	// it would be set aside on age for as long as the block exists, which is the leak the run stamp was
+	// added to close.
+	it('a record that is BOTH abandoned and lapsed is deleted, not merely set aside', async () => {
+		// Past the lease first, so the setup's own stranded record is not the one refusing here.
+		now += LEASE_MS + 1;
+		const earlierRun = new StorageRepo(raw, { runId: 'run-1', pendLeaseMs: LEASE_MS, now: () => now });
+		expect((await earlierRun.pend(writeOf('a-dead'), { localWriter: true })).success).to.equal(true);
+		expect(await earlierRun.pendingClaimOf(B, 'a-dead' as ActionId), 'stamped with the run that saved it')
+			.to.include({ actionId: 'a-dead', localRun: 'run-1' });
+
+		now += LEASE_MS + 1;
+		const laterRun = new StorageRepo(raw, { runId: 'run-2', pendLeaseMs: LEASE_MS, now: () => now });
+		expect((await laterRun.pend(writeOf('a-newcomer'))).success, 'neither arm refuses the newcomer').to.equal(true);
+		expect(await raw.getPendingTransaction(B, 'a-dead' as ActionId), 'the abandoned arm ran: the record is gone').to.equal(undefined);
+	});
 });
 
 /**

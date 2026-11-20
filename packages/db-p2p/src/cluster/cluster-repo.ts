@@ -20,7 +20,7 @@ import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import type { BlockArchive } from "../storage/struct.js";
-import { isReservationAgainst, isAbandonedClaim, hasLapsed, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, hasLapsed, claimAgeMs, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
 import { batchShapeFault, getAffectedBlockIds } from "./record-operations.js";
@@ -2211,7 +2211,7 @@ export class ClusterMember implements ICluster {
 					requestedRev: pendRequest.rev,
 					rival: claim.actionId,
 					claimedRev: claim.rev,
-					ageMs: pendLease.now() - (claim.pendingSince ?? pendLease.runStartedAt),
+					ageMs: claimAgeMs(claim, pendLease),
 					leaseMs: pendLease.leaseMs
 				});
 			} else if (isReservationAgainst(claim, reservation)) {

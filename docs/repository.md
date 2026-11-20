@@ -279,7 +279,7 @@ and today its retries do not re-read the block, so it then re-pends on the stale
 is refused (backlog `bug-a-writer-held-by-a-change-it-never-saw-retries-on-its-stale-copy`); and a
 record whose change no member will ever take — an abandoned action's, on a block no later write
 touched — is no longer superseded by the collection moving on where it stands on enough members to
-deny a super-majority (backlog `debt-unpromotable-pending-records-need-a-sweep`). A copy on one
+deny a super-majority, and holds the block until its lease runs out (the next section). A copy on one
 member alone is outvoted, and because the apply-time scan keeps the revision rule, that member still
 stores the admitted pend, whose commit sweeps the record. A record with no stored base — the release
 wrote slots without bases — keeps the revision rule, so a node upgraded over its own leftovers does

@@ -291,10 +291,11 @@ export class BlockStorage implements IBlockStorage {
 	 * with no claim on file is left alone (its slot is unknown, so its death is unprovable here).
 	 *
 	 * Runs under the block's write latch on every path that advances `latest`, which is the one moment
-	 * a record's death becomes provable. This is the locally decidable half of what backlog
-	 * `debt-unpromotable-pending-records-need-a-sweep` asks for; the other half — a record whose slot
-	 * the block has NOT reached, whose writer simply never came back — is not decidable from local
-	 * state and is not touched here.
+	 * a record's death becomes provable. That is the locally decidable half of reclaiming pending
+	 * state; the other half — a record whose slot the block has NOT reached, whose writer simply never
+	 * came back — is not decidable from local state and is not touched here. Nothing removes such a
+	 * record, but it stops RESERVING its block once it has stood past the node's pend lease
+	 * (`hasLapsed` in `pending-claim.ts`), so it no longer refuses later writers for good.
 	 */
 	private async sweepDeadClaims(meta: BlockMetadata, latestRev: number): Promise<void> {
 		for (const [actionId, rev] of Object.entries(meta.pendingRevs ?? {}) as [ActionId, number][]) {

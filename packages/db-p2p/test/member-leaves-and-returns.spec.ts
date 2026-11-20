@@ -25,8 +25,8 @@
  * step. Were the write split into a tail round and a sweep of the rest, C lost during the tail round would miss
  * the sweep's own promise round, leaving the sweep short of its all-three bar: the write would be acknowledged
  * torn and the pending record it abandons could not be cancelled (a cancel needs the same all-three bar) until
- * the member returns. That residual is owned by backlog `debt-unpromotable-pending-records-need-a-sweep`; it is
- * not the healing this spec is about.
+ * the member returns — the record standing meanwhile, though it stops reserving its block one pend lease later
+ * (`hasLapsed`). That residual is not the healing this spec is about.
  *
  * ## Two arms: how long C was away
  *
@@ -268,8 +268,8 @@ describe('A member that leaves mid-session and returns (three machines)', functi
 					attempts.push(...phaseAttempts);
 				}
 				// NOTE: almost all of this latency is the transactor's cancel loop — a cancel needs the same
-				// all-three bar the write missed (arm of backlog `debt-unpromotable-pending-records-need-a-sweep`).
-				// Reported, not asserted.
+				// all-three bar the write missed, so it spends every round and the record stands until the
+				// member returns or its pend lease runs out. Reported, not asserted.
 				const refusalMs = Date.now() - startedWrite;
 
 				expect(refusal, `with C away B's write must be refused (it returned ${JSON.stringify(durability)})`).to.not.equal(undefined);

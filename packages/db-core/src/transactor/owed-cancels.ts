@@ -37,8 +37,9 @@ export interface OwedCancelsInit {
 /**
  * Bounds the memory a writer spends on cancels it cannot land. Evicting an entry re-opens the wedge
  * that entry was kept to close, so it is logged; a writer that owes this many is cut off from its
- * cohorts, and its records are the node-side backstop's (backlog
- * `debt-unpromotable-pending-records-need-a-sweep`).
+ * cohorts, and the records it leaves standing are freed only by the node-side pend lease, which ends
+ * their reservation without removing them (`hasLapsed` in
+ * `packages/db-p2p/src/storage/pending-claim.ts`).
  */
 const DEFAULT_MAX_OWED_ACTIONS = 256;
 

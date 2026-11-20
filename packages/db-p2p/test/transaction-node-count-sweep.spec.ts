@@ -354,8 +354,8 @@ describe('Transaction sweep across node counts (one scenario at 1–5 machines)'
 					// NOTE: a refusal's elapsed time here (~1 s at two and three machines, measured 2026-09-16) is almost
 					// all the transactor's cancel loop, not the refusal: a cancel is itself a cluster transaction, so with
 					// the same member away it misses its own super-majority and spends all six cancel rounds
-					// (`NetworkTransactor.MAX_CANCEL_ROUNDS`). Reported in the table, not asserted; tracked as an arm of
-					// backlog `debt-unpromotable-pending-records-need-a-sweep`.
+					// (`NetworkTransactor.MAX_CANCEL_ROUNDS`). Reported in the table, not asserted; the record the
+					// undischarged cancel leaves behind stops reserving its block one pend lease later.
 					const elapsedMs = Date.now() - startedWrite;
 					attempts.push(...oneAwayAttempts);
 
