@@ -36,7 +36,11 @@ export class IndexPredicate {
 	 * call, a subquery) or a column it cannot resolve.
 	 */
 	static compile(predicate: unknown, columns: readonly StoredColumnSchema[], tableName: string): IndexPredicate {
-		const compiled = compilePredicate(predicate as PredicateExpression, columns.map(storedToColumnSchema), tableName);
+		const compiled = compilePredicate(
+			predicate as PredicateExpression,
+			columns.map(col => storedToColumnSchema(col, tableName)),
+			tableName,
+		);
 		return new IndexPredicate(compiled, undefined);
 	}
 

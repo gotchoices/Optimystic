@@ -4,10 +4,10 @@
  *
  * `isBlobRef` in `packages/db-core/src/blob/blob-ref.ts` is the one rule for what is and is
  * not a reference, so the type adds no grammar of its own. It also holds the refusal that
- * keeps a table with such a column from opening in a process that has not registered the
- * type ({@link assertBlobRefTypeRegistered}) — the type's name contains "BLOB", so with
- * `pragma strict_type_names = false` Quereus's SQLite affinity rules would otherwise make
- * the column a BLOB column, whose row codec base64-DECODES every stored string.
+ * keeps such a column from being written to, or opened from, a catalog record in a process that
+ * has not registered the type ({@link assertBlobRefTypeRegistered}) — the type's name contains
+ * "BLOB", so with `pragma strict_type_names = false` Quereus's SQLite affinity rules would
+ * otherwise make the column a BLOB column, whose row codec base64-DECODES every stored string.
  */
 
 import { BINARY_COLLATION, PhysicalType, QuereusError, StatusCode } from '@quereus/quereus';
@@ -18,13 +18,17 @@ import { isBlobRef } from '@optimystic/db-core';
 export const BLOBREF_TYPE_NAME = 'BLOBREF';
 
 /**
- * How a host makes the plugin's types reach this process — the remedy both refusals name:
- * {@link assertBlobRefTypeRegistered} here, and the hydrate guard in
- * `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`.
+ * How a missing logical type is made to reach this process — the remedy every refusal in this
+ * module and in `packages/quereus-plugin-optimystic/src/schema/schema-manager.ts` names.
+ *
+ * Type-neutral on purpose: the hydrate refusals it is quoted in fire for ANY type a record names
+ * and this process cannot resolve, the host's own custom types included, so it must not send a
+ * reader after the Optimystic plugin for a type the plugin never owned.
  */
 export const REGISTER_TYPES_REMEDY =
-	'load the plugin through registerPlugin, or register its `types` with db.registerType when '
-	+ 'registering its parts by hand, before opening the table';
+	'register the type with db.registerType before opening the table — the plugin\'s own types '
+	+ '(`blobref`) come with registerPlugin, or register `plugin.types` by hand when assembling '
+	+ 'its parts';
 
 /**
  * A reference has exactly ONE accepted spelling, so there is nothing for a `parse` to

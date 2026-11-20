@@ -1194,12 +1194,6 @@ export class OptimysticVirtualTable extends VirtualTable {
         // order misses once when its lists are out of that order: both the
         // candidate and the merge come out sorted, the persisted side does not.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
-        // Before the write below, not only at the settled-schema check further down: a
-        // declaration naming `blobref` in a process that has not registered the type was built
-        // as a BLOB column, and this arm would otherwise persist `affinity: 'BLOB'` OVER a
-        // record whose rows were written as BLOBREF — leaving the table unopenable even by a
-        // process that does have the type.
-        assertBlobRefTypeRegistered(candidateStored.columns, this.blobRefGuardSubject());
         let mergedCandidate: StoredTableSchema = persistedSchema
           ? this.schemaManager.mergeWithPersisted(candidateStored, persistedSchema)
           : candidateStored;
@@ -1259,7 +1253,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         }
       } else if (persistedSchema) {
         this.tableSchema.columns = persistedSchema.columns.map((col, index) => ({
-          ...storedToColumnSchema(col),
+          ...storedToColumnSchema(col, qualifiedTableName(this.qualifiedTable)),
           affinity: col.affinity as any,
           index,
         }));
@@ -1279,11 +1273,14 @@ export class OptimysticVirtualTable extends VirtualTable {
         throw new Error('Cannot create table without column definitions');
       }
 
-      // The table's shape is settled: refuse a `blobref` column this process cannot read as
-      // one before the row codec below is built over it. Covers the arms the declaration-time
-      // call above does not — a record written by a build that predates the type, loaded by one
-      // that has it, and the reverse.
-      assertBlobRefTypeRegistered(storedSchema.columns, this.blobRefGuardSubject());
+      // The table's shape is settled: refuse a `blobref` column this process cannot read as one
+      // before the row codec below is built over it. The write side of the same rule sits in
+      // `SchemaManager.storeStoredSchema`; this is the OPEN side, for a record already in storage
+      // that this process never writes — the shape a build predating the type left behind.
+      assertBlobRefTypeRegistered(
+        storedSchema.columns,
+        `table '${qualifiedTableName(this.qualifiedTable)}'`,
+      );
 
       // Fold persisted uniqueness metadata into this.tableSchema BEFORE the
       // enforcement indexes are synthesized below, so enforcement never depends
@@ -1368,11 +1365,6 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(wrapped.message);
       throw wrapped;
     }
-  }
-
-  /** What a refused `blobref` column belongs to, for {@link assertBlobRefTypeRegistered}'s message. */
-  private blobRefGuardSubject(): string {
-    return `table '${qualifiedTableName(this.qualifiedTable)}'`;
   }
 
   /**

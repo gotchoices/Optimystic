@@ -13,7 +13,7 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { QuereusError, StatusCode, buildColumnIndexMap, compilePredicate, getType, inferType } from '@quereus/quereus';
 import type { LogicalType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
-import { REGISTER_TYPES_REMEDY } from './blobref-type.js';
+import { REGISTER_TYPES_REMEDY, assertBlobRefTypeRegistered } from './blobref-type.js';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { PredicateExpression } from './index-predicate.js';
@@ -782,8 +782,16 @@ function registeredStoredType(name: string, subject: string): LogicalType {
  * A column declared WITHOUT a type has only the canonical name to go on, which
  * {@link registeredStoredType} resolves strictly.
  */
-function hydratedColumnType(col: StoredColumnSchema): LogicalType {
-	const subject = `column '${col.name}'`;
+/**
+ * `schema.table` for a catalog record — the name every refusal that names a record's table or one
+ * of its columns uses. A record spells its own name `name`, not `tableName`, hence the adapter.
+ */
+function recordTableName(record: { readonly schemaName: string; readonly name: string }): string {
+	return qualifiedTableName({ schemaName: record.schemaName, tableName: record.name });
+}
+
+function hydratedColumnType(col: StoredColumnSchema, table: string): LogicalType {
+	const subject = `column '${col.name}' of table '${table}'`;
 	if (col.declaredType === undefined) return registeredStoredType(col.affinity, subject);
 	const inferred = inferType(col.declaredType);
 	if (inferred.name === col.affinity) return inferred;
@@ -801,11 +809,15 @@ function hydratedColumnType(col: StoredColumnSchema): LogicalType {
  * comes from {@link hydratedColumnType}. Also used by the vtab's own load arm (a `connect` whose
  * caller supplied no columns) and by the index manager's partial-index predicates
  * (`IndexPredicate`), so none of them rebuilds a column differently.
+ *
+ * `table` is the qualified name a type refusal names alongside the column — required because
+ * hydrate walks a whole catalog, so without it the refusal says which column disagreed but not
+ * which of the tables being opened it belongs to, and every caller has the name to hand.
  */
-export function storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
+export function storedToColumnSchema(col: StoredColumnSchema, table: string): ColumnSchema {
 	return {
 		name: col.name,
-		logicalType: hydratedColumnType(col),
+		logicalType: hydratedColumnType(col, table),
 		declaredType: col.declaredType,
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,
@@ -899,7 +911,8 @@ function predicateColumnNames(predicate: unknown, record: StoredTableSchema): st
 	if (predicate === undefined) {
 		return [];
 	}
-	const { referencedColumns } = compilePredicate(predicate as PredicateExpression, record.columns.map(storedToColumnSchema), record.name);
+	const table = recordTableName(record);
+	const { referencedColumns } = compilePredicate(predicate as PredicateExpression, record.columns.map(col => storedToColumnSchema(col, table)), record.name);
 	return [...referencedColumns].map(position => record.columns[position]!.name);
 }
 
@@ -1098,6 +1111,14 @@ export class SchemaManager {
 	 * it was declared on, and one that drops an indexed column is refused here.
 	 */
 	async storeStoredSchema(stored: StoredTableSchema, transactor?: ITransactor): Promise<StoredTableSchema> {
+		// Every column a catalog record gains passes through here (CREATE TABLE's declaration arm,
+		// ALTER TABLE ADD COLUMN, and the record re-writes that re-persist a settled shape), and
+		// the three gravestone/subtract/tag writers below never add one. So this is the seam that
+		// holds the rule rather than each caller: nothing is ever persisted declaring `blobref`
+		// while its rows resolve to another type, which is what a process missing the type would
+		// otherwise write over a record whose rows were written AS blobref — leaving the table
+		// unopenable even by a process that does have the type.
+		assertBlobRefTypeRegistered(stored.columns, `table '${recordTableName(stored)}'`);
 		if (this.batch) {
 			return this.storeInBatch(this.batch, stored, transactor);
 		}
@@ -1804,7 +1825,10 @@ export class SchemaManager {
 	 * binding, and the session never decides a hydrated table's identity (its `encoding`).
 	 *
 	 * NOTE: this and the other record ↔ `TableSchema` conversions below (~300 lines) use no
-	 * manager state; this file is 1532 lines. If it grows again, move them to their own module.
+	 * manager state; this file is 2057 lines (`wc -l`), up from the 1532 at which this note first
+	 * said "if it grows again, move them to their own module". The condition has tripped — the
+	 * extraction is owed, and is a refactor of its own rather than a rider on the next change
+	 * here. Whoever takes it: the conversions are self-contained, so the move is mechanical.
 	 */
 	storedToTableSchema(
 		stored: StoredTableSchema,
@@ -1812,7 +1836,8 @@ export class SchemaManager {
 		vtabAuxData?: unknown,
 		sessionVtabArgs: Readonly<Record<string, SqlValue>> = {}
 	): TableSchema {
-		const columns = stored.columns.map(storedToColumnSchema);
+		const table = recordTableName(stored);
+		const columns = stored.columns.map(col => storedToColumnSchema(col, table));
 		const primaryKeyDefinition = stored.primaryKeyDefinition.map(pk => ({
 			index: pk.index,
 			desc: pk.desc,

@@ -2,10 +2,10 @@
  * The `blobref` column type (docs/blobs.md §SQL): text whose value must be a well-formed blob
  * reference — the short content identifier that names a large stored file.
  *
- * What is pinned here: which values such a column accepts and refuses, and the two refusals that
- * keep a table with such a column from being opened by a process that would read the column as
- * something else. Nothing here tests the registration wiring, the type's metadata flags, or that
- * an index on the column still walks — a type, the existing index-walk specs and `yarn check`
+ * What is pinned here: which values such a column accepts and refuses, and the refusals that keep
+ * a process which would read the column as something else from either writing a catalog record
+ * for it or opening one. Nothing here tests the registration wiring, the type's metadata flags, or
+ * that an index on the column still walks — a type, the existing index-walk specs and `yarn check`
  * cover those.
  *
  * The reference below is one of the fixed vectors in `packages/db-core/test/blob-builder.spec.ts`
@@ -100,15 +100,14 @@ describe('blobref column type', function () {
 		}
 	});
 
-	it('refuses every spelling that is not a canonical reference', async () => {
-		// A blob has exactly ONE accepted spelling, so each of these either names a different thing
-		// or names nothing: accepting any would let two rows naming the same bytes compare unequal.
+	it('refuses a value that is not a canonical reference', async () => {
+		// Which spellings are and are not references is `isBlobRef`'s rule, pinned over the whole
+		// vector set (upper case, CIDv0, other codecs, padding, whitespace, non-strings) by
+		// `packages/db-core/test/blob-ref.spec.ts`. What is pinned HERE is only that the column
+		// consults that rule at all, and what the engine reports when it says no: two values, one
+		// per arm of `validate` — a string the grammar refuses, and a value that is not a string.
 		const REFUSED: readonly { readonly what: string; readonly value: SqlValue }[] = [
-			{ what: 'upper-cased', value: REF.toUpperCase() },
-			{ what: 'a version-0 CID', value: 'QmTcHsGD2NnEbei2GLnpWibHQf7VFbCCh8BwwDsCbizyEc' },
-			{ what: 'a dag-cbor CID', value: 'bafyreicojquuwmy7piqjti3zx3buxh47ya64i2vumxmzr5gwqpnfgsd6nu' },
-			{ what: 'a leading space', value: ` ${REF}` },
-			{ what: 'base32 padding', value: `${REF}======` },
+			{ what: 'the upper-cased spelling of a real reference', value: REF.toUpperCase() },
 			{ what: 'an integer', value: 42 },
 		];
 
@@ -135,12 +134,13 @@ describe('blobref column type', function () {
 		// Guard 1 (`hydratedColumnType` in src/schema/schema-manager.ts): a record saying "these rows
 		// were written as X, declared x" where `x` no longer resolves to X in this process.
 		//
-		// Tampered from the direction a build that PREDATES the type produces — `affinity: 'BLOB'`,
-		// which is what Quereus's SQLite affinity rules make of the name `blobref` — rather than by
-		// un-registering the type here: Quereus's type registry is process-wide with no
-		// un-register (`TypeRegistry` in `@quereus/quereus/src/types/registry.ts`), so a test that
-		// needed BLOBREF absent could not be made to hold in a shared mocha process. Both
-		// directions are the same disagreement, caught at the same place, with the same throw.
+		// The type cannot be un-registered to produce the disagreement honestly: Quereus's type
+		// registry is process-wide with no un-register (`TypeRegistry` in
+		// `@quereus/quereus/src/types/registry.ts`), so a test needing BLOBREF absent would pass
+		// or fail on file ordering in a shared mocha process. So the record is tampered instead —
+		// on its DECLARED side (`declaredType: 'blob'` over rows written as BLOBREF) rather than
+		// its affinity side, because the affinity-side tamper is itself what the write guard below
+		// refuses. Same disagreement, same place, same throw, both ways round.
 		const shared = buildSharedLocalTransactor(new MemoryRawStorage());
 
 		const first = openSession(shared);
@@ -153,7 +153,7 @@ describe('blobref column type', function () {
 			expect(stored!.columns.map(col => col.affinity)).to.deep.equal(['TEXT', BLOBREF_TYPE_NAME]);
 			await manager.storeStoredSchema({
 				...stored!,
-				columns: stored!.columns.map(col => (isBlobRefColumn(col) ? { ...col, affinity: 'BLOB' } : col)),
+				columns: stored!.columns.map(col => (isBlobRefColumn(col) ? { ...col, declaredType: 'blob' } : col)),
 			});
 		} finally {
 			first.db.close();
@@ -162,7 +162,7 @@ describe('blobref column type', function () {
 		const second = openSession(shared);
 		try {
 			const error = await captureThrown(() => second.plugin.hydrate(second.db));
-			expect(error.message).to.include(`column 'Content'`);
+			expect(error.message).to.include(`column 'Content' of table 'main.Attachment'`);
 			expect(error.message).to.include(BLOBREF_TYPE_NAME);
 			expect(error.message).to.include(`'BLOB'`);
 			expect(second.db.schemaManager.findTable('Attachment', 'main'), 'nothing enters the catalog')
@@ -172,13 +172,35 @@ describe('blobref column type', function () {
 		}
 	});
 
+	it('refuses to write a catalog record declaring blobref whose rows resolve to another type', async () => {
+		// Guard 2 at the seam it is held on: `SchemaManager.storeStoredSchema`, which every column a
+		// record gains passes through (CREATE TABLE's declaration arm, ALTER TABLE ADD COLUMN, and
+		// the record re-writes). A process missing the type would otherwise persist such a column
+		// over a record whose rows were written AS blobref, and the table would then open for
+		// nobody. Reached by handing the manager the record such a process builds, since in a
+		// process that HAS the type no SQL produces one.
+		const { db, plugin } = openSession(buildSharedLocalTransactor(new MemoryRawStorage()));
+		try {
+			await db.exec(TABLE_DDL);
+			const manager = sharedSchemaManager(plugin);
+			const stored = (await manager.getSchema('main', 'Attachment'))!;
+			const error = await captureThrown(() => manager.storeStoredSchema({
+				...stored,
+				columns: stored.columns.map(col => (isBlobRefColumn(col) ? { ...col, affinity: 'BLOB' } : col)),
+			}));
+			expect(error).to.be.instanceOf(QuereusError);
+			expect(error.message).to.include(`Column 'Content' of table 'main.Attachment'`);
+		} finally {
+			db.close();
+		}
+	});
+
 	it('refuses a column declared blobref whose rows resolved to another type', () => {
-		// Guard 2 (`assertBlobRefTypeRegistered`, called twice from
-		// `OptimysticVirtualTable.doInitialize`): the shape `create table … (Content blobref)`
-		// produces in a process that never registered the type, under `pragma strict_type_names =
-		// false`. Called directly — in a process that HAS the type, no SQL reaches this rule (a
-		// declaration here resolves to BLOBREF, and a stored record that disagrees is refused by
-		// guard 1 first), and the registry is process-wide, as the test above explains.
+		// Guard 2's rule itself: the shape `create table … (Content blobref)` produces in a process
+		// that never registered the type, under `pragma strict_type_names = false`. Called directly
+		// — in a process that HAS the type, no declaration reaches it (a declaration here resolves
+		// to BLOBREF, and a stored record that disagrees is refused by guard 1 first), and the
+		// registry is process-wide, as the test above explains.
 		const error = assertionOver([
 			{ name: 'Id', affinity: 'TEXT', declaredType: 'text' },
 			{ name: 'Content', affinity: 'BLOB', declaredType: 'blobref' },
