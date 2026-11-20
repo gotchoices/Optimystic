@@ -1,6 +1,9 @@
-import { openDB, type DBSchema, type IDBPDatabase } from 'idb';
+import { openDB, type DBSchema, type IDBPDatabase, type StoreNames } from 'idb';
 import type { ActionId, BlockId, PieceId } from '@optimystic/db-core';
 import type { JournalRecord } from '@optimystic/db-p2p';
+import { createLogger } from './logger.js';
+
+const log = createLogger('db');
 
 /**
  * The key of the applied-through mark in the `journal` store. A string, where every record's key
@@ -88,14 +91,72 @@ export interface OptimysticWebDB extends DBSchema {
 
 export const DEFAULT_DB_NAME = 'optimystic';
 // Bumped to 2 when the `proofs` object store was added, to 3 for `journal`, to 4 for
-// `commitProofs`, and to 5 for `pieces`. The `upgrade` hook is guarded by
-// `objectStoreNames.contains`, so an existing database gains only the stores it lacks (ticket
-// `debt-indexeddb-version-upgrade-is-untested-and-unhandled` owns testing that, and the open that
-// another tab's older connection blocks). A database at this version cannot be opened by a build
-// asking for an older one: the browser refuses the open with a `VersionError`.
+// `commitProofs`, and to 5 for `pieces`. The `upgrade` hook creates only the stores an existing
+// database lacks, so a database any earlier version wrote gains the rest empty and keeps every
+// record (`test/db.spec.ts` opens a version 1 database and reopens it here). A database at this
+// version cannot be opened by a build asking for an older one: the browser refuses the open with a
+// `VersionError`.
 export const DEFAULT_DB_VERSION = 5;
 
+/**
+ * Every object store in the current schema, in the order the stores appear in
+ * {@link OptimysticWebDB}. A version bump appends to this and raises {@link DEFAULT_DB_VERSION}.
+ *
+ * The `satisfies` clause is what keeps the list and the schema interface from drifting: a name not
+ * in {@link OptimysticWebDB} is a type error. (`StoreNames` rather than `keyof`, which `DBSchema`'s
+ * index signature would widen to `string | number`.)
+ *
+ * NOTE: the upgrade loop only ever creates. A store dropped from the schema would linger in an
+ * existing database with its rows, since nothing deletes it; revisit if a store is ever dropped —
+ * the right handling depends on whether its data needs migrating first.
+ */
+export const OBJECT_STORES = [
+	'metadata', 'revisions', 'pending', 'transactions', 'proofs',
+	'commitProofs', 'materialized', 'journal', 'kv', 'pieces',
+] as const satisfies readonly StoreNames<OptimysticWebDB>[];
+
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
+
+/**
+ * Callbacks for the connection-lifecycle events IndexedDB raises outside a normal open. Each is
+ * also logged whether or not it is supplied; supplying one is how a host takes action.
+ *
+ * None of these closes the handle. The handle's stores (`IndexedDBRawStorage`, `IndexedDBKVStore`)
+ * buffer writes and hold armed timers, and this function does not own them — the host constructs
+ * them afterwards and owns the close order — so closing from here would lose writes the host could
+ * have flushed first. The recommended host handler is in the package README.
+ */
+export interface OptimysticWebDbLifecycle {
+	/**
+	 * An older connection on this origin is holding up this open, so it is waiting rather than
+	 * resolving. (`idb`'s `blocked`.) Diagnosis only: the other tab is the one that can yield.
+	 */
+	onUpgradeBlocked?(currentVersion: number, requestedVersion: number | null): void;
+	/**
+	 * This connection is what is holding up another tab's open at a newer version. (`idb`'s
+	 * `blocking`.) The recommended handler flushes and closes, then prompts a reload — see the
+	 * package README.
+	 */
+	onBlockingUpgrade?(currentVersion: number, requestedVersion: number | null): void;
+	/**
+	 * The browser closed this connection abnormally — eviction, or site data cleared. (`idb`'s
+	 * `terminated`; not called for `db.close()`.)
+	 */
+	onConnectionLost?(): void;
+}
+
+/**
+ * Hands one lifecycle event to the host. Host callbacks run as DOM event listeners, where a throw
+ * becomes an uncaught top-level error the open can never report, so the throw is logged against
+ * the event it came from instead of escaping unattributed.
+ */
+function notifyHost(event: string, call: () => void): void {
+	try {
+		call();
+	} catch (error) {
+		log('%s handler threw %o', event, error);
+	}
+}
 
 /**
  * Opens (and creates if necessary) the Optimystic IndexedDB database used by
@@ -103,42 +164,40 @@ export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
  *
  * The same handle can be safely shared across all four — IndexedDB connections
  * support concurrent transactions across disjoint object stores.
+ *
+ * With no `lifecycle` callbacks the behaviour is the browser's default: an open an older connection
+ * blocks waits for that connection to close, and the older connection keeps it. The events are
+ * logged either way.
  */
 export async function openOptimysticWebDb(
 	name: string = DEFAULT_DB_NAME,
 	version: number = DEFAULT_DB_VERSION,
+	lifecycle: OptimysticWebDbLifecycle = {},
 ): Promise<OptimysticWebDBHandle> {
 	return openDB<OptimysticWebDB>(name, version, {
 		upgrade(db) {
-			if (!db.objectStoreNames.contains('metadata')) {
-				db.createObjectStore('metadata');
+			for (const store of OBJECT_STORES) {
+				if (!db.objectStoreNames.contains(store)) {
+					db.createObjectStore(store);
+				}
 			}
-			if (!db.objectStoreNames.contains('revisions')) {
-				db.createObjectStore('revisions');
+		},
+		blocked(currentVersion, blockedVersion) {
+			log('upgrade-blocked db=%s current=%d requested=%o', name, currentVersion, blockedVersion);
+			if (lifecycle.onUpgradeBlocked) {
+				notifyHost('upgrade-blocked', () => lifecycle.onUpgradeBlocked!(currentVersion, blockedVersion));
 			}
-			if (!db.objectStoreNames.contains('pending')) {
-				db.createObjectStore('pending');
+		},
+		blocking(currentVersion, blockedVersion) {
+			log('blocking-upgrade db=%s current=%d requested=%o', name, currentVersion, blockedVersion);
+			if (lifecycle.onBlockingUpgrade) {
+				notifyHost('blocking-upgrade', () => lifecycle.onBlockingUpgrade!(currentVersion, blockedVersion));
 			}
-			if (!db.objectStoreNames.contains('transactions')) {
-				db.createObjectStore('transactions');
-			}
-			if (!db.objectStoreNames.contains('proofs')) {
-				db.createObjectStore('proofs');
-			}
-			if (!db.objectStoreNames.contains('commitProofs')) {
-				db.createObjectStore('commitProofs');
-			}
-			if (!db.objectStoreNames.contains('materialized')) {
-				db.createObjectStore('materialized');
-			}
-			if (!db.objectStoreNames.contains('journal')) {
-				db.createObjectStore('journal');
-			}
-			if (!db.objectStoreNames.contains('kv')) {
-				db.createObjectStore('kv');
-			}
-			if (!db.objectStoreNames.contains('pieces')) {
-				db.createObjectStore('pieces');
+		},
+		terminated() {
+			log('connection-lost db=%s', name);
+			if (lifecycle.onConnectionLost) {
+				notifyHost('connection-lost', () => lifecycle.onConnectionLost!());
 			}
 		},
 	});

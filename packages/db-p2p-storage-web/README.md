@@ -121,6 +121,35 @@ that asks for an older version cannot open a version 5 database: the browser
 refuses the open with a `VersionError`. That is a downgrade, outside the promise
 that data an earlier build wrote reads on a later one.
 
+When another tab already holds a connection at the older version, the browser
+will not run the upgrade until that connection closes, so the new tab's open
+simply waits. `openOptimysticWebDb` takes an optional third argument so both
+sides can say so and the host can resolve it — `onUpgradeBlocked` on the waiting
+open, `onBlockingUpgrade` on the connection in the way, and `onConnectionLost`
+when the browser closes a connection abnormally (eviction, or site data
+cleared). Each is logged whether or not it is supplied; supplying one is how a
+host takes action. The recommended `onBlockingUpgrade` handler is the shutdown
+sequence the host already owns, plus a reload prompt:
+
+```ts
+const db = await openOptimysticWebDb(DEFAULT_DB_NAME, DEFAULT_DB_VERSION, {
+  onBlockingUpgrade: async () => {
+    await rawStorage.close();   // applies what it still holds, disarms its timers
+    await kvStore.close();
+    db.close();                 // the other tab's upgrade can now proceed
+    showReloadPrompt();         // this tab's storage is gone until it reloads
+  },
+});
+```
+
+The package does not do this itself, because it does not own the stores on its
+handle: they are constructed afterwards by the host, which is also the owner of
+the close order above. A bare `db.close()` from inside `openOptimysticWebDb`
+would close the handle under stores still holding buffered writes and armed
+timers, discarding writes in this tab to unblock a different one. So the
+callbacks are what make the two-tabs violation below **visible**; they are not
+what fixes it.
+
 `getApproximateBytesUsed()` returns `(await navigator.storage.estimate()).usage`,
 which is **per-origin**, not per-database. That is adequate for `StorageMonitor`
 — which uses the figure as an advisory ring-selection input — but is not a
