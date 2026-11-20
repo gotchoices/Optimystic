@@ -95,7 +95,7 @@ export interface CachedBlob {
 	readonly ref: BlobRef;
 	/** The record's `size`; 0 when it has none yet. */
 	readonly bytes: number;
-	/** The record's `lastReadAt`; 0 when it has never been read here. */
+	/** When the blob was last read here: the record's `lastReadAt`, else its `cached` hold's `at` ({@link lastReadOf}). */
 	readonly lastReadAt: number;
 }
 
@@ -416,12 +416,12 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 	 * {@link BlobPinIndex.listPins}. A record that does not decode is logged (`record:unreadable`) and
 	 * skipped, as in `responsibleRefs`, so that blob's pins are invisible rather than fatal.
 	 *
-	 * NOTE: scans every blob record; if a machine ever holds enough blobs for a prefix query to show up,
-	 * index pins by owner prefix — the same tripwire `responsibleRefs` carries.
+	 * NOTE: scans every blob record ({@link readableRecords}); if a machine ever holds enough blobs for a
+	 * prefix query to show up, index pins by owner prefix.
 	 */
 	async *listPins(ownerPrefix: string): AsyncIterable<{ ref: BlobRef; owner: string }> {
-		for (const ref of await this.records.listRefs()) {
-			for (const owner of pinOwnersOf(await this.readableRecord(ref))) {
+		for await (const { ref, record } of this.readableRecords()) {
+			for (const owner of pinOwnersOf(record)) {
 				if (owner.startsWith(ownerPrefix)) {
 					yield { ref, owner };
 				}
@@ -456,13 +456,14 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 	 * Every ref whose record holds `responsible`. A record that fails to decode is logged
 	 * (`record:unreadable`) and skipped.
 	 *
-	 * NOTE: reads every record, which is acceptable for the start-up enumeration this serves. If the
-	 * record count ever makes start-up slow, keep an index of the hold kinds each record carries.
+	 * NOTE: reads every record ({@link readableRecords}), which is acceptable for the start-up
+	 * enumeration this serves. If the record count ever makes start-up slow, keep an index of the hold
+	 * kinds each record carries.
 	 */
 	async responsibleRefs(): Promise<BlobRef[]> {
 		const refs: BlobRef[] = [];
-		for (const ref of await this.records.listRefs()) {
-			if (responsibleHoldOf(await this.readableRecord(ref)) !== undefined) {
+		for await (const { ref, record } of this.readableRecords()) {
+			if (responsibleHoldOf(record) !== undefined) {
 				refs.push(ref);
 			}
 		}
@@ -498,13 +499,12 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		return (await this.readableRecord(ref))?.whole === true;
 	}
 
-	/** {@link BlobCacheRecords.cachedBlobs}. Reads every record, as `responsibleRefs` and `listPins` do; the `NOTE:` at `BlobCacheBudget.enforce` carries that cost's tripwire. */
+	/** {@link BlobCacheRecords.cachedBlobs}. Reads every record ({@link readableRecords}), as `responsibleRefs` and `listPins` do; the `NOTE:` at `BlobCacheBudget.runOnce` carries that cost's tripwire. */
 	async cachedBlobs(): Promise<CachedBlob[]> {
 		const blobs: CachedBlob[] = [];
-		for (const ref of await this.records.listRefs()) {
-			const record = await this.readableRecord(ref);
-			if (record !== undefined && cacheOnly(record)) {
-				blobs.push({ ref, bytes: record.size ?? 0, lastReadAt: record.lastReadAt ?? 0 });
+		for await (const { ref, record } of this.readableRecords()) {
+			if (cacheOnly(record)) {
+				blobs.push({ ref, bytes: record.size ?? 0, lastReadAt: lastReadOf(record) });
 			}
 		}
 		return blobs;
@@ -600,6 +600,24 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 			this.scheduleSweep();
 		}
 		return result;
+	}
+
+	/**
+	 * Every blob with a record this node can read, in `listRefs` order: the one pass behind `listPins`,
+	 * `responsibleRefs` and `cachedBlobs`, each of which filters it. A record that does not decode is
+	 * logged (`record:unreadable`) and left out, so one unreadable record cannot fail a caller's pass.
+	 *
+	 * NOTE: one `get` per record, and the three callers above each walk the lot. If a machine ever holds
+	 * enough blobs for these passes to show up in a profile, index the records by what each pass asks
+	 * about (hold kinds, pin owners) rather than widening this one.
+	 */
+	private async *readableRecords(): AsyncIterable<{ ref: BlobRef; record: BlobRecord }> {
+		for (const ref of await this.records.listRefs()) {
+			const record = await this.readableRecord(ref);
+			if (record !== undefined) {
+				yield { ref, record };
+			}
+		}
 	}
 
 	/** The record of `ref`, or undefined when there is none or it does not decode (logged). */
@@ -798,6 +816,22 @@ function recordAfterOwedRelease(current: BlobRecord | undefined): BlobRecord | u
 /** Held for reads and nothing else: the only blobs the cache budget counts and evicts (docs/blobs.md §Lifetime). */
 function cacheOnly(record: BlobRecord): boolean {
 	return record.holds.length > 0 && record.holds.every(hold => hold.kind === 'cached');
+}
+
+/**
+ * When the blob was last read here, for the cache budget's eviction order: the record's `lastReadAt`,
+ * else the `cached` hold's `at`.
+ *
+ * The fallback covers the ordinary case rather than an edge one. `touchLastRead` runs at the start of
+ * a read and never creates a record, so the read that fetches a blob for the first time finds no
+ * record to write `lastReadAt` to — the hold the fetch then takes carries the only time the record
+ * has. Reading the record's own `lastReadAt` alone would date every freshly fetched blob to the epoch
+ * and evict it ahead of blobs read long ago, which is the cache throwing away exactly what it just
+ * paid the network for.
+ */
+function lastReadOf(record: BlobRecord): number {
+	// `?? 0` for the type: every record this is asked about holds `cached` (`cacheOnly`).
+	return record.lastReadAt ?? record.holds.find(hold => hold.kind === 'cached')?.at ?? 0;
 }
 
 /** The current record unchanged unless `cached` is still its only hold, in which case dropping that hold leaves no holds and `BlobRecordStore.update` deletes it. */

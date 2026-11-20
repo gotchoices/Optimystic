@@ -81,24 +81,37 @@ async function pieceIdsOf(content: Uint8Array): Promise<PieceId[]> {
 }
 
 /**
- * Adds the `cached` hold a fetch for a read would take, with `lastReadAt` as if that read happened
- * then. Through a `BlobRecordStore` over the same key-value store, as `local-blob-service.spec.ts`
- * reads records back: the service takes this hold only from inside a fetch.
+ * Adds the `cached` hold a fetch takes at `at`, and `lastReadAt` when given. Through a
+ * `BlobRecordStore` over the same key-value store, as `local-blob-service.spec.ts` reads records
+ * back: the service takes this hold only from inside a fetch.
+ *
+ * `lastReadAt` left out is the record a first-ever fetch leaves: `touchLastRead` runs at the start of
+ * the read and finds no record to write to, so the hold's `at` is the only time the record carries.
  */
-async function holdCachedAt(kv: IKVStore, ref: BlobRef, lastReadAt: number): Promise<void> {
+async function holdCachedAt(kv: IKVStore, ref: BlobRef, at: number, lastReadAt?: number): Promise<void> {
 	await new BlobRecordStore(kv).update(ref, current => {
 		if (current === undefined) {
 			throw new Error(`no record for ${ref}`);
 		}
-		return { ...current, lastReadAt, holds: [...current.holds, { kind: 'cached', at: lastReadAt }] };
+		const held = { ...current, holds: [...current.holds, { kind: 'cached' as const, at }] };
+		return lastReadAt === undefined ? held : { ...held, lastReadAt };
 	});
 }
 
-/** A blob held by a `cached` hold alone, the way a read that had to fetch leaves one. */
+/** A blob held by a `cached` hold alone, read again at `lastReadAt` after the fetch that brought it. */
 async function cacheOnlyBlob(service: LocalBlobService, kv: IKVStore, seed: number, lastReadAt: number): Promise<{ ref: BlobRef; content: Uint8Array }> {
+	return heldForReadsAlone(service, kv, seed, lastReadAt, lastReadAt);
+}
+
+/** The same, with no `lastReadAt` at all: fetched at `at` and not read again since. */
+async function justFetchedBlob(service: LocalBlobService, kv: IKVStore, seed: number, at: number): Promise<{ ref: BlobRef; content: Uint8Array }> {
+	return heldForReadsAlone(service, kv, seed, at, undefined);
+}
+
+async function heldForReadsAlone(service: LocalBlobService, kv: IKVStore, seed: number, at: number, lastReadAt: number | undefined): Promise<{ ref: BlobRef; content: Uint8Array }> {
 	const content = bytesOf(BLOB_BYTES, seed);
 	const { ref } = await service.put(streamOf(content));
-	await holdCachedAt(kv, ref, lastReadAt);
+	await holdCachedAt(kv, ref, at, lastReadAt);
 	await service.unpin(ref, DEFAULT_BLOB_OWNER);
 	return { ref, content };
 }
@@ -139,6 +152,23 @@ describe('BlobCacheBudget', () => {
 		for (const kept of [...cacheOnly.slice(2), { ref: pinnedRef, content: pinnedContent }]) {
 			expect(await readAll(service.read(kept.ref, { from: 'here' })), `kept ${kept.ref}`).to.deep.equal(kept.content);
 		}
+	});
+
+	it('dates a blob whose only read is the fetch that brought it by its cached hold', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		// Read, and read again later, so its record carries a `lastReadAt` of 1.
+		const readTwice = await cacheOnlyBlob(service, kv, 1, 1);
+		// Fetched at 10 and never read since: a `cached` hold at 10 and no `lastReadAt` at all, which is
+		// what every first-ever fetch leaves behind.
+		const justFetched = await justFetchedBlob(service, kv, 2, 10);
+
+		// Room for one of the two 300 KiB blobs, so the one read longer ago goes.
+		const enforcement = await budgetOver(service, 400 * 1024).enforce();
+
+		expect(enforcement.evicted).to.deep.equal([readTwice.ref]);
+		expect(await recordOf(kv, justFetched.ref)).to.not.equal(undefined);
 	});
 
 	it('does not evict a blob being read, and evicts it once the read ends', async () => {

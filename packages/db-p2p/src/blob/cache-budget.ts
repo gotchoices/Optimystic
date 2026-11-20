@@ -70,6 +70,11 @@ export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: numbe
 	return { evict, cachedBytes, skippedInUse };
 }
 
+// NOTE: only a read or fetch that pulled something triggers an enforcement, so a blob that becomes
+// cache-only when some other hold is released — an `unpin`, and the `responsible` and `owed` releases
+// `feat-unreferenced-blobs-are-reclaimed` will add — can leave the cache over budget until the next
+// read that fetches or the next restart. If a node is ever seen sitting over budget with its reads
+// idle, call `request()` from those releases too.
 /**
  * Keeps the blobs held only for reads within a byte budget (docs/blobs.md §Lifetime). Enforced after
  * a read or fetch that pulled anything and once when the node has built its blob service — there is
