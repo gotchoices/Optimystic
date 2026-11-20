@@ -1714,15 +1714,21 @@ StorageRepo.get()                          # read-driven promotion (context prov
   once. Two residuals are accepted and recorded at their sites: a pend delivered to a member
   after another collection of the action already committed and emitted there holds nothing for
   that earlier event (`notePendGroup`), and a collection that lands after the timer released
-  fires only its own listeners (`armHoldTimer` — the tripwire is to have the vtab subscribe to its
-  index collections too if gaps beyond `changeHoldMs` are ever seen). Nothing is held for an
+  fires only its own listeners (`armHoldTimer`), which for a table tagged `optimystic.network_watch` is
+  now covered — the vtab holds a network watch per collection of the table, and the watch service wakes
+  a collection's watchers on its own landing in this node's storage, so the late index landing wakes the
+  table after all; an untagged table still has the gap, and the remedy there would be the same
+  per-collection subscription on the local feed rather than a longer hold. Nothing is held for an
   action with no pend group here — one pended before a restart, an `inv:` invalidation, a
   collection in this node's cohort whose sibling collection is not (larger groups; such a node
   behaves as before). The catch-all feed is never held: neither tail-rotation detection nor the
   owned-block feed wants a delay. (Cohort-topic origination, the feed's third consumer, resolves
   its commit certificate by the event's collection tail, so a held table event would still find
-  the table record's certificate; holding it for origination is backlog
-  `feat-a-network-watch-wake-sees-the-whole-commit`.) Pinned by the "a hold while another
+  the table record's certificate; holding it for origination was weighed and rejected — it would delay
+  every multi-collection announcement, and it helps only where the machine announcing the table also
+  stores that table's indexes, so it closes nothing when the table's tail group and the index's tail
+  group are disjoint. The vtab watching each of its collections covers that case too; see *Reactive
+  Watch Bridge* below.) Pinned by the "a hold while another
   collection of the action is still pending" cases in `packages/db-p2p/test/storage-repo.spec.ts` and end to end by
   `packages/quereus-plugin-optimystic/test/two-node-index-wake-consistency.spec.ts`.
 - Exposed on the node as `node.blockChangeNotifier` — one of the handles declared by
@@ -1753,29 +1759,61 @@ StorageRepo.commit → CollectionChangeEvent → transactor.onCollectionChange
   unwired (its `NetworkTransactor` gets no `localChangeNotifier`, so the
   subscription is an inert no-op). A transactor that can't observe local commits
   degrades gracefully — the consumer keeps fetching/polling.
-- **Subscription identity.** The vtab subscribes to exactly one collection id —
+- **Subscription identity.** The vtab's LOCAL subscription is on exactly one collection id —
   `CollectionFactory.getCollectionId(options)` = `parseCollectionId(collectionUri)`
   = the URI path (`tree://app/users` → `app/users`). This equals the
   `header.collectionId` stamped on every block (`TransactorSource.createBlockHeader`)
   and therefore the `CollectionChangeEvent.collectionId`. Index sub-collections
-  (`<uri>/index/<name>`) carry their own ids and are NOT separately watched —
-  whole-table invalidation re-queries them anyway. What makes that re-query see the
+  (`<uri>/index/<name>`) carry their own ids and are NOT separately subscribed to on this
+  feed — whole-table invalidation re-queries them anyway. What makes that re-query see the
   indexes is storage, not the subscription: a node holds the table's event until every
   other collection of the same action pending there has landed (see *A collection's wake
   waits for the action's other collections pending here* above), so the wake arrives when
   the table and its indexes agree, possibly later than the table's own commit applied.
   The schema tree (`tree://optimystic/schema`) is skipped (schema writes aren't
   data-watch events).
-- **The network watch has the same shape, and is not held.** Origination fires on the
-  root group member when the TABLE's commit applies there (`selfAppliedTail` over the
-  catch-all feed, which is never held), so a network notification can reach a subscriber
-  before the index's commit has applied anywhere, and the watch service's tick
-  (`ReactivityCollectionWatch` in `packages/db-p2p/src/reactivity/collection-watch.ts`)
-  compares only the table's tail revision, so it never wakes again for that commit. On a
-  subscriber that also stores the collections — every member of a group no larger than a
-  cohort, the two-member case — the network wake is an early over-wake and the held storage
-  wake that follows is consistent. A subscriber that stores nothing of the table still has
-  the gap; that is backlog `feat-a-network-watch-wake-sees-the-whole-commit`.
+- **The network watch covers the table's whole collection set, because it cannot be held.**
+  Origination fires on the root group member when a collection's commit applies there
+  (`selfAppliedTail` over the catch-all feed, which is never held — holding it would delay
+  tail-rotation detection too). A SQL transaction's table commit and its index commits are
+  separate storage commits, announced by their own tails' storage groups, so a notification for
+  the table can arrive before the index's commit has applied anywhere. The vtab therefore opens
+  one watch per collection of the table rather than one for the table: the id
+  `getCollectionId(options)` resolves, unioned with every collection this instance registered
+  with the transaction bridge under the table's name — the main tree, each declared index tree,
+  each synthesized unique-enforcement tree and the blob reference tree (`wantedNetworkWatches`
+  and `applyNetworkWatch` in
+  `packages/quereus-plugin-optimystic/src/optimystic-module.ts`, reconciled from the same
+  registration funnel every path already goes through, so the watched set cannot drift from the
+  collections the table maintains). Every watch calls the same listener, so a wake on any
+  collection is the same coarse whole-table invalidation the table's own wake is. That buys two
+  things:
+  - **Woken again once the commit can be read whole.** The index's own landing is announced by
+    its own tail's group, and the watcher holds a subscription for it, so a first wake whose
+    index read came back empty is followed by a second within the time the index's commit takes
+    — not within a tick.
+  - **A tick backstop that sees the index.** Each collection is a watched subscription in its own
+    right, so `ReactivityCollectionWatch`'s tick
+    (`packages/db-p2p/src/reactivity/collection-watch.ts`) reads and compares its tail: an
+    announcement that is lost, or never made (on a storage group of three or fewer only the
+    member that coordinated the commit holds a full certificate —
+    [reactivity.md §Origination point](reactivity.md#origination-point)), still wakes the watcher
+    within one tick interval (30 s Core, 20 s Edge).
+
+  Two consequences to know about. A wake can now arrive index-first, so a re-query can read an
+  index entry whose row is not visible yet; the index-driven scan already skips an entry whose row
+  is missing or no longer implies it (counted `rejected` on the `index:seek` trace), and the state
+  is reachable anyway, since a table and its indexes are read as independent collections with no
+  cross-collection snapshot. And each newly opened watch wakes its listeners once on its first
+  committed-tail read — the service's open-the-watch-then-read promise — so a tagged table with
+  three indexes fires four whole-table invalidations as it initializes rather than one; coarse
+  invalidation, so that costs re-queries. On a subscriber that also stores the collections — every
+  member of a group no larger than a cohort, the two-member case — these are early over-wakes and
+  the held storage wake that follows is consistent. The subscriber that needs them is one that
+  stores none of the table (a client node, `servesBlocks: false`), for which the network watches
+  are the only wake there is. What they cost is one cohort registration and one watched tail per
+  collection instead of per table ([reactivity.md §The node's watch
+  service](reactivity.md#the-nodes-watch-service), *What a tick costs*).
 - **Coarse invalidation.** `notifyExternalChange` fires every matching watcher as
   a global whole-table change: `full` watches fire with empty hits, `rows`/
   `rowsByGroup` watches surface their registered literals as possibly-changed.
@@ -2005,7 +2043,8 @@ StorageRepo.onAnyCollectionChange        # catch-all feed (every collection, not
     Quereus plugin does (`CollectionFactory`'s `tailReaders`). The cost and the recovery bound are in
     [reactivity.md § The node's watch service](reactivity.md#the-nodes-watch-service). The stop
     wrapper stops the service first, ahead of the rotation scheduler and the host. The Quereus plugin
-    uses it for tables tagged `optimystic.network_watch` (see *Reactive Watch Bridge* above).
+    uses it for tables tagged `optimystic.network_watch`, one watch per collection of such a table
+    (see *Reactive Watch Bridge* above).
   - **Tail rotation is now live** (`reactivity-rotation-host-wiring-e2e`). The bridge hands every commit
     event that names a tail — ahead of, and whatever becomes of, its tail-applied gate — to
     `ReactivityOriginationManager.observeTailCommit`, which remembers per collection the tail this node last

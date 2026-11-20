@@ -902,17 +902,20 @@ export class OptimysticVirtualTable extends VirtualTable {
   /** Whether the table is in the span it watches over: from full initialization until DROP TABLE. */
   private networkWatchArmed = false;
   /**
-   * Closes the open network watch; absent while none is open.
-   * NOTE: `CollectionFactory.dispose` closes the watch behind this field's back, so a tag flip on a
-   * table still live after `plugin.dispose()` finds it set and reopens nothing; dispose is end-of-life
-   * for the factory today — if it ever stops being, have dispose tell the tables.
+   * The open network watches, one per collection of this table ({@link wantedNetworkWatches}), each
+   * keyed by its collection id and holding its close; empty while none is open.
+   * NOTE: `CollectionFactory.dispose` closes these watches behind this field's back, so a tag flip on
+   * a table still live after `plugin.dispose()` finds the map populated and reopens nothing; dispose
+   * is end-of-life for the factory today — if it ever stops being, have dispose tell the tables.
    */
-  private closeNetworkWatch?: () => Promise<void>;
+  private readonly networkWatchCloses = new Map<CollectionId, () => Promise<void>>();
   /**
-   * Opening and closing the network watch, one step at a time, so a tag flipped (or the table
-   * dropped) while a step is in flight is applied after it rather than beside it.
+   * Opening and closing the network watches, one step at a time, so a tag flipped (or the table
+   * dropped, or an index created) while a step is in flight is applied after it rather than beside it.
    */
   private networkWatchSteps: Promise<void> = Promise.resolve();
+  /** A reconcile step is queued and has not started, so a further request needs no second step. */
+  private networkWatchStepQueued = false;
   /** The "tagged, but no watch service" warning was logged; it is logged once per table. */
   private networkWatchUnavailableLogged = false;
   /**
@@ -1569,7 +1572,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * blocks the table.
    *
    * Scope decisions:
-   *   - Only the MAIN-table collection is watched. Index sub-collections
+   *   - Only the MAIN-table collection is subscribed to LOCALLY. Index sub-collections
    *     (`<uri>/index/<name>`) mutate under the same actionId but carry their
    *     own collection id; whole-table invalidation re-queries them anyway. The
    *     re-query reads the indexes too, so the storage layer holds the table's
@@ -1580,26 +1583,33 @@ export class OptimysticVirtualTable extends VirtualTable {
    *   - The plugin-global schema tree (`tree://optimystic/schema`) is skipped —
    *     schema writes are not data-watch events.
    *
-   * A table tagged `"optimystic.network_watch" = true` also gets a network watch,
-   * which hears commits made on any machine rather than only those this node's
-   * storage applies. It is not awaited — the watch does its network work in the
-   * background — and a failure to open it is logged and leaves the local
-   * subscription working. Opening it here, before any statement reads the table,
-   * is what the watch service asks of its callers: a commit the first read missed
-   * still wakes the watchers.
+   * A table tagged `"optimystic.network_watch" = true` also gets network watches,
+   * which hear commits made on any machine rather than only those this node's
+   * storage applies — one per collection of the table ({@link wantedNetworkWatches}),
+   * since the network notification for the table's own commit is never held and so can
+   * arrive before an index's commit has applied anywhere. They are not awaited — a watch
+   * does its network work in the background — and a failure to open one is logged and
+   * leaves the local subscription working. Opening them here, before any statement reads
+   * the table, is what the watch service asks of its callers: a commit the first read
+   * missed still wakes the watchers.
    */
   private async ensureChangeSubscription(): Promise<void> {
-    if (this.changeSubscribed) {
+    if (this.options.collectionUri === 'tree://optimystic/schema') {
       return;
     }
-    if (this.options.collectionUri === 'tree://optimystic/schema') {
+    // Outside the subscribe-once guard below, because a SECOND doInitialize — the upgrade after a
+    // provisional pass, a retry after a failure, adoptCatalogEntry taking a description another
+    // machine changed — leaves the subscription alone but may have opened index trees this table
+    // is not yet watching. Runs after registerCollections and forgetUnmaintainedTrees have settled
+    // the registry, which the existing order gives: this is the last step of doInitialize.
+    this.networkWatchArmed = true;
+    this.reconcileNetworkWatch();
+    if (this.changeSubscribed) {
       return;
     }
     // Set the guard before awaiting so a concurrent initialize() cannot
     // double-subscribe; reset it on failure to allow a later retry.
     this.changeSubscribed = true;
-    this.networkWatchArmed = true;
-    this.reconcileNetworkWatch();
     try {
       const collectionId = this.collectionFactory.getCollectionId(this.options);
       this.changeUnsubscribe = await this.collectionFactory.subscribeToCollectionChanges(
@@ -1669,7 +1679,7 @@ export class OptimysticVirtualTable extends VirtualTable {
   /**
    * Release what this instance registered beyond its own fields, for a table that is gone from this
    * machine: on DROP TABLE, on a refused CREATE, and when the catalog shows another machine dropped
-   * it ({@link OptimysticModule.followCatalog}). The change subscription and network watch, the
+   * it ({@link OptimysticModule.followCatalog}). The change subscription and the network watches, the
    * materialized-view follower's registration, the bridge's naming of the table in commit reports,
    * and its offline policy. Nothing in storage or the catalog is touched, and the collections stay
    * registered with the bridge, as a DROP has always left them. Idempotent.
@@ -1688,7 +1698,7 @@ export class OptimysticVirtualTable extends VirtualTable {
    * machine created included, whose trees that machine has populated.
    *
    * Re-initialized in place rather than replaced by a new instance, as a failed `apply schema`
-   * re-initializes one ({@link oweCatalogRecord}): the change subscription, network watch,
+   * re-initializes one ({@link oweCatalogRecord}): the change subscription, the network watches,
    * materialized-view registration (with any signal it holds), offline policy and commit-report
    * naming stay as they are, and the tag-derived state follows through {@link followSchemaTags} when
    * the module announces the new entry. The open collection handles are reused too
@@ -1730,11 +1740,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.txnBridge.forgetTree(kept.referenceTree.tree);
     }
     this.handlesToKeep = undefined;
+    // A collection out of the registry is a collection out of the watched set (see registerTree).
+    this.reconcileNetworkWatch();
   }
 
   /**
-   * Tear down the collection-change subscription and the materialized-view
-   * follower's registration (idempotent). Part of {@link releaseRegistrations}.
+   * Tear down the collection-change subscription, every open network watch and the materialized-view
+   * follower's registration (idempotent). Part of {@link releaseRegistrations}. Disarming before the
+   * reconcile is what empties the watch map: a leftover entry would be a watch that keeps renewing
+   * and keeps invalidating a table that is gone.
    *
    * Deliberately NOT called from disconnect(): in this vtab, disconnect() is a
    * per-statement no-op that intentionally keeps the table initialized across
@@ -1769,10 +1783,10 @@ export class OptimysticVirtualTable extends VirtualTable {
    * tags, since `tableSchema` differs from the engine's object on purpose (UNIQUE
    * constraints folded in from the record, indexes withheld after a failed batch
    * commit) — so a re-initialize that rewrites the record from `tableSchema` writes the
-   * new tags rather than the old ones. Then the network watch is started or stopped to
+   * new tags rather than the old ones. Then the network watches are started or stopped to
    * match, and the offline policy is published again — a transaction already queued keeps the
    * acknowledgement it got. Idempotent. A table not yet initialized only records the tags; its
-   * initialization opens the watch. Saving the tags to the catalog record is the
+   * initialization opens the watches. Saving the tags to the catalog record is the
    * module's job, not this instance's: a hydrated table may have no instance at all.
    */
   followSchemaTags(schema: TableSchema): void {
@@ -1949,47 +1963,135 @@ export class OptimysticVirtualTable extends VirtualTable {
     this.txnBridge.getOfflineMode()?.withdrawTablePolicy(this.qualifiedTable);
   }
 
-  /** Queue one step bringing the network watch in line with the tags and the table's lifetime. */
+  /**
+   * Queue one step bringing the open network watches in line with the tags, the table's lifetime and
+   * the collections it currently registers. Called from every path that changes one of those three:
+   * {@link ensureChangeSubscription}, {@link teardownChangeSubscription}, {@link followSchemaTags},
+   * {@link registerTree}, and each `forgetTree` of one of this table's trees.
+   *
+   * Coalesced: a step already queued and not yet started absorbs further requests, so the burst of
+   * {@link registerTree} calls one initialization makes costs one or two reconciles rather than one
+   * per index. Sound because a step reads the wanted set when it RUNS, not when it was queued.
+   */
   private reconcileNetworkWatch(): void {
-    this.networkWatchSteps = this.networkWatchSteps.then(() => this.applyNetworkWatch());
+    if (this.networkWatchStepQueued) {
+      return;
+    }
+    this.networkWatchStepQueued = true;
+    this.networkWatchSteps = this.networkWatchSteps.then(() => {
+      this.networkWatchStepQueued = false;
+      return this.applyNetworkWatch();
+    });
   }
 
+  /**
+   * The collections a network watch is wanted on: the table's own, unioned with every collection this
+   * instance has registered with the transaction bridge under this table's name — the main tree, each
+   * declared index tree, each synthesized unique-enforcement tree, and the blob reference tree.
+   *
+   * The table's own id is included explicitly so this can never LOSE the watch the table has had since
+   * the feature shipped, whatever the registry holds (a table whose initialization failed before
+   * `registerCollections`, say). The rest comes from the registry rather than from
+   * `indexManager.getIndexTrees()` and `blobReferences` because {@link registerTree} and
+   * `txnBridge.forgetTree` are already the one funnel every path goes through, so there is no second
+   * list to keep in step and a table that grows a new kind of child collection is watched without
+   * anyone remembering to add it here.
+   *
+   * Two kinds of collection in the set are never read by a watcher's re-query: a unique-enforcement
+   * tree is consulted only while staging a write, and the blob reference tree is write-side
+   * bookkeeping (reading a blob's bytes goes through the blob service by id). Watching them anyway is
+   * deliberate — each costs one registration and one extra whole-table invalidation per write that
+   * touches it, which is cheaper than a narrower rule that has to be re-derived every time the table's
+   * shape changes.
+   *
+   * NOTE: a tagged table now holds one cohort registration and one watched tail per collection instead
+   * of one per table, so on a machine that stores none of them the per-tick request fan-out
+   * (`docs/reactivity.md` §The node's watch service, *What a tick costs*) grows with the table's
+   * collection count — unmeasured, and structural rather than observed. If that ever shows up, add a
+   * tag value that watches only the table's own collection, accepting the index gap this closes back.
+   */
+  private wantedNetworkWatches(): Set<CollectionId> {
+    return new Set<CollectionId>([
+      this.collectionFactory.getCollectionId(this.options),
+      ...this.txnBridge.collectionsOf(this.qualifiedTable),
+    ]);
+  }
+
+  /**
+   * One reconcile step: open every wanted collection not already open and close every open collection
+   * no longer wanted. When the table is not armed or not tagged nothing is wanted, so every entry
+   * closes — which is what {@link teardownChangeSubscription} and a tag flipped off rely on, and why
+   * this iterates the map rather than special-casing the table's own handle.
+   */
   private async applyNetworkWatch(): Promise<void> {
-    const wanted = this.networkWatchArmed && this.networkWatchTagged;
-    try {
-      if (wanted && !this.closeNetworkWatch) {
-        await this.openNetworkWatch();
-      } else if (!wanted && this.closeNetworkWatch) {
-        const close = this.closeNetworkWatch;
-        this.closeNetworkWatch = undefined;
+    const wanted = this.networkWatchArmed && this.networkWatchTagged
+      ? this.wantedNetworkWatches()
+      : new Set<CollectionId>();
+    const opened: CollectionId[] = [];
+    const closed: CollectionId[] = [];
+    for (const collectionId of wanted) {
+      if (this.networkWatchCloses.has(collectionId)) continue;
+      if (await this.openNetworkWatch(collectionId)) {
+        opened.push(collectionId);
+      }
+    }
+    for (const [collectionId, close] of [...this.networkWatchCloses]) {
+      if (wanted.has(collectionId)) continue;
+      this.networkWatchCloses.delete(collectionId);
+      closed.push(collectionId);
+      try {
         await close();
+      } catch (error) {
+        log(
+          `WARN: failed to close the network watch on '${collectionId}' for '${this.tableName}': ` +
+          `${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+    if (opened.length > 0 || closed.length > 0) {
+      log('watch:network-set table=%s opened=%o closed=%o', this.tableName, opened, closed);
+    }
+  }
+
+  /**
+   * Open one collection's network watch, recording its close. Returns whether a watch was opened — a
+   * node with no cohort-topic watch service opens none (and is reported once per table, not once per
+   * collection: there every collection resolves `undefined`, and the warning must not be multiplied by
+   * the index count), and a failure is logged and left out of the map.
+   *
+   * Each collection is opened and caught on its own so one failure cannot cost the others. In practice
+   * a failure is all-or-nothing — `watchCollectionOverNetwork` only rejects if the transactor cannot be
+   * built, since `ReactivityCollectionWatch.watch` itself never fails for network reasons.
+   *
+   * NOTE: nothing retries a failed collection on its own; the next reconcile does, which happens when
+   * the collection set or the tag next changes. That is how the single watch has always behaved.
+   */
+  private async openNetworkWatch(collectionId: CollectionId): Promise<boolean> {
+    try {
+      const close = await this.collectionFactory.watchCollectionOverNetwork(
+        this.options,
+        collectionId,
+        () => this.handleCollectionChange()
+      );
+      if (close) {
+        this.networkWatchCloses.set(collectionId, close);
+        return true;
+      }
+      if (!this.networkWatchUnavailableLogged) {
+        this.networkWatchUnavailableLogged = true;
+        log(
+          `WARN: '${this.tableName}' is tagged ${NETWORK_WATCH_TAG} but transactor '${this.options.transactor}' ` +
+          `has no cohort-topic watch service (a 'network' transactor over a node built with cohort_topic ` +
+          `enabled); only commits this node stores will wake its watchers`
+        );
       }
     } catch (error) {
       log(
-        `WARN: failed to ${wanted ? 'open' : 'close'} the network watch for '${this.tableName}': ` +
+        `WARN: failed to open the network watch on '${collectionId}' for '${this.tableName}': ` +
         `${error instanceof Error ? error.message : String(error)}`
       );
     }
-  }
-
-  private async openNetworkWatch(): Promise<void> {
-    const close = await this.collectionFactory.watchCollectionOverNetwork(
-      this.options,
-      this.collectionFactory.getCollectionId(this.options),
-      () => this.handleCollectionChange()
-    );
-    if (close) {
-      this.closeNetworkWatch = close;
-      return;
-    }
-    if (!this.networkWatchUnavailableLogged) {
-      this.networkWatchUnavailableLogged = true;
-      log(
-        `WARN: '${this.tableName}' is tagged ${NETWORK_WATCH_TAG} but transactor '${this.options.transactor}' ` +
-        `has no cohort-topic watch service (a 'network' transactor over a node built with cohort_topic ` +
-        `enabled); only commits this node stores will wake its watchers`
-      );
-    }
+    return false;
   }
 
   /**
@@ -2998,9 +3100,15 @@ export class OptimysticVirtualTable extends VirtualTable {
    * Register one of this table's trees with the bridge (see
    * {@link TransactionBridge.registerCollection}), under this table's qualified name — the key a
    * commit's durability report groups the tree's collection under.
+   *
+   * The registry is also what names the collections a tagged table watches over the network
+   * ({@link wantedNetworkWatches}), so every registration reconciles the watches. The reconcile is
+   * coalesced and a table not yet armed wants nothing, so the burst of calls one initialization makes
+   * is free.
    */
   private registerTree(tree: Tree<any, any>): void {
     this.txnBridge.registerCollection(tree.getCollection(), this.qualifiedTable);
+    this.reconcileNetworkWatch();
   }
 
   /** Stop the bridge naming this table in commit reports. Part of {@link releaseRegistrations}. */
@@ -4450,6 +4558,8 @@ export class OptimysticVirtualTable extends VirtualTable {
     const tree = this.indexManager.unregisterIndex(indexName);
     if (tree) {
       this.txnBridge.forgetTree(tree);
+      // A collection out of the registry is a collection out of the watched set (see registerTree).
+      this.reconcileNetworkWatch();
     }
     const lower = indexName.toLowerCase();
     const uniqueConstraints = (this.tableSchema.uniqueConstraints ?? []).filter(

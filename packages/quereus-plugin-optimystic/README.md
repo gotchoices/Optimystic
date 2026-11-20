@@ -460,7 +460,7 @@ Notes:
 
 A table declared with the `optimystic.network_watch` tag also wakes when any other
 machine commits to it — including on a phone or laptop that stores none of the
-table's blocks:
+table's blocks — and wakes again once that commit can be read whole:
 
 ```sql
 create table users (id integer primary key, name text)
@@ -495,16 +495,29 @@ What it needs:
   other machines' commits — but other machines are not woken by its commits. A
   node the host builds with a real cluster size both watches and announces.
 
-What it costs: one cohort registration per tagged table for as long as the table
-is open, renewed every 20 s (Edge node) or 30 s (Core node), and one read of the
-collection's log tail at each renewal — the fallback check that turns a lost
-notification into one renewal's delay rather than a missed wake. The first tail
-read after a table opens wakes its watchers once, whether or not anything changed.
-On a machine that both stores the table and watches it, another machine's commit
-wakes watchers twice (once from storage, once from the network); both are coarse
-whole-table invalidations, so the cost is one extra re-query. The watch closes on
-`drop table`, and on `plugin.dispose()` for a `Database` closed without dropping
-its tables.
+What it opens: one watch per **collection** of the tagged table — its rows, each
+index, each index the plugin synthesizes to enforce a `UNIQUE` constraint, and the
+reference tree a table with `blobref` columns has. A SQL transaction writes all of
+them, but each lands as its own commit, announced by the machines that store that
+collection's log tail; watching only the table's rows would wake a watcher before
+the indexes were readable, so a lookup through an index right after the wake would
+miss the new row. With every collection watched, the index's own landing wakes the
+table a second time, and the renewal's tail check below covers the index too. The
+set follows the table: `create index` adds a watch, `drop index` removes one.
+
+What it costs: one cohort registration per watched collection for as long as the
+table is open, renewed every 20 s (Edge node) or 30 s (Core node), and one read of
+that collection's log tail at each renewal — the fallback check that turns a lost
+notification into one renewal's delay rather than a missed wake. The tail reads of
+all a machine's watches batch into one request per machine that answers for them,
+so what grows with the collection count is how many machines that is. The first
+tail read after a watch opens wakes the table's watchers once, whether or not
+anything changed, so a tagged table with three indexes invalidates four times as
+it opens. On a machine that both stores the table and watches it, another machine's
+commit wakes watchers once from storage and once per collection from the network.
+All of these are coarse whole-table invalidations, so the cost of an extra one is
+one re-query. The watches close on `drop table`, and on `plugin.dispose()` for a
+`Database` closed without dropping its tables.
 
 ### Materialized views over Optimystic tables
 

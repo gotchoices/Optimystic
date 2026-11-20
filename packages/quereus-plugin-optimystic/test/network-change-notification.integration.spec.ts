@@ -15,6 +15,12 @@
  * table's topic are counted to show the notification arrived; and every tail read the watch service
  * makes on the watcher is counted, so a wake its fallback check produced is told apart.
  *
+ * The tagged table also has a secondary index, which is a collection of its own: a tagged table opens one
+ * network watch per collection it registers, so the index's commit — announced by its own tail's storage
+ * group, after the table's — wakes the table a second time, once it can be read whole. The watched set is
+ * asserted through the service's `isAttached` / `watchedCount` seams, and shrinks back to the table alone
+ * when the index is dropped.
+ *
  * Gated on OPTIMYSTIC_INTEGRATION=1:
  *   yarn workspace @optimystic/quereus-plugin-optimystic test:integration
  */
@@ -37,6 +43,9 @@ const NETWORK_NAME = 'network-change-notification-it';
 const MACHINES = 3;
 const WATCHED_URI = 'tree://network-watch/Watched';
 const WATCHED_ID = 'network-watch/Watched';
+/** The index's own collection: the table's URI path plus `/index/<name>`, as `openIndexTree` derives it. */
+const WATCHED_INDEX_NAME = 'watched_by_v';
+const WATCHED_INDEX_ID = `${WATCHED_ID}/index/${WATCHED_INDEX_NAME}`;
 const UNTAGGED_URI = 'tree://network-watch/Untagged';
 /** How long a wake may take and still count; under the watch service's fallback tick (20 s Edge, 30 s Core). */
 const WAKE_BOUND_MS = 10_000;
@@ -154,7 +163,7 @@ describe('Network change notification for a tagged table over real libp2p', func
 		return { reads, restore: () => { Collection.readCommittedTails = original; } };
 	}
 
-	it("wakes a tagged table's watch when another machine commits, and leaves an untagged sibling asleep", async () => {
+	it("wakes a tagged table's watch when another machine commits, watches each of the table's collections, and leaves an untagged sibling asleep", async () => {
 		await stabilizedMesh();
 		const [writerNode, watcherNode, thirdNode] = nodes as [OptimysticNode, OptimysticNode, OptimysticNode];
 		watcherNode.blockChangeNotifier = inertNotifier;
@@ -165,6 +174,8 @@ describe('Network change notification for a tagged table over real libp2p', func
 		for (const { db } of [writer, watcher, third]) {
 			await db.exec(`create table Watched (id integer primary key, v text) using optimystic('${WATCHED_URI}') with tags ("optimystic.network_watch" = true)`);
 			await db.exec(`create table Untagged (id integer primary key, v text) using optimystic('${UNTAGGED_URI}')`);
+			// A second collection under the tagged table, so the watched set is more than the table itself.
+			await db.exec(`create index ${WATCHED_INDEX_NAME} on Watched (v)`);
 		}
 		// The watch anchors on the log's tail block, so the collection has to have committed once.
 		await writer.db.exec(`insert into Watched (id, v) values (1, 'before the watch attached')`);
@@ -172,7 +183,10 @@ describe('Network change notification for a tagged table over real libp2p', func
 
 		const watchService = watcherNode.reactivityWatch!;
 		// The first attach to a new topic is deferred by the cohort and lands on the service's next tick.
-		await waitFor(() => watchService.isAttached(WATCHED_ID), { timeoutMs: 180_000, intervalMs: 250, description: "the watcher's table registered with its topic cohort" });
+		// Both of the table's collections attach, each under its own tail's storage group as the root.
+		await waitFor(() => watchService.isAttached(WATCHED_ID) && watchService.isAttached(WATCHED_INDEX_ID),
+			{ timeoutMs: 180_000, intervalMs: 250, description: "the watcher's table and its index registered with their topic cohorts" });
+		expect(watchService.watchedCount, "a tagged table watches each collection it registers — here its rows and its one index — and the untagged sibling watches none").to.equal(2);
 
 		// Only the node that coordinates a commit announces it, to the registrations its own cohort engine
 		// holds; the watcher's reaches the writer over cohort gossip unless the writer is the topic's primary.
@@ -215,6 +229,12 @@ describe('Network change notification for a tagged table over real libp2p', func
 			await writer.db.exec(`insert into Untagged (id, v) values (2, 'after the watch attached')`);
 			await new Promise(resolve => setTimeout(resolve, WAKE_BOUND_MS));
 			expect(wakes.untagged, 'an untagged table has only the (inert) local listener, so nothing wakes it').to.equal(0);
+
+			// The watched set follows the table's collections both ways: the index leaves it on a drop.
+			await watcher.db.exec(`drop index ${WATCHED_INDEX_NAME}`);
+			await waitFor(() => watchService.watchedCount === 1 && !watchService.isAttached(WATCHED_INDEX_ID),
+				{ timeoutMs: 30_000, intervalMs: 50, description: "the dropped index's watch closed" });
+			expect(watchService.isAttached(WATCHED_ID), "dropping an index leaves the table's own watch attached").to.equal(true);
 		} finally {
 			offCount();
 			restore();

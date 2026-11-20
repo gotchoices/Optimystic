@@ -579,8 +579,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * The catch-all feed is never held: it feeds tail-rotation detection and the owned-block feed,
 	 * neither of which wants a delay, and cohort-topic origination, which resolves its commit
 	 * certificate by the event's collection tail and so would find the right record's certificate
-	 * after a hold too (holding it for origination is backlog
-	 * `feat-a-network-watch-wake-sees-the-whole-commit`).
+	 * after a hold too. Holding it for origination was weighed and rejected: it would delay every
+	 * multi-collection announcement, and it helps only where the announcing machine also stores the
+	 * action's other collections, so it closes nothing when their tail groups are disjoint. The
+	 * Quereus vtab watches each of its table's collections over the network instead.
 	 *
 	 * `tailId` is the `CommitRequest.tailId` on the commit path; `undefined` on read-driven
 	 * promotions and replica landings, which have no commit request. A single commit is for one
@@ -712,9 +714,13 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 *
 	 * NOTE: a collection of the action that lands AFTER this timer released fires only its own
 	 * collection's listeners, so the table's watchers are not woken a second time for it, and a
-	 * lookup through that collection at the released wake can still miss. Fine while every gap stays
-	 * under `changeHoldMs`; if gaps beyond it are ever seen, have the vtab also subscribe to its
-	 * index collections (wake the table on any of them) rather than lengthening the hold.
+	 * lookup through that collection at the released wake can still miss. A table tagged
+	 * `optimystic.network_watch` is covered: the Quereus vtab holds a watch on each of its
+	 * collections, and the reactivity watch service wakes a collection's watchers on its own landing
+	 * here, so the late landing wakes the table after all. An untagged table still has the gap. Fine
+	 * while every gap stays under `changeHoldMs`; if gaps beyond it are ever seen on untagged tables,
+	 * give the vtab's LOCAL subscription the same per-collection shape rather than lengthening the
+	 * hold.
 	 */
 	private armHoldTimer(hold: ActionChangeHold, actionId: ActionId): void {
 		this.cancelHoldTimer(actionId);

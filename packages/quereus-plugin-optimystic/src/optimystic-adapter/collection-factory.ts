@@ -493,6 +493,13 @@ export class CollectionFactory {
    * cohort-topic watch service (`node.reactivityWatch` in `@optimystic/db-p2p`) — as opposed to
    * {@link subscribeToCollectionChanges}, which hears only commits this node's own storage applies.
    *
+   * `collectionId` is independent of `options.collectionUri`: `options` only names the transactor and
+   * the node to watch through. One table passes several ids — a tagged vtab watches each of its
+   * collections (its rows, each index tree, the blob reference tree), since a commit that writes them
+   * all applies as a separate storage commit per collection and each is announced by its own tail's
+   * storage group. Every handle is tracked in {@link networkWatches} regardless, so {@link dispose}
+   * closes them all.
+   *
    * Resolves `undefined` when there is no watch service to use: a transactor other than
    * `network`, one registered directly with no node behind it, or a node built without
    * `cohortTopic.enabled` (an injected node may not have been built with it). Otherwise resolves
