@@ -689,7 +689,7 @@ shared with `sync` (`AttemptCycle` and `stageAttempt` in
 
 The drain's whole job is to decide, for each failure, whether the entry should wait and retry,
 settle as failed, or be resolved as possibly landed. It must decide from error **types**, never from
-message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text`).
+message text.
 
 | Outcome | Example | Entry becomes |
 |---|---|---|

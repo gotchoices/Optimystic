@@ -50,7 +50,7 @@ const cases: Array<[string, unknown, string]> = [
 	// The real class, not a hand-rolled stand-in: this row exists for the "never walk `cause`" rule,
 	// and pinning it against the aggregate the transactor actually throws is what would fail if
 	// someone later gave `classifyCommitFailure` a `phase` arm.
-	['an aggregate whose cause is a shortfall', new PeersIncompleteError('commit', 'Some peers did not complete', new PromiseShortfallError(shortfall)), 'unknown'],
+	['an aggregate whose cause is a shortfall', PeersIncompleteError.peersDidNotComplete('commit', 'peer-a[blocks:2](non-success)', new PromiseShortfallError(shortfall)), 'unknown'],
 ]
 
 describe('classifyCommitFailure', () => {

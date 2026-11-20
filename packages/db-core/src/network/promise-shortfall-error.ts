@@ -15,9 +15,8 @@ import type { PromiseShortfall, ShortfallFailure, SoloRefusalReason } from "./st
  * that refusal.
  *
  * The message is the sentence the coordinator has always thrown, byte for byte: a downstream
- * repository matches it to retry a silent cohort (backlog
- * `debt-a-downstream-repo-classifies-retries-by-parsing-our-error-text`). Test for this class, or for
- * the refusal with `isShortfallFailure`, rather than for the text.
+ * repository matches it to retry a silent cohort. Test for this class, or for the refusal with
+ * `isShortfallFailure`, rather than for the text.
  */
 export class PromiseShortfallError extends Error {
 	/** Approve votes the round received. */

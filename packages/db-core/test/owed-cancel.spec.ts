@@ -12,6 +12,7 @@
 import { expect } from 'chai';
 import { NetworkTransactor } from '../src/transactor/network-transactor.js';
 import type { OwedCancelClock } from '../src/transactor/owed-cancels.js';
+import { PeersIncompleteError } from '../src/transactor/peers-incomplete-error.js';
 import { peerIdFromString } from '../src/network/types.js';
 import { localDurability } from '../src/network/durability.js';
 import { waitFor } from '../src/testing/async-wait.js';
@@ -91,7 +92,11 @@ describe('A cancel the transactor could not discharge is kept and re-sent', () =
 		state.cancelDown = true;
 		let threw: unknown;
 		try { await transactor.cancel({ actionId: 'X', blockIds: ['b1'] }); } catch (err) { threw = err; }
-		expect(threw, 'the cancel still reports that it did not discharge').to.be.instanceOf(Error);
+		// `phase` is the typed discriminator a consumer reads instead of the message, and `'cancel'` is
+		// the arm whose absence of the shared `Some peers did not complete:` sentence keeps an
+		// undischarged cancel out of a downstream retry-safe bucket (see `PeersIncompleteError`).
+		expect(threw, 'the cancel still reports that it did not discharge').to.be.instanceOf(PeersIncompleteError);
+		expect((threw as PeersIncompleteError).phase).to.equal('cancel');
 		expect(Object.fromEntries(transactor.owedCancelBlocks())).to.deep.equal({ X: ['b1'] });
 		expect(live().length, 'one timer is armed while a cancel is owed').to.equal(1);
 
