@@ -6,6 +6,7 @@ export * from "./blob/sweep-gate.js";
 export * from "./blob/local-piece-source.js";
 export * from "./blob/piece-sweeper.js";
 export * from "./blob/local-blob-service.js";
+export * from "./blob/cache-budget.js";
 export * from "./blob/blob-protocol.js";
 export * from "./blob/blob-frames.js";
 export * from "./blob/progress-deadline.js";

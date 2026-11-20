@@ -27,6 +27,7 @@ import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
 import type { IPieceStore } from './blob/piece-store.js';
 import { MemoryPieceStore } from './blob/memory-piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
+import { BlobCacheBudget, DEFAULT_BLOB_CACHE_BUDGET_BYTES } from './blob/cache-budget.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
 import { blobAcceptanceOf } from './blob/accepts-blobs.js';
 import { BlobProtocolClient } from './blob/blob-protocol-client.js';
@@ -365,8 +366,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * are `DrainScheduler`'s, defaulting as the under-replication drain's do. `enabled: false` builds
 	 * no drain at all, and then `node.blobs.announce` REJECTS rather than recording an entry nothing
 	 * would ever send; such a node still serves, fetches and holds blobs.
+	 *
+	 * `cacheBudgetBytes` is how many bytes of blobs this node may keep purely because it read them
+	 * (`BlobCacheBudget` in `packages/db-p2p/src/blob/cache-budget.ts`, docs/blobs.md §Lifetime),
+	 * default `DEFAULT_BLOB_CACHE_BUDGET_BYTES` (256 MiB). Over the budget, the least recently read of
+	 * those blobs lose their `cached` hold and are swept; a blob held for any other reason — pinned,
+	 * owed or responsible — is never counted or evicted, and a blob being read is never evicted. `0`
+	 * keeps no such blob beyond the ones being read. Anything but an integer at or above 0 throws.
 	 */
-	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
+	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; cacheBudgetBytes?: number; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -921,6 +929,22 @@ function resolvePieceStore(provider: PieceStoreProvider | undefined): IPieceStor
 }
 
 /**
+ * Resolve how many bytes of read-only blob cache this node may keep ({@link NodeOptions.blobs}'s
+ * `cacheBudgetBytes`). A value that is not a whole number of bytes at or above 0 throws rather than
+ * being rounded or ignored: a budget read as something other than what the host declared would either
+ * evict blobs it meant to keep or keep blobs it meant to be rid of.
+ */
+function resolveBlobCacheBudgetBytes(declared: number | undefined): number {
+	if (declared === undefined) {
+		return DEFAULT_BLOB_CACHE_BUDGET_BYTES;
+	}
+	if (!Number.isSafeInteger(declared) || declared < 0) {
+		throw new RangeError(`blobs.cacheBudgetBytes must be an integer number of bytes at or above 0, got ${declared}`);
+	}
+	return declared;
+}
+
+/**
  * Resolve the full FRET engine the cohort-topic host needs.
  *
  * `createCohortTopicHost` consumes the complete {@link FretService} engine surface — notably
@@ -1249,6 +1273,9 @@ export async function createLibp2pNodeBase(
 	// Read here, before the blob protocol service entry below closes over it: an on-demand node declines
 	// every announcement, including the ones that arrive before the receiver exists.
 	const blobHold: BlobHoldPolicy = options.blobs?.hold ?? 'eager';
+	// Read here rather than where the budget is built, below: this is before `createLibp2p` and
+	// `node.start()`, so a misconfigured host gets the error instead of a started node to roll back.
+	const blobCacheBudgetBytes = resolveBlobCacheBudgetBytes(options.blobs?.cacheBudgetBytes);
 	// Bound after libp2p has started, below, since the receiver needs the node's key network and fetcher
 	// while the service entry is built before them.
 	let blobReceiver: BlobAnnounceReceiver | undefined;
@@ -1741,6 +1768,27 @@ export async function createLibp2pNodeBase(
 		}
 		// Its stop wrapper runs before the blob service's, so no fetched piece is stored after that.
 		const blobTransfer = wireBlobFetcher({ node, protocolPrefix, linkDeadlines, keyNetwork, membership, reputation, blobs });
+		// The byte budget over the blobs this node kept only because it read them (docs/blobs.md
+		// §Lifetime). Built before `node.blobs`, which triggers it after every read or fetch that pulled
+		// something; its stop wrapper goes on AFTER the blob service's (installed above), so it runs
+		// BEFORE it and no enforcement writes a record or sweeps once the blob service has stopped.
+		const blobCacheBudget = new BlobCacheBudget({
+			records: blobs,
+			budgetBytes: blobCacheBudgetBytes,
+			log: createLogger('blob:reclaim', node.peerId.toString()),
+		});
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await blobCacheBudget.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		// Once, now: a budget lowered across a restart is applied to what the last run cached.
+		blobCacheBudget.request();
 		// `node.blobs`. The blob protocol service keeps answering from `blobs`: a peer's stat is about
 		// what this node holds, and must not start a probe of its own.
 		const nodeBlobs = new NodeBlobService({
@@ -1752,6 +1800,7 @@ export async function createLibp2pNodeBase(
 			// Reader repair (docs/blobs.md §Placement, copying and durability): the receiver is built a few
 			// lines below, before anything can read through this service.
 			afterFetchedWhole: ref => blobReceiver?.keepAfterRead(ref),
+			requestCacheEnforcement: () => blobCacheBudget.request(),
 			// Left off entirely when the drain is disabled, so `announce` rejects rather than taking a
 			// hold on a blob nothing would announce. Bound through the `let` above, as
 			// `afterFetchedWhole` is: the drain is built below, before the factory returns.
@@ -1849,6 +1898,7 @@ export async function createLibp2pNodeBase(
 		// Expose for tests/diagnostics, as the block drain and its ledger are exposed.
 		(node as any).blobCopyDrain = blobCopies;
 		(node as any).owedBlobLedger = owedBlobLedger;
+		(node as any).blobCacheBudget = blobCacheBudget;
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to

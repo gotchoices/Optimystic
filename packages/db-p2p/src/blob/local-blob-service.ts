@@ -90,6 +90,39 @@ export interface BlobOwedRecords {
 	emitDurability(event: BlobDurabilityEvent): void;
 }
 
+/** One cache-only blob as the cache budget sees it. */
+export interface CachedBlob {
+	readonly ref: BlobRef;
+	/** The record's `size`; 0 when it has none yet. */
+	readonly bytes: number;
+	/** The record's `lastReadAt`; 0 when it has never been read here. */
+	readonly lastReadAt: number;
+}
+
+/**
+ * What the cache budget needs of this node's blob records and pieces; `LocalBlobService` is it
+ * (docs/blobs.md §Lifetime).
+ *
+ * A door rather than a second `BlobRecordStore` over the same `IKVStore`, for the reason
+ * {@link BlobOwedRecords} gives: two instances keep separate per-ref queues, and a write that
+ * bypassed `changeRecord` would also bypass the sweep gate and `PieceSweeper.noteRecordChange`,
+ * which is what keeps a running sweep from deleting a concurrent write's pieces.
+ */
+export interface BlobCacheRecords {
+	/** Every blob whose record holds `cached` and no other hold. A record that does not decode is
+	 *  logged (`record:unreadable`) and skipped, as `responsibleRefs` does, so one unreadable record
+	 *  cannot fail an enforcement — and a blob whose record cannot be read is never evicted. */
+	cachedBlobs(): Promise<CachedBlob[]>;
+	/** Remove `ref`'s `cached` hold, but only while that is still its only hold; `true` when it did.
+	 *  A record left with no hold is deleted and its pieces left for the sweep. Not flushed: a hold
+	 *  removal a crash undoes is made again by the next enforcement. */
+	releaseCached(ref: BlobRef): Promise<boolean>;
+	/** {@link LocalBlobService.inUse}. */
+	inUse(ref: BlobRef): boolean;
+	/** {@link LocalBlobService.sweep}. */
+	sweep(): Promise<BlobSweepResult>;
+}
+
 /**
  * Reading this machine's pins by owner. Not part of `BlobService`: enumeration is a property of a
  * store, not of the service contract.
@@ -134,9 +167,10 @@ export interface LocalBlobServiceInit {
  * which fetches from other machines through `readThrough` and `fetchStore`; used on its own it never
  * asks another machine. It owns the records the copy drain changes and the `onDurability` listeners it
  * emits through ({@link BlobOwedRecords}); announcing is `NodeBlobService`'s, since this service has
- * no cohort. It also reads its own pins back ({@link BlobPinIndex}).
+ * no cohort. It also reads its own pins back ({@link BlobPinIndex}) and offers the cache budget its
+ * door onto the blobs held only for reads ({@link BlobCacheRecords}).
  */
-export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIndex {
+export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIndex, BlobCacheRecords {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -464,6 +498,30 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		return (await this.readableRecord(ref))?.whole === true;
 	}
 
+	/** {@link BlobCacheRecords.cachedBlobs}. Reads every record, as `responsibleRefs` and `listPins` do; the `NOTE:` at `BlobCacheBudget.enforce` carries that cost's tripwire. */
+	async cachedBlobs(): Promise<CachedBlob[]> {
+		const blobs: CachedBlob[] = [];
+		for (const ref of await this.records.listRefs()) {
+			const record = await this.readableRecord(ref);
+			if (record !== undefined && cacheOnly(record)) {
+				blobs.push({ ref, bytes: record.size ?? 0, lastReadAt: record.lastReadAt ?? 0 });
+			}
+		}
+		return blobs;
+	}
+
+	/**
+	 * {@link BlobCacheRecords.releaseCached}. The change function is itself the condition, applied at
+	 * this reference's turn in the record store's per-ref queue: a blob that gained a pin, an `owed` or
+	 * a `responsible` hold since the enumeration keeps every hold, and this reports `false`.
+	 */
+	async releaseCached(ref: BlobRef): Promise<boolean> {
+		const result = await this.changeRecord(ref, recordAfterCacheEviction);
+		// The change function either deletes the record — `cached` was its only hold — or returns it
+		// untouched, so a `before` with no `after` is exactly an eviction that happened.
+		return result.before !== undefined && result.after === undefined;
+	}
+
 	/** {@link BlobOwedRecords.emitDurability}. */
 	emitDurability(event: BlobDurabilityEvent): void {
 		for (const listener of [...this.durabilityListeners]) {
@@ -735,6 +793,19 @@ function recordAfterOwedRelease(current: BlobRecord | undefined): BlobRecord | u
 	}
 	const holds = current.holds.filter(hold => hold.kind !== 'owed');
 	return holds.length === current.holds.length ? current : { ...current, holds };
+}
+
+/** Held for reads and nothing else: the only blobs the cache budget counts and evicts (docs/blobs.md §Lifetime). */
+function cacheOnly(record: BlobRecord): boolean {
+	return record.holds.length > 0 && record.holds.every(hold => hold.kind === 'cached');
+}
+
+/** The current record unchanged unless `cached` is still its only hold, in which case dropping that hold leaves no holds and `BlobRecordStore.update` deletes it. */
+function recordAfterCacheEviction(current: BlobRecord | undefined): BlobRecord | undefined {
+	if (current === undefined || !cacheOnly(current)) {
+		return current;
+	}
+	return { ...current, holds: current.holds.filter(hold => hold.kind !== 'cached') };
 }
 
 /** Never creates a record: a record deleted while the drain was classifying stays deleted. */

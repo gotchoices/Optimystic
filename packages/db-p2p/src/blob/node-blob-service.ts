@@ -58,6 +58,16 @@ export interface NodeBlobServiceDeps {
 	 * announce.
 	 */
 	oweCopies?: (ref: BlobRef, scope: BlobScope) => Promise<void>;
+	/**
+	 * `BlobCacheBudget.request`, bound by the node (`packages/db-p2p/src/blob/cache-budget.ts`): asks
+	 * for the cached blobs to be brought back within their byte budget, without waiting. Called after
+	 * a read or fetch that pulled something, which is the only way the cache grows.
+	 *
+	 * The callback rather than the budget itself: the budget is built over the `LocalBlobService` this
+	 * service is built over, and a service built without one — every test of this class — must keep
+	 * working, caching without bound as it does today.
+	 */
+	requestCacheEnforcement?: () => void;
 	/** Default Date.now (probe timing in the log line). */
 	now?: () => number;
 }
@@ -89,6 +99,7 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 	private readonly probeTimeoutMs: number;
 	private readonly afterFetchedWhole: ((ref: BlobRef) => void) | undefined;
 	private readonly oweCopies: ((ref: BlobRef, scope: BlobScope) => Promise<void>) | undefined;
+	private readonly requestCacheEnforcement: (() => void) | undefined;
 	private readonly now: () => number;
 	private readonly progress = new Map<BlobRef, ProgressCount>();
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
@@ -101,6 +112,7 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 		this.probeTimeoutMs = deps.probeTimeoutMs;
 		this.afterFetchedWhole = deps.afterFetchedWhole;
 		this.oweCopies = deps.oweCopies;
+		this.requestCacheEnforcement = deps.requestCacheEnforcement;
 		this.now = deps.now ?? Date.now;
 		// Never unsubscribed: the fetcher lives exactly as long as the node, and so does this service.
 		this.fetcher.onPieceStored(event => this.pieceStored(event));
@@ -255,6 +267,15 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 				readController.abort(new Error('blob read ended'));
 			}
 			detach();
+			// Only a read that fetched added anything to the cache. Here as well as at the session's
+			// settle below, because either alone leaves a gap: the session's tail may still hold a use
+			// now, so the blob just read would be skipped as in use, and at the settle the read may
+			// still be consuming. The budget's single-flight collapses the pair into one run and one
+			// follow-on. `readThrough`'s own `finally` has already released this read's use: the inner
+			// generator is finished by the time this one's `finally` runs.
+			if (session !== undefined) {
+				this.requestCacheEnforcement?.();
+			}
 		}
 	}
 
@@ -285,6 +306,8 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 		const settled = (): void => {
 			endUse();
 			this.sessionSettled(ref, count);
+			// After the use is released, so the blob this session fetched is itself evictable.
+			this.requestCacheEnforcement?.();
 		};
 		void session.done.then(
 			() => {
