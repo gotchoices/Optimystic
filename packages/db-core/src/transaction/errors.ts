@@ -128,6 +128,14 @@ export class CoordinatorStaleLossError extends Error {
 		 * retry loop reads each entry against its own collection's next revision (`RevisionStallWatch`). */
 		public readonly staleAtByCollection: ReadonlyMap<CollectionId, ConfirmedRevision> = new Map(),
 	) {
+		// NOTE: this error names no rivals, where its single-collection counterpart now does
+		// (`SyncRetryExhaustedError.rivals` in `packages/db-core/src/collection/struct.ts`, built from
+		// the holders a refusal reported), so a multi-collection writer still cannot tell a budget
+		// spent against rivals it could name from one spent against silence. Left out deliberately:
+		// no consumer drives `TransactionCoordinator` directly today, and the symmetric field would be
+		// a per-collection `rivalsByCollection` fed from this coordinator's own per-participant retry
+		// state — a second retry machine's worth of work. If a multi-collection writer ever needs the
+		// distinction, carry it per collection exactly the way `staleAtByCollection` is carried.
 		// Deliberately does not assert that nothing committed: this is also the internal signal a
 		// half-landed attempt retries on, and it then surfaces as a partial error's `reason`.
 		super(

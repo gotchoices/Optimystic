@@ -2595,6 +2595,10 @@ describe('NetworkTransactor', () => {
       expect(result.success).to.be.false;
       expect(Object.prototype.hasOwnProperty.call(result, 'staleAt'),
         'an all-absent aggregate must omit the key, not emit undefined').to.be.false;
+      // Same rule for the two held-block claims, so a plain stale refusal keeps exactly the shape
+      // it had before they existed.
+      expect(Object.prototype.hasOwnProperty.call(result, 'heldBy')).to.be.false;
+      expect(Object.prototype.hasOwnProperty.call(result, 'pending')).to.be.false;
     });
   })
 
@@ -2683,6 +2687,40 @@ describe('NetworkTransactor', () => {
         expect(result.staleAt).to.deep.equal({ blockId: 'block-2', rev: 6 });
         // The mixed batch keeps its existing `some`-based retryability, unchanged by the new field.
         expect(result.conflict).to.be.true;
+      }
+    });
+
+    // Who HOLDS the blocks is two separate claims — `heldBy` is what the refusing MEMBERS' signed
+    // `held` votes reported, `pending` is what a coordinator read out of its OWN storage — and both
+    // have to survive the rebuild or the writer that exhausts its budget cannot tell a contended
+    // failure from a silent one (`SyncRetryExhaustedError.rivals`).
+    it("carries both batches' held-block claims through the rebuilt aggregate", async () => {
+      const result = await runTwoStalePends(
+        {
+          success: false, conflict: true, reason: 'held on A',
+          heldBy: { 'peer-A': 'rival-a' },
+          // A `policy: 'r'` pend has a producer return the holder's transform too. The rebuild is the
+          // action-level answer and nothing rebases from it, so the payload must not ride up.
+          pending: [{ blockId: 'block-1', actionId: 'rival-a', transform: { updates: [createBlockOperation()] } }]
+        },
+        {
+          success: false, conflict: true, reason: 'held on B',
+          heldBy: { 'peer-B': 'rival-b' },
+          // Repeats block-1/rival-a, which must collapse to the one pair it already is.
+          pending: [{ blockId: 'block-1', actionId: 'rival-a' }, { blockId: 'block-2', actionId: 'rival-b' }]
+        }
+      );
+
+      expect(result.success).to.be.false;
+      if (!result.success) {
+        // Each key is one peer, so the two maps merge rather than choose.
+        expect(result.heldBy).to.deep.equal({ 'peer-A': 'rival-a', 'peer-B': 'rival-b' });
+        // Deduplicated on (blockId, actionId), and stripped of transforms — deep-equal is the
+        // assertion that matters here: an entry that kept its transform fails it.
+        expect(result.pending).to.deep.equal([
+          { blockId: 'block-1', actionId: 'rival-a' },
+          { blockId: 'block-2', actionId: 'rival-b' }
+        ]);
       }
     });
   })

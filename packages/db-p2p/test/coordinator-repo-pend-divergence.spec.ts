@@ -340,6 +340,9 @@ describe('CoordinatorRepo pend — blocks held by a rival unresolved action', ()
 		expect(result.success).to.equal(false);
 		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
 		expect((result as StaleFailure).pending).to.deep.equal([{ blockId: BLOCK, actionId: 'a-rival' }]);
+		// The members' own `held` votes ride out beside the corroborated list, never folded into it:
+		// two claims from two machines, and a writer that read them as one would count one rival twice.
+		expect((result as StaleFailure).heldBy).to.deep.equal(held.heldBy);
 	});
 
 	it('returns the conflict un-enriched when local storage cannot corroborate a rival', async () => {
@@ -354,6 +357,10 @@ describe('CoordinatorRepo pend — blocks held by a rival unresolved action', ()
 		expect(isConflictFailure(result as StaleFailure)).to.equal(true);
 		expect((result as StaleFailure).pending, 'nothing corroborated, so nothing to attach').to.equal(undefined);
 		expect((result as StaleFailure).reason).to.equal(held.message);
+		// This arm is the COMMON one under delivery latency, so it is the arm that most needs to name
+		// the holder: carrying `heldBy` only where the re-read succeeded would leave the usual failure
+		// indistinguishable from silence by the time it reaches the writer.
+		expect((result as StaleFailure).heldBy).to.deep.equal(held.heldBy);
 	});
 
 	it("does not count the request's own actionId as a rival", async () => {

@@ -1,5 +1,5 @@
 import type { IBlock, BlockId, Action, ActionId, BlockContentDigests, BlockStore, Transforms, WriteDurability, WriteFailure } from "../index.js";
-import type { BlockBaseRevs, StaleFailure } from "../network/struct.js";
+import type { BlockBaseRevs, RivalHolders, StaleFailure } from "../network/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
 import type { Lane } from "../lane/lane.js";
 import { Log } from "../log/log.js";
@@ -216,6 +216,37 @@ export class RevisionStallWatch {
 	}
 }
 
+/**
+ * The unresolved rival actions `refusal` named as holding the write's blocks, or `undefined` when it
+ * named none — what separates a retry budget spent against rivals a responder can NAME from one
+ * spent against silence (see {@link RivalHolders}, carried out on
+ * {@link SyncRetryExhaustedError.rivals}).
+ *
+ * The coordinator's own corroborated rivals (`StaleFailure.pending`) win over the refusing members'
+ * signed `held` votes (`StaleFailure.heldBy`) — not because either is better evidence, but because
+ * `corroborated` has to say which one the ids came from, and a refusal carrying both carries the
+ * same rival twice. Returns `undefined`, never an empty {@link RivalHolders}: an empty one would read
+ * as "a rival was named" to anyone testing presence, which is the distinction this exists to draw.
+ *
+ * Deliberately module-private. The house pattern for reading a {@link WriteFailure} is the exported
+ * predicates in `packages/db-core/src/network/stale-failure.ts`, and this belongs there as soon as a
+ * SECOND consumer exists — the offline drain reading rivals off a returned refusal would be one —
+ * but there is none today, so exporting it now would be API nobody calls.
+ */
+function rivalsFrom(refusal: WriteFailure): RivalHolders | undefined {
+	const corroborated = distinct(refusal.pending?.map(p => p.actionId));
+	if (corroborated.length > 0) {
+		return { actionIds: corroborated, corroborated: true };
+	}
+	const voted = distinct(refusal.heldBy === undefined ? undefined : Object.values(refusal.heldBy));
+	return voted.length === 0 ? undefined : { actionIds: voted, corroborated: false };
+}
+
+/** `ids` without repeats, order preserved; empty for `undefined`. */
+function distinct(ids: readonly ActionId[] | undefined): ActionId[] {
+	return ids === undefined ? [] : [...new Set(ids)];
+}
+
 /** The sleep before the refresh that follows a write's `failures`-th consecutive loss: none while a
  * member holds the next slot for this write ({@link RevisionStallWatch.holdsSlot}), else jittered. */
 function retryBackoffMs(failures: number, watch: RevisionStallWatch, config: JitteredBackoffConfig, rand?: RandFn): number {
@@ -419,6 +450,11 @@ export class AttemptCycle {
 	// sync (which iterates many times committing progress) never trips it.
 	private consecutiveFailures = 0;
 	private lastReason: string | undefined;
+	// The rivals named by the most recent refusal that named ANY, kept on the same terms as
+	// `lastReason`: a refusal that names none leaves the previous answer standing, and forward
+	// progress discards it (see recordCommit), so a write that commits, loses and then exhausts never
+	// reports a rival from before the commit.
+	private lastRivals: RivalHolders | undefined;
 	// What the responders confirmed, and the two rules that read it (the stall check, the slot hold).
 	private readonly watch: RevisionStallWatch;
 
@@ -469,7 +505,7 @@ export class AttemptCycle {
 			throw makeAbortError(this.signal);
 		}
 		if (this.pastDeadline()) {
-			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason ?? 'deadline exceeded', this.watch.staleAt);
+			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason ?? 'deadline exceeded', this.watch.staleAt, this.lastRivals);
 		}
 		const verdict = this.watch.check(requestedRev);
 		if (verdict.kind === 'clear') {
@@ -482,7 +518,7 @@ export class AttemptCycle {
 		}
 		if (verdict.kind === 'stalled') {
 			throw new SyncRevisionStalledError(this.collectionId, this.consecutiveFailures, verdict.staleAt,
-				requestedRev, heldRev, this.lastReason);
+				requestedRev, heldRev, this.lastReason, this.lastRivals);
 		}
 	}
 
@@ -526,19 +562,22 @@ export class AttemptCycle {
 		}
 		this.consecutiveFailures++;
 		this.lastReason = refusal.reason ?? this.lastReason;
+		this.lastRivals = rivalsFrom(refusal) ?? this.lastRivals;
 		this.watch.noteRefusal(refusal.staleAt);
 		if (this.consecutiveFailures >= this.maxAttempts) {
-			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason, this.watch.staleAt);
+			throw new SyncRetryExhaustedError(this.collectionId, this.consecutiveFailures, this.lastReason, this.watch.staleAt, this.lastRivals);
 		}
 	}
 
 	/** Account for a commit — by an attempt, or by a refresh that finished the write's own entry,
 	 * which is a commit too and is reported and counted exactly like one (see {@link durability}).
-	 * Forward progress: the no-progress budget and the stall evidence start over. */
+	 * Forward progress: the no-progress budget, the stall evidence and the last refusal's diagnostics
+	 * (its reason and its named rivals) all start over. */
 	recordCommit(durability: WriteDurability): void {
 		this.durability = this.durability === undefined ? durability : mergeDurability([this.durability, durability]);
 		this.consecutiveFailures = 0;
 		this.lastReason = undefined;
+		this.lastRivals = undefined;
 		this.watch.noteCommit();
 	}
 

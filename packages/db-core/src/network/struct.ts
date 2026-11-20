@@ -272,6 +272,11 @@ export type StaleFailure = {
 	 * the presence of this field.
 	 */
 	staleAt?: { blockId: BlockId; rev: number };
+	/** Peer id → the action id that member's storage says holds the blocks this pend needs, from the
+	 *  members' signed `held` votes (`BlocksHeldError.heldBy`). A SEPARATE claim from {@link pending}:
+	 *  these are what the refusing MEMBERS reported, `pending` is what the coordinator read out of its
+	 *  own storage, and the two must not be merged into one list. */
+	heldBy?: Record<string, ActionId>;
 	/** Never set on a lost race — an expiry is its own failure shape, {@link ExpiredFailure}. */
 	expired?: never;
 	/** Never set on a lost race — a cohort too few of whose members answered is its own failure
@@ -280,6 +285,21 @@ export type StaleFailure = {
 	/** Never set on a lost race — a write judged invalid is its own failure shape,
 	 *  {@link RejectedFailure}. */
 	rejected?: never;
+};
+
+/**
+ * The unresolved rival actions some responder named as holding the blocks a write needs — the
+ * summary of {@link StaleFailure.pending} and {@link StaleFailure.heldBy} that a writer branches on.
+ * Never constructed empty: its absence is what "nobody named a rival" looks like.
+ */
+export type RivalHolders = {
+	/** Distinct action ids of the named rivals. Never empty. */
+	readonly actionIds: readonly ActionId[];
+	/** True when the coordinator read at least one holder out of its OWN storage
+	 *  ({@link StaleFailure.pending}); false when the only evidence is the refusing members' signed
+	 *  `held` votes ({@link StaleFailure.heldBy}), which is the normal shape under delivery latency.
+	 *  Diagnostic: both are a named live rival. */
+	readonly corroborated: boolean;
 };
 
 /**
@@ -315,6 +335,7 @@ export type ExpiredFailure = {
 	expired: TransactionExpiry;
 	missing?: never;
 	pending?: never;
+	heldBy?: never;
 	staleAt?: never;
 	shortfall?: never;
 	rejected?: never;
@@ -381,6 +402,7 @@ export type ShortfallFailure = {
 	shortfall: PromiseShortfall;
 	missing?: never;
 	pending?: never;
+	heldBy?: never;
 	staleAt?: never;
 	expired?: never;
 	rejected?: never;
@@ -431,6 +453,7 @@ export type RejectedFailure = {
 	rejected: TransactionInvalidity;
 	missing?: never;
 	pending?: never;
+	heldBy?: never;
 	staleAt?: never;
 	expired?: never;
 	shortfall?: never;

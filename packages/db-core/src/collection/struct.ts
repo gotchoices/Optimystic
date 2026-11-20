@@ -3,7 +3,7 @@ import type { IChainHeader } from "../chain/chain-nodes.js";
 import type { RandFn } from "../utility/backoff.js";
 import type { EntryId } from "./segments.js";
 import type { AlreadyAppliedTally } from "./action.js";
-import type { BlockBaseRevs, BlockContentDigests } from "../network/struct.js";
+import type { BlockBaseRevs, BlockContentDigests, RivalHolders } from "../network/struct.js";
 import type { Hlc } from "../hlc/hlc.js";
 import type { Lane } from "../lane/lane.js";
 
@@ -304,6 +304,11 @@ export class SyncRetryExhaustedError extends Error {
 		 * (see `StaleFailure.staleAt`). Absent whenever no rejection carried a confirmed number —
 		 * which is normal, not a signal that the failure was something other than a lost race. */
 		readonly staleAt?: { blockId: BlockId; rev: number },
+		/** The unresolved rival actions a responder named as holding this write's blocks, as of the
+		 * last refusal that named any — what separates "I lost races to writers I can name" from "I
+		 * spent my budget against silence". Absent when no refusal named one, which is what silence
+		 * looks like. */
+		readonly rivals?: RivalHolders,
 	) {
 		super(`sync for collection ${collectionId} exhausted ${attempts} retries` +
 			(lastReason ? `: ${lastReason}` : '') +
@@ -344,8 +349,9 @@ export class SyncRevisionStalledError extends SyncRetryExhaustedError {
 		 * committed nothing. */
 		readonly heldRev: number | undefined,
 		lastReason?: string,
+		rivals?: RivalHolders,
 	) {
-		super(collectionId, attempts, lastReason, staleAt);
+		super(collectionId, attempts, lastReason, staleAt, rivals);
 		// The base class's "exhausted N retries" wording is deliberately NOT reused: it reads as
 		// ordinary contention, which is exactly the misdiagnosis this class exists to prevent.
 		this.message = `sync for collection ${collectionId} stopped after ${attempts} attempts: `

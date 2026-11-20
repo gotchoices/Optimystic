@@ -1330,6 +1330,74 @@ describe('Collection', () => {
       })
     })
 
+    // A budget spent losing races to writers a responder could NAME and a budget spent against
+    // machines that never answered are two situations a caller must handle differently, and until
+    // `rivals` the only thing separating them was the prose in `lastReason`. The rivals ride all the
+    // way from the refusal to the error, so these cases are the end-to-end contract across every
+    // boundary that used to drop them (`CoordinatorRepo.answerBlocksHeld`, `refusalFrom`,
+    // `AttemptCycle.recordRefusal`).
+    describe('rivals on exhaustion', () => {
+      /** Always fails commit with the caller-supplied StaleFailure. Local for the same reason the
+       *  sibling suites' fakes are: the shared FlakyCommitTransactor must keep naming no rivals. */
+      class HeldCommitTransactor implements ITransactor {
+        constructor(private readonly inner: TestTransactor, private readonly failure: StaleFailure) {}
+        get(b: BlockGets) { return this.inner.get(b) }
+        getStatus(a: ActionBlocks[]) { return this.inner.getStatus(a) }
+        pend(r: PendRequest) { return this.inner.pend(r) }
+        cancel(a: ActionBlocks) { return this.inner.cancel(a) }
+        async commit(_request: CommitRequest): Promise<CommitResult> { return this.failure }
+      }
+
+      /** Spends the whole budget against `failure` and hands back the error it threw. */
+      const exhaustAgainst = async (failure: StaleFailure) => {
+        const transactorUnderTest = new HeldCommitTransactor(new TestTransactor(), failure)
+        const collection = await Collection.createOrOpen<TestAction>(transactorUnderTest, collectionId, initOptions)
+        await collection.act({ type: 'set', data: { value: 'never-commits', timestamp: 1 } })
+        const syncPromise = collection.sync({ maxAttempts: 3, baseBackoffMs: 1, maxBackoffMs: 5 })
+        syncPromise.catch(() => { /* asserted by the caller */ })
+        return await syncPromise.catch(e => e) as SyncRetryExhaustedError
+      }
+
+      it('names the rivals, and says whether the coordinator read them itself', async () => {
+        // Both sources in one case: they are one behaviour — the summary's precedence — and the
+        // SETUP is what would be duplicated by splitting them, not the assertion.
+        // `pending` is the coordinator's own storage read, so the rivals are corroborated.
+        const corroborated = await exhaustAgainst({
+          success: false,
+          conflict: true,
+          reason: 'pending conflict: block(s) held by unresolved rival action(s) rival-a',
+          pending: [{ blockId: 'hot-block', actionId: 'rival-a' }, { blockId: 'other-block', actionId: 'rival-a' }]
+        })
+        expect(corroborated).to.be.instanceOf(SyncRetryExhaustedError)
+        // Deduplicated: two blocks held by one action are one rival, not two.
+        expect(corroborated.rivals?.actionIds).to.deep.equal(['rival-a'])
+        expect(corroborated.rivals?.corroborated).to.equal(true)
+
+        // `heldBy` alone is the normal shape under delivery latency: the refusing member is ahead of
+        // the coordinator, so its own re-read corroborated nothing. Still a named live rival.
+        const voted = await exhaustAgainst({
+          success: false,
+          conflict: true,
+          reason: 'Pend blocks held: 2/3 member(s) hold an unresolved rival action (1/3 approvals)',
+          heldBy: { 'peer-0': 'rival-b', 'peer-1': 'rival-b' }
+        })
+        expect(voted.rivals?.actionIds).to.deep.equal(['rival-b'])
+        expect(voted.rivals?.corroborated, 'only the members named it, not our own storage').to.equal(false)
+      })
+
+      it('leaves rivals ABSENT when no refusal named one', async () => {
+        // The negative arm of the discriminator, and the whole reason it is absent rather than an
+        // empty summary: an empty `rivals` would read as "a rival was named" to a caller testing
+        // presence, which is exactly the budget-against-silence case this has to stay distinct from.
+        const err = await exhaustAgainst({ success: false, conflict: true, reason: 'always stale' })
+
+        expect(err).to.be.instanceOf(SyncRetryExhaustedError)
+        expect(err.rivals, 'nobody named a rival, so there is nothing to report').to.equal(undefined)
+        // The message is deliberately unchanged by any of this — a caller reads the field.
+        expect(err.message).to.contain(`sync for collection ${collectionId} exhausted 3 retries`)
+      })
+    })
+
     // A sync whose view of "the current revision" is WRONG rather than merely behind re-requests
     // the identical taken revision on every attempt: the refresh cannot move it (a collection never
     // lowers its held revision, and an equal or absent read leaves it unchanged), so the whole retry

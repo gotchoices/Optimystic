@@ -2524,9 +2524,18 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   `conflict: true` *unconditionally*. Its local re-read is an **enricher, not a gate**: when this
   node's own storage can corroborate the rivals they are attached as `StaleFailure.pending` and fed
   to `CoordinatorRepo.noteStuckReservation`; when it cannot — the ordinary shape under delivery
-  latency, where the refusing member is ahead of the coordinator — the conflict is returned bare,
-  and the naming falls to the members that hold the record (`cluster-member:stuck-reservation`, the
-  same counter kept per member in `ClusterMember.validatePendOperations`).
+  latency, where the refusing member is ahead of the coordinator — no rival list is attached, and the
+  stuck-reservation naming falls to the members that hold the record
+  (`cluster-member:stuck-reservation`, the same counter kept per member in
+  `ClusterMember.validatePendOperations`). The action ids the `held` votes themselves named ride out
+  on **both** arms, as `StaleFailure.heldBy` (peer id → that member's holding action id). They are
+  not the same claim as `StaleFailure.pending` and are never folded into it: `heldBy` is what the
+  refusing members reported, `pending` is what this coordinator read out of its own storage, and a
+  consumer that merged the two lists would report one rival as two. A writer summarises whichever
+  arrived into `SyncRetryExhaustedError.rivals` (`rivalsFrom` in
+  `packages/db-core/src/collection/write-attempts.ts`), which is how a write that spends its whole
+  retry budget says whether it lost to rivals it can name or spent the budget against silence — see
+  [offline-sync.md §Classifying an attempt's outcome](offline-sync.md#classifying-an-attempts-outcome).
   Gating on that re-read is what previously let a transient refusal escape as a permanent verdict on
   a small cohort, where one non-approval already sinks super-majority. Together with the bullet above
   these are the two returned refusals that are not confirmed revision losses; they are separate vote

@@ -5,7 +5,7 @@ import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struc
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
 import { assertTransactionFits, transactionBytes, MAX_TRANSACTION_BYTES } from "../network/transaction-size.js";
-import type { ActionTransforms, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability, MessageOptions } from "../index.js";
+import type { ActionTransforms, ActionPending, ActionBlocks, ActionLineage, BlockActionStatus, ITransactor, PendSuccess, CommitSuccess, StaleFailure, WriteFailure, IKeyNetwork, BlockId, GetBlockResults, PendResult, CommitResult, PendRequest, IRepo, BlockGets, Transforms, CommitRequest, ActionId, RepoCommitRequest, ClusterNomineesResult, CollectionId, IBlock, GetBlockResult, CoordinatorIntent, BlockUnavailableReason, BlockContentDigests, BlockBaseRevs, WriteDurability, MessageOptions } from "../index.js";
 import type { IBlockChangeNotifier, CollectionChangeListener } from "./change-notifier.js";
 import type { HlcClock } from "../hlc/clock.js";
 import { transformForBlockId, concatTransforms, concatTransform, transformsFromTransform, blockIdsForTransforms } from "../transform/helpers.js";
@@ -1766,6 +1766,12 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  *   can arrive with neither `missing` nor `pending` (`CoordinatorRepo.classifyStaleRejection`), so
  *   retryability has to be carried explicitly. A reason-only refusal comes out with `missing: []`.
  *
+ * The two claims about who HOLDS the blocks ride through too, each kept separate because each names
+ * only what its own source holds — `heldBy`, the refusing members' signed `held` votes, and
+ * `pending`, the rivals a coordinator read out of its own storage. Both are omitted entirely when no
+ * response carried them, so a plain stale refusal keeps exactly the shape it always had. See
+ * {@link mergedHeldBy} and {@link distinctBlockActions} for the merge and the narrowing.
+ *
  * NOTE: `some`, not `every`, for `conflict`, so a write whose batches mix a lost race with a genuine
  * hard rejection is reported retryable and burns its (bounded, backed-off) retry budget before
  * failing. Deliberate: an unclassified reason-only response from an older peer is indistinguishable
@@ -1780,13 +1786,56 @@ function refusalFrom(responses: WriteFailure[]): WriteFailure {
 	}
 	const staleAt = highestStaleAt(responses.map(r => r.staleAt));
 	const reason = responses.map(r => r.reason).find(r => r !== undefined);
+	const heldBy = mergedHeldBy(responses);
+	const pending = distinctBlockActions(responses.flatMap(r => r.pending ?? []));
 	return {
 		missing: distinctBlockActionTransforms(responses.flatMap(r => r.missing).filter((x): x is ActionTransforms => x !== undefined)),
 		...(staleAt === undefined ? {} : { staleAt }),
 		...(reason === undefined ? {} : { reason }),
+		...(heldBy === undefined ? {} : { heldBy }),
+		...(pending.length === 0 ? {} : { pending }),
 		conflict: responses.some(isConflictFailure),
 		success: false as const
 	};
+}
+
+/**
+ * Every refused response's `heldBy` as one map, or `undefined` when none carried one — the
+ * action-level answer to "which members' storage named a holder, and which action did it name?"
+ * ({@link StaleFailure.heldBy}).
+ *
+ * Keys are the REFUSING COHORT MEMBERS' peer ids, not the coordinators', so a key can repeat: two
+ * batches' cohorts may share a member, and that member can hold a different rival on each batch's
+ * blocks. The later response wins such a key — the field's shape is one action id per peer, so there
+ * is nowhere to put the other. That can drop one of several named rivals; it can never turn a named
+ * rival into silence, which is the distinction the field exists to carry, and the writer's summary
+ * ({@link StaleFailure.heldBy} → `rivalsFrom`) deduplicates the action ids anyway.
+ */
+function mergedHeldBy(responses: WriteFailure[]): Record<string, ActionId> | undefined {
+	const merged: Record<string, ActionId> = {};
+	for (const response of responses) {
+		Object.assign(merged, response.heldBy);
+	}
+	return isRecordEmpty(merged) ? undefined : merged;
+}
+
+/**
+ * The distinct `(blockId, actionId)` pairs of `pending`, each once — the rivals a coordinator's own
+ * storage named, rebuilt at action level ({@link StaleFailure.pending}).
+ *
+ * Any `transform` is deliberately STRIPPED. This rebuild is the action-level refusal and nothing
+ * rebases from it; `CoordinatorRepo.corroborateHeldBlocks` already produces entries with no
+ * transform; and a `PendRequest.policy` of `'r'` does have a producer return pending transforms, so
+ * shipping them up would inflate a refusal with payload no consumer reads.
+ */
+function distinctBlockActions(pending: ActionPending[]): ActionPending[] {
+	const actionsByBlock = new Map<BlockId, Set<ActionId>>();
+	for (const { blockId, actionId } of pending) {
+		const actions = actionsByBlock.get(blockId) ?? new Set<ActionId>();
+		actions.add(actionId);
+		actionsByBlock.set(blockId, actions);
+	}
+	return [...actionsByBlock].flatMap(([blockId, actions]) => [...actions].map(actionId => ({ blockId, actionId })));
 }
 
 /**

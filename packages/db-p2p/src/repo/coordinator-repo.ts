@@ -3400,12 +3400,14 @@ export class CoordinatorRepo implements IRepo {
 	 * rival list for {@link StaleFailure.pending} and the input {@link noteStuckReservation} needs to
 	 * name a block wedged behind a reservation that will never clear.
 	 *
-	 * NOTE: `error.heldBy` (peerId → holding action id) is dropped at this boundary, the same deliberate
-	 * drop the {@link ConflictRaceLostError} arm of {@link pendThroughCluster} documents: `StaleFailure`
-	 * has no field for it, and the members' action ids are not the same claim as the rivals this node
-	 * read out of its own storage, so they must not be folded into `pending`. A caller that wants to
-	 * WAIT on the holder rather than re-race it needs a typed field added here; never recover the ids
-	 * by parsing `reason`.
+	 * `error.heldBy` (peerId → holding action id) rides out on `StaleFailure.heldBy`, on BOTH arms —
+	 * it is what a writer that spent its whole retry budget uses to tell "I lost races to rivals I can
+	 * name" from "I spent my budget against silence" (`SyncRetryExhaustedError.rivals`, built by
+	 * `rivalsFrom` in `packages/db-core/src/collection/write-attempts.ts`), and the un-corroborated arm
+	 * is the common one, so carrying it only where the re-read succeeded would leave the usual failure
+	 * silent. It is still NOT folded into `pending`: the members' action ids and the rivals this node
+	 * read out of its own storage are different claims from different machines, and a consumer that
+	 * merged them would report one rival as two. Never recover the ids by parsing `reason`.
 	 */
 	private async answerBlocksHeld(error: BlocksHeldError, batch: PendBatch, peerCount: number): Promise<StaleFailure> {
 		const pending = await this.corroborateHeldBlocks(batch, peerCount);
@@ -3418,7 +3420,7 @@ export class CoordinatorRepo implements IRepo {
 				actionId: batch.actionId,
 				heldBy: error.heldBy
 			});
-			return { success: false, conflict: true, reason: error.message };
+			return { success: false, conflict: true, reason: error.message, heldBy: error.heldBy };
 		}
 		// Counted as its own statement, never inside the log payload below: this call is the detection
 		// mechanism, not a formatting step, and payload expressions in this repo are fair game to wrap
@@ -3440,6 +3442,7 @@ export class CoordinatorRepo implements IRepo {
 			success: false,
 			conflict: true,
 			pending,
+			heldBy: error.heldBy,
 			reason: `pending conflict: block(s) held by unresolved rival action(s) ${[...new Set(pending.map(p => p.actionId))].join(', ')}`
 		};
 	}
