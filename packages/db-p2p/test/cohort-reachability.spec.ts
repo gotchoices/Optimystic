@@ -75,6 +75,22 @@ describe('KeyNetworkCohortReachability', () => {
 		});
 	});
 
+	describe('aloneFor', () => {
+		it('is false where `reachable` is true: a cohort naming another member is reachable, not alone', async () => {
+			const gate = gateOver({ h: { members: [SELF, PARTNER] } });
+			expect(await gate.reachable([block('h')]), 'reachable').to.equal(true);
+			expect(await gate.aloneFor([block('h')]), 'alone').to.equal(false);
+		});
+
+		it('is true when this node is genuinely the whole cohort', async () => {
+			expect(await gateOver({ h: { members: [SELF] } }).aloneFor([block('h')])).to.equal(true);
+		});
+
+		it('is false on a self-only view while a remembered member is absent', async () => {
+			expect(await gateOver({ h: { members: [SELF], absent: [PARTNER] } }).aloneFor([block('h')])).to.equal(false);
+		});
+	});
+
 	describe('onChange', () => {
 		it('coalesces a connection and the identify that follows it into one wake, and wakes nobody after the last unsubscribe', async () => {
 			const events = new EventTarget();

@@ -630,6 +630,15 @@ export type BlockGets = {
 	 *  through `Collection.readCommittedTails`, which reads every watched tail on a timer. Distinct from
 	 *  `skipClusterFetch`, the sync protocol's guard, which skips every consult and never flags. */
 	skipWindowConsult?: true;
+	/** The asker wants each block's answer to rest on a consult made for this read wherever the read
+	 *  path would otherwise answer from the coordinator's own copy and consult behind the answer: a held
+	 *  block whose lazy read-repair window has expired, or that `readRepairSampleRate` picked, is consulted
+	 *  BEFORE it is answered, as under `'paranoid'`. Reads inside the window are answered as before. Set
+	 *  only by the blob reclaim pass, whose reads must be confirmable ({@link GetBlockResult.cohortConfirmed}).
+	 *  Whole-read, forwarded on every batch like {@link skipWindowConsult}. A peer that predates the field
+	 *  ignores it and answers as before, without the marker, which the asker reads as unconfirmed. When both
+	 *  are set, `awaitConsult` wins. */
+	awaitConsult?: true;
 };
 
 /**
@@ -734,6 +743,15 @@ export type GetBlockResult = {
 	 *  the content here is real, it may just be behind. Absent = confirmed, so every
 	 *  producer that omits it keeps its meaning. */
 	unconfirmedAheadRev?: number;
+	/** Set by the answering coordinator when at least one cohort member other than itself vouched for this
+	 *  answer: the consult made for this read, or the one that armed the read-repair window the answer was
+	 *  served under, heard from EVERY member of the coordinator's non-self cohort view, at least one such
+	 *  member exists, and nothing it heard is ahead of what is served; or the window was armed by a commit
+	 *  that another cohort member co-signed. POSITIVE on purpose: absent means "not known to be confirmed",
+	 *  so an answer from a repo that predates the field, a `TestTransactor`, a solo-self consult, a consult
+	 *  with a silent member, a background consult or a sync read all read as unconfirmed. Never set beside
+	 *  `unavailable` or `unconfirmedAheadRev`. Nothing but the blob reclaim pass reads it. */
+	cohortConfirmed?: true;
 	/** This repo's answer to {@link BlockGets.lineageOf}, from its OWN records only — no cohort
 	 *  view. Absent when the question was not asked, or the repo predates it. */
 	lineage?: BlockLineage;

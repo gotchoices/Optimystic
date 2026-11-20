@@ -15,6 +15,12 @@
  *
  * It also tells listeners when the answer may have improved: a connection opened, or a peer was
  * identified, debounced so the identify that follows a connection is coalesced with it.
+ *
+ * It answers one more question, for one more asker: `aloneFor` says whether this node is the WHOLE
+ * cohort of some blocks, which is a stricter thing than reachable — a cohort naming another machine
+ * is reachable and not alone. The blob reclaim pass asks it, because it may act on a block read no
+ * cohort member confirmed only on a machine that genuinely has no cohort member to ask
+ * (docs/blobs.md §Lifetime).
  */
 import type { BlockId, ICohortReachability, IKeyNetwork, RoutingKey } from '@optimystic/db-core';
 import { routingKeyForBlock } from '@optimystic/db-core';
@@ -66,8 +72,11 @@ type BlockVerdict = { readonly open: true } | { readonly open: false; readonly r
 
 const OPEN: BlockVerdict = { open: true };
 
-/** The gate a node exposes: `onChange` is always present. */
-export type NodeCohortReachability = ICohortReachability & Required<Pick<ICohortReachability, 'onChange'>>;
+/** What the blob reclaim pass needs beyond {@link ICohortReachability}: see {@link KeyNetworkCohortReachability.aloneFor}. */
+export interface CohortAloneness { aloneFor(blockIds: readonly BlockId[]): Promise<boolean>; }
+
+/** The gate a node exposes: `onChange` is always present, and `aloneFor` is answerable. */
+export type NodeCohortReachability = ICohortReachability & Required<Pick<ICohortReachability, 'onChange'>> & CohortAloneness;
 
 export class KeyNetworkCohortReachability implements NodeCohortReachability {
 	private readonly log: Logger;
@@ -102,6 +111,34 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 		const closed = verdicts.find(verdict => !verdict.open);
 		this.noteAnswer(closed);
 		return closed === undefined;
+	}
+
+	/**
+	 * True when, for every distinct block, `findCluster` assembles exactly this node and the self-only
+	 * view passes the test {@link reachable} applies to one ({@link whyNotAlone}: no remembered serving
+	 * member missing, no bootstrap peer awaited, no identify in flight). False when any cohort names
+	 * another member — unlike `reachable`, which answers true then — is empty, or its lookup throws.
+	 * Never throws.
+	 *
+	 * Why a second method rather than widening `reachable`: the blob reclaim pass may act on a read no
+	 * cohort member confirmed only when this node is the whole cohort, and `reachable` is also true when
+	 * the cohort names another member — which is exactly when such a read must not count, because that
+	 * member was either not asked or did not vouch.
+	 *
+	 * Deliberately NOT on db-core's `ICohortReachability`: that would force an answer out of
+	 * `alwaysReachable` and every other implementer for a question only a node with a real key network
+	 * can answer, and the offline queue — that interface's one consumer — does not ask it.
+	 *
+	 * One line per false answer, naming the first block that failed; `reachable`'s one-line-per-change
+	 * record ({@link noteAnswer}) is untouched, and no listener is woken.
+	 */
+	async aloneFor(blockIds: readonly BlockId[]): Promise<boolean> {
+		const distinct = [...new Set(blockIds)];
+		const judged = await Promise.all(distinct.map(async blockId => ({ blockId, reason: await this.judgeAlone(blockId) })));
+		const failed = judged.find(({ reason }) => reason !== undefined);
+		if (failed === undefined) return true;
+		this.log('reachability:not-alone reason=%s block=%s', failed.reason, failed.blockId);
+		return false;
 	}
 
 	/**
@@ -151,6 +188,24 @@ export class KeyNetworkCohortReachability implements NodeCohortReachability {
 		if (cohort.length === 0) return { open: false, reason: 'no-cohort', blockId };
 		const reason = await this.whyNotAlone(key);
 		return reason === undefined ? OPEN : { open: false, reason, blockId };
+	}
+
+	/**
+	 * Why this block's cohort is not this node alone, or `undefined` when it is ({@link aloneFor}).
+	 * `'other-members'` is the one reason {@link judgeCohort} does not have: there it OPENS the gate.
+	 * A lookup that throws is a reason rather than a rejection, so one bad block closes `aloneFor`
+	 * without failing it.
+	 */
+	private async judgeAlone(blockId: BlockId): Promise<UnreachableReason | 'other-members' | undefined> {
+		try {
+			const key = routingKeyForBlock(blockId);
+			const cohort = Object.keys(await this.deps.keyNetwork.findCluster(key));
+			if (cohort.some(peerId => peerId !== this.deps.selfId)) return 'other-members';
+			if (cohort.length === 0) return 'no-cohort';
+			return await this.whyNotAlone(key);
+		} catch {
+			return 'lookup-failed';
+		}
 	}
 
 	/** For a self-only view: what says it may not be the whole cohort, or `undefined` when this node is genuinely alone. */

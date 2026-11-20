@@ -403,6 +403,25 @@ type CurrencyVerdict =
 	| { kind: 'unsettled-claim'; rev: number; claimants: readonly string[]; silent: readonly string[] };
 
 /**
+ * Whether a consult's outcome lets the answers it marks carry {@link GetBlockResult.cohortConfirmed}:
+ * every member of the non-self cohort view answered, at least one exists, nothing heard is ahead of
+ * what this node serves, and the pass did not end on a claim it could not settle. Deliberately
+ * conservative: partial silence does not vouch, although the read path serves it unflagged and arms the
+ * window on it — a silent member may hold a revision the others missed, and the one consumer of this
+ * marker deletes data.
+ *
+ * NOTE: for a HELD block this needs a corroborated revision, since the no-quorum path reports any
+ * claim at all as `absence === 'claimed'`. So a cohort that cannot field the corroboration quorum
+ * however it answers — the undeclared two-machine deployment, whose `cohort-too-small` decline is
+ * already recorded two exits below — never confirms a held block, and the blob reclaim pass there
+ * keeps every blob. Fail-safe, and no worse than before the marker existed; if such a deployment ever
+ * needs reclaiming, the fix is declaring its `clusterSize`, which makes its sole partner a quorum.
+ */
+function consultVouches(answered: readonly string[], silent: readonly string[], currency: CurrencyVerdict, absence: AbsenceVerdict): boolean {
+	return answered.length > 0 && silent.length === 0 && currency.kind === 'nothing-ahead' && absence !== 'claimed';
+}
+
+/**
  * Extended cluster interface that includes the ability to check if a transaction was executed.
  * This is used by CoordinatorRepo to avoid duplicate execution.
  */
@@ -632,12 +651,20 @@ export interface ICoordinatorClusterSeam {
  * ({@link CoordinatorRepo.quietCohortStillVouches}). Every other stamp carries none, so any other
  * marking — a commit, the solo-self exit, a consult that did not hear from everyone — ends the span.
  * `quietLogged` says the span has already been reported once.
+ *
+ * `vouched` says whether a cohort member other than this node stood behind what the marking pass
+ * established, so an answer served under this stamp may carry
+ * {@link GetBlockResult.cohortConfirmed}. Absent means not vouched, which is the honest reading for
+ * every stamp whose pass asked nobody (the solo-self exit, a solo commit) and for one written by a
+ * test seam. Every caller of {@link CoordinatorRepo.markBlocksSeen} states it, so an exit added later
+ * has to decide rather than inherit a default.
  */
 interface FreshnessStamp {
 	at: number;
 	floorConsulted?: number;
 	quiet?: QuietCohort;
 	quietLogged?: boolean;
+	vouched?: true;
 }
 
 /**
@@ -1056,6 +1083,14 @@ export class CoordinatorRepo implements IRepo {
 	 * span holds ({@link quietCohortStillVouches}): its last consult heard from every member of a cohort
 	 * in which every commit needs every member, and none of them has disconnected since.
 	 *
+	 * Each path says whether the answer it leaves is one a cohort member outside this node vouched for
+	 * ({@link markCohortConfirmed}): the blocking consult's own verdict, or the window stamp's for a read
+	 * served inside the window or under a quiet span. The paths that answer from the local copy without a
+	 * consult ANYBODY waited on — the `skipWindowConsult` opt-out, a consult started behind the read, and
+	 * a consult that threw — leave the answer unmarked, which reads as "not known to be confirmed". A
+	 * read that sets {@link BlockGets.awaitConsult} moves the window's consult back in front of the
+	 * answer so it can be marked, and overrides the `skipWindowConsult` opt-out.
+	 *
 	 * A consult this pass waits on joins `round` (the read's {@link ConsultRound}, when there is one) and
 	 * asks each peer through it; one it starts behind the read joins the shared background round
 	 * instead, when coalescing is on ({@link startHeldBlockConsult}). It joins the read's round before
@@ -1088,22 +1123,33 @@ export class CoordinatorRepo implements IRepo {
 			// serve the same content as confirmed — the exact silent lie this marker exists
 			// to end, re-opened for `readRepairWindowMs` at a time.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			// The stamp of the pass that armed this window says whether a cohort member vouched for it.
+			// Read from the map rather than the local `stamp` below, which exists only for an expired
+			// window. Gated on the mode because `readRepairMode: 'off'` never consults a held block, so
+			// an `'off'` node's stamp can be arbitrarily old; in `'lazy'` it is at most one
+			// `readRepairWindowMs` old, or a quiet span's length. Consequence, stated out loud: on an
+			// `'off'` node no held block is ever reported confirmed.
+			this.markCohortConfirmed(results, blockId, this.readRepairMode !== 'off' && this.lastSeenCommitMs.get(blockId)?.vouched === true);
 			return;
 		}
 
 		// `readRepairDemand` asks on every read under `'paranoid'`, so the mode is tested here
 		// rather than inferred from `windowDemands`.
 		const windowOnly = isStale && !floorDemands && this.readRepairMode === 'lazy';
-		if (windowOnly && blockGets.skipWindowConsult) {
+		if (windowOnly && blockGets.skipWindowConsult && !blockGets.awaitConsult) {
 			// The asker opted out of exactly this consult (`BlockGets.skipWindowConsult`): served from the
 			// local copy with the memo's stamp, and the window left expired so the next read consults.
+			// `BlockGets.awaitConsult` wins over the opt-out: an asker that needs a confirmable answer
+			// is asking for the consult this flag skips.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			return;
 		}
 		// Only an expired window can be answered by a quiet span: a sample is an operator's request for a
 		// consult, and an unstamped block has no span to extend.
 		const stamp = windowOnly && windowDemand === 'expired' ? this.lastSeenCommitMs.get(blockId) : undefined;
-		const background = windowOnly && !this.awaitWindowConsults;
+		// `BlockGets.awaitConsult` moves the window's consult back in FRONT of the answer, so the answer
+		// can carry the consult's verdict ({@link GetBlockResult.cohortConfirmed}).
+		const background = windowOnly && !this.awaitWindowConsults && !blockGets.awaitConsult;
 		// A consult that will run in the shared background round takes no seat in this read's round, so
 		// reserving one here would only hold back the read's other consults across the quiet-span await.
 		const reserved = stamp?.quiet && !(background && this.backgroundRounds) ? round?.join(blockGets.context) : undefined;
@@ -1112,6 +1158,10 @@ export class CoordinatorRepo implements IRepo {
 			// Served exactly as a read inside the window is, and the stamp is left as it is, so the span
 			// still ends `readRepairQuietWindowMs` after the consult that started it.
 			this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
+			// The span's own guarantee is that every member of a cohort whose commits need all of them
+			// has stayed connected since the consult that stamped it, so that consult's verdict still
+			// stands for this answer.
+			this.markCohortConfirmed(results, blockId, stamp.vouched === true);
 			return;
 		}
 		const asker = askerStatementFor(blockGets, blockId, options?.asker, localEntry?.state?.latest);
@@ -1133,7 +1183,7 @@ export class CoordinatorRepo implements IRepo {
 		const passSeq = this.nextPassSeq();
 		const seat = reserved ?? round?.join(blockGets.context);
 		try {
-			const { absence, currency, heldBySilence } = await leavingSeat(seat, this.fetchBlockFromCluster(blockId, blockGets.context, held, floor, asker, seat));
+			const { absence, currency, vouched, heldBySilence } = await leavingSeat(seat, this.fetchBlockFromCluster(blockId, blockGets.context, held, floor, asker, seat));
 			// A missing block consults on every read whatever the hold says, so its silences place none.
 			if (!isMissing) this.noteConsultOutcome(blockId, heldBySilence);
 			// `lineageOf` rides along: the refreshed entry REPLACES the local one below, and an
@@ -1167,6 +1217,9 @@ export class CoordinatorRepo implements IRepo {
 				this.recordAheadClaim(blockId, currency, passSeq);
 				this.flagUnconfirmedCurrency(results, blockId, blockGets.context);
 			}
+			// Last, so it sees the entry the consult refreshed and every doubt flag applied above: the
+			// marker and a doubt marker must never sit on the same answer.
+			this.markCohortConfirmed(results, blockId, vouched);
 		} catch (err) {
 			this.log('cluster-fetch:error', { blockId, background: false, error: (err as Error).message });
 			// The consult that was supposed to make this answer trustworthy did not run.
@@ -1245,6 +1298,20 @@ export class CoordinatorRepo implements IRepo {
 		} else if (entry.block === undefined && !entry.state?.latest && entry.unavailable === undefined) {
 			entry.unavailable = reason;
 		}
+	}
+
+	/**
+	 * Mark this block's answer as one a cohort member outside this node vouched for
+	 * ({@link GetBlockResult.cohortConfirmed}), when `vouched` and the entry carries neither
+	 * `unavailable` nor `unconfirmedAheadRev` — the marker and a doubt marker must never sit together,
+	 * since its one consumer, the blob reclaim pass, deletes data on it. Callers pass the verdict of the
+	 * consult the answer rests on and call this LAST, once the entry and its flags are final.
+	 */
+	private markCohortConfirmed(results: GetBlockResults, blockId: BlockId, vouched: boolean): void {
+		if (!vouched) return;
+		const entry = results[blockId];
+		if (!entry || entry.unavailable !== undefined || entry.unconfirmedAheadRev !== undefined) return;
+		entry.cohortConfirmed = true;
 	}
 
 	/**
@@ -1501,19 +1568,24 @@ export class CoordinatorRepo implements IRepo {
 	}
 
 	/**
-	 * Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). `floor` is
-	 * the asker's floor the marking pass consulted under, recorded so a later read under the same
-	 * floor does not consult again inside the window; omitted (a commit, or a pass not asked one) it
-	 * clears any floor recorded before. `quiet` starts a quiet span ({@link quietSpanStartedBy});
-	 * omitted, it ends any span recorded before — see {@link FreshnessStamp}.
+	 * Mark blocks as freshly observed from cluster authority (post-commit or post-fetch). `basis` says
+	 * what the marking pass established. `basis.vouched` is whether a cohort member other than this node
+	 * stood behind it, which is what lets a read served under the stamp carry
+	 * {@link GetBlockResult.cohortConfirmed}; it is required so every exit states it rather than
+	 * inheriting a default. `basis.floor` is the asker's floor the pass consulted under, recorded so a
+	 * later read under the same floor does not consult again inside the window; omitted (a commit, or a
+	 * pass not asked one) it clears any floor recorded before. `basis.quiet` starts a quiet span
+	 * ({@link quietSpanStartedBy}); omitted, it ends any span recorded before — see
+	 * {@link FreshnessStamp}.
 	 */
-	private markBlocksSeen(blockIds: readonly BlockId[], floor?: number, quiet?: QuietCohort): void {
+	private markBlocksSeen(blockIds: readonly BlockId[], basis: { vouched: boolean; floor?: number; quiet?: QuietCohort }): void {
 		const now = this.now();
 		for (const id of blockIds) {
 			this.lastSeenCommitMs.set(id, {
 				at: now,
-				...(floor === undefined ? {} : { floorConsulted: floor }),
-				...(quiet === undefined ? {} : { quiet })
+				...(basis.floor === undefined ? {} : { floorConsulted: basis.floor }),
+				...(basis.quiet === undefined ? {} : { quiet: basis.quiet }),
+				...(basis.vouched ? { vouched: true } : {})
 			});
 		}
 	}
@@ -1663,7 +1735,9 @@ export class CoordinatorRepo implements IRepo {
 	 * during its consensus round, not a retried or carried delivery.
 	 */
 	noteCohortCommitApplied(applied: CohortCommitApplied): void {
-		if (this.commitQuorumRulesOutRivals(applied.approvals, applied.cohortSize)) this.markBlocksSeen(applied.blockIds);
+		// A cohort of more than one means a member outside this node signed the commit, so the blocks it
+		// landed are vouched for; `cohortSize` counts this node (`Object.keys(record.peers).length`).
+		if (this.commitQuorumRulesOutRivals(applied.approvals, applied.cohortSize)) this.markBlocksSeen(applied.blockIds, { vouched: applied.cohortSize > 1 });
 	}
 
 	/**
@@ -1772,6 +1846,11 @@ export class CoordinatorRepo implements IRepo {
 	 * The background pass itself: the same consult, memo update and outcome line as the blocking path
 	 * in {@link readRepairBlock}, minus the absence verdict (the block is held). Never rejects: an error
 	 * is logged and the memo stands, since a thrown consult refutes nothing — as on the blocking path.
+	 *
+	 * The consult's `vouched` verdict is ignored here: the read this pass runs behind has already been
+	 * answered, so nothing it learns can mark that answer. What it does reach is the WINDOW's stamp,
+	 * which `fetchBlockFromCluster` writes itself, so the next read inside the window it arms is marked
+	 * from the stamp ({@link markCohortConfirmed}).
 	 */
 	private async runHeldBlockConsult(blockId: BlockId, context: ActionContext | undefined, held: ActionRev | undefined, floor: number | undefined, asker: AskerStatement | undefined, passSeq: number, seat: ConsultSeat | undefined): Promise<void> {
 		try {
@@ -1865,6 +1944,11 @@ export class CoordinatorRepo implements IRepo {
 	 *    retire it when the memo's claimants are among the peers that answered), `no-evidence`
 	 *    leaves it standing untouched. Required, not optional, so an exit added later has to say
 	 *    which it means.
+	 *  - `vouched` — whether a cohort member other than this node stood behind the outcome
+	 *    ({@link consultVouches}), which is what lets `get` mark the answer
+	 *    {@link GetBlockResult.cohortConfirmed} and what the window's stamp records for the reads
+	 *    served under it. Required for the same reason `currency` is: every exit that asks nobody
+	 *    answers `false`, and one added later has to choose.
 	 *
 	 * Nothing is remembered about an absence: `get` runs this pass on every read of a block missing
 	 * locally (see the accepted-tradeoff NOTE there).
@@ -1896,8 +1980,8 @@ export class CoordinatorRepo implements IRepo {
 		floor?: number,
 		asker?: AskerStatement,
 		seat?: ConsultSeat
-	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict; heldBySilence?: readonly string[] }> {
-		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' } };
+	): Promise<{ absence: AbsenceVerdict; currency: CurrencyVerdict; vouched: boolean; heldBySilence?: readonly string[] }> {
+		if (!this.clusterLatestCallback) return { absence: 'confirmed', currency: { kind: 'no-evidence' }, vouched: false };
 		const localRev = held?.rev;
 
 		const peers = await this.keyNetwork.findCluster(routingKeyForBlock(blockId));
@@ -1912,7 +1996,7 @@ export class CoordinatorRepo implements IRepo {
 		// blip, and re-entering costs no network work beyond the `findCluster` the read already
 		// makes. Do not "fix" this by symmetry with the solo-self exit.
 		// Currency: nobody was asked, so nothing was refuted — an earlier pass's unsettled claim stands.
-		if (peerIds.length === 0) return { absence: 'unasked', currency: { kind: 'no-evidence' } };
+		if (peerIds.length === 0) return { absence: 'unasked', currency: { kind: 'no-evidence' }, vouched: false };
 
 		// Solo-cluster short-circuit: the only responsible peer is us. There is no
 		// remote to sync from, so skip the callback entirely. Querying ourselves
@@ -1947,7 +2031,7 @@ export class CoordinatorRepo implements IRepo {
 			// The floor is recorded with the stamp for the same reason: a one-machine deployment
 			// holding a floor it cannot meet (an abandoned entry's) consults once per window per
 			// block, not once per read.
-			if (!namedThisWindow) this.markBlocksSeen([blockId], floor);
+			if (!namedThisWindow) this.markBlocksSeen([blockId], { vouched: false, floor });
 			// Currency: this exit queried NOBODY, so it refutes nothing — an earlier pass's unsettled
 			// claim survives it. Note the coupling with the arming just above: retained doubt now
 			// persists for up to `readRepairWindowMs` before a consult can refute it. That is correct
@@ -1956,7 +2040,8 @@ export class CoordinatorRepo implements IRepo {
 			// the memo are answers to different questions; do not collapse them.
 			// Absence: `unasked`, for the same reason — this view may simply not have identified its
 			// peers yet, which only the asker's floor can contradict (see `unavailableReasonFor`).
-			return { absence: 'unasked', currency: { kind: 'no-evidence' } };
+			// Nothing vouches for an answer nobody was asked about.
+			return { absence: 'unasked', currency: { kind: 'no-evidence' }, vouched: false };
 		}
 
 		const cohortBefore = await this.connectedCohortBeforeConsult(blockId, peerIds.length);
@@ -2035,6 +2120,8 @@ export class CoordinatorRepo implements IRepo {
 					&& (uncorroboratedBaseline === undefined || uncorroboratedRev > uncorroboratedBaseline)
 					? { kind: 'unsettled-claim', rev: uncorroboratedRev, claimants: claimantsAtOrAbove(uncorroboratedRev), silent }
 					: nothingAheadVerdict;
+			// Both returns below share this `(absence, currency)` pair, so the predicate is applied once.
+			const vouched = consultVouches(answered, silent, currency, absence);
 			// Arm the lazy read-repair window when — and only when — the decline is provably
 			// PERMANENT for the cohort-size reason: `cohort-too-small` means the cohort cannot field
 			// the quorum even if every member answered and agreed (an undeclared two-machine cohort
@@ -2052,14 +2139,14 @@ export class CoordinatorRepo implements IRepo {
 			// reportRepairDeadlock is what lets the window re-arm after it expires without the log
 			// repeating.
 			if (deadlock === 'cohort-too-small') {
-				this.markBlocksSeen([blockId], floor, currency.kind === 'nothing-ahead' ? quietSpanAt(local ?? held) : undefined);
-				return { absence, currency };
+				this.markBlocksSeen([blockId], { vouched, floor, quiet: currency.kind === 'nothing-ahead' ? quietSpanAt(local ?? held) : undefined });
+				return { absence, currency, vouched };
 			}
 			// Left unarmed so a peer that recovers is heard, but held so the next read does not re-ask at
 			// once: on a slow link that is one consult per per-peer deadline, each queued behind the one
 			// that went unanswered. (A silent pass never yields `cohort-too-small` — see
 			// `classifyRepairDeadlock` — so no pass is both armed and held.)
-			return silent.length > 0 ? { absence, currency, heldBySilence: silent } : { absence, currency };
+			return silent.length > 0 ? { absence, currency, vouched, heldBySilence: silent } : { absence, currency, vouched };
 		}
 
 		// The self answer is the sharper baseline (same storage, same context, read alongside the
@@ -2108,14 +2195,15 @@ export class CoordinatorRepo implements IRepo {
 				voters: corroboration?.voters,
 				...(corroboration?.certified ? { certified: true } : {})
 			});
-			this.markBlocksSeen([blockId], floor, quietSpanAt(local ?? held));
+			const vouched = consultVouches(answered, silent, nothingAheadVerdict, silenceVerdict);
+			this.markBlocksSeen([blockId], { vouched, floor, quiet: quietSpanAt(local ?? held) });
 			// Only reachable when this node HOLDS a revision (the baseline), so `get` never
 			// consults this verdict — computed consistently rather than hard-coded.
 			// Currency: the cohort corroborated at or below what this node holds, so nothing is
 			// ahead. Only reachable when a peer answered (a corroboration requires claims), so the
 			// shared verdict resolves to `nothing-ahead` and a memo whose claimants are among those
 			// answers is cleared.
-			return { absence: silenceVerdict, currency: nothingAheadVerdict };
+			return { absence: silenceVerdict, currency: nothingAheadVerdict, vouched };
 		}
 
 		// Corroborated revision is ahead of ours — converge onto it.
@@ -2159,16 +2247,18 @@ export class CoordinatorRepo implements IRepo {
 		// just failed on this cohort is not made to succeed by re-asking seconds later — but if a
 		// profile ever shows floored reads stuck a window behind a revision the cohort holds, record
 		// the floor only when `converged` and let the floor be the retry cadence for this exit.
-		// A quiet span starts only when the pass reached exactly the corroborated revision, whose action
-		// is then the one this node holds.
-		this.markBlocksSeen([blockId], floor, converged && rev === corroborated.rev ? quietSpanAt(corroborated) : undefined);
 		// Converged: the corroboration is itself the evidence that nothing is ahead, and it came from
 		// peers that answered — the shared verdict resolves to `nothing-ahead`, and the memo retires
-		// if its claimants are among those peers.
+		// if its claimants are among those peers. Computed ahead of the stamp below, which records
+		// whether this outcome vouches for the answers served under it.
 		const currency: CurrencyVerdict = converged
 			? nothingAheadVerdict
 			: { kind: 'unsettled-claim', rev: corroborated.rev, claimants: claimantsAtOrAbove(corroborated.rev), silent };
-		return { absence, currency };
+		const vouched = consultVouches(answered, silent, currency, absence);
+		// A quiet span starts only when the pass reached exactly the corroborated revision, whose action
+		// is then the one this node holds.
+		this.markBlocksSeen([blockId], { vouched, floor, quiet: converged && rev === corroborated.rev ? quietSpanAt(corroborated) : undefined });
+		return { absence, currency, vouched };
 	}
 
 	/**
@@ -3605,6 +3695,9 @@ export class CoordinatorRepo implements IRepo {
 			// whole commit runs on that one cohort — so a per-block verdict would be measuring a
 			// quorum that never voted. If commits ever coordinate per-block cohorts separately (see
 			// `debt-sender-side-coordinating-block-binding-is-unchecked`), this must follow them.
+			// Every stamp this path writes is VOUCHED (`markBlocksSeen`'s `basis.vouched`): cluster
+			// consensus ran, so at least one cohort member outside this node signed the revision the
+			// stamp covers — the `commitSolo` path, where nobody else did, stamps unvouched.
 			const armFreshness = this.commitQuorumRulesOutRivals(countApprovingCommitVotes(record), peerCount);
 			// THE DURABILITY GATE. A commit is acknowledged to the writer only when more than half of
 			// the cohort it ran on (`record.peers`) reports that its storage durably holds the
@@ -3682,7 +3775,7 @@ export class CoordinatorRepo implements IRepo {
 				if (!isDurableMajority(durableHolders, durability.cohortPeerIds.length)) {
 					return this.refuseCommitNotDurable(batch, durableHolders, durability, 'local-executed');
 				}
-				if (armFreshness) this.markBlocksSeen(blockIds);
+				if (armFreshness) this.markBlocksSeen(blockIds, { vouched: true });
 				return await this.acknowledgeCommit(batch, { success: true, durability: this.cohortWriteDurability(durability, localDurable) }, localDurable, record);
 			}
 			// Local cluster didn't execute during consensus. Attempt a local commit, but tolerate
@@ -3722,7 +3815,7 @@ export class CoordinatorRepo implements IRepo {
 			// is in the cohort) form the majority, and this node now holds it. Storage's own `local`
 			// answer is replaced by the cohort's — this node counts exactly as the gate counted it,
 			// i.e. only when it is a cohort member.
-			if (armFreshness) this.markBlocksSeen(blockIds);
+			if (armFreshness) this.markBlocksSeen(blockIds, { vouched: true });
 			// The fallback commit landed every block, so this node holds them — whether or not it is
 			// a cohort member — and can source a push to whoever the class names as missing.
 			return await this.acknowledgeCommit(batch, { ...local.held, durability: this.cohortWriteDurability(durability, selfInCohort) }, true, record);
@@ -3909,7 +4002,7 @@ export class CoordinatorRepo implements IRepo {
 			return this.refuseCommitNotDurable(batch, durability.remoteHolders.length, durability, `fallback-diverged: ${detail}`);
 		}
 		this.log('coordinator-repo:commit-local-failed-cluster-succeeded', { actionId: batch.actionId, error: detail });
-		if (armFreshness) this.markBlocksSeen(batch.blockIds);
+		if (armFreshness) this.markBlocksSeen(batch.blockIds, { vouched: true });
 		// This node holds nothing: it is an UNCONFIRMED member when it is in the cohort (so the class
 		// is `majority`), and simply absent from the count when it is not (so the class can be `full`
 		// when every member confirmed). Both fall out of the one rule in `cohortWriteDurability`.
@@ -4204,7 +4297,7 @@ export class CoordinatorRepo implements IRepo {
 		// commitQuorumRulesOutRivals — so the window stays unarmed and the read path's
 		// solo-self-skip exit re-arms it once per consult instead (which keeps GitHub issue #8's
 		// consult storm bounded at one per window).
-		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds);
+		if (this.commitQuorumRulesOutRivals(1, peerCount)) this.markBlocksSeen(blockIds, { vouched: false });
 		return await this.acknowledgeCommit(batch, { ...result, durability: soloDurability }, true);
 	}
 
