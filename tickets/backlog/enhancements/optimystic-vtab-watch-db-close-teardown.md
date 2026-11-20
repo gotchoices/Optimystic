@@ -53,3 +53,7 @@ shared `StorageRepo` and no post-close `notifyExternalChange` dispatch occurs.
 
 - A host-called teardown hook now exists: `plugin.dispose()`, which the README tells hosts to call after `db.close()`. The network-watch half of the plugin work releases its subscriptions there (`CollectionFactory.watchCollectionOverNetwork` tracks its handles and closes them in `dispose()`). The local storage listener could be released the same way — tracked by the factory and released in `dispose()` — which would close this ticket for hosts that call `dispose()` without any Quereus change.
 - Added cost while the leak stands: a table tagged `optimystic.network_watch` on a `Database` closed without `dispose()` keeps its network subscription alive until the node stops — a renewal and a tail read about every 30 s, plus a logged no-op `notifyExternalChange` per announcement.
+
+## Addendum (from `feat-a-network-watch-wake-sees-the-whole-commit`)
+
+- A tagged table now opens one network watch per collection it owns — its rows, each secondary index, each synthesized unique-enforcement index, and its blob reference tree — rather than one for the table. So the leaked cost above is multiplied by the table's collection count: that many renewals and tail reads every tick, and that many logged no-op `notifyExternalChange` dispatches per remote write. The root cause and the fix are unchanged; only the magnitude is larger than this ticket's original note says.
