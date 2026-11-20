@@ -37,3 +37,9 @@ Only cohorts that can reach their promise bar without one member: `cohortCanMiss
 ## The refusal is not reported as final
 
 Measured on the same spec (phase 4 now prints it): N's write reaches the caller as `TornActionError` with `final: false` — "whether the write is saved could not be established" — although all four members answered that they do not hold it (`commit-not-durable: 0 of 4 cohort member(s) report holding rev 3`) and the fork guard deleted each member's pending record when it refused. So the application is told to read back before resubmitting rather than that it may resubmit. That is conservative, never unsafe, but it is the wrong signal for a write that can never land. Fixing the retry above removes this outcome in this shape; if the retry fix does not land first, `Collection`'s classification of an all-members-answered `commit-not-durable` refusal is the site to look at.
+
+## Arm: a second way the hold ends, once reservations have a time limit (2026-11-20)
+
+`implement/1-a-pending-record-reserves-its-block-only-for-a-bounded-time` makes a pending record stop reserving its block once it has stood for longer than the node's lease (five minutes by default). This ticket's loop is reached by a second route after that lands: today N is held until R's data-block commit arrives and then re-pends on its stale base; with the lease, a rival R whose commit never arrives at all also stops holding N, and N's next pend — still on the base it read before R existed — is admitted and then refused by the fork guard exactly as described above.
+
+Nothing about the fix changes: the signal N needs is the same (a held refusal naming a rival the handle's own log already lists as committed means its copy of that block is behind), and the site is the same. What changes is that the shape no longer needs R to commit, so a reproduction need not drive R's commit to completion.
