@@ -211,6 +211,11 @@ describe('blob fetcher', function () {
 			expect(held).to.deep.equal([true, true, true, true, false, false, false, false]);
 			expect(await bPieces.has(firstSession[0]!), 'the list piece was kept').to.equal(true);
 			expect(firstSession.slice(1)).to.deep.equal(data.slice(0, 4));
+			// The fetch wrote the blob's size as soon as its plan read it off the root list piece, so the
+			// cache budget can cost the half-finished download B is now holding (docs/blobs.md §Lifetime).
+			// Only `[ref, bytes]`: the entry's `lastReadAt` is a real clock reading.
+			const cached = await b.blobs.local.cachedBlobs();
+			expect(cached.map(blob => [blob.ref, blob.bytes])).to.deep.equal([[ref, content.byteLength]]);
 
 			release();
 			await fetcher.start(ref, request).done;

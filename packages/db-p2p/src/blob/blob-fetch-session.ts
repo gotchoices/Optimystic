@@ -81,6 +81,10 @@ export class FetchSession implements BlobFetchSession {
 	private retryDelayMs = BLOB_WAIT_RETRY_INITIAL_MS;
 	private piecesStored = 0;
 	private bytesStored = 0;
+	/** Set once `holdCached` has resolved: before that there may be no record for a size to be written to. */
+	private held = false;
+	/** Whether this session has already written the blob's size ({@link noteSize}). */
+	private sizeNoted = false;
 	private outcome: Outcome | undefined;
 	private resolveDone!: () => void;
 	private rejectDone!: (reason: unknown) => void;
@@ -119,6 +123,7 @@ export class FetchSession implements BlobFetchSession {
 			return;
 		}
 		await this.ctx.store.holdCached(this.ref);
+		this.held = true;
 		// Planned again under the hold: a sweep may have removed pieces the unheld walk saw present, and
 		// the hold protects whatever this walk sees.
 		let plan = await this.plan();
@@ -403,7 +408,40 @@ export class FetchSession implements BlobFetchSession {
 				listSize = entry.fileBytes;
 			}
 		}
-		return { missing: [...missing], listSize };
+		const plan = { missing: [...missing], listSize };
+		await this.noteSize(plan);
+		return plan;
+	}
+
+	/**
+	 * Writes the blob's full size onto the record as soon as a plan has read it off the root list piece
+	 * — under the `cached` hold, once per session, and before the transfer rather than at `finish`.
+	 *
+	 * `finish` is too late for the cache budget (docs/blobs.md §Lifetime): a fetch that is cancelled or
+	 * runs out of holders never reaches it, and a ranged fetch writes no size there at all, so the blob
+	 * this node now holds part of would be one whose cost the budget cannot name. Nothing is lost by
+	 * writing early — `markPartial` only sets the size and leaves `whole: false`, which is what the
+	 * record already says, and `finish` sets it back to true for a whole fetch.
+	 *
+	 * A single-piece blob has no list root, so no plan of it carries a size; such a blob is either
+	 * absent here or whole, and `finish` sizes the whole case.
+	 *
+	 * NOTE: the one exception is a RANGED fetch of a single-piece blob — no list root for this to read a
+	 * size off, and `finish` writes none for a ranged request, so the record is left unsized and the
+	 * cache budget evicts the blob at its next enforcement. Harmless while nothing asks for byte ranges,
+	 * and bounded when something does (one wasted fetch of at most 256 KiB per ranged read, never
+	 * unbounded storage). If ranged reads become ordinary
+	 * (`blocked/quereus-reads-and-writes-a-range-of-a-large-value`), size such a blob from the root
+	 * piece's own length, which `finish` already reads for the unranged case.
+	 */
+	private async noteSize(plan: Plan): Promise<void> {
+		if (this.sizeNoted || !this.held || plan.listSize === undefined) {
+			return;
+		}
+		// Set before the write, not after: `markPartial` logs its own failures rather than throwing, so a
+		// retry would never happen anyway, and this keeps one write per session either way.
+		this.sizeNoted = true;
+		await this.ctx.store.markPartial(this.ref, plan.listSize);
 	}
 
 	private async succeed(): Promise<void> {

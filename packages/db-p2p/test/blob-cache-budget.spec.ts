@@ -1,11 +1,12 @@
 /**
- * Ticket: feat-blob-cached-copies-stay-within-a-budget (docs/blobs.md §Lifetime).
+ * Tickets: feat-blob-cached-copies-stay-within-a-budget and
+ * the-blob-cache-budget-counts-a-partly-held-blob-as-nothing (docs/blobs.md §Lifetime).
  *
  * The blobs a machine keeps only because it read them are evicted, least recently read first, once
- * they take more space than the budget allows — and never while one of them is being read. These two
- * specs run `BlobCacheBudget` over a real `LocalBlobService`, so what they pin is the whole path: the
- * enumeration of cache-only records, the ordering, the conditional hold removal, and the piece sweep
- * that follows it.
+ * they take more space than the budget allows — never while one of them is being read, and always
+ * when the machine never learned how big one of them is. These specs run `BlobCacheBudget` over a
+ * real `LocalBlobService`, so what they pin is the whole path: the enumeration of cache-only records,
+ * the ordering, the conditional hold removal, and the piece sweep that follows it.
  */
 
 import { expect } from 'chai';
@@ -100,16 +101,34 @@ async function holdCachedAt(kv: IKVStore, ref: BlobRef, at: number, lastReadAt?:
 
 /** A blob held by a `cached` hold alone, read again at `lastReadAt` after the fetch that brought it. */
 async function cacheOnlyBlob(service: LocalBlobService, kv: IKVStore, seed: number, lastReadAt: number): Promise<{ ref: BlobRef; content: Uint8Array }> {
-	return heldForReadsAlone(service, kv, seed, lastReadAt, lastReadAt);
+	return heldForReadsAlone(service, kv, bytesOf(BLOB_BYTES, seed), lastReadAt, lastReadAt);
 }
 
 /** The same, with no `lastReadAt` at all: fetched at `at` and not read again since. */
 async function justFetchedBlob(service: LocalBlobService, kv: IKVStore, seed: number, at: number): Promise<{ ref: BlobRef; content: Uint8Array }> {
-	return heldForReadsAlone(service, kv, seed, at, undefined);
+	return heldForReadsAlone(service, kv, bytesOf(BLOB_BYTES, seed), at, undefined);
 }
 
-async function heldForReadsAlone(service: LocalBlobService, kv: IKVStore, seed: number, at: number, lastReadAt: number | undefined): Promise<{ ref: BlobRef; content: Uint8Array }> {
-	const content = bytesOf(BLOB_BYTES, seed);
+/**
+ * A blob held for reads alone whose record carries no `size` at all. A fetch writes the size as soon
+ * as its plan reads it off the root list piece, so what is left of this state is the window between
+ * that piece arriving and the write, which a crash can catch — and every record written before
+ * `BlobFetchStore.markPartial` existed. Its pieces are all here, which is what makes the behaviour
+ * under test visible: a blob the budget cannot cost at all.
+ */
+async function unsizedBlob(service: LocalBlobService, kv: IKVStore, seed: number, at: number): Promise<{ ref: BlobRef; content: Uint8Array }> {
+	const blob = await heldForReadsAlone(service, kv, bytesOf(BLOB_BYTES, seed), at, at);
+	await new BlobRecordStore(kv).update(blob.ref, current => {
+		if (current === undefined) {
+			throw new Error(`no record for ${blob.ref}`);
+		}
+		// `encodeBlobRecord` is `JSON.stringify`, which drops the key outright.
+		return { ...current, size: undefined };
+	});
+	return blob;
+}
+
+async function heldForReadsAlone(service: LocalBlobService, kv: IKVStore, content: Uint8Array, at: number, lastReadAt: number | undefined): Promise<{ ref: BlobRef; content: Uint8Array }> {
 	const { ref } = await service.put(streamOf(content));
 	await holdCachedAt(kv, ref, at, lastReadAt);
 	await service.unpin(ref, DEFAULT_BLOB_OWNER);
@@ -169,6 +188,35 @@ describe('BlobCacheBudget', () => {
 
 		expect(enforcement.evicted).to.deep.equal([readTwice.ref]);
 		expect(await recordOf(kv, justFetched.ref)).to.not.equal(undefined);
+	});
+
+	it('evicts a cache-only blob whose size it never learned, even when the cache is within budget', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		// Three blobs held for reads alone: one of 300 KiB, one of no bytes at all — whose record says
+		// `size: 0` — and one whose record carries no size. The empty one is what makes the assertion
+		// mean something: without it the test passes for a fix that reads an absent size as zero.
+		const unsized = await unsizedBlob(service, kv, 1, 1);
+		const sized = await cacheOnlyBlob(service, kv, 2, 2);
+		const empty = await heldForReadsAlone(service, kv, new Uint8Array(0), 3, 3);
+
+		// Ten times what every byte the node can account for comes to, so nothing is over budget and the
+		// one eviction is the unsized blob's, on its own account.
+		const enforcement = await budgetOver(service, 10 * BLOB_BYTES).enforce();
+
+		expect(enforcement.cachedBytes).to.equal(BLOB_BYTES);
+		expect(enforcement.skippedInUse).to.equal(0);
+		expect(enforcement.evicted).to.deep.equal([unsized.ref]);
+		expect(await recordOf(kv, unsized.ref)).to.equal(undefined);
+		for (const id of await pieceIdsOf(unsized.content)) {
+			expect(await pieces.has(id), `piece ${id} of the evicted ${unsized.ref}`).to.equal(false);
+		}
+		// The sized blob and the 0-byte one are untouched, pieces and all.
+		for (const kept of [sized, empty]) {
+			expect(await recordOf(kv, kept.ref), `record of ${kept.ref}`).to.not.equal(undefined);
+			expect(await readAll(service.read(kept.ref, { from: 'here' })), `kept ${kept.ref}`).to.deep.equal(kept.content);
+		}
 	});
 
 	it('does not evict a blob being read, and evicts it once the read ends', async () => {

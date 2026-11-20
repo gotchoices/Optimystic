@@ -17,7 +17,7 @@ export const DEFAULT_BLOB_CACHE_BUDGET_BYTES = 256 * 1024 * 1024;
 
 /** What one enforcement did. */
 export interface CacheEnforcement {
-	/** The total of every cache-only blob, before eviction. */
+	/** {@link CacheEvictionChoice.cachedBytes}, over the cache-only blobs this enforcement enumerated. */
 	readonly cachedBytes: number;
 	readonly evicted: readonly BlobRef[];
 	/** How many blobs the budget would otherwise have evicted but left alone because a read or fetch of them was running. */
@@ -27,7 +27,11 @@ export interface CacheEnforcement {
 /** What `chooseEvictions` decided. */
 export interface CacheEvictionChoice {
 	readonly evict: readonly BlobRef[];
-	/** The total of every blob given, before eviction. */
+	/**
+	 * The total of the blobs given whose size this node knows, before eviction. The unsized ones are
+	 * left out, which under-counts what the cache really takes — safe only because they are evicted in
+	 * the same pass, so the bytes this number omits are bytes the node is about to stop holding.
+	 */
 	readonly cachedBytes: number;
 	readonly skippedInUse: number;
 }
@@ -46,28 +50,61 @@ const NOTHING_ENFORCED: CacheEnforcement = { cachedBytes: 0, evicted: [], skippe
  * (ties by reference ascending, so the choice is deterministic), skipping any `inUse` reports true
  * for. Pure: it reads nothing and writes nothing.
  *
- * A blob with no recorded size contributes 0 bytes and is evicted like any other once the walk
- * reaches it — dropping a blob nobody has read, whose contents this node knows nothing about, is
- * free. A budget the walk cannot reach because every remaining blob is in use leaves the cache over
- * budget; the next enforcement tries again, and nothing retries on a timer.
+ * A blob whose record carries no size is evicted on its own account, whatever the total, and before
+ * the walk: this node holds part of it and never learned how big the whole is, so it cannot bound
+ * what it is spending there, and a cost it cannot bound is not one it keeps. Those go first, least
+ * recently read among themselves, and then the walk over the sized blobs runs until their total is
+ * within budget. A fetch writes the size as soon as its plan reads it off the root list piece
+ * (`BlobFetchStore.markPartial`), so the blobs this reaches are the ones a crash caught between the
+ * root piece arriving and that write. An unsized blob is not the same thing as an empty one: a 0-byte
+ * blob's record says `size: 0` and it is counted and walked like any other.
+ *
+ * A budget the walk cannot reach because every remaining blob is in use leaves the cache over budget;
+ * the next enforcement tries again, and nothing retries on a timer.
  */
 export function chooseEvictions(blobs: readonly CachedBlob[], budgetBytes: number, inUse: (ref: BlobRef) => boolean): CacheEvictionChoice {
-	const cachedBytes = blobs.reduce((total, blob) => total + blob.bytes, 0);
+	const ordered = [...blobs].sort(leastRecentlyReadFirst);
+	const sized = ordered.filter(isSized);
+	// NOTE: a cache-only blob counts at the blob's full size whether or not every piece is here, which
+	// over-counts a partly held blob — the direction docs/blobs.md §Lifetime accepts for pieces shared
+	// between blobs, since it evicts sooner and so uses less storage, not more. While nothing asks for
+	// byte ranges the over-count is at most the tail of one interrupted download per blob; a caller that
+	// reads small ranges out of very large blobs would count far more than it holds and evict a cache
+	// that was never over its real limit. If ranged reads become ordinary, count what is held instead —
+	// the fetch already knows the bytes it stored — rather than walking each tree, which costs one
+	// piece-store read per piece per enforcement.
+	const cachedBytes = sized.reduce((total, blob) => total + blob.bytes, 0);
 	const evict: BlobRef[] = [];
-	let evictedBytes = 0;
 	let skippedInUse = 0;
-	for (const blob of [...blobs].sort(leastRecentlyReadFirst)) {
+	/** Whether `blob` was chosen; a blob being read or fetched is left alone and counted as skipped. */
+	const choose = (blob: CachedBlob): boolean => {
+		if (inUse(blob.ref)) {
+			skippedInUse++;
+			return false;
+		}
+		evict.push(blob.ref);
+		return true;
+	};
+	for (const blob of ordered) {
+		if (blob.bytes === undefined) {
+			choose(blob);
+		}
+	}
+	let evictedBytes = 0;
+	for (const blob of sized) {
 		if (cachedBytes - evictedBytes <= budgetBytes) {
 			break;
 		}
-		if (inUse(blob.ref)) {
-			skippedInUse++;
-			continue;
+		if (choose(blob)) {
+			evictedBytes += blob.bytes;
 		}
-		evict.push(blob.ref);
-		evictedBytes += blob.bytes;
 	}
 	return { evict, cachedBytes, skippedInUse };
+}
+
+/** A blob whose record carries a size, narrowed so the sized walk can add it up. */
+function isSized(blob: CachedBlob): blob is CachedBlob & { readonly bytes: number } {
+	return blob.bytes !== undefined;
 }
 
 // NOTE: only a read or fetch that pulled something triggers an enforcement, so a blob that becomes
@@ -166,13 +203,17 @@ export class BlobCacheBudget {
 			if (await this.records.releaseCached(ref)) {
 				const blob = byRef.get(ref);
 				evicted.push(ref);
-				this.log('cache:evicted ref=%s bytes=%d lastReadAt=%d', ref, blob?.bytes ?? 0, blob?.lastReadAt ?? 0);
+				// `bytes=unsized` rather than 0: the two mean different things here, and the first is why the
+				// blob was evicted.
+				this.log('cache:evicted ref=%s bytes=%s lastReadAt=%d', ref, blob?.bytes ?? 'unsized', blob?.lastReadAt ?? 0);
 			}
 		}
 		if (evicted.length > 0) {
 			await this.records.sweep();
 		}
-		if (cachedBytes > this.budgetBytes) {
+		// `evicted.length` is in the condition because an unsized blob is evicted whatever the total, so a
+		// pass that dropped only those would otherwise summarize nothing.
+		if (cachedBytes > this.budgetBytes || evicted.length > 0) {
 			this.log('cache:enforced cachedBytes=%d budget=%d evicted=%d skippedInUse=%d', cachedBytes, this.budgetBytes, evicted.length, skipped);
 		}
 		return { cachedBytes, evicted, skippedInUse: skipped };

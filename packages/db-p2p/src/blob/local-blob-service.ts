@@ -59,6 +59,14 @@ export interface BlobFetchStore {
 	storePiece(ref: BlobRef, id: PieceId, bytes: Uint8Array): Promise<void>;
 	/** Sets `whole: true` and `size` on the existing record; never creates a record, and a failure is logged, not thrown. Not flushed. */
 	markWhole(ref: BlobRef, size: number): Promise<void>;
+	/**
+	 * Sets `size` on the existing record and the `whole` hint to false: the size of a blob this node
+	 * holds only part of. Never creates a record; a failure is logged, not thrown. Not flushed.
+	 *
+	 * The caller holds `ref` (`holdCached`) first. `whole: false` is the honest hint, since a fetch
+	 * that got this far found something missing; `markWhole` sets it back once every piece is here.
+	 */
+	markPartial(ref: BlobRef, size: number): Promise<void>;
 }
 
 /**
@@ -93,8 +101,13 @@ export interface BlobOwedRecords {
 /** One cache-only blob as the cache budget sees it. */
 export interface CachedBlob {
 	readonly ref: BlobRef;
-	/** The record's `size`; 0 when it has none yet. */
-	readonly bytes: number;
+	/**
+	 * The record's `size`, or undefined when the record carries none: this node holds part of the blob
+	 * and never learned how big the whole is, so it cannot say what it is spending here. Not the same
+	 * as a 0-byte blob, whose record carries `size: 0` — the budget counts that one and evicts the
+	 * unsized one (`chooseEvictions`).
+	 */
+	readonly bytes: number | undefined;
 	/** When the blob was last read here: the record's `lastReadAt`, else its `cached` hold's `at` ({@link lastReadOf}). */
 	readonly lastReadAt: number;
 }
@@ -205,6 +218,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 			holdCached: ref => this.holdCached(ref),
 			storePiece: (ref, id, bytes) => this.storeFetchedPiece(ref, id, bytes),
 			markWhole: (ref, size) => this.correctRecord(ref, true, size),
+			markPartial: (ref, size) => this.correctRecord(ref, false, size),
 		};
 	}
 
@@ -504,7 +518,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		const blobs: CachedBlob[] = [];
 		for await (const { ref, record } of this.readableRecords()) {
 			if (cacheOnly(record)) {
-				blobs.push({ ref, bytes: record.size ?? 0, lastReadAt: lastReadOf(record) });
+				blobs.push({ ref, bytes: record.size, lastReadAt: lastReadOf(record) });
 			}
 		}
 		return blobs;
