@@ -29,7 +29,7 @@ import { armUnrefTimer } from '../unref-timer.js';
 import type { BlobFetcher, BlobFetchRequest, BlobFetchSession, PieceStoredEvent } from './blob-fetcher.js';
 import { forwardAborts } from './blob-fetch-session.js';
 import { blobHolderCandidates, type BlobHolderDeps } from './blob-holders.js';
-import { blobScopeProblem, type BlobLocalHolding } from './blob-protocol.js';
+import { assertAnnounceScope, type BlobLocalHolding } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
 import type { BlobPinIndex, LocalBlobService, MissingPiece } from './local-blob-service.js';
 
@@ -184,8 +184,7 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 	 * recorded scope is always one the drain can send.
 	 */
 	async announce(ref: BlobRef, scope: BlobScope): Promise<void> {
-		const problem = blobScopeProblem(scope);
-		if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+		assertAnnounceScope(scope);
 		if (this.oweCopies === undefined) {
 			throw new Error(`Blob ${ref} cannot be announced: this node was built without a blob copy drain`);
 		}

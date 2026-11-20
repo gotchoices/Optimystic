@@ -218,6 +218,18 @@ export function blobScopeProblem(scope: BlobScope): string | undefined {
 	return undefined;
 }
 
+/**
+ * Refuses a scope no announce may carry, with the one message every announce path gives: the wire
+ * client, and each `BlobService.announce` that records a scope before it would be sent. One function
+ * so a further announce path cannot come to spell the rule, or its refusal, differently.
+ *
+ * @throws RangeError for an empty scope or one over `MAX_BLOB_SCOPE_CHARS`.
+ */
+export function assertAnnounceScope(scope: BlobScope): void {
+	const problem = blobScopeProblem(scope);
+	if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+}
+
 function literalField<T extends string>(header: Header, name: string, allowed: readonly T[], peer: string): T {
 	const value = header.fields[name];
 	if (!isOneOf(value, allowed)) throw new BlobProtocolError(peer, `'${header.kind}' has '${name}' ${describe(value)}`);

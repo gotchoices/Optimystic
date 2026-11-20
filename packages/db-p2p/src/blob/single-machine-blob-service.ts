@@ -19,9 +19,10 @@ import type {
 	BlobService,
 	BlobStat,
 } from '@optimystic/db-core';
+import { KeyedSerialQueue } from '../keyed-serial-queue.js';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
-import { blobScopeProblem } from './blob-protocol.js';
+import { assertAnnounceScope } from './blob-protocol.js';
 import { LocalBlobService, type BlobPinIndex } from './local-blob-service.js';
 import type { IPieceStore } from './piece-store.js';
 
@@ -46,6 +47,8 @@ export interface SingleMachineBlobServiceInit {
  */
 export class SingleMachineBlobService implements BlobService, BlobPinIndex {
 	private readonly local: LocalBlobService;
+	/** Serializes `announce` per reference, as `BlobCopyDrain.settleRef` does for the same reason: read-decide-write over one record. */
+	private readonly announces = new KeyedSerialQueue();
 
 	constructor(init: SingleMachineBlobServiceInit) {
 		this.local = new LocalBlobService({ pieces: init.pieces, kv: init.kv, digest: init.digest, now: init.now });
@@ -70,7 +73,15 @@ export class SingleMachineBlobService implements BlobService, BlobPinIndex {
 		return this.local.stat(ref, options);
 	}
 
-	/** This machine's pieces alone; a piece that is not here fails the read, since there is nobody to fetch from. */
+	/**
+	 * This machine's pieces alone; a piece that is not here fails the read, since there is nobody to fetch from.
+	 *
+	 * NOTE: accepted tradeoff — a read that did not ask for this machine's copy only fails with
+	 * `cohort-unreachable` rather than `not-here`, which reads oddly for a host that has no cohort at
+	 * all. Kept because `BlobUnavailableReason` in `packages/db-core/src/blob/errors.ts` defines
+	 * `not-here` as the answer to `from: 'here'`, and nothing branches on the reason; revisit if a
+	 * caller ever decides anything from it, and widen the reason's documented meaning when it does.
+	 */
 	read(ref: BlobRef, options?: BlobReadOptions): AsyncIterable<Uint8Array> {
 		return this.local.read(ref, options);
 	}
@@ -99,9 +110,16 @@ export class SingleMachineBlobService implements BlobService, BlobPinIndex {
 	 * networked node could send and a host that moves from this service to a node has nothing to
 	 * re-check. Throws RangeError for an empty scope or one over `MAX_BLOB_SCOPE_CHARS`.
 	 */
+	// `async` so a refused scope rejects rather than throwing out of the call, as every other
+	// `BlobService.announce` does.
 	async announce(ref: BlobRef, scope: BlobScope): Promise<void> {
-		const problem = blobScopeProblem(scope);
-		if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+		assertAnnounceScope(scope);
+		// Serialized per ref so that two announces of one reference cannot both read no stored class and
+		// both report the first one; the stored class is the only record of having reported it.
+		await this.announces.run(ref, () => this.announceFirst(ref, scope));
+	}
+
+	private async announceFirst(ref: BlobRef, scope: BlobScope): Promise<void> {
 		// Creates the record when there is none and flushes, so the blob survives a restart with a hold no sweep removes.
 		await this.local.holdOwed(ref);
 		if (await this.local.durabilityOf(ref) !== undefined) {

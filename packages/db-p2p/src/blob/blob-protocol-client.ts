@@ -22,7 +22,7 @@ import {
 	BlobPeerRefusedError,
 	BlobProtocolError,
 	BlobTransferStalledError,
-	blobScopeProblem,
+	assertAnnounceScope,
 	buildBlobProtocol,
 	checkAnswerFits,
 	decodeBlobAnswer,
@@ -126,8 +126,7 @@ export class BlobProtocolClient {
 	 */
 	async announce(peer: PeerId, ref: BlobRef, scope: BlobScope, options: BlobRequestOptions = {}): Promise<BlobAnnounceAnswer> {
 		parseBlobRef(ref);
-		const problem = blobScopeProblem(scope);
-		if (problem !== undefined) throw new RangeError(`A blob announce has ${problem}`);
+		assertAnnounceScope(scope);
 		const request = { kind: 'announce', ref, scope } satisfies BlobRequest;
 		const exchange = await this.openAccepted(peer, request, options.signal);
 		const { answer } = await exchange.readSoleAnswer(request);

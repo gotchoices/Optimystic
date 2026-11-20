@@ -46,6 +46,20 @@ describe('SingleMachineBlobService', () => {
 		expect(await blobs.stat(ref)).to.deep.include({ locality: 'here', durability: LOCAL_AND_WHOLE });
 	});
 
+	it('two announces of one reference in flight together report it once', async () => {
+		const blobs = serviceOver(new MemoryKVStore());
+		const events: BlobDurabilityEvent[] = [];
+		blobs.onDurability(event => events.push(event));
+		const { ref } = await blobs.put(streamOf(new Uint8Array([7, 8, 9])), { owner: 'tx-1' });
+
+		// Two transactions can commit the same content-addressed reference at once; without serializing
+		// per reference both read no stored class and both report the first one.
+		await Promise.all([blobs.announce(ref, 'Attachment/blobrefs'), blobs.announce(ref, 'Attachment/blobrefs')]);
+
+		expect(events).to.have.length(1);
+		expect(events[0]?.durability).to.deep.equal(LOCAL_AND_WHOLE);
+	});
+
 	it('a scope the wire would refuse takes no hold', async () => {
 		const kv = new MemoryKVStore();
 		const blobs = serviceOver(kv);

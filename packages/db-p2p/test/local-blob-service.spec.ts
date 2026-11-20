@@ -173,6 +173,12 @@ async function recordOf(kv: IKVStore, ref: BlobRef): Promise<BlobRecord | undefi
 	return new BlobRecordStore(kv).get(ref);
 }
 
+async function collect<T>(items: AsyncIterable<T>): Promise<T[]> {
+	const all: T[] = [];
+	for await (const item of items) all.push(item);
+	return all;
+}
+
 describe('LocalBlobService', () => {
 	it('a put is stored, read whole and by range, and held under `default` until unpinned', async () => {
 		const pieces = new MemoryPieceStore();
@@ -434,6 +440,24 @@ describe('LocalBlobService', () => {
 		const tooLong = await service.holdResponsible(ref, 'x'.repeat(MAX_BLOB_SCOPE_CHARS + 1)).catch((error: unknown) => error);
 		expect(tooLong).to.be.instanceOf(RangeError);
 		expect(await service.responsibleScope(ref)).to.equal('collection-b');
+	});
+
+	it('pins are read back by owner, filtered by prefix and past an unreadable record', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		const { ref } = await service.put(streamOf(bytesOf(1000, 30)), { owner: 'tx:a' });
+		await service.pin(ref, 'unstaged:1');
+		const other = (await service.put(streamOf(bytesOf(1000, 31)), { owner: 'tx:b' })).ref;
+		const unreadable = await refOf(bytesOf(1000, 32));
+		await kv.set(BLOB_RECORD_KEY_PREFIX + unreadable, 'garbage');
+
+		expect(await service.pinsOf(ref)).to.have.members(['tx:a', 'unstaged:1']);
+		expect(await service.pinsOf(unreadable)).to.deep.equal([]);
+		expect(await collect(service.listPins('tx:'))).to.have.deep.members([{ ref, owner: 'tx:a' }, { ref: other, owner: 'tx:b' }]);
+		expect(await collect(service.listPins('unstaged:'))).to.deep.equal([{ ref, owner: 'unstaged:1' }]);
+		// No prefix is every pin, and the unreadable record is skipped rather than failing the pass.
+		expect(await collect(service.listPins(''))).to.have.length(3);
 	});
 
 	it('a malformed record stops the sweep', async () => {
