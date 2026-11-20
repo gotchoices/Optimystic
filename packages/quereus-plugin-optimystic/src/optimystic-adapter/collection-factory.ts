@@ -26,6 +26,8 @@ import type { RowData, ParsedOptimysticOptions, TransactionState } from '../type
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
 import { addListener } from './listeners.js';
+import { BlobScopeRegistration } from './blob-scope-registration.js';
+import type { NetworkBinding } from './blob-scope-registration.js';
 import { LateBoundCohortReachability } from './late-bound-reachability.js';
 import { compareTreeKeys } from '../schema/key-encoding.js';
 
@@ -41,16 +43,13 @@ const blobLog = createLogger('blob');
  */
 export type SqlBlobBackendService = BlobService & BlobPinIndex;
 
-/** One network's blob store, as the SQL layer needs it. */
-export interface BlobBackend {
-	/** The transactor key (`${transactor}:${keyNetwork}`) this backend belongs to. */
-	readonly key: string;
+/**
+ * One network's blob store, as the SQL layer needs it: the network binding — the transactor key
+ * and its transactor, through which this network's reference trees and scope registry are read and
+ * written — plus the blob service over it.
+ */
+export interface BlobBackend extends NetworkBinding {
 	readonly service: SqlBlobBackendService;
-	/**
-	 * The transactor of the same key. Reference trees and the scope registry of this network are read
-	 * and written through it; nothing in this part does either yet.
-	 */
-	readonly transactor: ITransactor;
 }
 
 /**
@@ -158,6 +157,14 @@ export class CollectionFactory {
   private singleMachineBlobServices = new Set<SingleMachineBlobService>();
   /** Told once per backend, the first time it resolves ({@link onBlobBackendResolved}). */
   private blobBackendListeners = new Set<(backend: BlobBackend) => void>();
+  /**
+   * This factory's blob-scope registrations, keyed by (transactor key, scope) — which reference
+   * trees it has confirmed in which network's scope registry (docs/blobs.md §Registering
+   * references). Public because the DDL paths that write the registry are on the module, not here,
+   * and they need no blob service: resolving one for a `network` transactor would build or reuse a
+   * libp2p node for a statement that only has to write one registry entry.
+   */
+  readonly blobScopes = new BlobScopeRegistration();
 
   /**
    * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
@@ -359,6 +366,14 @@ export class CollectionFactory {
    * through {@link getOrCreateTransactor} — the backend carries that transactor, and for `network`
    * it is also what builds or reuses the node.
    */
+  /**
+   * The transactor and key of `options`'s network, with NO blob service resolved — all the scope
+   * registry needs ({@link blobScopes}). Deliberately not {@link getBlobBackend}: see that field.
+   */
+  async networkBinding(options: ParsedOptimysticOptions): Promise<NetworkBinding> {
+    return { key: this.getTransactorKey(options), transactor: await this.getOrCreateTransactor(options) };
+  }
+
   async getBlobBackend(options: ParsedOptimysticOptions): Promise<BlobBackend> {
     const key = this.getTransactorKey(options);
     const resolved = this.blobBackends.get(key);
@@ -1023,6 +1038,9 @@ export class CollectionFactory {
   clearCache(): void {
     this.transactors.clear();
     this.blobBackends.clear();
+    // A memo for a key whose transactor has been replaced would skip a registration that is
+    // genuinely needed on the new one.
+    this.blobScopes.clear();
   }
 
   /**
@@ -1061,6 +1079,7 @@ export class CollectionFactory {
     const blobServices = [...this.singleMachineBlobServices];
     this.singleMachineBlobServices.clear();
     this.blobBackends.clear();
+    this.blobScopes.clear();
     this.transactors.clear();
     for (const watch of watches) {
       await watch.close();

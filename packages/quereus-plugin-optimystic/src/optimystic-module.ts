@@ -18,10 +18,14 @@ import type { IKVStore, IPieceStore, IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, equalityServesKeyColumn, rangeServesKeyColumn, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
-import { Tree } from '@optimystic/db-core';
+import { BlobReferenceTree, Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
-import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
-import { assertBlobRefTypeRegistered } from './schema/blobref-type.js';
+import type { BlobReferenceEntry, BlobScope, Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
+import { assertBlobRefTypeRegistered, isBlobRefColumn } from './schema/blobref-type.js';
+import { BlobReferenceMaintainer } from './schema/blob-reference-maintainer.js';
+import type { BlobRefColumn } from './schema/blob-reference-maintainer.js';
+import { blobReferenceOptions } from './optimystic-adapter/blob-scope-registration.js';
+import type { NetworkBinding } from './optimystic-adapter/blob-scope-registration.js';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { CatalogRecordState, PersistedIndexSchema, PersistedTableSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { descriptionDifference } from './schema/description-difference.js';
@@ -58,6 +62,8 @@ function transactorOnlyState(transactor: ITransactor): TransactionState {
 interface KeptHandles {
   readonly collection: Tree<string, any>;
   readonly indexTrees: ReadonlyMap<string, Tree<string, IndexEntry>>;
+  /** The blob reference tree, for a table that has one. */
+  readonly referenceTree?: BlobReferenceTree;
 }
 
 /** A UNIQUE constraint that binds a row, with the index tree enforcing it
@@ -863,6 +869,14 @@ export class OptimysticVirtualTable extends VirtualTable {
   private rowCodec?: RowCodec;
   private indexManager?: IndexManager;
   /**
+   * The table's blob reference tree and the `blobref` columns whose values it lists, staged beside
+   * the index trees on every write ({@link BlobReferenceMaintainer}, docs/blobs.md §Registering
+   * references). Absent for a table with no `blobref` column, which opens, registers and marks
+   * nothing: every registered collection costs a snapshot per savepoint and a slot in the session
+   * coordinator's map.
+   */
+  private blobReferences?: BlobReferenceMaintainer;
+  /**
    * Synthesized index descriptors that back a secondary UNIQUE constraint lacking a
    * declared index (see {@link buildUniqueEnforcementIndexes}). Computed once in
    * doInitialize and handed to the IndexManager; kept here too so the probe can tell a
@@ -1311,6 +1325,15 @@ export class OptimysticVirtualTable extends VirtualTable {
       const uniqueEnforcementIndexes = this.buildUniqueEnforcementIndexes(storedSchema);
       await indexManager.initialize(txnState?.transactor, uniqueEnforcementIndexes);
 
+      // The table's reference tree, opened alongside the index trees and for the same reason
+      // (create-on-missing: a table whose rows have never referenced a blob has never committed its
+      // header, so "absent" and "empty" are indistinguishable at the block layer). A table with no
+      // `blobref` column opens nothing and pays one column pass per initialization.
+      const referenceColumns = BlobReferenceMaintainer.columnsOf(storedSchema.columns);
+      const referenceTree = referenceColumns.length === 0
+        ? undefined
+        : kept?.referenceTree ?? await this.openBlobReferenceTree(txnState?.transactor);
+
       // Publish the rebuilt state in ONE synchronous step, after the last await.
       // doInitialize runs more than once for a table — the upgrade after a
       // provisional pass, and a retry after a failed attempt (see initialize()) — so
@@ -1327,6 +1350,9 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.rowCodec = rowCodec;
       this.indexManager = indexManager;
       this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
+      this.blobReferences = referenceTree === undefined
+        ? undefined
+        : this.buildBlobReferences(referenceColumns, referenceTree);
 
       if (readOnly) {
         // Provisional pass: leave the bridge's collection registry untouched (a
@@ -1666,7 +1692,9 @@ export class OptimysticVirtualTable extends VirtualTable {
    * materialized-view registration (with any signal it holds), offline policy and commit-report
    * naming stay as they are, and the tag-derived state follows through {@link followSchemaTags} when
    * the module announces the new entry. The open collection handles are reused too
-   * ({@link handlesToKeep}): a transaction the offline queue holds is sealed into them.
+   * ({@link handlesToKeep}) — the reference tree with the main tree and the index trees: a
+   * transaction the offline queue holds is sealed into them, so a re-initialization that opened a
+   * fresh handle would leave the queued entry staged into a tree nothing commits.
    */
   adoptCatalogEntry(entry: TableSchema): void {
     if (this.collection && this.indexManager) {
@@ -1676,7 +1704,7 @@ export class OptimysticVirtualTable extends VirtualTable {
         const tree = manager.getIndexTree(name);
         if (tree) indexTrees.set(name, tree);
       }
-      this.handlesToKeep = { collection: this.collection, indexTrees };
+      this.handlesToKeep = { collection: this.collection, indexTrees, referenceTree: this.blobReferences?.tree };
     }
     this.tableSchema = entry;
     this.isInitialized = false;
@@ -1687,12 +1715,19 @@ export class OptimysticVirtualTable extends VirtualTable {
    * After a re-initialization that reused `kept`: the index trees the new description no longer
    * maintains (an index another machine dropped) leave the transaction bridge, as a `DROP INDEX`
    * through this instance takes them out ({@link removeIndex}), and the handles are no longer kept.
+   *
+   * A kept reference tree leaves too when the adopted description has no `blobref` column. That is
+   * unreachable today — the two re-declare refusals and the drop-column blocker keep a table from
+   * losing such a column — and is cheap insurance against a future arm that can.
    */
   private forgetUnmaintainedTrees(kept: KeptHandles, manager: IndexManager): void {
     for (const [name, tree] of kept.indexTrees) {
       if (manager.getIndexTree(name) !== tree) {
         this.txnBridge.forgetTree(tree);
       }
+    }
+    if (kept.referenceTree !== undefined && this.blobReferences?.tree !== kept.referenceTree) {
+      this.txnBridge.forgetTree(kept.referenceTree.tree);
     }
     this.handlesToKeep = undefined;
   }
@@ -1825,7 +1860,13 @@ export class OptimysticVirtualTable extends VirtualTable {
     const unique = this.describeUniqueIndex(collectionId, table, rowCodec);
     if (unique) return unique;
     const indexed = this.indexManager?.getIndexTrees().some(tree => tree.getCollection().id === collectionId) ?? false;
-    return indexed ? { kind: 'index', table } : undefined;
+    // The reference tree answers as this table's, so a collection of it is named by its table
+    // rather than reading `unknown`. Honestly: the outlook never reads the description for these
+    // elements, because `CollectionJudge.element` in `./optimystic-adapter/commit-outlook.ts`
+    // returns before judging any element with no guard. It is for a restored entry's reported
+    // description, nothing more.
+    const references = this.blobReferences?.tree.tree.getCollection().id === collectionId;
+    return indexed || references ? { kind: 'index', table } : undefined;
   }
 
   private describeMainTree(table: string, rowCodec: RowCodec): MainTreeDescription {
@@ -2830,6 +2871,13 @@ export class OptimysticVirtualTable extends VirtualTable {
         this.txnBridge.markDirty(tree);
       }
     }
+    // Marking the reference tree dirty with the others is what carries it on every commit route
+    // with no commit-route code of its own: a session-mode participant (the coordinator commits
+    // every registered collection with staged changes), a member of the legacy batch, a tree of
+    // the per-tree sweep, and a collection of an offline queue entry.
+    if (this.blobReferences) {
+      this.txnBridge.markDirty(this.blobReferences.tree.tree);
+    }
     this.descriptionCheck ??= this.buildDescriptionCheck();
     this.txnBridge.noteTableWrite(this.descriptionCheck);
   }
@@ -2849,10 +2897,15 @@ export class OptimysticVirtualTable extends VirtualTable {
     };
   }
 
-  /** Whether any of this table's trees holds something not yet committed. */
+  /**
+   * Whether any of this table's trees holds something not yet committed. The reference tree is
+   * counted for the question to stay "any of this table's trees"; it changes no answer today,
+   * since a statement that stages a reference entry always stages into the main tree too.
+   */
   private hasStagedWrites(): boolean {
     return (this.collection?.hasUnsyncedChanges() ?? false)
-      || (this.indexManager?.getIndexTrees().some(tree => tree.hasUnsyncedChanges()) ?? false);
+      || (this.indexManager?.getIndexTrees().some(tree => tree.hasUnsyncedChanges()) ?? false)
+      || (this.blobReferences?.tree.tree.hasUnsyncedChanges() ?? false);
   }
 
   /**
@@ -2929,6 +2982,14 @@ export class OptimysticVirtualTable extends VirtualTable {
       for (const tree of this.indexManager.getIndexTrees()) {
         this.registerTree(tree);
       }
+    }
+    // The reference tree, so it is in the session coordinator's live registry, in legacy
+    // savepoints, and in `TransactionBridge.collectionsOf(table)` — which is how the offline
+    // restore finds its journaled segment ({@link OptimysticModule.collectionsOfTable}) and how the
+    // DDL gate `assertNoQueuedEntries` sees it. No key-taken or entry-changed renderer: its
+    // elements carry no guard.
+    if (this.blobReferences) {
+      this.registerTree(this.blobReferences.tree.tree);
     }
     this.registerUniqueKeyTakenMessages();
   }
@@ -3632,6 +3693,7 @@ export class OptimysticVirtualTable extends VirtualTable {
     for (const { pk, row, entry } of collisions) {
       await this.collection.stage([[pk, undefined, unchangedOrAbsent(entry)]]);
       await this.indexManager.deleteIndexEntries(row, pk, transactor);
+      if (this.blobReferences) await this.blobReferences.stageDelete(row, pk);
       evicted.push(row);
     }
     return evicted;
@@ -3826,6 +3888,7 @@ export class OptimysticVirtualTable extends VirtualTable {
                   txnState?.transactor,
                   this.guardedUniqueIndexes(values),
                 );
+                if (this.blobReferences) await this.blobReferences.stageUpdate(existingRow, values, insertKey, insertKey);
                 this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
                 // replacedRow (the same-PK slot) and evictedRows (rows at OTHER PKs)
                 // co-occur here; the executor runs each eviction's delete pipeline
@@ -3914,6 +3977,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               txnState?.transactor,
               this.guardedUniqueIndexes(values),
             );
+            if (this.blobReferences) await this.blobReferences.stageInsert(values, insertKey);
             this.recordWriteFacts(args.writeScope, 'insert', insertKey, values);
 
             return { status: 'ok', row: values, ...(evictedRows.length > 0 ? { evictedRows } : {}) };
@@ -4035,6 +4099,10 @@ export class OptimysticVirtualTable extends VirtualTable {
             // insert then delete, wrongly dropping the entry.
             if (pkMove.kind === 'displace') {
               await this.indexManager.deleteIndexEntries(pkMove.row, newKey, txnState?.transactor);
+              // Same order, for the same reason: when the displaced row and the moving row hold the
+              // same reference in the same column they stage the identical key, and
+              // remove-then-add leaves it present.
+              if (this.blobReferences) await this.blobReferences.stageDelete(pkMove.row, newKey);
             }
             await this.indexManager.updateIndexEntries(
               oldRow,
@@ -4047,6 +4115,7 @@ export class OptimysticVirtualTable extends VirtualTable {
               // a value-preserving move never refuses itself (see updateIndexEntries).
               this.guardedUniqueIndexes(values),
             );
+            if (this.blobReferences) await this.blobReferences.stageUpdate(oldRow, values, oldKey, newKey);
             // Under newKey: its `absent` insert half is what a fresh key assures. A same-key update
             // records a main-tree fact only when an assigned key column is fresh, which is then true
             // of the key however it reached newKey (minted earlier in this transaction).
@@ -4095,6 +4164,8 @@ export class OptimysticVirtualTable extends VirtualTable {
 
             // Stage deletes from all indexes
             await this.indexManager.deleteIndexEntries(oldRow, deleteKey, txnState?.transactor);
+            // And every blob reference the row held. A cascade child delete reaches this arm too.
+            if (this.blobReferences) await this.blobReferences.stageDelete(oldRow, deleteKey);
 
             // The engine skips its post-delete steps when `row` is absent.
             return { status: 'ok', row: oldRow };
@@ -4485,6 +4556,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.indexManager.repositionColumns(reposition);
       this.uniqueEnforcementIndexes = uniqueEnforcementIndexes;
     }
+    // Rebuilt for BOTH layout kinds, and from the schema handed over rather than from
+    // `this.tableSchema`, which `applyCatalogOnlyEdit` has not yet replaced: a DROP COLUMN of
+    // another column moves the `blobref` columns' positions, and an ADD COLUMN of a second
+    // `blobref` column extends the list.
+    this.blobReferences = this.blobReferences?.withColumns(BlobReferenceMaintainer.columnsOf(tableSchema.columns));
     this.rowCodec = rowCodec;
   }
 
@@ -4844,6 +4920,70 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.collectionFactory.nodeTag()
     );
     return tree as unknown as Tree<string, IndexEntry>;
+  }
+
+  /**
+   * Open (create-on-missing) the table's blob reference tree, at its collection's `/blobrefs`
+   * child — the index precedent being `<uri>/index/<name>` ({@link openIndexTree}).
+   *
+   * Through the ORDINARY collection path, not through `BlobReferenceTree.createOrOpen`, and it is
+   * the same tree that would have opened: db-core keys it on the entry's first element under the
+   * default string comparator, and the factory keys it on the entry's first element under
+   * `compareTreeKeys` (`./schema/key-encoding.ts`), which is that same expression. Going through
+   * the factory is what applies the factory's `treeOptions` — the offline queue's sealed-segment
+   * refusal callback and the materialized-view follower's adopted-commits callback — and the
+   * per-transaction collection cache, to this tree exactly as to every other tree the table opens.
+   *
+   * NOTE: a table deliberately declared AT another table's `<uri>/blobrefs` would adopt that
+   * table's reference tree as its main tree. The storage-adoption guard matches whole table URIs
+   * ({@link SchemaManager.findRecordForUri}), so it does not see this, exactly as it does not see a
+   * table declared at another's `<uri>/index/<name>`; revisit with that case, not before.
+   */
+  private async openBlobReferenceTree(transactor?: ITransactor): Promise<BlobReferenceTree> {
+    const tree = await this.collectionFactory.createOrGetCollection(
+      blobReferenceOptions(this.options),
+      transactor ? transactorOnlyState(transactor) : undefined
+    );
+    return new BlobReferenceTree(tree as unknown as Tree<string, BlobReferenceEntry>);
+  }
+
+  /** The reference tree's collection id — this table's {@link BlobScope}, which the network's scope
+   *  registry lists and a later announcement names. */
+  private blobReferenceScope(): BlobScope {
+    return this.collectionFactory.getCollectionId(blobReferenceOptions(this.options));
+  }
+
+  private buildBlobReferences(columns: readonly BlobRefColumn[], tree: BlobReferenceTree): BlobReferenceMaintainer {
+    return new BlobReferenceMaintainer(
+      qualifiedTableName(this.qualifiedTable),
+      columns,
+      tree,
+      this.blobReferenceScope(),
+    );
+  }
+
+  /**
+   * Start maintaining this table's reference tree, for the ADD COLUMN that gives an already
+   * initialized table its first `blobref` column: open the tree, build the maintainer from the
+   * schema the instance now holds, and register the tree with the bridge. The instance then
+   * maintains it from the next statement rather than from its next full initialization.
+   *
+   * Idempotent, and a no-op for an instance that is not initialized (its first initialization
+   * builds the maintainer), whose schema has no `blobref` column, or that already has one — which
+   * is every call but the one that matters, since it is awaited on the path every catalog-only
+   * ALTER converges on ({@link OptimysticModule.alterCatalogOnly}).
+   */
+  async attachBlobReferences(): Promise<void> {
+    if (!this.isInitialized || this.blobReferences !== undefined) {
+      return;
+    }
+    const columns = BlobReferenceMaintainer.columnsOf(this.tableSchema.columns);
+    if (columns.length === 0) {
+      return;
+    }
+    const tree = await this.openBlobReferenceTree(this.txnBridge.getCurrentTransaction()?.transactor);
+    this.blobReferences = this.buildBlobReferences(columns, tree);
+    this.registerTree(tree.tree);
   }
 
   /**
@@ -6267,6 +6407,13 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     // Initialize table and register connection before returning
     // This ensures the table is fully ready for queries and transactions
     try {
+      // Before the batch checkpoint that initializes the table, so a declaration whose reference
+      // tree cannot be registered writes nothing else. Registering first is harmless if the create
+      // then fails: an id whose tree was never written reads as an empty tree, certainly. A
+      // re-declare of an existing table pays one registry read the first time in a process.
+      if (tableSchema.columns.some(isBlobRefColumn)) {
+        await this.registerBlobScope(tableSchema);
+      }
       await this.underBatchCheckpoint(table.catalogManager, 'written', tableKey, async () => {
         await table.initialize();
         await table.ensureConnectionRegistered();
@@ -6283,6 +6430,70 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
 
     return table;
+  }
+
+  /**
+   * Put a table's reference tree into its network's scope registry, and refuse the statement when
+   * that cannot be confirmed: a scope the registry does not list is a scope a storage node never
+   * reads, so a reference committed into it would not keep its blob alive.
+   *
+   * Called by the `CREATE TABLE` of a table that HAS a `blobref` column and by the ADD COLUMN that
+   * gives a table its FIRST one — each caller judges that, since at ADD COLUMN time the table's own
+   * column list does not have the new column yet.
+   *
+   * Deliberately NOT called by hydrate: docs/internals.md §A first touch writes only what the table owes
+   * forbids a first touch writing what the table does not owe, and a hydrated table's tree was
+   * registered by whichever machine created it. The remaining gap — a tree missing from the
+   * registry, because it was created by a build that registered nothing, or dropped on another
+   * machine while this one kept writing — is closed where it matters:
+   * `feat-blob-pins-follow-sql-commits` confirms the scope before any announcement names it, and a
+   * receiver only ever reads a scope it was told about.
+   */
+  private async registerBlobScope(tableSchema: TableSchema): Promise<void> {
+    const { network, scope } = await this.blobScopeOf(tableSchema);
+    const outcome = await this.collectionFactory.blobScopes.ensure(network, scope);
+    if (!outcome.registered) {
+      throw new QuereusError(
+        `Cannot register the blob reference tree of table '${tableSchema.schemaName}.${tableSchema.name}' `
+        + `(scope '${scope}') in its network's scope registry, so the blobs its rows reference could not be `
+        + `kept: ${outcome.cause instanceof Error ? outcome.cause.message : String(outcome.cause)}`,
+        StatusCode.ERROR,
+        outcome.cause instanceof Error ? outcome.cause : undefined,
+      );
+    }
+  }
+
+  /**
+   * Take a dropped table's reference tree out of its network's scope registry, which makes the
+   * blobs it listed unreferenced there. A failure is logged and does not stop the drop, like the
+   * gravestone failure beside it: the blobs that tree lists then stay referenced, which keeps
+   * bytes rather than losing them. The reference tree itself stays in storage, as a dropped
+   * table's index trees do.
+   *
+   * NOTE: accepted tradeoff — a table re-created over the same URI re-registers the old tree,
+   * whose leftover entries then keep their blobs alive; it never loses one. Revisit if reclaiming
+   * those matters. Recorded in docs/blobs.md §Lifetime under *Accepted limits*.
+   */
+  private async unregisterBlobScope(tableSchema: TableSchema): Promise<void> {
+    try {
+      const { network, scope } = await this.blobScopeOf(tableSchema);
+      await this.collectionFactory.blobScopes.unregister(network, scope);
+    } catch (error) {
+      log(
+        'destroy(%s.%s): unregistering the blob reference tree failed; the blobs its rows referenced ' +
+        'stay referenced in this network\'s scope registry: %s',
+        tableSchema.schemaName, tableSchema.name, error
+      );
+    }
+  }
+
+  /** The network binding and reference-tree scope of `tableSchema`, resolved without a blob service. */
+  private async blobScopeOf(tableSchema: TableSchema): Promise<{ network: NetworkBinding; scope: BlobScope }> {
+    const options = this.parseTableSchema(tableSchema);
+    return {
+      network: await this.collectionFactory.networkBinding(options),
+      scope: this.collectionFactory.getCollectionId(blobReferenceOptions(options)),
+    };
   }
 
   /**
@@ -6877,7 +7088,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * machine saves is the one every machine running the same statement saves, and a second machine
    * finds its own column already in the record ({@link classifyColumnChange}).
    */
-  private addColumn(
+  private async addColumn(
     db: Database,
     tableSchema: TableSchema,
     change: AddColumnChange,
@@ -6904,7 +7115,14 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     }
     const after = columnSchemaToStored(column);
     this.assertNoQueuedEntries(tableSchema.schemaName, tableSchema.name, 'add column');
-    return this.alterCatalogOnly(tableSchema, {
+    // A column that gives the table its first `blobref` one: its reference tree joins the scope
+    // registry before the record names the column, and `attachBlobReferences` (below, through
+    // `alterCatalogOnly`) then gives the instance its maintainer. ADD COLUMN already refuses a
+    // DEFAULT, so no stored row gains a reference and nothing is backfilled.
+    if (isBlobRefColumn(after) && !tableSchema.columns.some(isBlobRefColumn)) {
+      await this.registerBlobScope(tableSchema);
+    }
+    return await this.alterCatalogOnly(tableSchema, {
       operation: 'add column',
       kind: 'column',
       name: column.name,
@@ -7012,6 +7230,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       return await this.saveCatalogOnly(manager, tableSchema, change);
     }, outcome => outcome === 'owned' || initializeWrites);
     table?.applyCatalogOnlyEdit(change.editSchema, change.layout);
+    // Where every catalog-only arm converges, so the ADD COLUMN that gives a table its first
+    // `blobref` column leaves the instance maintaining the tree from the next statement. A no-op
+    // for every other arm.
+    await table?.attachBlobReferences();
     if (adopted) {
       if (outcome === 'undone') {
         adopted.release(adoptedKey);
@@ -7414,6 +7636,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     await this.whenCatalogPersisted();
     this.assertNoQueuedEntries(schemaName, tableName, 'drop table');
     const tableKey = `${schemaName}.${tableName}`.toLowerCase();
+    // Read before the drop, while the engine still describes the table: whether it had a `blobref`
+    // column is what decides the unregistration below.
+    const entry = db.schemaManager.findTable(tableName, schemaName);
     const table = this.tables.get(tableKey)
       ?? await this.instantiateForTeardown(db, schemaName, tableName);
     if (table) {
@@ -7432,6 +7657,9 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
           'and a later CREATE over the same URI will not be checked against it: %s',
           schemaName, tableName, error
         );
+      }
+      if (entry?.columns.some(isBlobRefColumn)) {
+        await this.unregisterBlobScope(entry);
       }
     }
     this.tables.delete(tableKey);

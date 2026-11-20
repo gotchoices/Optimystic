@@ -1003,6 +1003,59 @@ not retried: it stays out of the record until the next change to those tags, or 
 failed is lost at restart (the `NOTE:` in `saveTableTags` in
 `packages/quereus-plugin-optimystic/src/optimystic-module.ts`).
 
+#### A table's blob references
+
+A table with a `blobref` column keeps a second tree listing which of its rows reference which
+stored blobs, at its collection's `/blobrefs` child, and that list is what keeps a referenced
+blob's bytes alive ([blobs.md §Registering references](blobs.md#registering-references)). It is
+maintained exactly the way the index trees are, and that is the whole of its integration: the
+instance opens it in `doInitialize` beside the index trees, publishes it in the same synchronous
+step, keeps its handle across a re-initialization (`adoptCatalogEntry`), registers it with the
+transaction bridge, and marks it dirty with the others on every write. Being one more dirty tree
+and one more registered collection is what carries it on every commit route — the session
+coordinator, which commits every registered collection with staged changes; the legacy batch; the
+per-tree sweep; and an offline queue entry, whose journaled segment the restore finds through the
+bridge's record of which collections back the table — with no commit-route code of its own. A
+table with no `blobref` column opens, registers and marks nothing: every registered collection
+costs a snapshot per open savepoint and a slot in the coordinator's map.
+
+`BlobReferenceMaintainer` (`packages/quereus-plugin-optimystic/src/schema/blob-reference-maintainer.ts`)
+is called at six sites in the vtab's `update()`, each immediately beside the `IndexManager` call it
+mirrors and in the same order: a REPLACE eviction, an INSERT OR REPLACE over an occupied key, an
+INSERT at a clear key, the displaced half of a displacing primary-key move, an UPDATE, and a DELETE
+(a cascade child delete reaching that same arm). An arm that returns without staging — IGNORE, a
+blocked decision, a row already removed in this transaction — stages nothing here either. The
+displacing move's order matters for the reason it matters for indexes: when the displaced row and
+the moving row hold the same reference in the same column they stage the identical key, and
+remove-then-add leaves it present.
+
+An entry's key is the reference, then the referrer: the row's framed primary key with the column
+name framed on as one more element (`blobReferrer` in that module). The primary key is already
+self-delimiting, so the concatenation is injective and splitting the referrer gives the key's
+elements followed by the column name. The column's stored NAME rather than its position, because a
+catalog-only DROP COLUMN of another column renumbers positions and would re-point every committed
+entry; the name is stable, since RENAME COLUMN is refused on these tables and two refusals keep a
+`blobref` column from being dropped or re-declared away (`columnDropBlockers` in
+`packages/quereus-plugin-optimystic/src/schema/catalog-only-change.ts`, `mergeForWrite` in
+`packages/quereus-plugin-optimystic/src/schema/schema-manager.ts`). The re-declare rule is held on
+the WRITE and dry-run paths only, deliberately: `viewOverRecord` merges to read, and a machine that
+hydrated before another machine's `add column … blobref` legitimately works from its own narrower
+column list and writes nothing, so refusing there would make the table unopenable on exactly the
+machine that is behaving correctly.
+
+The entries carry no guard, for the reasons in
+[Blob reference trees and the scope registry carry no guards](#blob-reference-trees-and-the-scope-registry-carry-no-guards):
+a reference entry restates what its row implies, and the row carries the `unchanged` guard that
+decides a race, so a refused writer's reference entries roll back with the rest of its transaction.
+What the maintainer stages is a pure function of the rows, the keys and the column list — no read of
+the tree, no clock, no blob service — which is what lets a validating member re-executing the
+statements derive the same operations.
+
+The network's scope registry is written at DDL time only, and never on a hydrate: a first touch
+writes only what the table owes (above), and a hydrated table's tree was registered by whichever
+machine created it. Consulting the registry per table at every start would be a read per table for a
+case the pin lifecycle closes anyway, by confirming the scope before any announcement names it.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

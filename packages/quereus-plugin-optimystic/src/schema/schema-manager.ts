@@ -13,7 +13,7 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { QuereusError, StatusCode, buildColumnIndexMap, compilePredicate, getType, inferType } from '@quereus/quereus';
 import type { LogicalType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
-import { REGISTER_TYPES_REMEDY, assertBlobRefTypeRegistered } from './blobref-type.js';
+import { REGISTER_TYPES_REMEDY, assertBlobRefTypeRegistered, isBlobRefColumn } from './blobref-type.js';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { PredicateExpression } from './index-predicate.js';
@@ -959,6 +959,49 @@ export function mergePersistedSchemas(
 }
 
 /**
+ * Refuse a re-declare that would leave the table's reference tree describing rows that no longer
+ * hold what it says — the write-side precondition of `BlobReferenceMaintainer` in
+ * `./blob-reference-maintainer.ts`. Two shapes, judged against the record's columns:
+ *
+ * - a column the record and `incoming` both have, where exactly one side is `blobref`. Turning a
+ *   `text` column that holds references into `blobref` over existing rows would give committed
+ *   references with no entries; turning one the other way would leave entries for a column nothing
+ *   maintains.
+ * - a `blobref` column the record has and `incoming` omits. The entries it implies would be left
+ *   behind with nothing to remove them, keeping their blobs alive for ever.
+ *
+ * Either way the way out is the same as for a persisted index over a dropped column: drop the
+ * table. A plain `Error`, as the index refusal in {@link mergePersistedSchemas} is, surfaced by
+ * `doInitialize`'s wrap with its other re-declare refusals. Nothing to judge when the table has no
+ * record yet.
+ */
+function assertBlobRefColumnsKept(incoming: PersistedTableSchema, persisted: PersistedTableSchema | undefined): void {
+	if (!persisted) {
+		return;
+	}
+	const declared = columnPositions(incoming.columns);
+	for (const column of persisted.columns) {
+		const at = declared.get(column.name.toLowerCase());
+		const now = at === undefined ? undefined : incoming.columns[at];
+		if (now !== undefined && isBlobRefColumn(now) === isBlobRefColumn(column)) {
+			continue;
+		}
+		if (now !== undefined) {
+			throw new Error(
+				`Cannot re-declare column '${column.name}' of table '${recordTableName(incoming)}' to or from blobref: `
+				+ `its rows' blob references would need rewriting. Drop and re-create the table.`
+			);
+		}
+		if (isBlobRefColumn(column)) {
+			throw new Error(
+				`Cannot re-declare table '${recordTableName(incoming)}' without column '${column.name}': `
+				+ `it holds blob references. Drop and re-create the table.`
+			);
+		}
+	}
+}
+
+/**
  * What the catalog holds for one table ({@link SchemaManager.readRecordsFresh}): its live record, a
  * gravestone (another machine dropped it), or neither.
  */
@@ -1130,7 +1173,7 @@ export class SchemaManager {
 		await tree.update();
 		const path = await tree.find(key);
 		const persisted = tree.isValid(path) ? this.livePersistedEntry(tree.at(path)) : undefined;
-		const merged = mergePersistedSchemas(toPersistedSchema(stored), persisted);
+		const merged = this.mergeForWrite(toPersistedSchema(stored), persisted);
 		const resolved = toStoredSchema(merged);
 
 		// The schema tree's keyExtractor (in collection-factory) treats entries
@@ -1162,7 +1205,7 @@ export class SchemaManager {
 	): Promise<StoredTableSchema> {
 		const key = catalogKey(stored.schemaName, stored.name);
 		const current = this.livePersistedEntry(await batch.readEntry(key, transactor));
-		const merged = mergePersistedSchemas(toPersistedSchema(stored), current);
+		const merged = this.mergeForWrite(toPersistedSchema(stored), current);
 		batch.write(key, [key, merged]);
 		return toStoredSchema(merged);
 	}
@@ -1187,10 +1230,30 @@ export class SchemaManager {
 	 * de-resolve → union → validate → resolve sequence as {@link storeStoredSchema},
 	 * so a caller comparing the two to skip a byte-identical write compares against
 	 * exactly what a write would land. Throws what the write would throw (a
-	 * re-declare that drops an indexed column).
+	 * re-declare that drops an indexed column, or one that changes a `blobref` column).
 	 */
 	mergeWithPersisted(candidate: StoredTableSchema, persisted: StoredTableSchema): StoredTableSchema {
-		return toStoredSchema(mergePersistedSchemas(toPersistedSchema(candidate), toPersistedSchema(persisted)));
+		return toStoredSchema(this.mergeForWrite(toPersistedSchema(candidate), toPersistedSchema(persisted)));
+	}
+
+	/**
+	 * {@link mergePersistedSchemas} under the rules that apply only to a WRITE (and to the dry run
+	 * of one, {@link mergeWithPersisted}): the record's `blobref` columns must survive the
+	 * re-declare unchanged ({@link assertBlobRefColumnsKept}).
+	 *
+	 * Deliberately not applied by {@link viewOverRecord}, which merges to read rather than to
+	 * write. A machine that hydrated before another machine's `add column … blobref` legitimately
+	 * works from its own narrower column list and writes nothing; refusing there would make the
+	 * table unopenable on exactly the machine that is behaving correctly.
+	 */
+	private mergeForWrite(incoming: PersistedTableSchema, persisted: PersistedTableSchema | undefined): PersistedTableSchema {
+		// Ahead of the kept-columns rule, so a process that cannot resolve the type is told to
+		// register it rather than to drop the table: without this, a declaration whose `blobref`
+		// column fell through to BLOB reads as a re-declare "from blobref" against the record.
+		// `storeStoredSchema` holds the same guard at its own entry; this is cheap and total.
+		assertBlobRefTypeRegistered(incoming.columns, `table '${recordTableName(incoming)}'`);
+		assertBlobRefColumnsKept(incoming, persisted);
+		return mergePersistedSchemas(incoming, persisted);
 	}
 
 	/**

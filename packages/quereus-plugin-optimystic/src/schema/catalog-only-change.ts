@@ -27,6 +27,8 @@
 
 import { structuralEquals } from '@optimystic/db-core';
 import { StatusCode } from '@quereus/quereus';
+import { isBlobRefColumn } from './blobref-type.js';
+import type { BlobRefColumnShape } from './blobref-type.js';
 import type { StoredCheckConstraint, StoredColumnSchema, StoredTableSchema } from './schema-manager.js';
 import { sameTags, tagSlots } from './tag-overlay.js';
 import type { TagBearingSchema, TagChange, Tags } from './tag-overlay.js';
@@ -189,7 +191,9 @@ export function positionOfNamed(items: readonly CatalogObject[], name: string): 
  * catalog record (`StoredTableSchema`) share, so one rule judges both.
  */
 export interface ColumnKeyedParts {
-	readonly columns: readonly { readonly name: string; readonly generated: boolean }[];
+	/** Each column carries what the blobref rule reads of it too ({@link columnDropBlockers}), which
+	 *  is exactly `BlobRefColumnShape` — reused rather than restated so the two cannot drift. */
+	readonly columns: readonly (BlobRefColumnShape & { readonly name: string; readonly generated: boolean })[];
 	readonly primaryKeyDefinition: readonly { readonly index: number }[];
 	readonly indexes?: readonly { readonly name: string; readonly columns: readonly { readonly index: number }[] }[];
 	readonly uniqueConstraints?: readonly { readonly name?: string; readonly columns: readonly number[] }[];
@@ -202,7 +206,10 @@ export interface ColumnKeyedParts {
  * phrase each; empty when nothing stands in the way. A key, an index (declared, or a
  * unique-enforcement tree), a UNIQUE constraint and a FOREIGN KEY all key stored data on the
  * column's values, and a generated column's value is computed into its row — dropping any of them
- * would need rows or trees rewritten.
+ * would need rows or trees rewritten. A `blobref` column is refused for the mirror-image reason:
+ * the table's reference tree holds an entry per row per such column
+ * (`BlobReferenceMaintainer` in `./blob-reference-maintainer.ts`), and dropping the column would
+ * leave entries no row implies, keeping their blobs alive for ever.
  *
  * NOTE: expressions are not judged — a CHECK, a DEFAULT or a generated expression naming the
  * column. Quereus refuses those against the engine's own catalog before the module is called; a
@@ -214,8 +221,12 @@ export interface ColumnKeyedParts {
 export function columnDropBlockers(parts: ColumnKeyedParts, position: number): string[] {
 	const blockers: string[] = [];
 	const named = (kind: string, name: string | undefined) => (name ? `${kind} '${name}'` : `a ${kind}`);
-	if (parts.columns[position]?.generated) {
+	const column = parts.columns[position];
+	if (column?.generated) {
 		blockers.push('it is a generated column');
+	}
+	if (column !== undefined && isBlobRefColumn(column)) {
+		blockers.push('it holds blob references');
 	}
 	if (parts.primaryKeyDefinition.some(pk => pk.index === position)) {
 		blockers.push('it is in the primary key');

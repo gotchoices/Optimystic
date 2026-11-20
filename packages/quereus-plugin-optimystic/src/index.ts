@@ -55,6 +55,13 @@ export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } fr
 // `BLOBREF_TYPE` with `db.registerType`, and `isBlobRefColumn` tells whether a column is one.
 export { BLOBREF_TYPE, BLOBREF_TYPE_NAME, isBlobRefColumn } from './schema/blobref-type.js';
 
+// How a table's reference tree names the row and column that hold one reference (docs/blobs.md
+// §Registering references). A host reading a reference tree back — to see which rows reference a
+// blob — decodes a key with `decodeBlobReferenceKey` (db-core) and splits the referrer with
+// `splitKeyTuple`: the last element is the column name, the ones before it the primary key's.
+export { blobReferrer } from './schema/blob-reference-maintainer.js';
+export type { BlobRefColumn, ReferenceChange } from './schema/blob-reference-maintainer.js';
+
 // The blob service `plugin.blobs` and `plugin.blobsFor(table)` hand out (docs/blobs.md §SQL), and
 // the per-network backend every table and service on one transactor key shares. Exported from
 // `./plugin` too. A host needs none of this to USE the services — only to name their types.

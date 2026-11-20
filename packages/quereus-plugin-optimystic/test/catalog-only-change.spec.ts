@@ -9,7 +9,9 @@
 import { expect } from 'chai';
 import { StatusCode } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
-import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange } from '../src/schema/catalog-only-change.js';
+import { AdoptedChanges, adoptedChangeKey, classifyCheckChange, classifyColumnChange, columnDropBlockers } from '../src/schema/catalog-only-change.js';
+import { BLOBREF_TYPE_NAME } from '../src/schema/blobref-type.js';
+import type { BlobRefColumnShape } from '../src/schema/blobref-type.js';
 import { toPersistedSchema, withoutColumn } from '../src/schema/schema-manager.js';
 import type { StoredCheckConstraint, StoredColumnSchema, StoredTableSchema } from '../src/schema/schema-manager.js';
 
@@ -147,5 +149,25 @@ describe('catalog-only column changes', () => {
 		expect(dropped.uniqueConstraints?.map(uc => uc.columns)).to.deep.equal([[3]]);
 		expect(dropped.generatedColumnDependencies).to.deep.equal([[4, [2, 3]]]);
 		expect(dropped.generatedColumnTopoOrder).to.deep.equal([4]);
+	});
+
+	it('a blobref column cannot be dropped, in either shape a column arrives in', () => {
+		// The table's reference tree holds an entry per row per `blobref` column, so dropping the
+		// column would leave entries no row implies and keep their blobs alive for ever
+		// (docs/blobs.md §Registering references). Judged over both shapes `isBlobRefColumn` reads,
+		// because the rule is asked over the engine's catalog entry (`logicalType`) and over a
+		// freshly read record (`affinity`) on different paths, and only the record shape would be
+		// covered by a SQL-level test.
+		const parts = (content: StoredColumnSchema & BlobRefColumnShape) => ({
+			columns: [column('id', 'INTEGER'), content],
+			primaryKeyDefinition: [{ index: 0 }],
+		});
+		const stored = { ...column('content', BLOBREF_TYPE_NAME), declaredType: 'blobref' };
+		const engineHeld = { ...column('content'), logicalType: { name: BLOBREF_TYPE_NAME } };
+
+		expect(columnDropBlockers(parts(stored), 1), 'a record\'s column').to.deep.equal(['it holds blob references']);
+		expect(columnDropBlockers(parts(engineHeld), 1), 'the engine\'s column').to.deep.equal(['it holds blob references']);
+		expect(columnDropBlockers(parts(stored), 0), 'another column of the same table').to.deep.equal(['it is in the primary key']);
+		expect(columnDropBlockers(parts({ ...column('content') }), 1), 'an ordinary text column').to.deep.equal([]);
 	});
 });
