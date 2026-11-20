@@ -8,6 +8,29 @@ import { LruMap } from '@optimystic/db-core';
 const DEFAULT_MAX_PAIRS = 4096;
 
 /**
+ * How many times one `(peer, proof)` pair may come back unresolved before the sender stops naming
+ * that proof to that peer at all.
+ *
+ * The first failure is forgiven because it is routinely transient: the peer restarted between two
+ * blocks of one commit and re-filed the proof from the inline retry, so the next block's reference
+ * resolves. A peer that resolves no reference ever — a replica store without
+ * `IBlockReplicaStore.getCommitProof`, or a holder that accepts blocks and retains no proof —
+ * answers every time, and with no bound every block of the commit would cost it two pushes
+ * indefinitely: the same proof bytes as before references existed, plus a round trip each. The
+ * bound makes that degradation the pre-reference behaviour plus this many extra round trips, once
+ * per pair.
+ */
+const MAX_UNRESOLVED_PER_PAIR = 2;
+
+/** What one sender knows about one `(peer, commit proof)` pair. */
+type PairState = {
+	/** Whether a push that CARRIED the proof to this peer was last confirmed by it. */
+	readonly shown: boolean;
+	/** How often this peer has answered that it could not resolve this proof's hash. */
+	readonly unresolved: number;
+};
+
+/**
  * Which commit proofs a sender has already shown each peer, so a push can NAME a proof
  * (`BlockTransferRequest.proofRefs`) instead of carrying it. A proof lists every block of its
  * commit, so copying a commit of N blocks to one peer used to put N copies of the same proof on the
@@ -15,37 +38,48 @@ const DEFAULT_MAX_PAIRS = 4096;
  *
  * **Being wrong in either direction is safe.** Believing a peer holds a proof when it does not
  * costs one extra round trip for that block and corrects itself — the receiver answers the hash in
- * `BlockTransferResponse.unresolvedProofs` and the sender forgets the pair and re-pushes with the
- * proof inline. Not knowing that a peer holds one costs one proof on the wire, which is exactly the
- * behaviour before references existed. So nothing here needs to be durable, replicated, or exact.
+ * `BlockTransferResponse.unresolvedProofs` and the sender records that and re-pushes with the proof
+ * inline. Not knowing that a peer holds one costs one proof on the wire, which is exactly the
+ * behaviour before references existed. So nothing here needs to be durable, replicated, or exact —
+ * and a peer that keeps failing to resolve is bounded by {@link MAX_UNRESOLVED_PER_PAIR} rather
+ * than retried forever.
  *
  * **Nothing expires.** No site deletes a stored commit proof (see `RawStoreDriver.getCommitProof`),
  * so a peer that filed a proof holds it for good; eviction at the cap only re-sends a proof.
  */
 export class PeerProofMemory {
-	/** Value is a placeholder — membership is the whole state. */
-	private readonly shown: LruMap<string, true>;
+	private readonly pairs: LruMap<string, PairState>;
 
 	constructor(maxPairs: number = DEFAULT_MAX_PAIRS) {
-		this.shown = new LruMap(maxPairs);
+		this.pairs = new LruMap(maxPairs);
 	}
 
-	/** Whether `peerId` has been shown the proof whose consensus message hashes to `messageHash`. */
+	/** Whether a push to `peerId` may name the proof whose consensus message hashes to `messageHash`. */
 	holds(peerId: string, messageHash: string): boolean {
-		// `get` rather than `has`, so the pair being used right now is the last to be evicted: a
-		// commit is copied block by block, and the pair for the commit in flight is the one that must
-		// survive the cap.
-		return this.shown.get(pairKey(peerId, messageHash)) !== undefined;
+		const state = this.read(peerId, messageHash);
+		return state !== undefined && state.shown && state.unresolved < MAX_UNRESOLVED_PER_PAIR;
 	}
 
-	/** Record that `peerId` has been shown that proof. */
+	/** Record that a push carrying that proof to `peerId` was confirmed. */
 	remember(peerId: string, messageHash: string): void {
-		this.shown.set(pairKey(peerId, messageHash), true);
+		this.write(peerId, messageHash, { shown: true, unresolved: this.read(peerId, messageHash)?.unresolved ?? 0 });
 	}
 
-	/** Forget the pair — the peer answered that it could not resolve the reference. */
-	forget(peerId: string, messageHash: string): void {
-		this.shown.delete(pairKey(peerId, messageHash));
+	/** Record that `peerId` answered that it could not resolve that proof's hash. */
+	recordUnresolved(peerId: string, messageHash: string): void {
+		const failures = (this.read(peerId, messageHash)?.unresolved ?? 0) + 1;
+		this.write(peerId, messageHash, { shown: false, unresolved: Math.min(failures, MAX_UNRESOLVED_PER_PAIR) });
+	}
+
+	// `get` rather than `peek`, so the pair being used right now is the last to be evicted: a commit
+	// is copied block by block, and the pair for the commit in flight is the one that must survive
+	// the cap.
+	private read(peerId: string, messageHash: string): PairState | undefined {
+		return this.pairs.get(pairKey(peerId, messageHash));
+	}
+
+	private write(peerId: string, messageHash: string, state: PairState): void {
+		this.pairs.set(pairKey(peerId, messageHash), state);
 	}
 }
 
