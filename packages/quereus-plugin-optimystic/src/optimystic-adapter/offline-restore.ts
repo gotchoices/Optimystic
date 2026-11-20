@@ -72,7 +72,7 @@ type RestoreOutcome = { kind: 'restored' } | { kind: 'deferred'; reason: Exclude
 type ResolvedCollections = { kind: 'resolved'; collections: Collection<any>[] } | Extract<RestoreOutcome, { kind: 'deferred' }>;
 type Waiter = { resolve: () => void; reject: (error: unknown) => void };
 
-const openTransactionMessage = 'offline restore: a transaction is open on this Database; the restore runs only between transactions, since the open segment of each collection belongs to the transaction';
+export const openTransactionMessage = 'offline restore: a transaction is open on this Database; the restore runs only between transactions, since the open segment of each collection belongs to the transaction';
 
 /**
  * Puts journaled transactions back in the queue after a restart (docs/offline-sync.md §Restore after
@@ -112,6 +112,12 @@ export class OfflineRestore {
 	private readonly changeWaiters: Waiter[] = [];
 	/** Records whose `offline:restore-stuck` line was logged. */
 	private readonly stuckLogged = new Set<string>();
+	/**
+	 * Whether a pass has run to completion in this process ({@link hasCompletedPass}). Set at the END
+	 * of {@link pass}, so a pass that threw — an unknown record version, a table initialization that
+	 * faulted — leaves it false.
+	 */
+	private completedPass = false;
 	private disposed = false;
 
 	constructor(private readonly host: RestoreHost) {}
@@ -145,6 +151,27 @@ export class OfflineRestore {
 	 * bridge's routing and the DDL gate. */
 	holdsRecords(): boolean {
 		return this.deferred.size > 0 || this.discarding.size > 0;
+	}
+
+	/**
+	 * Whether a journaled record for `transactionId` is one this restore still holds: deferred, or
+	 * discarded and still settling. Either way the transaction is not finished with, so nothing may
+	 * judge its blob reference pins from committed state — a deferred record goes on to commit once
+	 * its table can be read, and a discarding one is settling its own pins already
+	 * (`SqlBlobPins.reconcile`, via `OfflineMode.holdsTransaction`).
+	 */
+	holds(transactionId: string): boolean {
+		return this.deferred.has(transactionId) || this.discarding.has(transactionId);
+	}
+
+	/**
+	 * Whether a pass has completed in this process. Until one has, a journaled transaction still on
+	 * disk is in no queue and deferred nowhere, so its absence must NOT be read as "settled": the
+	 * blob-pin reconciliation would release the pins of an entry that goes on to commit
+	 * (`OfflineMode.reconcileReady`).
+	 */
+	hasCompletedPass(): boolean {
+		return this.completedPass;
 	}
 
 	/** Whether a deferred record wrote the table named `schema.table`. */
@@ -264,6 +291,9 @@ export class OfflineRestore {
 			}
 			this.notifyChanged();
 		}
+		// Last, and only on a pass that threw nothing: {@link hasCompletedPass} is what licenses the
+		// blob-pin reconciliation to read a journaled transaction's absence as "settled".
+		this.completedPass = true;
 	}
 
 	/** The entry records in queue order: settle, skip, put back or defer each, until one is deferred;

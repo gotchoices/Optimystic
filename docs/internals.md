@@ -1128,6 +1128,38 @@ here or on another machine, so a settle that re-registered its tree would keep t
 rows listed for ever — and a certain "not listed" is what makes those pins releasable rather than
 kept.
 
+A pin no arm got to release is the restart reconciliation's: `SqlBlobPins.reconcile` judges every
+transaction pin whose transaction is not live from committed state, which is the reference tree the
+pin's own label names. It reaches the pins the same way a settle without memory does —
+`listPins` per backend, grouped by transaction and then by scope — and it costs one
+`BlobReferenceTree.listed` per scope, so a whole scope's pins are decided by one committed read. A
+listed reference is announced and released; one the read certainly does not list is released without
+an announcement; a scope whose read was not certain keeps every pin and logs
+`blob:reconcile-uncertain`. Three triggers, and no timer: after the offline queue's restore (which
+AWAITS it, so `plugin.hydrate`'s reconciliation has happened by the time the hydrate resolves —
+and `hydrate` resolves the default network's blob store too, since a host that has hydrated and not
+yet opened a table would otherwise have no store to look in), on every reachability wake, and when a
+network's blob store first resolves here (`CollectionFactory.onBlobBackendResolved`, whose replay of
+the already-resolved backends is what makes the subscription order-independent). One boolean,
+`mayHoldStalePins`, is what makes the frequent triggers free: it starts set, is set again by any arm
+that keeps a pin it could not release and by a store this process has not looked at, and is cleared
+by a pass that goes on to look at every known store — so a phone whose connections churn pays the
+listing only when it is actually owed one.
+
+Two orderings are load-bearing, and both are `OfflineMode`'s to answer rather than `SqlBlobPins`'s,
+so the pins interpret no queue statuses. `holdsTransaction` is what makes a transaction LIVE here:
+the queue answers `undefined` for an entry that has left it with its terminal status, which is
+exactly "settled", and the restore answers for a record it has deferred or is still discarding.
+`reconcileReady` is the stronger one: with a journal the reconciliation is a no-op until a restore
+pass has COMPLETED in this process (`OfflineRestore.hasCompletedPass`, set at the end of a pass, so
+a pass that threw leaves it false), because before that pass a journaled transaction still on disk
+is in no queue and deferred nowhere, its reference is not yet listed in committed state, and its pin
+would be released while the entry went on to commit. With no journal it is true from the start,
+since a queued transaction did not survive the restart at all. The reconciliation runs on the same
+work chain as a queued settlement, so no two of them ever handle one transaction's pins at once; a
+request made while a pass is chained and not yet started joins it, and one made while a pass is
+running is chained behind it.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

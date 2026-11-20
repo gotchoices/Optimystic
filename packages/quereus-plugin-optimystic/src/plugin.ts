@@ -24,6 +24,9 @@ import { SqlBlobPins } from './optimystic-adapter/blob-pins.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
+/** The blob sub-namespace, for the one blob line this entry logs (docs/debugging.md
+ * §quereus-plugin sub-namespaces). */
+const blobLog = createLogger('blob');
 
 // The error classes a caller classifies commit and write failures by (see docs/transactions.md).
 // Exported from this entry as well as the root so a host that loads the plugin here can import them
@@ -96,9 +99,19 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		knownBackends: () => collectionFactory.knownBlobBackends(),
 		tablesOf: scope => txnBridge.tablesOf(scope),
 		whenTransactionIdle: () => txnBridge.whenTransactionIdle(),
+		isLive: transactionId => {
+			const open = txnBridge.getCurrentTransaction();
+			return (open?.isActive === true && open.stampId === transactionId) || offline.holdsTransaction(transactionId);
+		},
+		reconcileReady: () => offline.reconcileReady(),
 	});
 	txnBridge.attachBlobPins(blobPins);
 	offline.attachBlobPins(blobPins);
+	// Every network's blob store this process opens, the ones already open replayed at once: a store
+	// this process has not looked at may hold a pin a PREVIOUS process left behind, and the pass that
+	// judges those pins has nothing to look at until some store is known. The unsubscribe is dropped
+	// deliberately — the factory and the pins live and die with this registration.
+	collectionFactory.onBlobBackendResolved(backend => blobPins.backendResolved(backend));
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge, costProfile);
 	// The restore after a restart initializes each journaled transaction's tables through the module.
 	offline.attachTableResolver(optimysticModule);
@@ -212,8 +225,9 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		/**
 		 * The blob pins a committing transaction's references are held under (`SqlBlobPins`). A
 		 * queued transaction's pins are released when the queue finishes with it, off the commit, so
-		 * `blobPins.settled()` is how a caller waits for those releases. Never await it inside a
-		 * transaction: the work it waits on waits for the transaction to end.
+		 * `blobPins.settled()` is how a caller waits for those releases — and for the reconciliation
+		 * of the pins a previous process left behind, which {@link hydrate} triggers. Never await it
+		 * inside a transaction: the work it waits on waits for the transaction to end.
 		 */
 		blobPins,
 		/**
@@ -255,7 +269,12 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		/**
 		 * Hydrate Quereus's in-memory catalog from persisted Optimystic vtab
 		 * schemas, then put the offline queue's journaled transactions back
-		 * (`plugin.offline.restore()`; README § Offline mode, "Restarting").
+		 * (`plugin.offline.restore()`; README § Offline mode, "Restarting")
+		 * and reconcile the blob reference pins a previous process left behind
+		 * (`SqlBlobPins.reconcile`, awaited here: a pin whose transaction
+		 * committed is announced and released, one whose transaction never did
+		 * is released, and one whose scope cannot be read with confidence is
+		 * kept for the next restart or reachability wake).
 		 * Hosts that re-open a `Database` against existing storage should call
 		 * this once after registering the plugin (and before running `apply
 		 * schema` / DDL) so Quereus sees the existing tables in its catalog and
@@ -273,7 +292,28 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 */
 		hydrate: async (db: Database) => {
 			const counts = await optimysticModule.hydrateCatalog(db, config, config);
+			// Puts the journaled transactions back, and then AWAITS the reconciliation of the blob
+			// reference pins a previous process left behind (`OfflineMode.restore`, which never throws
+			// out of that reconciliation), so a restart's pin reconciliation has happened by the time
+			// this resolves.
 			await offline.restore();
+			// The DEFAULT network's blob store, so the reconciliation has somewhere to look in a host that
+			// has hydrated and not yet opened a table: its pass walks the stores of the transactor keys
+			// the factory has seen options for, and resolving this one reports the backend to
+			// `SqlBlobPins`, which chains a pass over it — `settled()` below is what waits for that pass.
+			// A table on ANOTHER network gets its own pass when that table first initializes and its
+			// backend resolves. It builds no libp2p node `hydrateCatalog` has not already built — it reads
+			// the catalog through the same transactor — so this adds a piece store, not a network, and a
+			// failure is logged rather than failing the hydrate.
+			// NOTE: a host that uses NO blobs pays one empty single-machine blob store, and its piece
+			// sweeper, per hydrate; if that ever shows up on a cold start, resolve it lazily on the first
+			// trigger that finds a pin instead of here.
+			try {
+				await collectionFactory.getBlobBackend(optimysticModule.defaultBindingOptions(db, config));
+			} catch (error) {
+				blobLog('blob:backend-resolution-failed step=hydrate %o', error);
+			}
+			await blobPins.settled();
 			return counts;
 		},
 		/**

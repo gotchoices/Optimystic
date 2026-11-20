@@ -171,7 +171,14 @@ export async function allPins(plugin: Plugin, prefix: string): Promise<string[]>
 	return found.sort();
 }
 
-/** Options that resolve to the handle's one cached `local:test` transactor. */
+/**
+ * Options that resolve to the handle's one cached `local:test` transactor.
+ *
+ * `blobStorageFactory` is here even though nothing resolved through these options opens a blob
+ * store: the factory remembers the FIRST options per transactor key, and that record is what builds
+ * the network's blob store later, so options that drop it can make this handle's blob store a fresh,
+ * empty one (`CollectionFactory.transactorOptions`).
+ */
 function bindingOptions(stores: BlobPinStores) {
 	return {
 		collectionUri: 'tree://unused',
@@ -181,6 +188,7 @@ function bindingOptions(stores: BlobPinStores) {
 		cache: false,
 		encoding: 'json' as const,
 		rawStorageFactory: () => stores.storage,
+		blobStorageFactory: () => stores.blobs,
 	};
 }
 

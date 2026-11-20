@@ -161,6 +161,15 @@ export class CollectionFactory {
    *
    * Neither {@link clearCache} nor {@link dispose} forgets these: they are inert configuration, and
    * keeping them lets a later resolution rebuild that network's store exactly the same way.
+   *
+   * What that asks of callers: options handed to {@link getOrCreateTransactor} must carry the
+   * PLUGIN-LEVEL factories (`rawStorageFactory`, `blobStorageFactory`) even when the collection
+   * being opened has no use for them, because the first options per key are what
+   * {@link knownBlobBackends} later builds that network's BLOB store from. An options object
+   * assembled field by field is how one gets dropped, silently — the catalog tree's did drop
+   * `blobStorageFactory`, and a hydrate then built the network's blob store over fresh in-memory
+   * stores and read none of the machine's pins. Spread an existing options object and override what
+   * differs, as `OptimysticModule`'s `openIndexTree` and its schema-catalog opener do.
    */
   private transactorOptions = new Map<string, ParsedOptimysticOptions>();
   /** The single-machine services this factory BUILT, so {@link dispose} can stop them. A `network`

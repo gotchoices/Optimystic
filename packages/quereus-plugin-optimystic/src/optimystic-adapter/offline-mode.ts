@@ -9,7 +9,7 @@ import type { TransactionBridge } from './txn-bridge.js';
 import type { SqlBlobPins } from './blob-pins.js';
 import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-config.js';
 import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
-import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
+import { OfflineRestore, openTransactionMessage, type DeferredRecord } from './offline-restore.js';
 import type { OfflineModeState, QueuedTransaction, QueuedTransactionStatus, TransactionOutcome } from './offline-status.js';
 import { followCommit, followOutlooks, judgeTransaction, outlookContradicted, refusedCheck, renderKey, WriteIndex } from './commit-outlook.js';
 import type {
@@ -411,14 +411,54 @@ export class OfflineMode {
 	 * tried again. A `queued` status is emitted for each transaction put back, before this resolves.
 	 * Without a journal there is nothing to put back, and this is a no-op.
 	 *
+	 * It also AWAITS the reconciliation of the blob reference pins a previous process left behind
+	 * ({@link SqlBlobPins.reconcile}) — which never throws, so it cannot fail a hydrate — so that a
+	 * restart's pin reconciliation is observable to the host and to a test without polling. That
+	 * reconciliation reads a journaled transaction's absence from the queue as "settled", which is
+	 * only true once a restore pass has completed ({@link reconcileReady}), so it runs after the pass
+	 * and not before it.
+	 *
 	 * @throws Error while a transaction is open on this `Database` (the open segment belongs to it;
-	 * run it between transactions); `OfflineJournalError` for a record written by a newer build, after
-	 * putting back every record before it; whatever a table's initialization threw, other than the
-	 * `BlockUnavailableError` that defers the record.
+	 * run it between transactions) — in EVERY configuration, journal or none, because the pin
+	 * reconciliation this awaits waits for the open transaction to end and so would deadlock;
+	 * `OfflineJournalError` for a record written by a newer build, after putting back every record
+	 * before it; whatever a table's initialization threw, other than the `BlockUnavailableError` that
+	 * defers the record.
 	 */
 	async restore(): Promise<void> {
-		if (this.restorer === undefined) return;
-		await this.restorer.run();
+		if (this.bridge.isTransactionActive()) throw new Error(openTransactionMessage);
+		if (this.restorer !== undefined) await this.restorer.run();
+		// After the pass: a pass that threw leaves `reconcileReady()` false, so the reconciliation this
+		// skips would have been a no-op anyway, and the next trigger runs it.
+		await this.blobPins?.reconcile();
+	}
+
+	/**
+	 * Whether the queue or the restore still holds `transactionId` — queued, being submitted,
+	 * partially committed, or journaled and not yet put back. `false` once it has settled, and for an
+	 * id this machine never queued.
+	 *
+	 * `OfflineQueue.status` answers `undefined` for an entry that has left the queue with its terminal
+	 * status, which is exactly "settled"; the restore's own hold covers a journaled record it has read
+	 * and deferred, and one whose discard is still settling. What the blob-pin reconciliation asks
+	 * before it judges a transaction's pins from committed state (`SqlBlobPins`'s `isLive`).
+	 */
+	holdsTransaction(transactionId: string): boolean {
+		return this.queue.status(transactionId) !== undefined || (this.restorer?.holds(transactionId) ?? false);
+	}
+
+	/**
+	 * Whether a transaction's absence from the queue may be read as "settled": with a journal, only
+	 * once a restore pass has completed in this process, since until then a journaled transaction
+	 * still on disk is in no queue and deferred nowhere. `true` with no journal, where a queued
+	 * transaction did not survive the restart at all.
+	 *
+	 * This is the ordering constraint the restart's blob-pin reconciliation rests on: before the first
+	 * pass, a journaled entry's reference is not yet listed in committed state, so judging it would
+	 * release the pins of an entry that goes on to commit.
+	 */
+	reconcileReady(): boolean {
+		return this.restorer === undefined || this.restorer.hasCompletedPass();
 	}
 
 	/**
@@ -542,6 +582,11 @@ export class OfflineMode {
 				.catch(error => log('offline:restore-pass-failed from=wake: %o', error));
 		}
 		this.queue.wake();
+		// A wake is also when a cohort that could not be read before may be readable now, which is
+		// what a kept pin is waiting for. No `whenTransactionIdle` dance here: the reconciliation's
+		// own chained step is the idleness wait, and it costs nothing at all unless some arm has kept
+		// a pin it could not release (`SqlBlobPins.reconcile`).
+		void this.blobPins?.reconcile();
 	};
 
 	private releaseGateWakes(): void {

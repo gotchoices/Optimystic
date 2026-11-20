@@ -6136,15 +6136,18 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     if (cached) return cached;
 
     const manager = new SchemaManager(async (transactor, create) => {
+      // Spread and override, as {@link openIndexTree} does, rather than copied field by field: the
+      // catalog tree itself needs only the transactor fields, but the collection factory remembers
+      // the FIRST options it sees per transactor key, and that record is what later builds the
+      // network's BLOB store (`CollectionFactory.transactorOptions`). Assembled by hand, this
+      // dropped `blobStorageFactory`, so a `hydrate` — whose catalog read is the first thing to
+      // name the key in a restarted process — built that network's blob store over fresh in-memory
+      // stores and found none of the machine's pins.
       const schemaOptions: ParsedOptimysticOptions = {
+        ...tableOptions,
         collectionUri: 'tree://optimystic/schema',
-        transactor: tableOptions.transactor,
-        keyNetwork: tableOptions.keyNetwork,
-        libp2p: tableOptions.libp2p,
-        libp2pOptions: tableOptions.libp2pOptions,
         cache: true,
         encoding: 'json',
-        rawStorageFactory: tableOptions.rawStorageFactory,
       };
       const txnState = transactor ? transactorOnlyState(transactor) : undefined;
       // Write paths bring the catalog into existence; read paths must observe an
