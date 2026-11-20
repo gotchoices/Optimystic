@@ -863,6 +863,12 @@ export class TransactionBridge {
    *
    * Following SQLite semantics: if a transaction is already active,
    * this is a no-op and returns the existing transaction.
+   *
+   * NOTE: reads only the BINDING out of `options` (transactor, key network, libp2p node, signer),
+   * never `collectionUri`. `OptimysticModule.registerBridgeConnection` relies on that: the
+   * connection hydration registers carries the schema catalog's options, not any table's, so a
+   * `collectionUri` read added here would begin that connection's transactions against the
+   * catalog's collection. If this ever needs the URI, give that connection a table's options.
    */
   async beginTransaction(options: ParsedOptimysticOptions): Promise<TransactionState> {
     if (this.currentTransaction?.isActive) {

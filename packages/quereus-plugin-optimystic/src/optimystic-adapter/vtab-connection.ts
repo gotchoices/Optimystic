@@ -44,6 +44,12 @@ export class OptimysticVirtualTableConnection implements VirtualTableConnection 
 		// than one per hydrated table; if a host ever ends up with many Optimystic connections on
 		// one Database and commits show the cost, make this a no-op for a transaction already
 		// committed by a sibling connection instead of opening a fresh one.
+		//
+		// A rollback is broadcast the same way, and the engine runs those in parallel
+		// (`TransactionManager.rollbackOpenConnections`), so the bridge's `rollbackTransaction`
+		// runs once per connection over the same snapshots. That is long-standing and covered
+		// (`test/deferred-constraint-rollback.spec.ts` rolls back a two-table transaction); the
+		// same consolidation would make it one pass.
 		const currentTxn = this.txnBridge.getCurrentTransaction();
 		if (!currentTxn?.isActive) {
 			await this.txnBridge.beginTransaction(this.options);

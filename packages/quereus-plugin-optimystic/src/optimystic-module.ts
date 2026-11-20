@@ -6476,6 +6476,10 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
    * already registered for the name) instead of adding a second one. No table instance is built:
    * caching an uninitialized one here would make that table's first `connect` ignore the
    * `tableSchema` Quereus supplies for it, which is the schema that path is documented to build from.
+   *
+   * The guard is per `Database`, not per table name: a host that declared an Optimystic table
+   * before hydrating already has one listening, and a second beside it would only add the
+   * per-commit cost above for reach this `Database` already has.
    */
   private async registerBridgeConnection(
     db: Database,
@@ -6483,7 +6487,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
     options: ParsedOptimysticOptions,
   ): Promise<void> {
     const internal = db as DatabaseInternal;
-    const existing: readonly VirtualTableConnection[] = internal.getConnectionsForTable(table.tableName);
+    const existing: readonly VirtualTableConnection[] = internal.getAllConnections();
     if (existing.some(connection => connection instanceof OptimysticVirtualTableConnection)) return;
     await internal.registerConnection(
       new OptimysticVirtualTableConnection(table.tableName, this.txnBridge, options),

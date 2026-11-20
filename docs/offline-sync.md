@@ -246,7 +246,9 @@ type QueuedFailureReason =
 - `queued` is delivered before `commit` resolves — inside the enqueue, once the journal holds the
   entry record when persistence is on — by the same rule `onCommitDurability` uses today, so a host
   wrapping `db.exec` can attribute it to the call — which is how an autocommit statement's caller
-  learns the id it never selected with `StampId()`.
+  learns the id without having stored `StampId()` in a column (it can: a write statement's
+  `StampId()` answers that statement's transaction, see
+  [README § StampId() Function](../packages/quereus-plugin-optimystic/README.md#stampid-function)).
 - `error` on `failed` is the error an online commit would have thrown for the same refusal, after
   `TransactionBridge.mapCommitRefusal` (so `ConstraintError` with the `UNIQUE constraint failed: …`
   message, or `ConcurrentModificationError`), with the db-core refusal reachable through `cause`.
