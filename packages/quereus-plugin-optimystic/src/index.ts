@@ -49,6 +49,12 @@ export type {
 // go in?"): on the `queued` status, and as the JSON `CommitOutlook()` answers. Exported from `./plugin` too.
 export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
 
+// The `blobref` column type (docs/blobs.md §SQL): text whose value must be a well-formed blob
+// reference. `register` returns it under `types`, so a host loading the plugin through
+// `registerPlugin` needs none of this; a host registering the plugin's parts by hand registers
+// `BLOBREF_TYPE` with `db.registerType`, and `isBlobRefColumn` tells whether a column is one.
+export { BLOBREF_TYPE, BLOBREF_TYPE_NAME, isBlobRefColumn } from './schema/blobref-type.js';
+
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
 

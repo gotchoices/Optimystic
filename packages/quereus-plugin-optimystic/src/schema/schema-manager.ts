@@ -13,6 +13,7 @@ import type { TableSchema, ColumnSchema, VirtualTableModule, UniqueConstraintSch
 import { QuereusError, StatusCode, buildColumnIndexMap, compilePredicate, getType, inferType } from '@quereus/quereus';
 import type { LogicalType } from '@quereus/quereus';
 import type { ITransactor } from '@optimystic/db-core';
+import { REGISTER_TYPES_REMEDY } from './blobref-type.js';
 import { CatalogBatch, recordOfEntry, recordUriOf } from './catalog-batch.js';
 import { columnDropBlockers, positionOfNamed, withoutNamed } from './catalog-only-change.js';
 import type { PredicateExpression } from './index-predicate.js';
@@ -756,25 +757,55 @@ function registeredStoredType(name: string, subject: string): LogicalType {
 	const type = getType(name);
 	if (type) return type;
 	throw new QuereusError(
-		`Unknown type '${name}' for ${subject} in a stored table description: register the type (Database.registerType) before opening the table`,
+		`Unknown type '${name}' for ${subject} in a stored table description. To fix: ${REGISTER_TYPES_REMEDY}`,
+		StatusCode.ERROR,
+	);
+}
+
+/**
+ * The logical type one hydrated column is rebuilt under, and the two ways a record can name a
+ * type this process cannot honour — kept in one helper so the two refusals stay together.
+ *
+ * A column declared WITH a type has its logical type re-inferred from that spelling by the same
+ * rule CREATE TABLE uses (`inferType`). That is lenient by design — with `strict_type_names` off
+ * an unregistered name falls through to the SQLite affinity rules — so the result is checked
+ * against the canonical name the record's rows were actually written under
+ * ({@link columnSchemaToStored} stores `logicalType.name` as `affinity`, and the writer's own
+ * `logicalType` was `inferType(declaredType)`, so the two agree for every spelling this process
+ * can resolve). A disagreement is refused for the same reason {@link registeredStoredType} refuses
+ * the other arm — read as the re-inferred type instead, the column's row codec and
+ * storage-adoption guard would key on a type its rows were never written under. The message names
+ * both sides rather than blaming one, because the disagreement runs in both directions: usually a
+ * plugin-registered type the writer had and this process does not, but also a record written
+ * BEFORE a type was registered, read by a process that has it.
+ *
+ * A column declared WITHOUT a type has only the canonical name to go on, which
+ * {@link registeredStoredType} resolves strictly.
+ */
+function hydratedColumnType(col: StoredColumnSchema): LogicalType {
+	const subject = `column '${col.name}'`;
+	if (col.declaredType === undefined) return registeredStoredType(col.affinity, subject);
+	const inferred = inferType(col.declaredType);
+	if (inferred.name === col.affinity) return inferred;
+	throw new QuereusError(
+		`Type mismatch for ${subject} in a stored table description: its rows were written as `
+		+ `'${col.affinity}', but its declared spelling '${col.declaredType}' resolves to `
+		+ `'${inferred.name}' in this process. Usually the type is not registered here — to fix: `
+		+ REGISTER_TYPES_REMEDY,
 		StatusCode.ERROR,
 	);
 }
 
 /**
  * One column of a hydrated table — the inverse of {@link columnSchemaToStored}. The logical type
- * is re-inferred from the declared spelling by the same rule CREATE TABLE uses (`inferType`),
- * falling back to the stored canonical name for a column declared without a type. Also used by
- * the vtab's own load arm (a `connect` whose caller supplied no columns) and by the index
- * manager's partial-index predicates (`IndexPredicate`), so none of them rebuilds a column
- * differently.
+ * comes from {@link hydratedColumnType}. Also used by the vtab's own load arm (a `connect` whose
+ * caller supplied no columns) and by the index manager's partial-index predicates
+ * (`IndexPredicate`), so none of them rebuilds a column differently.
  */
 export function storedToColumnSchema(col: StoredColumnSchema): ColumnSchema {
 	return {
 		name: col.name,
-		logicalType: col.declaredType !== undefined
-			? inferType(col.declaredType)
-			: registeredStoredType(col.affinity, `column '${col.name}'`),
+		logicalType: hydratedColumnType(col),
 		declaredType: col.declaredType,
 		notNull: col.notNull,
 		primaryKey: col.primaryKey,

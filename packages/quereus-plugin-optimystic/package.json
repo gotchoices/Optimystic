@@ -101,7 +101,10 @@
       "functions": [
         "StampId"
       ],
-      "collations": []
+      "collations": [],
+      "types": [
+        "blobref"
+      ]
     },
     "settings": [
       {

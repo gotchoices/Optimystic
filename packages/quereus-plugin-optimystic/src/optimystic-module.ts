@@ -21,6 +21,7 @@ import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, Data
 import { Tree } from '@optimystic/db-core';
 import { KeyRange, gateBlockIds, isCohortUnreachableRead } from '@optimystic/db-core';
 import type { Collection, CollectionId, ITransactor, TreeAlreadyAppliedGuard, TreeReadView, TreeUnchangedGuard, TreeUpsertGuard } from '@optimystic/db-core';
+import { assertBlobRefTypeRegistered } from './schema/blobref-type.js';
 import { SchemaManager, checkConstraintToStored, columnSchemaToStored, columnSetKey, mergeIndexLists, positionAfterRemoving, repositionIndexColumns, storedToColumnSchema, uniqueConstraintKey, uniqueEnforcementTreeName, withCheckConstraint, withColumn, withoutCheckConstraint, withoutColumn } from './schema/schema-manager.js';
 import type { CatalogRecordState, PersistedIndexSchema, PersistedTableSchema, StoredTableSchema, StoredIndexSchema, StoredColumnSchema } from './schema/schema-manager.js';
 import { descriptionDifference } from './schema/description-difference.js';
@@ -1193,6 +1194,12 @@ export class OptimysticVirtualTable extends VirtualTable {
         // order misses once when its lists are out of that order: both the
         // candidate and the merge come out sorted, the persisted side does not.
         const candidateStored = this.schemaManager.tableSchemaToStored(this.tableSchema);
+        // Before the write below, not only at the settled-schema check further down: a
+        // declaration naming `blobref` in a process that has not registered the type was built
+        // as a BLOB column, and this arm would otherwise persist `affinity: 'BLOB'` OVER a
+        // record whose rows were written as BLOBREF — leaving the table unopenable even by a
+        // process that does have the type.
+        assertBlobRefTypeRegistered(candidateStored.columns, this.blobRefGuardSubject());
         let mergedCandidate: StoredTableSchema = persistedSchema
           ? this.schemaManager.mergeWithPersisted(candidateStored, persistedSchema)
           : candidateStored;
@@ -1271,6 +1278,12 @@ export class OptimysticVirtualTable extends VirtualTable {
       } else {
         throw new Error('Cannot create table without column definitions');
       }
+
+      // The table's shape is settled: refuse a `blobref` column this process cannot read as
+      // one before the row codec below is built over it. Covers the arms the declaration-time
+      // call above does not — a record written by a build that predates the type, loaded by one
+      // that has it, and the reverse.
+      assertBlobRefTypeRegistered(storedSchema.columns, this.blobRefGuardSubject());
 
       // Fold persisted uniqueness metadata into this.tableSchema BEFORE the
       // enforcement indexes are synthesized below, so enforcement never depends
@@ -1355,6 +1368,11 @@ export class OptimysticVirtualTable extends VirtualTable {
       this.setErrorMessage(wrapped.message);
       throw wrapped;
     }
+  }
+
+  /** What a refused `blobref` column belongs to, for {@link assertBlobRefTypeRegistered}'s message. */
+  private blobRefGuardSubject(): string {
+    return `table '${qualifiedTableName(this.qualifiedTable)}'`;
   }
 
   /**

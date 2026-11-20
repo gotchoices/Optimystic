@@ -15,6 +15,7 @@ import { parseOfflineConfig } from './optimystic-adapter/offline-config.js';
 import { moduleCostProfile } from './optimystic-adapter/cost-profile.js';
 import type { CommitFullyHeldListener, SqlCommitDurabilityListener } from './optimystic-adapter/commit-durability.js';
 import { OptimysticModule, defaultTransactorOf } from './optimystic-module.js';
+import { BLOBREF_TYPE } from './schema/blobref-type.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
 import { createLogger } from './logger.js';
@@ -133,6 +134,13 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 			},
 		],
 		collations: [],
+		// The `blobref` column type (README § Large values — the `blobref` column type). The
+		// registry Quereus resolves types through is process-wide, so one registration serves every
+		// Database in the process; `registerPlugin` registers these before a host calls
+		// `plugin.hydrate`, which is early enough for every path that reads a column's type. A host
+		// registering the plugin's parts by hand must register these too — a table with a `blobref`
+		// column refuses to open without them rather than reading the column as a `blob`.
+		types: [{ name: 'blobref', definition: BLOBREF_TYPE }],
 		// Expose internal components for testing and advanced usage
 		collectionFactory,
 		txnBridge,
