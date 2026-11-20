@@ -257,6 +257,15 @@ export class BlobCopyDrain implements Startable {
 	 * counts: an unidentified member is owed until it is known not to take blobs, which errs toward
 	 * keeping the writer's copy. An `on-demand` node takes nothing it is merely responsible for, so it
 	 * does not count itself.
+	 *
+	 * NOTE: `refuses` is read from the member's protocol list, which a member that has not finished
+	 * identify can hold a partial version of (see the NOTE on `blobAcceptanceOf` in
+	 * `accepts-blobs.ts`). A member misread that way is left out of the denominator, so a pass that
+	 * lands inside that window can read `full` and release the writer's hold while that member holds
+	 * nothing — one copy short of what `full` promises, never nought, since `full` needs another
+	 * member holding it. Tracked as backlog `debt-a-peer-read-as-refusing-may-only-be-unidentified`,
+	 * which proposes telling "identified and lacks the protocol" from "record incomplete" at the
+	 * source rather than at each reader of it.
 	 */
 	private accepts(peerId: string, acceptance: Record<string, BlobAcceptance>): boolean {
 		if (peerId === this.deps.selfId) {
@@ -290,6 +299,14 @@ export class BlobCopyDrain implements Startable {
 		const others = view.accepting.filter(peerId => peerId !== this.deps.selfId);
 		if (others.length === 0) {
 			// Nobody else accepts blobs: nothing is owed, and nothing is counted against anyone.
+			//
+			// NOTE: a `solo` entry can never clear by itself — the group where no other member accepts
+			// blobs is a steady state, not a transient one (docs/blobs.md §Placement, copying and
+			// durability) — so the re-check timer keeps re-arming for as long as such a blob is owed,
+			// and each tick rescans the whole ledger and reassembles one cohort per entry. All local
+			// work (`findCluster` dials nothing), and the block drain's `solo` behaves the same way, but
+			// its entries do clear. If a phone-only group with many announced blobs ever shows that
+			// cost, give the `solo` verdict a longer re-check of its own rather than a shorter ledger.
 			context.tally('solo');
 			return;
 		}

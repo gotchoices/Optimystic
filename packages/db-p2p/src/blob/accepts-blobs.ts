@@ -37,6 +37,11 @@ export class BlobPeerRefusesError extends Error {
  * a caller ever remembers `refuses` until the peer reconnects (as the owed-copies drain remembers
  * `declined`), clear that memory on `peer:identify` too, or such a peer is skipped for a whole
  * connection.
+ *
+ * That "only skips one attempt" condition no longer holds: `BlobCopyDrain.accepts`
+ * (`blob-copy-drain.ts`) also leaves a `refuses` member out of the denominator a blob's durability is
+ * counted over, so a misread inside the window can report `full` and release the writer's `owed`
+ * hold. Backlog `debt-a-peer-read-as-refusing-may-only-be-unidentified` carries that.
  */
 export async function blobAcceptanceOf(
 	keyNetwork: Pick<Libp2pKeyPeerNetwork, 'protocolSupport'>,
