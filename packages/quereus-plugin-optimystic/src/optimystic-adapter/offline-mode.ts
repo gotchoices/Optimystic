@@ -6,6 +6,7 @@ import type {
 	Lane, OfflineQueueOptions, OfflineQueueState, QueuedEntry, TransactionDurability,
 } from '@optimystic/db-core';
 import type { TransactionBridge } from './txn-bridge.js';
+import type { SqlBlobPins } from './blob-pins.js';
 import { DEFAULT_JOURNAL_LABEL, type ParsedOfflineConfig } from './offline-config.js';
 import { OfflineJournal, type RetainedOutcome } from './offline-journal.js';
 import { OfflineRestore, type DeferredRecord } from './offline-restore.js';
@@ -227,6 +228,12 @@ export class OfflineMode {
 	/** Set by {@link dispose} before anything else, so a wake already on its way is ignored. */
 	private wakesReleased = false;
 	private disposed = false;
+	/**
+	 * The blob pins of this `Database`'s plugin registration ({@link attachBlobPins}): what settles a
+	 * queued transaction's blob reference pins once the queue has finished with it. Absent on a
+	 * controller built bare, which every spec that constructs `new OfflineMode(bridge, db)` relies on.
+	 */
+	private blobPins: SqlBlobPins | undefined;
 
 	constructor(private readonly bridge: TransactionBridge, private readonly db: Database, config: ParsedOfflineConfig = {}) {
 		this.journal = config.journal === undefined ? undefined : new OfflineJournal(config.journal, config.journalLabel ?? DEFAULT_JOURNAL_LABEL, {
@@ -262,6 +269,17 @@ export class OfflineMode {
 			this.lastQueueState = state;
 			this.publishState();
 		});
+	}
+
+	/**
+	 * Attach this registration's blob pins; set once by the plugin's `register`, as the bridge's
+	 * `attachBlobPins` is. A controller with none settles no pins, which is what tests that build a
+	 * bare controller rely on — and correct, since such a controller has no plugin to resolve a blob
+	 * backend through.
+	 */
+	attachBlobPins(pins: SqlBlobPins): void {
+		if (this.blobPins !== undefined) throw new Error('blob pins are already attached to this offline-mode controller');
+		this.blobPins = pins;
 	}
 
 	/**
@@ -1107,6 +1125,31 @@ export class OfflineMode {
 		if (status.kind === 'failed') this.announceChanged(status.entryId, status.changedCollections);
 		this.followStatus(status, firstQueued);
 		if (outcome !== undefined) this.settle(outcome.status);
+		this.settleBlobPins(status);
+	}
+
+	/**
+	 * A terminal status settles the transaction's blob reference pins
+	 * (`SqlBlobPins.settleQueued`): announced and released for the collections that committed,
+	 * released outright for the ones that did not. This is the one place every terminal queue
+	 * outcome passes through — the queue's own `onStatus`, and the restore's `emitSettled` for a
+	 * deferred record it discarded — and it is reached after the status has been delivered, so a
+	 * host's listener is never behind a pin release.
+	 *
+	 * `'all'` for a `committed` status because its arm names no collections: it carries the whole
+	 * transaction's `durability`. `partially-committed` settles NOTHING — it is not terminal, the
+	 * entry stays at the head in doubt, and its remaining collections are still owed.
+	 *
+	 * Never awaited: this runs synchronously inside the queue's drain and the restore's discard, and
+	 * the release is chained work that first waits for an open transaction to end.
+	 */
+	private settleBlobPins(status: EntryStatus): void {
+		if (this.blobPins === undefined) return;
+		if (status.kind === 'committed') {
+			void this.blobPins.settleQueued(status.entryId, 'all');
+		} else if (status.kind === 'failed') {
+			void this.blobPins.settleQueued(status.entryId, new Set(status.committedCollections ?? []));
+		}
 	}
 
 	/**

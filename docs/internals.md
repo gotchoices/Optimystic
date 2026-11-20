@@ -1099,6 +1099,35 @@ A partial commit's labels ARE collection ids: the sweep labels a tree by `Tree.d
 renders its collection id, and a reference tree's scope IS that id. A reference whose scope did not
 commit keeps its pin for the reconciliation to retry, as does one whose announcement failed.
 
+A QUEUED transaction's `queued` settlement is deliberately not the end of it: nothing is on the
+network yet, so its reference pins stay, and `SqlBlobPins.settleQueued` releases them when the queue
+reports the transaction committed or failed — announced into their scope for the collections that
+committed, released outright for the rest. `OfflineMode.onQueueStatus` is the one place every
+terminal queue outcome passes through (the queue's own `onStatus`, and the restore's `emitSettled`
+for a deferred record it discarded), so that is where it is called from, with `'all'` for a
+`committed` status, whose arm names no collections, and with `committedCollections` for a failed one.
+A `partially-committed` status settles nothing: it is not terminal, and the entry's remaining
+collections are still owed.
+
+It runs on `SqlBlobPins`'s own work chain rather than inside the status delivery, because each step
+first waits for any open transaction to end (`TransactionBridge.whenTransactionIdle`) — the
+online arms stay OFF that chain for the mirror-image reason, since they run inside
+`commitTransaction` under Quereus's exec mutex and must not wait on the transaction they belong to.
+What a transaction owes is read from memory when this process sealed the entry (`queued` remembers
+its `HeldPins`) and from the pins' own labels when it did not, which is every settle in a process
+that restored the entry from the journal. The fast path is load-bearing rather than an optimization:
+`LocalBlobService.listPins` scans every blob record on the machine and reads each one, so without it
+a phone holding ten thousand photos would pay ten thousand key-value reads per offline commit.
+
+Every announcement is preceded by a check that the scope is in the network's registry, and which
+check depends on whether a table in this process still backs it
+(`TransactionBridge.tablesOf`): one that does is registered as an online commit registers it, while
+one that does not is only READ (`BlobScopeRegistration.isRegistered`, which never writes and answers
+`undefined` for a reading it cannot trust). Registering is wrong there — the table was dropped,
+here or on another machine, so a settle that re-registered its tree would keep the blobs its old
+rows listed for ever — and a certain "not listed" is what makes those pins releasable rather than
+kept.
+
 ### Write Path (Local Changes)
 ```
 Collection.act(action)

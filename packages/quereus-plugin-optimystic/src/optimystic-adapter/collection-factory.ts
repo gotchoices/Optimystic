@@ -429,6 +429,31 @@ export class CollectionFactory {
   }
 
   /**
+   * Every blob backend of a transactor key this factory has seen options for ({@link transactorOptions}),
+   * each resolved ({@link getBlobBackend}), in no promised order. A key whose resolution throws is
+   * logged (`blob:backend-resolution-failed`) and left out, so one bad network does not hide the rest.
+   *
+   * Over the OPTIONS map rather than over the backends already resolved ({@link blobBackends}): a pin
+   * written by a PREVIOUS process sits in a store this one may not have opened yet, and a settle that
+   * only looked at opened stores would never find it. Resolving a store that holds nothing costs one
+   * empty store.
+   *
+   * Read by `SqlBlobPins` when it has to find a queued transaction's pins by their labels rather
+   * than from memory.
+   */
+  async knownBlobBackends(): Promise<BlobBackend[]> {
+    const backends: BlobBackend[] = [];
+    for (const [key, options] of [...this.transactorOptions]) {
+      try {
+        backends.push(await this.getBlobBackend(options));
+      } catch (error) {
+        blobLog('blob:backend-resolution-failed key=%s %o', key, error);
+      }
+    }
+    return backends;
+  }
+
+  /**
    * The transactor and key of `options`'s network, with NO blob service resolved — all the scope
    * registry needs ({@link blobScopes}). Deliberately not {@link getBlobBackend}: see that field.
    */

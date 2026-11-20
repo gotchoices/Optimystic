@@ -22,6 +22,12 @@
  * puts, and it is what lets an arm run for a commit whose {@link SqlBlobPins.holdForCommit} never
  * completed. None of them throws: by the time one runs the write is durable or queued, and a
  * failure here must not turn a successful commit into a failed one.
+ *
+ * A QUEUED transaction keeps its reference pins deliberately — nothing is on the network yet, so the
+ * writer is the only machine holding the bytes — until the queue finishes with it, which is
+ * {@link SqlBlobPins.settleQueued}. That arm runs OFF the commit, on this object's own work chain
+ * ({@link SqlBlobPins.settled}), because it has to wait for the transaction the status arrived during
+ * to end before it touches the blob service.
  */
 
 import type { BlobRef, BlobScope } from '@optimystic/db-core';
@@ -30,6 +36,7 @@ import type { BlobScopeRegistration } from './blob-scope-registration.js';
 import {
 	UNSTAGED_PIN_PREFIX,
 	parsePinLabel,
+	transactionPinPrefix,
 	transactionPutPinLabel,
 	transactionReferencePinLabel,
 } from './blob-pin-labels.js';
@@ -61,9 +68,51 @@ export interface SqlBlobPinsDeps {
 	/** `CollectionFactory.blobBackendForKey`: the backend of a transactor key the factory has seen. */
 	backendByKey(key: string): Promise<BlobBackend>;
 	registration: BlobScopeRegistration;
+	/** `CollectionFactory.knownBlobBackends`: every blob backend this process could hold a pin in. */
+	knownBackends(): Promise<BlobBackend[]>;
+	/** `TransactionBridge.tablesOf`: the tables a scope (a reference tree's collection id) still backs
+	 * in this process; empty or `undefined` once the table it belonged to is gone from here. */
+	tablesOf(scope: BlobScope): ReadonlyMap<string, unknown> | undefined;
+	/** `TransactionBridge.whenTransactionIdle`: resolves once no transaction is open on the bridge. */
+	whenTransactionIdle(): Promise<void>;
 }
 
+/** Whether a settling reference's scope may be announced into ({@link SqlBlobPins.scopeState}). */
+type ScopeState =
+	/** In its network's registry: announce. */
+	| 'registered'
+	/** Certainly NOT in it — the table was dropped, here or elsewhere: release without announcing. */
+	| 'dropped'
+	/** Cannot be told now: keep the pin and let the reconciliation retry. */
+	| 'unknown';
+
 export class SqlBlobPins {
+	/**
+	 * What each queued transaction holds, remembered by {@link queued} and taken by
+	 * {@link settleQueued}: the fast path that keeps a settle from scanning this machine's blob
+	 * records. One entry per queued transaction that added a reference, so it is bounded by the
+	 * queue's depth, and it is empty in a process that did not seal the entry itself.
+	 */
+	private readonly queuedPins = new Map<string, HeldPins>();
+	/**
+	 * Every transaction THIS process sealed into the queue, whether or not it added a reference
+	 * ({@link queued}), until it settles. What it answers is "is {@link queuedPins} authoritative for
+	 * this transaction": a transaction sealed here that is not in that map took no reference pin, so
+	 * its settle needs no pin listing at all.
+	 *
+	 * Without it, a host that uses NO blobs would pay a listing — and the resolution of a blob store
+	 * per network, which also starts that store's sweep — on every queued transaction it settles.
+	 * Absence means "cannot say", which is the safe direction: the listing runs.
+	 */
+	private readonly sealedHere = new Set<string>();
+	/** {@link settleQueued}'s work, one step at a time; never rejects ({@link chained}). */
+	private chain: Promise<void> = Promise.resolve();
+	private disposed = false;
+	/** Resolved by {@link dispose}, so a step parked on an open transaction is not what keeps a
+	 * disposing host waiting (`MaterializedViewFollower`'s `haltedPromise` precedent). */
+	private releaseChain = (): void => undefined;
+	private readonly disposing = new Promise<void>(resolve => { this.releaseChain = resolve; });
+
 	// NOTE: every pin, announcement and release below is awaited in sequence, one reference at a
 	// time, so a transaction that adds N references costs N local record writes at `holdForCommit`
 	// and up to 2N at the release — all local, and all inside the commit the host is awaiting. Fine
@@ -133,11 +182,14 @@ export class SqlBlobPins {
 
 	/**
 	 * The transaction was sealed into the offline queue. Its reference pins stay, to be settled with
-	 * the queued transaction itself; its `put` pins are dropped as a landed commit drops them.
+	 * the queued transaction itself ({@link settleQueued}), and what it holds is remembered so that
+	 * settle costs no pin listing; its `put` pins are dropped as a landed commit drops them.
 	 *
 	 * The `unstaged` pins are KEPT — see {@link abandoned}.
 	 */
-	async queued(_held: HeldPins | undefined, transaction: TransactionState): Promise<void> {
+	async queued(held: HeldPins | undefined, transaction: TransactionState): Promise<void> {
+		this.sealedHere.add(transaction.stampId);
+		if (held !== undefined) this.queuedPins.set(held.transactionId, held);
 		await this.releasePuts(transaction);
 	}
 
@@ -155,6 +207,176 @@ export class SqlBlobPins {
 	async abandoned(held: HeldPins | undefined, transaction: TransactionState): Promise<void> {
 		await this.releaseReferences(held?.references ?? []);
 		await this.releasePuts(transaction);
+	}
+
+	/**
+	 * A QUEUED transaction has settled: `'all'` for a `committed` outcome, and for a failed one the
+	 * collection ids it had committed, possibly none. Each reference pin it still holds is announced
+	 * into its scope and released when that scope committed, and released outright when it did not —
+	 * so the writer's piece sweep can take the bytes of a transaction that never landed.
+	 *
+	 * Chained rather than run inline ({@link chained}), and so never awaited by the caller: the queue
+	 * reports a terminal status synchronously from its drain, and from the restore's discard, neither
+	 * of which may be held up by a release that first waits for an open transaction to end. Never
+	 * throws, and never reports anything worse than a line in the log: the transaction has already
+	 * settled, and a pin that cannot be released is not a failure of anything a caller can retry.
+	 *
+	 * Idempotent, which is what makes a status delivered twice — or a race with the restart
+	 * reconciliation — harmless: announcing a reference twice is one record write, and unpinning a
+	 * label that is already gone does nothing.
+	 *
+	 * The transaction's OWN pins only, as every other arm. An `unstaged` pin is left alone even for a
+	 * reference that landed — where {@link committed} would drop it — because the two have different
+	 * remedies: an online commit is the pin's release, and a queued one is answered by the holding
+	 * period that expires an `unstaged` pin no open or queued transaction has staged
+	 * (`feat-sql-columns-hold-blob-references`). The bytes are kept either way.
+	 */
+	settleQueued(transactionId: string, committed: 'all' | ReadonlySet<string>): Promise<void> {
+		return this.chained(() => this.releaseQueued(transactionId, committed));
+	}
+
+	/**
+	 * Resolves once everything chained so far has run. Never rejects.
+	 *
+	 * NEVER await this inside a transaction: a chained step waits for the open transaction to end, so
+	 * awaiting it from inside one deadlocks. For `plugin.hydrate` and for specs.
+	 */
+	settled(): Promise<void> {
+		return this.chain;
+	}
+
+	/** Stop chaining further work and wait for what is chained; a step parked on an open transaction
+	 * stops waiting for it. Idempotent. */
+	async dispose(): Promise<void> {
+		this.disposed = true;
+		this.releaseChain();
+		await this.chain;
+	}
+
+	/**
+	 * Run `step` after everything chained before it, once no transaction is open on the bridge. The
+	 * chain is what the restart reconciliation joins, so no two settlements ever handle one
+	 * transaction's pins at the same time; it never rejects, and a step that faults is logged.
+	 *
+	 * The ONLINE arms above stay off this chain deliberately: they run inside `commitTransaction` and
+	 * `rollbackTransaction` under Quereus's exec mutex, and so must not wait on a chain that waits
+	 * for the transaction they belong to.
+	 */
+	private chained(step: () => Promise<void>): Promise<void> {
+		const run = this.chain.then(async () => {
+			await Promise.race([this.deps.whenTransactionIdle(), this.disposing]);
+			if (this.disposed) return;
+			await step();
+		}).catch(error => {
+			// Every step isolates each reference itself, so reaching here means the step faulted.
+			log('blob:pin-settle-failed %o', error);
+		});
+		this.chain = run;
+		return run;
+	}
+
+	/**
+	 * One queued transaction's reference pins, from memory when this process sealed the entry and
+	 * from the pins' own labels when it did not.
+	 */
+	private async releaseQueued(transactionId: string, committed: 'all' | ReadonlySet<string>): Promise<void> {
+		const held = this.queuedPins.get(transactionId);
+		this.queuedPins.delete(transactionId);
+		// Taken whichever path runs, so neither set holds a settled transaction.
+		const sealedHere = this.sealedHere.delete(transactionId);
+		// The fast path is not an optimization to be simplified away: `listPins` scans EVERY blob
+		// record on this machine and reads each one (the `NOTE:` at `LocalBlobService.listPins`), so
+		// without it a phone holding ten thousand photos would pay ten thousand key-value reads per
+		// offline commit. The listing is the correct general answer and is still needed — a process
+		// that did not seal the entry has nothing in memory — but it is the rare path.
+		const references = held?.references ?? (sealedHere ? [] : await this.listQueuedReferences(transactionId));
+		for (const reference of references) {
+			try {
+				await this.settleQueuedReference(transactionId, reference, committed);
+			} catch (error) {
+				log('blob:pin-release-failed transaction=%s ref=%s owner=%s %o',
+					transactionId, reference.ref, reference.label, error);
+			}
+		}
+	}
+
+	/**
+	 * Every reference pin the transaction holds in any store this process knows of, read back from the
+	 * labels — the path a settle takes for an entry the offline journal's restore put back after a
+	 * restart, since this process never sealed it and so remembers nothing of it.
+	 *
+	 * A `put` pin met on the way is dropped here rather than listed: `queued` already released the
+	 * transaction's puts, so one still present outlived its transaction, and the label is in hand.
+	 */
+	private async listQueuedReferences(transactionId: string): Promise<HeldReference[]> {
+		const prefix = transactionPinPrefix(transactionId);
+		const references: HeldReference[] = [];
+		for (const backend of await this.deps.knownBackends()) {
+			try {
+				for await (const { ref, owner } of backend.service.listPins(prefix)) {
+					const parsed = parsePinLabel(owner);
+					if (parsed?.kind === 'reference') {
+						references.push({ backend, ref, scope: parsed.scope, label: owner });
+					} else if (parsed?.kind === 'put') {
+						await this.unpinOrLog(backend, ref, owner);
+					}
+				}
+			} catch (error) {
+				log('blob:pin-listing-failed transaction=%s key=%s %o', transactionId, backend.key, error);
+			}
+		}
+		return references;
+	}
+
+	/** One settling reference: announced and released, released outright, or kept and logged. */
+	private async settleQueuedReference(transactionId: string, reference: HeldReference, committed: 'all' | ReadonlySet<string>): Promise<void> {
+		const { backend, ref, scope, label } = reference;
+		if (committed !== 'all' && !committed.has(scope)) {
+			// The transaction failed, was discarded, or committed only its other half: nothing holds
+			// this reference, so the bytes go with the writer's next piece sweep.
+			log('blob:pin-released transaction=%s ref=%s scope=%s reason=scope-not-committed', transactionId, ref, scope);
+			await this.unpinOrLog(backend, ref, label);
+			return;
+		}
+		const state = await this.scopeState(backend, scope);
+		if (state === 'unknown') {
+			// NOTE: nothing in this part retries a kept pin — `feat-blob-pins-reconcile-after-a-restart`
+			// is what does, so a kept pin is a deferral and not a leak.
+			log('blob:pin-kept transaction=%s ref=%s scope=%s reason=scope-unregistered', transactionId, ref, scope);
+			return;
+		}
+		if (state === 'registered') {
+			try {
+				await backend.service.announce(ref, scope);
+			} catch (error) {
+				log('blob:pin-kept transaction=%s ref=%s scope=%s reason=announce-failed %o', transactionId, ref, scope, error);
+				return;
+			}
+			log('blob:announced transaction=%s ref=%s scope=%s', transactionId, ref, scope);
+		} else {
+			log('blob:pin-released transaction=%s ref=%s scope=%s reason=scope-dropped', transactionId, ref, scope);
+		}
+		await this.unpinOrLog(backend, ref, label);
+	}
+
+	/**
+	 * Whether `scope` may be announced into. Announcing into a reference tree the network's registry
+	 * does not list tells the cohort to hold bytes no storage node will ever find referenced, so the
+	 * check comes before every announcement.
+	 *
+	 * Which check depends on whether a table here still backs the scope: one that does registers it
+	 * as an online commit does, and one that does not is only READ — registering a tree whose table
+	 * has been dropped would re-register it and keep its blobs for ever.
+	 */
+	private async scopeState(backend: BlobBackend, scope: BlobScope): Promise<ScopeState> {
+		// `BlobBackend extends NetworkBinding`, so the backend IS the network the registry is read
+		// and written through.
+		if ((this.deps.tablesOf(scope)?.size ?? 0) > 0) {
+			return (await this.deps.registration.ensure(backend, scope)).registered ? 'registered' : 'unknown';
+		}
+		const listed = await this.deps.registration.isRegistered(backend, scope);
+		if (listed === undefined) return 'unknown';
+		return listed ? 'registered' : 'dropped';
 	}
 
 	/**

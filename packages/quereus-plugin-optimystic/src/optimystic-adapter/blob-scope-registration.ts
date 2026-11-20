@@ -84,6 +84,35 @@ export class BlobScopeRegistration {
 		return await attempt;
 	}
 
+	/**
+	 * Whether `scope` is in `network`'s registry, WITHOUT writing: `undefined` when the answer cannot
+	 * be trusted. For a settling pin whose scope no table in this process backs any longer — the
+	 * table was dropped here or on another machine — where {@link ensure} would register a tree that
+	 * is deliberately gone and keep its blobs for ever.
+	 *
+	 * Not memoized, and deliberately so: {@link ensure}'s memo records a registration THIS process
+	 * made, while this answers a question about another machine's state, which can change under us.
+	 *
+	 * How each reading is answered:
+	 *
+	 *  - the listing holds `scope` → `true`, certain or not: every scope a listing names is listed.
+	 *  - `certain` and `exists` and the listing does not hold it → `false`.
+	 *  - anything else — an uncertain read, a registry that has never been written, or a throw →
+	 *    `undefined`. A registry reading as absent on a machine that holds pins is self-contradictory,
+	 *    and docs/blobs.md §Lifetime already fixes the bias: an uncertain read counts as "still
+	 *    referenced".
+	 */
+	async isRegistered(network: NetworkBinding, scope: BlobScope): Promise<boolean | undefined> {
+		try {
+			const listing = await BlobScopeRegistry.enumerate(network.transactor);
+			if (listing.scopes.includes(scope)) return true;
+			return listing.certain && listing.exists ? false : undefined;
+		} catch (cause) {
+			blobLog('blob:scope-register-failed key=%s scope=%s %o', network.key, scope, cause);
+			return undefined;
+		}
+	}
+
 	/** `BlobScopeRegistry.unregister`; idempotent. Forgets the memo for the pair. */
 	async unregister(network: NetworkBinding, scope: BlobScope): Promise<void> {
 		this.confirmed.delete(memoKey(network, scope));

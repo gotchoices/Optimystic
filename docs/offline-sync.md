@@ -1702,6 +1702,22 @@ points to, and [packages/db-p2p/docs/storage.md](../packages/db-p2p/docs/storage
 the local commit flushes the journal before it resolves, which is what makes step 1's "journaled"
 mean "survives a power cut".
 
+### Nothing about blobs is journaled
+
+A queued transaction that references a stored blob ([blobs.md §SQL](blobs.md#sql)) keeps that blob
+pinned on the writer until the transaction settles, because until then this machine holds the only
+copy of bytes a committed row will point at. The pins are released when the queue finishes with the
+transaction — announced into the table's reference tree for the collections that committed, dropped
+for the ones that did not (`SqlBlobPins.settleQueued` in
+`packages/quereus-plugin-optimystic/src/optimystic-adapter/blob-pins.ts`).
+
+That costs the journal nothing: a pin's own owner label names the transaction and the reference tree
+it was taken for, so the blob records are already the durable, per-machine record of which
+transaction owes which pin under which scope. A process that did not seal the entry itself — one
+that put it back from its journal records after a restart — finds what the transaction owes by
+listing its pins, and never decodes a journaled segment. So no field about blobs is added to any of
+the three records above, and the restore reads none.
+
 ## Interaction with existing machinery
 
 ### Durability reports and the full-replication event

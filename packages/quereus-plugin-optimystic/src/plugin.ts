@@ -86,12 +86,19 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	txnBridge.attachOfflineMode(offline);
 	collectionFactory.setSealedRefusedListener(offline.onSealedRefused);
 	// The pins a committing transaction's blob references are held under, and their release once it
-	// lands (README § Large values; docs/blobs.md §Committing a reference). Attached before any table
-	// opens, as the offline queue is: a commit asks the bridge for them.
-	txnBridge.attachBlobPins(new SqlBlobPins({
+	// lands or, for a queued transaction, once the queue has finished with it (README § Large values;
+	// docs/blobs.md §Committing a reference). Built AFTER the controller, which it reads, and attached
+	// to both before any table opens: a commit asks the bridge for them, and a terminal queue status
+	// settles the ones its transaction left behind.
+	const blobPins = new SqlBlobPins({
 		backendByKey: key => collectionFactory.blobBackendForKey(key),
 		registration: collectionFactory.blobScopes,
-	}));
+		knownBackends: () => collectionFactory.knownBlobBackends(),
+		tablesOf: scope => txnBridge.tablesOf(scope),
+		whenTransactionIdle: () => txnBridge.whenTransactionIdle(),
+	});
+	txnBridge.attachBlobPins(blobPins);
+	offline.attachBlobPins(blobPins);
 	const optimysticModule = new OptimysticModule(collectionFactory, txnBridge, costProfile);
 	// The restore after a restart initializes each journaled transaction's tables through the module.
 	offline.attachTableResolver(optimysticModule);
@@ -202,6 +209,13 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		// Expose internal components for testing and advanced usage
 		collectionFactory,
 		txnBridge,
+		/**
+		 * The blob pins a committing transaction's references are held under (`SqlBlobPins`). A
+		 * queued transaction's pins are released when the queue finishes with it, off the commit, so
+		 * `blobPins.settled()` is how a caller waits for those releases. Never await it inside a
+		 * transaction: the work it waits on waits for the transaction to end.
+		 */
+		blobPins,
 		/**
 		 * The blob service of the plugin's DEFAULT network — the one a table declared with no
 		 * `using` clause binds to (docs/blobs.md §SQL; README § Large values). `put` a stream to
@@ -338,8 +352,10 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		/**
 		 * Release what the plugin holds outside the `Database` — its subscriptions to the node's
 		 * full-replication events (forgetting every commit still followed, see
-		 * `TransactionBridge.dispose`), the materialized-view follower (a rebuild in flight is let
-		 * finish, nothing further is rebuilt), the offline queue's drain (`OfflineMode.dispose`: a
+		 * `TransactionBridge.dispose`), the pin releases a settled queued transaction still owes
+		 * (`SqlBlobPins.dispose`: what is running finishes, nothing further is released, and the pins
+		 * left are the restart reconciliation's), the materialized-view follower (a rebuild in flight
+		 * is let finish, nothing further is rebuilt), the offline queue's drain (`OfflineMode.dispose`: a
 		 * submission in flight is aborted after its current network step, nothing further is sent,
 		 * and queued entries stay sealed in their collections), and its LEASES on the raw-storage read caches behind
 		 * `local` transactors over host-supplied storage (see `CollectionFactory.dispose`). Call
@@ -355,6 +371,10 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 */
 		dispose: async () => {
 			await optimysticModule.whenCatalogPersisted();
+			// Before the offline controller: a pin release still chained may read it. A step parked on
+			// an open transaction stops waiting here, since the host has closed the `Database` (which
+			// ends that transaction) before calling this.
+			await blobPins.dispose();
 			// Before the bridge: a submission in flight finishes its current network step, and a commit
 			// it lands is reported through the bridge's follower while that is still live (a report
 			// after the bridge's dispose would subscribe the follower to the node's events again, with
