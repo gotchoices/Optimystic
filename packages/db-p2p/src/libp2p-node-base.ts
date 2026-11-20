@@ -13,7 +13,7 @@ import type { ConnectionGater, PeerId, PrivateKey } from '@libp2p/interface';
 import { clusterService } from './cluster/service.js';
 import { blockTransferService } from './cluster/block-transfer-service.js';
 import { repoService } from './repo/service.js';
-import { StorageRepo } from './storage/storage-repo.js';
+import { StorageRepo, resolvePendLeaseMs } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
 import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ReadCacheLease, type ResolvedReadCache } from './storage/with-read-cache.js';
@@ -1048,7 +1048,8 @@ function prepareServingStore(
 	options: NodeOptions,
 	consensusConfig: ResolvedClusterPolicy,
 	kvStore: IKVStore,
-	hlcClock: HlcClock
+	hlcClock: HlcClock,
+	linkDeadlines: LinkDeadlines
 ): ServingStore {
 	// Read from the one resolved cluster policy, never a second copy of the size or threshold.
 	const durabilityWindowPolicy = resolveDurabilityWindowPolicy(options.storageDurability, consensusConfig);
@@ -1075,6 +1076,10 @@ function prepareServingStore(
 	const storageRepo = new StorageRepo(rawStorage, {
 		createBlockStorage: (blockId, store) => new BlockStorage(blockId, store, late.restore),
 		clock: hlcClock,
+		// How long a pending record this node stores reserves its block, derived from the budget this
+		// node's declared link round trip gives one transactor operation — so a slow-link deployment
+		// gets a proportionally longer lease rather than the LAN figure.
+		pendLeaseMs: resolvePendLeaseMs(linkDeadlines.transactionTimeoutMs),
 	});
 
 	const clusterProxy: ICluster = {
@@ -1303,7 +1308,7 @@ export async function createLibp2pNodeBase(
 
 	// The serving role's storage half, built before libp2p because the four storage protocol services
 	// answer through it. A client builds none of it (docs/internals.md §Client nodes).
-	const serving = servesBlocks ? prepareServingStore(options, consensusConfig, kvStore, hlcClock) : undefined;
+	const serving = servesBlocks ? prepareServingStore(options, consensusConfig, kvStore, hlcClock, linkDeadlines) : undefined;
 
 	// The running node, bound immediately after `createLibp2p` below. Service factories that need the
 	// node at REQUEST time read it through this binding, never `components.libp2p` (see

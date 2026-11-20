@@ -25,7 +25,7 @@ import { expect } from 'chai';
 import { localDurability, clusterVoteVerificationPayload } from '@optimystic/db-core';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
 import type { IPendingClaimReader } from '../src/storage/storage-repo.js';
-import type { PendingClaim } from '../src/storage/pending-claim.js';
+import type { PendingClaim, ReservationLease } from '../src/storage/pending-claim.js';
 import { STUCK_RESERVATION_DISTINCT_ACTIONS } from '../src/repo/stuck-reservation.js';
 import { captureLog } from './support/capture-log.js';
 import type {
@@ -74,6 +74,9 @@ const OUR_ACTION = 'a-ours' as ActionId;
 const RIVAL_ACTION = 'a-rival' as ActionId;
 const SECOND_RIVAL = 'a-rival-2' as ActionId;
 const STUCK = 'cluster-member:stuck-reservation';
+
+/** A 300 ms pend lease whose clock reads `now` — what a member's storage hands its vote. */
+const leaseOf = (now: number): ReservationLease => ({ leaseMs: 300, runStartedAt: 0, now: () => now });
 
 const linesWith = (captured: unknown[][], tag: string): unknown[][] =>
 	captured.filter(args => typeof args[0] === 'string' && args[0].includes(tag));
@@ -125,8 +128,17 @@ class StateRepo implements IRepo {
  * from the claims so the two views cannot disagree.
  */
 class ClaimRepo extends StateRepo implements IPendingClaimReader {
-	/** The run this repo says it is, which a claim's `localRun` is judged against; see `isAbandonedClaim`. */
-	constructor(private readonly claims: PendingClaim[], latest?: ActionRev, readonly runId: string = 'run-under-test') {
+	/**
+	 * `runId` is the run this repo says it is, which a claim's `localRun` is judged against (see
+	 * `isAbandonedClaim`); `pendLease` is the lease a claim's `pendingSince` is judged against (see
+	 * `hasLapsed`), absent by default so no case that does not ask for a lease lapses anything.
+	 */
+	constructor(
+		private readonly claims: PendingClaim[],
+		latest?: ActionRev,
+		readonly runId: string = 'run-under-test',
+		readonly pendLease: ReservationLease | undefined = undefined
+	) {
 		super({ latest, pendings: claims.map(c => c.actionId) });
 	}
 	async listPendingClaims(_blockId: BlockId): Promise<PendingClaim[]> { return this.claims.map(c => ({ ...c })); }
@@ -323,6 +335,27 @@ describe('ClusterMember — a pending record reserves only the slot it claims', 
 			makePend({ rev: 2 })
 		);
 		expect(vote.signature?.type, 'a live record of this run reserves its slot').to.equal('held');
+		expect(vote.signature).to.have.property('heldBy', RIVAL_ACTION);
+	});
+
+	// Ticket: a-pending-record-reserves-its-block-only-for-a-bounded-time. A record that has stood
+	// past this node's pend lease has LAPSED: it is nobody's reservation at the vote either, whatever
+	// slot it claims. Unlike an abandoned record it is kept, so its own commit can still land — which
+	// is why this is the vote's concern and `validateCommitBaseDeclarations` never reads the lease.
+	it('approves over a record that has stood past this node\'s pend lease, whatever slot it claims', async () => {
+		const vote = await voteOnPend(
+			new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2, pendingSince: 1_000 }], LATEST_1, 'run-1', leaseOf(1_000 + 300 + 1)),
+			makePend({ rev: 2 })
+		);
+		expect(vote.signature?.type, 'a lapsed record is nobody\'s reservation').to.equal('approve');
+	});
+
+	it('still holds for the same record inside its lease', async () => {
+		const vote = await voteOnPend(
+			new ClaimRepo([{ actionId: RIVAL_ACTION, rev: 2, pendingSince: 1_000 }], LATEST_1, 'run-1', leaseOf(1_000 + 300)),
+			makePend({ rev: 2 })
+		);
+		expect(vote.signature?.type, 'at the boundary the record still reserves its slot').to.equal('held');
 		expect(vote.signature).to.have.property('heldBy', RIVAL_ACTION);
 	});
 

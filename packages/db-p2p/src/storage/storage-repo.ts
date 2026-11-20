@@ -19,7 +19,7 @@ import type { FlushOptions } from "./store-durability.js";
 import { BlockStorage } from "./block-storage.js";
 import { randomBytes } from "@noble/hashes/utils.js";
 import { toString as uint8ArrayToString } from "uint8arrays";
-import { isReservationAgainst, isAbandonedClaim, isBaseIndependent, declaredBaseFor, type PendingClaim } from "./pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, hasLapsed, isBaseIndependent, declaredBaseFor, type PendingClaim, type ReservationLease } from "./pending-claim.js";
 import type { IBlockReplicaStore } from "../cluster/block-transfer-service.js";
 import { proofDeclaredDigest, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { RevisionNotCoveredError } from "./i-block-storage.js";
@@ -44,6 +44,54 @@ export function mintRunId(): string {
  * What `StorageRepo.runId` defaults to.
  */
 export const PROCESS_RUN_ID = mintRunId();
+
+/**
+ * Default for {@link StorageRepoOptions.pendLeaseMs}: how long a pending record reserves its block
+ * from the moment this node stored it, past which it has LAPSED and stops reserving (`hasLapsed` in
+ * `./pending-claim.ts`). Five minutes.
+ *
+ * **What the figure has to clear, and how it was obtained.** One honest pend-to-commit span on one
+ * member. MEASURED: `packages/db-p2p/test/a-lapsed-pend-stops-reserving-its-block.spec.ts` logs the
+ * writer-side span of one healthy three-member coordinated write (the line `healthy pend-to-commit
+ * span`), which is an upper bound on how long any one member holds that write's record. On the
+ * in-process mesh, with no network between the machines, it is **41 ms** — so this default is about
+ * **7300x** the measured span. That multiple is not the margin a deployment actually gets: the
+ * figure a real link pays is set by the budgets the writer puts on each phase, which is what
+ * {@link PEND_LEASE_BUDGETS} counts. The pend and the commit each carry one `transactionTimeoutMs`
+ * (`NetworkTransactor` stamps `expiration = Date.now() + this.timeoutMs` separately for each), 30 s
+ * by default, and a sync cycle that exhausts its ten attempts of backoff takes roughly 21 s in total
+ * (`Collection.syncAttempts`) while discharging its pend on every failed attempt. Nothing in the
+ * repository holds one record open across a longer span: the offline queue re-sends a recorded
+ * ATTEMPT, which re-pends rather than committing an old record (`resumedAttempt` in
+ * `packages/db-core/src/collection/write-attempts.ts`).
+ *
+ * So the default is ten of those budgets. The longest span the code can hold ONE record open for is
+ * a pend budget plus a commit budget, two of them, 60 s at the default — a failed attempt discharges
+ * its own pend, so a retrying sync does not accumulate — which puts the default at five times that
+ * worst case and about an order of magnitude over a whole exhausted sync cycle's 21 s. It is 300_000
+ * rather than some other round number because at the default `transactionTimeoutMs` (30 s) the floor
+ * and the derived value agree exactly. RAISING it lengthens
+ * how long a genuinely stranded record wedges a block, which is the harm this bound exists to cap;
+ * LOWERING it toward one honest span risks lapsing a live record, which costs a lost race and a
+ * retry — never a lost change, see `hasLapsed` for that argument.
+ */
+export const DEFAULT_PEND_LEASE_MS = 300_000;
+
+/**
+ * How many whole `NetworkTransactor` operation budgets (`LinkDeadlines.transactionTimeoutMs`) a
+ * node's pend lease allows, so a slow-link deployment gets a proportionally longer lease rather
+ * than the LAN figure. See {@link DEFAULT_PEND_LEASE_MS} for what one budget covers.
+ */
+export const PEND_LEASE_BUDGETS = 10;
+
+/**
+ * The pend lease a node runs with, given the overall budget of one transactor operation its declared
+ * link round trip derives (`resolveLinkDeadlines` in `../rpc-deadline.ts`): {@link PEND_LEASE_BUDGETS}
+ * of those budgets, floored at {@link DEFAULT_PEND_LEASE_MS}.
+ */
+export function resolvePendLeaseMs(transactionTimeoutMs: number): number {
+	return Math.max(DEFAULT_PEND_LEASE_MS, PEND_LEASE_BUDGETS * transactionTimeoutMs);
+}
 
 /**
  * Default for {@link StorageRepoOptions.changeHoldMs}: long enough to cover the relayed links on which
@@ -196,6 +244,22 @@ export type StorageRepoOptions = {
 	 * stand for two runs of one node.
 	 */
 	runId?: string;
+	/**
+	 * How long a pending record this repo stores reserves its block against another writer, measured
+	 * from the moment it was stored — see {@link StorageRepo.pendLease} and `hasLapsed` in
+	 * `./pending-claim.ts`. Default {@link DEFAULT_PEND_LEASE_MS}; a node derives its own from the
+	 * budget its declared link round trip gives one transactor operation ({@link resolvePendLeaseMs}).
+	 * `0` disables lapsing entirely, so every record reserves until something removes it, exactly as
+	 * before the lease existed.
+	 */
+	pendLeaseMs?: number;
+	/**
+	 * This repo's wall clock, the one the pend lease is read and stamped against. Default `Date.now`.
+	 * Deliberately NOT taken from {@link clock}: tying the lease to the node's HLC would switch
+	 * `PendHlcIntake` on in every harness that only wants a fake clock, changing behaviour unrelated
+	 * to the lease. Mirrors `HlcClockOptions.localClock`; in production both are `Date.now`.
+	 */
+	now?: () => number;
 };
 
 /**
@@ -321,6 +385,13 @@ export interface IPendingClaimReader {
 	 * admitting one.
 	 */
 	readonly runId: string;
+	/**
+	 * The lease a claim's age is judged against — see {@link StorageRepo.pendLease}. Like `runId`, a
+	 * reader that hands out claims has to supply it or no consumer can tell a record stored a moment
+	 * ago from one that has stood for a day; a reader without it lapses nothing, which degrades the
+	 * vote to today's permanent hold rather than to admitting a rival.
+	 */
+	readonly pendLease: ReservationLease | undefined;
 }
 
 /**
@@ -398,11 +469,39 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	 * commit (`packages/quereus-plugin-optimystic/test/concurrent-insert-refusal.spec.ts`).
 	 */
 	readonly runId: string;
+	/** This repo's wall clock (`StorageRepoOptions.now`, `Date.now` by default): what stamps each
+	 *  pending record's {@link PendingClaim.pendingSince} and what {@link pendLease} reads. */
+	private readonly now: () => number;
+	/**
+	 * When this run of the repo started, by {@link now}: the anchor from which a record carrying no
+	 * `pendingSince` — one written before the field existed — is judged to have lapsed.
+	 *
+	 * Captured as `this.now()` in the constructor rather than as a module-level `Date.now()` beside
+	 * {@link PROCESS_RUN_ID}, so that a repo built with an injected clock anchors in THAT clock's
+	 * frame; comparing a fake clock's reading against a real `Date.now()` would make a test's verdict
+	 * meaningless. A second repo built later in the same process therefore anchors later, which can
+	 * only lengthen the grace such a record gets — the safe direction.
+	 */
+	readonly runStartedAt: number;
+	/**
+	 * How long a pending record this repo stored reserves its block, and the readings that judge it —
+	 * what both rival scans and the stuck-reservation enrichment pass to `hasLapsed`
+	 * (`./pending-claim.ts`, where the whole rule and its safety argument live). `undefined` when
+	 * `StorageRepoOptions.pendLeaseMs` is 0, which disables lapsing: no record ever stops reserving on
+	 * age, exactly as before the lease existed.
+	 */
+	readonly pendLease: ReservationLease | undefined;
 
 	constructor(private readonly storage: IRawStorage, options?: StorageRepoOptions) {
 		const factory = options?.createBlockStorage ?? ((blockId: BlockId, store: IRawStorage) => new BlockStorage(blockId, store));
 		this.createBlockStorage = blockId => factory(blockId, storage);
 		this.runId = options?.runId ?? PROCESS_RUN_ID;
+		this.now = options?.now ?? Date.now;
+		this.runStartedAt = this.now();
+		const pendLeaseMs = options?.pendLeaseMs ?? DEFAULT_PEND_LEASE_MS;
+		this.pendLease = pendLeaseMs > 0
+			? { leaseMs: pendLeaseMs, runStartedAt: this.runStartedAt, now: this.now }
+			: undefined;
 		this.validatePend = options?.validatePend;
 		this.unvalidatablePendPolicy = options?.unvalidatablePendPolicy ?? 'accept';
 		this.changeHoldMs = options?.changeHoldMs ?? DEFAULT_CHANGE_HOLD_MS;
@@ -1132,6 +1231,7 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 		// Already deduped: `blockIdsForTransforms` builds its result through a Set. So the pass-2 save
 		// loop below cannot write one block twice, and the echoed `blockIds` carries no duplicate.
 		const blockIds = blockIdsForTransforms(request.transforms);
+		const pendLease = this.pendLease;
 		log('pend actionId=%s blockIds=%d rev=%s localRun=%s', request.actionId, blockIds.length, request.rev, localRun);
 		const pendings: ActionPending[] = [];
 		const missing: ActionTransforms[] = [];
@@ -1257,14 +1357,24 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				// the cohort approved is not then refused here at apply, and a member that voted `held` on
 				// a stray record but was outvoted still stores the pend, whose commit then sweeps the record.
 				//
-				// Ahead of the slot rule: a record stamped with an earlier run of this node is abandoned
-				// — its writer was a transactor in a process of this node that no longer exists, so
-				// nothing can ever commit or cancel it — whatever slot it claims. It is deleted in pass 2.
+				// Ahead of the slot rule, in this order: a record stamped with an earlier run of this node is
+				// abandoned — its writer was a transactor in a process of this node that no longer exists, so
+				// nothing can ever commit or cancel it — whatever slot it claims, and it is deleted in pass 2;
+				// then a record that has stood past its lease has LAPSED and stops reserving, though it is
+				// kept and its own commit still promotes it (`hasLapsed`). Abandonment is asked first so a
+				// record that is both is deleted rather than merely set aside.
 				for (const claim of await blockStorage.listPendingClaims()) {
 					if (isAbandonedClaim(claim, this.runId)) {
 						abandoned.push({ blockId, actionId: claim.actionId });
 						log('pend:abandoned-claim actionId=%s blockId=%s rival=%s claimedRev=%s run=%s',
 							request.actionId, blockId, claim.actionId, claim.rev, claim.localRun);
+					} else if (pendLease !== undefined && hasLapsed(claim, pendLease)) {
+						// Not added to the pass-2 delete list, unlike an abandoned record: the writer is not
+						// provably gone, only absent far longer than any honest write takes, so the record
+						// stops RESERVING and nothing else (`hasLapsed`). Its own commit still promotes it.
+						log('pend:lapsed-claim actionId=%s blockId=%s rival=%s claimedRev=%s ageMs=%d leaseMs=%d',
+							request.actionId, blockId, claim.actionId, claim.rev,
+							pendLease.now() - (claim.pendingSince ?? pendLease.runStartedAt), pendLease.leaseMs);
 					} else if (isReservationAgainst(claim, { rev: request.rev })) {
 						pendings.push({ blockId, actionId: claim.actionId });
 					} else {
@@ -1342,7 +1452,17 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 				const blockTransform = sharedTransformForBlockId(request.transforms, blockId);
 				const baseRev = declaredBaseFor(request.baseRevs, blockId, blockTransform);
 				try {
+					// `pendingSince` is read fresh per block rather than once for the whole pass, so each
+					// record's lease runs from when THAT record was stored; the passes are local I/O, so the
+					// spread is sub-millisecond either way.
+					//
+					// NOTE: a re-pend of the same action overwrites the claim here, stamp and all, so it
+					// RESTARTS the record's lease. That is correct — a writer that re-pends is demonstrably
+					// alive — but it means the lease does not bound a hostile or looping writer, which can
+					// hold a block indefinitely by re-pending. True before the lease too, and it belongs to
+					// the dispute subsystem rather than here.
 					await blockStorage.savePendingTransaction(request.actionId, blockTransform, {
+						pendingSince: this.now(),
 						...(request.rev === undefined ? {} : { rev: request.rev }),
 						...(baseRev === undefined ? {} : { baseRev }),
 						...(localRun === undefined ? {} : { localRun })

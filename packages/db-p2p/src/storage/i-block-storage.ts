@@ -102,7 +102,7 @@ export interface IBlockStorage {
     /**
      * Saves a pending action (seeding this block's metadata when it has none), with `claim`, what the
      * block's metadata will say about the record ({@link PendingClaimFields}: the slot it claims, the
-     * base it was computed against, the node run that saved it).
+     * base it was computed against, the node run that saved it, and when it was stored).
      *
      * `claim.rev` is the revision the pend is claiming — the `rev` of the `PendRequest` this record
      * belongs to, or absent for a claim that names no revision (an insert-only pend). When it
@@ -137,22 +137,30 @@ export interface IBlockStorage {
      * applies the pend alone for a writer in its own process (`StorageRepo.pend`, from
      * `MessageOptions.localWriter`), and kept beside the other two (`BlockMetadata.pendingRuns`) so
      * a later run can judge the record abandoned (`isAbandonedClaim`). Absent for every other record.
+     *
+     * `claim.pendingSince` is the caller's wall-clock reading as it saves the record, and is the one
+     * claim field that is REQUIRED: a record reserves its block only for a bounded span from it, and
+     * one that carries none is judged from the reader's run start instead, which lapses sooner (see
+     * `hasLapsed` in `pending-claim.ts`). Kept beside the other three (`BlockMetadata.pendingSince`)
+     * in the same metadata write. A re-pend of the same action overwrites it, so a live writer's
+     * record cannot lapse under it.
      */
     savePendingTransaction(actionId: ActionId, transform: Transform, claim: PendingClaimFields, latch: BlockWriteLatch): Promise<void>;
 
-    /** Deletes a pending action, and the revision, base and run it was recorded as claiming. */
+    /** Deletes a pending action, and the revision, base, run and stored-at it was recorded with. */
     deletePendingTransaction(actionId: ActionId, latch: BlockWriteLatch): Promise<void>;
 
     /**
      * Every pending record on this block, each with the revision it was pended at, the base it was
-     * computed against and the node run that saved it when those are known — the pending namespace
-     * joined against `BlockMetadata.pendingRevs`, `pendingBases` and `pendingRuns`. This is the view
-     * the rival-pend checks read (`StorageRepo.pend`'s apply-time scan and
-     * `ClusterMember.validatePendOperations`' promise vote), because whether a record reserves the
-     * block against a given pend depends first on whether its writer can still act
-     * (`isAbandonedClaim`) and then on the slot it claims measured against the pend's revision — and,
-     * at the vote of a cohort that can leave a member out, its base (`isReservationAgainst`) — not on
-     * its mere presence. Read-only; no latch.
+     * computed against, the node run that saved it and when it was stored, when those are known — the
+     * pending namespace joined against `BlockMetadata.pendingRevs`, `pendingBases`, `pendingRuns` and
+     * `pendingSince`. This is the view the rival-pend checks read (`StorageRepo.pend`'s apply-time
+     * scan and `ClusterMember.validatePendOperations`' promise vote), because whether a record
+     * reserves the block against a given pend depends first on whether its writer can still act
+     * (`isAbandonedClaim`), then on whether the record has stood past its lease (`hasLapsed`), and
+     * only then on the slot it claims measured against the pend's revision — and, at the vote of a
+     * cohort that can leave a member out, its base (`isReservationAgainst`) — not on its mere
+     * presence. Read-only; no latch.
      */
     listPendingClaims(): Promise<PendingClaim[]>;
 

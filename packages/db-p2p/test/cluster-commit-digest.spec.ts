@@ -394,6 +394,8 @@ describe('ClusterMember — commit base-declaration check (promise round)', () =
 	 *  this check can fire. */
 	class ClaimOfRepo extends MockRepo implements IPendingClaimReader {
 		readonly runId = 'run-under-test';
+		/** No lease: this check never reads it, and a lapse must not change a commit vote. */
+		readonly pendLease = undefined;
 		constructor(private readonly claims: Record<string, PendingClaim | undefined>, private readonly latestRev?: number) { super(); }
 		override async get(gets: BlockGets): Promise<GetBlockResults> {
 			if (this.latestRev === undefined) return {};

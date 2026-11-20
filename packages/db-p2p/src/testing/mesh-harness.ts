@@ -159,6 +159,22 @@ export interface MeshOptions {
 	 * (a watcher woken for a table before its index landed) sets `0`.
 	 */
 	changeHoldMs?: number;
+	/**
+	 * Passed to every node's `StorageRepo` as `pendLeaseMs` — how long a pending record reserves its
+	 * block on that node before it LAPSES and stops reserving (`hasLapsed` in
+	 * `../storage/pending-claim.ts`); `0` disables lapsing. Omitted → the production default
+	 * (`DEFAULT_PEND_LEASE_MS`, five minutes), so no spec that does not ask for a lease sees different
+	 * behaviour. A spec that wants to observe a lapse sets a short lease and drives {@link MeshConfig.now}
+	 * past it, rather than waiting on a real timer.
+	 */
+	pendLeaseMs?: number;
+	/**
+	 * The wall clock every node's `StorageRepo` stamps and reads pending-record ages against
+	 * (`StorageRepoOptions.now`). Omitted → `Date.now`. One clock for the whole mesh, since the rule
+	 * never compares one node's reading with another's; a spec drives it forward to make a lease
+	 * elapse deterministically.
+	 */
+	now?: () => number;
 }
 
 export interface MeshFailureConfig {
@@ -624,7 +640,12 @@ export async function createMesh(nodeCount: number, options: MeshOptions): Promi
 		const { rawStorage, index } = durableByPeer.get(peerId.toString())!;
 		// A fresh run per build: a restart stands for a new process, whose pending records the old run
 		// stamped (`MessageOptions.localWriter`) are abandoned (`StorageRepo.runId`).
-		const storageRepo = new StorageRepo(rawStorage, { runId: mintRunId(), ...(options.changeHoldMs === undefined ? {} : { changeHoldMs: options.changeHoldMs }) });
+		const storageRepo = new StorageRepo(rawStorage, {
+			runId: mintRunId(),
+			...(options.changeHoldMs === undefined ? {} : { changeHoldMs: options.changeHoldMs }),
+			...(options.pendLeaseMs === undefined ? {} : { pendLeaseMs: options.pendLeaseMs }),
+			...(options.now === undefined ? {} : { now: options.now })
+		});
 
 		// Active reconciliation: when a member commits a block it never pended (cohort drift), or a
 		// reader holds a corroborated revision it cannot promote locally, pull the committed revision

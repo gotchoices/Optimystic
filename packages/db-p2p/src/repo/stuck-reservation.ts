@@ -82,31 +82,42 @@ function sameHolders(a: readonly ActionId[], b: readonly ActionId[]): boolean {
  *
  * The claim is deliberately about the RESERVATION, not about the writer's intent: this node cannot
  * see whether the holding process is alive, only that it has held the block across enough unrelated
- * later actions that no retry is going to win. So the line says what is provable (the block accepts
- * no writes while this record stands, and nothing on the node removes it) and points at the one check
+ * later actions that no retry inside its remaining lease is going to win. So the line says what is
+ * provable (the block accepts no writes while this record reserves it, and the record itself is
+ * removed only by a cancel, its own commit, or the abandonment judgement) and points at the one check
  * that settles the rest.
+ *
+ * It names the pend lease as the fourth and last thing that clears the hold (`hasLapsed` in
+ * `packages/db-p2p/src/storage/pending-claim.ts`), so an operator reading it knows the wedge is
+ * bounded rather than permanent. The line is still worth emitting: it fires while a lease is running,
+ * and a holder that keeps re-pending renews its lease, so a cohort can still be wedged indefinitely
+ * by a LIVE holder — which is exactly what a recurrence past one lease now tells the reader.
  */
 export function stuckReservationMessage(holders: readonly ActionId[], refusedActions: number): string {
 	const held = holders.join(', ');
-	return `This block is WEDGED BEHIND A PENDING WRITE THAT IS NOT COMPLETING, and retrying will never ` +
+	return `This block is WEDGED BEHIND A PENDING WRITE THAT IS NOT COMPLETING, and retrying will not ` +
 		`clear it: action(s) ${held} reserved the block and have now refused ${refusedActions} DISTINCT, ` +
 		`unrelated later actions. Each of those refusals on its own looks exactly like an ordinary ` +
 		`optimistic-concurrency loss, which is normal and healthy — the repetition is what is not. A ` +
 		`healthy rival holds a block only for its own pend-to-commit window and then releases it by ` +
 		`committing or cancelling; a reservation that keeps refusing NEW writers is holding the block ` +
-		`against every writer on every machine, and each of them loses again identically. EXACTLY THREE ` +
-		`THINGS CLEAR IT: a cancel for action(s) ${held} on this block (route it through the cohort so ` +
-		`every member drops the record), that same action's own commit landing, or — on a one-machine ` +
-		`group only — the next write to the block, when the record is one this node's own earlier run ` +
-		`left for a writer in its own process (that writer is provably gone, and the node drops such a ` +
-		`record by itself; if this line is from a solo node, no cancel by hand is needed). Nothing else ` +
-		`on the node expires it — there is no sweep for a remote writer's record, or for a record of a ` +
-		`write a larger cohort decided — so until one of those happens the block takes NO writes while ` +
-		`continuing to serve reads and to look healthy in every other respect. The usual cause is a ` +
-		`writer that went away between a failed or half-applied commit and the cancel it owed, so check ` +
-		`whether whatever ran ${held} still exists before cancelling on its behalf. This line is a ` +
-		`diagnosis and nothing more: this node does not expire, refuse, or delete the record on the ` +
-		`strength of it.`;
+		`against every writer on every machine, and each of them loses again identically. FOUR THINGS ` +
+		`CLEAR IT: a cancel for action(s) ${held} on this block (route it through the cohort so every ` +
+		`member drops the record), that same action's own commit landing, or — on a one-machine group ` +
+		`only — the next write to the block, when the record is one this node's own earlier run left ` +
+		`for a writer in its own process (that writer is provably gone, and the node drops such a ` +
+		`record by itself; if this line is from a solo node, no cancel by hand is needed) — and ` +
+		`failing all of those, the record's own PEND LEASE running out, after which it stops reserving ` +
+		`the block on each member that has held it that long, without being deleted and with its own ` +
+		`commit still honoured. So the wedge is BOUNDED, not permanent: the lease is five minutes by ` +
+		`default and longer on a node that declares a slow link. Until one of those four happens the ` +
+		`block takes NO writes while continuing to serve reads and to look healthy in every other ` +
+		`respect, and this line still means something while a lease is running — and it means a live ` +
+		`holder, re-pending and so renewing its lease, when it keeps recurring past one. The usual ` +
+		`cause is a writer that went away between a failed or half-applied commit and the cancel it ` +
+		`owed, so check whether whatever ran ${held} still exists before cancelling on its behalf. ` +
+		`This line is a diagnosis and nothing more: this node does not refuse or delete the record on ` +
+		`the strength of it.`;
 }
 
 /**
@@ -148,10 +159,11 @@ export interface StuckReservationEpisode {
  * declares, such as an abandoned action's record on a block no later write touched.)
  *
  * **Never a control path.** This classifies and reports; it never refuses, expires, or deletes
- * anything. Deciding when a durable pending record may be removed is precisely the hard problem
- * backlog `debt-unpromotable-pending-records-need-a-sweep` exists for — deleting a live reservation
- * is worse than the leak — and a counter accurate enough for a log line is not evidence enough to
- * destroy state.
+ * anything. Deciding when a durable pending record may be REMOVED is still the hard problem —
+ * deleting a live reservation is worse than the leak, and a counter accurate enough for a log line
+ * is not evidence enough to destroy state. The bound that did arrive stops a record RESERVING rather
+ * than removing it, and it is measured against the record's own age under the block latch, not
+ * against this counter (`hasLapsed` in `packages/db-p2p/src/storage/pending-claim.ts`).
  *
  * **Two instances, two vantage points.** The coordinator keeps one (`CoordinatorRepo.noteStuckReservation`),
  * fed by cohort-wide `held`-answered refusals whose holder its OWN storage corroborates, and every

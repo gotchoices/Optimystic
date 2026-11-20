@@ -14,7 +14,7 @@ import { settleSoloAhead, type BlockLineageAsk } from "../cluster/solo-ahead.js"
 import { DEFAULT_CLUSTER_SIZE, reconcilePassTimeoutMs, resolveCohortQueryTimeoutMs, resolveReadRepairCoalesceMs, resolveReadRepairQuietWindowMs, resolveRepairCorroborationClusterSize } from "../cluster/cluster-policy.js";
 import { isMissingBaseRevisionFailure, COMMIT_NOT_DURABLE_REASON, MISSING_BASE_REVISION_REASON, SOLO_COMMIT_REFUSED_REASON, type ILocalApply, type IRevisionActionReader, type IPendingClaimReader, type StorageApplyOptions } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
-import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, hasLapsed, reservationRequestFor, cohortCanMissAPend, type PendingClaim } from "../storage/pending-claim.js";
 import { buildBlockCommitProof, type BlockCommitProof } from "../cluster/commit-proof.js";
 import { foldCommitResults, foldPendResults } from "../cluster/batch-verdicts.js";
 import type { ReconcileBlockCallback, BlockHoldersSink, ConsultedArchives, CohortCommitApplied } from "../cluster/cluster-repo.js";
@@ -3497,12 +3497,15 @@ export class CoordinatorRepo implements IRepo {
 
 	/**
 	 * This node's LIVE pending records on `blockId`, each with the slot it claims when storage can say
-	 * (`IPendingClaimReader`, which `StorageRepo` implements). A record an earlier run of this node left
-	 * for a writer in its own process is left out (`isAbandonedClaim`, against the run the reader says
-	 * it is), as both rival scans leave it out: it is nobody's reservation, the next pend applied here
-	 * deletes it, and naming it would tell an operator to cancel by hand a record the node drops itself.
-	 * A repo without the capability answers with `state.pendings` alone, every record read as an
-	 * unknown claim — which reserves, so the corroboration can only over-name, never under-name.
+	 * (`IPendingClaimReader`, which `StorageRepo` implements). Two kinds are left out, as both rival
+	 * scans leave them out: a record an earlier run of this node left for a writer in its own process
+	 * (`isAbandonedClaim`, against the run the reader says it is) — nobody's reservation, deleted by
+	 * the next pend applied here, and naming it would tell an operator to cancel by hand a record the
+	 * node drops itself — and one that has stood past this node's pend lease (`hasLapsed`), which this
+	 * node has stopped holding the block for, so naming it as a holder would point an operator at a
+	 * reservation that no longer refuses anyone. A repo without the capability answers with
+	 * `state.pendings` alone, every record read as an unknown claim — which reserves, so the
+	 * corroboration can only over-name, never under-name.
 	 */
 	private async pendingClaimsOf(blockId: BlockId): Promise<PendingClaim[]> {
 		const live = await this.livePendingClaims(blockId);
@@ -3515,12 +3518,15 @@ export class CoordinatorRepo implements IRepo {
 	 * This node's live pending records on `blockId` from storage that can list them
 	 * (`IPendingClaimReader`, probed as `ClusterMember` probes it), or `undefined` from storage that
 	 * cannot. A record an earlier run of this node left for a writer in its own process is left out
-	 * (`isAbandonedClaim`): that pend was applied here alone, so nothing can ever commit it.
+	 * (`isAbandonedClaim`): that pend was applied here alone, so nothing can ever commit it. So is one
+	 * that has stood past the reader's pend lease (`hasLapsed`): this node no longer holds the block
+	 * for it.
 	 */
 	private async livePendingClaims(blockId: BlockId): Promise<PendingClaim[] | undefined> {
 		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
 		if (typeof reader.listPendingClaims !== 'function') return undefined;
-		return (await reader.listPendingClaims(blockId)).filter(claim => !isAbandonedClaim(claim, reader.runId));
+		return (await reader.listPendingClaims(blockId))
+			.filter(claim => !isAbandonedClaim(claim, reader.runId) && !hasLapsed(claim, reader.pendLease));
 	}
 
 	/**

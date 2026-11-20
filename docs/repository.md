@@ -302,15 +302,20 @@ it — including a replica landing under a *different* action, the reconcile sha
 the missed action's record standing forever. The committing action's own claim is dropped by `setLatest`
 with no delete, since promotion already moved its record; `recover` still deletes each recovered action's
 record, since a retry may have re-pended it while the lost `setLatest` was owed. A record with no claim on file is never swept, because
-its death cannot be proved. This is the locally decidable half of what backlog
-`debt-unpromotable-pending-records-need-a-sweep` asks for; a record whose slot the block has not
-reached and whose writer never came back is the half that ticket still owns.
+its death cannot be proved. That is the locally decidable half: a record whose slot the block has
+not reached and whose writer never came back is not removed by it, and is bounded instead by the
+lease the next section states.
 
 #### A pending record's lifetime is bounded by its writer
 
 Invariant P constrains which states may coexist on a member; this sibling rule constrains how long
-the pending state may outlive the transaction that created it. Only five things ever remove a
-pending record: the client's `cancel` (routed through consensus, so every member drops it), a
+the pending state may outlive the transaction that created it. It has two halves, and they are
+different kinds of claim. Which things REMOVE a record is the writer's business, and the list is
+closed. How long a record RESERVES its block is a separate question with a separate answer — a
+bounded span measured from the moment this node stored it — and the two are independent: a record
+that has stopped reserving is still on file, and its own commit still promotes it. Removal first.
+
+Only five things ever remove a pending record: the client's `cancel` (routed through consensus, so every member drops it), a
 divergence-shaped commit refusal (`StorageRepo.dropUnpromotablePendings`), a forward write
 carrying the *same* action id (`BlockStorage.saveForwardRevision`'s same-action delete), the
 dead-claim sweep that runs whenever `latest` advances to or past the revision a record claims
@@ -335,9 +340,9 @@ judgement or lands after the delete — and proceeds; `ClusterMember.reservingRi
 the vote the same way (logged `cluster-member:validation-pending-abandoned`), and the record is
 deleted when the approved pend applies. The mark is positive on purpose: a path that forgets it
 leaves the record standing, as every record stood before the mark existed, whereas a forgotten
-negative mark would have a live remote writer's record judged dead. There is no age bound and no
-background sweep, and the sweep and the judgement only ever remove a record whose promotion has
-become impossible. So the writer that pends a block owns its record's fate: when
+negative mark would have a live remote writer's record judged dead. There is no background sweep,
+and the sweep and the judgement only ever remove a record whose promotion has become impossible. So
+the writer that pends a block owns its record's fate: when
 `NetworkTransactor.commit` returns, every block in the request must be either **committed** or have
 had its pending record **cancelled** — a client that reports success while walking away from a
 pended block strands the record permanently, and the members then reject every later write to that
@@ -383,10 +388,66 @@ the record — and on a **one-machine group** the strand no longer wedges anythi
 exits before `node.stop()` resolves, with a write between its pend and its commit, leaves a record
 the next run judges abandoned and drops on the next write to the block (GitHub #54, pinned by
 `packages/db-p2p/test/an-interrupted-write-does-not-wedge-the-collection.spec.ts`). On a larger
-cohort the same exit still strands the record on the other members, since a coordinated write's
-records carry no stamp, and a remote writer's record through any node is never stamped; the
-node-side backstop for those residuals is tracked in backlog
-`debt-unpromotable-pending-records-need-a-sweep`.
+cohort the same exit still strands the RECORD on the other members, since a coordinated write's
+records carry no stamp, and a remote writer's record through any node is never stamped. What it no
+longer strands is the BLOCK, which is the second half of the rule.
+
+**A record reserves its block only for a bounded span.** The span runs from the moment this node
+stored the record, which it writes down beside the record's slot (`BlockMetadata.pendingSince`, read
+back as `PendingClaim.pendingSince`). Past that span the record has **lapsed**: it no longer reserves
+the block against any other writer, at either rival scan. It is **not deleted**, and its own commit
+is still honoured — both halves of that sentence are load-bearing, and the rule is `hasLapsed` in
+`packages/db-p2p/src/storage/pending-claim.ts`. The span is `StorageRepoOptions.pendLeaseMs`
+(`DEFAULT_PEND_LEASE_MS`, five minutes; a node derives its own as ten times the budget its declared
+link round trip gives one transactor operation, so a slow-link deployment gets a proportionally
+longer lease), and `0` turns lapsing off entirely.
+
+An age bound is what is left once the cheaper signals are spent. The block-passed-the-slot test
+(`sweepDeadClaims`), the request-passed-the-slot test (`isReservationAgainst`) and the
+provably-dead-writer test (`isAbandonedClaim`) are all in, and what none of them reaches — by
+construction — is a record whose slot the collection has not moved past, carrying no in-process
+mark: a coordinated write's record, a remote writer's record pended through this node, a record whose
+owed cancel a restart forgot, or a record written by a build that kept no claim at all. No comparison
+of revisions can retire any of those. The alternative — a cancel driven by a writer-liveness protocol
+— needs a writer identity that survives the writer's own restart and a reachable writer, which the
+deployments that reported this (phones behind circuit relays) cannot promise.
+
+Lapsing is safe where deleting is not, and that asymmetry is why a merely generous bound is good
+enough. Deleting a record whose write is still in flight makes that write's commit fail with a
+missing-pend error, which the cluster layer reads as this node having diverged and repairs by copying
+the whole block from a peer — more expensive than the leak. Lapsing destroys nothing, so a lease that
+fires too early costs only the reservation: another writer is admitted, and one of the two writes is
+then refused as stale and retried, the ordinary lost race. The full case analysis is in
+[correctness.md](correctness.md) Theorem 1 Case 2, which this does not weaken.
+
+The lease is read exactly where a record is asked to RESERVE — `StorageRepo.pendUnderLatches` pass 1
+(logged `pend:lapsed-claim`), `ClusterMember.reservingRivals` at the promise vote (logged
+`cluster-member:validation-pending-lapsed`), and `CoordinatorRepo.pendingClaimsOf`, so the
+diagnostic enrichment behind a `held` answer never names a holder this node has stopped holding the
+block for. Unlike an abandoned record, a lapsed one is **not** added to the pend's delete list. It is
+deliberately NOT read where a record is APPLIED or checked: not by
+`ClusterMember.validateCommitBaseDeclarations`, not by the read-driven promotion in
+`StorageRepo.get`, not by `StorageRepo.internalCommit`'s fork guard. No commit is refused for having
+lapsed. Both scans ask abandoned, then lapsed, then slot, in that order, so a record that is both
+abandoned and lapsed is deleted rather than merely set aside.
+
+No consensus round decides a lapse, and members may disagree for a moment. Nothing is destroyed, so
+no member removes state another is relying on; the verdict is monotone in local time and permanent
+once reached, and each member anchors it to its OWN receipt of the same record — nothing ever
+compares one node's clock with another's — so members reach it within the pend's own propagation
+spread of each other, milliseconds, not within clock skew. While they do differ, a member that has
+not yet lapsed the record votes `held`, which a cohort of four or more absorbs (`cohortCanMissAPend`)
+and which a cohort of two or three resolves on the writer's next retry. A node whose wall clock steps
+backwards delays every lapse, which is safe; one that steps forwards lapses early, which costs a lost
+race.
+
+Two things the lease deliberately does not do. It does not reclaim the record's **bytes**: a block
+that is never written again keeps them until something else resolves the slot, the accepted cost of
+never destroying state on a presumption. And it does not bound a writer that keeps **re-pending** the
+same action, since a re-pend overwrites the claim and restarts the lease — correct, because such a
+writer is demonstrably alive, but it means a hostile or looping writer can hold a block indefinitely,
+as it could before the lease. That belongs to the dispute subsystem. The whole rule is reproduced
+end to end by `packages/db-p2p/test/a-lapsed-pend-stops-reserving-its-block.spec.ts`.
 
 A stranded record is at least **named** rather than left to be re-derived. Every refusal it causes is
 reported as an ordinary optimistic-concurrency loss, because that is what a single refusal is
@@ -398,17 +459,22 @@ can lose to it before it releases. `coordinator-repo:stuck-reservation` (`noteSt
 unchanged holding action has refused eight *distinct* later actions on a block — distinct actions, not
 refusals, since a retrying writer reuses one action id (minted once per sync cycle in `syncInternal`,
 `packages/db-core/src/collection/collection.ts`). The line carries the block id, the holding action
-ids, the count, and prose naming the only two cures: a cancel for that action id, or that action's own
-commit. The counting, threshold and wording live in `StuckReservationTracker`
+ids, the count, and prose naming what clears the hold: a cancel for that action id, that action's own
+commit, the abandonment judgement on a one-machine group, and — failing all of those — the record's
+own lease running out, so the wedge the line reports is bounded rather than permanent. The line is
+still worth saying: it fires while a lease is running, and a holder that keeps re-pending renews its
+lease, so a recurrence past one lease names a *live* holder. The counting, threshold and wording live
+in `StuckReservationTracker`
 (`packages/db-p2p/src/repo/stuck-reservation.ts`), and every member keeps its own instance too, fed
 by its own `held` votes (`cluster-member:stuck-reservation`, from `ClusterMember.validatePendOperations`):
 the coordinator can only name a holder its own storage corroborates, so a reservation only some
 members hold is named by those members, where the record lives. Like every diagnostic in this
 package both go to the `debug` logger, so a node that may need them has to be running with
 `DEBUG='optimystic:db-p2p:coordinator-repo*,optimystic:db-p2p:cluster-member'` — see
-[debugging.md](debugging.md). It is a diagnosis only — nothing expires, refuses, or deletes a record on the strength of it,
-which remains the open problem the backlog ticket above exists for. What reaches either counter
-since the section above is the *same-slot* residue only: a record claiming a slot the collection has
+[debugging.md](debugging.md). It is a diagnosis only — nothing refuses or deletes a record on the
+strength of it; the bound that does arrive is measured against the record's own age under the block
+latch, not against this counter. What reaches either counter since the section above is the
+*same-slot* residue only, for as long as its lease runs: a record claiming a slot the collection has
 already moved past no longer refuses at all.
 
 ## Block Storage Repository

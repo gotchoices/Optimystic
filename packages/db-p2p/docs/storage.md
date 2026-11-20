@@ -1210,24 +1210,30 @@ export type BlockMetadata = {
   pendingRevs?: Record<ActionId, number>;   // Per pending record, the revision its pend claimed
   pendingBases?: Record<ActionId, number>;  // Per pending record, the base its operations were computed against
   pendingRuns?: Record<ActionId, string>;   // Per pending record the node applied alone for its own process's writer, the node run that saved it
+  pendingSince?: Record<ActionId, number>;  // Per pending record, this node's wall clock when it stored the record
 };
 ```
 
-`pendingRevs`, `pendingBases` and `pendingRuns` describe the block's pending records — the slot each
-one claims, the committed revision its update operations were computed against, and the run of
-this node that saved it — and are written, dropped and swept together with the record
-(`BlockStorage.recordClaim`), never on their own. They live here rather than inside the record
-because a promotion moves the record's bytes into the committed store unchanged. An entry whose
-record is gone is inert (every reader joins against the pending namespace), and a record with no
-entry reads as unknown: an unknown slot is the strongest kind of reservation, an unknown base is
-simply nothing to compare, and an unknown run says nothing about the writer. The run is written
-only for a record the node applied alone, with no consensus, for a writer in its own process
-(`MessageOptions.localWriter`); a record stamped with a run other than the current one
-(`StorageRepo.runId`) is abandoned, and the next pend of the block deletes it (`isAbandonedClaim`
-in `src/storage/pending-claim.ts`). Read through `IBlockStorage.listPendingClaims` and
-`IBlockStorage.pendingClaimOf`; the rules that consume them are in `docs/repository.md`, "A
-pending record claims a slot, and reserves the block until a writer builds on it" and "A pending
-record's lifetime is bounded by its writer".
+`pendingRevs`, `pendingBases`, `pendingRuns` and `pendingSince` describe the block's pending records
+— the slot each one claims, the committed revision its update operations were computed against, the
+run of this node that saved it, and when this node stored it — and are written, dropped and swept
+together with the record (`BlockStorage.recordClaim`), never on their own. They live here rather than
+inside the record because a promotion moves the record's bytes into the committed store unchanged. An
+entry whose record is gone is inert (every reader joins against the pending namespace), and a record
+with no entry reads as unknown: an unknown slot is the strongest kind of reservation, an unknown base
+is simply nothing to compare, an unknown run says nothing about the writer, and an unknown stored-at
+is judged from the reading run's start instead.
+
+The run is written only for a record the node applied alone, with no consensus, for a writer in its
+own process (`MessageOptions.localWriter`); a record stamped with a run other than the current one
+(`StorageRepo.runId`) is abandoned, and the next pend of the block deletes it (`isAbandonedClaim` in
+`src/storage/pending-claim.ts`). The stored-at is written for **every** record — it is the one
+required field of `PendingClaimFields`, so a save path that forgot to stamp it is a compile error —
+and a record that has stood past this node's pend lease has lapsed: it stops reserving the block
+against other writers, while staying on file so its own commit can still promote it (`hasLapsed`, same
+file). Read through `IBlockStorage.listPendingClaims` and `IBlockStorage.pendingClaimOf`; the rules
+that consume them are in `docs/repository.md`, "A pending record claims a slot, and reserves the block
+until a writer builds on it" and "A pending record's lifetime is bounded by its writer".
 
 `lineageFloor` is what lets a node say whether the content it holds now was built from a given
 committed write — the question a writer asks when its write was superseded before it could confirm

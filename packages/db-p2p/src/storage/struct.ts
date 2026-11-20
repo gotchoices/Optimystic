@@ -65,11 +65,12 @@ export type BlockMetadata = {
 	 * its own rule — `StorageRepo.internalCommit` falls back to the commit's declaration and then
 	 * abstains; the read-driven promotion in `StorageRepo.get` declines.
 	 *
-	 * NOTE: the sibling maps are not always co-keyed with `pendingRevs`. A rev-less pend that names a
-	 * base, or that storage stamps with a run, would leave an entry here or in `pendingRuns` and none
-	 * in `pendingRevs`, which the slot-driven dead-claim sweep cannot see, so it would live until the
-	 * record is deleted or promoted. Harmless, and no production caller sends a rev-less pend (see the
-	 * NOTE in `StorageRepo.pend`); if one ever appears, sweep these maps too.
+	 * NOTE: the sibling maps are not always co-keyed with `pendingRevs`. `pendingSince` is stamped on
+	 * EVERY record, and a base or a run can be present without a slot, so a rev-less pend leaves an
+	 * entry in one of the three siblings and none in `pendingRevs` — which the slot-driven dead-claim
+	 * sweep cannot see, so it would live until the record is deleted or promoted. Harmless, and no
+	 * production caller sends a rev-less pend (see the NOTE in `StorageRepo.pend`); if one ever
+	 * appears, sweep these maps too.
 	 */
 	pendingBases?: Record<ActionId, number>;
 	/**
@@ -86,6 +87,28 @@ export type BlockMetadata = {
 	 * (`BlockStorage.recordClaim`), so the three can never describe different records.
 	 */
 	pendingRuns?: Record<ActionId, string>;
+	/**
+	 * When this node stored each pending record, by its own wall clock, keyed by the record's action
+	 * id. A record reserves its block against other writers only for a bounded span measured from
+	 * this moment; past that span it has LAPSED — it no longer reserves, though it is not deleted and
+	 * its own commit is still honoured (`hasLapsed` in `pending-claim.ts`). Read back as
+	 * `PendingClaim.pendingSince`.
+	 *
+	 * Written for EVERY record, unlike the three siblings above: `PendingClaimFields.pendingSince` is
+	 * required, so a save path that forgot to stamp it is a compile error rather than a record that
+	 * silently lapses on the fallback below. Absent only for a record written before this field
+	 * existed, which is judged from the run's start instead (see `hasLapsed`).
+	 *
+	 * A fourth sibling of `pendingRevs`, `pendingBases` and `pendingRuns`, kept beside them for the
+	 * same reasons (the record's value stays a plain transform, so the raw drivers can promote it
+	 * byte-for-byte; metadata the release before the field wrote reads without a migration) and
+	 * written, dropped and swept in the same metadata writes (`BlockStorage.recordClaim`), so the
+	 * four can never describe different records.
+	 *
+	 * Only ever read by the node that wrote it, against that node's own clock: nothing compares one
+	 * node's reading with another's, so clock skew between members is not part of the rule.
+	 */
+	pendingSince?: Record<ActionId, number>;
 };
 
 export type ArchiveRevisions = Record<number, {

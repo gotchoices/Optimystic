@@ -2516,9 +2516,15 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   (`MessageOptions.localWriter`, never on the wire), in an earlier run of the node
   (`StorageRepo.runId`, stamped as `BlockMetadata.pendingRuns`) — abandoned by `isAbandonedClaim` in
   the same file, deleted under the latch by the next pend of the block, which is what keeps a
-  process exit between pend and commit from wedging a one-machine group (GitHub #54). Without
-  the slot rule a member that promised a write and missed its commit vetoed every later write to the
-  block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
+  process exit between pend and commit from wedging a one-machine group (GitHub #54). And ahead of
+  the slot rule but behind that one, both scans set aside a record that has simply stood too long: a
+  record reserves its block only for a bounded span from the moment the member stored it
+  (`BlockMetadata.pendingSince`), past which it has **lapsed** and reserves nothing — while staying on
+  file, so its own commit still promotes it (`hasLapsed`, same file; five minutes by default, longer on
+  a node that declares a slow link). That is what bounds the wedge a coordinated write's record or a
+  remote writer's record would otherwise make permanent, since neither carries a run stamp (GitHub
+  #18). Without the slot rule a member that promised a write and missed its commit vetoed every later
+  write to the block; see [repository.md §Invariant P](repository.md#invariant-p--a-pending-record-and-a-committed-record-never-coexist-for-one-action).
   The coordinator raises `BlocksHeldError` — again never
   `ValidatorRejectionError` — and `CoordinatorRepo.pend` returns it as a `StaleFailure` with
   `conflict: true` *unconditionally*. Its local re-read is an **enricher, not a gate**: when this

@@ -149,7 +149,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, {}, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -176,7 +176,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, {}, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -202,7 +202,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const initialBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, {}, l);
+				await blockStorage.savePendingTransaction('initial-action' as ActionId, { insert: initialBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('initial-action' as ActionId, initialBlock, l);
 				await blockStorage.saveRevision(1, 'initial-action' as ActionId, l);
 				await blockStorage.promotePendingTransaction('initial-action' as ActionId, l);
@@ -457,7 +457,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const existingBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock }, {}, l);
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: existingBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, existingBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
@@ -508,7 +508,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, {}, l);
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
@@ -573,7 +573,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1');
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, {}, l);
+				await blockStorage.savePendingTransaction('create' as ActionId, { insert: testBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('create' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'create' as ActionId, l);
 				await blockStorage.promotePendingTransaction('create' as ActionId, l);
@@ -1110,7 +1110,7 @@ describe('StorageRepo', () => {
 			const blockStorage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const testBlock = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock }, {}, l);
+				await blockStorage.savePendingTransaction('setup' as ActionId, { insert: testBlock }, { pendingSince: Date.now() }, l);
 				await blockStorage.saveMaterializedBlock('setup' as ActionId, testBlock, l);
 				await blockStorage.saveRevision(1, 'setup' as ActionId, l);
 				await blockStorage.promotePendingTransaction('setup' as ActionId, l);
@@ -1146,7 +1146,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(blockId as BlockId, rawStorage);
 				const block = makeBlock(blockId, { items: [] });
 				await withBlockWriteLatch(blockId as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1204,7 +1204,7 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1292,7 +1292,7 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1353,13 +1353,13 @@ describe('StorageRepo', () => {
 			const storage = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+				await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 				await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 				await storage.saveRevision(1, 'setup' as ActionId, l);
 				await storage.promotePendingTransaction('setup' as ActionId, l);
 				await storage.setLatest({ actionId: 'setup' as ActionId, rev: 1 }, false, l);
 				// rev 2 durable but latest deliberately NOT advanced (the lost-setLatest / Crash-D3 signature).
-				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, {}, l);
+				await storage.savePendingTransaction('a2' as ActionId, { insert: makeBlock('block-1', { items: ['a2'] }) }, { pendingSince: Date.now() }, l);
 				await storage.saveMaterializedBlock('a2' as ActionId, makeBlock('block-1', { items: ['a2'] }), l);
 				await storage.saveRevision(2, 'a2' as ActionId, l);
 				await storage.promotePendingTransaction('a2' as ActionId, l);
@@ -1395,7 +1395,7 @@ describe('StorageRepo', () => {
 			const storage1 = new BlockStorage('block-1' as BlockId, rawStorage);
 			const block1 = makeBlock('block-1', { items: [] });
 			await withBlockWriteLatch('block-1' as BlockId, async l => {
-				await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 }, {}, l);
+				await storage1.savePendingTransaction('setup' as ActionId, { insert: block1 }, { pendingSince: Date.now() }, l);
 				await storage1.saveMaterializedBlock('setup' as ActionId, block1, l);
 				await storage1.saveRevision(1, 'setup' as ActionId, l);
 				await storage1.promotePendingTransaction('setup' as ActionId, l);
@@ -1406,7 +1406,7 @@ describe('StorageRepo', () => {
 			const storage2 = new BlockStorage('block-2' as BlockId, rawStorage);
 			const block2 = makeBlock('block-2', { items: [] });
 			await withBlockWriteLatch('block-2' as BlockId, async l => {
-				await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 }, {}, l);
+				await storage2.savePendingTransaction('setup' as ActionId, { insert: block2 }, { pendingSince: Date.now() }, l);
 				await storage2.saveMaterializedBlock('setup' as ActionId, block2, l);
 				await storage2.saveRevision(1, 'setup' as ActionId, l);
 				await storage2.promotePendingTransaction('setup' as ActionId, l);
@@ -1715,7 +1715,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlock(id, { items: [] });
 				await withBlockWriteLatch(id as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -1793,7 +1793,7 @@ describe('StorageRepo', () => {
 				const storage = new BlockStorage(id as BlockId, rawStorage);
 				const block = makeBlockInCollection(id, collectionId, { items: [] });
 				await withBlockWriteLatch(id as BlockId, async l => {
-					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, {}, l);
+					await storage.savePendingTransaction('setup' as ActionId, { insert: block }, { pendingSince: Date.now() }, l);
 					await storage.saveMaterializedBlock('setup' as ActionId, block, l);
 					await storage.saveRevision(1, 'setup' as ActionId, l);
 					await storage.promotePendingTransaction('setup' as ActionId, l);
@@ -2800,8 +2800,8 @@ describe('StorageRepo', () => {
 					policy: 'c',
 					baseRevs: { [BLOCK]: 4 }
 				});
-				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a5' as ActionId), 'the base is dropped at pend for a base-independent transform')
-					.to.deep.equal({ actionId: 'a5' });
+				expect((await new BlockStorage(BLOCK, raw).pendingClaimOf('a5' as ActionId))?.baseRev, 'the base is dropped at pend for a base-independent transform')
+					.to.equal(undefined);
 				await member.saveReplicatedBlock(BLOCK, makeBlock(BLOCK, { items: ['seeded'] }), { actionId: 'a-repl' as ActionId, rev: 2 });
 
 				const result = await member.commit({ actionId: 'a5' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 5 });
@@ -2840,7 +2840,8 @@ describe('StorageRepo', () => {
 				const spliceOne = (index: number, values: unknown[]): Transform => ({ updates: [['items', index, 0, values]] });
 
 				await pendAsRelease('a-declared', 3, spliceOne(1, ['b']));
-				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a-declared' as ActionId)).to.deep.equal({ actionId: 'a-declared', rev: 3 });
+				expect(await new BlockStorage(BLOCK, raw).pendingClaimOf('a-declared' as ActionId), 'the release-shaped record: a slot, and no base, run or stored-at')
+					.to.deep.equal({ actionId: 'a-declared', rev: 3 });
 				expect((await member.commit({
 					actionId: 'a-declared' as ActionId, blockIds: [BLOCK], tailId: BLOCK, rev: 3,
 					blockDigests: { [BLOCK]: { digest: 'declared', baseRev: 2 } as BlockContentDigest }
@@ -3314,7 +3315,7 @@ describe('StorageRepo', () => {
 			await rawStorage.saveMetadata(BLOCK, { latest: { rev: 3, actionId: 'ghost' as ActionId }, ranges: [[3]] });
 			await withBlockWriteLatch(BLOCK, async l => {
 				await new BlockStorage(BLOCK, rawStorage).savePendingTransaction('a1' as ActionId,
-					{ insert: makeBlock(BLOCK, { items: ['fresh'] }) }, {}, l);
+					{ insert: makeBlock(BLOCK, { items: ['fresh'] }) }, { pendingSince: Date.now() }, l);
 			});
 
 			const preview = await repo.previewCommitDigest(BLOCK, 'a1' as ActionId, 4);
@@ -3769,7 +3770,8 @@ describe('StorageRepo.pend — a record an earlier run of this node left for its
 
 	it('a record pended without the in-process mark is not stamped, and still reserves against a later run', async () => {
 		expect((await run1.pend(writeOf('a-remote'))).success, 'pended as a remote writer\'s pend arrives: no options').to.equal(true);
-		expect(await run1.pendingClaimOf(B, 'a-remote' as ActionId), 'no mark ⇒ no stamp').to.deep.equal({ actionId: 'a-remote', rev: 2 });
+		expect(await run1.pendingClaimOf(B, 'a-remote' as ActionId), 'no mark ⇒ no run stamp')
+			.to.include({ actionId: 'a-remote', rev: 2 }).and.to.not.have.property('localRun');
 
 		const refused = await run2.pend(writeOf('a-newcomer'), { localWriter: true });
 		expect(refused.success, 'the next run cannot tell its writer is gone, so the record still reserves').to.equal(false);
@@ -3780,7 +3782,7 @@ describe('StorageRepo.pend — a record an earlier run of this node left for its
 
 	it('a record the in-process writer pended in an earlier run is deleted, claim and all, and the pend lands', async () => {
 		expect((await run1.pend(writeOf('a-dead'), { localWriter: true })).success).to.equal(true);
-		expect(await run1.pendingClaimOf(B, 'a-dead' as ActionId), 'stamped with the run that saved it').to.deep.equal({ actionId: 'a-dead', rev: 2, localRun: 'run-1' });
+		expect(await run1.pendingClaimOf(B, 'a-dead' as ActionId), 'stamped with the run that saved it').to.include({ actionId: 'a-dead', rev: 2, localRun: 'run-1' });
 
 		const landed = await run2.pend(writeOf('a-newcomer'));
 		expect(landed.success, `the dead record must not refuse: ${JSON.stringify(landed)}`).to.equal(true);
@@ -3789,6 +3791,59 @@ describe('StorageRepo.pend — a record an earlier run of this node left for its
 		const meta = (await raw.getMetadata(B))!;
 		expect(meta.pendingRevs, 'its claim is dropped; the newcomer\'s stands').to.deep.equal({ 'a-newcomer': 2 });
 		expect(meta.pendingRuns, 'and its stamp with it (the unmarked newcomer gets none)').to.equal(undefined);
+	});
+});
+
+/**
+ * Ticket: a-pending-record-reserves-its-block-only-for-a-bounded-time.
+ *
+ * The residual the run stamp cannot reach: a record with NO `localRun` — the shape a coordinated
+ * write and a remote writer's pend through this node both leave — whose slot the collection has not
+ * moved past. Neither `isAbandonedClaim` nor `isReservationAgainst` can ever retire it, so before the
+ * lease it reserved the block against every later writer for good. Now it reserves for its lease and
+ * then LAPSES: it stops reserving, and it is still on file afterwards, which is the half of the rule
+ * that keeps a lapse from costing the write whose record it is.
+ */
+describe('StorageRepo.pend — a record that has stood past its lease stops reserving its block', () => {
+	const B = 'block-leased' as BlockId;
+	const LEASE_MS = 300;
+	let raw: MemoryRawStorage;
+	let repo: StorageRepo;
+	/** The repo's clock, driven by the spec: a lease must elapse by decision, never by a real timer. */
+	let now: number;
+
+	const writeOf = (actionId: string): PendRequest => ({
+		actionId: actionId as ActionId, transforms: makeUpdateTransforms(B, [['items', 0, 0, [actionId]]]), rev: 2, policy: 'r'
+	});
+
+	beforeEach(async () => {
+		raw = new MemoryRawStorage();
+		now = 1_000_000;
+		repo = new StorageRepo(raw, { pendLeaseMs: LEASE_MS, now: () => now });
+		await repo.saveReplicatedBlock(B, makeBlock(B, { items: [] }), { actionId: 'r1' as ActionId, rev: 1 });
+		// No `localWriter`, so nothing is stamped with the run: exactly what a consensus apply and a
+		// remote writer's pend through this node both leave behind.
+		expect((await repo.pend(writeOf('a-stranded'))).success).to.equal(true);
+		expect((await repo.pendingClaimOf(B, 'a-stranded' as ActionId))?.localRun, 'unstamped by construction').to.equal(undefined);
+	});
+
+	it('reserves the block while its lease runs', async () => {
+		now += LEASE_MS;	// at the boundary: the comparison is strictly greater, so it still reserves
+		const refused = await repo.pend(writeOf('a-newcomer'));
+		expect(refused.success, 'a record inside its lease is a reservation like any other').to.equal(false);
+		expect((refused as StaleFailure).conflict).to.equal(true);
+		expect((refused as StaleFailure).pending?.map(p => p.actionId)).to.deep.equal(['a-stranded']);
+	});
+
+	it('stops reserving past its lease, and is KEPT — the record and its claim both stand', async () => {
+		now += LEASE_MS + 1;
+		const landed = await repo.pend(writeOf('a-newcomer'));
+		expect(landed.success, `the lapsed record must not refuse: ${JSON.stringify(landed)}`).to.equal(true);
+		expect((landed as PendSuccess).pending, 'and is not reported as a rival either').to.deep.equal([]);
+
+		expect(await raw.getPendingTransaction(B, 'a-stranded' as ActionId), 'the record itself is not deleted').to.not.equal(undefined);
+		expect((await repo.pendingClaimOf(B, 'a-stranded' as ActionId))?.rev,
+			'nor is its claim dropped, so its own commit can still promote it').to.equal(2);
 	});
 });
 

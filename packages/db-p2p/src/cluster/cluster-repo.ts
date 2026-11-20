@@ -20,7 +20,7 @@ import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
 import type { BlockArchive } from "../storage/struct.js";
-import { isReservationAgainst, isAbandonedClaim, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
+import { isReservationAgainst, isAbandonedClaim, hasLapsed, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
 import { checkPendValidation, TRANSACTION_EXPIRED } from "../pend-validation.js";
 import { batchShapeFault, getAffectedBlockIds } from "./record-operations.js";
@@ -2175,16 +2175,22 @@ export class ClusterMember implements ICluster {
 	 * `pendRequest` — see `isReservationAgainst` for the rule, fed the pend's revision and the base it
 	 * declares for this block (`reservationRequestFor`, the same reading storage applies at apply).
 	 *
-	 * Asked first, ahead of the slot rule: a record an earlier run of this node left for a writer in its
-	 * own process (`isAbandonedClaim`, against the run this member's storage says it is) is nobody's
-	 * reservation, so this member's vote does not hold a newcomer on it. The vote is read-only; the
-	 * record is deleted when the approved pend applies here (`StorageRepo.pend`). A storage seam that
-	 * does not say which run it is judges no claim abandoned, which is the hold this member cast before
-	 * the stamp existed.
+	 * Asked first, ahead of the slot rule, and in this order: a record an earlier run of this node left
+	 * for a writer in its own process (`isAbandonedClaim`, against the run this member's storage says
+	 * it is) is nobody's reservation, so this member's vote does not hold a newcomer on it; then a
+	 * record that has stood past this node's pend lease has LAPSED (`hasLapsed`, against the lease its
+	 * storage says it runs) and likewise holds nobody — its writer is not provably gone, but it has
+	 * been absent far longer than any honest write takes. The vote is read-only in both cases: an
+	 * abandoned record is deleted when the approved pend applies here (`StorageRepo.pend`), and a
+	 * lapsed one is kept, so its own commit can still land. A storage seam that does not say which run
+	 * it is judges no claim abandoned, and one that does not say its lease lapses none — each the hold
+	 * this member cast before that fact was recorded, never an admission.
 	 */
 	private reservingRivals(record: ClusterRecord, blockId: BlockId, claims: PendingClaim[], pendRequest: PendRequest): ActionId[] {
 		const reservation = this.reservationRequestOf(record, pendRequest, blockId);
-		const currentRun = (this.storageRepo as IRepo & Partial<IPendingClaimReader>).runId;
+		const reader = this.storageRepo as IRepo & Partial<IPendingClaimReader>;
+		const currentRun = reader.runId;
+		const pendLease = reader.pendLease;
 		const reserving: ActionId[] = [];
 		for (const claim of claims) {
 			if (isAbandonedClaim(claim, currentRun)) {
@@ -2196,6 +2202,17 @@ export class ClusterMember implements ICluster {
 					rival: claim.actionId,
 					claimedRev: claim.rev,
 					run: claim.localRun
+				});
+			} else if (pendLease !== undefined && hasLapsed(claim, pendLease)) {
+				log('cluster-member:validation-pending-lapsed', {
+					messageHash: record.messageHash,
+					blockId,
+					actionId: pendRequest.actionId,
+					requestedRev: pendRequest.rev,
+					rival: claim.actionId,
+					claimedRev: claim.rev,
+					ageMs: pendLease.now() - (claim.pendingSince ?? pendLease.runStartedAt),
+					leaseMs: pendLease.leaseMs
 				});
 			} else if (isReservationAgainst(claim, reservation)) {
 				reserving.push(claim.actionId);
@@ -2674,6 +2691,11 @@ export class ClusterMember implements ICluster {
 	 * digest check), this member holds no record for the action on the block, the record carries no
 	 * base (an inserted or deleted block, a base-less sender, or a record written before bases were
 	 * kept), the read fails — or this member does not hold the declared base as its latest.
+	 *
+	 * Deliberately does NOT read the pend lease (`hasLapsed`): this checks a record it is about to
+	 * APPLY, not whether that record reserves the block against someone else. A lapsed record's own
+	 * commit must still land — that is the half of the lease rule that keeps a lapse from costing the
+	 * write — so the age of the record is no business of this vote.
 	 *
 	 * That last abstain is what keeps an HONEST retry off this reject. The one disagreement an honest
 	 * writer can meet here is a stale record from an earlier attempt of a retried action (same action

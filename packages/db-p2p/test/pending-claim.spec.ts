@@ -1,6 +1,7 @@
 /**
- * Tickets: a-member-that-missed-a-commit-refuses-every-later-write (review), and
- * a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it (the base arm).
+ * Tickets: a-member-that-missed-a-commit-refuses-every-later-write (review),
+ * a-rival-pend-is-superseded-only-by-a-writer-that-built-on-it (the base arm), and
+ * a-pending-record-reserves-its-block-only-for-a-bounded-time (the lease, last suite).
  *
  * The one rule both rival scans apply (`StorageRepo.pend` at apply, `ClusterMember.validatePendOperations`
  * at the promise vote), pinned as a table so a change to it is a visible decision rather than a side
@@ -11,7 +12,7 @@
 
 import { expect } from 'chai';
 import type { ActionId, BlockId, PendRequest, Transform } from '@optimystic/db-core';
-import { isReservationAgainst, cohortCanMissAPend, reservationRequestFor, usableBase, type ReservationRequest } from '../src/storage/pending-claim.js';
+import { isReservationAgainst, cohortCanMissAPend, hasLapsed, reservationRequestFor, usableBase, type ReservationRequest } from '../src/storage/pending-claim.js';
 
 const rival = 'rival' as ActionId;
 const claimAt = (rev: number | undefined) => rev === undefined ? { actionId: rival } : { actionId: rival, rev };
@@ -174,5 +175,68 @@ describe('reservationRequestFor — the one reading of an incoming pend both riv
 		expect(ignoredBase).to.equal(6);
 		expect(usableBase(request)).to.equal(undefined);
 		expect(isReservationAgainst(claimAt(5), request), 'the revision rule applies').to.equal(false);
+	});
+});
+
+/**
+ * Ticket: a-pending-record-reserves-its-block-only-for-a-bounded-time.
+ *
+ * A record reserves its block for a bounded span from the moment the node stored it; past that span
+ * it has LAPSED and reserves nothing, while still being kept so its own commit can land. `hasLapsed`
+ * has exactly three branches, one case each; the seams that read it are pinned at the repo tier
+ * (`storage-repo.spec.ts`), the vote (`cluster-pend-held-vote.spec.ts`) and end to end
+ * (`a-lapsed-pend-stops-reserving-its-block.spec.ts`).
+ */
+describe('hasLapsed — a pending record reserves its block only for a bounded time', () => {
+	const RUN_STARTED_AT = 1_000_000;
+	const LEASE_MS = 300_000;
+	/** A lease whose clock reads `now`, anchored at a run that started before every stamp below. */
+	const leaseAt = (now: number) => ({ leaseMs: LEASE_MS, runStartedAt: RUN_STARTED_AT, now: () => now });
+
+	describe('a stamped record is judged from its own stored-at', () => {
+		const stored = { actionId: rival, rev: 2, pendingSince: RUN_STARTED_AT + 50_000 };
+
+		it('has not lapsed inside its lease', () => {
+			expect(hasLapsed(stored, leaseAt(stored.pendingSince))).to.equal(false);
+			expect(hasLapsed(stored, leaseAt(stored.pendingSince + LEASE_MS - 1))).to.equal(false);
+		});
+
+		it('has not lapsed at exactly its lease: the comparison is strictly greater', () => {
+			expect(hasLapsed(stored, leaseAt(stored.pendingSince + LEASE_MS))).to.equal(false);
+		});
+
+		it('has lapsed past its lease, and stays lapsed', () => {
+			expect(hasLapsed(stored, leaseAt(stored.pendingSince + LEASE_MS + 1))).to.equal(true);
+			expect(hasLapsed(stored, leaseAt(stored.pendingSince + 10 * LEASE_MS))).to.equal(true);
+		});
+
+		it('is judged from the stamp, not from the run: a clock behind the stamp lapses nothing', () => {
+			// A record stored by an earlier run of a node whose clock has since stepped backwards.
+			expect(hasLapsed(stored, leaseAt(RUN_STARTED_AT))).to.equal(false);
+		});
+	});
+
+	describe('an unstamped record — written before the field existed — is judged from the run\'s start', () => {
+		// The population this branch exists for: no slot either, which both other rules treat as the
+		// strongest possible claim and neither can ever retire.
+		const legacy = { actionId: rival };
+
+		it('gets exactly one lease of grace from the run\'s start', () => {
+			expect(hasLapsed(legacy, leaseAt(RUN_STARTED_AT)), 'at the run\'s start').to.equal(false);
+			expect(hasLapsed(legacy, leaseAt(RUN_STARTED_AT + LEASE_MS)), 'at the boundary').to.equal(false);
+			expect(hasLapsed(legacy, leaseAt(RUN_STARTED_AT + LEASE_MS + 1)), 'one tick past it').to.equal(true);
+		});
+
+		it('is judged the same way whatever slot it claims', () => {
+			const past = leaseAt(RUN_STARTED_AT + LEASE_MS + 1);
+			expect(hasLapsed({ actionId: rival, rev: 2 }, past)).to.equal(true);
+			expect(hasLapsed({ actionId: rival, rev: 2, baseRev: 1, localRun: 'run-1' }, past)).to.equal(true);
+		});
+	});
+
+	it('lapses nothing without a lease, whatever the claim says', () => {
+		// `pendLeaseMs: 0` and a reader that cannot say the time both arrive here as `undefined`.
+		expect(hasLapsed({ actionId: rival }, undefined)).to.equal(false);
+		expect(hasLapsed({ actionId: rival, rev: 2, pendingSince: 1 }, undefined)).to.equal(false);
 	});
 });

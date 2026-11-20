@@ -35,14 +35,29 @@ export interface PendingClaim {
 	 * the slot rule alone. See {@link isAbandonedClaim}.
 	 */
 	localRun?: string;
+	/**
+	 * When this node stored the record, by its own wall clock (`BlockMetadata.pendingSince`). The
+	 * record reserves its block only for a bounded span from this moment; past it the record has
+	 * lapsed — see {@link hasLapsed}. Absent only for a record written before the field existed,
+	 * which {@link hasLapsed} judges from the run's start instead.
+	 */
+	pendingSince?: number;
 }
 
 /**
  * What storage keeps for one pending record beside the record itself — a {@link PendingClaim} less
  * the action id the metadata maps are keyed by. The shape `IBlockStorage.savePendingTransaction`
  * takes and `BlockStorage.recordClaim` writes.
+ *
+ * `pendingSince` is REQUIRED here, unlike `rev`, `baseRev` and `localRun`, which are all absent for
+ * legitimate records. There is exactly one production caller of `savePendingTransaction`
+ * (`StorageRepo.pendUnderLatches`), so requiring it costs nothing and makes "a save path forgot to
+ * stamp it" a compile error. That matters because {@link hasLapsed}'s fallback for an unstamped
+ * record is in the LAPSING direction — the opposite of how `localRun`'s positive mark is read — so a
+ * forgotten stamp would quietly stop a live record reserving its block one lease after the run
+ * started, rather than quietly leaving it reserving.
  */
-export type PendingClaimFields = Omit<PendingClaim, 'actionId'>;
+export type PendingClaimFields = Omit<PendingClaim, 'actionId' | 'pendingSince'> & { pendingSince: number };
 
 /**
  * Whether a pending record is ABANDONED: its writer was a transactor in a process of this node that no
@@ -66,6 +81,108 @@ export type PendingClaimFields = Omit<PendingClaim, 'actionId'>;
  */
 export function isAbandonedClaim(claim: PendingClaim, currentRun: string | undefined): boolean {
 	return claim.localRun !== undefined && currentRun !== undefined && claim.localRun !== currentRun;
+}
+
+/**
+ * What a reader must know to judge whether a pending record has lapsed — see {@link hasLapsed}.
+ * Handed out by the repo that stored the records (`StorageRepo.pendLease`), because every value in
+ * it is that node's own: its configured lease, its own run's start, and its own clock.
+ */
+export interface ReservationLease {
+	/** How long a record reserves its block, in milliseconds from the moment this node stored it. */
+	leaseMs: number;
+	/** When this run of the node started — the anchor for a record that carries no `pendingSince`. */
+	runStartedAt: number;
+	/** This node's wall-clock reading, in the same frame as {@link PendingClaim.pendingSince}. */
+	now(): number;
+}
+
+/**
+ * Whether a pending record has LAPSED: it has stood for far longer than any honest pend-to-commit
+ * span, so it no longer reserves its block against another writer. It is NOT deleted, and its own
+ * commit is still honoured — both halves of that sentence are load-bearing.
+ *
+ * **Why an age bound is the rule here.** Every locally-decidable signal is already in and does not
+ * reach this population: the block-passed-the-slot test (`BlockStorage.sweepDeadClaims`), the
+ * request-passed-the-slot test ({@link isReservationAgainst}), and the provably-dead-writer test
+ * ({@link isAbandonedClaim}). What is left by construction is a record whose slot the collection has
+ * not moved past, carrying no in-process mark — a coordinated write's record, a remote writer's
+ * record pended through this node, a record whose owed cancel a restart forgot, or a record written
+ * by a build that kept no claim at all. No comparison of revisions can retire any of them, and the
+ * alternative (a cancel driven by a writer-liveness protocol) needs a writer identity that survives
+ * the writer's own restart and a reachable writer, which the deployments that reported this — phones
+ * behind circuit relays — cannot promise. So: an age bound.
+ *
+ * **Why lapsing is safe where deleting is not.** Deleting a record whose write is still in flight
+ * makes that write's commit fail with a missing-pend error, which the cluster layer reads as this
+ * node having diverged and repairs by copying the whole block from a peer — more expensive than the
+ * leak. Lapsing destroys nothing, so a lease that fires too early costs only the RESERVATION: another
+ * writer is admitted, and one of the two writes is then refused as stale and retried, the ordinary
+ * lost-race path every client already handles (the case analysis is in docs/correctness.md, Theorem 1
+ * Case 2). That asymmetry is what makes a merely generous bound good enough here, where a
+ * deletion-based bound would have to be provably safe.
+ *
+ * Three branches, and no fourth:
+ *
+ *  - No `lease` → nothing has lapsed. A reader that cannot say the time judges nothing, exactly as a
+ *    claims reader with no `currentRun` judges nothing abandoned.
+ *  - `claim.pendingSince` present → lapsed once more than `leaseMs` has passed since it. Strictly
+ *    greater, so a record stored exactly `leaseMs` ago still reserves.
+ *  - `claim.pendingSince` absent → judged from `lease.runStartedAt` on the same terms. A record
+ *    written before the field existed gets exactly one lease of grace from the earliest moment this
+ *    run could have known of it. This is the one case where the fallback is in the lapsing direction
+ *    on purpose: such a record usually carries no `rev` either, which both the other rules treat as
+ *    the strongest possible claim and neither can ever retire, so the alternative is the permanent
+ *    wedge this rule exists to remove.
+ *
+ * Separate from {@link isAbandonedClaim} and {@link isReservationAgainst} on purpose, and asked in
+ * that order at both rival scans (`StorageRepo.pendUnderLatches` at apply,
+ * `ClusterMember.reservingRivals` at the promise vote): abandonment is a fact about the WRITER,
+ * lapsing a fact about the AGE, the slot rule a fact about the SLOT. Abandonment first, so a record
+ * that is both is deleted rather than merely set aside.
+ *
+ * Read only where a record is asked to RESERVE. The commit-side readers — `StorageRepo.internalCommit`,
+ * the read-driven promotion in `StorageRepo.get`, `ClusterMember.validateCommitBaseDeclarations` —
+ * never ask, which is what keeps a lapse from costing the write: a lapsed record's own commit still
+ * promotes it normally. The vote and the apply on one node read the same stored `pendingSince`
+ * against the same clock, and time only moves forward, so the apply can only ever be MORE permissive
+ * than the vote that preceded it — the existing invariant that the apply never refuses what the vote
+ * approved still holds.
+ *
+ * Members need not agree on the verdict and briefly will not. Nothing is destroyed, so no member
+ * removes state another relies on; each anchors the verdict to its OWN receipt of the same record,
+ * so they reach it within the pend's propagation spread (milliseconds), not within clock skew; and
+ * while they differ, a member that has not yet lapsed the record votes `held`, which a cohort of
+ * four or more absorbs ({@link cohortCanMissAPend}) and which a smaller cohort resolves on the
+ * writer's next retry.
+ *
+ * A node whose wall clock steps BACKWARDS delays every lapse, which is safe. One that steps FORWARDS
+ * lapses early, which costs a lost race. Neither needs a mechanism.
+ *
+ * What this does NOT bound: a writer that keeps RE-PENDING the same action. A re-pend overwrites the
+ * claim and so restarts its lease, which is correct — the writer is demonstrably alive — but means a
+ * hostile or looping writer can hold a block indefinitely. That is true today without the lease and
+ * belongs to the dispute subsystem, not here.
+ */
+export function hasLapsed(claim: PendingClaim, lease: ReservationLease | undefined): boolean {
+	if (lease === undefined) {
+		return false;
+	}
+	// NOTE: a lapsed record's bytes are never deleted by this rule, so a block that is never written
+	// again keeps them until something else resolves the slot (a commit, a cancel, the dead-claim
+	// sweep). The accepted cost of never destroying state on a presumption; if leaked pending records
+	// ever show up as a storage cost, the cure is a sweep that can enumerate the blocks holding them,
+	// which raw storage cannot do today.
+	// NOTE: the fallback below lapses an unstamped record, which is the OPPOSITE direction from how
+	// `localRun`'s positive mark is read — deliberately. Such a record was written before the field
+	// existed and usually carries no `rev` either, which the other two rules treat as the strongest
+	// possible claim and neither can retire, so reading "no stamp" as "never lapses" would keep
+	// exactly the permanent wedge this rule exists to remove. It is a one-time upgrade population.
+	// NOTE: a node that restarts more often than its lease re-anchors that grace on every run, so an
+	// unstamped record never lapses there. Same one-time population, on a node that never stays up for
+	// one lease; no mechanism.
+	const since = claim.pendingSince ?? lease.runStartedAt;
+	return lease.now() - since > lease.leaseMs;
 }
 
 /**
@@ -143,14 +260,15 @@ export interface ReservationRequest {
  * whose log-tail pend did not, and whose cancel never arrived — used to be superseded as soon as the
  * collection moved past its slot, and under the base arm holds every newcomer instead.
  *
- * NOTE: from four members up, residual (2) wedges the block when the stray record stands on enough
+ * NOTE: from four members up, residual (2) holds the block while the stray record stands on enough
  * members to deny a super-majority (a writer that crashed after its data-block pend, before any
  * cancel); a stray record on one member alone is outvoted, and that member's own apply (revision
  * rule) then admits the newcomer, whose commit sweeps the record. Locally the member cannot tell the
  * crashed writer's record from the missed-pend shape: both are a record claiming a slot past the
- * block's latest, met by a newcomer whose base is that latest. Backlog
- * `debt-unpromotable-pending-records-need-a-sweep` owns abandoned records, and both stuck-reservation
- * lines name the block; if it shows up in the field, the cure is that sweep, not a looser rule here.
+ * block's latest, met by a newcomer whose base is that latest. The cure arrived as the LEASE
+ * ({@link hasLapsed}): a record that has stood past its lease stops reserving at both rival scans,
+ * so the hold is bounded by the lease rather than permanent, and the rule here stays as strict as
+ * safety wants it. Both stuck-reservation lines still name such a block while the lease runs.
  */
 export function isReservationAgainst(claim: PendingClaim, request: ReservationRequest): boolean {
 	if (claim.rev === undefined || request.rev === undefined) {
