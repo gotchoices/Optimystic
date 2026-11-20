@@ -153,6 +153,8 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
 	private readonly durabilityListeners = new Set<(event: BlobDurabilityEvent) => void>();
 	private readonly fetchDoor: BlobFetchStore;
+	/** Reads and fetches in flight, by reference; an entry exists only while its count is above zero. */
+	private readonly uses = new Map<BlobRef, number>();
 
 	constructor(init: LocalBlobServiceInit) {
 		this.pieces = init.pieces;
@@ -162,7 +164,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		this.sweepDelayMs = init.sweepDelayMs ?? DEFAULT_SWEEP_DELAY_MS;
 		this.now = init.now ?? Date.now;
 		this.setTimer = init.setTimer ?? armUnrefTimer;
-		this.sweeper = new PieceSweeper({ pieces: this.pieces, records: this.records, gate: this.gate, inProgress: this.inProgress, digest: this.digest });
+		this.sweeper = new PieceSweeper({ pieces: this.pieces, records: this.records, gate: this.gate, inProgress: this.inProgress, digest: this.digest, inUseRefs: () => this.inUseRefs() });
 		this.fetchDoor = {
 			source: this.source,
 			digest: this.digest,
@@ -193,6 +195,46 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 	/** Runs a sweep now, or joins the one running. */
 	sweep(): Promise<BlobSweepResult> {
 		return this.sweeper.run();
+	}
+
+	/**
+	 * Whether a read or a fetch of `ref` is running on this node (docs/blobs.md §Holds). A caller that
+	 * is about to take a blob's last hold away asks this first; the sweep asks `inUseRefs`.
+	 */
+	inUse(ref: BlobRef): boolean {
+		return this.uses.has(ref);
+	}
+
+	/** Every ref with a use in flight, in no promised order. */
+	inUseRefs(): BlobRef[] {
+		return [...this.uses.keys()];
+	}
+
+	// NOTE: a use ends only when its holder releases it, so an iterator abandoned without `return` —
+	// neither drained by `for await` nor closed by hand — keeps its blob out of every sweep for the
+	// life of the process. Harmless while consumers use `for await` or call `return`; if a node is ever
+	// seen keeping blobs nothing is reading, put a time limit on a use.
+	/**
+	 * Counts a use of `ref` until the returned function is called; a second call does nothing, so a
+	 * `finally` reached twice (a generator that throws while returning) cannot take another reader's
+	 * protection away. Synchronous and gate-free, so it can be the first statement of a generator
+	 * body, before any `await`.
+	 */
+	beginUse(ref: BlobRef): () => void {
+		this.uses.set(ref, (this.uses.get(ref) ?? 0) + 1);
+		let released = false;
+		return () => {
+			if (released) {
+				return;
+			}
+			released = true;
+			const count = this.uses.get(ref) ?? 0;
+			if (count <= 1) {
+				this.uses.delete(ref);
+			} else {
+				this.uses.set(ref, count - 1);
+			}
+		};
 	}
 
 	/**
@@ -269,6 +311,20 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 	 * to not whole, as `read`'s does.
 	 */
 	async *readThrough(ref: BlobRef, options: BlobReadOptions, missing: MissingPiece): AsyncIterable<Uint8Array> {
+		// The first statement of the body, before any `await`, so every read that has started reaching
+		// for bytes is counted; the body does not run at all until the first `next()`, so a read created
+		// and never iterated counts nothing. `finally` runs on completion, on a throw, and when a
+		// `for await` consumer breaks out (which calls this generator's `return`).
+		const endUse = this.beginUse(ref);
+		try {
+			yield* this.readChunks(ref, options, missing);
+		} finally {
+			endUse();
+		}
+	}
+
+	/** The read itself, split out so the use `readThrough` counts is visibly the first thing its body does. */
+	private async *readChunks(ref: BlobRef, options: BlobReadOptions, missing: MissingPiece): AsyncIterable<Uint8Array> {
 		const { signal } = options;
 		signal?.throwIfAborted();
 		void this.touchLastRead(ref);
@@ -288,8 +344,15 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 
 	/** Resolves when the blob is whole here; this service asks nobody, so otherwise it rejects with `cohort-unreachable`. `NodeBlobService.fetch` fetches. */
 	async fetch(ref: BlobRef, _options: BlobFetchOptions = {}): Promise<void> {
-		if ((await this.stat(ref)).locality !== 'here') {
-			throw new BlobUnavailableError(ref, 'cohort-unreachable');
+		// A use even though this only stats: every public read and fetch holds one, and a path exempt by
+		// accident is the hole this mechanism exists to close.
+		const endUse = this.beginUse(ref);
+		try {
+			if ((await this.stat(ref)).locality !== 'here') {
+				throw new BlobUnavailableError(ref, 'cohort-unreachable');
+			}
+		} finally {
+			endUse();
 		}
 	}
 
@@ -427,9 +490,9 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		return subscribe(this.durabilityListeners, listener);
 	}
 
-	// NOTE: eviction of cached blobs (`feat-unreferenced-blobs-are-reclaimed`) must skip a blob with a
-	// fetch session in flight: a fetch stores pieces only under this hold, and a record deleted under
-	// it would leave the fetch's later pieces unprotected from the next sweep.
+	// NOTE: a blob whose `cached` hold goes while something is still reading or fetching it is protected
+	// by the uses `readThrough`, `fetch` and every `NodeBlobService` fetch session hold, which the sweep
+	// takes as roots (`inUseRefs`); an evicting caller skips such a blob by asking `inUse`.
 	private async holdCached(ref: BlobRef): Promise<void> {
 		const at = this.now();
 		await this.changeRecord(ref, current => recordAfterCachedHold(current, ref, at));

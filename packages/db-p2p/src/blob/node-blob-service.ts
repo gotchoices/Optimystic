@@ -145,12 +145,19 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 	 * Rejects as the fetch's `done` does.
 	 */
 	async fetch(ref: BlobRef, options: BlobFetchOptions = {}): Promise<void> {
-		// Before the local stat, so a caller that cancelled still sees its own reason rather than a resolve.
-		options.signal?.throwIfAborted();
-		if ((await this.local.stat(ref)).locality === 'here') {
-			return;
+		// A use from before the first piece, rather than from the session's start, so a blob being
+		// brought here is never swept out from under the fetch (docs/blobs.md §Holds).
+		const endUse = this.local.beginUse(ref);
+		try {
+			// Before the local stat, so a caller that cancelled still sees its own reason rather than a resolve.
+			options.signal?.throwIfAborted();
+			if ((await this.local.stat(ref)).locality === 'here') {
+				return;
+			}
+			await this.startSession(ref, { priority: 'foreground', waitMs: options.waitMs, signal: options.signal }).done;
+		} finally {
+			endUse();
 		}
-		await this.startSession(ref, { priority: 'foreground', waitMs: options.waitMs, signal: options.signal }).done;
 	}
 
 	pin(ref: BlobRef, owner: string): Promise<void> {
@@ -272,7 +279,13 @@ export class NodeBlobService implements BlobService, BlobPinIndex {
 		const session = this.fetcher.start(ref, request);
 		const count = this.progress.get(ref) ?? this.newCount(ref);
 		count.sessions++;
-		const settled = (): void => this.sessionSettled(ref, count);
+		// The session's own use covers its tail: a read that consumed its whole range returns, releasing
+		// its use, while the session is still walking to confirm and marking the record whole.
+		const endUse = this.local.beginUse(ref);
+		const settled = (): void => {
+			endUse();
+			this.sessionSettled(ref, count);
+		};
 		void session.done.then(
 			() => {
 				settled();

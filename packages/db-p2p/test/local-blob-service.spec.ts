@@ -283,6 +283,31 @@ describe('LocalBlobService', () => {
 		expect(await pieces.has(orphan)).to.equal(true);
 	});
 
+	it('a sweep keeps the pieces of a blob being read after its last hold went', async () => {
+		const pieces = new MemoryPieceStore();
+		const kv = new MemoryKVStore();
+		const service = serviceOver(pieces, kv);
+		// Two data pieces and a list root, so the read is suspended between chunks while the sweep runs.
+		const content = bytesOf(300 * 1024, 17);
+		const { ref } = await service.put(streamOf(content));
+		await service.unpin(ref, DEFAULT_BLOB_OWNER);
+		expect(await recordOf(kv, ref), 'the last hold took the record with it').to.equal(undefined);
+
+		const read = service.read(ref, { from: 'here' })[Symbol.asyncIterator]();
+		const first = await read.next();
+
+		// No record names the blob, so the records pass never reaches it: only the read's use keeps it.
+		expect(await service.sweep()).to.deep.include({ kind: 'swept', deleted: 0, kept: 3 });
+		const chunks: Uint8Array[] = [first.value];
+		for (let next = await read.next(); next.done !== true; next = await read.next()) {
+			chunks.push(next.value);
+		}
+		expect(concat(chunks)).to.deep.equal(content);
+
+		expect(await service.sweep()).to.deep.include({ kind: 'swept', deleted: 3 });
+		expect(await listed(pieces)).to.deep.equal([]);
+	});
+
 	it('a change refused for a string that is not a reference leaves a running sweep unharmed', async () => {
 		const releaseList = gate();
 		const kv = new HeldListKVStore(new MemoryKVStore(), releaseList.promise);

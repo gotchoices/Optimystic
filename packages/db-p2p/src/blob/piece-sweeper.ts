@@ -59,11 +59,14 @@ export interface PieceSweeperDeps {
 	readonly gate: SweepGate;
 	readonly inProgress: InProgressPieces;
 	readonly digest: BlobDigest;
+	/** Refs a read or fetch is running on (`LocalBlobService.inUseRefs`); their present pieces are kept
+	 *  whether or not they have a record. */
+	readonly inUseRefs: () => Iterable<BlobRef>;
 }
 
 /**
  * Deletes every stored piece in no held blob's tree (docs/blobs.md §Holds), closed against the
- * four things that can make a piece live while it decides:
+ * five things that can make a piece live while it decides:
  *
  * - a put that has stored pieces but not yet written its record: its ids are in `inProgress` when
  *   the deletes are decided, because an id is added before its piece is stored and released only
@@ -81,7 +84,11 @@ export interface PieceSweeperDeps {
  *   as its `put`, so the decide step, which runs after every shared holder has finished, walks the
  *   blob again with the parent present and keeps the child. A parent stored after the decide step
  *   finds the child deleted, and the fetch's next plan asks for it. A fetch's ids need no
- *   `inProgress`: its record exists before its first piece.
+ *   `inProgress`: its record exists before its first piece;
+ * - a read or fetch in flight on a blob whose last hold has gone, so it has no record and the
+ *   records pass never reaches it: `inUseRefs` names it, and the decide step walks it with no record
+ *   required. The window a read beginning during the delete phase leaves open is the pre-existing
+ *   exposure of reading an unheld blob (`NodeBlobService.storedPiece`).
  */
 export class PieceSweeper {
 	private readonly pieces: IPieceStore;
@@ -89,6 +96,7 @@ export class PieceSweeper {
 	private readonly gate: SweepGate;
 	private readonly inProgress: InProgressPieces;
 	private readonly digest: BlobDigest;
+	private readonly inUseRefs: () => Iterable<BlobRef>;
 	private readonly source: PieceSource;
 	/** The refs whose records changed since the running sweep started; absent while none runs. */
 	private changed: Set<BlobRef> | undefined;
@@ -100,6 +108,7 @@ export class PieceSweeper {
 		this.gate = deps.gate;
 		this.inProgress = deps.inProgress;
 		this.digest = deps.digest;
+		this.inUseRefs = deps.inUseRefs;
 		this.source = localPieceSource(deps.pieces);
 	}
 
@@ -152,9 +161,12 @@ export class PieceSweeper {
 	}
 
 	// NOTE: puts and record changes wait while this runs, bounded by the re-walks of records changed
-	// during the sweep and by the deletes, not by the walk of every held blob.
+	// during the sweep, the walks of the refs in use, and the deletes — not by the walk of every held
+	// blob.
 	private async decideAndDelete(candidates: readonly PieceId[], live: Set<PieceId>): Promise<SweptResult | SweepAbort> {
-		const unreadable = await this.walkHeld(this.changed ?? [], live);
+		// Inside the exclusive gate because this is the latest point at which the sweep can read
+		// anything, so every use taken before the deletes begin is seen.
+		const unreadable = await this.walkHeld(this.changed ?? [], live) ?? await this.walkInUse(live);
 		if (unreadable !== undefined) {
 			return unreadable;
 		}
@@ -167,6 +179,22 @@ export class PieceSweeper {
 	private async walkHeld(refs: Iterable<BlobRef>, live: Set<PieceId>): Promise<SweepAbort | undefined> {
 		for (const ref of refs) {
 			const abort = await this.walkRecord(ref, live);
+			if (abort !== undefined) {
+				return abort;
+			}
+		}
+		return undefined;
+	}
+
+	/**
+	 * Keeps every present piece of the trees something is reading or fetching, record or no record:
+	 * these are the refs `walkRecord` would return at once for, which is exactly the blob whose last
+	 * hold has just gone while a read of it runs. A ref that also has a record is walked twice, which
+	 * adds and removes nothing and costs one tree walk of a blob somebody is reading right now.
+	 */
+	private async walkInUse(live: Set<PieceId>): Promise<SweepAbort | undefined> {
+		for (const ref of this.inUseRefs()) {
+			const abort = await this.walkTree(ref, live);
 			if (abort !== undefined) {
 				return abort;
 			}
@@ -192,6 +220,11 @@ export class PieceSweeper {
 			}
 			throw error;
 		}
+		return this.walkTree(ref, live);
+	}
+
+	/** Adds every present piece of `ref`'s tree to `live`; an abort when the tree cannot be read. */
+	private async walkTree(ref: BlobRef, live: Set<PieceId>): Promise<SweepAbort | undefined> {
 		try {
 			for await (const entry of walkBlobPieces(ref, this.source, { digest: this.digest })) {
 				if (entry.present) {
