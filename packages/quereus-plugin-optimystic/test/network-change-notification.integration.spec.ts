@@ -38,6 +38,7 @@ import {
 } from '@optimystic/db-p2p';
 import register from '../dist/plugin.js';
 import type { ParsedOptimysticTreeOptions } from '../dist/index.js';
+import { pickLocalTcpMultiaddr } from './libp2p-addrs.js';
 
 const NETWORK_NAME = 'network-change-notification-it';
 const MACHINES = 3;
@@ -59,14 +60,6 @@ interface Machine {
 }
 
 const inertNotifier: IBlockChangeNotifier = { onCollectionChange: () => () => { } };
-
-function pickLocalTcpMultiaddr(node: OptimysticNode): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/'))
-		?? addrs.find(a => a.includes('/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No usable TCP multiaddr; have: ${addrs.join(', ')}`);
-	return local;
-}
 
 /** The options the plugin resolves for a table on this network, which name its cached transactor. */
 function networkOptions(collectionUri: string): ParsedOptimysticTreeOptions {

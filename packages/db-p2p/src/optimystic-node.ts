@@ -79,8 +79,9 @@ export interface OptimysticNodeAttachmentsBase {
 	 * The node's blob service (docs/blobs.md §The node's blob service), over `NodeOptions.pieceStorage`
 	 * and the blob records in `NodeOptions.kvStore`. On a client too: the machine a blob is put on holds
 	 * its only copy until a row referencing it commits. A read fetches the pieces this node lacks from
-	 * the machines that hold them, `fetch` brings a whole blob here, and `stat` with `probe` asks the
-	 * blob's cohort; announcing and copying are later work, behind the same interface.
+	 * the machines that hold them, `fetch` brings a whole blob here, `stat` with `probe` asks the blob's
+	 * cohort, and `announce` hands the blob to the node's copy drain, which copies it to the cohort and
+	 * reports its durability.
 	 */
 	blobs: NodeBlobService;
 }

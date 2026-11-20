@@ -44,9 +44,10 @@ import {
 	type BlobDurabilityEvent,
 	type BlobRef,
 } from '@optimystic/db-core';
-import { waitFor } from '@optimystic/db-core/test';
+import { waitFor, waitForValue } from '@optimystic/db-core/test';
 import { buildBlobProtocol, createLibp2pNode, type OptimysticNode } from '@optimystic/db-p2p';
 import register from '../dist/plugin.js';
+import { pickLocalTcpMultiaddr } from './libp2p-addrs.js';
 import { queryAll } from './query-helpers.js';
 
 const NETWORK_NAME = 'two-node-blob-it';
@@ -57,8 +58,22 @@ const MESSAGE_URI = 'tree://two-node-blob/Message';
 
 /** Three data pieces under one list piece, so the copy is a real multi-piece pull. */
 const BLOB_BYTES = 2 * BLOB_PIECE_BYTES + 1024;
-/** How long the copy may take: two real nodes, the drain's own debounce, and a multi-piece transfer. */
-const DURABILITY_BOUND_MS = 120_000;
+
+/**
+ * Every bounded wait the run makes, in the order it reaches them. The suite's timeout is their sum plus
+ * room for the two node boots, so the slowest machine still fails on the WAIT's own message — "stalled
+ * at `local`", "each node to know the other serves the blob protocol" — rather than on a bare mocha
+ * timeout, which says only that some number of seconds passed.
+ */
+const BOUNDS_MS = {
+	mesh: 30_000,
+	cohort: 40_000,
+	blobProtocol: 40_000,
+	blobCohort: 40_000,
+	/** The copy itself: two real nodes, the drain's own debounce, and a multi-piece transfer. */
+	durability: 120_000,
+};
+const SUITE_TIMEOUT_MS = Object.values(BOUNDS_MS).reduce((total, bound) => total + bound, 0) + 60_000;
 
 const CREATE_ATTACHMENT = `create table Attachment (Id text primary key, Content blobref null) using optimystic('${ATTACHMENT_URI}')`;
 const CREATE_MESSAGE = `create table Message (Id text primary key, Body text, AttachmentId text) using optimystic('${MESSAGE_URI}')`;
@@ -69,14 +84,6 @@ interface Machine {
 	readonly node: OptimysticNode;
 	readonly db: Database;
 	readonly plugin: Plugin;
-}
-
-function pickLocalTcpMultiaddr(node: OptimysticNode): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/'))
-		?? addrs.find(a => a.includes('/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No usable TCP multiaddr; have: ${addrs.join(', ')}`);
-	return local;
 }
 
 /** Bytes from a seeded xorshift, so no two of the blob's data pieces are equal and share one piece id. */
@@ -102,7 +109,7 @@ async function* streamOf(content: Uint8Array): AsyncIterable<Uint8Array> {
 }
 
 /** The durability reported for `ref`, in the order the events arrived. */
-function classesFor(events: readonly BlobDurabilityEvent[], ref: BlobRef): BlobDurability[] {
+function durabilitiesFor(events: readonly BlobDurabilityEvent[], ref: BlobRef): BlobDurability[] {
 	return events.filter(event => event.ref === ref).map(event => event.durability);
 }
 
@@ -120,27 +127,22 @@ async function waitForCohortDurability(
 	ref: BlobRef,
 	timeoutMs: number,
 ): Promise<BlobDurability> {
-	const beyondLocal = (): BlobDurability | undefined =>
-		classesFor(events, ref).find(({ quorum }) => quorum === 'majority' || quorum === 'full');
 	try {
-		await waitFor(() => beyondLocal() !== undefined, {
-			timeoutMs,
-			intervalMs: 250,
-			description: "the blob's durability to reach majority or full",
-		});
+		return await waitForValue(
+			() => durabilitiesFor(events, ref).find(({ quorum }) => quorum === 'majority' || quorum === 'full'),
+			{ timeoutMs, intervalMs: 250, description: "the blob's durability to reach majority or full" },
+		);
 	} catch {
-		const seen = classesFor(events, ref);
+		const seen = durabilitiesFor(events, ref);
 		const last = seen[seen.length - 1];
 		throw new Error(last === undefined
 			? `No durability was reported for ${ref} within ${timeoutMs}ms, so nothing announced it`
 			: `The blob's durability stalled at '${last.quorum}' (${last.confirmed} of ${last.accepting} accepting cohort members hold it) for ${timeoutMs}ms`);
 	}
-	return beyondLocal()!;
 }
 
 describe('a blob reaches the cohort before the row that shows it, over real libp2p', function () {
-	// Two real libp2p boots, cohort convergence, the drain's own debounce and a multi-piece transfer.
-	this.timeout(240_000);
+	this.timeout(SUITE_TIMEOUT_MS);
 
 	before(function () {
 		if (!process.env.OPTIMYSTIC_INTEGRATION) this.skip();
@@ -155,10 +157,12 @@ describe('a blob reaches the cohort before the row that shows it, over real libp
 	const clusterPolicy = { allowDownsize: true, sizeTolerance: 0.5, assumedClusterSize: 2 };
 
 	afterEach(async () => {
-		for (const { db, plugin } of machines.splice(0, machines.length)) {
+		// Settled rather than sequential: one handle that refuses to close must not leave two real libp2p
+		// nodes listening for the rest of the run.
+		await Promise.allSettled(machines.splice(0, machines.length).map(async ({ db, plugin }) => {
 			await db.close();
 			await plugin.dispose();
-		}
+		}));
 		await Promise.allSettled(nodes.splice(0, nodes.length).map(node => node.stop()));
 	});
 
@@ -188,14 +192,14 @@ describe('a blob reaches the cohort before the row that shows it, over real libp
 			}
 		}
 		await waitFor(() => mesh.every(node => node.getPeers().length >= 1),
-			{ timeoutMs: 30_000, intervalMs: 250, description: 'the 2-node mesh to connect' });
+			{ timeoutMs: BOUNDS_MS.mesh, intervalMs: 250, description: 'the 2-node mesh to connect' });
 		await waitFor(async () => {
 			for (const node of mesh) {
 				const ids = Object.keys(await node.keyNetwork.findCluster(routingKeyForBlock('two-node-blob-probe')));
 				if (ids.length !== 2) return false;
 			}
 			return true;
-		}, { timeoutMs: 40_000, intervalMs: 500, description: 'both nodes to assemble the same 2-peer cohort' });
+		}, { timeoutMs: BOUNDS_MS.cohort, intervalMs: 500, description: 'both nodes to assemble the same 2-peer cohort' });
 		// A member whose protocol list has not landed yet reads as REFUSING blobs, which leaves it out of
 		// the denominator durability is counted over — and a denominator of this node alone is `local`
 		// whatever happens (`blobAcceptanceOf` in packages/db-p2p/src/blob/accepts-blobs.ts, and backlog
@@ -206,11 +210,19 @@ describe('a blob reaches the cohort before the row that shows it, over real libp
 				if ((await node.keyNetwork.peersServing(BLOB_PROTOCOL, [other.peerId.toString()])).length !== 1) return false;
 			}
 			return true;
-		}, { timeoutMs: 40_000, intervalMs: 250, description: 'each node to know the other serves the blob protocol' });
+		}, { timeoutMs: BOUNDS_MS.blobProtocol, intervalMs: 250, description: 'each node to know the other serves the blob protocol' });
 		return [a, b];
 	}
 
-	/** A `Database` whose plugin runs over `node`, as a host that builds its own node wires one. */
+	/**
+	 * A `Database` whose plugin runs over `node`, as a host that builds its own node wires one.
+	 *
+	 * NOTE: this `Machine` / `machineOver` / teardown trio is the same as
+	 * `network-change-notification.integration.spec.ts`'s, parameterized differently (cluster size,
+	 * cohort topic, an inert change notifier there). Two copies stay cheap to keep in step; if a third
+	 * real-libp2p spec in this package wants them, extract them into one harness the way
+	 * `mesh-node-harness.ts` was extracted once the mock mesh had four copies.
+	 */
 	function machineOver(node: OptimysticNode): Machine {
 		const db = new Database();
 		const plugin = register(db, { default_network_name: NETWORK_NAME, default_key_network: 'libp2p', enable_cache: false });
@@ -240,13 +252,18 @@ describe('a blob reaches the cohort before the row that shows it, over real libp
 
 		const content = deterministicBytes(BLOB_BYTES, 1);
 		const { ref } = await writer.plugin.blobs.put(streamOf(content));
+		// A's NODE holds what A's PLUGIN put, which is the wiring everything below rests on: a plugin that
+		// fell through to a single-machine blob service (see `machineOver`) would have put the bytes in a
+		// store with no cohort behind it, and the durability wait would be the first to notice — two
+		// minutes later, and reporting a stall rather than the misconfiguration that caused it.
+		expect((await a.blobs.stat(ref)).locality, "A's node holds the blob its own plugin put").to.equal('here');
 		expect((await b.blobs.stat(ref)).locality, 'B holds nothing of a blob only A has put').to.equal('unknown');
 
 		// The routing key is the digest in the reference, so which machines are responsible for THIS blob
 		// is not the test's to choose. Asserted up front, because the durability wait below would
 		// otherwise be the thing that failed, with nothing to say about why.
 		await waitFor(async () => Object.keys(await a.keyNetwork.findCluster(routingKeyForBlob(ref))).length === 2,
-			{ timeoutMs: 40_000, intervalMs: 250, description: "A to see both machines in the blob's cohort" });
+			{ timeoutMs: BOUNDS_MS.blobCohort, intervalMs: 250, description: "A to see both machines in the blob's cohort" });
 
 		// Subscribed before the first commit — and after the put, which is what resolved the backend these
 		// events come off: a subscription made before anything else touched the network starts that
@@ -260,10 +277,10 @@ describe('a blob reaches the cohort before the row that shows it, over real libp
 
 			// Not awaited: the announce and its first durability report happen inside the COMMIT, so by the
 			// time `exec` resolves the first class is already reported (docs/blobs.md §Committing a reference).
-			expect(classesFor(events, ref), 'the commit announced the blob before it returned')
+			expect(durabilitiesFor(events, ref), 'the commit announced the blob before it returned')
 				.to.have.length.of.at.least(1);
 
-			const reached = await waitForCohortDurability(events, ref, DURABILITY_BOUND_MS);
+			const reached = await waitForCohortDurability(events, ref, BOUNDS_MS.durability);
 			expect(reached.confirmed, 'both accepting members of the cohort hold the blob').to.equal(2);
 
 			// The claim the two-commit pattern rests on, asserted BEFORE the second commit: the bytes are on

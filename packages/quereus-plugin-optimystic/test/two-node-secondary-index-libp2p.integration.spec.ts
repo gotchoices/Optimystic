@@ -32,6 +32,7 @@ import {
 	type PeerId as DbPeerId,
 } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { pickLocalTcpMultiaddr } from './libp2p-addrs.js';
 
 const NETWORK_NAME = 'two-node-index-it';
 const TABLE_URI = 'tree://two-node-index/FormationUsage';
@@ -48,14 +49,6 @@ const createTableSql = `
 	) using optimystic('${TABLE_URI}')
 `;
 const createIndexSql = `create index formation_usage_by_token on FormationUsage(Token)`;
-
-function pickLocalTcpMultiaddr(node: Libp2p): string {
-	const addrs = node.getMultiaddrs().map(a => a.toString());
-	const local = addrs.find(a => a.startsWith('/ip4/127.0.0.1/tcp/'))
-		?? addrs.find(a => a.includes('/tcp/') && a.includes('/p2p/'));
-	if (!local) throw new Error(`No usable TCP multiaddr; have: ${addrs.join(', ')}`);
-	return local;
-}
 
 async function waitFor(predicate: () => boolean | Promise<boolean>, timeoutMs: number, what: string): Promise<void> {
 	const deadline = Date.now() + timeoutMs;

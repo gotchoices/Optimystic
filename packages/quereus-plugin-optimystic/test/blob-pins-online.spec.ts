@@ -16,10 +16,10 @@
  * which is exactly the observable this asserts against. Real blobs throughout (`plugin.blobs.put`
  * of a few bytes), never fabricated references, so `stat` and the `owed` hold mean something.
  *
- * Not here: the two-node proof that the bytes reach the cohort before the row that shows them
- * (`feat-a-blob-reaches-the-cohort-before-the-row-that-shows-it`), the queued-transaction and
- * restart arms (`feat-sql-columns-hold-blob-references`), and the partial-commit routing, which is
- * the commit routes' own mechanism rather than this one's.
+ * Not here: the two-node proof that the bytes reach the cohort before the row that shows them, which
+ * is `two-node-blob-reference.integration.spec.ts`; the queued-transaction and restart arms
+ * (`feat-sql-columns-hold-blob-references`); and the partial-commit routing, which is the commit
+ * routes' own mechanism rather than this one's.
  */
 
 import { expect } from 'chai';
