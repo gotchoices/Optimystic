@@ -142,6 +142,10 @@ const db = await openOptimysticWebDb(DEFAULT_DB_NAME, DEFAULT_DB_VERSION, {
 });
 ```
 
+Nothing awaits the handler — IndexedDB raises these as events, with no request
+left to defer — so a handler that throws or rejects is reported only on the
+`optimystic:db-p2p-storage-web:db` log channel.
+
 The package does not do this itself, because it does not own the stores on its
 handle: they are constructed afterwards by the host, which is also the owner of
 the close order above. A bare `db.close()` from inside `openOptimysticWebDb`

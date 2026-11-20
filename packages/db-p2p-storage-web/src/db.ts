@@ -102,9 +102,11 @@ export const DEFAULT_DB_VERSION = 5;
  * Every object store in the current schema, in the order the stores appear in
  * {@link OptimysticWebDB}. A version bump appends to this and raises {@link DEFAULT_DB_VERSION}.
  *
- * The `satisfies` clause is what keeps the list and the schema interface from drifting: a name not
- * in {@link OptimysticWebDB} is a type error. (`StoreNames` rather than `keyof`, which `DBSchema`'s
- * index signature would widen to `string | number`.)
+ * The list and the schema interface are kept from drifting in both directions: `satisfies` rejects
+ * a name {@link OptimysticWebDB} does not declare, and {@link UnlistedStore} below rejects a store
+ * it declares that this list omits — the direction a version bump actually gets wrong, and the one
+ * that would otherwise compile and simply never create the store. (`StoreNames` rather than
+ * `keyof`, which `DBSchema`'s index signature would widen to `string | number`.)
  *
  * NOTE: the upgrade loop only ever creates. A store dropped from the schema would linger in an
  * existing database with its rows, since nothing deletes it; revisit if a store is ever dropped —
@@ -115,11 +117,23 @@ export const OBJECT_STORES = [
 	'commitProofs', 'materialized', 'journal', 'kv', 'pieces',
 ] as const satisfies readonly StoreNames<OptimysticWebDB>[];
 
+/**
+ * Any store {@link OptimysticWebDB} declares that {@link OBJECT_STORES} omits — `never` once the
+ * list is complete. {@link EveryStoreListed} is the assertion: a leftover name does not satisfy the
+ * `extends never` constraint, and the compile error names the store that was forgotten.
+ */
+type UnlistedStore = Exclude<StoreNames<OptimysticWebDB>, (typeof OBJECT_STORES)[number]>;
+type EveryStoreListed<Unlisted extends never = UnlistedStore> = Unlisted;
+
 export type OptimysticWebDBHandle = IDBPDatabase<OptimysticWebDB>;
 
 /**
  * Callbacks for the connection-lifecycle events IndexedDB raises outside a normal open. Each is
  * also logged whether or not it is supplied; supplying one is how a host takes action.
+ *
+ * A callback may be `async` — the recommended `onBlockingUpgrade` handler is — but nothing awaits
+ * it: IndexedDB raises these as events, with no request left to defer. A rejection is logged, not
+ * reported anywhere a caller can see.
  *
  * None of these closes the handle. The handle's stores (`IndexedDBRawStorage`, `IndexedDBKVStore`)
  * buffer writes and hold armed timers, and this function does not own them — the host constructs
@@ -131,28 +145,34 @@ export interface OptimysticWebDbLifecycle {
 	 * An older connection on this origin is holding up this open, so it is waiting rather than
 	 * resolving. (`idb`'s `blocked`.) Diagnosis only: the other tab is the one that can yield.
 	 */
-	onUpgradeBlocked?(currentVersion: number, requestedVersion: number | null): void;
+	onUpgradeBlocked?(currentVersion: number, requestedVersion: number | null): void | Promise<void>;
 	/**
 	 * This connection is what is holding up another tab's open at a newer version. (`idb`'s
 	 * `blocking`.) The recommended handler flushes and closes, then prompts a reload — see the
 	 * package README.
 	 */
-	onBlockingUpgrade?(currentVersion: number, requestedVersion: number | null): void;
+	onBlockingUpgrade?(currentVersion: number, requestedVersion: number | null): void | Promise<void>;
 	/**
 	 * The browser closed this connection abnormally — eviction, or site data cleared. (`idb`'s
 	 * `terminated`; not called for `db.close()`.)
 	 */
-	onConnectionLost?(): void;
+	onConnectionLost?(): void | Promise<void>;
 }
 
 /**
- * Hands one lifecycle event to the host. Host callbacks run as DOM event listeners, where a throw
- * becomes an uncaught top-level error the open can never report, so the throw is logged against
- * the event it came from instead of escaping unattributed.
+ * Hands one lifecycle event to the host, if the host supplied a handler for it. Host callbacks run
+ * as DOM event listeners, where a throw becomes an uncaught top-level error the open can never
+ * report, so a failure is logged against the event it came from instead of escaping unattributed —
+ * a rejection too, since the recommended `onBlockingUpgrade` handler is `async` (see the README).
  */
-function notifyHost(event: string, call: () => void): void {
+function notifyHost<Args extends unknown[]>(
+	event: string,
+	handler: ((...args: Args) => void | Promise<void>) | undefined,
+	...args: Args
+): void {
+	if (!handler) return;
 	try {
-		call();
+		void Promise.resolve(handler(...args)).catch(error => log('%s handler rejected %o', event, error));
 	} catch (error) {
 		log('%s handler threw %o', event, error);
 	}
@@ -184,21 +204,15 @@ export async function openOptimysticWebDb(
 		},
 		blocked(currentVersion, blockedVersion) {
 			log('upgrade-blocked db=%s current=%d requested=%o', name, currentVersion, blockedVersion);
-			if (lifecycle.onUpgradeBlocked) {
-				notifyHost('upgrade-blocked', () => lifecycle.onUpgradeBlocked!(currentVersion, blockedVersion));
-			}
+			notifyHost('upgrade-blocked', lifecycle.onUpgradeBlocked, currentVersion, blockedVersion);
 		},
 		blocking(currentVersion, blockedVersion) {
 			log('blocking-upgrade db=%s current=%d requested=%o', name, currentVersion, blockedVersion);
-			if (lifecycle.onBlockingUpgrade) {
-				notifyHost('blocking-upgrade', () => lifecycle.onBlockingUpgrade!(currentVersion, blockedVersion));
-			}
+			notifyHost('blocking-upgrade', lifecycle.onBlockingUpgrade, currentVersion, blockedVersion);
 		},
 		terminated() {
 			log('connection-lost db=%s', name);
-			if (lifecycle.onConnectionLost) {
-				notifyHost('connection-lost', () => lifecycle.onConnectionLost!());
-			}
+			notifyHost('connection-lost', lifecycle.onConnectionLost);
 		},
 	});
 }

@@ -74,15 +74,16 @@ describe('openOptimysticWebDb', () => {
 	it('an open blocked by an older connection reports instead of waiting silently', async () => {
 		const name = freshDbName();
 		const old = await openOptimysticWebDb(name, 1);
-		const blocked: [number, number | null][] = [];
+		// Awaited rather than polled after a tick: the event is queued, not raised synchronously,
+		// and awaiting it is what makes the assertion independent of how many turns that takes. If
+		// it never fires the test fails on mocha's timeout, naming this line.
+		let reportBlocked!: (seen: [number, number | null]) => void;
+		const blocked = new Promise<[number, number | null]>(resolve => { reportBlocked = resolve; });
 		const opening = openOptimysticWebDb(name, 2, {
-			onUpgradeBlocked: (current, requested) => { blocked.push([current, requested]); },
+			onUpgradeBlocked: (current, requested) => { reportBlocked([current, requested]); },
 		});
 
-		// `fake-indexeddb` queues the `blocked` event as a database task rather than firing it
-		// synchronously, so one macrotask tick is needed before asserting.
-		await new Promise(resolve => setTimeout(resolve, 0));
-		expect(blocked).to.deep.equal([[1, 2]]);
+		expect(await blocked).to.deep.equal([1, 2]);
 
 		old.close();              // what the host's handler would do, after flushing
 		const db = await opening; // leave nothing pending
