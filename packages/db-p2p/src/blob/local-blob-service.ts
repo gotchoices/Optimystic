@@ -377,7 +377,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords {
 
 	/** This service has no cohort: announcing is `NodeBlobService.announce`'s, which drives the copy drain. */
 	async announce(_ref: BlobRef, _scope: BlobScope): Promise<void> {
-		throw new Error('announcing a blob to its cohort is not built yet (feat-a-referenced-blob-is-copied-to-its-cohort)');
+		throw new Error('announcing a blob to its cohort is not built yet (feat-blob-owed-copies-are-drained)');
 	}
 
 	/** Never fires: this service fetches nothing. `NodeBlobService.onProgress` reports the fetches it starts. */

@@ -37,7 +37,9 @@ export interface BlobDurability {
 	readonly quorum: DurabilityQuorum;
 	/** Accepting members known to hold the whole blob, this node included when it holds it. */
 	readonly confirmed: number;
-	/** Cohort members that accept blobs, this node included when it does. Zero exactly when quorum is 'unrouted'. */
+	/** Cohort members that accept blobs, this node included when it does. Zero when the cohort could not be
+	 *  named ('unrouted'), and also when it was named but no member accepts blobs — which stays 'local', since
+	 *  the writer holds the only copy there is. */
 	readonly accepting: number;
 	/** Accepting members not yet known to hold it, by peer-id string. Absent when the cohort could not be named. */
 	readonly unconfirmed?: readonly string[];

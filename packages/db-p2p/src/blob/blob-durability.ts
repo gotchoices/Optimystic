@@ -38,11 +38,13 @@ export interface BlobCohortView {
  * @param selfId this node's peer id, as it is spelt in `view.accepting` and `holders`.
  */
 export function classifyBlobDurability(view: BlobCohortView, holders: ReadonlySet<string>, selfId: string): BlobDurability {
+	// Before the counts: an unresolved view names nobody, so neither count can be anything but zero,
+	// and `confirmed` never reads as larger than `accepting`.
+	if (!view.resolved) {
+		return { quorum: 'unrouted', confirmed: 0, accepting: 0 };
+	}
 	const confirmed = view.accepting.filter(peerId => holders.has(peerId));
 	const unconfirmed = view.accepting.filter(peerId => !holders.has(peerId));
-	if (!view.resolved) {
-		return { quorum: 'unrouted', confirmed: confirmed.length, accepting: 0 };
-	}
 	const n = confirmed.length;
 	const k = view.accepting.length;
 	const counts = { confirmed: n, accepting: k, unconfirmed };

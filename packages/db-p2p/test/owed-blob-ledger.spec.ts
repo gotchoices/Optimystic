@@ -4,8 +4,8 @@
  * `OwedBlobLedger` is the durable half of "whose copy of this blob is still owed": the copy drain
  * reads it on every pass and must find what a restart left. These specs pin the ledger's own rules
  * over the in-memory key-value store — what a second entry for one ref keeps, what a confirmed
- * holder adds, the scan's order, the lazily loaded size index, and what a key holding nonsense reads
- * as. The drain's use of it lives in the drain's own spec.
+ * holder adds, the scan's order, the lazily loaded size index, and what a key holding nonsense — or a
+ * key that is not a reference at all — reads as. The drain's use of it lives in the drain's own spec.
  */
 
 import { expect } from 'chai';
@@ -113,6 +113,19 @@ describe('OwedBlobLedger', () => {
 		expect(await kv.get(key)).to.equal('not an entry');
 		await ledger.record(ref, SCOPE);
 		expect((await ledger.get(ref))?.scope).to.equal(SCOPE);
+	});
+
+	it('skips a key under the prefix that is not a reference, instead of failing every scan', async () => {
+		const ref = await refOf(12);
+		const kv = new MemoryKVStore();
+		await kv.set(`${OWED_BLOB_KEY_PREFIX}not-a-reference`, '{}');
+		const ledger = ledgerOver(kv);
+		await ledger.record(ref, SCOPE);
+		const captured = await captureLog('blob:store', async () => {
+			expect((await ledger.list()).map(entry => entry.ref)).to.deep.equal([ref]);
+			expect(await ledger.size()).to.equal(1);
+		});
+		expect(hasTag(captured, 'entry:bad-key')).to.equal(true);
 	});
 
 	it('serializes a record and a holder confirmation for one ref', async () => {

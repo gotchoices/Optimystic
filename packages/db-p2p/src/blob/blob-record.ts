@@ -47,6 +47,11 @@ export class BlobRecordFormatError extends Error {
 const HOLD_KINDS: ReadonlySet<string> = new Set<BlobHoldKind>(['pin', 'owed', 'responsible', 'cached']);
 
 /** db-core declares `DurabilityQuorum` as a type with no runtime list; one local list in the one module that needs it beats a new cross-package export. */
+// NOTE: neither this list nor HOLD_KINDS is checked against its type for exhaustiveness — the element
+// type only constrains what is written, not what is left out — so a class or hold kind added upstream
+// would make this decoder refuse every record carrying it, and refusing a record stops that blob's
+// sweep. Harmless while both sets are closed; if either grows, derive the list from a
+// `Record<DurabilityQuorum, …>` / `Record<BlobHoldKind, …>` so the compiler names what is missing.
 const DURABILITY_QUORUMS: ReadonlySet<string> = new Set<DurabilityQuorum>(['full', 'majority', 'local', 'unrouted']);
 
 /** The key a record of `ref` is stored under. */

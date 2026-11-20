@@ -1,4 +1,4 @@
-import { parseBlobRef, type BlobRef, type BlobScope } from '@optimystic/db-core';
+import { isBlobRef, parseBlobRef, type BlobRef, type BlobScope } from '@optimystic/db-core';
 import { KeyedSerialQueue } from '../keyed-serial-queue.js';
 import { createLogger } from '../logger.js';
 import type { IKVStore } from '../storage/i-kv-store.js';
@@ -143,7 +143,15 @@ export class OwedBlobLedger {
 		// under `FileKVStore`, and opening them all at once would trade a slower scan for
 		// file-descriptor exhaustion.
 		for (const key of keys) {
-			const entry = await this.read(key.slice(OWED_BLOB_KEY_PREFIX.length) as BlobRef);
+			const suffix = key.slice(OWED_BLOB_KEY_PREFIX.length);
+			// Skipped rather than parsed, as `BlobRecordStore.listRefs` skips a bad key: `read` would
+			// throw BlobRefError on it, and one stray key under the prefix would then fail every scan —
+			// so `list` and `size`, and with them every drain pass, for as long as the key is there.
+			if (!isBlobRef(suffix)) {
+				log('entry:bad-key key=%s', key);
+				continue;
+			}
+			const entry = await this.read(suffix);
 			if (entry !== undefined) entries.push(entry);
 		}
 		return entries.sort((a, b) => a.recordedAt - b.recordedAt);
@@ -161,12 +169,11 @@ export class OwedBlobLedger {
 	}
 
 	private indexFrom(scan: Promise<OwedBlobEntry[]>): Promise<Set<BlobRef>> {
-		return scan
-			.then(entries => new Set(entries.map(entry => entry.ref)))
-			.catch((err: unknown) => {
-				this.indexLoad = undefined;
-				throw err;
-			});
+		const load = scan.then(entries => new Set(entries.map(entry => entry.ref)));
+		// The stored chain carries its own handler, so a `list` whose caller handles the scan's failure
+		// itself does not also leave this promise rejected with nobody listening.
+		void load.catch(() => { this.indexLoad = undefined; });
+		return load;
 	}
 
 	private async read(ref: BlobRef): Promise<OwedBlobEntry | undefined> {

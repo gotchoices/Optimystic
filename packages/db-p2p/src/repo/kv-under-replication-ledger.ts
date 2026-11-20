@@ -286,19 +286,17 @@ export class KvUnderReplicationLedger implements IUnderReplicationLedger {
 	}
 
 	private indexFrom(scan: Promise<UnderReplicatedEntry[]>): Promise<Set<BlockId>> {
-		return scan
-			.then(entries => new Set(entries.map(entry => entry.blockId)))
-			.catch((err: unknown) => {
-				this.indexLoad = undefined;
-				throw err;
-			});
+		const load = scan.then(entries => new Set(entries.map(entry => entry.blockId)));
+		// The stored chain carries its own handler, so a `list` whose caller handles the scan's failure
+		// itself does not also leave this promise rejected with nobody listening.
+		void load.catch(() => { this.indexLoad = undefined; });
+		return load;
 	}
 
 	private async read(blockId: BlockId): Promise<UnderReplicatedEntry | undefined> {
 		const raw = await this.kv.get(keyFor(blockId));
 		return raw === undefined ? undefined : parseEntry(blockId, raw);
 	}
-
 }
 
 function keyFor(blockId: BlockId): string {

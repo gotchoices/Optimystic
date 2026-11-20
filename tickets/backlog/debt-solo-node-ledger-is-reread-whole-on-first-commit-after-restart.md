@@ -1,5 +1,5 @@
 description: A machine running alone now keeps a saved note for every block it writes, and after a restart its first save reads every one of those notes back before it can answer. On slow storage (a phone, a busy disk) that first save could stall for a long time.
-files: packages/db-p2p/src/repo/kv-under-replication-ledger.ts (`index()`, `record`, `settle`, `evictBeyondCap`), packages/db-p2p/src/repo/coordinator-repo.ts (`noteReplicationShortfall`), packages/db-p2p/src/libp2p-node-base.ts (where the ledger is built)
+files: packages/db-p2p/src/repo/kv-under-replication-ledger.ts (`index()`, `record`, `settle`, `evictBeyondCap`), packages/db-p2p/src/repo/coordinator-repo.ts (`noteReplicationShortfall`), packages/db-p2p/src/libp2p-node-base.ts (where the ledger is built), packages/db-p2p/src/blob/owed-blob-ledger.ts (`index()`, `record`, `remove` — the second arm below)
 repro: static
 severity: edge-case
 likelihood: unusual
@@ -36,3 +36,11 @@ The first commit after a restart costs about what any other commit costs, regard
 - Warm the index when the node starts, rather than on the first commit, so the load runs alongside libp2p boot. The first commit still waits if it arrives before the load finishes. (Done incidentally by the drain's start pass — see above — whenever the drain and its re-check timer are enabled; a node with the drain disabled still loads on its first commit.)
 - Persist what the index needs (presence and eviction order) as its own compact record, so loading it is one read.
 - Revisit whether a `local` commit on a node that has never had a partner needs a per-block entry at all, or whether one "this node has written while alone" marker plus the owned-block set would carry the same information to the drain.
+
+# Second arm: the blob ledger inherited the cost without the reason
+
+`OwedBlobLedger` (`packages/db-p2p/src/blob/owed-blob-ledger.ts`, added by `feat-blob-owed-ledger-and-durability-classes` and found in its review) was shaped after the ledger above, index and all: `record` and `remove` both `await this.index()`, so the first `record` after a restart is one `list` plus one read per stored entry — the same shape as the measurement above, with the same unmeasured wall clock.
+
+What makes it a distinct arm rather than another instance: the ledger above needs the index for correctness (it is the eviction order, and `maxEntries` is enforced from it), while the blob ledger has **no cap** and needs the index only to answer `size()` without a scan. Nothing in `record` or `remove` reads the index for a decision — they only keep it current. So the load could simply be skipped when it has not happened yet: an entry written while the index is unloaded is in the store, and the next `size()` scans and finds it. That makes this arm much cheaper to resolve than the first, and resolvable on its own.
+
+The path that pays it is `NodeBlobService.announce` (built by `feat-blob-owed-copies-are-drained`), which awaits the entry before it resolves, so a writer announcing its first blob after a restart waits on the scan. The copy drain's start pass warms the index off that path on a node where the drain is enabled, exactly as the block drain's does — the same residual, and the same mitigation.
