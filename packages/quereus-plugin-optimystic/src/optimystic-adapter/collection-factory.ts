@@ -388,9 +388,15 @@ export class CollectionFactory {
    * that throws is logged and does not disturb the resolution reporting to it.
    */
   onBlobBackendResolved(listener: (backend: BlobBackend) => void): () => void {
+    // A listener already in the set must not be replayed to a second time: the set would hold it
+    // once either way, so without this check "once per backend" would break for the one host
+    // mistake that is invisible from the outside — subscribing the same function twice.
+    const replay = !this.blobBackendListeners.has(listener);
     const unsubscribe = addListener(this.blobBackendListeners, listener);
-    for (const backend of [...this.blobBackends.values()]) {
-      this.callBlobBackendListener(listener, backend);
+    if (replay) {
+      for (const backend of [...this.blobBackends.values()]) {
+        this.callBlobBackendListener(listener, backend);
+      }
     }
     return unsubscribe;
   }
@@ -1004,9 +1010,19 @@ export class CollectionFactory {
   /**
    * Clear all cached transactors (useful for testing or cleanup)
    * Note: Collections are only cached within transactions, not globally
+   *
+   * The blob backends go with them: each carries the transactor of its key
+   * ({@link BlobBackend.transactor}), so keeping one past the transactor it names would hand a
+   * reader of this network's reference trees a transactor nothing else writes through. For
+   * `network` that costs nothing — the node, and so `node.blobs`, outlives this, and the next
+   * resolution finds the same store. For every other transactor the next resolution builds a fresh
+   * single-machine store, which is coherent with the block store `test` and `local` also rebuild
+   * from scratch here. The service left behind stays in {@link singleMachineBlobServices} and is
+   * stopped by {@link dispose} (its sweep timer is unref'd until then).
    */
   clearCache(): void {
     this.transactors.clear();
+    this.blobBackends.clear();
   }
 
   /**

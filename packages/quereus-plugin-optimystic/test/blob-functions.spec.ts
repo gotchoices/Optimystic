@@ -3,9 +3,9 @@
  * that read a reference's local state (docs/blobs.md §SQL).
  *
  * What is pinned here: what `BlobLocality` and `BlobSize` answer for a blob this machine holds, for
- * a well-formed reference nobody ever put, for a malformed one and for NULL; and the one piece of
+ * a well-formed reference nobody ever put, for a malformed one and for NULL; the one piece of
  * branching logic in `SqlBlobService` — which owner label a `put` pins under when the caller names
- * none.
+ * none; and which table `plugin.blobsFor(table)` resolves a service for, and which it refuses.
  *
  * Nothing here tests the registration of the functions, the option plumbing, or the label builders
  * on their own: `parsePinLabel` is exercised by the owner-label cases below, and a round-trip of the
@@ -16,9 +16,12 @@ import { expect } from 'chai';
 import { Database, QuereusError, StatusCode } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { BLOB_PIECE_BYTES, BlobRefError } from '@optimystic/db-core';
+import { MemoryRawStorage } from '@optimystic/db-p2p';
+import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 import { parsePinLabel } from '../dist/index.js';
 import { captureThrown, queryAll } from './query-helpers.js';
+import { buildSharedLocalTransactor } from './shared-local-transactor.js';
 
 /**
  * A canonical reference nobody put in this process: one of the fixed vectors in
@@ -54,6 +57,25 @@ function openSession(): { db: Database; plugin: PluginHandle } {
 	for (const func of plugin.functions) db.registerFunction(func.schema);
 	for (const type of plugin.types) db.registerType(type.name, type.definition);
 	return { db, plugin };
+}
+
+/**
+ * {@link openSession}'s parts over a `local` transactor somebody else owns, so a second `Database`
+ * can hydrate what the first persisted (`buildSharedLocalTransactor`, the harness
+ * `catalog-hydration.spec.ts` uses). Registered under the key the plugin resolves
+ * `default_transactor: 'local'` to.
+ */
+function openSharedSession(db: Database, transactor: ITransactor): PluginHandle {
+	const plugin = register(db, {
+		default_transactor: 'local',
+		default_key_network: 'test',
+		enable_cache: false,
+	} as unknown as Record<string, SqlValue>);
+	plugin.collectionFactory.registerTransactor('local:test', transactor);
+	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
+	for (const func of plugin.functions) db.registerFunction(func.schema);
+	for (const type of plugin.types) db.registerType(type.name, type.definition);
+	return plugin;
 }
 
 /** Two pieces of a repeating pattern: a full leaf and a short tail. */
@@ -165,6 +187,96 @@ describe('blob SQL functions and plugin.blobs', function () {
 		} finally {
 			db.close();
 			await plugin.dispose();
+		}
+	});
+});
+
+/**
+ * `plugin.blobsFor(table)` — the service of the network a NAMED table uses, which is the entry
+ * point a host with tables on more than one network reads a reference through.
+ *
+ * Three arms, which is what makes this worth a spec of its own: the table a statement has already
+ * touched (its binding comes off the cached instance), the table hydrated into the catalog that no
+ * statement has used yet (its binding is parsed from the catalog entry, and no instance is built),
+ * and the two tables it must refuse.
+ */
+describe('plugin.blobsFor', function () {
+	this.timeout(15_000);
+
+	it('hands out a fresh service over the same store as plugin.blobs', async () => {
+		const { db, plugin } = openSession();
+		try {
+			await db.exec(TABLE_DDL);
+			const { ref, size } = await plugin.blobs.put(twoPieces());
+
+			const forTable = await plugin.blobsFor('Attachment');
+			expect(forTable, 'a fresh wrapper, never plugin.blobs itself').to.not.equal(plugin.blobs);
+			// Attachment declares no transactor of its own, so it binds to the default network — one
+			// store, read through two objects.
+			const stat = await forTable.stat(ref);
+			expect({ locality: stat.locality, size: stat.size }).to.deep.equal({ locality: 'here', size });
+		} finally {
+			db.close();
+			await plugin.dispose();
+		}
+	});
+
+	it('refuses a table the catalog does not know, and one another module owns', async () => {
+		const { db, plugin } = openSession();
+		try {
+			await db.exec('create table Plain (Id text primary key)');
+			const unknown = await captureThrown(() => plugin.blobsFor('NoSuchTable'));
+			expect(unknown).to.be.instanceOf(QuereusError);
+			expect(unknown.message).to.contain('NoSuchTable');
+
+			const foreign = await captureThrown(() => plugin.blobsFor('Plain'));
+			expect(foreign).to.be.instanceOf(QuereusError);
+			expect(foreign.message, 'names the module that does own it').to.contain('not an Optimystic table');
+		} finally {
+			db.close();
+			await plugin.dispose();
+		}
+	});
+
+	it('answers for a table hydrated into the catalog that no statement has touched', async () => {
+		// The warm-restart harness of catalog-hydration.spec.ts: one storage and one transactor,
+		// two sessions. In the second, `users` is in the catalog with no instance behind it, which
+		// is the arm that reads the binding off the catalog entry rather than off an instance.
+		const storage = new MemoryRawStorage();
+		const shared = buildSharedLocalTransactor(storage);
+
+		const dbA = new Database();
+		const pluginA = openSharedSession(dbA, shared);
+		try {
+			await dbA.exec(`
+				create table users (id integer primary key, name text not null)
+					using optimystic('tree://blobfn/users')
+			`);
+			await dbA.exec(`insert into users (id, name) values (1, 'alice')`);
+		} finally {
+			dbA.close();
+			await pluginA.dispose();
+		}
+
+		const dbB = new Database();
+		const pluginB = openSharedSession(dbB, shared);
+		try {
+			expect((await pluginB.hydrate(dbB)).tables, 'the warm restart found the table').to.equal(1);
+
+			const forTable = await pluginB.blobsFor('users');
+			const { ref, size } = await forTable.put(twoPieces());
+			// Read back through the DEFAULT service: a hydrated table binds to the session's default
+			// network, so both must be the one store.
+			const stat = await pluginB.blobs.stat(ref);
+			expect({ locality: stat.locality, size: stat.size }).to.deep.equal({ locality: 'here', size });
+
+			// And the table is still usable: nothing half-built was left in the module's cache for
+			// its first real connect to trip over.
+			expect(await queryAll(dbB, `select name from users where id = 1`))
+				.to.deep.equal([{ name: 'alice' }]);
+		} finally {
+			dbB.close();
+			await pluginB.dispose();
 		}
 	});
 });

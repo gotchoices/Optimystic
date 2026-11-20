@@ -215,12 +215,15 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * network: the wrapper is thin and the sharing is in `CollectionFactory.getBlobBackend`, so
 		 * two wrappers over one network read the same blob records, hold the same pins and each
 		 * receive the same events. Compare networks, never these objects.
+		 *
+		 * `async` though nothing in it awaits, so an unknown table arrives as a REJECTION — what
+		 * the README and docs/blobs.md §SQL promise — rather than a synchronous throw.
 		 */
 		blobsFor: async (table: string, schema?: string): Promise<SqlBlobService> => {
-			// Resolved once here so a bad table name rejects THIS call rather than the service's first
-			// use; the binding itself is fixed at the table's construction, so re-reading it per use
-			// would answer the same thing.
-			const options = await optimysticModule.bindingOptionsOfTable(db, table, schema);
+			// Read once here so a bad table name rejects THIS call rather than the service's first
+			// use; the binding is fixed at the table's declaration, so re-reading it per use would
+			// answer the same thing.
+			const options = optimysticModule.bindingOptionsOfTable(db, table, schema);
 			return new SqlBlobService(() => collectionFactory.getBlobBackend(options), txnBridge);
 		},
 		/**

@@ -6559,30 +6559,36 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
   /**
    * How `schemaName.tableName` reaches storage ({@link OptimysticVirtualTable.bindingOptions}).
-   * Instantiates the table from the engine's catalog entry on this process's first touch of it, as
-   * {@link connect} would, but does NOT initialize it: the binding is fixed at construction, so
-   * nothing has to be read to answer this.
+   * Read off the cached instance when a statement has already touched the table, and otherwise
+   * parsed straight from the engine's catalog entry ({@link parseTableSchema}) — which is the same
+   * derivation {@link instantiateTable} would perform, and the whole of what a binding depends on.
+   *
+   * Deliberately builds NO instance for an untouched table: an uninitialized one left in
+   * {@link tables} would make that table's first `connect` ignore the `tableSchema` Quereus supplies
+   * for it, which is the schema that path is documented to build from (the same reason
+   * {@link registerBridgeConnection} caches none). Nothing here reads storage or registers anything.
    *
    * Throws a `QuereusError` for a table neither this module's cache nor the engine's catalog knows,
-   * and for a catalog table another module owns — resolving that one would build an Optimystic
-   * instance over somebody else's table, as {@link verifyIndexes} explains.
+   * and for a catalog table another module owns — answering for that one would report somebody
+   * else's table as an Optimystic binding, as {@link verifyIndexes} explains.
    */
-  async bindingOptionsOfTable(db: Database, tableName: string, schemaName = 'main'): Promise<ParsedOptimysticOptions> {
+  bindingOptionsOfTable(db: Database, tableName: string, schemaName = 'main'): ParsedOptimysticOptions {
+    const cached = this.tables.get(`${schemaName}.${tableName}`.toLowerCase());
+    if (cached) return cached.bindingOptions;
     const catalogEntry = db.schemaManager.findTable(tableName, schemaName);
-    if (catalogEntry && !this.ownsTable(db, catalogEntry)) {
-      throw new QuereusError(
-        `'${schemaName}.${tableName}' is not an Optimystic table (module '${catalogEntry.vtabModuleName}').`,
-        StatusCode.ERROR,
-      );
-    }
-    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
-    if (!resolved) {
+    if (!catalogEntry) {
       throw new QuereusError(
         `Optimystic table '${schemaName}.${tableName}' not found.`,
         StatusCode.ERROR,
       );
     }
-    return resolved.table.bindingOptions;
+    if (!this.ownsTable(db, catalogEntry)) {
+      throw new QuereusError(
+        `'${schemaName}.${tableName}' is not an Optimystic table (module '${catalogEntry.vtabModuleName}').`,
+        StatusCode.ERROR,
+      );
+    }
+    return this.parseTableSchema(catalogEntry);
   }
 
   /**

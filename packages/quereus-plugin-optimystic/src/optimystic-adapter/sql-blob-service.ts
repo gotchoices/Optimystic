@@ -167,6 +167,17 @@ export class SqlBlobService implements SqlBlobBackendService {
 			: unstagedPinLabel(this.now());
 	}
 
+	/**
+	 * The backend, resolved afresh on EVERY use rather than remembered: that is what makes a service
+	 * used after `CollectionFactory.dispose()` reach the store the factory built next instead of the
+	 * one it stopped (see {@link adoptBackend}).
+	 *
+	 * NOTE: so each call pays one binding derivation and one map lookup — which for `BlobLocality`
+	 * and `BlobSize` is per ROW of the query, since both read `plugin.blobs`. Nothing touches
+	 * storage, and the factory's own de-duplication means no second store is ever built; if a
+	 * `select BlobLocality(...)` over many rows ever shows up as slow, cache the resolved backend
+	 * behind a disposal generation the factory bumps, rather than simply remembering it here.
+	 */
 	private async backendNow(): Promise<BlobBackend> {
 		const backend = await this.resolve();
 		this.adoptBackend(backend);

@@ -1156,10 +1156,14 @@ describe('Plugin Registration & Lifecycle (TEST-7.3.1)', () => {
 		expect(plugin.vtables[0]!.name).to.equal('optimystic');
 	});
 
-	it('should register the StampId and CommitOutlook functions', () => {
+	it('registers exactly the plugin\'s SQL functions, and no others', () => {
 		const { plugin } = createTestEnv();
 
-		expect(plugin.functions.map(func => func.schema.name)).to.deep.equal(['StampId', 'CommitOutlook']);
+		// A CLOSED list on purpose: a function that silently stops being registered is invisible to
+		// every other test (a statement using it just fails to parse), so adding one here is the
+		// price of adding one to `register`.
+		expect(plugin.functions.map(func => func.schema.name))
+			.to.deep.equal(['StampId', 'CommitOutlook', 'BlobLocality', 'BlobSize']);
 	});
 
 	it('should support full CRUD lifecycle through adapter', async () => {
