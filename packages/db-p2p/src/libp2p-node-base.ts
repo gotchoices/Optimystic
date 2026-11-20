@@ -40,6 +40,8 @@ import { OwedBlobLedger } from './blob/owed-blob-ledger.js';
 import { BlobReferenceCheck } from './blob/reference-check.js';
 import { BlobAnnounceReceiver, type BlobHoldPolicy } from './blob/announce-receiver.js';
 import { BlobCohortReaction } from './blob/cohort-reaction.js';
+import { resolveReclaimGraceMs } from './blob/reclaim-marks.js';
+import { BlobReclaimPass } from './blob/reclaim-pass.js';
 import { seedHeldBlobs } from './blob/held-blob-seed.js';
 import { AnnounceLimiter } from './blob/announce-limiter.js';
 import { createNodeNetworkTransactor } from './node-network-transactor.js';
@@ -377,8 +379,15 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * those blobs lose their `cached` hold and are swept; a blob held for any other reason — pinned,
 	 * owed or responsible — is never counted or evicted, and a blob being read is never evicted. `0`
 	 * keeps no such blob beyond the ones being read. Anything but an integer at or above 0 throws.
+	 *
+	 * `reclaimGraceMs` is how long a blob must have been found listed nowhere before this node gives
+	 * its `responsible` or `owed` hold back (`BlobReclaimPass` in
+	 * `packages/db-p2p/src/blob/reclaim-pass.ts`, docs/blobs.md §Lifetime), default
+	 * `DEFAULT_RECLAIM_GRACE_MS` (7 days). Two counting passes at least this far apart must both have
+	 * found the blob unlisted, so the period is a floor on the real time between them, not a timer.
+	 * Anything below `MIN_RECLAIM_GRACE_MS` (1 hour), or not finite, throws.
 	 */
-	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; cacheBudgetBytes?: number; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
+	blobs?: { digest?: BlobDigest; hold?: BlobHoldPolicy; cacheBudgetBytes?: number; reclaimGraceMs?: number; copy?: Partial<BlobCopyDrainConfig> & { enabled?: boolean } };
 	/**
 	 * Override libp2p listen multiaddrs. An entry naming a relay (`<relay address>/p2p/<relay id>/p2p-circuit`)
 	 * is not handed to libp2p as written: the node listens on a bare `/p2p-circuit` and keeps the
@@ -1285,6 +1294,9 @@ export async function createLibp2pNodeBase(
 	// Read here rather than where the budget is built, below: this is before `createLibp2p` and
 	// `node.start()`, so a misconfigured host gets the error instead of a started node to roll back.
 	const blobCacheBudgetBytes = resolveBlobCacheBudgetBytes(options.blobs?.cacheBudgetBytes);
+	// Here for the same reason, and because this one decides when data is DELETED: a host that
+	// mistyped the grace period is told before the node starts reclaiming on it.
+	const blobReclaimGraceMs = resolveReclaimGraceMs(options.blobs?.reclaimGraceMs);
 	// Bound after libp2p has started, below, since the receiver needs the node's key network and fetcher
 	// while the service entry is built before them.
 	let blobReceiver: BlobAnnounceReceiver | undefined;
@@ -1911,6 +1923,33 @@ export async function createLibp2pNodeBase(
 			}
 			await blobCopies.start();
 		}
+		// --- Giving back the blobs committed state no longer lists ---
+		// The reference pass of docs/blobs.md §Lifetime, on BOTH roles like the copy drain and unlike the
+		// blob rebalance monitor: a client takes no `responsible` hold, but it is often the machine a blob
+		// was put on, so it owns owed entries and must drop the ones whose rows are gone — and its
+		// `aloneFor` is answerable, since it has a key network, while its `responsibleMarks()` is simply
+		// empty. Its stop wrapper goes on immediately, after the blob service's (installed above), so it
+		// runs BEFORE it and no pass writes a record or sweeps once the blob service has stopped.
+		const blobReclaim = new BlobReclaimPass({
+			records: blobs,
+			owed: owedBlobLedger,
+			transactor: committedReader,
+			cohort: cohortReachability,
+			partitionDetector,
+			// The row the cache budget already created; the two mechanisms are independent and share it.
+			log: createLogger('blob:reclaim', node.peerId.toString()),
+		}, { graceMs: blobReclaimGraceMs });
+		{
+			const previousStop = node.stop.bind(node);
+			node.stop = async () => {
+				try {
+					await blobReclaim.stop();
+				} finally {
+					await previousStop();
+				}
+			};
+		}
+		blobReclaim.start();
 		// --- Following the cohort of the blobs this node keeps for the network ---
 		// A second `RebalanceMonitor`, over blob references instead of block ids: the cohort comparison it
 		// makes for blocks, made for blobs by giving it the blob routing rule (docs/blobs.md §Placement,
@@ -2040,6 +2079,7 @@ export async function createLibp2pNodeBase(
 		(node as any).blobCopyDrain = blobCopies;
 		(node as any).owedBlobLedger = owedBlobLedger;
 		(node as any).blobCacheBudget = blobCacheBudget;
+		(node as any).blobReclaimPass = blobReclaim;
 		(node as any).blobRebalanceMonitor = blobRebalanceMonitor;
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
@@ -2063,6 +2103,7 @@ export async function createLibp2pNodeBase(
 			cohortReachability,
 			hlcClock,
 			blobs: nodeBlobs,
+			blobReclaim,
 		};
 		const attachments: OptimysticNodeAttachments | OptimysticClientNodeAttachments = served
 			? {

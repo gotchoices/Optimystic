@@ -26,6 +26,8 @@ export * from "./blob/blob-durability.js";
 export * from "./blob/blob-copy-drain.js";
 export * from "./blob/cohort-reaction.js";
 export * from "./blob/reclaim-marks.js";
+export * from "./blob/confirmation-recording-transactor.js";
+export * from "./blob/reclaim-pass.js";
 export * from "./cluster/client.js";
 export * from "./cluster/client-signature-verifier.js";
 export * from "./cluster/cluster-repo.js";

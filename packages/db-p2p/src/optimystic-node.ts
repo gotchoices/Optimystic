@@ -1,6 +1,7 @@
 import type { Libp2p, PrivateKey } from '@libp2p/interface';
 import type { BlockId, HlcClock, IBlockChangeNotifier, IRepo } from '@optimystic/db-core';
 import type { NodeBlobService } from './blob/node-blob-service.js';
+import type { BlobReclaimOnDemand } from './blob/reclaim-pass.js';
 import type { DisputeService } from './dispute/dispute-service.js';
 import type { Libp2pKeyPeerNetwork } from './libp2p-key-network.js';
 import type { NodeCohortReachability } from './network/cohort-reachability.js';
@@ -84,6 +85,14 @@ export interface OptimysticNodeAttachmentsBase {
 	 * reports its durability.
 	 */
 	blobs: NodeBlobService;
+	/**
+	 * The node's blob reference pass (docs/blobs.md §Lifetime), which releases the `responsible` and
+	 * `owed` holds of blobs no registered reference tree lists any longer. It runs on its own schedule
+	 * — five minutes after the node starts, then every six hours — and this handle only asks for a
+	 * pass now, which a host or a test uses to see one through without waiting. On a client too: it
+	 * takes no `responsible` hold, but it owns the owed entries of the blobs its host put.
+	 */
+	blobReclaim: BlobReclaimOnDemand;
 }
 
 /**

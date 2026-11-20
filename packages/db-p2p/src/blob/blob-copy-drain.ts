@@ -431,8 +431,10 @@ export class BlobCopyDrain implements Startable {
 	/**
 	 * The blob's cohort holds it: the record's `full` durability is written (above), the entry is
 	 * deleted, and only then is the `owed` hold released. A crash between the two leaves at worst an
-	 * `owed` hold with no entry, which keeps the bytes — the safe direction, and the reclaiming pass
-	 * (`feat-unreferenced-blobs-are-reclaimed`) covers an orphaned hold as it covers an orphaned entry.
+	 * `owed` hold with no entry, which keeps the bytes — the safe direction, and the same leak the
+	 * reclaim pass's own release accepts in the same order (the `NOTE:` in
+	 * `packages/db-p2p/src/blob/reclaim-pass.ts`). Nothing reclaims such a hold: that pass walks the
+	 * LEDGER's entries, so a hold with no entry is never visited, and the blob is kept for ever.
 	 *
 	 * Releasing the hold may delete the record outright when `owed` was its last hold, taking the
 	 * just-written durability with it. That is the intended end state — the writer stops holding the

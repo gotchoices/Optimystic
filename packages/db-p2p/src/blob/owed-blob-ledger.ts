@@ -50,9 +50,9 @@ export type OwedBlobLedgerOptions = {
  * instance per store.
  *
  * NOTE: no size cap, unlike the under-replication ledger's. Entries are bounded by the blobs this node
- * announced, and `feat-unreferenced-blobs-are-reclaimed` drops the entry of a blob whose scope stopped
- * listing it. If a deployment ever accumulates entries a reclaim pass does not clear, that pass is
- * what to look at before adding a cap here.
+ * announced, and `BlobReclaimPass` in `packages/db-p2p/src/blob/reclaim-pass.ts` drops the entry of a
+ * blob whose scope stopped listing it. If a deployment ever accumulates entries a reclaim pass does
+ * not clear, that pass is what to look at before adding a cap here.
  */
 export class OwedBlobLedger {
 	private readonly queue = new KeyedSerialQueue();
