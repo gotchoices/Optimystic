@@ -1,4 +1,4 @@
-import { walkBlobPieces, type BlobDigest, type BlobRef, type PieceId, type PieceSource } from '@optimystic/db-core';
+import { isBlobRef, walkBlobPieces, type BlobDigest, type BlobRef, type PieceId, type PieceSource } from '@optimystic/db-core';
 import { createLogger } from '../logger.js';
 import { BlobRecordFormatError } from './blob-record.js';
 import type { BlobRecordStore } from './blob-record-store.js';
@@ -186,6 +186,10 @@ export class PieceSweeper {
 		return undefined;
 	}
 
+	// NOTE: a blob in use with no record can stop a sweep the way a held blob with a damaged tree can
+	// (the accepted tradeoff above `walkRecord`), but only until its read ends — unless the use itself
+	// leaks (the `NOTE:` at `LocalBlobService.beginUse`), in which case sweeps stay stopped. If sweeps
+	// are ever seen aborting `tree-unreadable` on a ref no record names, that pair is why.
 	/**
 	 * Keeps every present piece of the trees something is reading or fetching, record or no record:
 	 * these are the refs `walkRecord` would return at once for, which is exactly the blob whose last
@@ -194,6 +198,14 @@ export class PieceSweeper {
 	 */
 	private async walkInUse(live: Set<PieceId>): Promise<SweepAbort | undefined> {
 		for (const ref of this.inUseRefs()) {
+			// A string that is not a reference names no stored piece, so there is nothing of it to keep,
+			// while `walkBlobPieces` would throw on its spelling and abort the sweep. The sweep's other
+			// roots are filtered the same way (`BlobRecordStore.listRefs`, and `changeRecord` before
+			// `noteRecordChange`), which is what keeps a cast string from stopping a sweep.
+			if (!isBlobRef(ref)) {
+				log('sweep:use-not-a-reference ref=%s', ref);
+				continue;
+			}
 			const abort = await this.walkTree(ref, live);
 			if (abort !== undefined) {
 				return abort;
