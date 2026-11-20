@@ -165,9 +165,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 	it('an insert under StampId() into a table with no fresh tag is assured: the write description says the key is fresh', async () => {
 		const node = await oneNode();
 		node.plugin.offline.enter();
-		// Inside an explicit transaction: in an autocommit statement StampId() is evaluated before the
-		// write begins the bridge's transaction, and answers NULL.
-		const insert = await queuedOutlook(node, `begin; insert into Memos (id, body) values (StampId(), 'a'); commit`);
+		const insert = await queuedOutlook(node, `insert into Memos (id, body) values (StampId(), 'a')`);
 		expect(insert.outlook).to.deep.equal(assured());
 	});
 
@@ -256,7 +254,7 @@ describe('Offline mode: the outlook of a queued transaction', function () {
 		expect(conversation.outlook?.kind, 'a natural key is exposed').to.equal('exposed');
 
 		// Quereus reads the parent whole for the foreign-key probe, so the dependency is by table.
-		const message = await queuedOutlook(node, `begin; insert into Messages (id, conversation, body) values (StampId(), 'c1', 'hi'); commit`);
+		const message = await queuedOutlook(node, `insert into Messages (id, conversation, body) values (StampId(), 'c1', 'hi')`);
 		expect(message.outlook).to.deep.equal({
 			kind: 'assured',
 			exposures: [],

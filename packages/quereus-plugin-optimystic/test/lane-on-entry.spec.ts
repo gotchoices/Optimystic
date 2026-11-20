@@ -48,11 +48,9 @@ describe('lane on the entry: a SQL commit carries the lane the plugin classified
 	}
 
 	it('is convergent for a fresh-keyed insert into a replay-permitted table, serializable for the same insert into a strong one', async () => {
-		// `StampId()` answers null until the bridge's transaction has begun, which an autocommit
-		// statement does at its first vtab touch, after the value is evaluated: begin explicitly.
-		await db.exec(`begin; insert into Merged (Id, Title) values (StampId(), 'a'); commit;`);
+		await db.exec(`insert into Merged (Id, Title) values (StampId(), 'a')`);
 		expect(await lastEntryLane('lane/merged')).to.equal('convergent');
-		await db.exec(`begin; insert into Plain (Id, Title) values (StampId(), 'a'); commit;`);
+		await db.exec(`insert into Plain (Id, Title) values (StampId(), 'a')`);
 		expect(await lastEntryLane('lane/plain')).to.equal('serializable');
 	});
 

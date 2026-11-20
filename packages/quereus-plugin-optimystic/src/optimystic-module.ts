@@ -6427,6 +6427,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
 
     let tables = 0;
     let indexes = 0;
+    let firstHydrated: QualifiedTableName | undefined;
     for (const { schemaName, tableName } of tableNames) {
       // Each table goes back into the engine schema it was declared in — never the host's
       // current schema. Its schema is part of its storage location (`defaultCollectionUri`)
@@ -6442,10 +6443,51 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       const hydratedSchema = schemaManager.storedToTableSchema(stored, this, auxData, sessionVtabArgs);
       (targetSchema ?? db.schemaManager.addSchema(schemaName)).addTable(hydratedSchema);
       tables++;
+      firstHydrated ??= { schemaName, tableName };
       indexes += hydratedSchema.indexes?.length ?? 0;
     }
 
+    if (firstHydrated) await this.registerBridgeConnection(db, firstHydrated, options);
+
     return { tables, indexes };
+  }
+
+  /**
+   * Register ONE connection with the engine, so this `Database` has an Optimystic connection
+   * listening before any statement runs.
+   *
+   * Quereus begins an autocommit write statement's transaction before it evaluates the statement,
+   * and broadcasts that `begin` to every connection registered with the `Database` — which is what
+   * makes `StampId()` inside `insert … values (StampId(), …)` answer that statement's stamp rather
+   * than NULL. A `create table` and a table's first touch each register a connection; hydration put
+   * the tables back in the engine's catalog but registered none, so the first write statement of a
+   * restarted process evaluated its rows with no Optimystic transaction open, and a `StampId()`
+   * primary key arrived NULL.
+   *
+   * One connection is enough: every Optimystic connection drives the same {@link TransactionBridge},
+   * and {@link beginTransaction} reads only the binding out of the options it is handed (transactor,
+   * key network, signer — never the collection URI), which for a hydrated table is this session's
+   * default either way (a catalog record carries no binding; see `identityVtabArgs`). More would
+   * cost — see the note on `OptimysticVirtualTableConnection.commit` for what each extra registered
+   * connection adds to every later commit — hence one, not one per hydrated table.
+   *
+   * Registered under a hydrated table's name, so that table's first touch ADOPTS this connection
+   * ({@link OptimysticVirtualTable.ensureConnectionRegistered} reuses an Optimystic connection
+   * already registered for the name) instead of adding a second one. No table instance is built:
+   * caching an uninitialized one here would make that table's first `connect` ignore the
+   * `tableSchema` Quereus supplies for it, which is the schema that path is documented to build from.
+   */
+  private async registerBridgeConnection(
+    db: Database,
+    table: QualifiedTableName,
+    options: ParsedOptimysticOptions,
+  ): Promise<void> {
+    const internal = db as DatabaseInternal;
+    const existing: readonly VirtualTableConnection[] = internal.getConnectionsForTable(table.tableName);
+    if (existing.some(connection => connection instanceof OptimysticVirtualTableConnection)) return;
+    await internal.registerConnection(
+      new OptimysticVirtualTableConnection(table.tableName, this.txnBridge, options),
+    );
   }
 
   /**

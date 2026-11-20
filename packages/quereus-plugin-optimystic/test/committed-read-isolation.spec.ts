@@ -217,24 +217,33 @@ describe('Committed-read connection isolation', function () {
 
 			const dbA = new Database();
 			registerWithSharedTransactor(dbA, shared);
+			// TWO tables, because `hydrate` registers one connection — on one hydrated table, to
+			// open the transaction bridge for a restarted process's first write statement
+			// (`OptimysticModule.registerBridgeConnection`). The table it claims cannot show the
+			// 0-to-1 contrast below, so the subject is whichever one it did not claim.
 			await dbA.exec(`create table Item (id integer primary key, cat text) using optimystic('tree://iso/firsttouch')`);
+			await dbA.exec(`create table Other (id integer primary key, cat text) using optimystic('tree://iso/firsttouch-other')`);
 			await dbA.exec(`insert into Item (id, cat) values (1, 'a'), (2, 'b'), (3, 'a')`);
+			await dbA.exec(`insert into Other (id, cat) values (1, 'a'), (2, 'b'), (3, 'a')`);
 
 			// Fresh Database over the same storage: catalog hydrated, table never touched
-			// (the module's table cache is empty), so this committed read initializes the
-			// table from scratch — and still must not register a connection.
+			// (the module's table cache holds it uninitialized at most), so this committed read
+			// initializes the table from scratch — and still must not register a connection.
 			const dbB = new Database();
 			const pluginB = registerWithSharedTransactor(dbB, shared);
 			await pluginB.hydrate(dbB);
 			try {
-				expect(connections(dbB, 'Item').length).to.equal(0);
-				expect(await scalar(dbB, `select count(*) as v from committed.Item`)).to.equal(3);
-				expect(connections(dbB, 'Item').length, 'committed first touch must not register').to.equal(0);
+				const unclaimed = ['Item', 'Other'].filter(table => connections(dbB, table).length === 0);
+				expect(unclaimed, 'hydrate registers ONE connection, not one per hydrated table').to.have.lengthOf(1);
+				const subject = unclaimed[0]!;
+
+				expect(await scalar(dbB, `select count(*) as v from committed.${subject}`)).to.equal(3);
+				expect(connections(dbB, subject).length, 'committed first touch must not register').to.equal(0);
 
 				// A live read on the same table DOES register — the contrast proves the
 				// committed path (not some global behavior) is what skipped registration.
-				expect(await scalar(dbB, `select count(*) as v from Item`)).to.equal(3);
-				expect(connections(dbB, 'Item').length).to.be.greaterThan(0);
+				expect(await scalar(dbB, `select count(*) as v from ${subject}`)).to.equal(3);
+				expect(connections(dbB, subject).length).to.be.greaterThan(0);
 			} finally {
 				dbA.close();
 				dbB.close();

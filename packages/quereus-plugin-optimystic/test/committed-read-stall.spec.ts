@@ -161,6 +161,13 @@ async function seedRows(db: Database, table: string, count: number): Promise<voi
 	await db.exec(`insert into ${table} (id, cat) values ${values.join(', ')}`);
 }
 
+/** The engine connections registered for `table` (DatabaseInternal surface, cast in tests). */
+function connectionsOf(db: Database, table: string): ReadonlyArray<unknown> {
+	return (db as unknown as {
+		getConnectionsForTable(t: string): ReadonlyArray<unknown>;
+	}).getConnectionsForTable(table);
+}
+
 const SEED = 40;
 const seededCats = (): string[] => Array.from({ length: SEED }, (_, i) => ((i + 1) % 2 === 0 ? 'a' : 'b'));
 
@@ -492,6 +499,10 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 				await a.db.exec(`create table Cold (id integer primary key, cat text) using optimystic('tree://stall/cold')`);
 				await seedRows(a.db, 'Cold', SEED);
 				await b.plugin.hydrate(b.db);
+				// `hydrate` registers one connection on a hydrated table, so a restarted process's
+				// first write statement has the bridge open (`registerBridgeConnection`). The claim
+				// below is that the committed read adds none, not that there are none.
+				const baseline = connectionsOf(b.db, 'Cold').length;
 
 				gate.arm();
 				writer = a.db.exec(`update Cold set cat = 'z'`);
@@ -505,10 +516,10 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 					2000,
 				);
 				expect(scan.map(r => r.cat)).to.deep.equal(seededCats());
-				const connections = (b.db as unknown as {
-					getConnectionsForTable(t: string): ReadonlyArray<unknown>;
-				}).getConnectionsForTable('Cold');
-				expect(connections.length, 'committed first touch must not register a connection').to.equal(0);
+				expect(
+					connectionsOf(b.db, 'Cold').length,
+					'committed first touch must not register a connection',
+				).to.equal(baseline);
 			} finally {
 				gate.release();
 				await writer?.catch(() => { });
@@ -531,6 +542,8 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 				await seedRows(a.db, 'Warm', 4);
 				await seedRows(a.db, 'Frozen', 4);
 				await b.plugin.hydrate(b.db);
+				// See the baseline note above: hydrate may have claimed Frozen for the bridge connection.
+				const frozenBaseline = connectionsOf(b.db, 'Frozen').length;
 
 				// Open a writer transaction on dbB touching Warm only. Frozen stays COLD
 				// in dbB's module cache.
@@ -551,10 +564,7 @@ describe('Committed reads under a stalled commit (proof B)', function () {
 				expect(registry.has(frozenId), 'bridge registry must not gain the cold table').to.equal(false);
 				expect(registry.size).to.equal(registrySizeBefore);
 				expect(b.plugin.txnBridge.getCurrentTransaction()!.collections.size, 'writer txn collection cache untouched').to.equal(txnCollectionsBefore);
-				const connections = (b.db as unknown as {
-					getConnectionsForTable(t: string): ReadonlyArray<unknown>;
-				}).getConnectionsForTable('Frozen');
-				expect(connections.length).to.equal(0);
+				expect(connectionsOf(b.db, 'Frozen').length, 'the committed read registered nothing').to.equal(frozenBaseline);
 
 				await b.db.exec('commit');
 

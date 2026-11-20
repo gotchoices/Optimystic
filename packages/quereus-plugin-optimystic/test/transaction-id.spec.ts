@@ -4,14 +4,19 @@
 
 import { expect } from 'chai';
 import { Database } from '@quereus/quereus';
+import { MemoryRawStorage } from '@optimystic/db-p2p';
+import type { ITransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
+import { queryAll } from './query-helpers.js';
+import { buildSharedLocalTransactor } from './shared-local-transactor.js';
 
 describe('StampId() Function', () => {
 	let db: Database;
+	let plugin: ReturnType<typeof register>;
 
 	beforeEach(async () => {
 		db = new Database();
-		const plugin = register(db, {
+		plugin = register(db, {
 			default_transactor: 'test',
 			default_key_network: 'test',
 			enable_cache: false,
@@ -44,6 +49,8 @@ describe('StampId() Function', () => {
 		});
 
 		it('should return NULL when not in a transaction', async () => {
+			// An autocommit SELECT has no side effects, so Quereus opens no transaction for it and
+			// there is none to name. An autocommit WRITE does — see the autocommit cases below.
 			const result = await db.prepare('SELECT StampId() as stamp_id').get();
 			expect(result).to.exist;
 			expect(result?.stamp_id).to.be.null;
@@ -166,6 +173,37 @@ describe('StampId() Function', () => {
 		});
 	});
 
+	describe('Autocommit statements', () => {
+		beforeEach(async () => {
+			await db.exec(`
+				CREATE TABLE stamped (id TEXT PRIMARY KEY, body TEXT)
+				USING optimystic('tree://test/stamped')
+			`);
+		});
+
+		it('stores the stamp of the transaction the write statement runs in', async () => {
+			// Quereus begins the implicit transaction before it evaluates the statement, so the
+			// `values` row sees it. Pinned against the commit's own report rather than merely
+			// "not null": the id stored must be the id the commit is known by.
+			const reported: string[] = [];
+			plugin.onCommitDurability(({ transactionId }) => { reported.push(transactionId); });
+
+			await db.exec(`INSERT INTO stamped (id, body) VALUES (StampId(), 'a')`);
+
+			const rows = await queryAll(db, 'SELECT id FROM stamped');
+			expect(rows.map(row => row.id)).to.deep.equal([reported.at(-1)]);
+		});
+
+		it('stores a different stamp for each statement', async () => {
+			await db.exec(`INSERT INTO stamped (id, body) VALUES (StampId(), 'a')`);
+			await db.exec(`INSERT INTO stamped (id, body) VALUES (StampId(), 'b')`);
+
+			const ids = (await queryAll(db, 'SELECT id FROM stamped')).map(row => row.id as string);
+			expect(ids).to.have.lengthOf(2);
+			expect(ids[0]).to.not.equal(ids[1]);
+		});
+	});
+
 	describe('Implementation details', () => {
 		it('should be defined in package.json metadata', async () => {
 			const { readFile } = await import('fs/promises');
@@ -215,3 +253,49 @@ describe('StampId() Function', () => {
 	});
 });
 
+/**
+ * The same autocommit write in a process that did not declare the table — it came back through
+ * `plugin.hydrate(db)`. Hydration puts the tables in the engine's catalog; it must also leave one
+ * Optimystic connection registered, or the statement's transaction is begun with nothing listening
+ * and `StampId()` answers NULL into a `TEXT PRIMARY KEY`.
+ */
+describe('StampId() in a hydrated Database', function () {
+	this.timeout(15_000);
+
+	function registerWithSharedTransactor(db: Database, transactor: ITransactor) {
+		const plugin = register(db, {
+			default_transactor: 'local',
+			default_key_network: 'test',
+			enable_cache: false,
+		});
+		plugin.collectionFactory.registerTransactor('local:test', transactor);
+		for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
+		for (const func of plugin.functions) db.registerFunction(func.schema);
+		return plugin;
+	}
+
+	it('answers the statement transaction stamp for the first write after hydrate', async () => {
+		const sharedTransactor = buildSharedLocalTransactor(new MemoryRawStorage());
+
+		const dbA = new Database();
+		registerWithSharedTransactor(dbA, sharedTransactor);
+		await dbA.exec(`
+			CREATE TABLE stamped (id TEXT PRIMARY KEY, body TEXT)
+			USING optimystic('tree://hydrate-stamp/stamped')
+		`);
+
+		// A fresh Database over the same storage: the table exists only once hydrate puts it back.
+		const dbB = new Database();
+		const pluginB = registerWithSharedTransactor(dbB, sharedTransactor);
+		expect((await pluginB.hydrate(dbB)).tables).to.equal(1);
+
+		// The FIRST statement of this Database, with no create and no prior touch of the table.
+		await dbB.exec(`INSERT INTO stamped (id, body) VALUES (StampId(), 'a')`);
+
+		const ids = (await queryAll(dbB, 'SELECT id FROM stamped')).map(row => row.id as string);
+		expect(ids, 'the hydrated table holds the inserted row').to.have.lengthOf(1);
+		expect(ids[0], 'the stamp, not NULL').to.match(/^[A-Za-z0-9_-]{40,50}$/);
+
+		await pluginB.dispose();
+	});
+});

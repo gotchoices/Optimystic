@@ -1372,7 +1372,11 @@ commit;
 ```
 
 `CommitOutlook()` mirrors `StampId()`: a function the plugin registers, answering for the current
-transaction, `NULL` outside one. It is useful online too, where it predicts whether a commit can
+transaction, `NULL` when there is no transaction to judge. The rule is `StampId()`'s
+([README § StampId() Function](../packages/quereus-plugin-optimystic/README.md#stampid-function)):
+an explicit `begin`, or the transaction Quereus opens for an autocommit **write** statement once this
+`Database` has any Optimystic connection registered; `NULL` for an autocommit read such as
+`select CommitOutlook()` on its own. It is useful online too, where it predicts whether a commit can
 lose a race at all. It judges what the transaction has staged at the moment it is evaluated
 (`Collection.openActions`, in every collection the transaction staged into), as an entry sealed
 behind everything queued now, by the same judgement a queued entry gets

@@ -147,6 +147,12 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		 * first statement sees the queued transactions. Idempotent. Resolves to
 		 * the catalog counts; rejects with `OfflineJournalError` for a journal
 		 * record written by a newer build (every record before it is restored).
+		 *
+		 * When it puts at least one table back it also leaves ONE connection registered with the
+		 * `Database`, under one of those tables' names, so the transaction Quereus opens for the
+		 * first autocommit write statement reaches the plugin and `StampId()` inside it answers
+		 * that statement's stamp rather than NULL (see `OptimysticModule.registerBridgeConnection`
+		 * and README § StampId() Function). A host that counts `getConnectionsForTable` will see it.
 		 */
 		hydrate: async (db: Database) => {
 			const counts = await optimysticModule.hydrateCatalog(db, config, config);

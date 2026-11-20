@@ -34,6 +34,16 @@ export class OptimysticVirtualTableConnection implements VirtualTableConnection 
 	async commit(): Promise<void> {
 		// For implicit transactions, Quereus may call commit() without calling begin() first
 		// In this case, we need to start a transaction before committing
+		//
+		// NOTE: this is also the path every connection AFTER the first takes at each commit —
+		// Quereus broadcasts commit to all of them, the first one ends the bridge's transaction,
+		// and the rest arrive to find it inactive and begin-and-commit an empty one. So each extra
+		// registered connection adds one empty begin and commit to every later transaction, which
+		// in session mode includes a `TransactionSession.create`. Cheap per connection, and the
+		// reason `hydrateCatalog` registers exactly one (see `registerBridgeConnection`) rather
+		// than one per hydrated table; if a host ever ends up with many Optimystic connections on
+		// one Database and commits show the cost, make this a no-op for a transaction already
+		// committed by a sibling connection instead of opening a fresh one.
 		const currentTxn = this.txnBridge.getCurrentTransaction();
 		if (!currentTxn?.isActive) {
 			await this.txnBridge.beginTransaction(this.options);
