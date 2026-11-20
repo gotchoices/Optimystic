@@ -39,6 +39,8 @@ import { BlobCopyDrain, type BlobCopyDrainConfig } from './blob/blob-copy-drain.
 import { OwedBlobLedger } from './blob/owed-blob-ledger.js';
 import { BlobReferenceCheck } from './blob/reference-check.js';
 import { BlobAnnounceReceiver, type BlobHoldPolicy } from './blob/announce-receiver.js';
+import { BlobCohortReaction } from './blob/cohort-reaction.js';
+import { seedHeldBlobs } from './blob/held-blob-seed.js';
 import { AnnounceLimiter } from './blob/announce-limiter.js';
 import { createNodeNetworkTransactor } from './node-network-transactor.js';
 import { answerFromArchiveResponse, claimFromConsultAnswer, lineageFromSyncResponse, servableProof, serveLineageAnswer, type ArchiveServingRepo } from './storage/block-archive.js';
@@ -74,7 +76,7 @@ import { buildBlockTransferProtocol, pushBlockToPeers } from './cluster/block-tr
 import { PreparedStreams } from './network/prepared-streams.js';
 import { UnderReplicationDrain, type UnderReplicationDrainConfig } from './repo/under-replication-drain.js';
 import { assertReportedRevision, recordHeldCopy, type HeldCopyDeps } from './repo/owed-copies.js';
-import type { RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
+import { RebalanceMonitor, type RebalanceMonitorConfig } from './cluster/rebalance-monitor.js';
 import { fretService, Libp2pFretService } from 'p2p-fret';
 import { syncService } from './sync/service.js';
 import { SyncClient } from './sync/client.js';
@@ -134,7 +136,7 @@ import {
 	type PushStateInit,
 	type NotificationVerifier,
 } from '@optimystic/db-core';
-import { HlcClock, routingKeyForBlock } from '@optimystic/db-core';
+import { HlcClock, routingKeyForBlob, routingKeyForBlock } from '@optimystic/db-core';
 import { PartitionDetector } from './cluster/partition-detector.js';
 import { assertSuperMajorityCoupling } from './cluster/supermajority-coupling.js';
 import { createLogger } from './logger.js';
@@ -187,6 +189,8 @@ type WiredServices = {
 const wiringLog = createLogger('node-wiring');
 /** The blob protocol's own channel, for the `held` frames the node answers before anything acts on them. */
 const blobLog = createLogger('blob:protocol');
+/** The blob copy channel, which the blob cohort monitor and its reaction also log under, so one filter shows a blob's whole copy story. */
+const blobCopyLog = createLogger('blob:copy');
 
 /**
  * Factory function or instance for creating raw storage. The node puts the write-through read
@@ -1293,6 +1297,10 @@ export async function createLibp2pNodeBase(
 	// every use: both are only reachable after the factory has assigned it.
 	let blobCopies: BlobCopyDrain | undefined;
 	const blobCopyWanted = (options.blobs?.copy?.enabled ?? true) !== false;
+	// The monitor that follows the cohort of the blobs this node keeps for the network, built below the
+	// drain but declared here so the drain's `onHolderConfirmed` can reach it. Read, not captured, for
+	// the same reason `blobCopies` is: it exists only once the factory has assigned it.
+	let blobRebalanceMonitor: RebalanceMonitor | undefined;
 	// Built once: it gates the four storage protocol services on a serving node and the blob protocol on both roles.
 	const inboundAuthorization = inboundAuthorizationOf(options);
 
@@ -1886,6 +1894,9 @@ export async function createLibp2pNodeBase(
 				records: blobs,
 				announce: (peerId, ref, scope) => blobTransfer.client.announce(peerIdFromString(peerId), ref, scope),
 				acceptance: peerIds => blobAcceptanceOf(keyNetwork, blobTransfer.blobProtocol, peerIds),
+				// A `whole` answer or an arriving `held` also counts for the cohort monitor's growth arm, so
+				// it stops re-announcing that reference to that peer.
+				onHolderConfirmed: (ref, peerId) => blobRebalanceMonitor?.recordBlockHolders({ blockIds: [ref], holders: [peerId] }),
 			}, blobCopyConfig);
 			{
 				const drain = blobCopies;
@@ -1900,10 +1911,116 @@ export async function createLibp2pNodeBase(
 			}
 			await blobCopies.start();
 		}
+		// --- Following the cohort of the blobs this node keeps for the network ---
+		// A second `RebalanceMonitor`, over blob references instead of block ids: the cohort comparison it
+		// makes for blocks, made for blobs by giving it the blob routing rule (docs/blobs.md §Placement,
+		// copying and durability, *When the cohort changes*). It is built here, not inside the serving
+		// role, because the blob service, the drain and the reaction it reacts with are built here; the two
+		// handles it needs exist only inside that role's arachnode gate, which hands them back. A client
+		// (`servesBlocks: false`) runs no serving role and so gets no blob monitor — which is right: it is
+		// in no cohort and never takes a `responsible` hold (`BlobAnnounceReceiver` answers
+		// `not-responsible`), and its owed blobs are followed by the drain on its own passes. Without FRET
+		// or with arachnode disabled this stays inert exactly as the block reaction does, and a wiring
+		// failure is logged and non-fatal for the same reason: following a cohort is a resilience
+		// mechanism, and the drain still keeps a writer's copies moving without it.
+		if (served?.arachnode && (options.rebalance?.enabled ?? true) !== false) {
+			try {
+				// Its own tracked set, never the shared owned-block set: these ids are blob references, placed
+				// by a different routing rule. Its was-responsible memory (`responsibilitySnapshot`) is
+				// per-monitor already.
+				const heldBlobRefs = new Set<string>();
+				// `options.rebalance` is shared with the block monitor: one switch and one set of tuning for
+				// "react to cohort changes". Constructed directly rather than through
+				// `NetworkManagerService.initRebalanceMonitor`, which holds the block instance.
+				const monitor = new RebalanceMonitor({
+					libp2p: node,
+					fret: served.arachnode.fret,
+					partitionDetector,
+					fretAdapter: served.arachnode.fretAdapter,
+					trackedBlocks: heldBlobRefs,
+					keyNetwork,
+					clusterSize: consensusConfig.clusterSize,
+					// Every id in `heldBlobRefs` came from a blob record, so it is a canonical reference.
+					routingKeyOf: id => routingKeyForBlob(id as BlobRef),
+					logName: 'blob:copy',
+				}, options.rebalance);
+				// The tracked set is the references kept for the NETWORK — an `owed` or a `responsible` hold.
+				// A pin or a `cached` hold is this node's own business: a node does not announce a blob it
+				// merely read. Fed before the seed below, so a hold taken during the seed is not missed.
+				//
+				// Best-effort iteration safety, as the owned-block set's eviction already accepts: this can
+				// add to or delete from the set while a check is mid-`for...of` over it, which does not throw
+				// in JavaScript — entries are visited best-effort — so it is documented rather than locked.
+				const offHoldsFeed = blobs.onHoldsChanged((ref, holds) => {
+					if (holds.some(hold => hold.kind === 'owed' || hold.kind === 'responsible')) {
+						monitor.trackBlock(ref);
+					} else {
+						monitor.untrackBlock(ref);
+					}
+				});
+				const reaction = new BlobCohortReaction({
+					selfId: node.peerId.toString(),
+					membership,
+					partitionDetector,
+					records: blobs,
+					owed: owedBlobLedger,
+					acceptance: peerIds => blobAcceptanceOf(keyNetwork, blobTransfer.blobProtocol, peerIds),
+					// Absent when the copy drain is switched off, and then nothing declines; such a node still
+					// follows the cohort of the blobs it holds `responsible`.
+					declining: blobCopies,
+					announce: (peerId, ref, scope) => blobTransfer.client.announce(peerIdFromString(peerId), ref, scope),
+					stat: (peerId, refs) => blobTransfer.client.stat(peerIdFromString(peerId), refs),
+				});
+				// `onRebalance` fires synchronously from the monitor's debounced check, so the reaction is
+				// hopped off its emit loop; a rejection out of `handle` is a local fault (an unreadable
+				// record), logged rather than left unhandled, and nothing is recorded, so the next check
+				// retries — as the block reaction's handler does.
+				//
+				// NOTE: no in-flight guard. The handler starts a reaction and returns, so a check landing
+				// before the previous reaction settles runs a second one over the same references. Unlikely
+				// (`minRebalanceIntervalMs` is 60 s and a reaction is a few round trips) and benign if it
+				// happens: `releaseResponsible` is idempotent, duplicate announcements are what
+				// `AnnounceLimiter` is for, and two reactions over one snapshot agree on their outcomes. If
+				// overlapping reactions ever do show up, hold one in-flight promise here and skip a check
+				// that lands on top of it, as `BlockTransferCoordinator` does with its `inFlight` keys.
+				monitor.onRebalance((event) => {
+					reaction.handle(event).then(async (result) => {
+						// In turn: at most a cohort's worth per check, each one serialized record write. The feed
+						// above untracks the reference when the release leaves no `owed` hold behind.
+						for (const ref of result.released) await blobs.releaseResponsible(ref);
+						for (const ref of result.retained) monitor.retainLost(ref);
+						for (const [ref, outcome] of result.growth) monitor.recordGrowthOutcome(ref, outcome);
+					}).catch((err) => { blobCopyLog('reaction:failed err=%o', err); });
+				});
+				await monitor.start();
+				blobRebalanceMonitor = monitor;
+				let seedStopping = false;
+				{
+					const previousStop = node.stop.bind(node);
+					node.stop = async () => {
+						seedStopping = true;
+						offHoldsFeed();
+						try {
+							await monitor.stop();
+						} finally {
+							await previousStop();
+						}
+					};
+				}
+				// After `start()`: holder evidence is ignored while the monitor is stopped. Fire-and-forget so
+				// a large record store never holds up startup, and cancellable through the stop wrapper above,
+				// exactly as the owned-block seed is.
+				void seedHeldBlobs({ records: blobs, owed: owedBlobLedger, monitor, isStopping: () => seedStopping })
+					.catch((err) => { wiringLog('held-blob-seed seed failed: %o', err); });
+			} catch (err) {
+				wiringLog('blob rebalance wiring init failed: %o', err);
+			}
+		}
 		// Expose for tests/diagnostics, as the block drain and its ledger are exposed.
 		(node as any).blobCopyDrain = blobCopies;
 		(node as any).owedBlobLedger = owedBlobLedger;
 		(node as any).blobCacheBudget = blobCacheBudget;
+		(node as any).blobRebalanceMonitor = blobRebalanceMonitor;
 
 		// The host-facing attachment surface, declared once in `optimystic-node.ts` and written here
 		// through typed object literals so every field is type-checked AND a field added to
@@ -2491,6 +2608,11 @@ interface ServingRole {
 	/** The cohort consult, self answered from local storage; the cohort-topic trust anchor reads it too. */
 	clusterLatestCallback: ClusterLatestCallback;
 	disputeService: DisputeService | undefined;
+	/**
+	 * FRET and its arachnode adapter, when arachnode is enabled and FRET is present. The blob cohort
+	 * monitor is built from these in the factory, beside the blob service it reacts with.
+	 */
+	arachnode?: { fret: FretService; fretAdapter: ArachnodeFretAdapter };
 }
 
 /**
@@ -2939,6 +3061,9 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	};
 
 	// Initialize Arachnode ring membership and restoration
+	// Handed back on the serving result for the blob cohort monitor, which needs these two handles but is
+	// built in the factory beside the blob service, the drain and the reaction it reacts with.
+	let arachnodeHandles: ServingRole['arachnode'];
 	const enableArachnode = options.arachnode?.enableRingZulu ?? true;
 	if (enableArachnode) {
 		// A child of the file's own `node-wiring` channel (same nesting convention as
@@ -2952,6 +3077,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 
 		if (fret) {
 			const fretAdapter = new ArachnodeFretAdapter(fret, node.peerId.toString());
+			arachnodeHandles = { fret, fretAdapter };
 
 			// Blocks whose shed range has been RELEASED (Phase C of a ring shift, or a confirmed
 			// rebalance release). This is the GC-eligibility signal the future storage sweep
@@ -3291,6 +3417,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		coordinatedRepo: coordinator,
 		reportBlockHeld,
 		clusterLatestCallback,
-		disputeService: disputeServiceInstance
+		disputeService: disputeServiceInstance,
+		arachnode: arachnodeHandles
 	};
 }

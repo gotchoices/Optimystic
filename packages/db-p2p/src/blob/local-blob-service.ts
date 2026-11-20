@@ -115,6 +115,14 @@ export interface BlobResponsibleRecords {
 	responsibleRefs(): Promise<BlobRef[]>;
 	/** Remove the `responsible` hold; a record left with no hold is deleted and the blob swept. No record, or no such hold, is a no-op. Flushed. */
 	releaseResponsible(ref: BlobRef): Promise<void>;
+	/**
+	 * Tell these listeners when a record's set of hold KINDS changed — the only thing that can change
+	 * whether a reference is kept for the network. `holds` is the record's holds after the change, empty
+	 * for a record that was deleted. Each listener is called in a `try`; a throw is logged
+	 * (`holds:listener-threw`) and does not stop the others, as {@link BlobOwedRecords.emitDurability}
+	 * does.
+	 */
+	onHoldsChanged(listener: (ref: BlobRef, holds: readonly BlobHold[]) => void): () => void;
 }
 
 /** One cache-only blob as the cache budget sees it. */
@@ -218,6 +226,7 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	private scheduledRun: Promise<void> | undefined;
 	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
 	private readonly durabilityListeners = new Set<(event: BlobDurabilityEvent) => void>();
+	private readonly holdsListeners = new Set<(ref: BlobRef, holds: readonly BlobHold[]) => void>();
 	private readonly fetchDoor: BlobFetchStore;
 	/** Reads and fetches in flight, by reference; an entry exists only while its count is above zero. */
 	private readonly uses = new Map<BlobRef, number>();
@@ -592,6 +601,11 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		return subscribe(this.durabilityListeners, listener);
 	}
 
+	/** {@link BlobResponsibleRecords.onHoldsChanged}, emitted from `changeRecord` — the one path every record change takes. */
+	onHoldsChanged(listener: (ref: BlobRef, holds: readonly BlobHold[]) => void): () => void {
+		return subscribe(this.holdsListeners, listener);
+	}
+
 	// NOTE: a blob whose `cached` hold goes while something is still reading or fetching it is protected
 	// by the uses `readThrough`, `fetch` and every `NodeBlobService` fetch session hold, which the sweep
 	// takes as roots (`inUseRefs`); an evicting caller skips such a blob by asking `inUse`.
@@ -643,7 +657,32 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 		if (result.before !== undefined && result.after === undefined) {
 			this.scheduleSweep();
 		}
+		this.emitHoldsChanged(ref, result);
 		return result;
+	}
+
+	/**
+	 * Tells the {@link BlobResponsibleRecords.onHoldsChanged} listeners when this change added or removed
+	 * a KIND of hold. A `lastReadAt` touch, a `whole` correction, or a `responsible` hold whose scope was
+	 * replaced leaves the kinds alone and so does not fire: whether this node keeps the blob for the
+	 * network did not change.
+	 *
+	 * Emitted before the caller's `flush`, deliberately: a listener only adds to or removes from an
+	 * in-memory set, and such a set is re-derived from the records at every start, so a hold a crash
+	 * loses costs nothing.
+	 */
+	private emitHoldsChanged(ref: BlobRef, result: BlobRecordChange): void {
+		const holds = result.after?.holds ?? [];
+		if (sameHoldKinds(result.before?.holds ?? [], holds)) {
+			return;
+		}
+		for (const listener of [...this.holdsListeners]) {
+			try {
+				listener(ref, holds);
+			} catch (error) {
+				log('holds:listener-threw ref=%s error=%s', ref, describe(error));
+			}
+		}
 	}
 
 	/**
@@ -921,7 +960,15 @@ function recordAfterRead(current: BlobRecord | undefined, at: number): BlobRecor
 	return { ...current, lastReadAt: at };
 }
 
-function subscribe<T>(listeners: Set<(event: T) => void>, listener: (event: T) => void): () => void {
+/** Whether two hold lists carry the same KINDS, whatever each hold's own properties say. */
+function sameHoldKinds(before: readonly BlobHold[], after: readonly BlobHold[]): boolean {
+	const was = new Set(before.map(hold => hold.kind));
+	const now = new Set(after.map(hold => hold.kind));
+	return was.size === now.size && [...was].every(kind => now.has(kind));
+}
+
+/** Generic in the listener type rather than in an event type: a feed may hand its listeners more than one argument. */
+function subscribe<L>(listeners: Set<L>, listener: L): () => void {
 	listeners.add(listener);
 	return () => {
 		listeners.delete(listener);
