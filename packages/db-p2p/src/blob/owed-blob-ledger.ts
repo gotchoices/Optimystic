@@ -21,6 +21,13 @@ export type OwedBlobEntry = {
 	readonly holders: readonly string[];
 	/** Milliseconds since the epoch; `list` orders oldest first. */
 	readonly recordedAt: number;
+	/**
+	 * When the first counting reclaim pass that found this entry's scope no longer listing the blob
+	 * started, ms since the epoch (docs/blobs.md §Lifetime). Every call that creates or re-records an
+	 * entry drops it, because such a call is the writer saying the reference is live; `addHolders`
+	 * keeps it.
+	 */
+	readonly unlistedSince?: number;
 };
 
 export type OwedBlobLedgerOptions = {
@@ -56,7 +63,12 @@ export class OwedBlobLedger {
 		this.now = options?.now ?? Date.now;
 	}
 
-	/** Create the entry, or replace an existing entry's scope keeping its holders and `recordedAt`. */
+	/**
+	 * Create the entry, or replace an existing entry's scope keeping its holders and `recordedAt` —
+	 * and dropping `unlistedSince`, so the reclaim grace period starts again. An `announce` for a
+	 * reference already owed is the writer saying the reference is live, which is why a re-record with
+	 * the same scope clears the mark too.
+	 */
 	async record(ref: BlobRef, scope: BlobScope): Promise<OwedBlobEntry> {
 		const key = keyFor(ref);
 		const entry = await this.queue.run(ref, async () => {
@@ -64,7 +76,12 @@ export class OwedBlobLedger {
 			const existing = await this.read(ref);
 			const stored: OwedBlobEntry = existing === undefined
 				? { ref, scope, holders: [], recordedAt: this.now() }
-				: { ...existing, scope };
+				// Built field by field rather than spread, so that the four fields a re-record keeps are
+				// stated and `unlistedSince` is dropped by construction. Not `{ ...existing, scope,
+				// unlistedSince: undefined }`: this package has `exactOptionalPropertyTypes` off (backlog
+				// `debt-tsconfig-exact-optional-property-types`), so that shape type-checks and then
+				// leans on `JSON.stringify` discarding the property to be correct.
+				: { ref, scope, holders: existing.holders, recordedAt: existing.recordedAt };
 			await this.kv.set(key, JSON.stringify(stored));
 			index.add(ref);
 			return stored;
@@ -83,6 +100,8 @@ export class OwedBlobLedger {
 			const held = new Set(existing.holders);
 			const added = peerIds.filter(peerId => !held.has(peerId));
 			if (added.length === 0) return existing;
+			// Spread, so `unlistedSince` survives: a peer confirming it holds a copy is not evidence that
+			// any committed row references the blob, so it must not restart the reclaim grace period.
 			const stored: OwedBlobEntry = { ...existing, holders: [...existing.holders, ...new Set(added)] };
 			await this.kv.set(key, JSON.stringify(stored));
 			wrote = true;
@@ -118,6 +137,62 @@ export class OwedBlobLedger {
 		const key = keyFor(ref);
 		await this.queue.run(ref, () => this.remove(ref, key));
 		await this.flushWrites();
+	}
+
+	/**
+	 * Drop the reclaim mark; no entry, or no mark, is a no-op.
+	 *
+	 * **Not flushed**, the one exception to this class's rule that every public write is durable before
+	 * it returns. A mark is advisory: one a crash loses costs a delay of one grace period and never a
+	 * lost copy, while flushing per entry would cost a node with thousands of them one store flush
+	 * each per pass. What the rule exists for is unchanged — every call that creates or deletes an
+	 * entry still flushes, because an entry a restart forgets is a copy nobody will ever send.
+	 */
+	async clearUnlisted(ref: BlobRef): Promise<void> {
+		const key = keyFor(ref);
+		await this.queue.run(ref, async () => {
+			const existing = await this.read(ref);
+			if (existing === undefined || existing.unlistedSince === undefined) return;
+			await this.kv.set(key, JSON.stringify(withoutUnlistedSince(existing)));
+		});
+	}
+
+	/**
+	 * Set the reclaim mark to `at` while the entry exists; answers whether it wrote. Never creates an
+	 * entry (an entry deleted meanwhile stays deleted). Not flushed, for the reason
+	 * {@link clearUnlisted} gives.
+	 */
+	async markUnlisted(ref: BlobRef, at: number): Promise<boolean> {
+		const key = keyFor(ref);
+		return this.queue.run(ref, async () => {
+			const existing = await this.read(ref);
+			if (existing === undefined || existing.unlistedSince === at) return false;
+			await this.kv.set(key, JSON.stringify({ ...existing, unlistedSince: at }));
+			return true;
+		});
+	}
+
+	/**
+	 * Delete the entry, but only while its reclaim mark is still exactly `mark`; answers whether it
+	 * wrote. An entry the drain deleted meanwhile reads as absent, so this answers `false` and the
+	 * pass leaves the `owed` hold to the drain, which released it with the entry.
+	 *
+	 * **Flushed**, unlike the two mark writes above. The pass deletes the entry and then releases the
+	 * `owed` hold, in that order, because a crash between the two leaves a hold with no entry —
+	 * storage kept, nothing lost — while the reverse leaves an entry whose drain announces a blob this
+	 * node no longer holds. That ordering only holds if the delete is durable before the release
+	 * writes, and `LocalBlobService.releaseOwed` flushes.
+	 */
+	async deleteIfUnlisted(ref: BlobRef, mark: number): Promise<boolean> {
+		const key = keyFor(ref);
+		const wrote = await this.queue.run(ref, async () => {
+			const existing = await this.read(ref);
+			if (existing?.unlistedSince !== mark) return false;
+			await this.remove(ref, key);
+			return true;
+		});
+		await this.flushWrites();
+		return wrote;
 	}
 
 	/**
@@ -217,5 +292,15 @@ function isEntryFor(ref: BlobRef, value: unknown): value is OwedBlobEntry {
 	return entry.ref === ref
 		&& typeof entry.scope === 'string' && entry.scope !== ''
 		&& Array.isArray(entry.holders) && entry.holders.every(peerId => typeof peerId === 'string')
-		&& typeof entry.recordedAt === 'number' && Number.isFinite(entry.recordedAt);
+		&& typeof entry.recordedAt === 'number' && Number.isFinite(entry.recordedAt)
+		// A mark nothing can interpret would decide a deletion, so it is checked beside `recordedAt`
+		// rather than kept as found. Malformed means the whole entry is read as absent, never deleted
+		// by a read — the rule above, unchanged — and the next `record` for the ref overwrites it.
+		&& (entry.unlistedSince === undefined || (typeof entry.unlistedSince === 'number' && Number.isFinite(entry.unlistedSince)));
+}
+
+/** The entry without its reclaim mark: the property omitted, not set to `undefined`, so it encodes and compares as one that never carried it. */
+function withoutUnlistedSince(entry: OwedBlobEntry): OwedBlobEntry {
+	const { unlistedSince: _dropped, ...rest } = entry;
+	return rest;
 }

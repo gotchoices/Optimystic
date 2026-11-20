@@ -31,6 +31,13 @@ export interface BlobRecord {
 	readonly lastReadAt?: number;
 	/** Never empty in a stored record: a record whose last hold goes is deleted. */
 	readonly holds: readonly BlobHold[];
+	/**
+	 * When the first counting reclaim pass that found this blob listed nowhere started, ms since the
+	 * epoch (docs/blobs.md §Lifetime). Meaningful only while the record holds `responsible`: every
+	 * write that adds or removes that hold drops this field in the same record write, so a mark can
+	 * never outlive the hold it was about and let one pass release a hold taken since.
+	 */
+	readonly unreferencedSince?: number;
 	/** How widely the blob is held, as last computed (docs/blobs.md §Placement, copying and durability).
 	 *  Stored so `stat` answers it and a restart does not re-emit an unchanged class. */
 	readonly durability?: BlobDurability;
@@ -104,6 +111,12 @@ function recordProblem(ref: BlobRef, record: Record<string, unknown>): string | 
 	}
 	if (record.lastReadAt !== undefined && !isFiniteNumber(record.lastReadAt)) {
 		return '"lastReadAt" is not a finite number';
+	}
+	// Checked rather than kept as found, as `lastReadAt` is: a mark nothing can interpret would decide
+	// a deletion. Refusing the record stops that blob's sweep until it is fixed, which is the price of
+	// the checked fields above and the honest one here.
+	if (record.unreferencedSince !== undefined && !isFiniteNumber(record.unreferencedSince)) {
+		return '"unreferencedSince" is not a finite number';
 	}
 	const durability = durabilityProblem(record.durability);
 	if (durability !== undefined) {

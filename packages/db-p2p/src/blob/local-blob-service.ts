@@ -163,6 +163,48 @@ export interface BlobCacheRecords {
 	sweep(): Promise<BlobSweepResult>;
 }
 
+/** What the reclaim pass knows about one blob this node holds because it is responsible for it. */
+export interface ResponsibleMark {
+	readonly ref: BlobRef;
+	/** When the first counting pass that found this blob listed nowhere started, if one has. */
+	readonly unreferencedSince?: number;
+}
+
+/**
+ * What the reclaim pass needs of this node's blob records; `LocalBlobService` is it (docs/blobs.md
+ * §Lifetime).
+ *
+ * A door rather than a second `BlobRecordStore` over the same `IKVStore`, for the reason
+ * {@link BlobOwedRecords} gives: two instances keep separate per-ref queues, and a write that
+ * bypassed `changeRecord` would also bypass the sweep gate and `PieceSweeper.noteRecordChange`.
+ */
+export interface BlobReclaimRecords {
+	/** Every record holding `responsible` with its mark, ascending by reference. A record that does
+	 *  not decode is logged (`record:unreadable`) and skipped, as `responsibleRefs` does. */
+	responsibleMarks(): Promise<ResponsibleMark[]>;
+	/** Drop the mark. A record that is gone, holds no `responsible` hold, or carries no mark is a
+	 *  no-op. Not flushed: a mark a crash restores costs a delay of one grace period, never a copy. */
+	clearUnreferenced(ref: BlobRef): Promise<void>;
+	/** Set the mark to `at` while the record still holds `responsible`; answers whether it wrote.
+	 *  Not flushed, for the reason {@link clearUnreferenced} gives.
+	 *
+	 *  No expected-mark condition, unlike {@link releaseResponsibleIfMarked}'s: nothing but the pass
+	 *  writes a mark and passes never overlap, so the only thing that can change a mark under a
+	 *  running pass is a *clear* — from a hold being taken or released. A hold released and re-taken
+	 *  mid-pass leaves no mark, which is exactly what the pass's snapshot said, so such a condition
+	 *  could never fire. Conditioning on the hold, which *can* have gone, is the condition that
+	 *  matters. */
+	markUnreferenced(ref: BlobRef, at: number): Promise<boolean>;
+	/** Remove the `responsible` hold and its mark, but only while the record still holds
+	 *  `responsible` AND its mark is still exactly `mark`; answers whether it wrote. A record left
+	 *  with no hold is deleted and its pieces are left for the sweep. Flushed, as
+	 *  `releaseResponsible` is. */
+	releaseResponsibleIfMarked(ref: BlobRef, mark: number): Promise<boolean>;
+	/** {@link LocalBlobService.sweep}, so the pass can sweep once after releasing holds — the same
+	 *  door {@link BlobCacheRecords} opens for the cache budget. */
+	sweep(): Promise<BlobSweepResult>;
+}
+
 /**
  * Reading this machine's pins by owner. Not part of `BlobService`: enumeration is a property of a
  * store, not of the service contract.
@@ -207,10 +249,11 @@ export interface LocalBlobServiceInit {
  * which fetches from other machines through `readThrough` and `fetchStore`; used on its own it never
  * asks another machine. It owns the records the copy drain changes and the `onDurability` listeners it
  * emits through ({@link BlobOwedRecords}); announcing is `NodeBlobService`'s, since this service has
- * no cohort. It also reads its own pins back ({@link BlobPinIndex}) and offers the cache budget its
- * door onto the blobs held only for reads ({@link BlobCacheRecords}).
+ * no cohort. It also reads its own pins back ({@link BlobPinIndex}), offers the cache budget its
+ * door onto the blobs held only for reads ({@link BlobCacheRecords}), and offers the reclaim pass its
+ * door onto the marks on the blobs it keeps for the network ({@link BlobReclaimRecords}).
  */
-export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords {
+export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords, BlobReclaimRecords {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -498,18 +541,75 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobRespo
 	 * {@link BlobResponsibleRecords.responsibleRefs}. A record that fails to decode is logged
 	 * (`record:unreadable`) and skipped.
 	 *
+	 * The one enumeration {@link responsibleMarks} makes, so the two cannot disagree about which
+	 * records hold `responsible`. This contract never promised an order, so the sort is not a change
+	 * any caller can see.
+	 *
 	 * NOTE: reads every record ({@link readableRecords}), which is acceptable for the start-up
 	 * enumeration this serves. If the record count ever makes start-up slow, keep an index of the hold
 	 * kinds each record carries.
 	 */
 	async responsibleRefs(): Promise<BlobRef[]> {
-		const refs: BlobRef[] = [];
+		return (await this.responsibleMarks()).map(mark => mark.ref);
+	}
+
+	/** {@link BlobReclaimRecords.responsibleMarks}. */
+	async responsibleMarks(): Promise<ResponsibleMark[]> {
+		const marks: ResponsibleMark[] = [];
 		for await (const { ref, record } of this.readableRecords()) {
 			if (responsibleHoldOf(record) !== undefined) {
-				refs.push(ref);
+				// The field left off rather than set to undefined: a mark's absence is a shape a caller
+				// may compare, and this package has `exactOptionalPropertyTypes` off (backlog
+				// `debt-tsconfig-exact-optional-property-types`), so the two are not the same value.
+				marks.push(record.unreferencedSince === undefined ? { ref } : { ref, unreferencedSince: record.unreferencedSince });
 			}
 		}
-		return refs;
+		return marks.sort((a, b) => a.ref < b.ref ? -1 : a.ref > b.ref ? 1 : 0);
+	}
+
+	/** {@link BlobReclaimRecords.clearUnreferenced}. */
+	async clearUnreferenced(ref: BlobRef): Promise<void> {
+		await this.changeRecord(ref, recordWithoutUnreferencedMark);
+	}
+
+	/**
+	 * {@link BlobReclaimRecords.markUnreferenced}. The change function is itself the condition,
+	 * applied at this reference's turn in the record store's per-ref queue, as `releaseCached`'s is:
+	 * a blob whose `responsible` hold went since the pass's enumeration is left alone.
+	 */
+	async markUnreferenced(ref: BlobRef, at: number): Promise<boolean> {
+		// Read off the change function rather than the change's before/after: the record survives a
+		// mark write either way, so presence cannot tell a write from a no-op. `BlobRecordStore.apply`
+		// calls the change function exactly once per update, which is what makes the flag sound.
+		let wrote = false;
+		await this.changeRecord(ref, current => {
+			const next = recordWithUnreferencedMark(current, at);
+			wrote = next !== current;
+			return next;
+		});
+		return wrote;
+	}
+
+	/**
+	 * {@link BlobReclaimRecords.releaseResponsibleIfMarked}. The change function is itself the
+	 * condition, for the reason `markUnreferenced` gives — and here it is the whole safety argument:
+	 * a hold released and taken again since the pass's enumeration carries no mark, so this writes
+	 * nothing and the live hold stands.
+	 */
+	async releaseResponsibleIfMarked(ref: BlobRef, mark: number): Promise<boolean> {
+		let wrote = false;
+		await this.changeRecord(ref, current => {
+			// The hold as well as the mark, though every write that removes the hold also clears the
+			// mark: a record written by a build that had the field and not that rule must not be read
+			// as a release that happened.
+			if (current === undefined || current.unreferencedSince !== mark || responsibleHoldOf(current) === undefined) {
+				return current;
+			}
+			wrote = true;
+			return recordAfterResponsibleRelease(current);
+		});
+		await this.records.flush();
+		return wrote;
 	}
 
 	/**
@@ -869,13 +969,17 @@ function recordAfterCachedHold(current: BlobRecord | undefined, ref: BlobRef, at
 	return current.holds.some(hold => hold.kind === 'cached') ? current : { ...current, holds: [...current.holds, cached] };
 }
 
-/** With no record, a new one holding `responsible` that knows nothing of the pieces yet; otherwise the `responsible` hold replaced, every other hold kept. */
+/**
+ * With no record, a new one holding `responsible` that knows nothing of the pieces yet; otherwise the
+ * `responsible` hold replaced, every other hold kept — and the unreferenced mark dropped, because
+ * taking this hold is fresh evidence that the blob is referenced, so the grace period starts again.
+ */
 function recordAfterResponsibleHold(current: BlobRecord | undefined, ref: BlobRef, scope: BlobScope, at: number): BlobRecord {
 	const responsible: BlobHold = { kind: 'responsible', at, scope };
 	if (current === undefined) {
 		return { v: 1, ref, whole: false, holds: [responsible] };
 	}
-	return { ...current, holds: [...current.holds.filter(hold => hold.kind !== 'responsible'), responsible] };
+	return withoutUnreferencedSince({ ...current, holds: [...current.holds.filter(hold => hold.kind !== 'responsible'), responsible] });
 }
 
 /** With no record, a new one holding `owed` that knows nothing of the pieces yet; a record already holding `owed` unchanged. */
@@ -902,7 +1006,52 @@ function recordAfterHoldRelease(kind: BlobHold['kind']): (current: BlobRecord | 
 }
 
 const recordAfterOwedRelease = recordAfterHoldRelease('owed');
-const recordAfterResponsibleRelease = recordAfterHoldRelease('responsible');
+const recordAfterResponsibleHoldRelease = recordAfterHoldRelease('responsible');
+
+/**
+ * The `responsible` hold released and its unreferenced mark dropped with it, answering the current
+ * record unchanged when there is no such hold.
+ *
+ * The mark goes with the hold it was about. A mark that outlived its hold would, once the hold was
+ * taken again, let a single pass release a hold taken minutes ago — which is the one failure mode
+ * these marks have.
+ */
+function recordAfterResponsibleRelease(current: BlobRecord | undefined): BlobRecord | undefined {
+	const next = recordAfterResponsibleHoldRelease(current);
+	// `undefined` only for a record that was not there, and identity only for a release that released
+	// nothing; in both cases there is no mark of ours to drop.
+	return next === undefined || next === current ? next : withoutUnreferencedSince(next);
+}
+
+/**
+ * The mark set to `at`, answering the current record unchanged when there is nothing to do: no
+ * record, the mark already `at`, or — the one that matters — no `responsible` hold, since the mark is
+ * only ever about that hold.
+ */
+function recordWithUnreferencedMark(current: BlobRecord | undefined, at: number): BlobRecord | undefined {
+	if (current === undefined || current.unreferencedSince === at || responsibleHoldOf(current) === undefined) {
+		return current;
+	}
+	return { ...current, unreferencedSince: at };
+}
+
+/**
+ * The mark dropped, answering the current record unchanged when there is nothing to do: no record, no
+ * mark, or no `responsible` hold — a stray mark left by a crash between a release and its clear is
+ * inert (`responsibleMarks` does not list it) and the next `holdResponsible` removes it.
+ */
+function recordWithoutUnreferencedMark(current: BlobRecord | undefined): BlobRecord | undefined {
+	if (current === undefined || current.unreferencedSince === undefined || responsibleHoldOf(current) === undefined) {
+		return current;
+	}
+	return withoutUnreferencedSince(current);
+}
+
+/** The record without its unreferenced mark: the property omitted, not set to `undefined`, so the record encodes and compares as one that never carried it. */
+function withoutUnreferencedSince(record: BlobRecord): BlobRecord {
+	const { unreferencedSince: _dropped, ...rest } = record;
+	return rest;
+}
 
 /** Held for reads and nothing else: the only blobs the cache budget counts and evicts (docs/blobs.md §Lifetime). */
 function cacheOnly(record: BlobRecord): boolean {
