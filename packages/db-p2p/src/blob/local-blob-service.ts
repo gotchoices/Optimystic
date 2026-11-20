@@ -100,6 +100,23 @@ export interface BlobOwedRecords {
 	emitDurability(event: BlobDurabilityEvent): void;
 }
 
+/**
+ * What the blob cohort reaction and its wiring need of this node's blob records; `LocalBlobService`
+ * is it (docs/blobs.md §Placement, copying and durability, *When the cohort changes*).
+ *
+ * A door rather than a second `BlobRecordStore` over the same `IKVStore`, for the reason
+ * {@link BlobOwedRecords} gives: two instances keep separate per-ref queues, and a write that
+ * bypassed `changeRecord` would also bypass the sweep gate and `PieceSweeper.noteRecordChange`.
+ */
+export interface BlobResponsibleRecords {
+	/** The scope of `ref`'s `responsible` hold, or undefined. */
+	responsibleScope(ref: BlobRef): Promise<BlobScope | undefined>;
+	/** Every reference whose record holds `responsible`. */
+	responsibleRefs(): Promise<BlobRef[]>;
+	/** Remove the `responsible` hold; a record left with no hold is deleted and the blob swept. No record, or no such hold, is a no-op. Flushed. */
+	releaseResponsible(ref: BlobRef): Promise<void>;
+}
+
 /** One cache-only blob as the cache budget sees it. */
 export interface CachedBlob {
 	readonly ref: BlobRef;
@@ -185,7 +202,7 @@ export interface LocalBlobServiceInit {
  * no cohort. It also reads its own pins back ({@link BlobPinIndex}) and offers the cache budget its
  * door onto the blobs held only for reads ({@link BlobCacheRecords}).
  */
-export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIndex, BlobCacheRecords {
+export class LocalBlobService implements BlobService, BlobOwedRecords, BlobResponsibleRecords, BlobPinIndex, BlobCacheRecords {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -463,13 +480,13 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 		await this.records.flush();
 	}
 
-	/** The scope of `ref`'s `responsible` hold, or undefined. A malformed record throws BlobRecordFormatError. */
+	/** {@link BlobResponsibleRecords.responsibleScope}. A malformed record throws BlobRecordFormatError. */
 	async responsibleScope(ref: BlobRef): Promise<BlobScope | undefined> {
 		return responsibleHoldOf(await this.records.get(ref))?.scope;
 	}
 
 	/**
-	 * Every ref whose record holds `responsible`. A record that fails to decode is logged
+	 * {@link BlobResponsibleRecords.responsibleRefs}. A record that fails to decode is logged
 	 * (`record:unreadable`) and skipped.
 	 *
 	 * NOTE: reads every record ({@link readableRecords}), which is acceptable for the start-up
@@ -484,6 +501,17 @@ export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIn
 			}
 		}
 		return refs;
+	}
+
+	/**
+	 * {@link BlobResponsibleRecords.releaseResponsible}, `releaseOwed`'s mirror. Flushed for the same
+	 * reason: a lost release only costs a blob kept one restart longer, but the two paths should not
+	 * differ for no reason. The bytes are left to the piece sweep only when no other hold remains, so a
+	 * node that also pinned or cached the blob keeps it.
+	 */
+	async releaseResponsible(ref: BlobRef): Promise<void> {
+		await this.changeRecord(ref, recordAfterResponsibleRelease);
+		await this.records.flush();
 	}
 
 	/** {@link BlobOwedRecords.holdOwed}. */
@@ -826,6 +854,15 @@ function recordAfterOwedRelease(current: BlobRecord | undefined): BlobRecord | u
 		return undefined;
 	}
 	const holds = current.holds.filter(hold => hold.kind !== 'owed');
+	return holds.length === current.holds.length ? current : { ...current, holds };
+}
+
+/** `recordAfterOwedRelease` for the `responsible` hold: the current record unchanged when there is nothing to release. */
+function recordAfterResponsibleRelease(current: BlobRecord | undefined): BlobRecord | undefined {
+	if (current === undefined) {
+		return undefined;
+	}
+	const holds = current.holds.filter(hold => hold.kind !== 'responsible');
 	return holds.length === current.holds.length ? current : { ...current, holds };
 }
 
