@@ -1,4 +1,4 @@
-import type { ITransactor, IKeyNetwork, CollectionId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability } from '@optimystic/db-core';
+import type { ITransactor, IKeyNetwork, CollectionId, IRepo, IBlockChangeNotifier, IBlockDurabilityNotifier, CollectionChangeListener, TransactionSigner, TreeCollectionOptions, ICohortReachability, BlobService } from '@optimystic/db-core';
 import { Tree, NetworkTransactor, isBlockChangeNotifier, isBlockDurabilityNotifier, bytesToB64url } from '@optimystic/db-core';
 import { randomBytes } from '@noble/hashes/utils.js';
 import {
@@ -8,6 +8,10 @@ import {
 	Libp2pKeyPeerNetwork,
 	StorageRepo,
 	MemoryRawStorage,
+	MemoryKVStore,
+	MemoryPieceStore,
+	SingleMachineBlobService,
+	type BlobPinIndex,
 	type ReadCacheLease,
 	withReadCache,
 	signPeer,
@@ -21,10 +25,33 @@ import { createMesh, buildNetworkTransactor } from '@optimystic/db-p2p/testing';
 import type { RowData, ParsedOptimysticOptions, TransactionState } from '../types.js';
 import type { Libp2p } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
+import { addListener } from './listeners.js';
 import { LateBoundCohortReachability } from './late-bound-reachability.js';
 import { compareTreeKeys } from '../schema/key-encoding.js';
 
 const log = createLogger('collection-factory');
+/** One line per blob backend this factory resolves (docs/debugging.md §quereus-plugin sub-namespaces). */
+const blobLog = createLogger('blob');
+
+/**
+ * A blob service that also lets its pins be read back by owner label — which is how a host
+ * inspects what the plugin holds, and how the plugin's own later parts find their pins again after a
+ * restart. Both services the SQL layer can sit on carry it (`NodeBlobService` and
+ * `SingleMachineBlobService` in `packages/db-p2p/src/blob/`).
+ */
+export type SqlBlobBackendService = BlobService & BlobPinIndex;
+
+/** One network's blob store, as the SQL layer needs it. */
+export interface BlobBackend {
+	/** The transactor key (`${transactor}:${keyNetwork}`) this backend belongs to. */
+	readonly key: string;
+	readonly service: SqlBlobBackendService;
+	/**
+	 * The transactor of the same key. Reference trees and the scope registry of this network are read
+	 * and written through it; nothing in this part does either yet.
+	 */
+	readonly transactor: ITransactor;
+}
 
 /**
  * A libp2p node this factory holds. Nodes it builds itself (`createLibp2pNode`) carry the full
@@ -114,6 +141,23 @@ export class CollectionFactory {
    * gate until one is.
    */
   private cohortGates = new Map<string, LateBoundCohortReachability>();
+  /** One blob backend per transactor key, by that key ({@link getBlobBackend}). */
+  private blobBackends = new Map<string, BlobBackend>();
+  /**
+   * Blob-backend resolutions still in flight, by the key {@link blobBackends} will hold them under
+   * — for the reason {@link transactorsInFlight} exists: two tables on one network resolving at
+   * once must share one store of pieces, records and pins. A resolution that fails is not
+   * remembered, so the next caller tries again.
+   */
+  // NOTE: as for {@link transactorsInFlight}, dispose() does not touch this map, so a resolution in
+  // flight across a dispose still lands in `blobBackends` and its service escapes the set dispose
+  // stopped. Same remedy if hosts ever dispose mid-initialization: drop results that settle after.
+  private blobBackendsInFlight = new Map<string, Promise<BlobBackend>>();
+  /** The single-machine services this factory BUILT, so {@link dispose} can stop them. A `network`
+   * backend's service belongs to its node and is stopped by {@link shutdown}. */
+  private singleMachineBlobServices = new Set<SingleMachineBlobService>();
+  /** Told once per backend, the first time it resolves ({@link onBlobBackendResolved}). */
+  private blobBackendListeners = new Set<(backend: BlobBackend) => void>();
 
   /**
    * Set the refusal callback every tree opened from now on carries (see {@link sealedRefusedListener}).
@@ -296,6 +340,100 @@ export class CollectionFactory {
   }
 
   /**
+   * The blob store of the network `options` binds to (docs/blobs.md §SQL), created on first use and
+   * then shared by every table and every `SqlBlobService` on that transactor key — so one network
+   * means one set of pieces, one set of blob records and one set of pins.
+   *
+   * Where the blobs live:
+   *
+   *  - **`network`**: the node's own service, `node.blobs`, over `NodeOptions.pieceStorage` and the
+   *    blob records in `NodeOptions.kvStore`. A node a host injected through
+   *    {@link registerLibp2pNode} may carry none (the attachments are optional), and then this falls
+   *    through to the single-machine arm.
+   *  - **everything else** (`local`, `test`, `mesh-test`, a custom transactor): a
+   *    `SingleMachineBlobService` over `options.blobStorageFactory`, or over memory when none is
+   *    given. Its cohort is this machine alone, so a committed reference's durability stays `local`.
+   *
+   * Concurrent callers for one key share a single resolution ({@link blobBackendsInFlight}); a
+   * resolution that fails is not remembered, so the next caller tries again. Resolution always goes
+   * through {@link getOrCreateTransactor} — the backend carries that transactor, and for `network`
+   * it is also what builds or reuses the node.
+   */
+  async getBlobBackend(options: ParsedOptimysticOptions): Promise<BlobBackend> {
+    const key = this.getTransactorKey(options);
+    const resolved = this.blobBackends.get(key);
+    if (resolved) return resolved;
+
+    let inFlight = this.blobBackendsInFlight.get(key);
+    if (!inFlight) {
+      inFlight = this.resolveBlobBackend(key, options)
+        .then(backend => {
+          this.blobBackends.set(key, backend);
+          this.announceBlobBackend(backend);
+          return backend;
+        })
+        .finally(() => this.blobBackendsInFlight.delete(key));
+      this.blobBackendsInFlight.set(key, inFlight);
+    }
+    return await inFlight;
+  }
+
+  /**
+   * Be told about each blob backend once: for every backend already resolved, at once as this is
+   * called, and then for each one that resolves later. Returns an idempotent unsubscribe.
+   *
+   * The replay of the already-resolved backends is what makes this safe to subscribe at any point:
+   * a listener that reconciles each network's pins (`feat-sql-columns-hold-blob-references`) must
+   * see every network, not only the ones whose first table came after it subscribed. A listener
+   * that throws is logged and does not disturb the resolution reporting to it.
+   */
+  onBlobBackendResolved(listener: (backend: BlobBackend) => void): () => void {
+    const unsubscribe = addListener(this.blobBackendListeners, listener);
+    for (const backend of [...this.blobBackends.values()]) {
+      this.callBlobBackendListener(listener, backend);
+    }
+    return unsubscribe;
+  }
+
+  private announceBlobBackend(backend: BlobBackend): void {
+    for (const listener of [...this.blobBackendListeners]) {
+      this.callBlobBackendListener(listener, backend);
+    }
+  }
+
+  private callBlobBackendListener(listener: (backend: BlobBackend) => void, backend: BlobBackend): void {
+    try {
+      listener(backend);
+    } catch (error) {
+      blobLog('blob:backend-listener-threw key=%s %o', backend.key, error);
+    }
+  }
+
+  private async resolveBlobBackend(key: string, options: ParsedOptimysticOptions): Promise<BlobBackend> {
+    // Also what builds or reuses the node a `network` backend reads its blob service off.
+    const transactor = await this.getOrCreateTransactor(options);
+    const nodeInfo = options.transactor === 'network'
+      ? this.libp2pNodes.get(this.getNodeKey(options))
+      : undefined;
+    const nodeBlobs = nodeInfo?.node.blobs;
+    if (nodeBlobs !== undefined) {
+      return { key, service: nodeBlobs, transactor };
+    }
+    // The two ways here, and an operator reading one of them wants to know which: no node at all
+    // (every transactor but `network`, and a `network` transactor a host registered directly) is the
+    // configuration working as intended; a node that carries no blob service is a host-injected one
+    // that cannot hold blobs for its network.
+    const reason = nodeInfo === undefined ? 'transactor-has-no-node' : 'node-without-blobs';
+    const service = new SingleMachineBlobService(
+      options.blobStorageFactory?.() ?? { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
+    );
+    service.start();
+    this.singleMachineBlobServices.add(service);
+    blobLog('blob:backend-single-machine key=%s reason=%s', key, reason);
+    return { key, service, transactor };
+  }
+
+  /**
    * Subscribe to per-collection change notifications for `collectionId` on the
    * transactor resolved from `options`, keeping the network-vs-local resolution
    * inside the factory (where transactor construction already lives).
@@ -379,6 +517,12 @@ export class CollectionFactory {
     let nodeInfo = this.libp2pNodes.get(nodeKey);
 
     if (!nodeInfo) {
+      // NOTE: no `pieceStorage` and no `kvStore`, so the plugin's own node keeps blob pieces and
+      // blob records in memory and loses them on restart — every pin with them, after which the
+      // next sweep deletes the pieces (the node logs its own `node-wiring` warning for each). A
+      // host that needs them persistent THROUGH the plugin has no option for it today: thread
+      // `blobStorageFactory` into this call's `pieceStorage` and `kvStore` when one does. A host
+      // that builds its own node and registers it with `registerLibp2pNode` already can.
       const node = await createLibp2pNode({
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
@@ -894,9 +1038,19 @@ export class CollectionFactory {
     this.readCacheLeases = [];
     const watches = [...this.networkWatches];
     this.networkWatches.clear();
+    // The single-machine blob services this factory built ({@link getBlobBackend}). Their sweep
+    // timer is unref'd, so this is hygiene rather than a leak — but a service nobody stops can run
+    // a sweep against a store the host has since closed. A `network` backend's service belongs to
+    // the node and is stopped by {@link shutdown}.
+    const blobServices = [...this.singleMachineBlobServices];
+    this.singleMachineBlobServices.clear();
+    this.blobBackends.clear();
     this.transactors.clear();
     for (const watch of watches) {
       await watch.close();
+    }
+    for (const service of blobServices) {
+      await service.stop();
     }
     for (const lease of leases) {
       await lease.release();

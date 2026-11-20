@@ -1,6 +1,6 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
-import type { IRawStorage, NodeOptions } from '@optimystic/db-p2p';
+import type { IKVStore, IPieceStore, IRawStorage, NodeOptions } from '@optimystic/db-p2p';
 import type { TransactionWriteFacts } from './optimystic-adapter/write-description.js';
 
 /**
@@ -34,6 +34,18 @@ export interface OptimysticOptions {
    * transactor types.
    */
   rawStorageFactory?: () => IRawStorage;
+
+  /**
+   * For a transactor with no libp2p node (`local`, `test`, `mesh-test`, a custom transactor):
+   * where blob pieces and blob records live (docs/blobs.md §SQL). Defaults to both in memory.
+   * Has no effect for `network`, whose blobs live in the node's own store.
+   *
+   * Both or neither should be persistent. A persistent piece store over in-memory records loses
+   * every pin at restart and the next sweep then deletes every piece; persistent records over
+   * in-memory pieces report blobs the machine cannot serve, which `stat` corrects. The plugin
+   * cannot tell whether an `IKVStore` is persistent, so neither case is refused.
+   */
+  blobStorageFactory?: () => { pieces: IPieceStore; kv: IKVStore };
 }
 
 /**
@@ -78,6 +90,7 @@ export interface ParsedOptimysticOptions {
   cache: boolean;
   encoding: 'json' | 'msgpack';
   rawStorageFactory?: () => IRawStorage;
+  blobStorageFactory?: () => { pieces: IPieceStore; kv: IKVStore };
 }
 
 /**

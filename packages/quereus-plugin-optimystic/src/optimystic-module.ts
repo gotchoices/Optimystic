@@ -14,7 +14,7 @@ import type { DescriptionVerdict, StaleVerdict, TableDescriptionCheck } from './
 import type { MainTreeDescription, MainTreeKeys, TableCollectionDescription, TableOutlookSource, UniqueIndexDescription } from './optimystic-adapter/commit-outlook.js';
 import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAcceptsEqualRow } from './optimystic-adapter/write-description.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
-import type { IRawStorage } from '@optimystic/db-p2p';
+import type { IKVStore, IPieceStore, IRawStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, equalityServesKeyColumn, rangeServesKeyColumn, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
@@ -651,7 +651,7 @@ export function defaultTransactorOf(aux: Readonly<Record<string, unknown>>): str
 function resolveBinding(
   args: Readonly<Record<string, SqlValue>>,
   aux: Readonly<Record<string, unknown>>,
-): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'rawStorageFactory'> {
+): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'rawStorageFactory' | 'blobStorageFactory'> {
   const transactor = (args['transactor'] as string) || defaultTransactorOf(aux);
   const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
   const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
@@ -659,6 +659,11 @@ function resolveBinding(
   // Plugin-level only (not exposed via per-table USING args because it's a function reference).
   const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
     ? (aux['rawStorageFactory'] as () => IRawStorage)
+    : undefined;
+  // Plugin-level only for the same reason. Where blobs live for a transactor with no libp2p node
+  // (`CollectionFactory.getBlobBackend`); see `OptimysticOptions.blobStorageFactory`.
+  const blobStorageFactory = typeof aux['blobStorageFactory'] === 'function'
+    ? (aux['blobStorageFactory'] as () => { pieces: IPieceStore; kv: IKVStore })
     : undefined;
   return {
     transactor,
@@ -671,6 +676,7 @@ function resolveBinding(
       cohortTopic: declaredCohortTopic(aux),
     },
     rawStorageFactory,
+    blobStorageFactory,
   };
 }
 
@@ -4991,6 +4997,17 @@ export class OptimysticVirtualTable extends VirtualTable {
   }
 
   /**
+   * How this table reaches storage — the transactor, key network, libp2p options and storage
+   * factories {@link resolveBinding} settled at construction. Exposed so the plugin can resolve
+   * the blob backend of the network a named table uses
+   * ({@link OptimysticModule.bindingOptionsOfTable}, `plugin.blobsFor`). Fixed for the life of the
+   * instance, so reading it needs no initialization.
+   */
+  get bindingOptions(): ParsedOptimysticOptions {
+    return this.options;
+  }
+
+  /**
    * Whether this instance owes the catalog its description, and so whether its next initialization
    * writes it. Cleared once a full initialization has; see {@link forgiveCatalogRecord} for the
    * other way out.
@@ -6524,6 +6541,48 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       const collection = registry.get(id);
       return collection === undefined ? [] : [collection];
     });
+  }
+
+  /**
+   * How a table declared with no `using` clause reaches storage: the session's `default_vtab_args`
+   * and the plugin's registration config, resolved the one way every path resolves a binding
+   * ({@link resolveBinding}). Resolved on each call rather than at registration, because a host may
+   * set the session's `default_vtab_args` after `register` returns.
+   *
+   * The `collectionUri` is the plugin catalog's and means nothing to a caller that only wants the
+   * binding — a blob backend reads the transactor, the key network and the libp2p options and
+   * nothing else (`plugin.blobs`, `CollectionFactory.getBlobBackend`).
+   */
+  defaultBindingOptions(db: Database, config: Record<string, SqlValue>): ParsedOptimysticOptions {
+    return this.deriveDefaultOptions(config, this.sessionDefaultVtabArgs(db));
+  }
+
+  /**
+   * How `schemaName.tableName` reaches storage ({@link OptimysticVirtualTable.bindingOptions}).
+   * Instantiates the table from the engine's catalog entry on this process's first touch of it, as
+   * {@link connect} would, but does NOT initialize it: the binding is fixed at construction, so
+   * nothing has to be read to answer this.
+   *
+   * Throws a `QuereusError` for a table neither this module's cache nor the engine's catalog knows,
+   * and for a catalog table another module owns — resolving that one would build an Optimystic
+   * instance over somebody else's table, as {@link verifyIndexes} explains.
+   */
+  async bindingOptionsOfTable(db: Database, tableName: string, schemaName = 'main'): Promise<ParsedOptimysticOptions> {
+    const catalogEntry = db.schemaManager.findTable(tableName, schemaName);
+    if (catalogEntry && !this.ownsTable(db, catalogEntry)) {
+      throw new QuereusError(
+        `'${schemaName}.${tableName}' is not an Optimystic table (module '${catalogEntry.vtabModuleName}').`,
+        StatusCode.ERROR,
+      );
+    }
+    const resolved = await this.lookupOrInstantiate(db, schemaName, tableName);
+    if (!resolved) {
+      throw new QuereusError(
+        `Optimystic table '${schemaName}.${tableName}' not found.`,
+        StatusCode.ERROR,
+      );
+    }
+    return resolved.table.bindingOptions;
   }
 
   /**

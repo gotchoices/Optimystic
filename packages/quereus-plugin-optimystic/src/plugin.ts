@@ -6,7 +6,7 @@
  */
 
 import type { Database, SqlValue } from '@quereus/quereus';
-import { FunctionFlags, TEXT_TYPE } from '@quereus/quereus';
+import { FunctionFlags, INTEGER_TYPE, TEXT_TYPE } from '@quereus/quereus';
 import { CollectionFactory } from './optimystic-adapter/collection-factory.js';
 import { TransactionBridge } from './optimystic-adapter/txn-bridge.js';
 import { OfflineMode } from './optimystic-adapter/offline-mode.js';
@@ -18,6 +18,8 @@ import { OptimysticModule, defaultTransactorOf } from './optimystic-module.js';
 import { BLOBREF_TYPE } from './schema/blobref-type.js';
 import { createStampIdFunction } from './functions/transaction-id.js';
 import { createCommitOutlookFunction } from './functions/commit-outlook.js';
+import { createBlobLocalityFunction, createBlobSizeFunction } from './functions/blob-functions.js';
+import { SqlBlobService } from './optimystic-adapter/sql-blob-service.js';
 import { createLogger } from './logger.js';
 
 const log = createLogger('plugin');
@@ -48,6 +50,10 @@ export type {
 	QueuedTransactionStatus, QueuedTransaction, TransactionOutcome, OfflineModeState, QueuedFailureReason,
 } from './optimystic-adapter/offline-status.js';
 export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } from './optimystic-adapter/commit-outlook.js';
+// Blobs (README § Large values — the `blobref` column type; docs/blobs.md §SQL): the service type
+// `plugin.blobs` and `plugin.blobsFor` hand out, and the backend one network's tables share.
+export { SqlBlobService } from './optimystic-adapter/sql-blob-service.js';
+export type { BlobBackend, SqlBlobBackendService } from './optimystic-adapter/collection-factory.js';
 
 /**
  * Plugin registration function
@@ -85,6 +91,18 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 	// Create the StampId and CommitOutlook functions
 	const stampIdFunc = createStampIdFunction(txnBridge);
 	const commitOutlookFunc = createCommitOutlookFunction(txnBridge, offline);
+	// The blob service of the DEFAULT network (docs/blobs.md §SQL). Its binding is derived on each
+	// use, not here, because a host may set the session's `default_vtab_args` after `register`
+	// returns — and because resolving it builds the libp2p node of a `network` transactor, which must
+	// not happen merely because the plugin was registered.
+	const blobs = new SqlBlobService(
+		() => collectionFactory.getBlobBackend(optimysticModule.defaultBindingOptions(db, config)),
+		txnBridge,
+	);
+	// Both functions read the default network: a scalar function has no table context. A host with
+	// tables on several networks reads `stat` through `plugin.blobsFor(table)` instead.
+	const blobLocalityFunc = createBlobLocalityFunction(blobs);
+	const blobSizeFunc = createBlobSizeFunction(blobs);
 
 	// Note: Transaction hooks are handled by the virtual table's begin, commit, rollback methods
 
@@ -132,6 +150,38 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 					implementation: commitOutlookFunc,
 				},
 			},
+			{
+				schema: {
+					name: 'BlobLocality',
+					numArgs: 1,
+					// Not DETERMINISTIC: the answer changes as bytes move between machines. See
+					// `createBlobLocalityFunction` for why neither function's value may be written into a row.
+					flags: FunctionFlags.UTF8,
+					isAsync: true,
+					returnType: {
+						typeClass: 'scalar' as const,
+						logicalType: TEXT_TYPE,
+						nullable: true,
+						isReadOnly: true,
+					},
+					implementation: blobLocalityFunc,
+				},
+			},
+			{
+				schema: {
+					name: 'BlobSize',
+					numArgs: 1,
+					flags: FunctionFlags.UTF8,
+					isAsync: true,
+					returnType: {
+						typeClass: 'scalar' as const,
+						logicalType: INTEGER_TYPE,
+						nullable: true,
+						isReadOnly: true,
+					},
+					implementation: blobSizeFunc,
+				},
+			},
 		],
 		collations: [],
 		// The `blobref` column type (README § Large values — the `blobref` column type). The
@@ -144,6 +194,35 @@ export default function register(db: Database, config: Record<string, SqlValue> 
 		// Expose internal components for testing and advanced usage
 		collectionFactory,
 		txnBridge,
+		/**
+		 * The blob service of the plugin's DEFAULT network — the one a table declared with no
+		 * `using` clause binds to (docs/blobs.md §SQL; README § Large values). `put` a stream to
+		 * get a reference a `blobref` column can hold, `read` it back, `stat` it. The network is
+		 * resolved on first use, so a host may still set the session's `default_vtab_args`.
+		 *
+		 * A blob put through this is PINNED and stays pinned: this release releases nothing, not on
+		 * rollback and not on commit (`feat-blob-pins-follow-sql-commits` closes that), so an
+		 * application that puts blobs here holds every one of them.
+		 */
+		blobs,
+		/**
+		 * The blob service of the network `table` uses. Rejects for a table that is not a known
+		 * Optimystic table. A reference means something only in the network whose machines hold the
+		 * bytes, so a host with tables on several networks goes through this rather than
+		 * {@link blobs}.
+		 *
+		 * A fresh wrapper per call, and NOT reference-equal to `plugin.blobs` even for the default
+		 * network: the wrapper is thin and the sharing is in `CollectionFactory.getBlobBackend`, so
+		 * two wrappers over one network read the same blob records, hold the same pins and each
+		 * receive the same events. Compare networks, never these objects.
+		 */
+		blobsFor: async (table: string, schema?: string): Promise<SqlBlobService> => {
+			// Resolved once here so a bad table name rejects THIS call rather than the service's first
+			// use; the binding itself is fixed at the table's construction, so re-reading it per use
+			// would answer the same thing.
+			const options = await optimysticModule.bindingOptionsOfTable(db, table, schema);
+			return new SqlBlobService(() => collectionFactory.getBlobBackend(options), txnBridge);
+		},
 		/**
 		 * Hydrate Quereus's in-memory catalog from persisted Optimystic vtab
 		 * schemas, then put the offline queue's journaled transactions back

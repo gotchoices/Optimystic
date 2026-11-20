@@ -1,0 +1,235 @@
+/**
+ * The blob service an application holds: `plugin.blobs` and `plugin.blobsFor(table)`
+ * (docs/blobs.md §SQL).
+ */
+
+import type {
+	BlobDurabilityEvent,
+	BlobFetchOptions,
+	BlobProgressEvent,
+	BlobPutOptions,
+	BlobPutResult,
+	BlobReadOptions,
+	BlobRef,
+	BlobScope,
+	BlobStat,
+} from '@optimystic/db-core';
+import type { BlobBackend, SqlBlobBackendService } from './collection-factory.js';
+import { transactionPutPinLabel, unstagedPinLabel } from './blob-pin-labels.js';
+import { addListener, notifyListeners } from './listeners.js';
+import type { TransactionBridge } from './txn-bridge.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('blob');
+
+/**
+ * One network's blob store, resolved on first use, with `put`'s owner label defaulted from the
+ * bridge's open transaction.
+ *
+ * Thin by design. The sharing happens in `CollectionFactory.getBlobBackend`, so two of these over
+ * one network are NOT reference-equal and yet read the same blob records, hold the same pins, and
+ * (each through its own forwarding listener) receive the same progress and durability events. A
+ * host should not compare `plugin.blobs` with `plugin.blobsFor(table)` for identity.
+ *
+ * Resolution is lazy because a host may set the session's `default_vtab_args` after `register`
+ * returns, and because resolving the default network of a `network` transactor builds the libp2p
+ * node — which must not happen merely because the plugin was registered.
+ */
+export class SqlBlobService implements SqlBlobBackendService {
+	private readonly progressListeners = new Set<(event: BlobProgressEvent) => void>();
+	private readonly durabilityListeners = new Set<(event: BlobDurabilityEvent) => void>();
+	/** The backend's unsubscribes, held while this has listeners of that kind and the backend resolved. */
+	private releaseProgress: (() => void) | undefined;
+	private releaseDurability: (() => void) | undefined;
+	private backend: BlobBackend | undefined;
+	/** A resolution started by {@link startResolving} alone, so a burst of subscriptions starts one. */
+	private resolving = false;
+	private readonly now: () => number;
+
+	/**
+	 * @param resolve The network's backend. Called on each use until one resolves; a resolution that
+	 *   fails is not remembered by the factory, so a later call retries.
+	 * @param bridge Whose open transaction names the default pin owner of a `put`.
+	 */
+	constructor(
+		private readonly resolve: () => Promise<BlobBackend>,
+		private readonly bridge: TransactionBridge,
+		now: () => number = Date.now,
+	) {
+		this.now = now;
+	}
+
+	/**
+	 * Store a stream as a blob on this network, pinned so it cannot be swept.
+	 *
+	 * The pin's owner label is the caller's `owner` when it gave one. Otherwise it names the
+	 * transaction open when the put STARTS — `sql/<stampId>/put` — and `sql-unstaged/<ms>` when none
+	 * is. Decided at the start, not when the put resolves: a put that outlives its transaction keeps
+	 * the label it began under, and reconciling such a stray pin is
+	 * `feat-sql-columns-hold-blob-references`' work.
+	 *
+	 * Nothing in this release releases a pin, so a blob put here is held until something unpins it:
+	 * a rollback of the transaction the put was made in does NOT release it, and neither does a
+	 * commit. `feat-blob-pins-follow-sql-commits` closes that.
+	 */
+	async put(source: AsyncIterable<Uint8Array>, options?: BlobPutOptions): Promise<BlobPutResult> {
+		const owner = options?.owner ?? this.defaultPinOwner();
+		const { service } = await this.backendNow();
+		return await service.put(source, { ...options, owner });
+	}
+
+	/** What THIS machine knows about a blob; `probe` asks the blob's cohort, on a network backend. */
+	async stat(ref: BlobRef, options?: { probe?: boolean }): Promise<BlobStat> {
+		const { service } = await this.backendNow();
+		return await service.stat(ref, options);
+	}
+
+	/** The bytes, or a range of them, in order; fetches what is not here unless told not to. */
+	async *read(ref: BlobRef, options?: BlobReadOptions): AsyncIterable<Uint8Array> {
+		const { service } = await this.backendNow();
+		yield* service.read(ref, options);
+	}
+
+	/** Bring the whole blob here ahead of a read. */
+	async fetch(ref: BlobRef, options?: BlobFetchOptions): Promise<void> {
+		const { service } = await this.backendNow();
+		await service.fetch(ref, options);
+	}
+
+	async pin(ref: BlobRef, owner: string): Promise<void> {
+		const { service } = await this.backendNow();
+		await service.pin(ref, owner);
+	}
+
+	async unpin(ref: BlobRef, owner: string): Promise<void> {
+		const { service } = await this.backendNow();
+		await service.unpin(ref, owner);
+	}
+
+	/** Tell the blob's cohort that committed state now references it, and where. On a single-machine
+	 * backend there is no cohort to tell: the blob is kept here and its durability recorded `local`. */
+	async announce(ref: BlobRef, scope: BlobScope): Promise<void> {
+		const { service } = await this.backendNow();
+		await service.announce(ref, scope);
+	}
+
+	/** The owner labels pinned on `ref` IN THIS MACHINE's blob records, not the network's; `[]` when
+	 * this machine holds no readable record for it. This plugin's labels are built and read in
+	 * `blob-pin-labels.ts`. */
+	async pinsOf(ref: BlobRef): Promise<string[]> {
+		const { service } = await this.backendNow();
+		return await service.pinsOf(ref);
+	}
+
+	/** Every (reference, owner) pin in THIS MACHINE's blob records whose owner label starts with
+	 * `ownerPrefix`, in no promised order. */
+	async *listPins(ownerPrefix: string): AsyncIterable<{ ref: BlobRef; owner: string }> {
+		const { service } = await this.backendNow();
+		yield* service.listPins(ownerPrefix);
+	}
+
+	/**
+	 * Fetch progress for one reference. The first subscription starts resolving the backend; a
+	 * listener subscribed before it resolves still hears everything after it, and an unsubscribe
+	 * before it resolves leaves nothing attached. Idempotent unsubscribe.
+	 */
+	onProgress(listener: (event: BlobProgressEvent) => void): () => void {
+		const unsubscribe = addListener(this.progressListeners, listener);
+		this.attachProgress();
+		return () => {
+			unsubscribe();
+			if (this.progressListeners.size === 0) {
+				this.releaseProgress?.();
+				this.releaseProgress = undefined;
+			}
+		};
+	}
+
+	/** A blob's durability class, as it is first recorded and as it changes. Same discipline as
+	 * {@link onProgress}. */
+	onDurability(listener: (event: BlobDurabilityEvent) => void): () => void {
+		const unsubscribe = addListener(this.durabilityListeners, listener);
+		this.attachDurability();
+		return () => {
+			unsubscribe();
+			if (this.durabilityListeners.size === 0) {
+				this.releaseDurability?.();
+				this.releaseDurability = undefined;
+			}
+		};
+	}
+
+	/** The transaction open NOW names the pin; see {@link put}. */
+	private defaultPinOwner(): string {
+		const current = this.bridge.getCurrentTransaction();
+		return current?.isActive === true
+			? transactionPutPinLabel(current.stampId)
+			: unstagedPinLabel(this.now());
+	}
+
+	private async backendNow(): Promise<BlobBackend> {
+		const backend = await this.resolve();
+		this.adoptBackend(backend);
+		return backend;
+	}
+
+	/**
+	 * Take the resolved backend and attach whichever forwarders have listeners waiting. Called on
+	 * every resolution: re-adopting the same object changes nothing, since the backend of one
+	 * network is one object for as long as it lives.
+	 *
+	 * A DIFFERENT object means the factory was disposed and built this network a fresh store
+	 * (`CollectionFactory.dispose` forgets its backends and stops the services it built), so the
+	 * forwarders move with it — otherwise this service's listeners would stay subscribed to a
+	 * stopped service and hear nothing again.
+	 */
+	private adoptBackend(backend: BlobBackend): void {
+		if (this.backend !== backend) {
+			this.releaseProgress?.();
+			this.releaseProgress = undefined;
+			this.releaseDurability?.();
+			this.releaseDurability = undefined;
+			this.backend = backend;
+		}
+		this.attachProgress();
+		this.attachDurability();
+	}
+
+	private attachProgress(): void {
+		if (this.releaseProgress !== undefined || this.progressListeners.size === 0) return;
+		const backend = this.backend;
+		if (backend === undefined) {
+			this.startResolving();
+			return;
+		}
+		this.releaseProgress = backend.service.onProgress(event => {
+			notifyListeners(this.progressListeners, event, error => log('blob:progress-listener-threw %o', error));
+		});
+	}
+
+	private attachDurability(): void {
+		if (this.releaseDurability !== undefined || this.durabilityListeners.size === 0) return;
+		const backend = this.backend;
+		if (backend === undefined) {
+			this.startResolving();
+			return;
+		}
+		this.releaseDurability = backend.service.onDurability(event => {
+			notifyListeners(this.durabilityListeners, event, error => log('blob:durability-listener-threw %o', error));
+		});
+	}
+
+	/**
+	 * Resolve the backend for its events alone, so a listener subscribed before anything else
+	 * touched this network still hears what happens on it. A failure is logged and nothing is
+	 * remembered: the listener stays in its set, {@link resolving} is cleared, and the next
+	 * subscription (or any other use of this service) tries again.
+	 */
+	private startResolving(): void {
+		if (this.resolving) return;
+		this.resolving = true;
+		void this.backendNow()
+			.catch(error => log('blob:backend-resolution-failed %o', error))
+			.finally(() => { this.resolving = false; });
+	}
+}

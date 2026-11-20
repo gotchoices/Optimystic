@@ -55,6 +55,24 @@ export type { CommitOutlook, Exposure, OutlookDependency, UncheckedDecision } fr
 // `BLOBREF_TYPE` with `db.registerType`, and `isBlobRefColumn` tells whether a column is one.
 export { BLOBREF_TYPE, BLOBREF_TYPE_NAME, isBlobRefColumn } from './schema/blobref-type.js';
 
+// The blob service `plugin.blobs` and `plugin.blobsFor(table)` hand out (docs/blobs.md §SQL), and
+// the per-network backend every table and service on one transactor key shares. Exported from
+// `./plugin` too. A host needs none of this to USE the services — only to name their types.
+export { SqlBlobService } from './optimystic-adapter/sql-blob-service.js';
+export type { BlobBackend, SqlBlobBackendService } from './optimystic-adapter/collection-factory.js';
+// The owner labels the plugin holds blob pins under, and the parser that reads one back — for a
+// host inspecting `plugin.blobs.pinsOf(ref)` or `listPins(prefix)`, which answer raw labels.
+export {
+	TRANSACTION_PIN_PREFIX,
+	UNSTAGED_PIN_PREFIX,
+	parsePinLabel,
+	transactionPinPrefix,
+	transactionPutPinLabel,
+	transactionReferencePinLabel,
+	unstagedPinLabel,
+} from './optimystic-adapter/blob-pin-labels.js';
+export type { ParsedPinLabel } from './optimystic-adapter/blob-pin-labels.js';
+
 // Export schema utilities
 export { RowCodec, type EncodedRow, type PrimaryKeyValue, type EncodingFormat } from './schema/row-codec.js';
 

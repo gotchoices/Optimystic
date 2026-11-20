@@ -101,7 +101,7 @@ Primary keys should be TEXT for ordered/range performance; other types (INTEGER,
 
 ### Large values — the `blobref` column type
 
-The plugin registers one column type of its own, **`blobref`**: text whose value must be a *blob reference* — the short content identifier (59 characters of lowercase base32) that names a large stored file held outside the row, outside transactions and outside the wire. See [docs/blobs.md §SQL](../../docs/blobs.md#sql) for the whole design; this is its first part, so the type exists and the service that produces references does not yet.
+The plugin registers one column type of its own, **`blobref`**: text whose value must be a *blob reference* — the short content identifier (59 characters of lowercase base32) that names a large stored file held outside the row, outside transactions and outside the wire. See [docs/blobs.md §SQL](../../docs/blobs.md#sql) for the whole design; this is its first two parts — the type, and the service an application puts files through.
 
 ```sql
 create table Attachment (
@@ -116,6 +116,36 @@ create table Attachment (
 - **How it compares.** As the text it is stored as, under BINARY. So an index on the column is an ordinary text index and serves `order by` by walking, and a `collate` other than BINARY is *refused* on such a column rather than silently ignored — the type's comparison does not consult a collation.
 - **A host registering the plugin's parts by hand must register `plugin.types` too**, not only `vtables` and `functions` — `for (const t of plugin.types) db.registerType(t.name, t.definition)`. `registerPlugin` does it for you. The type registry is process-wide, so one registration serves every `Database` in the process.
 - **A table with such a column refuses to open — and refuses to be written — without the type.** It is never read as a `blob` column instead: the name contains "BLOB", so the fallback type rules would make it one, and a `blob` column's row codec base64-*decodes* every stored string. Both refusals name the table and the column, and say to register the type. The write refusal matters as much as the open one: a process missing the type that re-declared the table, or added such a column to it, would otherwise persist "these rows are `blob`" over rows written as `blobref`, and then no process could open the table — not even one that has the type. The same applies to a build that predates the type.
+
+#### Putting and reading the bytes — `plugin.blobs`
+
+`plugin.blobs` is the blob service of the plugin's **default** network — the one a table declared with no `using` clause binds to. `put` a stream to get the reference a `blobref` column holds, and `read` it back:
+
+```typescript
+const { ref, size } = await plugin.blobs.put(fileStream);
+await db.exec('insert into Attachment (Id, Name, ByteSize, Content) values (?, ?, ?, ?)', [id, name, size, ref]);
+for await (const bytes of plugin.blobs.read(ref)) { /* … */ }
+```
+
+- **A reference means something only in the network whose machines hold the bytes.** `plugin.blobsFor(table)` is the service of the network a given table uses; use it instead of `plugin.blobs` when your tables are on more than one. It rejects for a table that is not a known Optimystic table. Each call returns a **fresh** object, and it is not reference-equal to `plugin.blobs` even for the default network — the wrapper is thin and the store behind it is shared per network, so two services over one network read the same blob records, hold the same pins and each receive the same events. Compare networks, never these objects.
+- **The network is resolved on first use**, not when `register` returns, so you may still set the session's `default_vtab_args` afterwards — and registering the plugin does not by itself build the libp2p node of a `network` transactor.
+- **A transactor with no libp2p node** (`local`, `test`, `mesh-test`, or one of your own) gets a single-machine service: it stores, reads, pins and sweeps exactly as a node's does, but its cohort is this machine alone, so a reference's durability stays `local` and nothing is ever copied elsewhere. Where its pieces and blob records live is `blobStorageFactory` (see *Plugin-Level Configuration*), in memory by default.
+- **Every blob you put is pinned, and this release releases nothing.** The pin names the transaction open when the put started, or `unstaged` when there was none, and it survives that transaction's commit **and** its rollback. So an application that puts blobs through this release holds every one of them until it unpins them itself (`plugin.blobs.unpin(ref, owner)`; `pinsOf(ref)` and `listPins(prefix)` show what this machine holds). Releasing a pin when its transaction settles is the next part of the design.
+
+#### `BlobLocality(ref)` and `BlobSize(ref)`
+
+Two SQL functions report what **this machine** knows about a reference, from its own blob records:
+
+```sql
+select Id, Name, BlobLocality(Content) as Locality, BlobSize(Content) as Bytes from Attachment;
+```
+
+- **`BlobLocality(ref)`** answers `'here'`, `'partial'`, `'elsewhere'` or `'unknown'` — the last for a reference this machine knows nothing of, which is an ordinary state and not an error.
+- **`BlobSize(ref)`** answers the blob's size in bytes, or NULL while its root piece is not here.
+- **Neither waits on the network.** They are answered from local records with no probe, which is also why neither is deterministic: the answer changes as bytes move.
+- **NULL in gives NULL** from both. Anything that is not a canonical reference — a malformed string, or a value that is not a string — is a type mismatch, with the reason in the message.
+- **Both read the DEFAULT network**, because a scalar function has no table context. With tables on several networks, read `plugin.blobsFor(table).stat(ref)` instead.
+- **Do not write either into a row.** A member re-executing the statement computes its own machine's answer, which is a different value.
 
 ## Transactions
 
@@ -561,6 +591,7 @@ The `register(db, config)` call accepts plugin-level defaults (consumed via the 
 | `link_round_trip_ms` | The slowest round trip, in milliseconds, between any two nodes that will talk to each other, relayed hops included. The node the plugin builds derives every network deadline from it, including the dial, cancel and overall write deadlines of the plugin's own transactor; see `linkRoundTripMs` under *Slow relayed links* in [the db-p2p readme](../db-p2p/readme.md). Unset keeps the LAN deadlines. A table on a node the host registered takes those deadlines from that node instead. Plugin-level only: it configures the node, which every table on one network and port shares. |
 | `cohort_topic` | The node's cohort-topic substrate, passed through as `cohortTopic` to the node the plugin builds (`NodeOptions.cohortTopic` in `@optimystic/db-p2p`): an object with a boolean `enabled`, plus the node's optional `wantK` and `host` tuning. Enabling it is what lets a table tagged `"optimystic.network_watch" = true` hear other machines' commits (see *Network change notification*). Anything without a boolean `enabled` is refused. Has no effect on a node the host registered. Plugin-level only, like `link_round_trip_ms`. |
 | `rawStorageFactory` | `() => IRawStorage` — supplies the raw storage backing the `'local'` transactor. Defaults to in-memory `MemoryRawStorage`. Hosts can plug in persistent storage (e.g. RN/MMKV). Function-typed, so it can only be passed via `register()`, not in a `USING` clause. |
+| `blobStorageFactory` | `() => { pieces: IPieceStore; kv: IKVStore }` — where blob pieces and blob records live for a transactor with no libp2p node (`'local'`, `'test'`, `'mesh-test'`, or one of your own). Defaults to both in memory. Make them both persistent or neither: persistent pieces over in-memory records lose every pin at restart and the next sweep then deletes the pieces, while persistent records over in-memory pieces report blobs the machine cannot serve (`stat` corrects that as it finds it). The plugin cannot tell whether a store is persistent, so neither case is refused. Has no effect on a `'network'` transactor, whose blobs live in the node's own store — for which the plugin's own node has no option today, so build the node yourself with `NodeOptions.pieceStorage` and `kvStore` and register it. Function-typed, so `register()` only. |
 | `cost_profile` | How slow these tables are to read, as the query planner prices them (Quereus's `costProfile`). A hint only: it changes plans, never results. By default it follows `default_transactor`: `'network'` (also the default when `default_transactor` is unset) declares Quereus's `'distributed'` category, since a read can leave the machine and a coordinator may consult its cohort before answering; every other transactor declares nothing, which plans like in-process memory. Give either a preset name — `'memory'`, `'localDisk'`, `'browserIdb'`, `'network'` or `'distributed'` — or, through `register()` only, an object `{ firstRowLatencyMs?, perRowLatencyMs? }` in milliseconds, for example `{ ...COST_PRESETS.network, perRowLatencyMs: 0.02 }` with `COST_PRESETS` from `@quereus/quereus`. It replaces the default entirely; an empty string or `null` counts as unset. An unknown name, another key, or a field that is not a finite, non-negative number is refused by `register`. Override it when the default is wrong for you: a small group whose nodes each hold every block reads from its own replica at local speed (consider `'localDisk'` or `'network'`); `'local'` over persistent `rawStorageFactory` storage should declare `'localDisk'` (a file, LevelDB, SQLite, MMKV) or `'browserIdb'` (IndexedDB); a host-registered transactor should declare its own category. It applies to every table registered through this plugin, whichever transactor a table names. |
 
 ```typescript
@@ -590,7 +621,10 @@ Restart*), then closes the network watches of tables tagged `optimystic.network_
 (each would otherwise keep renewing its cohort registration until the node stops), stops
 following commits for [`onCommitFullyHeld`](#when-a-pending-commit-becomes-fully-held--pluginoncommitfullyheldlistener)
 (releasing its subscription to the node's full-replication events and forgetting every commit
-still pending), and releases the plugin's claim on the read cache that sits in front of your
+still pending), stops the single-machine blob services it built for transactors with no libp2p
+node (each runs a periodic sweep, which must not run against a store you have closed — a
+`'network'` transactor's blob service belongs to its node and is stopped with the node), and
+releases the plugin's claim on the read cache that sits in front of your
 `rawStorageFactory` storage. That cache is **one per backing store per process**, shared by
 every `Database` registered over the same store — which is what lets two `Database`s over one
 directory see each other's committed writes — and it is only cleared once the last claim on it
