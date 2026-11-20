@@ -2,22 +2,29 @@ import { expect } from 'chai';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { pushable } from 'it-pushable';
+import * as lp from 'it-length-prefixed';
+import { toString as u8ToString } from 'uint8arrays/to-string';
 import type { PeerId } from '@libp2p/interface';
-import type { ActionId, CommitRequest, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
+import type { ActionId, ActionRev, BlockContentDigests, CommitRequest, IBlock, BlockId, BlockHeader } from '@optimystic/db-core';
 import { canonicalBlockHash, jsonEncodedBytes, MAX_BLOCK_BYTES } from '@optimystic/db-core';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
 import { StorageRepo } from '../src/storage/storage-repo.js';
 import {
 	BlockTransferService,
 	BlockTransferClient,
+	pushBlockToPeers,
 	sourceBlockCertification,
+	type BlockTransferRequest,
+	type BlockTransferResponse,
 	type BlockTransferServiceInit,
 	type IBlockReplicaStore,
 	type PushCertification,
 } from '../src/cluster/block-transfer-service.js';
+import type { BlockCommitProof } from '../src/cluster/commit-proof.js';
+import { MAX_BLOCK_MESSAGE_BYTES } from '../src/protocol-limits.js';
 import { ResponseTimeoutError, RESPONSE_TIMEOUT_ERROR_CODE } from '../src/protocol-client.js';
 import { makeSignedProof } from './support/commit-proof-fixtures.js';
-import { makeLinkedPair } from './support/linked-duplex-pair.js';
+import { makeLinkedPair, type LinkedStream } from './support/linked-duplex-pair.js';
 
 /**
  * Default-suite (no env gate) regression for the block-transfer request→response
@@ -71,8 +78,57 @@ const certifiedSource = async (blockId: string, block: IBlock, source: { rev: nu
 	return await sourceBlockCertification(sourceRepo, blockId as BlockId, read[blockId]);
 };
 
+/**
+ * A source repo holding EVERY block of one commit at `source`, each certified by that commit's
+ * single proof — what a node looks like after a multi-block transaction, and the only shape in
+ * which a per-(peer, commit) proof reference is observable.
+ */
+const certifiedCommitSource = async (
+	blocks: Record<string, IBlock>, source: ActionRev
+): Promise<{ repo: StorageRepo; proof: BlockCommitProof }> => {
+	const blockIds = Object.keys(blocks) as BlockId[];
+	const blockDigests: BlockContentDigests = {};
+	for (const id of blockIds) {
+		blockDigests[id] = { digest: await canonicalBlockHash(blocks[id]!) };
+	}
+	const commit: CommitRequest = {
+		actionId: source.actionId, blockIds, tailId: blockIds[0]!, rev: source.rev, blockDigests
+	};
+	const { proof } = await makeSignedProof(4, commit);
+	const repo = new StorageRepo(new MemoryRawStorage());
+	for (const id of blockIds) {
+		await repo.saveReplicatedBlock(id, blocks[id]!, source, proof);
+	}
+	return { repo, proof };
+};
+
 /** Mirrors `support/commit-proof-fixtures.ts`'s `PROOF_THRESHOLDS.superMajorityThreshold`. */
 const SUPER_MAJORITY = 0.75;
+
+/**
+ * `stream` with every frame it READS copied into `into` — what that side of the pair received, in
+ * order. Copied rather than retained by reference, so the framing decoder downstream cannot consume
+ * what the test will later decode again.
+ */
+const teeReads = (stream: LinkedStream, into: Uint8Array[]): LinkedStream => ({
+	...stream,
+	async *[Symbol.asyncIterator]() {
+		for await (const chunk of stream) {
+			into.push(new Uint8Array(typeof chunk?.subarray === 'function' ? chunk.subarray() : chunk));
+			yield chunk;
+		}
+	}
+});
+
+/** The JSON values carried by captured length-prefixed frames, decoded as the real peer decodes them. */
+const decodeFrames = async <T>(chunks: Uint8Array[]): Promise<T[]> => {
+	const out: T[] = [];
+	const source = (async function* () { yield* chunks; })();
+	for await (const msg of lp.decode(source, { maxDataLength: MAX_BLOCK_MESSAGE_BYTES })) {
+		out.push(JSON.parse(u8ToString(msg.subarray(), 'utf8')) as T);
+	}
+	return out;
+};
 
 /**
  * Wires a real BlockTransferService into a mock peerNetwork. The registrar captures
@@ -100,15 +156,24 @@ function makeWiredNetwork(repo: IBlockReplicaStore, init: BlockTransferServiceIn
 	// end-to-end tests at the bottom pass the strict default explicitly.
 	const service = new BlockTransferService(
 		{ registrar: registrar as any, repo, superMajorityThreshold: SUPER_MAJORITY }, init);
+	// Every frame each side READ, across all the connections of one test: the requests the service
+	// actually received and the responses the client actually got back. A test about the wire shape
+	// has to assert on these rather than on a log line.
+	const requestChunks: Uint8Array[] = [];
+	const responseChunks: Uint8Array[] = [];
 	const peerNetwork = {
 		async connect(_peerId: PeerId, _protocol: string, _options?: any) {
 			const { clientStream, serverStream } = makeLinkedPair();
 			// Run the handler concurrently; a handler error aborts its own server stream.
-			void Promise.resolve().then(() => handler?.(serverStream)).catch(() => { /* isolated */ });
-			return clientStream;
+			void Promise.resolve().then(() => handler?.(teeReads(serverStream, requestChunks))).catch(() => { /* isolated */ });
+			return teeReads(clientStream, responseChunks);
 		},
 	};
-	return { service, peerNetwork };
+	const received = {
+		requests: () => decodeFrames<BlockTransferRequest>(requestChunks),
+		responses: () => decodeFrames<BlockTransferResponse>(responseChunks),
+	};
+	return { service, peerNetwork, received };
 }
 
 describe('BlockTransfer round trip (registered handler + real stream)', () => {
@@ -280,6 +345,95 @@ describe('BlockTransfer round trip (registered handler + real stream)', () => {
 			const result = await repo.get({ blockIds: [blockId as BlockId] });
 			expect(result[blockId]?.state?.latest, 'persisted at the source revision').to.deep.equal(source);
 			expect(jsonEncodedBytes(result[blockId]?.block), 'and whole').to.equal(MAX_BLOCK_BYTES);
+		} finally {
+			await service.stop();
+		}
+	});
+
+	/**
+	 * A proof lists every block of its commit, so carrying it beside each block made copying one
+	 * commit of N blocks to one peer put N copies of the same proof on the wire. These two pin the
+	 * contract that replaces that: the first block of a commit carries the proof, every later block
+	 * NAMES it, and a peer that cannot resolve the name says so and is sent the proof.
+	 *
+	 * Both drive the real `pushBlockToPeers` — the one push loop every sender runs — against a real
+	 * `BlockTransferService` on the strict default, and assert on the frames that crossed.
+	 */
+	it('a second block of one commit names the proof the peer already holds instead of carrying it', async function () {
+		this.timeout(10000);
+		const source = { rev: 7, actionId: 'rt-ref-a7' as ActionId };
+		const [first, second] = ['rt-ref-1', 'rt-ref-2'];
+		const { repo: sourceRepo, proof } = await certifiedCommitSource(
+			{ [first!]: makeBlock(first!), [second!]: makeBlock(second!) }, source);
+
+		const { service, peerNetwork, received } = makeWiredNetwork(repo, {});
+		await service.start();
+		try {
+			const peer = (await makePeerId()).toString();
+			const firstPush = await pushBlockToPeers(sourceRepo, peerNetwork as any, first as BlockId, [peer]);
+			const secondPush = await pushBlockToPeers(sourceRepo, peerNetwork as any, second as BlockId, [peer]);
+
+			expect(firstPush.status === 'pushed' && firstPush.confirmed, 'the first block lands').to.deep.equal([peer]);
+			expect(secondPush.status === 'pushed' && secondPush.confirmed, 'and so does the second').to.deep.equal([peer]);
+
+			const requests = await received.requests();
+			expect(requests.length, 'one request per block — the reference cost no second round trip').to.equal(2);
+			expect(requests[0]!.blockProofs?.[first!], 'the first block of the commit carries the proof').to.not.be.undefined;
+			expect(requests[0]!.proofRefs, 'and names nothing').to.be.undefined;
+			expect(requests[1]!.proofRefs, 'the second block names the proof instead').to.deep.equal({ [second!]: proof.messageHash });
+			expect(requests[1]!.blockProofs, 'and carries no proof at all').to.be.undefined;
+			expect(requests[1]!.blockMeta?.[second!], 'the revision metadata still travels').to.deep.equal(source);
+
+			// Both revisions landed CERTIFIED on the receiver, which is what makes the reference a
+			// saving rather than a regression to proof-less replication.
+			for (const id of [first!, second!]) {
+				expect(await repo.getBlockProof(id as BlockId, source.rev), `${id} retained the proof`).to.deep.equal(proof);
+			}
+		} finally {
+			await service.stop();
+		}
+	});
+
+	it('a reference the receiver cannot resolve is reported back, and the retry carries the proof inline', async function () {
+		this.timeout(10000);
+		const source = { rev: 7, actionId: 'rt-unref-a7' as ActionId };
+		const [first, second] = ['rt-unref-1', 'rt-unref-2'];
+		const { repo: sourceRepo, proof } = await certifiedCommitSource(
+			{ [first!]: makeBlock(first!), [second!]: makeBlock(second!) }, source);
+
+		// Persists blocks exactly as a real node does, but resolves no reference — which is what a
+		// restarted peer, an evicted sender memory and a never-retaining holder all look like from
+		// the sender's side.
+		const unresolving: IBlockReplicaStore = {
+			saveReplicatedBlock: (blockId, block, src, verifiedProof) =>
+				repo.saveReplicatedBlock(blockId, block, src, verifiedProof),
+			getCommitProof: async () => undefined,
+		};
+
+		const { service, peerNetwork, received } = makeWiredNetwork(unresolving, {});
+		await service.start();
+		try {
+			const peer = (await makePeerId()).toString();
+			// The first push is what makes the sender believe this peer holds the proof.
+			await pushBlockToPeers(sourceRepo, peerNetwork as any, first as BlockId, [peer]);
+			const secondPush = await pushBlockToPeers(sourceRepo, peerNetwork as any, second as BlockId, [peer]);
+
+			expect(secondPush.status === 'pushed' && secondPush.confirmed,
+				'the retry places the block').to.deep.equal([peer]);
+
+			const requests = await received.requests();
+			const answers = await received.responses();
+			expect(requests.length, 'the named push, then one retry').to.equal(3);
+			expect(requests[1]!.proofRefs, 'the second block was pushed by reference first')
+				.to.deep.equal({ [second!]: proof.messageHash });
+			expect(answers[1]!.unresolvedProofs, 'which this receiver could not resolve, and said so')
+				.to.deep.equal([proof.messageHash]);
+			expect(answers[1]!.missing, 'so the strict-default receiver refused the block').to.deep.equal([second]);
+			expect(requests[2]!.blockProofs?.[second!], 'and the retry carries the proof itself').to.not.be.undefined;
+			expect(requests[2]!.proofRefs, 'naming nothing this time').to.be.undefined;
+
+			expect(await repo.getBlockProof(second as BlockId, source.rev),
+				'the block landed certified on the retry').to.deep.equal(proof);
 		} finally {
 			await service.stop();
 		}

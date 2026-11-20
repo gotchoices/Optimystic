@@ -2080,6 +2080,24 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 	}
 
 	/**
+	 * The {@link BlockCommitProof} this node retained for the consensus message that hashes to
+	 * `messageHash`, however many blocks that commit covered — one record per message, which is how
+	 * a proof is stored (`IRawStorage.getCommitProof`).
+	 *
+	 * Public because a push may NAME a proof instead of carrying it, for a peer that has already
+	 * been shown it (`BlockTransferRequest.proofRefs`); `BlockTransferService.handlePush` resolves
+	 * the reference through here. Keyed by the message alone, so any block of the commit having
+	 * landed is enough — and what the resolved proof actually certifies is still decided by the same
+	 * `certifyContent` call an inline proof goes through.
+	 *
+	 * Read-only and unlatched, for the reason {@link getBlockProof} is: a proof is written once and
+	 * never mutated.
+	 */
+	async getCommitProof(messageHash: string): Promise<BlockCommitProof | undefined> {
+		return await this.storage.getCommitProof(messageHash);
+	}
+
+	/**
 	 * @param declaredBaseRev The committed revision of the base the WRITER applied this block's
 	 * transform to, as declared in the commit op's `blockDigests[blockId].baseRev`. Untrusted wire
 	 * data, so it is typed `unknown` and validated in {@link guardCommitBase} — where it is the

@@ -13,6 +13,7 @@ import { certifyContent, proofThresholds } from './certified-claims.js';
 import type { BlockCommitProof, ProofThresholds } from './commit-proof.js';
 import { servableProof, type ArchiveServingRepo } from '../storage/block-archive.js';
 import type { BlockHoldersSink } from './cluster-repo.js';
+import { peerProofMemoryFor } from './peer-proof-memory.js';
 import { registerProtocolHandler } from '../network/register-protocol-handler.js';
 
 const log = createLogger('block-transfer-service');
@@ -65,7 +66,36 @@ export interface BlockTransferRequest {
 	 * ACCEPTED is the receiver's `requirePushCertificate` decision (default: reject).
 	 */
 	blockProofs?: Record<string, BlockCommitProof>;
+	/**
+	 * Per block, the `messageHash` of the proof that certifies it — a reference the receiver resolves
+	 * out of its own commit-proofs store, used instead of carrying the proof in {@link blockProofs}
+	 * when the sender has already shown this peer that proof. A reference the receiver cannot resolve
+	 * is answered in {@link BlockTransferResponse.unresolvedProofs}, and the sender re-pushes the
+	 * block with the proof inline.
+	 *
+	 * Keyed by block id, like {@link blockProofs}, because a reference is a per-block statement ("the
+	 * proof for THIS block is the one you filed under H"). A block id present in both maps takes the
+	 * inline proof.
+	 *
+	 * Why references at all: a proof carries its consensus message verbatim, and that message's
+	 * commit operation lists every block id and declared digest of the commit — so a proof's size
+	 * grows with the commit's block count, and copying all N blocks of one commit to one peer used to
+	 * put N copies of the same proof on the wire.
+	 *
+	 * A reference says nothing on its own: the resolved proof is verified against the declared
+	 * `(rev, actionId)` and the pushed bytes by the same `certifyContent` call an inline proof goes
+	 * through, so a reference extends the sender no trust it did not already have.
+	 */
+	proofRefs?: Record<BlockId, string>;
 }
+
+/**
+ * The most characters a {@link BlockTransferRequest.proofRefs} entry may have before the receiver
+ * refuses to key a store read on it. A `messageHash` is a base58btc multihash of about fifty
+ * characters, so this is generous for every honest sender while keeping an unauthenticated peer from
+ * making this node look up an arbitrarily large value.
+ */
+const MAX_PROOF_REF_CHARS = 256;
 
 /**
  * The `blockMeta` a pusher sends alongside one block: the source's own `state.latest`, so the
@@ -114,6 +144,13 @@ export function sourceBlockMeta(
 export type PushCertification = {
 	blockMeta?: Record<string, ActionRev>;
 	blockProofs?: Record<string, BlockCommitProof>;
+	/**
+	 * Names the proof instead of carrying it — see {@link BlockTransferRequest.proofRefs}. Never
+	 * built by {@link sourceBlockCertification}, which has no peer to project for: it is set by
+	 * {@link pushBlockToPeers} as the per-peer projection of the `blockProofs` entry for the one peer
+	 * being pushed to.
+	 */
+	proofRefs?: Record<BlockId, string>;
 };
 
 /**
@@ -167,6 +204,16 @@ export interface BlockTransferResponse {
 	accepted: string[];
 	/** Block IDs the receiver did not persist: absent, not a block, uncertified, or a persist fault. */
 	missing: string[];
+	/**
+	 * Message hashes this request REFERENCED ({@link BlockTransferRequest.proofRefs}) that this
+	 * receiver could not resolve. Its presence is the sender's cue to re-push the affected block with
+	 * the proof inline; absence of a referenced hash from this list means the receiver resolved it.
+	 *
+	 * Distinct from {@link missing}, which lists BLOCK ids. A block can be accepted and its reference
+	 * still unresolved (a receiver running `requirePushCertificate: false` takes the block
+	 * uncertified), so a sender must read this list independently of `missing`.
+	 */
+	unresolvedProofs?: string[];
 }
 
 // --- Service (server-side handler) ---
@@ -189,6 +236,18 @@ export interface IBlockReplicaStore {
 	 * holder that can only corroborate.
 	 */
 	saveReplicatedBlock(blockId: BlockId, block: IBlock, source?: ActionRev, verifiedProof?: BlockCommitProof): Promise<void>;
+
+	/**
+	 * The proof stored under a consensus message's hash (`BlockCommitProof.messageHash`) — how a push
+	 * that NAMED a proof instead of carrying it ({@link BlockTransferRequest.proofRefs}) is resolved.
+	 *
+	 * Optional so existing test doubles and a plain embedder keep compiling. Absent, every reference
+	 * is answered {@link BlockTransferResponse.unresolvedProofs} and the sender re-pushes with the
+	 * proof inline, which is exactly the behaviour before references existed, plus one round trip per
+	 * block — logged distinctly (`push:proof-ref-no-store`) so the misconfiguration is diagnosable
+	 * rather than merely slow.
+	 */
+	getCommitProof?(messageHash: string): Promise<BlockCommitProof | undefined>;
 }
 
 export interface BlockTransferServiceInit extends InboundStreamAuthorizationInit {
@@ -364,6 +423,14 @@ export class BlockTransferService implements Startable {
 	 * {@link BlockTransferServiceInit.requirePushCertificate} for the migration flag and its
 	 * rationale.
 	 *
+	 * **A named proof is resolved first** ({@link resolveProof}): a push may NAME the proof by its
+	 * message hash instead of carrying it, when the sender has already shown this node that proof.
+	 * Nothing after the resolution differs — the resolved proof goes through the same
+	 * `certifyContent` call, so one presented for a block or revision it does not certify fails
+	 * `claim-not-in-message` exactly as an inline one would. A reference this node cannot resolve is
+	 * reported in {@link BlockTransferResponse.unresolvedProofs} and the block then takes the path it
+	 * takes with no proof at all.
+	 *
 	 * Decisions are strictly PER BLOCK: in a multi-block push a block that verifies is accepted
 	 * beside one that does not.
 	 *
@@ -378,6 +445,8 @@ export class BlockTransferService implements Startable {
 	private async handlePush(request: BlockTransferRequest, senderPeerId?: string): Promise<BlockTransferResponse> {
 		const accepted: string[] = [];
 		const missing: string[] = [];
+		/** Deduplicated: several blocks of one commit reference one hash. */
+		const unresolvedProofs = new Set<string>();
 
 		if (!request.blocks) {
 			return { accepted: [], missing: request.blockIds };
@@ -397,7 +466,7 @@ export class BlockTransferService implements Startable {
 			// Certify BEFORE persisting: `saveReplicatedBlock` advances `latest`, so anything that
 			// reaches it becomes this node's authoritative revision.
 			const source = request.blockMeta?.[blockId];
-			const proof = request.blockProofs?.[blockId];
+			const proof = await this.resolveProof(request, blockId, unresolvedProofs);
 			let verifiedProof: BlockCommitProof | undefined;
 			if (proof !== undefined) {
 				if (!source) {
@@ -456,7 +525,57 @@ export class BlockTransferService implements Startable {
 		}
 
 		this.reportSenderHolds(accepted, senderPeerId);
-		return { accepted, missing };
+		return {
+			accepted, missing,
+			...(unresolvedProofs.size > 0 ? { unresolvedProofs: [...unresolvedProofs] } : {})
+		};
+	}
+
+	/**
+	 * The proof certifying `blockId` in this request: the inline one
+	 * ({@link BlockTransferRequest.blockProofs}), else the one a reference
+	 * ({@link BlockTransferRequest.proofRefs}) names, resolved out of this node's own commit-proofs
+	 * store — which holds the proof of every commit any of whose blocks this node has accepted.
+	 *
+	 * A reference this node cannot resolve is added to `unresolved`, the sender's cue to re-push the
+	 * block with the proof inline; the block itself then takes exactly the path it takes with no
+	 * proof at all (refused under the default `requirePushCertificate`, accepted uncertified under
+	 * the migration flag).
+	 *
+	 * Called from {@link handlePush} BEFORE its `proof-without-meta` guard, so a reference without
+	 * `blockMeta` is refused for the same reason an inline proof without meta is.
+	 */
+	private async resolveProof(
+		request: BlockTransferRequest, blockId: string, unresolved: Set<string>
+	): Promise<BlockCommitProof | undefined> {
+		const inline = request.blockProofs?.[blockId];
+		if (inline !== undefined) return inline;
+		const ref: unknown = request.proofRefs?.[blockId];
+		if (ref === undefined) return undefined;
+		// Typed and bounded BEFORE any store read: this value comes from an unauthenticated peer and
+		// is about to be used as a store key. An unusable reference is not echoed back in
+		// `unresolvedProofs` — no honest sender produces one, and echoing would return the peer its
+		// own junk at its own chosen size.
+		if (typeof ref !== 'string' || ref.length === 0 || ref.length > MAX_PROOF_REF_CHARS) {
+			log('push:proof-ref-invalid block=%s type=%s chars=%d',
+				blockId, typeof ref, typeof ref === 'string' ? ref.length : 0);
+			return undefined;
+		}
+		if (typeof this.repo.getCommitProof !== 'function') {
+			log('push:proof-ref-no-store block=%s ref=%s (this store resolves no references — every push costs a second round trip)',
+				blockId, ref);
+			unresolved.add(ref);
+			return undefined;
+		}
+		try {
+			const resolved = await this.repo.getCommitProof(ref);
+			if (resolved !== undefined) return resolved;
+			log('push:proof-ref-unknown block=%s ref=%s', blockId, ref);
+		} catch (error) {
+			log('push:proof-ref-read-failed block=%s ref=%s err=%s', blockId, ref, (error as Error).message);
+		}
+		unresolved.add(ref);
+		return undefined;
 	}
 
 	/**
@@ -512,7 +631,8 @@ export class BlockTransferClient extends ProtocolClient {
 	 *   and the cohort commit proof for that same revision, built as one unit by
 	 *   {@link sourceBlockCertification}. Without a proof the receiver rejects the block under its
 	 *   default `requirePushCertificate: true`; without metadata it replicates at a deterministic
-	 *   rev-1 (and rejects any proof, which then covers nothing).
+	 *   rev-1 (and rejects any proof, which then covers nothing). A `proofRefs` entry NAMES the proof
+	 *   instead of carrying it — see {@link BlockTransferRequest.proofRefs}.
 	 * @param options Optional per-call deadlines/cancellation forwarded to the
 	 *   underlying request. `dialTimeoutMs` bounds connecting; `responseTimeoutMs`
 	 *   bounds waiting for the reply once connected (so a peer that connects but goes
@@ -529,7 +649,8 @@ export class BlockTransferClient extends ProtocolClient {
 		const request: BlockTransferRequest = {
 			blockIds: Object.keys(blocks), reason, blocks,
 			...(certification?.blockMeta ? { blockMeta: certification.blockMeta } : {}),
-			...(certification?.blockProofs ? { blockProofs: certification.blockProofs } : {})
+			...(certification?.blockProofs ? { blockProofs: certification.blockProofs } : {}),
+			...(certification?.proofRefs ? { proofRefs: certification.proofRefs } : {})
 		};
 		return await this.processMessage<BlockTransferResponse>(request, this.protocol, { ...options, maxDataLength: MAX_BLOCK_MESSAGE_BYTES, maxRequestBytes: MAX_BLOCK_MESSAGE_BYTES });
 	}
@@ -608,6 +729,18 @@ export interface PushBlockOptions {
  * `repo` is the node's OWN store, so the read never consults the cluster and the certification
  * comes from the proof this node retained; a repo without a proof accessor pushes meta-only
  * (`certified: false`), which a default-configured receiver refuses.
+ *
+ * **A proof crosses the wire once per (peer, commit).** A proof lists every block of its commit, so
+ * carrying it with each block made copying one commit to one peer cost N copies of it. The first
+ * block of a commit pushed to a peer carries the proof; the rest NAME it by its message hash
+ * ({@link BlockTransferRequest.proofRefs}), which the receiver resolves out of the commit-proofs
+ * store it filed the proof in. Which proofs each peer has been shown is the sender's own bounded
+ * memory, keyed on `repo` — see {@link peerProofMemoryFor}. A peer that cannot resolve a reference
+ * says so ({@link BlockTransferResponse.unresolvedProofs}) and the block is pushed once more with
+ * the proof inline, so being wrong costs a round trip rather than a placement.
+ *
+ * `PushBlockOutcome.certified` is unchanged by all of this: it still says a proof existed LOCALLY
+ * for this block, whether the push carried it or named it.
  */
 export async function pushBlockToPeers(
 	repo: ArchiveServingRepo,
@@ -628,6 +761,25 @@ export async function pushBlockToPeers(
 	const deadlines = { dialTimeoutMs: options.dialTimeoutMs, responseTimeoutMs: options.responseTimeoutMs };
 	const stopAfter = options.stopAfterConfirmed ?? Number.POSITIVE_INFINITY;
 
+	const blocks = { [blockId]: result.block };
+	// The hash the receiver files this block's proof under — `undefined` when this node retained no
+	// proof, in which case nothing below differs from the pre-reference push.
+	const proofHash = certification.blockProofs?.[blockId]?.messageHash;
+	const shownProofs = peerProofMemoryFor(repo);
+	// Everything the inline certification claims, except that it NAMES the proof instead of carrying
+	// it. Built once: it is the same projection for every peer, and which peers it is sent to is what
+	// the memory decides.
+	//
+	// NOTE: a block whose bytes plus its proof exceed `MAX_BLOCK_MESSAGE_BYTES` (8 MiB; a block may
+	// be up to 7.5 MiB and a large commit's proof over the 512 KiB left over) still fails locally in
+	// `ProtocolClient.processMessage`, by name, surfacing here as `unreachable` — but now only for
+	// the first block per (peer, commit) instead of every one, so the reference path is what makes
+	// the rest of such a commit placeable at all.
+	const byReference: PushCertification | undefined = proofHash === undefined ? undefined : {
+		...(certification.blockMeta ? { blockMeta: certification.blockMeta } : {}),
+		proofRefs: { [blockId]: proofHash }
+	};
+
 	const confirmed: string[] = [];
 	const refusals: PushRefusal[] = [];
 	const skipped: string[] = [];
@@ -638,11 +790,41 @@ export async function pushBlockToPeers(
 		}
 		try {
 			const client = new BlockTransferClient(peerIdFromString(peerIdStr), peerNetwork, options.protocolPrefix);
-			const response = await client.pushBlocks({ [blockId]: result.block }, reason, certification, deadlines);
+			// NOTE: `BlockTransferCoordinator` runs up to `maxConcurrency` (default 4) block pushes in
+			// parallel, so against a cold memory up to that many inline copies of one commit's proof can
+			// be in flight to one peer before the first answer warms it. Bounded, and noise against the
+			// one-copy-per-block this removes. Joining an in-flight push per (peer, hash) — the way
+			// `KvRawStorage.ensureCommitProof` joins an in-flight save — would make it exactly one, at
+			// the cost of serializing concurrent pushes of a commit behind its first block.
+			let named = byReference !== undefined && shownProofs.holds(peerIdStr, proofHash!);
+			let response = await client.pushBlocks(blocks, reason, named ? byReference : certification, deadlines);
+			if (named && response.unresolvedProofs?.includes(proofHash!)) {
+				// The peer does not hold the proof after all — it restarted, never retained one, or its
+				// store resolves no references. Keyed off `unresolvedProofs` and never off `missing`, so a
+				// lenient receiver that took the block uncertified still gets the proof, which
+				// `StorageRepo.saveReplicatedBlock` back-fills onto the revision it just landed. One such
+				// retry per peer per block, and its answer is the peer's answer.
+				shownProofs.forget(peerIdStr, proofHash!);
+				named = false;
+				response = await client.pushBlocks(blocks, reason, certification, deadlines);
+			}
 			if (response.missing.includes(blockId)) {
 				refusals.push({ peerId: peerIdStr, reason: 'rejected' });
 			} else {
 				confirmed.push(peerIdStr);
+				// The peer answered without listing the block, having just been sent the proof itself, so
+				// it holds that proof and every later block of the commit can name it.
+				//
+				// NOTE: a receiver that accepts a block and retains NO proof for it — a diverged holder
+				// whose own materialization contradicts the declared digest, reached through
+				// `saveReplicatedBlock`'s monotonic no-op — is remembered as holding it anyway, so every
+				// later reference for that commit comes back unresolved and each of its blocks costs that
+				// peer two pushes. Bounded, abnormal, and still strictly fewer proof bytes than before.
+				// An exact answer needs the receiver to report what it RETAINED, which
+				// `saveReplicatedBlock` does not return today.
+				if (!named && proofHash !== undefined) {
+					shownProofs.remember(peerIdStr, proofHash);
+				}
 			}
 		} catch (err) {
 			refusals.push({ peerId: peerIdStr, reason: 'unreachable', error: err instanceof Error ? err.message : String(err) });
