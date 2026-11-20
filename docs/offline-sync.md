@@ -704,23 +704,7 @@ message text (backlog `debt-a-downstream-repo-classifies-retries-by-parsing-our-
 | Torn, outcome unknown | `TornActionError` with `final: false` | `submitting`, in doubt; see below |
 | Part of the entry committed | `CoordinatorPartialCommitError` (in `packages/db-core/src/transaction/errors.ts`) | `partially-committed`; see below |
 
-`classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts` sorts an
-error into these rows, as a `CommitFailureClass`. It follows two rules. It reads only an error's
-class and its structured fields (`BlockUnavailableError.reason`, `TornActionError.final`), never its
-message. And it reads only the error it is given, never its `cause`: a commit-phase shortfall still
-reaches a local writer as the `cause` of the transactor's plain `Some peers did not complete`
-aggregate, and that write is in doubt rather than "nothing sent", so it sorts as `unknown`. The
-Quereus bridge's mapped errors are not recognised either; stage 4 classifies the db-core error it
-holds before mapping it. A validator rejection reaches the writer as `ValidityRejectedError` only
-when every member that sank the pend signed it as a judgement of the transaction (expiry votes
-aside) and the coordinator's own storage confirms no revision loss; a validity vote beside any other
-reject stays the unclassified throw it always was, since it may be a stale revision only members
-ahead of the coordinator can see (see "A pend rejection is returned only when it is classified" in
-[internals.md §Consensus Execution](internals.md#consensus-execution)). Anything the drain cannot
-classify (`unknown`) is treated as transient, logged with the entry id, and counted, so an
-unclassified failure is retried rather than silently dropping a change the application was told was
-committed; it is re-sent only under the attempt's own identity (below), and `expireAfterMs` bounds
-how long that can go on.
+`classifyCommitFailure` in `packages/db-core/src/transaction/commit-failure-class.ts` sorts an error into these rows, as a `CommitFailureClass`. It follows two rules. It reads only an error's class and its structured fields (`BlockUnavailableError.reason`, `TornActionError.final`), never its message. And it reads only the error it is given, never its `cause`: a commit-phase shortfall still reaches a local writer as the `cause` of the transactor's `Some peers did not complete` aggregate, and that write is in doubt rather than "nothing sent", so it sorts as `unknown`. That aggregate is a `PeersIncompleteError` (in `packages/db-core/src/transactor/peers-incomplete-error.ts`), whose `phase` field names which transactor operation raised it — `'get'`, `'pend'`, `'commit'` or `'cancel'` — so a consumer no longer has to read the sentence to tell them apart. `classifyCommitFailure` could sort on that field and deliberately does not: a pend-phase transport failure stored nothing while a commit-phase one is in doubt, and choosing that mapping is a decision about drain behaviour rather than a rename, so every phase still sorts as `unknown`. The Quereus bridge's mapped errors are not recognised either; stage 4 classifies the db-core error it holds before mapping it. A validator rejection reaches the writer as `ValidityRejectedError` only when every member that sank the pend signed it as a judgement of the transaction (expiry votes aside) and the coordinator's own storage confirms no revision loss; a validity vote beside any other reject stays the unclassified throw it always was, since it may be a stale revision only members ahead of the coordinator can see (see "A pend rejection is returned only when it is classified" in [internals.md §Consensus Execution](internals.md#consensus-execution)). Anything the drain cannot classify (`unknown`) is treated as transient, logged with the entry id, and counted, so an unclassified failure is retried rather than silently dropping a change the application was told was committed; it is re-sent only under the attempt's own identity (below), and `expireAfterMs` bounds how long that can go on.
 
 ### Identity across attempts
 

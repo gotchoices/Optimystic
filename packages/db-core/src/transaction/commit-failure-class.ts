@@ -68,9 +68,17 @@ export function isCohortUnreachableRead(error: unknown): error is BlockUnavailab
  * - **Type only, never text.** It reads the error's class and the structured fields
  *   `BlockUnavailableError.reason` and `TornActionError.final`, never `message`.
  * - **The error thrown, never its `cause`.** A commit-phase shortfall reaches a local writer nested
- *   as the `cause` of the transactor's plain `Some peers did not complete` aggregate; that write is
- *   in doubt, not "nothing sent", and walking `cause` would sort it as unreachable. A wrapper whose
- *   wrapping means something is its own arm (`CoordinatorPartialCommitError`).
+ *   as the `cause` of the transactor's `Some peers did not complete` aggregate (a
+ *   `PeersIncompleteError`); that write is in doubt, not "nothing sent", and walking `cause` would
+ *   sort it as unreachable. A wrapper whose wrapping means something is its own arm
+ *   (`CoordinatorPartialCommitError`).
+ *
+ * NOTE: those aggregates sort as `unknown`, and deliberately so even though `PeersIncompleteError`
+ * now carries a `phase` this function could sort on. The arms would mean different things to the
+ * offline drain — a `'pend'`-phase transport failure stored nothing, a `'commit'`-phase one is in
+ * doubt — and picking that mapping is a decision about drain behaviour, not a rename. If the drain
+ * ever needs to tell the two apart, sort on `phase` here rather than widening the "never walk
+ * `cause`" rule above.
  *
  * The Quereus bridge's mapped errors (`ConstraintError`, `ConcurrentModificationError`) are not
  * recognised: classify the db-core error before mapping it.

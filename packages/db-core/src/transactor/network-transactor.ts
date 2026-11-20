@@ -22,6 +22,7 @@ import { isRecordEmpty } from "../utility/is-record-empty.js";
 import { type CoordinatorBatch, type RetryBackoff, makeBatchesByPeer, incompleteBatches, everyBatch, allBatches, mergeBlocks, processBatches, createBatchesForPayload, retryWaitWithinBudget, retrySleep } from "../utility/batch-coordinator.js";
 import { abortableDelay, jitteredBackoffMs } from "../utility/backoff.js";
 import { OwedCancels, type OwedCancelClock } from "./owed-cancels.js";
+import { PeersIncompleteError } from "./peers-incomplete-error.js";
 import { createLogger, verbose } from "../logger.js";
 
 const log = createLogger('network-transactor');
@@ -461,9 +462,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					const errMsg = b.request?.isError ? ` cause=${errorMessage(b.request.error)}` : ''
 					return `${b.peerId.toString()}[block:${b.blockId}](${status})${errMsg}`
 				});
-			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
-			(aggregate as any).cause = rootCause;
-			throw aggregate;
+			// NOTE: this sentence and the `[block:` token are a downstream retry discriminator — sereus
+			// `control-write-retry.ts` matches both to decide a failure is safe to re-present. Do not
+			// reword either; see {@link PeersIncompleteError}.
+			throw new PeersIncompleteError('get',
+				`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`, rootCause);
 		}
 		if (unansweredIds.length > 0) {
 			log('get:unanswered blockIds=%o root=%s', unansweredIds, errorMessage(rootCause));
@@ -826,10 +829,11 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 			// surfaced in the aggregate message is the actual coordinator failure, not any
 			// downstream "no coordinator available" thrown by retry lookup.
 			const rootCause = firstBatchError(batches) ?? error;
-			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
-			(aggregate as any).cause = rootCause;
-			(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
-			error = aggregate;
+			// NOTE: this sentence and the `[block:` token are a downstream retry discriminator — sereus
+			// `control-write-retry.ts` matches both to decide a failure is safe to re-present. Do not
+			// reword either; see {@link PeersIncompleteError}.
+			error = new PeersIncompleteError('pend',
+				`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`, rootCause);
 		}
 
 		if (error) { // If any failures, discharge every pending record this pend left behind
@@ -1410,9 +1414,13 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 					return `${b.peerId.toString()}[blocks:${b.payload instanceof Array ? (b.payload as any[]).length : 1}](${status})${extra ? ' ' + extra : ''}${errMsg}`
 				});
 			const rootCause = firstBatchError(batches) ?? error;
-			const aggregate = new Error(`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`);
-			(aggregate as any).cause = rootCause;
-			error = aggregate;
+			// NOTE: this sentence and the `[blocks:` token are a downstream retry discriminator — sereus
+			// `control-write-retry.ts` matches the sentence against `[block:` to single out the retry-safe
+			// read/pend failures, so the plural form here is what keeps a commit failure out of that
+			// bucket. Do not reword the sentence, and do not merge the two token forms; see
+			// {@link PeersIncompleteError}.
+			error = new PeersIncompleteError('commit',
+				`Some peers did not complete: ${details}${rootCause ? `; root: ${rootCause.message}` : ''}`, rootCause);
 		}
 		return { batches, error };
 	};
@@ -1622,12 +1630,15 @@ export class NetworkTransactor implements ITransactor, IBlockChangeNotifier {
 		const stillHeld = new Set(outstanding);
 		this.owedCancels.discharged(actionRef.actionId, requested.filter(bid => !stillHeld.has(bid)));
 		this.owedCancels.record(actionRef.actionId, outstanding, rootCause?.message);
-		const aggregate = new Error(`Cancel of action ${actionRef.actionId} did not discharge ${outstanding.length} block(s): ${outstanding.join(', ')}`
+		// NOTE: do NOT give this aggregate the `Some peers did not complete:` prefix the other three
+		// carry — not for consistency, not for anything. That sentence is sereus
+		// `control-write-retry.ts`'s discriminator for "safe to re-present", and adopting it here would
+		// make an undischarged cancel classify as retry-safe. Its absence is load bearing; see
+		// {@link PeersIncompleteError}.
+		throw new PeersIncompleteError('cancel',
+			`Cancel of action ${actionRef.actionId} did not discharge ${outstanding.length} block(s): ${outstanding.join(', ')}`
 			+ (details ? `; peers: ${details}` : '')
-			+ (rootCause ? `; root: ${rootCause.message}` : ''));
-		(aggregate as any).cause = rootCause;
-		(aggregate as AggregateError).errors = rootCause ? [rootCause] : [];
-		throw aggregate;
+			+ (rootCause ? `; root: ${rootCause.message}` : ''), rootCause);
 	}
 
 	/**

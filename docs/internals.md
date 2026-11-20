@@ -2587,7 +2587,8 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   a downstream repository that matches it. Two consequences of returning rather than throwing: the
   writer's transactor no longer re-picks another coordinator for a shortfall (the accepted-tradeoff
   `NOTE:` in `CoordinatorRepo.pendThroughCluster`), and a local writer meets the error itself rather
-  than as the `cause` of a `Some peers did not complete` aggregate. **A pend answer only:**
+  than as the `cause` of a `Some peers did not complete` aggregate (a `PeersIncompleteError`, phase
+  `'pend'`). **A pend answer only:**
   `CoordinatorRepo.commit` still throws a commit-phase shortfall, because the commit side reads a
   returned refusal as a confirmed conflict (the `NOTE:` at its catch).
   A pend the members that sank it judged invalid (bullet above) comes back as `RejectedFailure`,
@@ -3088,7 +3089,9 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   with no block, the reason the table gives a consult that threw, so the read of that block fails
   typed while the other blocks of the same read are returned. A coordinator that responded and left
   a requested block out is a protocol fault rather than unreachability, and still fails the whole
-  read with its `Some peers did not complete` aggregate.
+  read with its `Some peers did not complete` aggregate — a `PeersIncompleteError` whose `phase` is
+  `'get'` (`packages/db-core/src/transactor/peers-incomplete-error.ts`), so a caller can tell that
+  protocol fault from the four transactor aggregates without reading the sentence.
 
   Note the second row: `'cohort-unreachable'` is *silence from machines this node knows about*, not
   isolation in general. A node whose routing view yields no cohort member at all, and whose

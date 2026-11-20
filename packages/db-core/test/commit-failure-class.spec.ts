@@ -1,7 +1,7 @@
 import { expect } from 'chai'
 import {
-	BlockUnavailableError, KeyBound, KeyRange, PromiseShortfallError, SyncRevisionStalledError, TornActionError,
-	TreeEntryChangedError, TreeKeyTakenError, TreeRangeTakenError, classifyCommitFailure,
+	BlockUnavailableError, KeyBound, KeyRange, PeersIncompleteError, PromiseShortfallError, SyncRevisionStalledError,
+	TornActionError, TreeEntryChangedError, TreeKeyTakenError, TreeRangeTakenError, classifyCommitFailure,
 } from '../src/index.js'
 import type { CommitFailureClass } from '../src/index.js'
 
@@ -47,7 +47,10 @@ const cases: Array<[string, unknown, string]> = [
 	['a torn write proven not saved', torn(true), 'torn-not-saved'],
 	['a torn write of unknown outcome', torn(false), 'in-doubt'],
 	['a plain error carrying the shortfall sentence', new Error(new PromiseShortfallError(shortfall).message), 'unknown'],
-	['an aggregate whose cause is a shortfall', new Error('Some peers did not complete', { cause: new PromiseShortfallError(shortfall) }), 'unknown'],
+	// The real class, not a hand-rolled stand-in: this row exists for the "never walk `cause`" rule,
+	// and pinning it against the aggregate the transactor actually throws is what would fail if
+	// someone later gave `classifyCommitFailure` a `phase` arm.
+	['an aggregate whose cause is a shortfall', new PeersIncompleteError('commit', 'Some peers did not complete', new PromiseShortfallError(shortfall)), 'unknown'],
 ]
 
 describe('classifyCommitFailure', () => {

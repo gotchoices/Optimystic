@@ -6,7 +6,7 @@ import type { Scenario } from './simulation.js'
 import { randomBytes } from '@libp2p/crypto'
 import { routingKeyForBlock } from '../src/network/routing-key.js'
 import type { BlockId, BlockLineage, PendRequest, BlockOperation, ClusterPeers, FindCoordinatorOptions, IKeyNetwork, IRepo, ITransactor, BlockGets, GetBlockResult, GetBlockResults, PendResult, CommitRequest, CommitResult, StaleFailure, ActionId } from '../src/index.js'
-import { BlockUnavailableError, BlockPossiblyStaleError, MAX_TRANSACTION_BYTES, TransactionTooLargeError } from '../src/index.js'
+import { BlockUnavailableError, BlockPossiblyStaleError, MAX_TRANSACTION_BYTES, PeersIncompleteError, TransactionTooLargeError } from '../src/index.js'
 import type { PeerId } from '../src/index.js'
 import { peerIdFromString } from '../src/network/types.js'
 import { toString as uint8ArrayToString } from 'uint8arrays/to-string'
@@ -447,6 +447,10 @@ describe('NetworkTransactor', () => {
         thrown = e
       }
       expect((thrown as Error | undefined)?.message).to.match(/^Some peers did not complete/)
+      // The sentence is a downstream contract (see `PeersIncompleteError`); `phase` is what a
+      // consumer should read instead, and `'get'` means this protocol fault, not unreachability.
+      expect(thrown).to.be.instanceOf(PeersIncompleteError)
+      expect((thrown as PeersIncompleteError).phase).to.equal('get')
     })
 
     // Ticket absence-verdict-names-the-evidence (review pass): the reason now travels out
