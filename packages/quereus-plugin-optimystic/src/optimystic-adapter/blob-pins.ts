@@ -189,7 +189,9 @@ export class SqlBlobPins {
 	 */
 	async queued(held: HeldPins | undefined, transaction: TransactionState): Promise<void> {
 		this.sealedHere.add(transaction.stampId);
-		if (held !== undefined) this.queuedPins.set(held.transactionId, held);
+		// Both keyed by the same expression deliberately: a map keyed differently from its guard would
+		// make the guard skip the listing for a transaction the map cannot answer for.
+		if (held !== undefined) this.queuedPins.set(transaction.stampId, held);
 		await this.releasePuts(transaction);
 	}
 
@@ -264,6 +266,10 @@ export class SqlBlobPins {
 	 */
 	private chained(step: () => Promise<void>): Promise<void> {
 		const run = this.chain.then(async () => {
+			// NOTE: each race leaves one reaction on `disposing`, which settles only at dispose, so a
+			// process that settles very many queued transactions retains one per settle (the
+			// `MaterializedViewFollower` precedent has the same shape, at a far lower rate). Unmeasured;
+			// if a long-lived host ever shows memory growing here, give the wait a waiter it removes.
 			await Promise.race([this.deps.whenTransactionIdle(), this.disposing]);
 			if (this.disposed) return;
 			await step();
@@ -289,6 +295,10 @@ export class SqlBlobPins {
 		// without it a phone holding ten thousand photos would pay ten thousand key-value reads per
 		// offline commit. The listing is the correct general answer and is still needed — a process
 		// that did not seal the entry has nothing in memory — but it is the rare path.
+		//
+		// NOTE: a terminal status delivered TWICE for one transaction takes the listing on the second
+		// pass, since both records were taken on the first; it is correct (it finds nothing) and rare.
+		// `feat-blob-pins-reconcile-after-a-restart`'s `mayHoldStalePins` is where to cut it.
 		const references = held?.references ?? (sealedHere ? [] : await this.listQueuedReferences(transactionId));
 		for (const reference of references) {
 			try {

@@ -28,36 +28,11 @@ import type { SqlValue } from '@quereus/quereus';
 import { BlobReferenceTree, decodeBlobReferenceKey } from '@optimystic/db-core';
 import type { BlobRef, CollectionId, ICohortReachability, ITransactor } from '@optimystic/db-core';
 import { MemoryKVStore, MemoryPieceStore, MemoryRawStorage, type IKVStore, type IPieceStore } from '@optimystic/db-p2p';
+import { PowerLossKVStore } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
 import { parsePinLabel } from '../dist/index.js';
 
 export type Plugin = ReturnType<typeof register>;
-
-/**
- * The journal of a handle's offline queue: a plain map, which is everything the journal asks of a
- * store, handed to every handle over one {@link BlobPinStores} so a restart reads what the last
- * process wrote. NOT a `MemoryKVStore`, which the registration config refuses by name — a journal
- * lost with the process is the no-journal configuration — and this one is deliberately not lost.
- */
-class SharedJournal implements IKVStore {
-	private readonly records = new Map<string, string>();
-
-	async get(key: string): Promise<string | undefined> {
-		return this.records.get(key);
-	}
-
-	async set(key: string, value: string): Promise<void> {
-		this.records.set(key, value);
-	}
-
-	async delete(key: string): Promise<void> {
-		this.records.delete(key);
-	}
-
-	async list(prefix: string): Promise<string[]> {
-		return [...this.records.keys()].filter(key => key.startsWith(prefix));
-	}
-}
 
 /**
  * A reachability gate as a test sets it (`offline-restore.spec.ts`'s own `Gate`): closed keeps every
@@ -97,7 +72,11 @@ export function createStores(): BlobPinStores {
 	return {
 		storage: new MemoryRawStorage(),
 		blobs: { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
-		journal: new SharedJournal(),
+		// A `PowerLossKVStore` no test ever crashes is a plain durable map, which is everything the
+		// journal asks of a store. NOT a `MemoryKVStore`, which the registration config refuses by
+		// name — a journal lost with the process is the no-journal configuration — and this one is
+		// deliberately not lost.
+		journal: new PowerLossKVStore(),
 	};
 }
 

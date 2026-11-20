@@ -48,7 +48,7 @@ describe('a queued transaction\'s blob pins settle with it', function () {
 		const stores = createStores();
 		// Unreachable, so the entry the commit seals stays queued and its pin can be observed before
 		// the drain settles it.
-		let handle = openPlugin(stores, { reachable: false });
+		const handle = openPlugin(stores, { reachable: false });
 		try {
 			const { db, plugin } = handle;
 			await db.exec(TABLE_DDL(uri));

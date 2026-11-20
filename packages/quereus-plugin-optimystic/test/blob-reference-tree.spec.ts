@@ -17,7 +17,9 @@
  *    match the rows.
  *  - **Racing writers**: a loser refused on one row leaves no reference entry behind, and two
  *    writers referencing one blob from different rows both land.
- *  - **The registry**: a created table's scope is listed, a dropped one's is not.
+ *  - **The registry**: a created table's scope is listed, a dropped one's is not, and the check-only
+ *    reading a settling blob pin asks (`BlobScopeRegistration.isRegistered`) answers each of its
+ *    three readings — listed, certainly not listed, and cannot say — without writing anything.
  *  - **The two refusals** that keep the tree describing real rows: a re-declare that changes or
  *    omits a `blobref` column, and a DROP COLUMN of one.
  *
@@ -508,24 +510,39 @@ describe('a table\'s blob reference tree follows its rows', function () {
 		}
 	});
 
-	it('a created table\'s scope is in the registry and a dropped one\'s is not', async () => {
+	it('a created table\'s scope is in the registry and a dropped one\'s is not, and the check-only reading agrees', async () => {
 		const withRefs = 'tree://blobrefs/registry-refs';
 		const without = 'tree://blobrefs/registry-plain';
 		const storage = new MemoryRawStorage();
 		const { db, plugin } = createDb(storage);
 		try {
-			await db.exec(`create table T (Id integer primary key, R1 blobref null) using optimystic('${withRefs}')`);
+			// The table with no blobref column first, so the registry has never been written when the
+			// check-only reading is asked its first question.
 			await db.exec(`create table U (Id integer primary key, V text) using optimystic('${without}')`);
 			const transactor = await transactorOf(plugin, storage);
+			// `isRegistered` is what a settling blob pin asks about a scope no table in this process
+			// backs any more, and its answer decides whether that pin is RELEASED — so the bytes a
+			// dropped table's rows referenced ride on this mapping (`SqlBlobPins.scopeState`).
+			const binding = { key: 'local:test', transactor };
+			expect(await plugin.collectionFactory.blobScopes.isRegistered(binding, scopeOf(withRefs)),
+				'a registry that has never been written cannot answer: keep the pin').to.equal(undefined);
+
+			await db.exec(`create table T (Id integer primary key, R1 blobref null) using optimystic('${withRefs}')`);
 
 			const listed = await BlobScopeRegistry.enumerate(transactor);
 			expect(listed.certain, 'the registry read must be trustworthy').to.equal(true);
 			expect(listed.scopes, 'the blobref table\'s scope is registered').to.include(scopeOf(withRefs));
 			expect(listed.scopes, 'a table with no blobref column registers nothing').to.not.include(scopeOf(without));
+			expect(await plugin.collectionFactory.blobScopes.isRegistered(binding, scopeOf(withRefs)),
+				'a listed scope reads as listed, with nothing written to learn it').to.equal(true);
+			expect(await plugin.collectionFactory.blobScopes.isRegistered(binding, scopeOf(without)),
+				'a certain listing that does not name the scope is a certain no').to.equal(false);
 
 			await db.exec('drop table T');
 			const afterDrop = await BlobScopeRegistry.enumerate(transactor);
 			expect(afterDrop.scopes, 'a dropped table\'s scope leaves the registry').to.not.include(scopeOf(withRefs));
+			expect(await plugin.collectionFactory.blobScopes.isRegistered(binding, scopeOf(withRefs)),
+				'the dropped table\'s scope reads as gone, which is what makes its pins releasable').to.equal(false);
 		} finally {
 			db.close();
 			await plugin.dispose();
