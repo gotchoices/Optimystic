@@ -131,6 +131,8 @@ export interface BlobReclaimOptions {
 	firstPassDelayMs?: number;
 	/** Default `Date.now`; tests inject a clock. */
 	now?: () => number;
+	/** Default `armUnrefTimer`, the seam `LocalBlobService` and `BlobAnnounceReceiver` take; tests inject a timer they can see. */
+	setTimer?: (fn: () => void, ms: number) => () => void;
 }
 
 /** What one pass read and did. */
@@ -206,6 +208,7 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 	private readonly intervalMs: number;
 	private readonly firstPassDelayMs: number;
 	private readonly now: () => number;
+	private readonly setTimer: (fn: () => void, ms: number) => () => void;
 	/** The pass in flight, absent while none runs. */
 	private running: Promise<ReclaimPassReport> | undefined;
 	/** Whether {@link start} armed the schedule; a `runNow` on an unstarted pass arms no timer. */
@@ -218,6 +221,7 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 		this.intervalMs = options?.intervalMs ?? DEFAULT_RECLAIM_INTERVAL_MS;
 		this.firstPassDelayMs = options?.firstPassDelayMs ?? DEFAULT_RECLAIM_FIRST_PASS_DELAY_MS;
 		this.now = options?.now ?? Date.now;
+		this.setTimer = options?.setTimer ?? armUnrefTimer;
 	}
 
 	/** Arm the first pass after `firstPassDelayMs`; each later pass `intervalMs` after the previous one ENDS. */
@@ -250,11 +254,19 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 		await this.running?.then(noop, noop);
 	}
 
+	/**
+	 * Replaces whatever timer is pending rather than adding to it: a `runNow` lands while the
+	 * schedule's timer is still pending (the first one is five minutes out, the rest six hours), and
+	 * its pass re-arms from here — so an arm that only overwrote the canceller would leave the earlier
+	 * timer live, un-cancellable and firing passes of its own, one more for every such call.
+	 */
 	private arm(delayMs: number): void {
+		this.cancelTimer?.();
+		this.cancelTimer = undefined;
 		if (this.stopped) {
 			return;
 		}
-		this.cancelTimer = armUnrefTimer(() => {
+		this.cancelTimer = this.setTimer(() => {
 			this.cancelTimer = undefined;
 			// A pass that threw already logged `reclaim:pass-failed`; the timer is re-armed either way.
 			void this.run().catch(noop);
@@ -288,8 +300,12 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 
 	private async runPass(): Promise<ReclaimPassReport> {
 		const startedAt = this.now();
+		// NOTE: no reachable path reaches this with `stopped` today — `runNow` rejects once stopped,
+		// `stop()` cancels the timer, and the timer's callback reaches this check in the same
+		// synchronous tick as the firing. Kept because it is the contract the report type states, and
+		// because any later caller of `run()` would need it.
 		if (this.stopped) {
-			return { startedAt, skipped: 'stopped', counted: false, notCounted: ['stopped'], ...NOTHING_READ };
+			return this.logged({ startedAt, skipped: 'stopped', counted: false, notCounted: ['stopped'], ...NOTHING_READ });
 		}
 
 		// The work this pass decides about, snapshotted before any read. Every write below is
@@ -297,7 +313,7 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 		const responsible = await this.deps.records.responsibleMarks();
 		const owedEntries = await this.deps.owed.list();
 		if (responsible.length === 0 && owedEntries.length === 0) {
-			return { startedAt, skipped: 'nothing-held', counted: false, notCounted: [], ...NOTHING_READ };
+			return this.logged({ startedAt, skipped: 'nothing-held', counted: false, notCounted: [], ...NOTHING_READ });
 		}
 		// One of the two snapshots is non-empty, or the line above returned.
 		const holdsAny = true;
@@ -403,8 +419,7 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 			unconfirmedBlocks,
 			...applied,
 		};
-		this.logPass(report);
-		return report;
+		return this.logged(report);
 	}
 
 	/**
@@ -517,8 +532,8 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 		return { newlyMarked, cleared, released, owedReleased };
 	}
 
-	/** One line per pass, skipped ones included. */
-	private logPass(report: ReclaimPassReport): void {
+	/** One line per pass, skipped ones included, and then the report — so no exit can return unlogged. */
+	private logged(report: ReclaimPassReport): ReclaimPassReport {
 		this.deps.log(
 			'reclaim:pass startedAt=%d%s counted=%s notCounted=%s scopes=%d treesRead=%d responsible=%d owed=%d listed=%d marked=%d cleared=%d released=%d owedReleased=%d unconfirmedBlocks=%d ms=%d',
 			report.startedAt,
@@ -537,6 +552,7 @@ export class BlobReclaimPass implements BlobReclaimOnDemand {
 			report.unconfirmedBlocks,
 			this.now() - report.startedAt,
 		);
+		return report;
 	}
 }
 

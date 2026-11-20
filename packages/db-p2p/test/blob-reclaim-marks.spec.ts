@@ -7,7 +7,7 @@
  * specs pin the pure grace-period rule, and — on a real `LocalBlobService` and a real
  * `OwedBlobLedger` — that each mark lives and dies with the thing it is about, so a mark can never
  * make one pass release a hold taken since. Nothing here reads committed state: the pass that writes
- * the marks is `feat-unreferenced-blobs-are-reclaimed`.
+ * the marks is `BlobReclaimPass` in `packages/db-p2p/src/blob/reclaim-pass.ts`.
  */
 
 import { expect } from 'chai';

@@ -12,7 +12,8 @@
  * pass's reads are unvouched and the cohort gate decides whether they may be acted on. Everything
  * else is the real class: a real `LocalBlobService` over a `MemoryPieceStore`, a real
  * `OwedBlobLedger`, a real `KeyNetworkCohortReachability` over a key-network double, and a real
- * `PartitionDetector`. The clock is injected, and `start()` is never called, so no timer is armed.
+ * `PartitionDetector`. The clock is injected, and `start()` is called only by the one case about the
+ * schedule, which injects a timer seam too, so no case arms a real timer.
  */
 
 import { expect } from 'chai';
@@ -195,6 +196,22 @@ function intoPartition(detector: PartitionDetector): void {
 			detector.recordFailure(`churned-peer-${peer}`);
 		}
 	}
+}
+
+type ArmedTimer = { readonly delayMs: number; live: boolean };
+
+/** A timer seam that records every arm and whether it is still live, so a pass that armed without
+ *  cancelling the one before it is visible. */
+function timerSpy(): { readonly armed: ArmedTimer[]; readonly setTimer: (fn: () => void, ms: number) => () => void } {
+	const armed: ArmedTimer[] = [];
+	return {
+		armed,
+		setTimer: (_fn, ms) => {
+			const entry: ArmedTimer = { delayMs: ms, live: true };
+			armed.push(entry);
+			return () => { entry.live = false; };
+		},
+	};
 }
 
 /** A clean pass's evidence, which every predicate case varies one field of. */
@@ -448,6 +465,32 @@ describe('blob reclaim pass', () => {
 		const report = await h.passAt(1_000 + G);
 		expect(report).to.deep.include({ counted: true, released: 0, newlyMarked: 1 });
 		expect(await h.blobs.responsibleMarks()).to.deep.equal([{ ref: b, unreferencedSince: 1_000 + G }]);
+	});
+
+	it('keeps one timer armed when a pass is asked for while the schedule is pending', async () => {
+		// `runNow` on a started pass lands while the schedule's timer is pending, and the pass re-arms
+		// from the same place: an arm that did not cancel first would leave the earlier timer live, so
+		// every such call would add a timer that `stop()` cannot reach and that fires passes of its own.
+		const timer = timerSpy();
+		const kv = new MemoryKVStore();
+		const pass = new BlobReclaimPass({
+			// Holds nothing, so each pass returns `skipped: 'nothing-held'` and the case is about the schedule alone.
+			records: new LocalBlobService({ pieces: new MemoryPieceStore(), kv, setTimer: () => () => undefined }),
+			owed: new OwedBlobLedger(kv),
+			transactor: new StalingTransactor(),
+			cohort: new KeyNetworkCohortReachability({ keyNetwork: keyNetworkOver([SELF]), selfId: SELF }),
+			partitionDetector: new PartitionDetector(),
+			log: createLogger('blob:reclaim', SELF),
+		}, { setTimer: timer.setTimer, firstPassDelayMs: 1_000, intervalMs: 2_000 });
+		pass.start();
+		expect(timer.armed.map(entry => entry.delayMs)).to.deep.equal([1_000]);
+
+		await pass.runNow();
+		expect(timer.armed.map(entry => entry.delayMs), 'the pass re-armed at the interval').to.deep.equal([1_000, 2_000]);
+		expect(timer.armed.filter(entry => entry.live).length, 'the first-pass timer was cancelled, not left behind').to.equal(1);
+
+		await pass.stop();
+		expect(timer.armed.some(entry => entry.live), 'nothing is left armed after stop').to.equal(false);
 	});
 
 	it('reads nothing when this node holds no responsible blob and owes none', async () => {
