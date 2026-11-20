@@ -31,7 +31,7 @@ import { forwardAborts } from './blob-fetch-session.js';
 import { blobHolderCandidates, type BlobHolderDeps } from './blob-holders.js';
 import { blobScopeProblem, type BlobLocalHolding } from './blob-protocol.js';
 import type { BlobProtocolClient } from './blob-protocol-client.js';
-import type { LocalBlobService, MissingPiece } from './local-blob-service.js';
+import type { BlobPinIndex, LocalBlobService, MissingPiece } from './local-blob-service.js';
 
 const log = createLogger('blob:service');
 
@@ -80,7 +80,7 @@ interface ProbeResult {
 	readonly held?: string;
 }
 
-export class NodeBlobService implements BlobService {
+export class NodeBlobService implements BlobService, BlobPinIndex {
 	/** The single-machine service underneath; the blob protocol service answers from it, and tests reach its fetch door through it. */
 	readonly local: LocalBlobService;
 	private readonly fetcher: Pick<BlobFetcher, 'start' | 'onPieceStored'>;
@@ -159,6 +159,16 @@ export class NodeBlobService implements BlobService {
 
 	unpin(ref: BlobRef, owner: string): Promise<void> {
 		return this.local.unpin(ref, owner);
+	}
+
+	/** {@link BlobPinIndex.pinsOf}, from the single-machine service underneath: a pin is this machine's alone, as `pin` and `unpin` are. */
+	pinsOf(ref: BlobRef): Promise<string[]> {
+		return this.local.pinsOf(ref);
+	}
+
+	/** {@link BlobPinIndex.listPins}, from the single-machine service underneath. */
+	listPins(ownerPrefix: string): AsyncIterable<{ ref: BlobRef; owner: string }> {
+		return this.local.listPins(ownerPrefix);
 	}
 
 	/**

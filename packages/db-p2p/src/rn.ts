@@ -26,6 +26,7 @@ export * from './blob/blob-get-slots.js';
 export * from './blob/blob-holders.js';
 export * from './blob/blob-fetcher.js';
 export * from './blob/node-blob-service.js';
+export * from './blob/single-machine-blob-service.js';
 export * from './blob/reference-check.js';
 export * from './blob/announce-limiter.js';
 export * from './blob/announce-receiver.js';

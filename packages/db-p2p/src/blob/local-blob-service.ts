@@ -90,6 +90,21 @@ export interface BlobOwedRecords {
 	emitDurability(event: BlobDurabilityEvent): void;
 }
 
+/**
+ * Reading this machine's pins by owner. Not part of `BlobService`: enumeration is a property of a
+ * store, not of the service contract.
+ *
+ * Serves a caller that must find pins it does not remember — the SQL plugin reads its transactions'
+ * pins back off the machine after a restart, and finds the pin an earlier owner took on a reference a
+ * transaction is taking over (docs/blobs.md §Holds).
+ */
+export interface BlobPinIndex {
+	/** The owner labels pinned on `ref`, in no promised order; `[]` when this machine holds no readable record for it. */
+	pinsOf(ref: BlobRef): Promise<string[]>;
+	/** Every (reference, owner) pin whose owner label starts with `ownerPrefix`, in no promised order. */
+	listPins(ownerPrefix: string): AsyncIterable<{ ref: BlobRef; owner: string }>;
+}
+
 /** Supplies a piece the local store lacks; resolves with its verified bytes or rejects with why it cannot. */
 export type MissingPiece = (id: PieceId) => Promise<Uint8Array>;
 
@@ -119,9 +134,9 @@ export interface LocalBlobServiceInit {
  * which fetches from other machines through `readThrough` and `fetchStore`; used on its own it never
  * asks another machine. It owns the records the copy drain changes and the `onDurability` listeners it
  * emits through ({@link BlobOwedRecords}); announcing is `NodeBlobService`'s, since this service has
- * no cohort.
+ * no cohort. It also reads its own pins back ({@link BlobPinIndex}).
  */
-export class LocalBlobService implements BlobService, BlobOwedRecords {
+export class LocalBlobService implements BlobService, BlobOwedRecords, BlobPinIndex {
 	private readonly pieces: IPieceStore;
 	private readonly records: BlobRecordStore;
 	private readonly gate = new SweepGate();
@@ -293,6 +308,28 @@ export class LocalBlobService implements BlobService, BlobOwedRecords {
 	async unpin(ref: BlobRef, owner: string): Promise<void> {
 		await this.changeRecord(ref, current => recordAfterUnpin(current, owner));
 		await this.records.flush();
+	}
+
+	/** {@link BlobPinIndex.pinsOf}. A record that does not decode reads as absent, so one unreadable record cannot fail a caller's pass — the rule `durabilityOf` and `responsibleRefs` already apply. */
+	async pinsOf(ref: BlobRef): Promise<string[]> {
+		return pinOwnersOf(await this.readableRecord(ref));
+	}
+
+	/**
+	 * {@link BlobPinIndex.listPins}. A record that does not decode is logged (`record:unreadable`) and
+	 * skipped, as in `responsibleRefs`, so that blob's pins are invisible rather than fatal.
+	 *
+	 * NOTE: scans every blob record; if a machine ever holds enough blobs for a prefix query to show up,
+	 * index pins by owner prefix — the same tripwire `responsibleRefs` carries.
+	 */
+	async *listPins(ownerPrefix: string): AsyncIterable<{ ref: BlobRef; owner: string }> {
+		for (const ref of await this.records.listRefs()) {
+			for (const owner of pinOwnersOf(await this.readableRecord(ref))) {
+				if (owner.startsWith(ownerPrefix)) {
+					yield { ref, owner };
+				}
+			}
+		}
 	}
 
 	/**
@@ -565,6 +602,11 @@ function assertScope(scope: BlobScope): void {
 
 function responsibleHoldOf(record: BlobRecord | undefined): Extract<BlobHold, { kind: 'responsible' }> | undefined {
 	return record?.holds.find((hold): hold is Extract<BlobHold, { kind: 'responsible' }> => hold.kind === 'responsible');
+}
+
+/** Every owner the record pins for; `flatMap` rather than `filter` so the hold's kind narrows to the one carrying an owner. */
+function pinOwnersOf(record: BlobRecord | undefined): string[] {
+	return (record?.holds ?? []).flatMap(hold => hold.kind === 'pin' ? [hold.owner] : []);
 }
 
 function pinnedBy(record: BlobRecord, owner: string): boolean {
