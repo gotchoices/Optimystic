@@ -13,6 +13,11 @@
  * transaction id that is neither open nor queued — which is exactly the state a crashed process
  * leaves behind — and then restarts into a fresh plugin, whose `hydrate` awaits the reconciliation.
  *
+ * A fourth case holds the ORDERING the three rest on: a transaction the offline journal still holds
+ * is in no queue until a restore pass has read it, so a pass that judged it before then would release
+ * the pins of an entry that goes on to commit. That is the one way this mechanism can lose an
+ * application's bytes, so it is driven rather than inspected.
+ *
  * The registered-scope arms (a table dropped on another machine, so the scope is certainly gone from
  * the network's registry) and the stray-`put`-pin arm are branches of the same pass with no new
  * mechanism behind them, and are checked by inspection rather than by two more harnesses.
@@ -27,7 +32,7 @@ import type { BlobRef } from '@optimystic/db-core';
 import { TRANSACTION_PIN_PREFIX, transactionReferencePinLabel } from '../dist/index.js';
 import {
 	allPins, closePlugin, createStores, openPlugin, pinsOn, putBlob, referencesInTree, restart, scopeOf,
-	transactorOf, type PluginHandle,
+	soleQueuedEntry, transactorOf, type PluginHandle,
 } from './blob-pins-harness.js';
 import { Isolation } from './isolation.js';
 
@@ -143,6 +148,59 @@ describe('blob reference pins reconcile after a restart', function () {
 			expect(await allPins(handle.plugin, TRANSACTION_PIN_PREFIX),
 				'now that the tree reads certainly, the pin is announced and released').to.deep.equal([]);
 			expect((await handle.plugin.blobs.stat(ref)).durability?.quorum).to.equal('local');
+		} finally {
+			await closePlugin(handle);
+		}
+	});
+
+	it('leaves a journaled transaction\'s pins alone until the restore has read the journal', async () => {
+		const uri = 'tree://blobpins-reconcile/journaled';
+		const stores = createStores();
+		// Unreachable throughout, so the commit is sealed into the queue and journaled and NOTHING of
+		// it reaches storage: its reference tree is never written, and a committed read of a tree that
+		// was never written answers "lists nothing", certainly — the very answer that releases a pin.
+		let handle = openPlugin(stores, { reachable: false });
+		try {
+			await handle.db.exec(TABLE_DDL(uri));
+			const ref = await putBlob(handle, 5);
+			handle.plugin.offline.enter();
+			await handle.db.exec(`insert into T (Id, R) values (1, '${ref}')`);
+			const transactionId = soleQueuedEntry(handle.plugin);
+			const pinned = `${ref} ${transactionReferencePinLabel(transactionId, scopeOf(uri))}`;
+			expect(await allPins(handle.plugin, TRANSACTION_PIN_PREFIX),
+				'the queued transaction holds its reference pin').to.deep.equal([pinned]);
+
+			// The restart WITHOUT `hydrate`: the journaled record is on disk and unread, so the
+			// transaction is in no queue and deferred nowhere. Reading the blob service is what resolves
+			// the default network's store, and that resolution is itself a reconciliation trigger.
+			await closePlugin(handle);
+			handle = openPlugin(stores, { reachable: false });
+			expect((await handle.plugin.blobs.stat(ref)).durability,
+				'nothing of the transaction reached the network, so nothing was announced').to.equal(undefined);
+			await handle.plugin.blobPins.settled();
+
+			expect(await referencesInTree(await transactorOf(handle, stores), scopeOf(uri)),
+				'committed state says, certainly, that nothing lists the reference').to.deep.equal([]);
+			expect(await allPins(handle.plugin, TRANSACTION_PIN_PREFIX),
+				'the pin is kept anyway: judged now, it would be released and its bytes swept while the entry went on to commit')
+				.to.deep.equal([pinned]);
+
+			// Once the restore has read the journal the entry is back in the queue, and the queue is what
+			// holds it live from then on.
+			await handle.plugin.hydrate(handle.db);
+			expect(handle.plugin.offline.entries().map(entry => entry.transactionId),
+				'the journaled transaction is back in the queue').to.deep.equal([transactionId]);
+			expect(await allPins(handle.plugin, TRANSACTION_PIN_PREFIX),
+				'still held, now because the queue holds the transaction').to.deep.equal([pinned]);
+
+			handle.gate.open();
+			await handle.plugin.offline.whenDrained();
+			await handle.plugin.blobPins.settled();
+
+			expect(await allPins(handle.plugin, TRANSACTION_PIN_PREFIX),
+				'the entry committed and its own settlement released the pin').to.deep.equal([]);
+			expect((await handle.plugin.blobs.stat(ref)).durability?.quorum,
+				'the bytes the deferral kept are the ones the commit announced').to.equal('local');
 		} finally {
 			await closePlugin(handle);
 		}

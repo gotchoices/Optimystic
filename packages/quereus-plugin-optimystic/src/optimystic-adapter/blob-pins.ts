@@ -495,7 +495,17 @@ export class SqlBlobPins {
 
 	// ── reconciliation from committed state ──────────────────────────────────
 
-	/** One reconciliation pass: every backend this process knows of, in turn. */
+	/**
+	 * One reconciliation pass: every backend this process knows of, in turn.
+	 *
+	 * NOTE: a backend whose store cannot be resolved is logged and left OUT of the walk
+	 * (`CollectionFactory.knownBlobBackends`), and this pass cannot tell it was skipped, so it clears
+	 * {@link mayHoldStalePins} without having looked there. The pins stay — which is the safe
+	 * direction — and a resolution is not remembered, so the next successful one announces the backend
+	 * and re-arms the flag ({@link backendResolved}). If a network whose blob store can never be
+	 * resolved is ever seen holding pins for ever, have `knownBlobBackends` report the skip and leave
+	 * the flag set for it.
+	 */
 	private async reconcilePass(): Promise<void> {
 		// Re-checked here as well as at the request, since a pass chained behind a running one may find
 		// that the running one has already answered for everything.

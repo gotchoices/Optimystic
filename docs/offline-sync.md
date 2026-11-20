@@ -1577,6 +1577,15 @@ open segment belongs to that transaction. The pass is `OfflineRestore` in
 `packages/quereus-plugin-optimystic/src/optimystic-adapter/offline-restore.ts`, owned by the
 controller; it runs one at a time, and a pass requested while one runs starts after it.
 
+After the pass, and before it returns, `restore()` also reconciles the blob reference pins the last process left
+behind — announcing and releasing the ones whose transaction committed, releasing the ones whose transaction never
+did (`SqlBlobPins.reconcile`, [blobs.md §SQL](blobs.md#sql)). That reconciliation never throws, so it cannot fail a
+`hydrate`; it reads a journaled transaction's absence from the queue as "settled", which is only true once the pass
+above has completed, which is why it runs after the pass and not before it. It is also why `restore()` refuses an open
+transaction in EVERY configuration, journal or none: the reconciliation waits for the open transaction to end, so
+awaiting `restore()` from inside one would wait for itself. A host with no journal configured that called `restore()`
+inside a transaction and relied on it doing nothing now gets that refusal.
+
 A pass lists the label's entry, drive and outcome records once. It loads the outcome records into
 the retained outcomes (one past `outcomeRetentionMs` is deleted instead), reserves every listed
 sequence number on the queue so a transaction queued meanwhile never takes a journaled one, and then
