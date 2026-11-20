@@ -79,13 +79,17 @@ export type ProofVerdict =
  * hashes bind no peer set, so its signer list is unbound and it can never be certified (the caller
  * logs the skip).
  *
- * NOTE: the proof carries the commit message whole, so a batch's proof — and every block's stored
- * copy of it — grows with the number of collections the record commits: each operation adds its
- * block ids, log tail and digests, roughly 150 bytes per block by field size (estimated, not
- * measured). Six collections of a few blocks each add a few kilobytes to the 4.6 KB measured for a
- * two-block commit, well inside the 1 MiB message bound. If proof storage ever matters, trim a
- * proof to the claimed operation — which needs a message hash that commits to each operation
- * separately, since verification recomputes the hash from the message the proof carries.
+ * NOTE: the proof carries the commit message whole, so it grows with the number of BLOCKS the
+ * record commits across its collections: each operation adds its block ids, log tail and digests —
+ * ~136 bytes per block, measured. Six collections of a few blocks each add a few kilobytes to the
+ * 4.6 KB measured for a two-block commit, but a commit touching thousands is megabytes: 528 KB over
+ * 3,383 blocks (GitHub #60), 953 KB over 7,000 (`test/block-archive-proof.spec.ts`, "keeping a
+ * response that could not be sent at all under the frame cap"). Each store keeps ONE copy per
+ * message hash and every revision entry references it (`KvRawStorage.getCommitProof`), and each wire
+ * carries it once per peer or response (`BlockTransferRequest.proofRefs`, `SyncResponse.proofs`), so
+ * the repetition that made the size bite is gone. What remains is the size itself. If that ever
+ * matters, trim a proof to the claimed operation — which needs a message hash that commits to each
+ * operation separately, since verification recomputes the hash from the message the proof carries.
  */
 export function buildBlockCommitProof(record: ClusterRecord): BlockCommitProof | undefined {
 	if (record.membershipVersion !== 2 || typeof record.membershipDigest !== 'string') {

@@ -1,4 +1,4 @@
-import type { ActionContext, ActionRev, BlockId, BlockLineage, IBlock, IRepo } from "@optimystic/db-core";
+import { jsonEncodedBytes, type ActionContext, type ActionRev, type BlockId, type BlockLineage, type IBlock, type IRepo } from "@optimystic/db-core";
 import type { ArchiveRevisions, BlockArchive } from "./struct.js";
 import type { SyncBlockAnswer, SyncContentOmitted, SyncResponse } from "../sync/protocol.js";
 import { proofClaimsCommit, type BlockCommitProof } from "../cluster/commit-proof.js";
@@ -204,12 +204,11 @@ export function fitConsultContent(
 	answers: ReadonlyArray<readonly [BlockId, SyncBlockAnswer]>,
 	budgetBytes: number
 ): Array<[BlockId, SyncBlockAnswer]> {
-	const encoder = new TextEncoder();
 	let spent = 0;
 	let carried = 0;
 	return answers.map(([blockId, answer]): [BlockId, SyncBlockAnswer] => {
 		if (!answer.archive || answer.contentOmitted !== undefined) return [blockId, answer];
-		const size = encoder.encode(JSON.stringify(answer.archive)).byteLength;
+		const size = jsonEncodedBytes(answer.archive);
 		if (carried > 0 && spent + size > budgetBytes) return [blockId, withoutContent(blockId, answer, 'size')];
 		carried++;
 		spent += size;
@@ -245,17 +244,25 @@ type ArchiveRevision = ArchiveRevisions[number];
  * The table is built FROM the entries it rewrites, so this cannot mis-pair a proof with a revision it
  * does not certify: an entry's reference is the hash of the proof that was in that entry.
  *
- * Proofs are admitted in answer order while the running total of their JSON-encoded size stays
- * within `budgetBytes`, and the FIRST proof is always admitted — so a one-block answer is served as
- * it is today, with its proof merely relocated. A proof past the budget is not admitted, and the
- * entries that would have named it are served PROOF-LESS rather than inline: the pre-proof shape
- * every consumer already tolerates (a pre-proof revision, a diverged member and an un-upgraded peer
- * all legitimately answer without one). Leaving it inline instead would put back the bytes the
- * budget exists to keep out of the frame.
+ * Proofs are weighed in answer order, each admitted when its JSON-encoded size fits what is left of
+ * `budgetBytes` — so a small proof later in the response still rides after a large one was refused,
+ * rather than the budget closing at the first refusal. The FIRST proof is always admitted, so a
+ * one-block answer is served as it is today, with its proof merely relocated. A proof past the
+ * budget is not admitted, and the entries that would have named it are served PROOF-LESS rather than
+ * inline: the pre-proof shape every consumer already tolerates (a pre-proof revision, a diverged
+ * member and an un-upgraded peer all legitimately answer without one). Leaving it inline instead
+ * would put back the bytes the budget exists to keep out of the frame.
  */
 export function dedupeResponseProofs(response: SyncResponse, budgetBytes: number): SyncResponse {
-	const encoder = new TextEncoder();
-	const proofs: Record<string, BlockCommitProof> = {};
+	const admitted = new Map<string, BlockCommitProof>();
+	/**
+	 * Hashes already weighed and refused. A verdict holds for the whole response — `spent` only
+	 * grows, so a proof that did not fit cannot fit later — and memoizing it is what keeps the pass
+	 * linear in DISTINCT proofs rather than in entries: without it, the 31 later entries of a
+	 * 32-block answer naming one refused proof re-encode it 31 times to reach the same verdict,
+	 * measured at 163 ms per response against 861 KB of proof (a 7,000-block commit's).
+	 */
+	const refused = new Set<string>();
 	let spent = 0;
 	/**
 	 * The hash to name `proof` by, or `undefined` when it is not admitted — past the budget, or
@@ -272,13 +279,25 @@ export function dedupeResponseProofs(response: SyncResponse, budgetBytes: number
 		// today: storage keeps one proof per `messageHash` (`KvRawStorage.storeCommitProofIfAbsent`),
 		// so every entry of a response reads the same object. If a store ever retains per-revision
 		// vote sets, compare the two before collapsing them.
-		if (proofs[hash]) return hash;
-		const size = encoder.encode(JSON.stringify(proof)).byteLength;
+		if (admitted.has(hash)) return hash;
+		if (refused.has(hash)) return undefined;
+		const size = jsonEncodedBytes(proof);
 		// The first proof always rides. Leaving it out would answer a claim proof-lessly where the
 		// pre-table build answered it certified, and a lone oversized proof is the only evidence this
 		// node has for that revision.
-		if (spent > 0 && spent + size > budgetBytes) return undefined;
-		proofs[hash] = proof;
+		//
+		// NOTE: so a single proof larger than the whole frame still makes its response unsendable,
+		// losing every answer in it rather than one. Bounded by the commit path rather than by
+		// anything here: a proof is its consensus message plus at most `MAX_PROOF_SIGNERS`
+		// signatures (~100 KB), and that message had to cross the cluster protocol under the same
+		// `MAX_BLOCK_MESSAGE_BYTES` frame to reach consensus at all — so only a commit within that
+		// last ~100 KB of the frame can produce a proof past it. Revisit if a proof ever grows a
+		// payload the message did not carry, or if the two protocols stop sharing one frame cap.
+		if (spent > 0 && spent + size > budgetBytes) {
+			refused.add(hash);
+			return undefined;
+		}
+		admitted.set(hash, proof);
 		spent += size;
 		return hash;
 	};
@@ -288,7 +307,10 @@ export function dedupeResponseProofs(response: SyncResponse, budgetBytes: number
 		const { proof, ...rest } = entry;
 		return ref === undefined ? rest : { ...rest, proofRef: ref };
 	}));
-	return spent > 0 ? { ...deduped, proofs } : deduped;
+	// A `Map` rather than an object accumulator throughout: a `messageHash` is a peer-chosen string
+	// at the hydrating end, and `'__proto__'` or `'constructor'` reads as an inherited member of an
+	// object literal — truthy on lookup, swallowed on assignment.
+	return admitted.size > 0 ? { ...deduped, proofs: Object.fromEntries(admitted) } : deduped;
 }
 
 /**
