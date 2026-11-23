@@ -749,7 +749,7 @@ Once the tail block commits, the coordinator now tracks any peers that promised 
 - The peer acknowledges the commit and the local record reflects its signature; or
 - The retry budget is exhausted (defaults: 5 attempts, the first 250 ms after the missed broadcast and each later one after double the previous wait, capped at 8 s — so the last attempt lands about 7.75 s after the miss).
 
-Unless the node was built with a `transactionStateStore` (from which `recoverTransactions` resumes a persisted retry after a restart), the retry lives only in the coordinator's memory: a member that stays away longer than the schedule, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
+A node built by `createLibp2pNode` always persists the retry: its serving half builds a `PersistentTransactionStateStore` over the node's own key-value store, and `recoverTransactions` resumes a persisted retry at start. How much of it survives a restart is exactly how durable that store is — a node left on the default in-memory store keeps the retry only for the life of its process, so a member that stays away longer than the schedule, or whose coordinator restarts meanwhile, is not owed anything afterwards. At three machines such a member still heals on its own reads — it holds the pending record it stored when it promised, and a read that sees the action committed in the collection's log promotes it — which `packages/db-p2p/test/member-leaves-and-returns.spec.ts` pins alongside the retry path.
 
 Retries reuse the original `ClusterRecord` so peers that missed the initial commit can still apply the operation idempotently. A retry can itself complete the commit majority — in a two-member cohort that ran a commit round (the other member's promise-round commit was not kept) and whose other member missed it, the record carries only the coordinator's commit until the retry reaches that member, which then applies on receipt — so once a retry leaves the record at a majority it runs the same consensus broadcast as the first pass: the coordinator's own member first if it has not applied, then any member that has not applied or reports a refused commit.
 
@@ -1320,9 +1320,10 @@ shared mutable cell or reconstruct those four objects anyway — a restart weari
 What a rebuild costs, in operator terms:
 
 - **Survives:** every block, every persisted commit proof, executed-transaction markers, and in-flight
-  coordinator/participant state *if* the host wired a `transactionStateStore` (recovered by
-  `ClusterMember.recoverTransactions` / `CoordinatorRepo.recoverTransactions`). A host that wires none
-  loses in-flight transactions — which is already what it does on every crash.
+  coordinator/participant state, which every serving node keeps in its key-value store (recovered by
+  `ClusterMember.recoverTransactions` / `CoordinatorRepo.recoverTransactions`). A node left on the
+  default in-memory key-value store loses the in-flight state on a process restart — which is already
+  what it does on every crash.
 - **Resets, all in the safe direction:** the read-repair freshness window, recorded doubt about peers
   running ahead, the responsibility cache, and the rebalance monitor's responsibility snapshot. The
   first read of each held block after a rebuild consults the cohort, so doubt is rediscovered rather

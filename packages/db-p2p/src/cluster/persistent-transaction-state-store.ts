@@ -81,6 +81,11 @@ export class PersistentTransactionStateStore implements ITransactionStateStore {
 		return raw !== undefined;
 	}
 
+	// NOTE: this is a full scan of the `executed/` prefix — one `list`, then a `get` and possibly a
+	// `delete` per key — and the member runs it on its periodic cleanup, not only at recovery. It is
+	// bounded by `ExecutedTransactionTtlMs` (10 minutes) of applied transactions. If the sweep ever
+	// shows up in a profile on a busy node, put the timestamp in the key and delete by range instead
+	// of reading every value.
 	async pruneExecuted(olderThan: number): Promise<void> {
 		const keys = await this.kv.list(EXECUTED_KEY_PREFIX);
 		for (const key of keys) {

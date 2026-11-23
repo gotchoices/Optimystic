@@ -2196,7 +2196,20 @@ export class ClusterCoordinator {
 		}, 100);
 	}
 
-	/** Fire-and-forget persist — errors are logged, never thrown. */
+	/**
+	 * Fire-and-forget persist — errors are logged, never thrown.
+	 *
+	 * NOTE: this writes the WHOLE `ClusterRecord`, and the ordinary two-member shape writes it three
+	 * times per cluster message (`promising`, `committing`, and the deferred commit-broadcast round),
+	 * each copy larger than the last as promises and commits accumulate. Measured on a two-machine
+	 * cohort writing one row of a `Tree` (two cluster messages): 16.9 KB over 9 key-value writes on
+	 * the coordinating machine, against 6.3 KB the same transaction wrote to its block store — so the
+	 * agreement path now writes about 3.7× the bytes it did before the state store was wired. All of
+	 * it is off the request's latency path (nothing awaits these). If that volume ever matters — a
+	 * key-value store sharing a write-ahead log with the block store, or a node on slow media —
+	 * persist the phase and a delta rather than the whole record, or write only the `broadcasting`
+	 * phase, which is the only one recovery can resume.
+	 */
 	private persistCoordinatorState(
 		messageHash: string,
 		record: ClusterRecord,

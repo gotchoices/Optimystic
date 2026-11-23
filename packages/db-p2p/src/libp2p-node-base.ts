@@ -62,6 +62,7 @@ import type { OptimysticClientNode, OptimysticClientNodeAttachments, OptimysticN
 import { ClusterClient } from './cluster/client.js';
 import type { IRepo, ICluster, ITransactionValidator, BlockId, ActionRev, IBlockChangeNotifier, BlobDigest, BlobRef, BlobScope } from '@optimystic/db-core';
 import type { ITransactionStateStore } from './cluster/i-transaction-state-store.js';
+import { PersistentTransactionStateStore } from './cluster/persistent-transaction-state-store.js';
 import { networkManagerService, type NetworkManagerService } from './network/network-manager-service.js';
 import { assertCircuitRelayTransport, assertRelayAddrsAdvertisable, planRelayListenAddrs, superviseRelayReservations, type RelayReservationSupervisorOptions } from './network/relay-reservation.js';
 import { BootstrapContactTracker, planBootstrapTargets } from './network/bootstrap-contact.js';
@@ -286,7 +287,7 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * block-transfer), so every other node of this build classifies it as not serving from its identify
 	 * list, it is in no cohort, and it never coordinates. Its reads and writes go to the network's
 	 * serving machines. The options that configure only serving subsystems (`storage`,
-	 * `storageDurability`, `transactionStateStore`, `validator`, `onCommitCertificate`, `dispute`,
+	 * `storageDurability`, `validator`, `onCommitCertificate`, `dispute`,
 	 * `blockTransfer`, `rebalance`, `spreadOnChurn`, `underReplicationDrain`, `arachnode`,
 	 * `responsibilityK`) are ignored on a client, with one `node-wiring` line naming those it was given.
 	 * A client still registers the blob protocol, gated by `authorizeInboundStream`. See
@@ -510,9 +511,6 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * attach — the last of those heal when a push back-fills one.
 	 */
 	blockTransfer?: { requirePushCertificate?: boolean };
-
-	/** Optional persistent store for 2PC transaction state (enables crash recovery) */
-	transactionStateStore?: ITransactionStateStore;
 
 	/**
 	 * Optional sink for the consensus commit certificate, fired per committed consensus record just
@@ -822,7 +820,7 @@ export type ClientNodeOptions = NodeOptions & { servesBlocks: false };
  */
 function logIgnoredServingOptions(options: NodeOptions): void {
 	const servingOnly = [
-		'storage', 'storageDurability', 'transactionStateStore', 'validator', 'onCommitCertificate', 'dispute',
+		'storage', 'storageDurability', 'validator', 'onCommitCertificate', 'dispute',
 		'blockTransfer', 'rebalance', 'spreadOnChurn', 'underReplicationDrain', 'arachnode', 'responsibilityK'
 	] as const satisfies readonly (keyof NodeOptions)[];
 	const given = servingOnly.filter(name => options[name] !== undefined);
@@ -913,11 +911,6 @@ function durabilityWindowClause(durability: StoreDurability, policy: DurabilityW
  * Resolve the node's durable key-value store, beside {@link resolveStorage}. The memory fallback is
  * LOUD on purpose: a silent one would look like the under-replication ledger works and then fail the
  * one case it exists for — a shortfall recorded before a restart being there after it.
- *
- * NOTE: with a key-value store always present, `PersistentTransactionStateStore` is now
- * constructible here from the same instance. Wiring it changes commit-retry recovery behaviour and
- * belongs to `feat-long-lived-pend-completes-as-members-appear`, not to this resolver;
- * `NodeOptions.transactionStateStore` stays the only way it is supplied.
  */
 function resolveKvStore(provider: KVStoreProvider | undefined, servesBlocks: boolean): IKVStore {
 	if (provider !== undefined) {
@@ -1034,6 +1027,13 @@ interface ServingStore {
 	lease: ReadCacheLease | undefined;
 	storageRepo: StorageRepo;
 	underReplicationLedger: KvUnderReplicationLedger;
+	/**
+	 * Where the member keeps the record it promised on and the coordinator keeps the record it is
+	 * broadcasting — the state of an agreement in flight, which only matters across a restart. Built
+	 * over the node's own key-value store, so it is exactly as durable as this node's other
+	 * bookkeeping; a node whose store is in memory keeps it only for this process.
+	 */
+	transactionStateStore: ITransactionStateStore;
 	/** The one window function: the member's apply of a consensus record and the coordinator's own fallback apply flush with the window for the record's cohort. */
 	durabilityWindowFor: DurabilityWindowFor;
 	late: LateServingBindings;
@@ -1079,6 +1079,14 @@ function prepareServingStore(
 	// would pay one sync per block here — coalesce in `noteReplicationShortfall` if one ever does.
 	const underReplicationLedger = new KvUnderReplicationLedger(kvStore, { beforeRecord: () => rawStorage.flush() });
 
+	// The node's own transaction state store, over the same key-value store: a serving node ALWAYS
+	// has one, so `ClusterMember` and `CoordinatorRepo` always persist what an in-flight agreement
+	// needs to be resumed after a restart, and the two `recoverTransactions` passes at start always
+	// run. Its three key prefixes are declared in `NODE_KV_NAMESPACES`, which is what keeps a
+	// file-backed store sharing the block store's directory from listing them as blocks. A client
+	// builds none of this — it runs neither a member nor a coordinator.
+	const transactionStateStore = new PersistentTransactionStateStore(kvStore);
+
 	// The restore starts as a placeholder that finds nothing, rebound once the restoration
 	// coordinator exists after start.
 	const late: LateServingBindings = { restore: async (_blockId, _rev?) => undefined };
@@ -1112,7 +1120,7 @@ function prepareServingStore(
 
 	const onBlockHolders: BlockHoldersSink = (holders) => late.blockHolders?.(holders);
 
-	return { rawStorage, lease, storageRepo, underReplicationLedger, durabilityWindowFor, late, clusterProxy, repoProxy, onBlockHolders };
+	return { rawStorage, lease, storageRepo, underReplicationLedger, transactionStateStore, durabilityWindowFor, late, clusterProxy, repoProxy, onBlockHolders };
 }
 
 /**
@@ -2705,7 +2713,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore,
 		partitionDetector
 	} = ctx;
-	const { storageRepo, rawStorage, underReplicationLedger, durabilityWindowFor, onBlockHolders } = serving;
+	const { storageRepo, rawStorage, underReplicationLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
 
 	// Fetch a block archive from one cohort peer over the sync protocol, bounded by the same
@@ -2832,7 +2840,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		validator: options.validator,
 		reputation,
 		consensusConfig,
-		stateStore: options.transactionStateStore,
+		stateStore: transactionStateStore,
 		reconcileBlock,
 		onCommitCertificate,
 		onBlockHolders,
@@ -2878,7 +2886,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		},
 		fretSvc,
 		reputation,
-		options.transactionStateStore
+		transactionStateStore
 	);
 
 	// Create callback for querying cluster peers for their latest block revision. Three-way
@@ -2981,11 +2989,12 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	// HERE at construction. See `assertSuperMajorityCoupling`.
 	assertSuperMajorityCoupling(member, coordinator);
 
-	// Recover persisted transaction state before accepting new requests
-	if (options.transactionStateStore) {
-		await member.recoverTransactions();
-		await coordinator.recoverTransactions();
-	}
+	// Recover persisted transaction state before accepting new requests. Unconditional: a serving
+	// node always has a transaction state store (see `prepareServingStore`). Member first, then
+	// coordinator: the member restores the records it promised on, so a coordinator resuming a commit
+	// broadcast in the same pass finds this machine's own participant state already in place.
+	await member.recoverTransactions();
+	await coordinator.recoverTransactions();
 
 	// --- Shared owned-block set for the resilience monitors ---
 	// SpreadOnChurnMonitor (sender) and RebalanceMonitor (responsibility tracker) both act on "the

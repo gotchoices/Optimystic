@@ -542,8 +542,8 @@ node is about to report to another machine:
 The one block-storage write outside a group is the read path's re-cache of a materialized
 block (`materializeBlock` in `packages/db-p2p/src/storage/block-storage.ts`), which can be
 recomputed and becomes durable with the next group's flush. `PersistentTransactionStateStore`
-(`packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`), wired only when a host
-passes `NodeOptions.transactionStateStore`, writes without waiting and promises nothing before
+(`packages/db-p2p/src/cluster/persistent-transaction-state-store.ts`), which every serving node
+builds over its own key-value store, writes without waiting and promises nothing before
 it replies, so it is not flushed. Over `WriteGroupDriver` both wait in memory, like every other
 write, until the next group's flush or the driver's idle flush, whichever comes first.
 
