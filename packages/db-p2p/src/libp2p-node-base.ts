@@ -2489,15 +2489,10 @@ export async function createLibp2pNodeBase(
 				// The live root group at a registration's root key, so the service can notice a registration a
 				// walk left outside the group that announces its tail's commits. `resolveReactivityCohort` is
 				// `rootGroupAt` — the placement rule itself, read fresh — deliberately NOT the host's snapshot
-				// view, which `snapshots.ensure` may answer from a snapshot up to one gossip interval old and
-				// which is one of the ways a registration lands wrong in the first place.
-				//
-				// NOTE: the register walk that REPAIRS such a registration is still dialed from that snapshot
-				// (the router's `rootGroupMembers`, `createCohortTopicHost` in `cohort-topic/host.ts`), so the
-				// detector and the repair read the group by two different rules and a repair attempted inside
-				// the snapshot's max age re-lands the same placement. That is what bounds the repair to a tick
-				// of the watch service rather than to one walk; closing it is
-				// `a-misplaced-registration-is-repaired-from-a-stale-group`.
+				// view, which `snapshots.ensure` may answer from a snapshot up to one gossip interval old.
+				// The register walk that REPAIRS such a registration reads the same rule live (the router's
+				// `rootGroupMembers`, `createCohortTopicHost` in `cohort-topic/host.ts`, is bound to
+				// `snapshots.live`), so detector and repair agree and the repair can reach a different group.
 				rootGroupMembers: resolveReactivityCohort,
 				recover,
 				recoverSigners,

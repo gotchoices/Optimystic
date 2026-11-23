@@ -35,8 +35,11 @@ export interface FretTopicRouterOptions {
 	 * {@link ITopicRouter.routeToRoot}; omitting it leaves that method absent, so the walk falls back to ring
 	 * routing on the root key, which reaches the ring's nearest peers to the root coordinate `H(rootKey)` —
 	 * the group itself unless the ring is shared with another network (see `routeToTier` in
-	 * `packages/db-core/src/cohort-topic/walk.ts`). The host binds it to its root-group option, keyed by the
-	 * coordinate `H(rootKey)`.
+	 * `packages/db-core/src/cohort-topic/walk.ts`). The host binds it to a **live** read of its root-group
+	 * option at the coordinate `H(rootKey)`, not to the group snapshot its synchronous cohort sites read: the
+	 * member list dialed here is what a landed registration is later judged against by a live read of the same
+	 * rule (`verifyRootGroup` in `packages/db-p2p/src/reactivity/collection-watch.ts`), so a walk served a
+	 * snapshot could not repair a misplacement that snapshot caused.
 	 */
 	readonly rootGroupMembers?: (rootKey: Uint8Array) => Promise<readonly string[]>;
 	/**

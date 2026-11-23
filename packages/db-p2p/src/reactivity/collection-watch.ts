@@ -30,8 +30,10 @@
  * the registration's life. When that view was wrong the registration is held outside the group that announces,
  * where no announcer, no cohort gossip and no keep-alive finds it. So the service reads the root group live —
  * right after a registration lands, and on each tick — and registers again when the registration's member set
- * is not the group's (see {@link ReactivityCollectionWatch.verifyRootGroup}). That repair is bounded by a tick
- * rather than immediate, for the reason the NOTE on its register attempt gives.
+ * is not the group's (see {@link ReactivityCollectionWatch.verifyRootGroup}). The repair walk reads the group
+ * by that same live rule, so it reaches the group the rule names now rather than the list the misplacement came
+ * from; what it cannot repair inside one walk is a mismatch caused by the *admitting* member's own stale view,
+ * which clears within a gossip interval and costs a tick.
  *
  * **One tick, one read per reader.** The tick is one timer for the whole service, not one per collection, and
  * reads the tails of every collection that reads through one {@link CollectionTailReader} in one call, so a
@@ -754,8 +756,10 @@ export class ReactivityCollectionWatch {
 	 * and acts on the first, so the mismatch is answered inside the attach rather than a tick later.
 	 *
 	 * One attempt per detection — a re-registration that fails, or that lands on the same wrong members again,
-	 * is left to the next reading, exactly as a failed first attach is left to the next tick. The NOTE on that
-	 * attempt is why landing on the same members again is the ordinary case and not the exception.
+	 * is left to the next reading, exactly as a failed first attach is left to the next tick. The attempt is a
+	 * walk whose root step reads the placement rule live, so it dials exactly what this check compared against;
+	 * landing on the same members again means the admitting member's own view is the stale one (see the NOTE at
+	 * the comparison), which clears within a gossip interval and is then repaired by the next reading.
 	 */
 	private async verifyRootGroup(sub: Subscription, confirm: boolean): Promise<void> {
 		const readMembers = this.options.rootGroupMembers;
@@ -795,6 +799,13 @@ export class ReactivityCollectionWatch {
 		// (two register frames a minute, inside the cohort's allowance of four) and the mismatch would never
 		// clear; if that shows up, compare against the group the register walk itself dialed rather than against
 		// this node's live view.
+		//
+		// NOTE: the set on the handle is not this node's reading at all — it is the group the ADMITTING member
+		// reported, which is that member's own engine view, refreshed on its gossip rounds and so up to one
+		// gossip interval old. So a mismatch can have a cause this node cannot influence: the repair walk below
+		// correctly dials the live group, reaches the same first member, and is handed the same stale report
+		// back. That case clears itself within one gossip interval on the admitting member and is then repaired
+		// by the next tick's reading, so the bound on it stays one watch tick.
 		const held = memberSetKey(handle.cohortMembers.map(bytesToPeerIdString));
 		const fresh = memberSetKey(group);
 		if (held === fresh) {
@@ -808,20 +819,17 @@ export class ReactivityCollectionWatch {
 		}
 		// Held one short of the threshold rather than cleared: this reading WAS a mismatch, so the next
 		// mismatched reading is already the second consecutive one and acts without waiting a further tick.
-		// That matters because the attempt below often does not repair the placement (see the NOTE on it): the
-		// repair then costs one tick, not two. Only a reading that matches clears the count.
+		// That matters whenever the attempt below does not repair the placement — a failed walk, or a mismatch
+		// whose cause is the admitting member's own stale view (see the NOTE at the comparison): the repair then
+		// costs one tick, not two. Only a reading that matches clears the count.
 		sub.rootGroupMismatches = MISMATCH_READINGS_BEFORE_REREGISTER - 1;
 		// This condition is otherwise silent — `isAttached` reports a misplaced registration as attached — so the
 		// line is what lets the next report of a deaf watcher be read off a run rather than a probe build.
 		log("re-registering collection=%s: its registration is held outside the root group at its tail — it names members [%s], the group reads [%s]", sub.collectionId, held, fresh);
-		// NOTE: this attempt is a fresh register walk, and on a node with a cohort-topic host the walk's root
-		// step resolves the members it dials through `RootGroupSnapshots.ensure` in
-		// `packages/db-p2p/src/cohort-topic/host.ts`, whose max age is the gossip interval (5 s). A repair that
-		// runs milliseconds after the walk it is repairing — the landing check always does — is therefore served
-		// the SAME cached member list and dials the same members in the same order, so it mostly re-lands the
-		// same placement; what repairs it is the next mismatched reading, one tick later, by when the snapshot
-		// has refreshed. Closing that is `a-misplaced-registration-is-repaired-from-a-stale-group`:
-		// the view that judges a placement and the view the repair walk dials must be one read.
+		// This attempt is a fresh register walk, and on a node with a cohort-topic host the walk's root step
+		// reads the placement rule live (`RootGroupSnapshots.live` in `packages/db-p2p/src/cohort-topic/host.ts`),
+		// so it dials exactly what the reading above compared against and can reach a different member set
+		// however soon after the misplaced walk it runs.
 		await this.place(sub, manager, `the root group at tail=${bytesToB64url(rootKey)}`, () => manager.register().then(() => true));
 	}
 

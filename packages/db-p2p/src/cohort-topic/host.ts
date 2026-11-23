@@ -61,9 +61,11 @@
  * {@link CoordEngine} reads that group from a per-coord **snapshot** (filled before the engine is created,
  * refreshed on each gossip round, read on demand for a `/sign` or membership request) everywhere a default
  * engine assembles the FRET cohort, stamps `rootPlaced` on its `/sign` requests and gossip, and publishes its
- * cert under the ratio rule. A host with no `rootGroup` refuses every root-placed frame; one that is not in
- * the group a frame lands on answers `unwilling_member` naming the group, so the walk's member retry dials a
- * real member. Which rule a coordinate is served under is decided once, when its engine is created, and a
+ * cert under the ratio rule. The one root-group read that does **not** go through the snapshot is a register
+ * walk's root step, which reads `membersAt` live, for the reason the router wiring in
+ * {@link createCohortTopicHost} gives. A host with no `rootGroup` refuses every root-placed frame; one that is
+ * not in the group a frame lands on answers `unwilling_member` naming the group, so the walk's member retry
+ * dials a real member. Which rule a coordinate is served under is decided once, when its engine is created, and a
  * frame claiming the other rule for it is refused (see {@link EnginePlacement}).
  *
  * **Scope.** `followOn` derivation for a promoted-redirect arrival is parked in backlog
@@ -440,6 +442,13 @@ export interface RootGroupSnapshots {
 	ensure(coord: RingCoord): Promise<RootGroupSnapshot>;
 	/** A fresh read, replacing whatever is held (the gossip-cadence refresh). */
 	refresh(coord: RingCoord): Promise<RootGroupSnapshot>;
+	/**
+	 * A fresh read for a caller that must not be served a stale group — a register walk's root step, whose
+	 * dialed member list is what the watch service's live mismatch check is judged against. Shares the one
+	 * in-flight read per coord with `ensure` and `refresh`, and falls back to the held snapshot when the
+	 * fresh read fails, so such a caller is never left worse off than `ensure` would have left it.
+	 */
+	live(coord: RingCoord): Promise<RootGroupSnapshot>;
 	/** Forget `coord` (its engine was evicted). */
 	drop(coord: RingCoord): void;
 }
@@ -487,6 +496,19 @@ function createRootGroupSnapshots(deps: {
 		},
 		refresh(coord: RingCoord): Promise<RootGroupSnapshot> {
 			return read(coord, bytesToB64url(coord));
+		},
+		live(coord: RingCoord): Promise<RootGroupSnapshot> {
+			const key = bytesToB64url(coord);
+			return read(coord, key).catch((err: unknown) => {
+				// A failed fresh read must not leave this caller worse off than `ensure` would have: fall back to
+				// whatever is held, and only propagate when there is nothing to fall back to.
+				const current = held.get(key);
+				if (current === undefined) {
+					throw err;
+				}
+				log("cohort-topic: live root group read failed at %s, falling back to the held snapshot: %o", key, err);
+				return current;
+			});
 		},
 		drop(coord: RingCoord): void {
 			held.delete(bytesToB64url(coord));
@@ -1041,9 +1063,15 @@ export async function createCohortTopicHost(node: Libp2p, fret: FretService, opt
 		selfPeerId: selfPeerStr,
 		handleLocally: (activity: Uint8Array): Promise<Uint8Array> => handleRegisterFrame(activity, "self"),
 		handleRenewBatchLocally: (frame: Uint8Array): Promise<Uint8Array> => handleRenewBatchFrame(frame),
+		// A walk's root step reads the group LIVE, not through the snapshot: the member list it dials is what the
+		// watch service's mismatch check judges a landed registration against (`verifyRootGroup` in
+		// `reactivity/collection-watch.ts` reads the placement rule fresh), so a repair walk served a snapshot
+		// would re-dial the very list the misplacement came from. A register walk is rare (attach, tail rotation,
+		// repair) and `membersAt` is a ring read plus cached peerStore records, so this is a different trade from
+		// the synchronous cohort sites the snapshot exists for — those all still read it.
 		...(rootGroup === undefined ? {} : {
 			rootGroupMembers: (rootKey: Uint8Array): Promise<readonly string[]> =>
-				rootGroup.snapshots.ensure(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
+				rootGroup.snapshots.live(addressing.rootCoord(rootKey)).then((snapshot) => snapshot.memberStrs),
 		}),
 	});
 	const sizeEstimator = new FretSizeEstimator(fret);
@@ -2578,12 +2606,11 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// NOTE: that revisit condition has now been seen — a reactivity registration admitted here by a node the
 	// tail's root group does not contain left the watcher deaf for ≈90 s, the renewal failover's strike-out.
 	// It was answered on the PARTICIPANT side instead (`verifyRootGroup` in `reactivity/collection-watch.ts`
-	// re-reads the root group and registers again), which cuts that to a tick or two of the watch service —
-	// not to one round-trip, because the repair walk dials the same root-group snapshot the misplaced walk did
-	// (`a-misplaced-registration-is-repaired-from-a-stale-group`). Closing the engine on a refresh
-	// that drops self would be the more principled fix but needs a handoff path for the records it still holds,
-	// and with the participant repairing itself it buys little; revisit if a holder is ever the only thing that
-	// can repair such a record, or if the participant-side repair is not enough once that ticket lands.
+	// re-reads the root group and registers again), and since the walk's root step now reads the group live
+	// (the router's `rootGroupMembers` above) that repair reaches the group the rule names now rather than
+	// re-landing the placement it is repairing. Closing the engine on a refresh that drops self would be the
+	// more principled fix but needs a handoff path for the records it still holds, and with the participant
+	// repairing itself it buys little; revisit if a holder is ever the only thing that can repair such a record.
 	//
 	// The child cohorts this cohort parents (recorded by the parent-side child-link dispatch). Its `count`
 	// feeds the demotion gate, the gossip summary, and the traffic snapshot below (was hardcoded 0).
