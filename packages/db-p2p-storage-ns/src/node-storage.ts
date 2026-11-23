@@ -1,4 +1,4 @@
-import { blockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { OptimysticNSDBHandle } from './db.js';
 import { SqliteRawStorage, type SqliteRawStorageOptions } from './sqlite-storage.js';
 import { SqliteKVStore } from './sqlite-kv-store.js';
@@ -26,7 +26,7 @@ export function sqliteNodeStorage(db: OptimysticNSDBHandle, options: SqliteNodeS
 	const blocks = new SqliteRawStorage(db, options);
 	const kv = new SqliteKVStore(db);
 	const pieces = new SqlitePieceStore(db);
-	assertOneLocation(blocks, pieces);
+	assertBlockStoreCountsPieces(blocks, pieces, 'this SQLite handle');
 	return {
 		blocks,
 		kv,
@@ -50,17 +50,4 @@ export function sqliteNodeStorage(db: OptimysticNSDBHandle, options: SqliteNodeS
 			}
 		},
 	};
-}
-
-/**
- * Both stores were built over one handle, so they must report one store identity — which is what
- * tells the node's storage monitor that the block store's byte count already measures the pieces
- * (`blockStoreCountsPieces`). Asserted here so that a later edit which opened a second handle inside
- * this factory could not silently make every node over it report itself fuller than it is. One
- * comparison of two strings per open.
- */
-function assertOneLocation(blocks: SqliteRawStorage, pieces: SqlitePieceStore): void {
-	if (!blockStoreCountsPieces(blocks, pieces)) {
-		throw new Error(`The stores opened over this SQLite handle report two locations (blocks ${blocks.getStoreIdentity()}, pieces ${pieces.storeIdentity()}), so a node over them would count its blob pieces twice`);
-	}
 }

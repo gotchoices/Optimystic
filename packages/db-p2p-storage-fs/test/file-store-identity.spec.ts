@@ -2,7 +2,7 @@ import assert from 'node:assert';
 import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage, FileBatchBackend, fileNodeStorage } from '../src/index.js';
+import { FileRawStorage, FileBatchBackend, FilePieceStore, fileNodeStorage } from '../src/index.js';
 import {
 	blockStoreCountsPieces,
 	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, WriteGroupDriver, withReadCache,
@@ -63,6 +63,14 @@ describe('FileRawStorage store identity', () => {
 	it('does not crash on an empty basePath (resolves to the cwd)', () => {
 		const empty = new FileRawStorage('').getStoreIdentity();
 		assert.strictEqual(empty, new FileRawStorage(process.cwd()).getStoreIdentity());
+	});
+
+	// What `docs/blobs.md` §The local store claims of a Node host, and what every `*NodeStorage`
+	// factory asserts before it returns: the piece store names the base path it was given, not the
+	// `optimystic-pieces/` directory inside it, so the block store's byte count — which measures the
+	// whole tree — is the only figure the monitor adds.
+	it('gives a FilePieceStore over the same basePath one identity with the block store, so pieces are counted once', () => {
+		assert.ok(blockStoreCountsPieces(new FileRawStorage(base), new FilePieceStore(base)));
 	});
 
 	// The composition the whole passthrough chain exists for, and the one the `IRawStorage`
@@ -185,18 +193,6 @@ describe('fileNodeStorage', () => {
 
 	afterEach(async () => {
 		await fs.rm(dir, { recursive: true, force: true });
-	});
-
-	// The claim `docs/blobs.md` §The local store makes about a Node host, and the one the factory's own
-	// assertion protects: one location, so the block store's byte count already measures the pieces and
-	// the monitor does not add them again.
-	it('gives the block store and the piece store one identity, so pieces are counted once', async () => {
-		const storage = fileNodeStorage(dir);
-		try {
-			assert.ok(blockStoreCountsPieces(storage.blocks, storage.pieces));
-		} finally {
-			await storage.close();
-		}
 	});
 
 	// The reference counting: `store.lock` is present exactly while some holder has the directory, so

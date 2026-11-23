@@ -1,4 +1,4 @@
-import { blockStoreCountsPieces, type OpenNodeStorage, type StoreIdentity } from '@optimystic/db-p2p';
+import { assertBlockStoreCountsPieces, type OpenNodeStorage, type StoreIdentity } from '@optimystic/db-p2p';
 import { FileRawStorage, type FileRawStorageOptions } from './file-storage.js';
 import { FileKVStore, type FileKVStoreOptions } from './file-kv-store.js';
 import { FilePieceStore } from './file-piece-store.js';
@@ -99,7 +99,8 @@ function openDirectory(identity: StoreIdentity, basePath: string, options: FileN
 	const blocks = new FileRawStorage(basePath, options);
 	const kv = new FileKVStore(basePath, options);
 	const pieces = new FilePieceStore(basePath);
-	assertOneLocation(basePath, blocks, pieces);
+	// The piece store lives inside the base path, which the block store's byte count measures.
+	assertBlockStoreCountsPieces(blocks, pieces, basePath);
 	const opened: OpenDirectory = { identity, blocks, kv, pieces, holders: 0 };
 	openDirectories.set(identity, opened);
 	return opened;
@@ -127,18 +128,5 @@ async function release(held: OpenDirectory): Promise<void> {
 		} finally {
 			await held.blocks.close();
 		}
-	}
-}
-
-/**
- * Both stores were built over one base path, so they must report one store identity — which is what
- * tells the node's storage monitor that the block store's byte count already measures the pieces
- * (`blockStoreCountsPieces`). Asserted here so that a later edit which moved the piece store to a
- * sibling directory could not silently make every node over this factory report itself fuller than
- * it is. One comparison of two strings per open.
- */
-function assertOneLocation(basePath: string, blocks: FileRawStorage, pieces: FilePieceStore): void {
-	if (!blockStoreCountsPieces(blocks, pieces)) {
-		throw new Error(`The stores opened over ${basePath} report two locations (blocks ${blocks.getStoreIdentity()}, pieces ${pieces.storeIdentity()}), so a node over them would count its blob pieces twice`);
 	}
 }

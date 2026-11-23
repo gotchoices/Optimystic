@@ -52,6 +52,23 @@ export function blockStoreCountsPieces(storage: IRawStorage, pieces: IPieceStore
 }
 
 /**
+ * Throws unless {@link blockStoreCountsPieces} holds of a block store and a piece store a platform
+ * factory built over ONE location — the thing the monitor's decision above rests on, so a factory
+ * that handed back a piece store its block store does not measure would make every node over it
+ * report itself fuller than it is. Each storage package's `*NodeStorage` factory calls this before
+ * it returns, so an edit that moved the pieces elsewhere (a sibling directory, a second handle
+ * opened inside the factory) fails loudly on the first open instead. One comparison of two strings.
+ *
+ * `location` is the one place both were built over, named for the message: a base path, or a phrase
+ * for a handle the caller passed.
+ */
+export function assertBlockStoreCountsPieces(blocks: IRawStorage, pieces: IPieceStore, location: string): void {
+	if (!blockStoreCountsPieces(blocks, pieces)) {
+		throw new Error(`The stores opened over ${location} report two locations (blocks ${blocks.getStoreIdentity?.()}, pieces ${pieces.storeIdentity?.()}), so a node over them would count its blob pieces twice`);
+	}
+}
+
+/**
  * Monitors storage capacity for ring selection.
  * Provides estimates based on storage backend or supplied overrides. Used bytes are the block
  * store's figure plus the piece store's, unless {@link blockStoreCountsPieces} says the block store

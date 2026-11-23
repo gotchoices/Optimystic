@@ -1,4 +1,4 @@
-import { blockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { OptimysticWebDBHandle } from './db.js';
 import { IndexedDBRawStorage, type IndexedDBRawStorageOptions } from './indexeddb-storage.js';
 import { IndexedDBKVStore, type IndexedDBKVStoreOptions } from './indexeddb-kv-store.js';
@@ -27,7 +27,7 @@ export function indexedDbNodeStorage(db: OptimysticWebDBHandle, options: Indexed
 	// The default prefix, named by leaving it out, with the options behind it.
 	const kv = new IndexedDBKVStore(db, undefined, options);
 	const pieces = new IndexedDBPieceStore(db, options);
-	assertOneLocation(blocks, pieces);
+	assertBlockStoreCountsPieces(blocks, pieces, 'this IndexedDB handle');
 	return {
 		blocks,
 		kv,
@@ -47,17 +47,4 @@ export function indexedDbNodeStorage(db: OptimysticWebDBHandle, options: Indexed
 			}
 		},
 	};
-}
-
-/**
- * Both stores were built over one handle, so they must report one store identity — which is what
- * tells the node's storage monitor that the block store's byte count already measures the pieces
- * (`blockStoreCountsPieces`). Asserted here so that a later edit which opened a second handle inside
- * this factory could not silently make every node over it report itself fuller than it is. One
- * comparison of two strings per open.
- */
-function assertOneLocation(blocks: IndexedDBRawStorage, pieces: IndexedDBPieceStore): void {
-	if (!blockStoreCountsPieces(blocks, pieces)) {
-		throw new Error(`The stores opened over this IndexedDB handle report two locations (blocks ${blocks.getStoreIdentity()}, pieces ${pieces.storeIdentity()}), so a node over them would count its blob pieces twice`);
-	}
 }

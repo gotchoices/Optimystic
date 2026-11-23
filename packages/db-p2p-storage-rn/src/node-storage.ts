@@ -1,4 +1,4 @@
-import { blockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { LevelDBLike } from './leveldb-like.js';
 import { LevelDBRawStorage, type LevelDBRawStorageOptions } from './leveldb-storage.js';
 import { LevelDBKVStore, type LevelDBKVStoreOptions } from './leveldb-kv-store.js';
@@ -33,7 +33,7 @@ export function levelDbNodeStorage(db: LevelDBLike, options: LevelDBNodeStorageO
 	// The default prefix, named by leaving it out, with the options behind it.
 	const kv = new LevelDBKVStore(db, undefined, options);
 	const pieces = new LevelDBPieceStore(db);
-	assertOneLocation(blocks, pieces);
+	assertBlockStoreCountsPieces(blocks, pieces, 'this LevelDB handle');
 	return {
 		blocks,
 		kv,
@@ -55,17 +55,4 @@ export function levelDbNodeStorage(db: LevelDBLike, options: LevelDBNodeStorageO
 			}
 		},
 	};
-}
-
-/**
- * Both stores were built over one handle, so they must report one store identity — which is what
- * tells the node's storage monitor that the block store's byte count already measures the pieces
- * (`blockStoreCountsPieces`). Asserted here so that a later edit which opened a second handle inside
- * this factory could not silently make every node over it report itself fuller than it is. One
- * comparison of two strings per open.
- */
-function assertOneLocation(blocks: LevelDBRawStorage, pieces: LevelDBPieceStore): void {
-	if (!blockStoreCountsPieces(blocks, pieces)) {
-		throw new Error(`The stores opened over this LevelDB handle report two locations (blocks ${blocks.getStoreIdentity()}, pieces ${pieces.storeIdentity()}), so a node over them would count its blob pieces twice`);
-	}
 }
