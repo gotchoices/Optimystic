@@ -51,3 +51,13 @@ A cheaper alternative, if that refactor is judged too wide: have `getOrCreateTra
 ## What would confirm the fix
 
 A caller cannot express a collection on a known network without its storage configuration, so no new code path can drop one; the behaviour this ticket describes has no way to arise. The blob-pin specs (`packages/quereus-plugin-optimystic/test/blob-pins-*.spec.ts`) exercise the path that caught it — they restart a process over shared stores and read back the pins the previous one wrote — and must keep passing unchanged.
+
+## Arm: the droppable storage fields are down to one (2026-11-23)
+
+Planning the one-storage-value chain produced `implement/the-sql-plugin-takes-one-storage-setting-per-network`, which replaces `rawStorageFactory` and `blobStorageFactory` with a single `storageFactory` returning the one value db-p2p now takes for a node's whole storage, and resolves it once per transactor key into a map on `CollectionFactory` rather than reading it out of whichever options object arrived first.
+
+That narrows this ticket without closing it. What it fixes: two independently droppable fields become one, the two can no longer disagree with each other, and every consumer of a network's storage — the `local` transactor's block store, the single-machine blob service, and the node the plugin builds itself — reads the one resolved value. What it leaves: `ParsedOptimysticOptions` still carries a network's storage inside a collection's options, so a hand-built options object can still reduce a known network's configuration, and first-options-win still decides. The `NetworkOptions`/`CollectionOptions` split above is still the fix that makes that unrepresentable, and the remaining hole is now one field in one place rather than two.
+
+Folding the split into that ticket was considered and rejected: it spans the aux-option reader, the catalog opener, `openIndexTree`, `getOrCreateTransactor`, `getTransactorKey`, `knownBlobBackends`, `blobBackendForKey` and the hand-built options object in roughly twenty specs, with its own failure mode (a mis-keyed network silently sharing or splitting state) — a separate agent run, and pairing the two risked both.
+
+One more instance of the same class to fold in when this is taken up: the storage map is keyed by transactor key (`<transactor>:<keyNetwork>`) while the node is keyed by node key (`<networkName>:<port>`), so two transactor keys resolving to one node key leave the node holding whichever key's storage built it — exactly as it holds whichever key's `libp2pOptions` built it today.

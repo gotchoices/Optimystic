@@ -2,7 +2,7 @@ description: An operator who gives a storage node a fixed amount of disk has no 
 architecture: packages/db-p2p/docs/storage.md, docs/blobs.md#lifetime, docs/arachnode-ring-handoff.md
 files: packages/db-p2p/src/storage/storage-monitor.ts (`StorageMonitor`, `StorageMonitorConfig`, `blockStoreCountsPieces`), packages/db-p2p/src/storage/ring-selector.ts, packages/db-p2p/src/blob/cache-budget.ts (`BlobCacheBudget`), packages/db-p2p/src/libp2p-node-base.ts (`arachnode.storage`, `blobs.cacheBudgetBytes`), the four storage packages' block, key-value and piece stores
 difficulty: hard
-prereq: 1-a-node-keeps-all-its-data-in-one-storage-setup
+prereq: each-storage-package-opens-a-whole-nodes-storage
 ----
 
 # A node counts every byte against one allotment
@@ -22,6 +22,8 @@ A machine that serves a group stores four kinds of data: block revisions and the
 - **One accounting surface on the node** that reports the total, the effective allotment, and the bytes per kind: blocks, blob pieces by why they are held (pinned, owed, responsible, cached), and bookkeeping. It is what ring selection reads, what the cached-blob budget reads, what an operator's dashboard reads, and what the next ticket acts on. Say what it costs to compute and how often; today's used-bytes scan is memoized for 60 s (`usedBytesCacheTtlMs`) because a full scan is expensive.
 - **Cached blobs come out of the allotment.** The cache may use what the allotment leaves after everything else, capped by `cacheBudgetBytes` when the host sets one. Decide the default share in the plan and say why.
 - **Docs:** packages/db-p2p/docs/storage.md gets a section on the allotment and what counts; docs/blobs.md §Lifetime and the arachnode ring docs say what they now read.
+
+Note on the transaction-state store (2026-11-23, from the planning that produced the `a-node-takes-all-its-storage-as-one-value` chain): the prereq chain resolves the node's storage into **three** stores a host opens — block store, key-value store, piece store (`NodeStorage` in db-p2p) — and keeps the node's transaction state inside the key-value store rather than in a fourth store of its own. So "the sum includes the key-value store and the transaction-state store" is one figure here, not two, and `IKVStore` is the interface this ticket has to give a byte measure to (it has none today, where `IPieceStore` has `bytesUsed` and `IRawStorage` has `getApproximateBytesUsed`).
 
 ## Expected behaviour
 
