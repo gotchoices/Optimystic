@@ -1,6 +1,11 @@
 import type { ITransactionStateStore, PersistedCoordinatorState, PersistedParticipantState } from "./i-transaction-state-store.js";
 
-/** In-memory ITransactionStateStore. Default when no persistent store is injected. */
+/**
+ * In-memory `ITransactionStateStore`. No node builds one: a serving node always gets a
+ * `PersistentTransactionStateStore` over its own key-value store (`prepareServingStore` in
+ * `../libp2p-node-base.ts`), which is this when that store is a `MemoryKVStore`. It stays for the
+ * specs that drive a member or coordinator directly and want the state without a key-value store.
+ */
 export class MemoryTransactionStateStore implements ITransactionStateStore {
 	private readonly coordinatorStates = new Map<string, PersistedCoordinatorState>();
 	private readonly participantStates = new Map<string, PersistedParticipantState>();

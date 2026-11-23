@@ -364,11 +364,12 @@ export interface Mesh {
 	 * executed-transaction memory, the coordinator's in-flight transactions and scheduled commit
 	 * retries, every read-repair stamp. The harness wires no `ITransactionStateStore`, so nothing is
 	 * recovered either — whereas a node built by `createLibp2pNode` always has one, over its own
-	 * key-value store, and so resumes its persisted commit retries on restart
-	 * (`ClusterCoordinator.recoverTransactions`). The old instance is made inert rather than merely forgotten —
-	 * its member is disposed, and every outbound call it would still make (a commit retry whose timer
-	 * fires later, a cohort consult, an archive fetch) fails the way a stopped process's dial does — so
-	 * a retry the old process owed cannot quietly deliver after the restart and pass for healing.
+	 * key-value store, and resumes a persisted commit retry on restart as far as that store is durable
+	 * (`ClusterCoordinator.recoverTransactions`). The old instance is made inert rather than merely
+	 * forgotten — its member is disposed, and every outbound call it would still make (a commit retry
+	 * whose timer fires later, a cohort consult, an archive fetch) fails the way a stopped process's
+	 * dial does — so a retry the old process owed cannot quietly deliver after the restart and pass
+	 * for healing.
 	 *
 	 * Reachability (`failures`) is untouched: a node that was unreachable stays unreachable.
 	 *

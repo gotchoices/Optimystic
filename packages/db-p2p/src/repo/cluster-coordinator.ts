@@ -2235,13 +2235,22 @@ export class ClusterCoordinator {
 
 	/**
 	 * Recover coordinator transactions from persistent store after a restart.
-	 * Called during node startup, before accepting new requests.
+	 *
+	 * Called during node startup, but NOT before the node answers: `wireServingRole` binds this
+	 * coordinator as the served repo's target before it awaits this pass, so a request that reaches
+	 * it meanwhile can start a transaction under a hash this pass is about to restore — a client
+	 * re-sending the same write after the coordinator restarted derives the same `messageHash`. Such
+	 * a hash is left to the live transaction, which owns its retry and its persisted state.
 	 */
 	async recoverTransactions(): Promise<void> {
 		if (!this.stateStore) return;
 		const states = await this.stateStore.getAllCoordinatorStates();
 		for (const state of states) {
 			const { messageHash } = state;
+			if (this.transactions.has(messageHash)) {
+				log('cluster-tx:recovery-live', { messageHash });
+				continue;
+			}
 			// Expired — clean up
 			if (state.record.message.expiration && state.record.message.expiration < this.now()) {
 				log('cluster-tx:recovery-expired', { messageHash });

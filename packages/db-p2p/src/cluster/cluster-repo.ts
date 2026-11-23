@@ -3903,7 +3903,12 @@ export class ClusterMember implements ICluster {
 
 	/**
 	 * Recover member transactions from persistent store after a restart.
-	 * Called during node startup, before accepting new requests.
+	 *
+	 * Called during node startup, but NOT before the node answers: `wireServingRole` binds this
+	 * member into the cluster protocol's proxy before it awaits this pass, and libp2p started well
+	 * before that — so a cohort peer retrying a commit to a machine that has just come back can be
+	 * served while this pass is still reading the store. A hash already in `activeTransactions` is
+	 * therefore left to that delivery, which holds the fresher record and has its timeouts armed.
 	 */
 	async recoverTransactions(): Promise<void> {
 		if (!this.stateStore) return;
@@ -3918,6 +3923,13 @@ export class ClusterMember implements ICluster {
 		const participantStates = await this.stateStore.getAllParticipantStates();
 		for (const state of participantStates) {
 			const { messageHash } = state;
+			// A delivery that landed while this pass was reading the store owns this hash: overwriting
+			// its entry would drop the record it merged and strand its two armed timers, and its own
+			// `clearTransaction` deletes the persisted copy when it finishes.
+			if (this.activeTransactions.has(messageHash)) {
+				log('cluster-member:recovery-live', { messageHash });
+				continue;
+			}
 			// Expired — clean up
 			if (state.record.message.expiration && state.record.message.expiration < now) {
 				log('cluster-member:recovery-expired', { messageHash });
@@ -3944,6 +3956,13 @@ export class ClusterMember implements ICluster {
 	/**
 	 * Checks if a transaction's operations were already executed during consensus.
 	 * Falls back to the persistent store when the in-memory map misses.
+	 *
+	 * NOTE: this is the one state-store access on a request's latency path — every other is
+	 * fire-and-forget — and `handleConsensus` awaits it on each delivery, so since every serving node
+	 * has a store it costs one key-value `get` per cluster message, which a file-backed store answers
+	 * with one `ENOENT` read. Cheap beside the signature verification and block reads the same
+	 * delivery does; if a profile ever says otherwise, hold a negative set of the hashes this process
+	 * has already missed on rather than asking the store twice for the same one.
 	 */
 	async wasTransactionExecutedAsync(messageHash: string): Promise<boolean> {
 		if (this.executedTransactions.has(messageHash)) return true;

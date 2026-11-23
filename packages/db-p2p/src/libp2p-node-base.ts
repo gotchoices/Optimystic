@@ -917,7 +917,7 @@ function resolveKvStore(provider: KVStoreProvider | undefined, servesBlocks: boo
 		return typeof provider === 'function' ? provider() : provider;
 	}
 	wiringLog(servesBlocks
-		? 'WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent; neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this node held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.'
+		? 'WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent; neither will the state of an agreement in flight, so a commit this node was still broadcasting is not resumed and a record it promised on is not restored; neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this node held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.'
 		: 'WARN: no kvStore supplied — using an in-memory store. The high-water mark of the HLC clock will NOT survive a restart, so a client restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this client held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.');
 	return new MemoryKVStore();
 }
@@ -2989,8 +2989,13 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	// HERE at construction. See `assertSuperMajorityCoupling`.
 	assertSuperMajorityCoupling(member, coordinator);
 
-	// Recover persisted transaction state before accepting new requests. Unconditional: a serving
-	// node always has a transaction state store (see `prepareServingStore`). Member first, then
+	// Recover persisted transaction state. Unconditional: a serving node always has a transaction
+	// state store (see `prepareServingStore`). NOT before the node answers — libp2p started above and
+	// both bindings a request reaches (`late.cluster`, `late.coordinatedRepo`) are already set, which
+	// is deliberate: deferring the coordinated repo past this point would serve an inbound pend or
+	// commit from the bare storage repo, with no consensus. A cohort peer retrying a commit to a
+	// machine that has just come back is exactly the traffic to expect here, so both passes leave a
+	// hash already live in memory to its delivery rather than overwriting it. Member first, then
 	// coordinator: the member restores the records it promised on, so a coordinator resuming a commit
 	// broadcast in the same pass finds this machine's own participant state already in place.
 	await member.recoverTransactions();
