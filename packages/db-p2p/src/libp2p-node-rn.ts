@@ -3,13 +3,11 @@ import {
 	type ClientNodeOptions,
 	type Libp2pTransports,
 	type NodeOptions,
-	type RawStorageProvider,
-	type KVStoreProvider,
 	type ServingNodeOptions,
 } from './libp2p-node-base.js';
 import type { OptimysticClientNode, OptimysticNode } from './optimystic-node.js';
 
-export type { ClientNodeOptions, Libp2pTransports, NodeOptions, RawStorageProvider, KVStoreProvider, ServingNodeOptions };
+export type { ClientNodeOptions, Libp2pTransports, NodeOptions, ServingNodeOptions };
 
 /**
  * React Native-friendly libp2p node factory.

@@ -55,9 +55,8 @@ const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
-  storage: rawStorage,
-  kvStore,
-  pieceStorage,
+  // A node takes all of its storage as one value, so none of the three can be left out.
+  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
 });
 ```
 

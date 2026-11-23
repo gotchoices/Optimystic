@@ -13,6 +13,7 @@ import { BlobUnavailableError, readBlob, rootPieceId, walkBlobPieces, type BlobR
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import type { IPieceStore } from '../src/blob/piece-store.js';
 import { localPieceSource } from '../src/blob/local-piece-source.js';
 import { BlobProtocolClient } from '../src/blob/blob-protocol-client.js';
@@ -76,7 +77,8 @@ describe('blob fetcher', function () {
 			clusterSize: 3,
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false },
-			pieceStorage,
+			// Its own key-value and block store per node, and the piece store this mesh watches.
+			storage: { ...memoryNodeStorage(), pieces: pieceStorage },
 			...extra
 		});
 		const started = { a: await spawn(stores.a), b: await spawn(stores.b), c: await spawn(stores.c) };

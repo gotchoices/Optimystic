@@ -113,3 +113,4 @@ export * from "./storage/i-kv-store.js";
 export * from "./storage/memory-kv-store.js";
 export * from "./storage/kv-hlc-clock-store.js";
 export * from "./storage/node-kv-namespaces.js";
+export * from "./storage/node-storage.js";

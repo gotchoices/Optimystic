@@ -113,7 +113,7 @@ describe('FileRawStorage store identity', () => {
 	// the driver over it. db-p2p pins the seam's behaviour over memory drivers and a
 	// synthetic-identity proxy; these pin the same behaviour over a real filesystem backend
 	// reporting a real identity, which is the composition an embedding host actually builds and
-	// hands to `rawStorageFactory` / a `RawStorageProvider`.
+	// hands to `rawStorageFactory` / `NodeOptions.storage`'s `blocks`.
 	describe('through a driver-level cache (KvRawStorage over CachedStoreDriver(WriteGroupDriver(FileBatchBackend)))', () => {
 		const driverLevel = (dir: string, pool: SharedCachePool, label?: string) =>
 			new KvRawStorage(new CachedStoreDriver(new WriteGroupDriver(new FileBatchBackend(dir)), pool, label));

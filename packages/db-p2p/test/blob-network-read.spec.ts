@@ -10,6 +10,7 @@ import { BlobUnavailableError, buildBlob, routingKeyForBlob, type BlobProgressEv
 import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import { buildBlobProtocol } from '../src/blob/blob-protocol.js';
 import { concat, localTcpAddr, streamOf, until } from './support/blob-mesh.js';
 
@@ -59,7 +60,8 @@ describe('node blob service over the network', function () {
 			clusterSize: 2,
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false },
-			pieceStorage,
+			// Its own key-value and block store per node, and the piece store this pair watches.
+			storage: { ...memoryNodeStorage(), pieces: pieceStorage },
 		});
 		const a = await spawn(aPieces);
 		nodes.push(a);

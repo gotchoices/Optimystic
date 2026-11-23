@@ -15,6 +15,7 @@ import * as os from 'node:os';
 import { Database } from '@quereus/quereus';
 import {
 	createLibp2pNode,
+	memoryNodeStorage,
 	RepoClient
 } from '@optimystic/db-p2p';
 import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
@@ -613,7 +614,9 @@ describe('Distributed Transaction Validation', function () {
 			port,
 			bootstrapNodes,
 			networkName: NETWORK_NAME,
-			storage: new FileRawStorage(storagePath),
+			// Blocks on disk under this node's own directory; its records and pieces in memory, which
+			// this spec never restarts over.
+			storage: { ...memoryNodeStorage(), blocks: new FileRawStorage(storagePath) },
 			fretProfile: 'core',  // Use 'core' profile for more consistent coordinator selection
 			clusterSize: MESH_SIZE,
 			clusterPolicy: {

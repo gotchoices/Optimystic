@@ -2,7 +2,7 @@
 import { Command, InvalidArgumentError } from 'commander';
 import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
-import { getNetworkManager, createLibp2pNode, MemoryRawStorage, MemoryKVStore, MemoryPieceStore, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type IRawStorage, type IKVStore, type IPieceStore } from '@optimystic/db-p2p';
+import { getNetworkManager, createLibp2pNode, memoryNodeStorage, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type OpenNodeStorage } from '@optimystic/db-p2p';
 import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
@@ -41,7 +41,7 @@ class LocalTransactor implements ITransactor {
 
 interface NetworkSession {
 	node: any;
-	stores: NodeStores;
+	stores: OpenNodeStorage;
 	transactor: NetworkTransactor | LocalTransactor;
 	diaries: Map<string, Diary<any>>;
 	trees: Map<string, BTree<any, any>>;
@@ -49,42 +49,36 @@ interface NetworkSession {
 	isSingleNode: boolean; // Track if we're in single-node mode
 }
 
-/** The stores handed to the node, kept because the node never closes a store it was handed (`RawStorageProvider`). */
-interface NodeStores {
-	storage: IRawStorage;
-	kvStore: IKVStore;
-	pieceStore: IPieceStore;
-	/** For file storage, checkpoints the shared write-ahead log and removes the directory's lock. */
-	close(): Promise<void>;
-}
-
 /**
- * The block store, the node-local state that must survive a restart (the under-replication
- * ledger, the blob records) and the blob pieces. File storage puts all three over one base path, where they share one write-ahead log and one
- * lock: FileRawStorage.listBlockIds yields only directories that hold a meta.json, so the ledger's
- * `under-replicated/` directory is never read as a block, nor is `optimystic-pieces/`. Memory storage
- * gets a memory key-value store and piece store explicitly — the node's own fallbacks would warn
- * about losing state across a restart, which a memory-storage peer loses anyway.
+ * All of the node's storage — the blocks, the node-local records that must survive a restart (the
+ * under-replication ledger, the blob records) and the blob pieces — opened as one value, closed by
+ * this process because the node closes no store it was handed. File storage puts all three over one
+ * base path, where they share one write-ahead log and one lock: FileRawStorage.listBlockIds yields
+ * only directories that hold a meta.json, so the ledger's `under-replicated/` directory is never read
+ * as a block, nor is `optimystic-pieces/`. `memoryNodeStorage()` is passed explicitly for the memory
+ * option — a peer asked for memory storage means it, so the node's own warning about losing
+ * everything across a restart would only be noise.
  */
-function openStores(options: { storage?: 'memory' | 'file'; storagePath?: string }): NodeStores {
+function openStores(options: { storage?: 'memory' | 'file'; storagePath?: string }): OpenNodeStorage {
 	if (options.storage !== 'file') {
-		return { storage: new MemoryRawStorage(), kvStore: new MemoryKVStore(), pieceStore: new MemoryPieceStore(), close: async () => { } };
+		return memoryNodeStorage();
 	}
-	const storage = new FileRawStorage(options.storagePath!);
-	const kvStore = new FileKVStore(options.storagePath!);
-	const pieceStore = new FilePieceStore(options.storagePath!);
+	const blocks = new FileRawStorage(options.storagePath!);
+	const kv = new FileKVStore(options.storagePath!);
+	const pieces = new FilePieceStore(options.storagePath!);
 	return {
-		storage,
-		kvStore,
-		pieceStore,
+		blocks,
+		kv,
+		pieces,
+		/** Checkpoints the shared write-ahead log and removes the directory's lock. */
 		close: async () => {
 			try {
-				await pieceStore.close();
+				await pieces.close();
 			} finally {
 				try {
-					await kvStore.close();
+					await kv.close();
 				} finally {
-					await storage.close();
+					await blocks.close();
 				}
 			}
 		},
@@ -447,9 +441,7 @@ class PeerSession {
 			appendAnnounceAddrs: options.appendAnnounceAddr,
 			networkName: options.network || 'optimystic',
 			fretProfile: options.fretProfile,
-			storage: stores.storage,
-			kvStore: stores.kvStore,
-			pieceStorage: stores.pieceStore,
+			storage: stores,
 			clusterSize,
 			clusterPolicy: superMajorityThreshold !== undefined || assumedClusterSize !== undefined
 				|| repairCorroborationClusterSize !== undefined

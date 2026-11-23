@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { createLibp2pNode, StorageRepo, MemoryRawStorage } from '@optimystic/db-p2p';
+import { createLibp2pNode, StorageRepo, MemoryRawStorage, memoryNodeStorage } from '@optimystic/db-p2p';
 import { Diary } from '@optimystic/db-core';
 
 /**
@@ -15,7 +15,7 @@ describe('Offline mode storage sharing', () => {
 			port: 0,
 			bootstrapNodes: [],
 			networkName: 'test-offline-identity',
-			storage: () => new MemoryRawStorage(),
+			storage: memoryNodeStorage(),
 		});
 		try {
 			const nodeStorageRepo = (node as any).storageRepo as StorageRepo;
@@ -37,7 +37,7 @@ describe('Offline mode storage sharing', () => {
 			port: 0,
 			bootstrapNodes: [],
 			networkName: 'test-offline-write-read',
-			storage: () => new MemoryRawStorage(),
+			storage: memoryNodeStorage(),
 		});
 		try {
 			const nodeStorageRepo = (node as any).storageRepo as StorageRepo;

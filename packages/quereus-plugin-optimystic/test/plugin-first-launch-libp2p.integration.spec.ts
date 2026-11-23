@@ -6,7 +6,8 @@ import type { PrivateKey } from '@libp2p/interface';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import {
 	createLibp2pNode,
-	MemoryRawStorage,
+	memoryNodeStorage,
+	type OpenNodeStorage,
 	RepoClient,
 } from '@optimystic/db-p2p';
 import {
@@ -47,7 +48,7 @@ interface NodeWiring {
 
 async function spawnNode(
 	trackedNodes: Libp2p[],
-	overrides: { storage?: MemoryRawStorage; privateKey?: PrivateKey } = {}
+	overrides: { storage?: OpenNodeStorage; privateKey?: PrivateKey } = {}
 ): Promise<NodeWiring> {
 	const node = await createLibp2pNode({
 		port: 0,
@@ -142,7 +143,8 @@ describe('Plugin first-launch over real libp2p', function () {
 
 	it('cold-restart over shared storage preserves rows', async function () {
 		this.timeout(25_000);
-		const storage = new MemoryRawStorage();
+		// One storage for both sessions: node B below reads what node A wrote.
+		const storage = memoryNodeStorage();
 		const privateKey = await generateKeyPair('Ed25519');
 
 		// Session 1: boot node A, create table + insert row, stop node A.

@@ -8,7 +8,7 @@
 import {
 	createLibp2pNode,
 	StorageRepo,
-	MemoryRawStorage,
+	memoryNodeStorage,
 	RepoClient
 } from '@optimystic/db-p2p';
 import net from 'node:net';
@@ -55,7 +55,7 @@ async function createNode(port: number, bootstrapNodes: string[]): Promise<TestN
 		port,
 		bootstrapNodes,
 		networkName: 'quick-test',
-		storage: () => new MemoryRawStorage(),
+		storage: memoryNodeStorage(),
 		fretProfile: 'edge',
 		clusterSize: 3,
 		clusterPolicy: {

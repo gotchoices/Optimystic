@@ -30,6 +30,7 @@ import { createNodeNetworkTransactor } from '../src/node-network-transactor.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { MemoryKVStore } from '../src/storage/memory-kv-store.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import { concat, localTcpAddr, streamOf, until } from './support/blob-mesh.js';
 import { captureLog, hasLine } from './support/capture-log.js';
 
@@ -195,11 +196,11 @@ describe("a blob's owed copies drained over the network", function () {
 		const writerPieces = new CountingPieceStore();
 		const writerKv = new MemoryKVStore();
 		const writerStorage = new MemoryRawStorage();
-		const writerOptions = { privateKey: writerKey, pieceStorage: writerPieces, kvStore: writerKv, storage: writerStorage };
+		const writerOptions = { privateKey: writerKey, storage: { blocks: writerStorage, kv: writerKv, pieces: writerPieces } };
 		const receiverPieces = new MemoryPieceStore();
 
 		let a = await spawn(writerOptions);
-		const b = await spawn({ pieceStorage: receiverPieces });
+		const b = await spawn({ storage: { ...memoryNodeStorage(), pieces: receiverPieces } });
 		await link(b, a);
 		const net = transactorOver(a);
 		await BlobScopeRegistry.register(net, SCOPE);

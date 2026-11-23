@@ -43,9 +43,8 @@ const pieceStorage = new FilePieceStore('/var/lib/my-peer/data');
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
-  storage: rawStorage,
-  kvStore,
-  pieceStorage,
+  // A node takes all of its storage as one value, so none of the three can be left out.
+  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
 });
 
 // … and on shutdown, after the node has stopped:
@@ -55,11 +54,11 @@ await kvStore.close();
 await rawStorage.close();
 ```
 
-The node keeps blob pieces in `pieceStorage` and their records in `kvStore`,
-and serves both through `libp2p.blobs` (`docs/blobs.md` in the repository
-root). Without `pieceStorage` it keeps pieces in memory and logs a warning: a
-restart then loses the pieces while `kvStore` keeps their records, and those
-blobs read as not here.
+The node keeps blob pieces in the `pieces` store and their records in the `kv`
+store, and serves both through `libp2p.blobs` (`docs/blobs.md` in the repository
+root). The three go in as one `storage` value, so there is no field to forget:
+without the option at all the node keeps everything in memory and logs one
+`node-wiring` warning saying so.
 
 The node never closes a store it was handed, so close each after `stop()`.
 Closing flushes what the store still holds and, for the last store over the
@@ -97,9 +96,10 @@ never mistaken for a block. KV bytes do count
 toward `FileRawStorage.getApproximateBytesUsed` when the path is shared. Over
 one `basePath` the two share one log, one lock and one checkpoint.
 
-Without a `kvStore`, the node falls back to an in-memory store and logs a
-`node-wiring` warning: what the ledger records, the HLC clock's high-water
-mark and the blob records are then lost on restart.
+Without a `storage` option at all, the node falls back to in-memory stores for
+everything and logs one `node-wiring` warning: the blocks, what the ledger
+records, the state of an agreement in flight, the HLC clock's high-water mark,
+the blob records and the pieces are then all lost on restart.
 
 ## On-disk layout
 

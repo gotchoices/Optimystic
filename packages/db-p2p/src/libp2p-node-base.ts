@@ -15,17 +15,14 @@ import { blockTransferService } from './cluster/block-transfer-service.js';
 import { repoService } from './repo/service.js';
 import { StorageRepo, resolvePendLeaseMs } from './storage/storage-repo.js';
 import { BlockStorage } from './storage/block-storage.js';
-import { MemoryRawStorage } from './storage/memory-storage.js';
 import { withReadCache, type ReadCacheLease, type ResolvedReadCache } from './storage/with-read-cache.js';
 import type { IRawStorage } from './storage/i-raw-storage.js';
 import type { StoreDurability } from './storage/store-durability.js';
 import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindowFor, type DurabilityWindowPolicy, type StorageDurabilityOptions } from './storage/durability-window.js';
-import type { IKVStore } from './storage/i-kv-store.js';
-import { MemoryKVStore } from './storage/memory-kv-store.js';
+import { memoryNodeStorage, type NodeStorage } from './storage/node-storage.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
 import type { IPieceStore } from './blob/piece-store.js';
-import { MemoryPieceStore } from './blob/memory-piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
 import { BlobCacheBudget, DEFAULT_BLOB_CACHE_BUDGET_BYTES } from './blob/cache-budget.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
@@ -196,29 +193,6 @@ const blobLog = createLogger('blob:protocol');
 const blobCopyLog = createLogger('blob:copy');
 
 /**
- * Factory function or instance for creating raw storage. The node puts the write-through read
- * cache in front of the resolved instance (`withReadCache`, unless it is a `MemoryRawStorage` or
- * already read-cached) under a lease, and releases THAT LEASE when it stops; the instance you
- * supplied is never disposed. The cache is shared per backing store: two concurrently running nodes handed
- * one uncached instance — or two instances that report the same `getStoreIdentity()`, such as two
- * `FileRawStorage` over one directory — read and write through ONE cache, which is cleared and
- * unregistered only when the last of them stops. Sequential reuse (a restart over the same
- * instance) starts cold once the previous node's lease has released. What remains unguarded is
- * the cross-process case (Invariant 5 in `packages/db-p2p/docs/storage.md`). A host that attaches
- * its own read cache and hands the result in keeps owning it; the node never releases it. Either
- * documented cache construction is accepted here — `new CachedRawStorage(inner)` or
- * `new KvRawStorage(new CachedStoreDriver(driver))`, the latter preferred when the backend's
- * driver is reachable. Both report `IRawStorage.readCached`, which is what the seam checks.
- */
-export type RawStorageProvider = IRawStorage | (() => IRawStorage);
-
-/** Factory function or instance for the node's durable key-value store; see {@link NodeOptions.kvStore}. */
-export type KVStoreProvider = IKVStore | (() => IKVStore);
-
-/** Factory function or instance for the node's store of blob pieces; see {@link NodeOptions.pieceStorage}. */
-export type PieceStoreProvider = IPieceStore | (() => IPieceStore);
-
-/**
  * `ClusterPolicyOptions` is intersected in, not restated: `resolveClusterPolicy` consumes those
  * fields structurally, so a second copy of the shape here would let a newly added knob compile and
  * be silently ignored. See `cluster/cluster-policy.ts` for what each one resolves to.
@@ -286,10 +260,11 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * false: a client. It registers none of the four storage protocols (repo, cluster, sync,
 	 * block-transfer), so every other node of this build classifies it as not serving from its identify
 	 * list, it is in no cohort, and it never coordinates. Its reads and writes go to the network's
-	 * serving machines. The options that configure only serving subsystems (`storage`,
-	 * `storageDurability`, `validator`, `onCommitCertificate`, `dispute`,
-	 * `blockTransfer`, `rebalance`, `spreadOnChurn`, `underReplicationDrain`, `arachnode`,
-	 * `responsibilityK`) are ignored on a client, with one `node-wiring` line naming those it was given.
+	 * serving machines. The options that configure only serving subsystems (`storageDurability`,
+	 * `validator`, `onCommitCertificate`, `dispute`, `blockTransfer`, `rebalance`, `spreadOnChurn`,
+	 * `underReplicationDrain`, `arachnode`, `responsibilityK`) are ignored on a client, with one
+	 * `node-wiring` line naming those it was given.
+	 * {@link NodeOptions.storage} is NOT among them: a client uses its key-value store and its pieces.
 	 * A client still registers the blob protocol, gated by `authorizeInboundStream`. See
 	 * docs/internals.md §Client nodes.
 	 */
@@ -322,8 +297,21 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 *  - `false`: never run it.
 	 */
 	holePunching?: boolean;
-	/** Storage provider - either an IRawStorage instance or a factory function. Defaults to MemoryRawStorage if not provided. See {@link RawStorageProvider} for the ownership rule. */
-	storage?: RawStorageProvider;
+	/**
+	 * Every store this node persists to, as one value: the block store, the key-value store and the
+	 * piece store ({@link NodeStorage}, which states who owns the read cache in front of the block
+	 * store). Each storage package opens all of it over one location in one call; there is no part of
+	 * it a host can leave out, and the node closes none of it — a host that supplies one closes it
+	 * after `stop()`.
+	 *
+	 * Absent → `memoryNodeStorage()`, with one `node-wiring` `WARN:` line naming everything the node
+	 * is then keeping in memory and what is lost with each. Pass `memoryNodeStorage()` yourself to
+	 * say the memory case was intended and get no warning.
+	 *
+	 * A client (`servesBlocks: false`) uses two thirds of it — the key-value store and the pieces —
+	 * and never touches the block store, so this is NOT a serving-only option.
+	 */
+	storage?: NodeStorage;
 	/**
 	 * How long a storage write may wait before it is forced onto disk, computed per write from the size
 	 * of the cohort its consensus ran on (see `durabilityWindowMs` in `storage/durability-window.ts`).
@@ -334,28 +322,6 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 * node construction.
 	 */
 	storageDurability?: StorageDurabilityOptions;
-	/**
-	 * Durable key-value store for node-local state that must survive a restart — today, the
-	 * under-replication ledger (which blocks this node acknowledged below full replication, and who
-	 * is still missing each), the HLC clock's high-water mark (`hlc/high-water`) and the blob records
-	 * (`optimystic-blobs/`, docs/blobs.md §The local store). An instance or a factory, the same shape
-	 * as {@link NodeOptions.storage}.
-	 * Absent → an in-memory store, with a `node-wiring` warning: the ledger, the clock and the blob
-	 * records still work, but what they record is lost on restart. `FileKVStore` from `@optimystic/db-p2p-storage-fs` may share
-	 * `FileRawStorage`'s base path; see its README. Like the raw storage, the node never closes it:
-	 * a host that supplies one closes it after `stop()`.
-	 */
-	kvStore?: KVStoreProvider;
-	/**
-	 * The store of blob pieces behind `node.blobs` (docs/blobs.md §The local store). An instance or a
-	 * factory, the same shape as {@link NodeOptions.kvStore}; a factory that throws fails node
-	 * construction. Used on a client too, which keeps the blobs its own host puts.
-	 * Absent → a `MemoryPieceStore`, with a `node-wiring` warning: pieces are lost on restart while
-	 * their records in {@link NodeOptions.kvStore} may survive, so such blobs then read as not here.
-	 * `FilePieceStore` from `@optimystic/db-p2p-storage-fs` shares `FileRawStorage`'s base path; see its
-	 * README. The node never closes it: a host that supplies one closes it after `stop()`.
-	 */
-	pieceStorage?: PieceStoreProvider;
 	/**
 	 * The blob service's settings. `digest` is the hashing port that names every piece (docs/blobs.md
 	 * §References and pieces), default `defaultBlobDigest()`. A supplied digest is used as given:
@@ -819,13 +785,15 @@ export type ClientNodeOptions = NodeOptions & { servesBlocks: false };
  * options: a serving-only option added later is added here.
  */
 function logIgnoredServingOptions(options: NodeOptions): void {
+	// NOT `storage`: a client reads two thirds of that value (the key-value store and the pieces) and
+	// only leaves its block store alone, so reporting it as ignored would be a lie.
 	const servingOnly = [
-		'storage', 'storageDurability', 'validator', 'onCommitCertificate', 'dispute',
+		'storageDurability', 'validator', 'onCommitCertificate', 'dispute',
 		'blockTransfer', 'rebalance', 'spreadOnChurn', 'underReplicationDrain', 'arachnode', 'responsibilityK'
 	] as const satisfies readonly (keyof NodeOptions)[];
 	const given = servingOnly.filter(name => options[name] !== undefined);
 	if (given.length > 0) {
-		wiringLog('client node (servesBlocks: false) builds no storage, so it ignores: %s', given.join(', '));
+		wiringLog('client node (servesBlocks: false) stores no blocks, so it ignores: %s', given.join(', '));
 	}
 }
 
@@ -845,21 +813,17 @@ function withLinkDerivedCohortBudget(options: NodeOptions, deadlines: LinkDeadli
 }
 
 /**
- * Resolve the node's raw storage and put the write-through read cache in front of it. This is
- * the single place the network node resolves its `IRawStorage`, so it is the single place the
- * cache is wired (`withReadCache` states the exclusions: memory storage, and storage that
- * already reports `readCached`, pass through unchanged). The default is a bare
- * `MemoryRawStorage`, deliberately not routed through the helper — nothing to cache.
+ * Put the write-through read cache in front of the node's block store. This is the single place the
+ * network node resolves its `IRawStorage`, so it is the single place the cache is wired
+ * (`withReadCache` states the exclusions: memory storage, and storage that already reports
+ * `readCached`, pass through unchanged — the memory default from `memoryNodeStorage()` takes the
+ * first of those, so it stays unwrapped with nothing to release).
  *
  * `lease` is this node's claim on the (possibly shared) cache, and the ONLY thing its stop path
  * may release — a host that supplied an already-cached storage, in either documented
  * construction, keeps owning it (see {@link ResolvedReadCache}).
  */
-function resolveStorage(provider: RawStorageProvider | undefined, networkName: string): ResolvedReadCache {
-	if (!provider) {
-		return { storage: new MemoryRawStorage(), lease: undefined };
-	}
-	const storage = typeof provider === 'function' ? provider() : provider;
+function resolveStorage(storage: IRawStorage, networkName: string): ResolvedReadCache {
 	// NOTE: the label is the network name, so N nodes on one network in one process over N DISTINCT
 	// stores produce N identically-labelled rows in `SharedCachePool.stats()` (the pool keys on a
 	// monotonic store id, not the label); N nodes over ONE store share a single row, labelled by
@@ -908,30 +872,31 @@ function durabilityWindowClause(durability: StoreDurability, policy: DurabilityW
 }
 
 /**
- * Resolve the node's durable key-value store, beside {@link resolveStorage}. The memory fallback is
- * LOUD on purpose: a silent one would look like the under-replication ledger works and then fail the
- * one case it exists for — a shortfall recorded before a restart being there after it.
+ * Resolve the node's storage: whatever the host supplied, or `memoryNodeStorage()` with ONE
+ * `node-wiring` `WARN:` line naming everything the node is then keeping in memory and what is lost
+ * with each. The test is the PRESENCE OF THE OPTION, not the durability of the stores behind it,
+ * which is the point of taking the whole value: a host that passes `memoryNodeStorage()` has said it
+ * meant the memory case and gets no warning, and there is no longer a part of its storage a host can
+ * drop by accident.
+ *
+ * The warning is LOUD on purpose: a silent fallback would look like the under-replication ledger
+ * works and then fail the one case it exists for — a shortfall recorded before a restart being there
+ * after it.
+ *
+ * NOTE: a host can still hand-build a `NodeStorage` whose parts disagree — a `FileRawStorage` beside
+ * a `MemoryKVStore` — and that case is silent, where the three separate options each warned for
+ * themselves. It is the host's deliberate composition and `IKVStore` has no `durability` to report,
+ * so the node cannot tell. If a host is ever bitten by a mixed set, give `IKVStore` the `durability`
+ * field `IPieceStore` and `IRawStorage` already have and name the memory parts in this same line.
  */
-function resolveKvStore(provider: KVStoreProvider | undefined, servesBlocks: boolean): IKVStore {
-	if (provider !== undefined) {
-		return typeof provider === 'function' ? provider() : provider;
+function resolveNodeStorage(supplied: NodeStorage | undefined, servesBlocks: boolean): NodeStorage {
+	if (supplied !== undefined) {
+		return supplied;
 	}
 	wiringLog(servesBlocks
-		? 'WARN: no kvStore supplied — using an in-memory store. The under-replication ledger (blocks this node acknowledged before every cohort member held them) will NOT survive a restart, so copies owed at shutdown are never sent; neither will the state of an agreement in flight, so a commit this node was still broadcasting is not resumed and a record it promised on is not restored; neither will the high-water mark of the HLC clock, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this node held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.'
-		: 'WARN: no kvStore supplied — using an in-memory store. The high-water mark of the HLC clock will NOT survive a restart, so a client restarted with its wall clock behind can stamp new changes below ones it stamped before; nor will the blob records, so a restart sweeps every blob this client held. Supply NodeOptions.kvStore (e.g. FileKVStore) to keep them.');
-	return new MemoryKVStore();
-}
-
-/**
- * Resolve the node's store of blob pieces, beside {@link resolveKvStore}, on either role. The memory
- * fallback is loud for the same reason: the blob records may be durable while the pieces are not.
- */
-function resolvePieceStore(provider: PieceStoreProvider | undefined): IPieceStore {
-	if (provider !== undefined) {
-		return typeof provider === 'function' ? provider() : provider;
-	}
-	wiringLog('WARN: no pieceStorage supplied — using an in-memory piece store. Blob pieces this node stores will NOT survive a restart, while their records in the key-value store may, so such blobs then read as not here. Supply NodeOptions.pieceStorage (e.g. FilePieceStore) to keep them.');
-	return new MemoryPieceStore();
+		? 'WARN: no NodeOptions.storage supplied — keeping ALL of this node\'s storage in memory, so nothing it writes survives a restart. The blocks it holds for the network go with it, so it comes back holding nothing and its cohort has to restore every one. The under-replication ledger (blocks it acknowledged before every cohort member held them) goes, so copies owed at shutdown are never sent. The state of an agreement in flight goes, so a commit it was still broadcasting is not resumed and a record it promised on is not restored. The HLC clock\'s high-water mark goes, so a node restarted with its wall clock behind can stamp new changes below ones it stamped before. The blob records and the owed-blob ledger go, so a restart sweeps every blob it held, and the blob pieces go with them. Supply NodeOptions.storage — the block store, key-value store and piece store your platform\'s storage package opens over one location — or memoryNodeStorage() to say this was meant.'
+		: 'WARN: no NodeOptions.storage supplied — keeping ALL of this client\'s storage in memory, so nothing it writes survives a restart. The HLC clock\'s high-water mark goes, so a client restarted with its wall clock behind can stamp new changes below ones it stamped before. The blob records and the owed-blob ledger go, so a restart sweeps every blob it held, and the blob pieces go with them — including a blob its own host put that no committed row references yet, whose only copy this machine holds. Supply NodeOptions.storage — the block store, key-value store and piece store your platform\'s storage package opens over one location — or memoryNodeStorage() to say this was meant.');
+	return memoryNodeStorage();
 }
 
 /**
@@ -1060,13 +1025,14 @@ interface ServingStore {
 function prepareServingStore(
 	options: NodeOptions,
 	consensusConfig: ResolvedClusterPolicy,
-	kvStore: IKVStore,
+	storage: NodeStorage,
 	hlcClock: HlcClock,
 	linkDeadlines: LinkDeadlines
 ): ServingStore {
+	const kvStore = storage.kv;
 	// Read from the one resolved cluster policy, never a second copy of the size or threshold.
 	const durabilityWindowPolicy = resolveDurabilityWindowPolicy(options.storageDurability, consensusConfig);
-	const { storage: rawStorage, lease } = resolveStorage(options.storage, options.networkName);
+	const { storage: rawStorage, lease } = resolveStorage(storage.blocks, options.networkName);
 	logStorageDurability(rawStorage.durability, durabilityWindowPolicy);
 	const durabilityWindowFor: DurabilityWindowFor = cohortSize => durabilityWindowMs(cohortSize, durabilityWindowPolicy);
 	// A shortfall entry describes a commit in the block store, whose flush may have been given a
@@ -1290,11 +1256,14 @@ export async function createLibp2pNodeBase(
 	const servesBlocks = options.servesBlocks !== false;
 	if (!servesBlocks) logIgnoredServingOptions(options);
 	const bootstrapTargets = planBootstrapTargets(options.bootstrapNodes ?? []);
-	const kvStore = resolveKvStore(options.kvStore, servesBlocks);
+	// All of this node's storage, as one value: the host supplied it or it is in memory, and there is
+	// no third case in which a part of it is missing.
+	const nodeStorage = resolveNodeStorage(options.storage, servesBlocks);
+	const kvStore = nodeStorage.kv;
 	// The node's single-machine blob service, on both roles: the machine a blob is put on holds its
 	// only copy until its reference commits, and a client is often that machine (docs/blobs.md §The
 	// node's blob service). Started once the node has, below, where `node.blobs` is built over it.
-	const pieceStore = resolvePieceStore(options.pieceStorage);
+	const pieceStore = nodeStorage.pieces;
 	const blobs = new LocalBlobService({ pieces: pieceStore, kv: kvStore, digest: options.blobs?.digest });
 	// Read here, before the blob protocol service entry below closes over it: an on-demand node declines
 	// every announcement, including the ones that arrive before the receiver exists.
@@ -1336,7 +1305,7 @@ export async function createLibp2pNodeBase(
 
 	// The serving role's storage half, built before libp2p because the four storage protocol services
 	// answer through it. A client builds none of it (docs/internals.md §Client nodes).
-	const serving = servesBlocks ? prepareServingStore(options, consensusConfig, kvStore, hlcClock, linkDeadlines) : undefined;
+	const serving = servesBlocks ? prepareServingStore(options, consensusConfig, nodeStorage, hlcClock, linkDeadlines) : undefined;
 
 	// The running node, bound immediately after `createLibp2p` below. Service factories that need the
 	// node at REQUEST time read it through this binding, never `components.libp2p` (see

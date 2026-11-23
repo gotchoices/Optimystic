@@ -7,7 +7,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { multiaddr } from '@multiformats/multiaddr';
 import { hashKey } from 'p2p-fret';
 import { createLibp2pNode, type NodeOptions } from '../src/libp2p-node.js';
-import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import { RepoClient } from '../src/repo/client.js';
 import { pickLocalTcpMultiaddr } from './util/multiaddrs.js';
 
@@ -316,7 +316,8 @@ describe('Real libp2p integration', function () {
 
 	it('cold-restart over real transport with shared storage', async function () {
 		this.timeout(20_000);
-		const storage = new MemoryRawStorage();
+		// One storage for both nodes: the restart below reads what the first node wrote.
+		const storage = memoryNodeStorage();
 		const privateKey = await generateKeyPair('Ed25519');
 
 		const node1 = await spawnNode({

@@ -69,7 +69,7 @@ export interface OptimysticNodeAttachmentsBase {
 	cohortReachability: NodeCohortReachability;
 	/**
 	 * The node's hybrid logical clock (docs/crdt-sync.md §Migration Path, Stage 1), started before the
-	 * node could store anything, its high-water mark kept in `NodeOptions.kvStore`. A serving node's
+	 * node could store anything, its high-water mark kept in the `kv` of `NodeOptions.storage`. A serving node's
 	 * storage raises it to the HLC of every write it stores for others. A host that builds a transactor
 	 * over the node passes it as `NetworkTransactorInit.clock`, so the writes it mints and the writes
 	 * the node stores move one clock; a transactor without it mints from a process-wide clock that
@@ -77,8 +77,8 @@ export interface OptimysticNodeAttachmentsBase {
 	 */
 	hlcClock: HlcClock;
 	/**
-	 * The node's blob service (docs/blobs.md §The node's blob service), over `NodeOptions.pieceStorage`
-	 * and the blob records in `NodeOptions.kvStore`. On a client too: the machine a blob is put on holds
+	 * The node's blob service (docs/blobs.md §The node's blob service), over the `pieces` of
+	 * `NodeOptions.storage` and the blob records in its `kv`. On a client too: the machine a blob is put on holds
 	 * its only copy until a row referencing it commits. A read fetches the pieces this node lacks from
 	 * the machines that hold them, `fetch` brings a whole blob here, `stat` with `probe` asks the blob's
 	 * cohort, and `announce` hands the blob to the node's copy drain, which copies it to the cohort and

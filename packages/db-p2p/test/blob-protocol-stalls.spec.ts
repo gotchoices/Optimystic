@@ -15,6 +15,7 @@ import { createLibp2pNode } from '../src/libp2p-node.js';
 import type { OptimysticNode } from '../src/optimystic-node.js';
 import { registerProtocolHandler } from '../src/network/register-protocol-handler.js';
 import { MemoryPieceStore } from '../src/blob/memory-piece-store.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import { BlobProtocolClient } from '../src/blob/blob-protocol-client.js';
 import { readBlobFrames, sendBlobFrame } from '../src/blob/blob-frames.js';
 import { BlobTransferStalledError, buildBlobProtocol, encodeBlobHeader } from '../src/blob/blob-protocol.js';
@@ -66,7 +67,7 @@ describe('blob protocol stalls', function () {
 
 	beforeEach(async () => {
 		aPieces = new MemoryPieceStore();
-		a = await spawn({ pieceStorage: aPieces });
+		a = await spawn({ storage: { ...memoryNodeStorage(), pieces: aPieces } });
 		b = await spawn();
 		await b.dial(multiaddr(localTcpAddr(a)));
 	});

@@ -19,8 +19,7 @@ import { delay, waitFor } from '@optimystic/db-core/test';
 import { generateKeyPair } from '@libp2p/crypto/keys';
 import { createLibp2pNode, type ServingNodeOptions } from '../../src/libp2p-node.js';
 import type { OptimysticNode } from '../../src/optimystic-node.js';
-import { MemoryRawStorage } from '../../src/storage/memory-storage.js';
-import { MemoryKVStore } from '../../src/storage/memory-kv-store.js';
+import { memoryNodeStorage, type OpenNodeStorage } from '../../src/storage/node-storage.js';
 import type { IUnderReplicationLedger } from '../../src/repo/i-under-replication-ledger.js';
 import { RepoClient } from '../../src/repo/client.js';
 
@@ -40,15 +39,16 @@ export interface Machine {
 	readonly name: string;
 	readonly networkName: string;
 	readonly privateKey: PrivateKey;
-	readonly storage: MemoryRawStorage;
-	/** The node-local key-value store — today the under-replication ledger — which, like `storage`,
-	 *  must outlive a node process for a restart to mean anything. */
-	readonly kvStore: MemoryKVStore;
+	/** All of the machine's storage — its blocks, its node-local records (today the
+	 *  under-replication ledger) and its blob pieces. Built once per machine and handed to every node
+	 *  started over it, which is what makes a restart mean anything. In memory, so it outlives the
+	 *  node process but not the spec run. */
+	readonly storage: OpenNodeStorage;
 	node?: OptimysticNode;
 }
 
 export async function createMachine(name: string, networkName: string): Promise<Machine> {
-	return { name, networkName, privateKey: await generateKeyPair('Ed25519'), storage: new MemoryRawStorage(), kvStore: new MemoryKVStore() };
+	return { name, networkName, privateKey: await generateKeyPair('Ed25519'), storage: memoryNodeStorage() };
 }
 
 export function running(machine: Machine): OptimysticNode {
@@ -57,7 +57,7 @@ export function running(machine: Machine): OptimysticNode {
 }
 
 /** How a spec's machines reach each other. The cluster configuration is not part of it — see the module header. */
-export type NetworkShape = Omit<ServingNodeOptions, 'networkName' | 'privateKey' | 'storage' | 'kvStore' | 'clusterSize' | 'clusterPolicy'>;
+export type NetworkShape = Omit<ServingNodeOptions, 'networkName' | 'privateKey' | 'storage' | 'clusterSize' | 'clusterPolicy'>;
 
 export async function startMachine(machine: Machine, shape: NetworkShape): Promise<OptimysticNode> {
 	const node = await createLibp2pNode({
@@ -65,7 +65,6 @@ export async function startMachine(machine: Machine, shape: NetworkShape): Promi
 		networkName: machine.networkName,
 		privateKey: machine.privateKey,
 		storage: machine.storage,
-		kvStore: machine.kvStore,
 		clusterPolicy: { repairCorroborationClusterSize: 2 }
 	});
 	machine.node = node;
@@ -216,9 +215,10 @@ export async function describeWriteAttempt(attempt: WriteAttempt, row: Row, tree
 /** Every block `machine` holds a committed revision of, from its own storage only. */
 export async function committedBlocks(machine: Machine): Promise<Map<BlockId, number>> {
 	const { storageRepo } = running(machine);
-	if (!machine.storage.listBlockIds) throw new Error('MemoryRawStorage no longer enumerates block ids; the locality check needs it');
+	const listBlockIds = machine.storage.blocks.listBlockIds?.bind(machine.storage.blocks);
+	if (!listBlockIds) throw new Error('MemoryRawStorage no longer enumerates block ids; the locality check needs it');
 	const held = new Map<BlockId, number>();
-	for await (const blockId of machine.storage.listBlockIds()) {
+	for await (const blockId of listBlockIds()) {
 		const rev = (await storageRepo.get({ blockIds: [blockId] }))[blockId]?.state.latest?.rev;
 		if (rev !== undefined) held.set(blockId, rev);
 	}

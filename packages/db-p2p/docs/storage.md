@@ -1059,9 +1059,10 @@ Semantics worth knowing:
   - `CollectionFactory.createLocalTransactor`
     (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
     — wraps the host's `rawStorageFactory` result, label `quereus:local`.
-  - `resolveStorage` (`src/libp2p-node-base.ts`) — wraps a `RawStorageProvider`'s
-    instance or factory result, label `node:<networkName>`. The no-provider
-    default is a bare `MemoryRawStorage` and stays unwrapped.
+  - `resolveStorage` (`src/libp2p-node-base.ts`) — wraps the `blocks` store of
+    `NodeOptions.storage` (§8 below), label `node:<networkName>`. The memory
+    default from `memoryNodeStorage()` is a bare `MemoryRawStorage` and stays
+    unwrapped.
 
   **One cache per backing store, shared under leases.** A write-through cache
   is coherent only while every in-process writer to a store goes through the
@@ -1175,8 +1176,8 @@ Semantics worth knowing:
   `clearCache()` drops every entry; `dispose()` releases the pool
   registration when the workspace departs.
 - **Either form may cross a composition seam.** A host that builds its own cache
-  and hands it to `rawStorageFactory` or a `RawStorageProvider` may hand over
-  *either* shape — the seam detects both via `readCached` (above), returns it
+  and hands it to `rawStorageFactory`, or as the `blocks` store of
+  `NodeOptions.storage`, may hand over *either* shape — the seam detects both via `readCached` (above), returns it
   unchanged with no lease, and the host keeps owning it. The driver-level form
   stays the recommended one whenever the driver is reachable; requiring the
   storage-level form at a seam would force exactly the hosts that *have* a driver
@@ -1193,11 +1194,29 @@ Semantics worth knowing:
 
 ### 7. Blob pieces and records
 
-A node keeps large values ("blobs") outside the block store, in two places: their pieces in an `IPieceStore` (`NodeOptions.pieceStorage`; `FilePieceStore` on a Node host, `SqlitePieceStore` on NativeScript, `IndexedDBPieceStore` in a browser, `LevelDBPieceStore` on React Native, `MemoryPieceStore` by default), and one record per held blob in the node's key-value store (`NodeOptions.kvStore`, keys under `optimystic-blobs/`). `LocalBlobService` in `packages/db-p2p/src/blob/local-blob-service.ts` writes both and is the node's `node.blobs`, on a serving node and a client alike. The design, and what each store must promise, is [docs/blobs.md §The local store](../../../docs/blobs.md#the-local-store).
+A node keeps large values ("blobs") outside the block store, in two places: their pieces in an `IPieceStore` (the `pieces` of `NodeOptions.storage`, §8 below; `FilePieceStore` on a Node host, `SqlitePieceStore` on NativeScript, `IndexedDBPieceStore` in a browser, `LevelDBPieceStore` on React Native, `MemoryPieceStore` by default), and one record per held blob in the node's key-value store (its `kv`, keys under `optimystic-blobs/`). `LocalBlobService` in `packages/db-p2p/src/blob/local-blob-service.ts` writes both and is the node's `node.blobs`, on a serving node and a client alike. The design, and what each store must promise, is [docs/blobs.md §The local store](../../../docs/blobs.md#the-local-store).
 
 A put keeps one ordering across the two stores: every piece is stored and the piece store flushed, and only then is the record naming the pieces written and the key-value store flushed. So a record that survives a crash never names a piece the crash lost, and pieces a crash left without a record are removed by the sweep the service runs after it starts. The piece store keeps no prefix rule of its own (pieces are independent), which is why the ordering is the caller's.
 
 The node never closes the piece store, as it never closes the block store or the key-value store it was handed: a host closes it after `stop()`. On a serving node, the Arachnode storage monitor counts its bytes toward the node's use, once (`blockStoreCountsPieces` in `packages/db-p2p/src/storage/storage-monitor.ts`).
+
+### 8. A node's storage, as one value
+
+A node persists three kinds of thing, and takes all three as ONE option: `NodeOptions.storage`, a `NodeStorage` (`packages/db-p2p/src/storage/node-storage.ts`) with a `blocks` (`IRawStorage`), a `kv` (`IKVStore`) and a `pieces` (`IPieceStore`). Every storage package builds its three stores over one location anyway — `FileRawStorage`, `FileKVStore` and `FilePieceStore` over one base path; the SQLite, IndexedDB and LevelDB stores over one open database handle — so one value is what a host actually has, and there is no longer a field it can forget. The reason it is one value and not three options is that each of the three used to default to memory on its own: a host that supplied a block store and nothing else silently got a memory key-value store and memory pieces, and lost blob records and blob pieces at every restart with only a warning in a log.
+
+Which parts each role uses:
+
+| Part | Serving node | Client (`servesBlocks: false`) |
+|---|---|---|
+| `blocks` | yes — block revisions and their commit proofs, behind the read cache (§6) | never read; it stores no blocks for anyone |
+| `kv` | yes — the blob records, the owed-blob and under-replication ledgers, the HLC clock's high-water mark, the node's transaction state (each prefix in `NODE_KV_NAMESPACES`) | yes — the high-water mark, the blob records and the owed-blob ledger |
+| `pieces` | yes | yes — a client is often the only machine holding a blob its host put |
+
+`blocks` is required on both roles so that one value serves either and a host that changes the role changes one flag; an unused block store over a location the node already holds costs nothing, since every backend's constructor is lazy. There is no field for the transaction-state store: the node builds that over `kv` (`PersistentTransactionStateStore`), so the rule for it is stated once and holds on every platform.
+
+With `NodeOptions.storage` absent the node uses `memoryNodeStorage()` and logs one `node-wiring` `WARN:` line naming everything it is then keeping in memory and what is lost with each. The test is the PRESENCE of the option, not the durability of the stores behind it — so a host that passes `memoryNodeStorage()` has said it meant the memory case and gets no warning. A host may still hand-build a value whose parts disagree (a `FileRawStorage` beside a `MemoryKVStore`); that is silent, because `IKVStore` reports no durability for the node to read. The start-up durability line (`logStorageDurability`, serving nodes only) is a separate, factual report about `blocks` alone.
+
+The node closes nothing it was handed. A platform factory returns an `OpenNodeStorage` — a `NodeStorage` with a `close` — and the host calls that after `stop()`.
 
 ## Data Structures
 

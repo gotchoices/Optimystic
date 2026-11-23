@@ -381,8 +381,8 @@ export class CollectionFactory {
    *
    * Where the blobs live:
    *
-   *  - **`network`**: the node's own service, `node.blobs`, over `NodeOptions.pieceStorage` and the
-   *    blob records in `NodeOptions.kvStore`. A node a host injected through
+   *  - **`network`**: the node's own service, `node.blobs`, over the `pieces` of `NodeOptions.storage`
+   *    and the blob records in its `kv`. A node a host injected through
    *    {@link registerLibp2pNode} may carry none (the attachments are optional), and then this falls
    *    through to the single-machine arm.
    *  - **everything else** (`local`, `test`, `mesh-test`, a custom transactor): a

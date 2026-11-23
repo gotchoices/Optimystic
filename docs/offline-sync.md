@@ -1696,8 +1696,8 @@ delete a crash loses lists the outcome once more after the restart.
 
 `journal` takes the `IKVStore` interface (in `packages/db-p2p/src/storage/i-kv-store.ts`), which the
 filesystem, IndexedDB, React Native LevelDB and NativeScript SQLite packages all implement, so no new
-storage adapter is needed. A host may hand in the same instance it passes the node as
-`NodeOptions.kvStore`: the plugin's key prefix, `optimystic-offline/`, is in `NODE_KV_NAMESPACES` (in
+storage adapter is needed. A host may hand in the same instance it gives the node as the `kv` of
+`NodeOptions.storage`: the plugin's key prefix, `optimystic-offline/`, is in `NODE_KV_NAMESPACES` (in
 `packages/db-p2p/src/storage/node-kv-namespaces.ts`), which is how a file-backed store sharing a
 base path with block storage keeps block listings from walking it.
 

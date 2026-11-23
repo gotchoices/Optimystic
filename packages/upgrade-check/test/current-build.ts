@@ -3,7 +3,7 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import register from '@optimystic/quereus-plugin-optimystic/plugin';
 import { NetworkTransactor, type IRepo, type PeerId } from '@optimystic/db-core';
-import { createLibp2pNode, RepoClient, type IKVStore, type IPieceStore, type IRawStorage, type OptimysticNode } from '@optimystic/db-p2p';
+import { createLibp2pNode, RepoClient, type IRawStorage, type NodeStorage, type OptimysticNode } from '@optimystic/db-p2p';
 import { FileKVStore, FilePieceStore, FileRawStorage } from '@optimystic/db-p2p-storage-fs';
 import { LevelDBKVStore, LevelDBPieceStore, LevelDBRawStorage } from '@optimystic/db-p2p-storage-rn';
 import { privateKeyFromProtobuf } from '@libp2p/crypto/keys';
@@ -36,8 +36,6 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 		arachnode: { enableRingZulu: true },
 		storage: backend.storage,
-		kvStore: backend.kvStore,
-		pieceStorage: backend.pieceStorage,
 		privateKey: privateKeyFromProtobuf(Buffer.from(manifest.peerKey, 'base64')),
 	});
 	const transactor = nodeTransactor(node, manifest.networkName);
@@ -57,14 +55,18 @@ export async function startCurrentBuild(dataDir: string, manifest: FixtureManife
 		await stop();
 		throw err;
 	}
-	return { node, storage: backend.storage(), transactor, db, plugin, stop };
+	return { node, storage: backend.storage.blocks, transactor, db, plugin, stop };
 }
 
 interface OpenBackend {
-	storage: () => IRawStorage;
-	kvStore: IKVStore;
-	/** Over the same location as `storage`, which no fixture's build wrote a piece into. */
-	pieceStorage: IPieceStore;
+	/**
+	 * The node's storage over the older build's files. Hand-built rather than opened by one
+	 * per-platform factory: this file's whole job is to reproduce the directory layout each release
+	 * wrote, and for `fs` that is TWO directories (`blocks` and `kv`, as every fixture's `fs.json`
+	 * manifest declares) — a layout no one-location factory can or should produce. The piece store
+	 * sits over the same location as the blocks, which no fixture's build wrote a piece into.
+	 */
+	storage: NodeStorage;
 	/** Releases what the node does not own: the three stores, and for LevelDB the handle they share, which no store closes. */
 	close(): Promise<void>;
 }
@@ -76,22 +78,20 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 			// Kept and closed here: the node never closes a store it was handed, and closing is what
 			// checkpoints each directory's write-ahead log, releases its lock and makes the restart
 			// below reopen it from disk.
-			const storage = new FileRawStorage(join(dataDir, layout.blocks));
-			const kvStore = new FileKVStore(join(dataDir, layout.kv));
+			const blocks = new FileRawStorage(join(dataDir, layout.blocks));
+			const kv = new FileKVStore(join(dataDir, layout.kv));
 			// `<blocks>/optimystic-pieces/`, which `FileRawStorage`'s listing skips and its byte count includes.
-			const pieceStorage = new FilePieceStore(join(dataDir, layout.blocks));
+			const pieces = new FilePieceStore(join(dataDir, layout.blocks));
 			return {
-				storage: () => storage,
-				kvStore,
-				pieceStorage,
+				storage: { blocks, kv, pieces },
 				close: async () => {
 					try {
-						await pieceStorage.close();
+						await pieces.close();
 					} finally {
 						try {
-							await kvStore.close();
+							await kv.close();
 						} finally {
-							await storage.close();
+							await blocks.close();
 						}
 					}
 				},
@@ -103,19 +103,17 @@ async function openBackend(dataDir: string, layout: StorageLayout): Promise<Open
 			// applies what it still holds and disarms its timers before the handle goes away. The
 			// piece store holds nothing in memory and has no `close`.
 			const db = await openClassicLevel(join(dataDir, layout.path));
-			const storage = new LevelDBRawStorage(db);
-			const kvStore = new LevelDBKVStore(db);
-			const pieceStorage = new LevelDBPieceStore(db);
+			const blocks = new LevelDBRawStorage(db);
+			const kv = new LevelDBKVStore(db);
+			const pieces = new LevelDBPieceStore(db);
 			return {
-				storage: () => storage,
-				kvStore,
-				pieceStorage,
+				storage: { blocks, kv, pieces },
 				close: async () => {
 					try {
-						await kvStore.close();
+						await kv.close();
 					} finally {
 						try {
-							await storage.close();
+							await blocks.close();
 						} finally {
 							await db.close();
 						}

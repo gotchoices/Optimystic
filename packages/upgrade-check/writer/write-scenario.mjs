@@ -24,8 +24,10 @@ import { Database } from '@quereus/quereus';
 import register from '@optimystic/quereus-plugin-optimystic/plugin';
 import { Diary, NetworkTransactor } from '@optimystic/db-core';
 import { createLibp2pNode, RepoClient } from '@optimystic/db-p2p';
-// Namespace imports: a named import of an export an older build lacks (its piece store) fails the
-// whole module at link time, where an absent member of a namespace is only `undefined`.
+// Namespace imports: a named import of an export an older build lacks (its piece store, or the
+// one-value node storage) fails the whole module at link time, where an absent member of a
+// namespace is only `undefined`.
+import * as dbP2p from '@optimystic/db-p2p';
 import * as storageFs from '@optimystic/db-p2p-storage-fs';
 import * as storageRn from '@optimystic/db-p2p-storage-rn';
 import { generateKeyPair, privateKeyToProtobuf } from '@libp2p/crypto/keys';
@@ -148,7 +150,7 @@ console.log(`wrote ${rows.length} rows, ${entries.length} diary entries${blob ? 
 process.exit(0);
 
 async function startNode({ storage, kvStore, pieceStorage }, key) {
-	return await createLibp2pNode({
+	const shared = {
 		port: 0,
 		networkName: NETWORK_NAME,
 		bootstrapNodes: [],
@@ -156,12 +158,24 @@ async function startNode({ storage, kvStore, pieceStorage }, key) {
 		clusterSize: 1,
 		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 		arachnode: { enableRingZulu: true },
+		privateKey: key,
+	};
+	// `storage` means two different things either side of one change, so one options object cannot
+	// serve both builds: a build with `memoryNodeStorage` reads it as the node's WHOLE storage, while
+	// every build before that reads it as the block store alone, beside `kvStore` and `pieceStorage`.
+	// Probed the same way `BACKENDS` above probes for a piece store — an absent namespace member is
+	// just `undefined`. A build with `memoryNodeStorage` is well after piece stores, so `pieces` is there.
+	// Note `storage` is a factory in the old shape and the instance is what the new one wants.
+	if (typeof dbP2p.memoryNodeStorage === 'function') {
+		return await createLibp2pNode({ ...shared, storage: { blocks: storage(), kv: kvStore, pieces: pieceStorage } });
+	}
+	return await createLibp2pNode({
+		...shared,
 		storage,
 		// Builds before 1.0.0 have no `kvStore` option and ignore it.
 		kvStore,
 		// Builds before blob storage have no `pieceStorage` option, and nothing to pass for it.
 		pieceStorage,
-		privateKey: key,
 	});
 }
 

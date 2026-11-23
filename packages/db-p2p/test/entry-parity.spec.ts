@@ -36,7 +36,7 @@ const NODE_ONLY: ReadonlyMap<string, string> = new Map();
 
 /** The one intended asymmetry: the Node entry wires TCP/WebSocket transports, the RN entry does
  *  not. Both modules export exactly the same names (`createLibp2pNode`, `Libp2pTransports`,
- *  `NodeOptions`, `RawStorageProvider`), so this is invisible at the export-name level and has to
+ *  `NodeOptions`, `ServingNodeOptions`), so this is invisible at the export-name level and has to
  *  be modelled as a mapping — a plain set diff would report it as two spurious findings. */
 const ENTRY_SUBSTITUTIONS: ReadonlyMap<string, string> = new Map([
 	['./libp2p-node.js', './libp2p-node-rn.js']
