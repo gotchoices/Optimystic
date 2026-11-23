@@ -45,3 +45,18 @@ The discriminator is available: identify fills a peer record's `agentVersion` / 
 ## How it was found and what would confirm it
 
 Read from the code during the review of `feat-blob-owed-copies-are-drained`; not reproduced. Confirming it means driving a cohort member into the partial-list state — connect a member, have it open one non-blob stream, hold identify off, and run a copy drain pass while another member confirms — and watching the blob reach `full` with that member holding nothing. The two NOTEs now at the sites (`blobAcceptanceOf`, and `BlobCopyDrain.accepts`) point here.
+
+## A second arm: root placement latches the verdict instead of re-reading it
+
+Found while working `fix/reactivity-registration-held-outside-the-tail-root-group` (now `implement/`); read from the code, not reproduced.
+
+`membershipOf` carries its own NOTE about this window (`packages/db-p2p/src/libp2p-key-network.ts:1498`): a peer of this network can read `foreign` between a connection opening and identify landing, and "the next reading corrects it, and the cost is one cohort assembly that leaves the peer out". That accounting assumes an assembly's answer is used once and thrown away, which is true of a block read.
+
+Root placement is the exception. `servingCohortAt` is the same assembly, and the cohort-topic host persists its answer: into a `RootGroupSnapshot`, from there into the `cohortEpoch` and member set carried on a reactivity registration's handle, and from there into the registration record's deterministic primary and the gating that decides which gossip frames may merge it (`packages/db-core/src/cohort-topic/gossip/bus.ts:139-146` drops a record delta under a foreign epoch). So one assembly that leaves a serving peer out does not cost one skipped read — it places a watcher's registration on a machine outside the group that will announce the collection's changes, where no announcer can see it, cohort gossip cannot carry it out, and the watcher's own keep-alive pings a primary that holds nothing. Until that defect's own fix lands, the repair was the renewal's three-strike failover, about 90 s later.
+
+Two consequences for this ticket:
+
+- It raises the stakes named in `tradeoffs:` above. The window is still the few milliseconds before identify lands, but a second reader now turns it into a minute and a half of missed change notifications rather than one under-counted durability pass — so "unreachable in any real deployment" is a weaker argument than it was.
+- `membershipOf` has a sharper edge than `protocolSupport` for this case: a **non-empty, partial** protocol list is read `foreign` *and* erases the peer's remembered serving verdict (`rememberVerdict(idStr, false)`), so the memory that exists precisely to survive a missing protocol list does not rescue it. An empty list does fall back to the memory. Whatever discriminator this ticket settles on, it needs to stop the demotion as well as the verdict.
+
+The reactivity defect itself is being closed on the consumer side — the watcher now re-reads the group after its registration lands and on each later tick, and registers again on a mismatch — so this arm is about the source, not about that symptom.
