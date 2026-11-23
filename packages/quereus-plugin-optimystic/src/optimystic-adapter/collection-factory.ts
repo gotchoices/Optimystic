@@ -186,7 +186,16 @@ export class CollectionFactory {
    * {@link dispose} forgets this. One `NodeStorage` per location is what a storage package enforces
    * (`fileNodeStorage` in `@optimystic/db-p2p-storage-fs` counts holders over a directory, two sets
    * over one directory being what breaks its piece store), and asking a CONSTRUCTING factory twice
-   * is how two sets over one location would come back.
+   * is how two sets over one location would come back. A key present with the value `undefined`
+   * means the factory has been asked and the host supplied none, which is why {@link storageFor}
+   * `has`-tests rather than `get`-tests.
+   *
+   * NOTE: kept past {@link dispose}, so a stray statement after a host has disposed the plugin AND
+   * closed its stores reaches a CLOSED store, where re-asking the factory would have silently
+   * reopened one behind the host's back. Both are host-lifecycle errors and the closed store is the
+   * louder of the two, which is why this is not branched on. If a host ever needs dispose to hand
+   * its storage back, clear this there and say on the option that the factory is called once per
+   * network per plugin LIFETIME rather than per plugin.
    *
    * NOTE: keyed by TRANSACTOR key (`<transactor>:<keyNetwork>`) while a node is keyed by NODE key
    * (`<networkName>:<port>`). Two transactor keys that resolve to one node key build the node once,
@@ -194,15 +203,6 @@ export class CollectionFactory {
    * `libp2pOptions` today. Same class as backlog
    * `debt-a-networks-storage-is-taken-from-one-collections-options`, not this map's to fix.
    */
-  // A key present with the value `undefined` means the factory has been asked and the host supplied
-  // none, which is why this is `has`-tested rather than `get`-tested in {@link storageFor}.
-  //
-  // NOTE: kept past {@link dispose}, so a stray statement after a host has disposed the plugin AND
-  // closed its stores reaches a CLOSED store, where re-asking the factory would have silently
-  // reopened one behind the host's back. Both are host-lifecycle errors and the closed store is the
-  // louder of the two, which is why this is not branched on. If a host ever needs dispose to hand
-  // its storage back, clear this there and say on the option that the factory is called once per
-  // network per plugin LIFETIME rather than per plugin.
   private storages = new Map<string, NodeStorage | undefined>();
   /** The single-machine services this factory BUILT, so {@link dispose} can stop them. A `network`
    * backend's service belongs to its node and is stopped by {@link shutdown}. */
@@ -579,6 +579,14 @@ export class CollectionFactory {
    * "called once" hold for the table-and-catalog pair that opens together. Every storage factory is
    * synchronous for the same reason (`fileNodeStorage` opens nothing on disk until the first
    * operation).
+   *
+   * NOTE: this reads the CALLER's `options` while {@link transactorOptions} holds the key's first
+   * ones, so in principle a key could memoize `undefined` here while the remembered options carry a
+   * factory. It cannot today: every caller is either inside the key's first {@link createTransactor}
+   * — which {@link getOrCreateTransactor} records the options ahead of — or past an awaited
+   * `getOrCreateTransactor`, so the two memos always see one options object per key. A new caller
+   * that reaches this WITHOUT that is what would break it; read `transactorOptions.get(key)` here if
+   * one ever has to.
    */
   private storageFor(options: ParsedOptimysticOptions): NodeStorage | undefined {
     const key = this.getTransactorKey(options);

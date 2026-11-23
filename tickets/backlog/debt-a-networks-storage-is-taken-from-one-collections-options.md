@@ -53,7 +53,7 @@ A caller cannot express a collection on a known network without its storage conf
 
 ## Arm: the droppable storage fields are down to one (2026-11-23)
 
-`the-sql-plugin-takes-one-storage-setting-per-network` has landed; it replaced `rawStorageFactory` and `blobStorageFactory` with a single `storageFactory` returning the one value db-p2p now takes for a node's whole storage, and resolves it once per transactor key into a map on `CollectionFactory` rather than reading it out of whichever options object arrived first.
+`the-sql-plugin-takes-one-storage-setting-per-network` has landed; it replaced `rawStorageFactory` and `blobStorageFactory` with a single `storageFactory` returning the one value db-p2p now takes for a node's whole storage, and resolves it once per transactor key into a map on `CollectionFactory` so that every consumer of a network's storage reads one value. The factory it calls is still the one on whichever options object arrived first for that key, so the ordering this ticket is about is unchanged.
 
 That narrows this ticket without closing it. What it fixed: two independently droppable fields became one, the two can no longer disagree with each other, and every consumer of a network's storage — the `local` transactor's block store, the single-machine blob service, and the node the plugin builds itself — reads the one resolved value. What it leaves: `ParsedOptimysticOptions` still carries a network's storage inside a collection's options, so a hand-built options object can still reduce a known network's configuration, and first-options-win still decides. The `NetworkOptions`/`CollectionOptions` split above is still the fix that makes that unrepresentable, and the remaining hole is now one field in one place rather than two.
 

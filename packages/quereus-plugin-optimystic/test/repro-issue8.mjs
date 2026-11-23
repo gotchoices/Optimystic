@@ -132,7 +132,10 @@ async function main() {
 	const pluginConfig =
 		MODE === 'network'
 			? { default_key_network: 'libp2p', enable_cache: false }
-			: { default_transactor: 'local', default_key_network: 'test', enable_cache: false, rawStorageFactory: () => new KvRawStorage(driver) };
+			// Same shape as the node's `storage` above, and for the same reason: only `blocks` is the
+			// counted store. The plugin takes the whole value, so a bare block-storage factory here
+			// would be ignored and this arm would silently count a MemoryRawStorage.
+			: { default_transactor: 'local', default_key_network: 'test', enable_cache: false, storageFactory: () => ({ ...memoryNodeStorage(), blocks: new KvRawStorage(driver) }) };
 	const p = register(db, pluginConfig);
 
 	if (MODE === 'network') {
