@@ -2578,10 +2578,13 @@ function createCoordEngine(ctx: CoordEngineContext, servedCoord: RingCoord, tree
 	// NOTE: that revisit condition has now been seen — a reactivity registration admitted here by a node the
 	// tail's root group does not contain left the watcher deaf for ≈90 s, the renewal failover's strike-out.
 	// It was answered on the PARTICIPANT side instead (`verifyRootGroup` in `reactivity/collection-watch.ts`
-	// re-reads the root group and registers again), which repairs the condition in one round-trip. Closing the
-	// engine on a refresh that drops self would be the more principled fix but needs a handoff path for the
-	// records it still holds, and with the participant repairing itself it buys nothing; revisit if a holder
-	// is ever the only thing that can repair such a record.
+	// re-reads the root group and registers again), which cuts that to a tick or two of the watch service —
+	// not to one round-trip, because the repair walk dials the same root-group snapshot the misplaced walk did
+	// (`a-misplaced-registration-is-repaired-from-a-stale-group`). Closing the engine on a refresh
+	// that drops self would be the more principled fix but needs a handoff path for the records it still holds,
+	// and with the participant repairing itself it buys little; revisit if a holder is ever the only thing that
+	// can repair such a record, or if the participant-side repair is not enough once that ticket lands.
+	//
 	// The child cohorts this cohort parents (recorded by the parent-side child-link dispatch). Its `count`
 	// feeds the demotion gate, the gossip summary, and the traffic snapshot below (was hardcoded 0).
 	const childRegistry = createChildRegistry();
