@@ -2,14 +2,14 @@ description: A storage node that runs out of its allotted space today keeps acce
 architecture: docs/arachnode-ring-handoff.md, docs/blobs.md#lifetime, docs/blobs.md#placement-copying-and-durability, packages/db-p2p/docs/storage.md
 files: packages/db-p2p/src/storage/ring-selector.ts (`determineRing`, `shouldTransition`), packages/db-p2p/src/storage/ring-shift-coordinator.ts, packages/db-p2p/src/libp2p-node-base.ts (`gcEligibleBlocks`, `createArachnodeInfo`), packages/db-p2p/src/blob/cache-budget.ts, packages/db-p2p/src/blob/cohort-reaction.ts, packages/db-p2p/src/blob/announce-receiver.ts, packages/db-p2p/src/cluster/block-transfer-service.ts (`handlePush`), packages/db-p2p/src/cluster/cluster-repo.ts (the promise vote)
 difficulty: hard
-prereq: 2-a-node-counts-every-byte-against-one-allotment
+prereq: blob-bytes-are-reported-by-hold-and-the-cache-gets-a-share
 ----
 
 # A node stays within its allotment
 
 ## Why
 
-Once a node knows its allotment and what it is using (`2-a-node-counts-every-byte-against-one-allotment`), it still does nothing that frees space:
+Once a node knows its allotment and what it is using (the `every-store-reports-its-bytes-and-its-free-space` → `a-node-measures-its-use-against-one-allotment` → `blob-bytes-are-reported-by-hold-and-the-cache-gets-a-share` chain), it still does nothing that frees space:
 
 - **Narrowing never deletes.** Above 85% use, ring selection moves the node one ring outward, to a narrower slice of the keyspace, through the advertise, confirm and release handoff (`RingShiftCoordinator`). The released blocks go into `gcEligibleBlocks`, which nothing reads ("no sweep consumes this set yet … grows unbounded"), so the bytes stay on disk. A code comment names a ticket for that sweep, `st-storage-sweep-archival-and-capacity-estimate`, which does not exist.
 - **Nothing ever refuses.** A full node still accepts pushed replicas, blob announcements and pends as a cohort member, until a write fails on the disk itself.
