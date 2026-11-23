@@ -50,13 +50,21 @@ import {
 const N = 48;
 const WANT_K = 16;
 const MIN_SIGS = 14; // production k − x
-// Virtual-clock origin. All engine-side TTL math (sweep / demotion / promotion) is driven by an *explicit*
-// `now` relative to this — no wall-clock sleeps. It is based on `Date.now()` (not a synthetic small value)
-// for one reason: the inbound gossip bus's TTL-death guard (`gossip/bus.ts` `mergeRecords`) compares the
-// *real* clock to a replicated record's `lastPing` (the host injects no virtual clock into the bus), so a
-// record stamped far in the past would be dropped as dead on replication. Relative assertions stay
-// deterministic; only the absolute base tracks wall time (the same pattern as `live-tier.spec.ts`).
-const T0 = Date.now();
+// Virtual-clock origin, re-stamped before EVERY test (the `beforeEach` in the suite below). All engine-side
+// TTL math (sweep / demotion / promotion) is driven by an *explicit* `now` relative to this — no wall-clock
+// sleeps. It is based on `Date.now()` (not a synthetic small value) for one reason: the inbound gossip bus's
+// TTL-death guard (`gossip/bus.ts` `mergeRecords`) compares the *real* clock to a replicated record's
+// `lastPing` (the host injects no virtual clock into the bus), so a record stamped far in the past would be
+// dropped as dead on replication. Relative assertions stay deterministic; only the absolute base tracks wall
+// time (the same pattern as `live-tier.spec.ts`, which takes a fresh `Date.now()` inside each test).
+//
+// It must NOT be captured once at module load: mocha imports every spec file up front and only then runs
+// them, so a module-load origin is already minutes stale by the time a file late in a long run executes.
+// Once `Date.now() - T0 > DEFAULT_TTL_MS` (90s) the bus drops this spec's gossiped record as TTL-dead and the
+// replication assertions ("the backup replicated the record", "every cohort sibling replicated the record in
+// one round") fail — a load-dependent flake in the full `@optimystic/db-p2p` suite that never reproduces when
+// this file runs alone. Re-stamping per test keeps every record it gossips inside its own TTL.
+let T0 = Date.now();
 
 /** A distinct 32-byte topic id per suite section, so cohorts/coords never alias across tests. */
 function topic(seed: number): Uint8Array {
@@ -69,6 +77,12 @@ describe('cohort-topic: scale lifecycle (mock-tier e2e, N=48 ring / k=16 cohort)
 	// Real-Ed25519 single-process suite: raised to 120s to match the uniform mesh e2e class ceiling as
 	// insurance — these tests use virtual time but still do real Ed25519 in the same heap as the mesh specs.
 	this.timeout(120_000);
+
+	// Re-stamp the virtual-clock origin per test — see the note on `T0` above: an origin older than one TTL
+	// makes the gossip bus drop this spec's replicated records as dead, so the records must be stamped now.
+	beforeEach(() => {
+		T0 = Date.now();
+	});
 
 	describe('§Registration mechanics + §TTL and renewal', () => {
 		it('register → accepted; ttl/3 pings keep the record alive; stopping pings evicts it after ttl', async () => {
