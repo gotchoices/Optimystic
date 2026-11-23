@@ -205,19 +205,12 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	/** Optional — best cheap byte estimate. Passed through by the kernel. */
 	approximateBytesUsed?(): Promise<number>;
 	/**
-	 * Optional — the bytes this driver's LOCATION will still accept, by the backend's cheapest
-	 * honest measure. Passed through by the kernel and by every wrapper, as
-	 * {@link approximateBytesUsed} is.
-	 *
-	 * - Advisory and may be stale, like {@link approximateBytesUsed}. It is the LOCATION's free
-	 *   space, not this driver's share of it, so two stores over one location answer the same
-	 *   figure — which is why a consumer asks the block store and nobody else.
-	 * - **A failed read REJECTS; it never answers 0.** 0 means "full", and a transient failure
-	 *   read as full would make a node shed responsibility it did not need to shed. The consumer
-	 *   catches and treats the figure as unknown for that scan.
-	 * - Presence is fixed for the driver's life, like {@link storeIdentity}: a backend that cannot
-	 *   ask its platform omits the method ENTIRELY and never installs a stub answering 0, so
-	 *   `typeof driver.approximateBytesFree === 'function'` sees its true capability.
+	 * Optional — the LOCATION's free bytes. The whole contract is stated once on
+	 * `IRawStorage.getApproximateBytesFree` (`packages/db-p2p/src/storage/i-raw-storage.ts`), which
+	 * is the surface this member reaches a consumer through: advisory, the LOCATION's figure rather
+	 * than this driver's share of it, **rejecting rather than answering 0** on a failed read, and
+	 * omitted ENTIRELY — never stubbed — by a backend that cannot ask its platform. Passed through
+	 * by the kernel and by every wrapper, as {@link approximateBytesUsed} is.
 	 */
 	approximateBytesFree?(): Promise<number>;
 	/** Optional — release the underlying handle. */

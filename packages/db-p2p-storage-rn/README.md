@@ -65,14 +65,14 @@ block store's byte count, which covers the whole database, already measures both
 the piece range and the key-value store's keys: that is what makes the node count
 its blob pieces once rather than reporting itself fuller than it is, and its own
 key-value bookkeeping at all rather than leaving it unmeasured. The factory
-asserts it of all three before it returns.
+asserts it of all three before it returns. The three classes stay exported for a
+caller that needs one on its own.
 
 There is **no free-space figure**: this package is handed an already-open handle,
 not a path, and the binding exposes no free-space call, so
 `getApproximateBytesFree` is omitted entirely rather than stubbed at 0 — 0 would
 read as "full". A host that knows the device's figure supplies it to the node
 itself.
-The three classes stay exported for a caller that needs one on its own.
 
 **The handle stays yours.** The node closes no store it was handed, so close the
 storage after `stop()`; `storage.close()` never closes the handle, which you may

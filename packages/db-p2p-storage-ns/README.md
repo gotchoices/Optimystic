@@ -75,8 +75,8 @@ identity and the block store's byte count — the whole database file — alread
 measures the `pieces` table and the key-value store's rows. That is what makes the
 node count its blob pieces once rather than reporting itself fuller than it is,
 and its own key-value bookkeeping at all rather than leaving it unmeasured; the
-factory asserts it of all three before it returns. The three classes stay exported for a caller that needs one on
-its own.
+factory asserts it of all three before it returns. The three classes stay
+exported for a caller that needs one on its own.
 
 The same handle is shared by every consumer. The plugin runs every call on
 one native thread per database, in the order made, which orders single calls

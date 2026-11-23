@@ -271,3 +271,44 @@ describe('IndexedDB sync by the window', () => {
 		}
 	});
 });
+
+// ---------------------------------------------------------------------------
+// The browser-only free-space path, which nothing else here can reach: under Node there is no
+// `navigator.storage`, so the constructor leaves `approximateBytesFree` off entirely — itself the
+// contract (`IRawStorage.getApproximateBytesFree`), and also the reason the arithmetic and the
+// no-quota rejection would otherwise never run. The stub is of the platform global only, nothing
+// this repository owns, and it is one own property, added and removed per case.
+// ---------------------------------------------------------------------------
+describe('IndexedDBJournalStore free space', () => {
+	let db: OptimysticWebDBHandle;
+
+	beforeEach(async () => {
+		db = await freshDb();
+	});
+
+	afterEach(() => {
+		db.close();
+		delete (navigator as { storage?: unknown }).storage;
+	});
+
+	/** Installs the estimate this case's browser would report; the store reads presence at construction. */
+	function estimating(estimate: () => Promise<{ quota?: number; usage?: number }>): void {
+		Object.defineProperty(navigator, 'storage', { value: { estimate }, configurable: true });
+	}
+
+	it('reports the origin quota less its usage', async () => {
+		estimating(async () => ({ quota: 1000, usage: 400 }));
+		const store = new IndexedDBJournalStore(db, STRICT);
+		expect(store.approximateBytesFree, 'present where the platform can be asked').to.be.a('function');
+		expect(await store.approximateBytesFree!()).to.equal(600);
+	});
+
+	// The rule a node's allotment accounting rests on: unknown must read as unknown, never as
+	// "full" — a browser that reports no quota must not make the node shed responsibility.
+	it('rejects rather than answering 0 when the estimate carries no quota', async () => {
+		estimating(async () => ({ usage: 400 }));
+		const store = new IndexedDBJournalStore(db, STRICT);
+		const failure = await store.approximateBytesFree!().then(() => undefined, (err: Error) => err);
+		expect(failure?.message, 'the figure is unknown, not zero').to.match(/no quota/);
+	});
+});

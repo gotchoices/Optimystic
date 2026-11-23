@@ -31,11 +31,12 @@ export interface IKVStore {
 	 * **inequality proves nothing**. Omitted by a store that lives nowhere a block store measures
 	 * (memory); never a stub returning `undefined`.
 	 */
-	// NOTE: there is deliberately no `bytesUsed` here. In every shipping backend this store lives
-	// inside the location the block store measures whole, so a figure of its own would have no
-	// consumer, and an interface member nobody implements is worse than none. A backend that ever
-	// keeps its key-value store somewhere the block store does NOT measure must add a `bytesUsed` to
-	// it — the assertion above will refuse the layout first, and the accounting surface would
-	// otherwise report that store's bytes as unmeasured.
 	storeIdentity?(): StoreIdentity;
+
+	// NOTE: there is deliberately no `bytesUsed` on this interface. In every shipping backend this
+	// store lives inside the location the block store measures whole, so a figure of its own would
+	// have no consumer, and an interface member nobody implements is worse than none. A backend that
+	// ever keeps its key-value store somewhere the block store does NOT measure must add a
+	// `bytesUsed` to it — the assertion named above will refuse the layout first, and the accounting
+	// surface would otherwise report that store's bytes as unmeasured.
 }

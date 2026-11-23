@@ -754,6 +754,18 @@ The `IRawStorage` interface defines low-level storage operations, abstracting th
 - **Revision Management**: Mapping revisions to transaction IDs
 - **Durability**: `flush()` makes every write resolved before it survive the crashes the store's fixed `durability` names (Invariant 6 above)
 
+**How much room is left.** Beside `getApproximateBytesUsed`, a block store may report `getApproximateBytesFree()` — the bytes its LOCATION will still accept, by the backend's cheapest honest measure. It is the location's figure and not this store's share of it, so every store over one location answers the same number, which is why anything accounting for a node's room asks the block store and nobody else. Two rules make it safe to read: a failed measurement **rejects** rather than answering 0 (0 means "full", and a transient failure read as full would make a node shed responsibility it did not need to shed — a consumer catches and treats the figure as unknown for that scan), and whether a store has the method at all is fixed at construction, so a backend that cannot ask its platform omits it entirely rather than installing a stub. Which backends have one:
+
+| Package | Free space | How |
+|---|---|---|
+| `@optimystic/db-p2p-storage-fs` | yes | one `fs.promises.statfs(basePath)`: the blocks available to an unprivileged process times the block size — the whole filesystem holding the directory |
+| `@optimystic/db-p2p-storage-web` | yes, in a browser | `navigator.storage.estimate()`, `quota - usage`; origin-scoped exactly as its used figure is, so the two agree. Omitted when the platform has no `navigator.storage.estimate` (Node under `fake-indexeddb`, which is how the package's specs run), and rejects when the estimate carries no quota |
+| `@optimystic/db-p2p-storage-ns` | no | the package is handed an open SQLite database, not a path, and NativeScript offers no free-space call reachable from a database handle |
+| `@optimystic/db-p2p-storage-rn` | no | the package is handed an open LevelDB handle, with the same gap |
+| memory | no | there is no disk; the free space of a `Map` is the heap, which is not a storage allotment — the same reason a memory store reports no store identity |
+
+A host on a platform that cannot answer supplies the figure itself, the way it supplies any other thing about the machine the node is running on.
+
 ### 4. File-based Storage (`FileRawStorage`)
 
 `FileRawStorage` in `packages/db-p2p-storage-fs/src/file-storage.ts` is the shared
@@ -1200,18 +1212,6 @@ A node keeps large values ("blobs") outside the block store, in two places: thei
 A put keeps one ordering across the two stores: every piece is stored and the piece store flushed, and only then is the record naming the pieces written and the key-value store flushed. So a record that survives a crash never names a piece the crash lost, and pieces a crash left without a record are removed by the sweep the service runs after it starts. The piece store keeps no prefix rule of its own (pieces are independent), which is why the ordering is the caller's.
 
 The node never closes the piece store, as it never closes the block store or the key-value store it was handed: a host closes it after `stop()`. On a serving node, the Arachnode storage monitor counts its bytes toward the node's use, once (`blockStoreCountsPieces` in `packages/db-p2p/src/storage/store-coverage.ts`).
-
-**How much room is left.** Beside `getApproximateBytesUsed`, a block store may report `getApproximateBytesFree()` — the bytes its LOCATION will still accept, by the backend's cheapest honest measure. It is the location's figure and not this store's share of it, so every store over one location answers the same number, which is why anything accounting for a node's room asks the block store and nobody else. Two rules make it safe to read: a failed measurement **rejects** rather than answering 0 (0 means "full", and a transient failure read as full would make a node shed responsibility it did not need to shed — a consumer catches and treats the figure as unknown for that scan), and whether a store has the method at all is fixed at construction, so a backend that cannot ask its platform omits it entirely rather than installing a stub. Which backends have one:
-
-| Package | Free space | How |
-|---|---|---|
-| `@optimystic/db-p2p-storage-fs` | yes | one `fs.promises.statfs(basePath)`: the blocks available to an unprivileged process times the block size — the whole filesystem holding the directory |
-| `@optimystic/db-p2p-storage-web` | yes, in a browser | `navigator.storage.estimate()`, `quota - usage`; origin-scoped exactly as its used figure is, so the two agree. Omitted when the platform has no `navigator.storage.estimate` (Node under `fake-indexeddb`, which is how the package's specs run), and rejects when the estimate carries no quota |
-| `@optimystic/db-p2p-storage-ns` | no | the package is handed an open SQLite database, not a path, and NativeScript offers no free-space call reachable from a database handle |
-| `@optimystic/db-p2p-storage-rn` | no | the package is handed an open LevelDB handle, with the same gap |
-| memory | no | there is no disk; the free space of a `Map` is the heap, which is not a storage allotment — the same reason a memory store reports no store identity |
-
-A host on a platform that cannot answer supplies the figure itself, the way it supplies any other thing about the machine the node is running on.
 
 ### 8. A node's storage, as one value
 

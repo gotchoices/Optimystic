@@ -64,8 +64,8 @@ identity, and the block store's byte count, the origin's estimate, already
 includes both the pieces and the key-value store's records: that is what makes the
 node count its blob pieces once rather than reporting itself fuller than it is,
 and its own key-value bookkeeping at all rather than leaving it unmeasured. The
-factory asserts it of all three before it returns. The three classes stay exported for a caller that needs one on its
-own.
+factory asserts it of all three before it returns. The three classes stay
+exported for a caller that needs one on its own.
 
 **The handle stays yours.** The node closes no store it was handed, so close the
 storage after `stop()`; `storage.close()` never closes the handle, which you may
