@@ -16,7 +16,7 @@ import { emptyWriteFacts, freshElementsOf, insertAcceptsEqualRow, rewriteAccepts
 import { emptyBlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
 import { isReplaying } from './transaction/replay-scope.js';
 import type { LibP2PNodeOptions, ParsedOptimysticOptions, RowData, TransactionState } from './types.js';
-import type { IKVStore, IPieceStore, IRawStorage } from '@optimystic/db-p2p';
+import type { NodeStorage } from '@optimystic/db-p2p';
 import { VirtualTable } from '@quereus/quereus';
 import { ConflictResolution, IndexConstraintOp, QuereusError, StatusCode, buildCheckConstraintSchema, buildColumnIndexMap, collectTableConstraintNames, columnDefToSchema, combineConjunctive, decodeIdxStr, equalitySeekKeyCount, equalityServesKeyColumn, rangeServesKeyColumn, shiftSchemaIndicesForDrop } from '@quereus/quereus';
 import type { VirtualTableModule, BaseModuleConfig, ColumnSchema, Database, DatabaseInternal, TableSchema, Row, FilterInfo, BestAccessPlanRequest, BestAccessPlanResult, IndexDescriptor, OrderingSpec, VirtualTableConnection, TableIndexSchema as IndexSchema, TableWrite, UniqueConstraintSchema, UpdateArgs, UpdateResult, SqlValue, SchemaChangeInfo, ModuleCostProfile, PredicateConstraint } from '@quereus/quereus';
@@ -652,7 +652,7 @@ export function defaultTransactorOf(aux: Readonly<Record<string, unknown>>): str
 
 /**
  * How a table reaches storage — the transactor and key network it goes through, the
- * network's name and port, and the raw-storage factory — resolved the one way every path
+ * network's name and port, and the storage factory — resolved the one way every path
  * resolves it: a `using optimystic(...)` argument (or, for a hydrated table, the session's
  * `default_vtab_args`) wins over the plugin's registration config (`default_transactor`
  * and friends, surfaced as `vtabAuxData`), which wins over the production defaults. The
@@ -662,19 +662,17 @@ export function defaultTransactorOf(aux: Readonly<Record<string, unknown>>): str
 function resolveBinding(
   args: Readonly<Record<string, SqlValue>>,
   aux: Readonly<Record<string, unknown>>,
-): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'rawStorageFactory' | 'blobStorageFactory'> {
+): Pick<ParsedOptimysticOptions, 'transactor' | 'keyNetwork' | 'libp2pOptions' | 'storageFactory'> {
   const transactor = (args['transactor'] as string) || defaultTransactorOf(aux);
   const keyNetwork = (args['keyNetwork'] as string) || (aux['default_key_network'] as string) || 'libp2p';
   const port = typeof args['port'] === 'number' ? args['port'] : (typeof aux['default_port'] === 'number' ? aux['default_port'] as number : 0);
   const networkName = (args['networkName'] as string) || (aux['default_network_name'] as string) || 'optimystic';
   // Plugin-level only (not exposed via per-table USING args because it's a function reference).
-  const rawStorageFactory = typeof aux['rawStorageFactory'] === 'function'
-    ? (aux['rawStorageFactory'] as () => IRawStorage)
-    : undefined;
-  // Plugin-level only for the same reason. Where blobs live for a transactor with no libp2p node
-  // (`CollectionFactory.getBlobBackend`); see `OptimysticOptions.blobStorageFactory`.
-  const blobStorageFactory = typeof aux['blobStorageFactory'] === 'function'
-    ? (aux['blobStorageFactory'] as () => { pieces: IPieceStore; kv: IKVStore })
+  // Every store this network persists to on this machine, as one value: the blocks behind a `local`
+  // transactor, the pieces and blob records behind a blob service with no libp2p node, and the
+  // node's own storage for `network`. See `OptimysticOptions.storageFactory`.
+  const storageFactory = typeof aux['storageFactory'] === 'function'
+    ? (aux['storageFactory'] as () => NodeStorage)
     : undefined;
   return {
     transactor,
@@ -686,8 +684,7 @@ function resolveBinding(
       linkRoundTripMs: declaredLinkRoundTripMs(aux),
       cohortTopic: declaredCohortTopic(aux),
     },
-    rawStorageFactory,
-    blobStorageFactory,
+    storageFactory,
   };
 }
 
@@ -6130,7 +6127,7 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       tableOptions.keyNetwork ?? '',
       tableOptions.libp2pOptions?.networkName ?? '',
       tableOptions.libp2pOptions?.port ?? 0,
-      tableOptions.rawStorageFactory ? '1' : '0',
+      tableOptions.storageFactory ? '1' : '0',
     ].join('|');
     const cached = this.schemaManagers.get(fingerprint);
     if (cached) return cached;
@@ -6140,9 +6137,11 @@ export class OptimysticModule implements VirtualTableModule<VirtualTable, Optimy
       // catalog tree itself needs only the transactor fields, but the collection factory remembers
       // the FIRST options it sees per transactor key, and that record is what later builds the
       // network's BLOB store (`CollectionFactory.transactorOptions`). Assembled by hand, this
-      // dropped `blobStorageFactory`, so a `hydrate` — whose catalog read is the first thing to
-      // name the key in a restarted process — built that network's blob store over fresh in-memory
-      // stores and found none of the machine's pins.
+      // dropped the blob half of the storage options — two fields then, one `storageFactory` now —
+      // so a `hydrate`, whose catalog read is the first thing to name the key in a restarted
+      // process, built that network's blob store over fresh in-memory stores and found none of the
+      // machine's pins. One field is a narrower hole, not a closed one; closing it is backlog
+      // `debt-a-networks-storage-is-taken-from-one-collections-options`.
       const schemaOptions: ParsedOptimysticOptions = {
         ...tableOptions,
         collectionUri: 'tree://optimystic/schema',

@@ -34,8 +34,8 @@ function isUnset(declared: unknown): boolean {
 /**
  * The category a transactor's storage falls in, or `undefined` where the plugin cannot know it:
  * `test` and `mesh-test` run in process; `local` is memory unless the host passed a
- * `rawStorageFactory`, an opaque function that may front a disk, IndexedDB or MMKV; a
- * host-registered transactor is unknown to the plugin altogether. The host declares those.
+ * `storageFactory`, whose `blocks` store is an opaque object that may front a disk, IndexedDB or
+ * MMKV; a host-registered transactor is unknown to the plugin altogether. The host declares those.
  */
 // NOTE: `network` maps to `distributed`, though in a group no larger than one cohort a node that
 // holds the block answers from its own replica (`selfReadVerdict` in

@@ -39,6 +39,7 @@ import type { ReferenceChange } from '../dist/index.js';
 import { addedReferences, emptyBlobReferenceLedger, putReferences } from '../src/optimystic-adapter/blob-reference-ledger.js';
 import type { BlobReferenceLedger } from '../src/optimystic-adapter/blob-reference-ledger.js';
 import { captureThrown, expectConstraintRefusal, queryAll } from './query-helpers.js';
+import { blocksOnly } from './storage-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -58,7 +59,7 @@ function createDb(storage: MemoryRawStorage): { db: Database; plugin: Plugin } {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => storage,
+		storageFactory: () => blocksOnly(storage),
 	} as unknown as Record<string, SqlValue>);
 	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
 	for (const func of plugin.functions) db.registerFunction(func.schema);
@@ -113,7 +114,7 @@ async function transactorOf(plugin: Plugin, storage: MemoryRawStorage): Promise<
 		libp2pOptions: {},
 		cache: false,
 		encoding: 'json' as const,
-		rawStorageFactory: () => storage,
+		storageFactory: () => blocksOnly(storage),
 	});
 }
 

@@ -27,6 +27,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { blocksOnly } from './storage-helpers.js';
 
 /**
  * Register the optimystic plugin against a fresh Database wired to the `local`
@@ -36,13 +37,13 @@ import { randomUUID } from 'node:crypto';
  */
 function createDb(dir: string): { db: Database; plugin: ReturnType<typeof register> } {
 	const db = new Database();
-	// `rawStorageFactory` is a function reference, not a SqlValue — it is read
+	// `storageFactory` is a function reference, not a SqlValue — it is read
 	// back via a `typeof === 'function'` guard in the plugin, so the cast is safe.
 	const config = {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => new FileRawStorage(dir),
+		storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) {
@@ -89,7 +90,7 @@ async function countTreeEntries(
 		libp2pOptions: {},
 		cache: false,
 		encoding: 'json',
-		rawStorageFactory: () => new FileRawStorage(dir),
+		storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 	});
 	await tree.update();
 	let n = 0;

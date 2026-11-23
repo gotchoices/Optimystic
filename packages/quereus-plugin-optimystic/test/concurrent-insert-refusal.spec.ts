@@ -38,6 +38,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { captureThrowMessage, captureThrown, expectConstraintRefusal } from './query-helpers.js';
+import { blocksOnly } from './storage-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -47,7 +48,7 @@ function createDb(dir: string): { db: Database; plugin: Plugin } {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => new FileRawStorage(dir),
+		storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
@@ -355,7 +356,7 @@ describe('Concurrent same-key INSERT refusal (two handles, one FileRawStorage di
 			const transactor = await pluginA.collectionFactory.getOrCreateTransactor({
 				collectionUri: 'tree://unused', transactor: 'local', keyNetwork: 'test',
 				libp2pOptions: {}, cache: false, encoding: 'json',
-				rawStorageFactory: () => new FileRawStorage(dir),
+				storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 			});
 			const coordinator = new TransactionCoordinator(transactor, pluginA.txnBridge.getCollectionRegistry());
 			const engine = new QuereusEngine(a, coordinator);

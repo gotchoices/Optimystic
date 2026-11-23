@@ -3,8 +3,9 @@
  * test wants to open.
  *
  * What it exists for is the RESTART. Every store a plugin instance would otherwise create for itself
- * — the block storage behind its `local` transactor, the pieces and blob records behind its blob
- * service, and the offline journal — is created once here and handed to every handle, so closing one
+ * — the block storage behind its `local` transactor and the pieces and blob records behind its blob
+ * service, now one `NodeStorage`, plus the offline journal — is created once here and handed to
+ * every handle, so closing one
  * handle and opening another over the same {@link BlobPinStores} is a restarted process: the second
  * handle finds the first's rows, its blob pins and its journaled queue entries, and remembers nothing
  * in memory. That is how a spec reaches the paths that read a pin's own label rather than what the
@@ -27,7 +28,7 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { BlobReferenceTree, decodeBlobReferenceKey } from '@optimystic/db-core';
 import type { BlobRef, CollectionId, ICohortReachability, ITransactor } from '@optimystic/db-core';
-import { MemoryKVStore, MemoryPieceStore, MemoryRawStorage, type IKVStore, type IPieceStore } from '@optimystic/db-p2p';
+import { MemoryKVStore, MemoryPieceStore, MemoryRawStorage, type IKVStore, type NodeStorage } from '@optimystic/db-p2p';
 import { PowerLossKVStore } from '@optimystic/db-p2p/testing';
 import register from '../dist/plugin.js';
 import { parsePinLabel } from '../dist/index.js';
@@ -61,17 +62,21 @@ export class Gate implements ICohortReachability {
 	}
 }
 
-/** Everything a restarted process finds again: one block store, one blob store, one journal. */
+/** Everything a restarted process finds again: one node storage, one journal. */
 export interface BlobPinStores {
-	readonly storage: MemoryRawStorage;
-	readonly blobs: { pieces: IPieceStore; kv: IKVStore };
+	/**
+	 * The one value every handle's `storageFactory` returns: one block store, one set of blob pieces,
+	 * one set of blob records. Built here rather than per handle, which is what makes opening a second
+	 * handle a RESTART — the plugin asks its factory once per network, so a handle whose factory
+	 * constructed would get stores of its own and find none of the first's rows or pins.
+	 */
+	readonly storage: NodeStorage;
 	readonly journal: IKVStore;
 }
 
 export function createStores(): BlobPinStores {
 	return {
-		storage: new MemoryRawStorage(),
-		blobs: { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
+		storage: { blocks: new MemoryRawStorage(), pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
 		// A `PowerLossKVStore` no test ever crashes is a plain durable map, which is everything the
 		// journal asks of a store. NOT a `MemoryKVStore`, which the registration config refuses by
 		// name — a journal lost with the process is the no-journal configuration — and this one is
@@ -108,8 +113,7 @@ export function openPlugin(stores: BlobPinStores, options: OpenOptions = {}): Pl
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => stores.storage,
-		blobStorageFactory: () => stores.blobs,
+		storageFactory: () => stores.storage,
 		offline: { journal: stores.journal, recheck: { baseMs: 20, maxMs: 100 } },
 	} as unknown as Record<string, SqlValue>);
 	// Before any table opens, so the gate a submission asks is this one rather than the always-open
@@ -174,10 +178,10 @@ export async function allPins(plugin: Plugin, prefix: string): Promise<string[]>
 /**
  * Options that resolve to the handle's one cached `local:test` transactor.
  *
- * `blobStorageFactory` is here even though nothing resolved through these options opens a blob
- * store: the factory remembers the FIRST options per transactor key, and that record is what builds
- * the network's blob store later, so options that drop it can make this handle's blob store a fresh,
- * empty one (`CollectionFactory.transactorOptions`).
+ * `storageFactory` is here even though nothing resolved through these options opens a blob store:
+ * the factory remembers the FIRST options per transactor key, and that record is what builds the
+ * network's storage later, so options that drop it can make this handle's blob store a fresh, empty
+ * one (`CollectionFactory.transactorOptions`).
  */
 function bindingOptions(stores: BlobPinStores) {
 	return {
@@ -187,8 +191,7 @@ function bindingOptions(stores: BlobPinStores) {
 		libp2pOptions: {},
 		cache: false,
 		encoding: 'json' as const,
-		rawStorageFactory: () => stores.storage,
-		blobStorageFactory: () => stores.blobs,
+		storageFactory: () => stores.storage,
 	};
 }
 

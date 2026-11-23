@@ -1,8 +1,8 @@
 /**
- * Verifies that `CollectionFactory.createLocalTransactor` honours the
- * `rawStorageFactory` field on `ParsedOptimysticOptions`. This is the
- * bootstrap-mode hook that lets a host (e.g. RN/MMKV) plug in persistent
- * storage instead of the default in-process `MemoryRawStorage`.
+ * Verifies that `CollectionFactory` honours the `storageFactory` field on
+ * `ParsedOptimysticOptions` — the one value a host supplies for everything a network persists to on
+ * this machine. This is the bootstrap-mode hook that lets a host (e.g. RN/MMKV) plug in persistent
+ * storage instead of the default in-process memory stores.
  */
 
 import { expect } from 'chai';
@@ -10,6 +10,7 @@ import { Database } from '@quereus/quereus';
 import register from '../dist/plugin.js';
 import { MemoryRawStorage } from '@optimystic/db-p2p';
 import type { ParsedOptimysticTreeOptions as ParsedOptimysticOptions } from '../dist/index.js';
+import { blocksOnly } from './storage-helpers.js';
 
 /**
  * MemoryRawStorage subclass that counts how often its mutating operations
@@ -58,10 +59,10 @@ function createPlugin() {
 	return plugin;
 }
 
-describe('local transactor honours rawStorageFactory', function () {
+describe('local transactor honours storageFactory', function () {
 	this.timeout(5000);
 
-	it('routes pend + commit through host-supplied IRawStorage', async () => {
+	it('routes pend + commit through the host-supplied block store', async () => {
 		const plugin = createPlugin();
 		const factory = plugin.collectionFactory;
 
@@ -75,9 +76,9 @@ describe('local transactor honours rawStorageFactory', function () {
 			libp2pOptions: {},
 			cache: false,
 			encoding: 'json',
-			rawStorageFactory: () => {
+			storageFactory: () => {
 				factoryCalls++;
-				return storage;
+				return blocksOnly(storage);
 			},
 		};
 
@@ -112,6 +113,38 @@ describe('local transactor honours rawStorageFactory', function () {
 		await collection.replace([['k1', ['k1', '"v1"']]]);
 	});
 
+	// A host's factory may CONSTRUCT its storage rather than return one it holds, and one location
+	// must only ever be opened once per process (`fileNodeStorage` counts holders over a directory,
+	// and two sets over one would double-count its pieces and break its piece store). So the plugin
+	// has to ask once per network however many tables, catalogs and blob services resolve on it —
+	// which is what this pins. The consumers below are deliberately the three different ones: the
+	// block store (a tree), the blob pieces and records (a blob service) and a second tree's catalog.
+	it('asks the factory once per transactor key, however many consumers resolve on it', async () => {
+		const factory = createPlugin().collectionFactory;
+		let factoryCalls = 0;
+		const options = (collectionUri: string): ParsedOptimysticOptions => ({
+			collectionUri,
+			transactor: 'local',
+			keyNetwork: 'test',
+			libp2pOptions: {},
+			cache: false,
+			encoding: 'json',
+			storageFactory: () => {
+				factoryCalls++;
+				return blocksOnly(new MemoryRawStorage());
+			},
+		});
+
+		const first = await factory.createOrGetCollection(options('tree://local-test/one'));
+		await first.replace([['k1', ['k1', '"v1"']]]);
+		await factory.createOrGetCollection(options('tree://local-test/two'));
+		const blobs = await factory.getBlobBackend(options('tree://local-test/one'));
+		await factory.getBlobBackend(options('tree://local-test/two'));
+
+		expect(blobs.key, 'both tables resolve on the one transactor key').to.equal('local:test');
+		expect(factoryCalls).to.equal(1);
+	});
+
 	// A table's first initialization opens its collection and reads the catalog together, and the
 	// two resolve the same transactor. Built once per caller, they would land on two stores, neither
 	// of which sees the other's writes.
@@ -125,9 +158,9 @@ describe('local transactor honours rawStorageFactory', function () {
 			libp2pOptions: {},
 			cache: false,
 			encoding: 'json',
-			rawStorageFactory: () => {
+			storageFactory: () => {
 				factoryCalls++;
-				return new MemoryRawStorage();
+				return blocksOnly(new MemoryRawStorage());
 			},
 		});
 

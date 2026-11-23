@@ -12,11 +12,11 @@ tradeoffs: Both places in the plugin that build a settings object by hand now co
 `ParsedOptimysticOptions` (`packages/quereus-plugin-optimystic/src/types.ts`) is one flat object carrying two unrelated kinds of thing:
 
 - **Which collection** is being opened — `collectionUri`, `cache`, `encoding`.
-- **Which network it is on and where that network's data lives on this machine** — `transactor`, `keyNetwork`, `libp2p`, `libp2pOptions`, `rawStorageFactory`, `blobStorageFactory`.
+- **Which network it is on and where that network's data lives on this machine** — `transactor`, `keyNetwork`, `libp2p`, `libp2pOptions`, `storageFactory`.
 
 `CollectionFactory.getOrCreateTransactor` records the FIRST such object it sees per transactor key (the `transactorOptions` map) and that record is thereafter the whole truth about that network: `knownBlobBackends()` and `blobBackendForKey()` build the network's blob store from it, long after and far away from whichever table happened to open first. So a caller that builds an options object field by field, and leaves out a field the collection it is opening has no use for, permanently misconfigures the network — for every later caller, including ones that pass complete options.
 
-That is not hypothetical. Reviewing `feat-blob-pins-reconcile-after-a-restart` (commit `ticket(implement): feat-blob-pins-reconcile-after-a-restart`) found it live: the schema catalog's options were assembled by hand and omitted `blobStorageFactory`, and because a restarted process reads the catalog before it opens any table, the catalog's reduced options were the record. Every blob store the process then built for that network was over fresh in-memory piece and record stores, so the process found none of its own blob pins and `plugin.blobs` answered as if the machine held nothing — no error, no log line, just wrong answers from `stat`, `pinsOf` and `listPins` for the life of the process.
+That is not hypothetical. Reviewing `feat-blob-pins-reconcile-after-a-restart` (commit `ticket(implement): feat-blob-pins-reconcile-after-a-restart`) found it live: the schema catalog's options were assembled by hand and omitted the blob half of the storage options — two fields then, one `storageFactory` since — and because a restarted process reads the catalog before it opens any table, the catalog's reduced options were the record. Every blob store the process then built for that network was over fresh in-memory piece and record stores, so the process found none of its own blob pins and `plugin.blobs` answered as if the machine held nothing — no error, no log line, just wrong answers from `stat`, `pinsOf` and `listPins` for the life of the process.
 
 ## Why a fix at this level
 
@@ -31,8 +31,7 @@ interface NetworkOptions {
   keyNetwork: 'libp2p' | 'test' | string;
   libp2p?: Libp2p;
   libp2pOptions: LibP2PNodeOptions;
-  rawStorageFactory?: () => IRawStorage;
-  blobStorageFactory?: () => { pieces: IPieceStore; kv: IKVStore };
+  storageFactory?: () => NodeStorage;
 }
 
 /** Which collection to open, on which network. */
@@ -54,9 +53,9 @@ A caller cannot express a collection on a known network without its storage conf
 
 ## Arm: the droppable storage fields are down to one (2026-11-23)
 
-Planning the one-storage-value chain produced `implement/the-sql-plugin-takes-one-storage-setting-per-network`, which replaces `rawStorageFactory` and `blobStorageFactory` with a single `storageFactory` returning the one value db-p2p now takes for a node's whole storage, and resolves it once per transactor key into a map on `CollectionFactory` rather than reading it out of whichever options object arrived first.
+`the-sql-plugin-takes-one-storage-setting-per-network` has landed; it replaced `rawStorageFactory` and `blobStorageFactory` with a single `storageFactory` returning the one value db-p2p now takes for a node's whole storage, and resolves it once per transactor key into a map on `CollectionFactory` rather than reading it out of whichever options object arrived first.
 
-That narrows this ticket without closing it. What it fixes: two independently droppable fields become one, the two can no longer disagree with each other, and every consumer of a network's storage — the `local` transactor's block store, the single-machine blob service, and the node the plugin builds itself — reads the one resolved value. What it leaves: `ParsedOptimysticOptions` still carries a network's storage inside a collection's options, so a hand-built options object can still reduce a known network's configuration, and first-options-win still decides. The `NetworkOptions`/`CollectionOptions` split above is still the fix that makes that unrepresentable, and the remaining hole is now one field in one place rather than two.
+That narrows this ticket without closing it. What it fixed: two independently droppable fields became one, the two can no longer disagree with each other, and every consumer of a network's storage — the `local` transactor's block store, the single-machine blob service, and the node the plugin builds itself — reads the one resolved value. What it leaves: `ParsedOptimysticOptions` still carries a network's storage inside a collection's options, so a hand-built options object can still reduce a known network's configuration, and first-options-win still decides. The `NetworkOptions`/`CollectionOptions` split above is still the fix that makes that unrepresentable, and the remaining hole is now one field in one place rather than two.
 
 Folding the split into that ticket was considered and rejected: it spans the aux-option reader, the catalog opener, `openIndexTree`, `getOrCreateTransactor`, `getTransactorKey`, `knownBlobBackends`, `blobBackendForKey` and the hand-built options object in roughly twenty specs, with its own failure mode (a mis-keyed network silently sharing or splitting state) — a separate agent run, and pairing the two risked both.
 

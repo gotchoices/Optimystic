@@ -20,6 +20,7 @@ import { Database } from '@quereus/quereus';
 import type { SqlValue } from '@quereus/quereus';
 import { KvRawStorage, MemoryStoreDriver, defaultCachePool, type RawStoreDriver } from '@optimystic/db-p2p';
 import register from '../dist/plugin.js';
+import { blocksOnly } from './storage-helpers.js';
 
 /** Count every driver method call by name, then delegate. Wraps the driver the plugin never sees. */
 function counting(inner: RawStoreDriver): { driver: RawStoreDriver; counts: Record<string, number> } {
@@ -56,7 +57,7 @@ function createDb(driver: RawStoreDriver): { db: Database; plugin: ReturnType<ty
 		// A KvRawStorage over anything but the memory driver is "host-supplied persistent
 		// storage" as far as the seam is concerned, so it gets the read cache — exactly the
 		// path FileRawStorage takes, without touching a disk.
-		rawStorageFactory: () => new KvRawStorage(driver),
+		storageFactory: () => blocksOnly(new KvRawStorage(driver)),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) {

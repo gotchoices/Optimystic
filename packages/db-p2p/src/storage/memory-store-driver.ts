@@ -177,7 +177,7 @@ export class MemoryStoreDriver implements RawStoreDriver {
 	// keys and get two read caches over one Map — the divergence dedupe exists to remove. Harmless
 	// today: this driver is a test fixture and every shipping backend's driver reports an identity,
 	// so the identity-less path only ever sees genuinely distinct stores. If a host ever wires
-	// `rawStorageFactory: () => new KvRawStorage(oneSharedDriver)` for two consumers, give this
+	// `new KvRawStorage(oneSharedDriver)` as the `blocks` store for two consumers, give this
 	// driver `identityForHandle('memory', this)` (store-identity.ts) — that makes the two wrappers
 	// name one store — and re-premise `local-transactor-read-cache.spec.ts`, which currently
 	// asserts the non-dedupe.

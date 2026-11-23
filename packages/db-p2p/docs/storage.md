@@ -1058,7 +1058,8 @@ Semantics worth knowing:
   The two seams that call it:
   - `CollectionFactory.createLocalTransactor`
     (`packages/quereus-plugin-optimystic/src/optimystic-adapter/collection-factory.ts`)
-    — wraps the host's `rawStorageFactory` result, label `quereus:local`.
+    — wraps the `blocks` store of the host's `storageFactory` result, label
+    `quereus:local`.
   - `resolveStorage` (`src/libp2p-node-base.ts`) — wraps the `blocks` store of
     `NodeOptions.storage` (§8 below), label `node:<networkName>`. The memory
     default from `memoryNodeStorage()` is a bare `MemoryRawStorage` and stays
@@ -1114,7 +1115,7 @@ Semantics worth knowing:
   covers caches this helper built. A cache can also be constructed directly —
   `new CachedRawStorage(inner)` and `new KvRawStorage(new
   CachedStoreDriver(driver))` are both supported — so a host that hand-builds a
-  cache over a directory, while a second consumer's `rawStorageFactory` returns
+  cache over a directory, while a second consumer's `storageFactory` returns
   a fresh storage over that same directory, still ends up with two caches: the
   helper never saw the first one. Two *different* failures live here, and they
   are caught in two places because only one of them is visible to the pool:
@@ -1176,7 +1177,7 @@ Semantics worth knowing:
   `clearCache()` drops every entry; `dispose()` releases the pool
   registration when the workspace departs.
 - **Either form may cross a composition seam.** A host that builds its own cache
-  and hands it to `rawStorageFactory`, or as the `blocks` store of
+  and hands it in as the `blocks` store of the Quereus plugin's `storageFactory` or of
   `NodeOptions.storage`, may hand over *either* shape — the seam detects both via `readCached` (above), returns it
   unchanged with no lease, and the host keeps owning it. The driver-level form
   stays the recommended one whenever the driver is reachable; requiring the

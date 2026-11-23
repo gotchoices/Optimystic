@@ -33,6 +33,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { blocksOnly } from './storage-helpers.js';
 
 interface ReadProbe {
 	query: number;
@@ -131,7 +132,7 @@ function createDb(dir: string): { db: Database; plugin: ReturnType<typeof regist
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => new FileRawStorage(dir),
+		storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 	} as unknown as Record<string, SqlValue>;
 	const plugin = register(db, config);
 	for (const vtable of plugin.vtables) {

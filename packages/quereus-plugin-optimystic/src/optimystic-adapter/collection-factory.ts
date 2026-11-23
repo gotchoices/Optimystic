@@ -10,6 +10,7 @@ import {
 	MemoryRawStorage,
 	MemoryKVStore,
 	MemoryPieceStore,
+	type NodeStorage,
 	SingleMachineBlobService,
 	type BlobPinIndex,
 	type ReadCacheLease,
@@ -163,15 +164,46 @@ export class CollectionFactory {
    * keeping them lets a later resolution rebuild that network's store exactly the same way.
    *
    * What that asks of callers: options handed to {@link getOrCreateTransactor} must carry the
-   * PLUGIN-LEVEL factories (`rawStorageFactory`, `blobStorageFactory`) even when the collection
-   * being opened has no use for them, because the first options per key are what
-   * {@link knownBlobBackends} later builds that network's BLOB store from. An options object
-   * assembled field by field is how one gets dropped, silently — the catalog tree's did drop
-   * `blobStorageFactory`, and a hydrate then built the network's blob store over fresh in-memory
-   * stores and read none of the machine's pins. Spread an existing options object and override what
-   * differs, as `OptimysticModule`'s `openIndexTree` and its schema-catalog opener do.
+   * PLUGIN-LEVEL factory (`storageFactory`) even when the collection being opened has no use for it,
+   * because the first options per key are what {@link storageFor} later builds that network's
+   * storage from. An options object assembled field by field is how it gets dropped, silently —
+   * when storage was two fields the catalog tree's options did drop the blob one, and a hydrate then
+   * built the network's blob store over fresh in-memory stores and read none of the machine's pins.
+   * Spread an existing options object and override what differs, as `OptimysticModule`'s
+   * `openIndexTree` and its schema-catalog opener do.
    */
   private transactorOptions = new Map<string, ParsedOptimysticOptions>();
+  /**
+   * Every store a transactor key's network persists to on this machine ({@link storageFor}): the
+   * blocks behind a `local` transactor ({@link createLocalTransactor}), the pieces and blob records
+   * behind a single-machine blob service ({@link resolveBlobBackend}), and the whole value as
+   * `NodeOptions.storage` for the node a `network` transactor builds
+   * ({@link createNetworkTransactor}).
+   *
+   * Keyed and kept exactly as {@link transactorOptions} is, and for the same reason: the host's
+   * factory is called ONCE per transactor key, however many tables and blob services resolve on it
+   * and however often a transactor is rebuilt over it, so neither {@link clearCache} nor
+   * {@link dispose} forgets this. One `NodeStorage` per location is what a storage package enforces
+   * (`fileNodeStorage` in `@optimystic/db-p2p-storage-fs` counts holders over a directory, two sets
+   * over one directory being what breaks its piece store), and asking a CONSTRUCTING factory twice
+   * is how two sets over one location would come back.
+   *
+   * NOTE: keyed by TRANSACTOR key (`<transactor>:<keyNetwork>`) while a node is keyed by NODE key
+   * (`<networkName>:<port>`). Two transactor keys that resolve to one node key build the node once,
+   * and it keeps the storage of whichever key built it — exactly as it keeps that key's
+   * `libp2pOptions` today. Same class as backlog
+   * `debt-a-networks-storage-is-taken-from-one-collections-options`, not this map's to fix.
+   */
+  // A key present with the value `undefined` means the factory has been asked and the host supplied
+  // none, which is why this is `has`-tested rather than `get`-tested in {@link storageFor}.
+  //
+  // NOTE: kept past {@link dispose}, so a stray statement after a host has disposed the plugin AND
+  // closed its stores reaches a CLOSED store, where re-asking the factory would have silently
+  // reopened one behind the host's back. Both are host-lifecycle errors and the closed store is the
+  // louder of the two, which is why this is not branched on. If a host ever needs dispose to hand
+  // its storage back, clear this there and say on the option that the factory is called once per
+  // network per plugin LIFETIME rather than per plugin.
+  private storages = new Map<string, NodeStorage | undefined>();
   /** The single-machine services this factory BUILT, so {@link dispose} can stop them. A `network`
    * backend's service belongs to its node and is stopped by {@link shutdown}. */
   private singleMachineBlobServices = new Set<SingleMachineBlobService>();
@@ -386,8 +418,9 @@ export class CollectionFactory {
    *    {@link registerLibp2pNode} may carry none (the attachments are optional), and then this falls
    *    through to the single-machine arm.
    *  - **everything else** (`local`, `test`, `mesh-test`, a custom transactor): a
-   *    `SingleMachineBlobService` over `options.blobStorageFactory`, or over memory when none is
-   *    given. Its cohort is this machine alone, so a committed reference's durability stays `local`.
+   *    `SingleMachineBlobService` over the `pieces` and `kv` of this network's storage
+   *    ({@link storageFor}), or over memory when the host supplied no factory. Its cohort is this
+   *    machine alone, so a committed reference's durability stays `local`.
    *
    * Concurrent callers for one key share a single resolution ({@link blobBackendsInFlight}); a
    * resolution that fails is not remembered, so the next caller tries again. Resolution always goes
@@ -523,12 +556,36 @@ export class CollectionFactory {
     // that cannot hold blobs for its network.
     const reason = nodeInfo === undefined ? 'transactor-has-no-node' : 'node-without-blobs';
     const service = new SingleMachineBlobService(
-      options.blobStorageFactory?.() ?? { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
+      this.storageFor(options) ?? { pieces: new MemoryPieceStore(), kv: new MemoryKVStore() },
     );
     service.start();
     this.singleMachineBlobServices.add(service);
     blobLog('blob:backend-single-machine key=%s reason=%s', key, reason);
     return { key, service, transactor };
+  }
+
+  /**
+   * Every store `options`'s network persists to on this machine: the host's `storageFactory` called
+   * once per transactor key and the result kept ({@link storages}), or `undefined` when the host
+   * supplied no factory.
+   *
+   * `undefined` rather than a memory default built here, so the ABSENCE reaches each consumer. It is
+   * what lets the node a `network` transactor builds log its own `node-wiring` `WARN:` line naming
+   * everything it is then keeping in memory: that warning tests the PRESENCE OF THE OPTION, so a
+   * default manufactured here would silence it by looking like a host that meant memory
+   * (`resolveNodeStorage` in `packages/db-p2p/src/libp2p-node-base.ts`).
+   *
+   * Synchronous, so two callers in one tick cannot both reach the factory — which is what makes
+   * "called once" hold for the table-and-catalog pair that opens together. Every storage factory is
+   * synchronous for the same reason (`fileNodeStorage` opens nothing on disk until the first
+   * operation).
+   */
+  private storageFor(options: ParsedOptimysticOptions): NodeStorage | undefined {
+    const key = this.getTransactorKey(options);
+    if (!this.storages.has(key)) {
+      this.storages.set(key, options.storageFactory?.());
+    }
+    return this.storages.get(key);
   }
 
   /**
@@ -622,14 +679,13 @@ export class CollectionFactory {
     let nodeInfo = this.libp2pNodes.get(nodeKey);
 
     if (!nodeInfo) {
-      // NOTE: no `storage`, so the plugin's own node keeps ALL of its storage in memory — blocks,
-      // blob pieces and blob records — and loses them on restart, every pin with them, after which
-      // the next sweep deletes the pieces (the node logs one `node-wiring` WARN: line saying so). A
-      // host that needs them persistent THROUGH the plugin has no option for it today: thread
-      // `blobStorageFactory`, and a block store with it, into a `NodeStorage` for this call's
-      // `storage` when one does — all three parts or none, since the option takes the whole value. A
-      // host that builds its own node and registers it with `registerLibp2pNode` already can.
+      // This network's storage, so the node keeps its blocks, blob pieces and blob records where the
+      // host said and a pin survives a restart ({@link storageFor}). `undefined` when the host
+      // supplied no factory, which is what makes the node log its own `node-wiring` WARN: line
+      // naming everything it is then keeping in memory — so leave it undefined rather than
+      // defaulting here.
       const node = await createLibp2pNode({
+        storage: this.storageFor(options),
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',
         bootstrapNodes: options.libp2pOptions?.bootstrapNodes ?? [],
@@ -691,8 +747,9 @@ export class CollectionFactory {
 
   /**
    * Create a local transactor (single-node, no network).
-   * Uses `options.rawStorageFactory` when supplied so hosts can plug in a
-   * persistent backend; otherwise falls back to in-memory `MemoryRawStorage`.
+   * Uses the `blocks` store of this network's storage ({@link storageFor}) when the host supplied a
+   * `storageFactory`, so hosts can plug in a persistent backend; otherwise falls back to in-memory
+   * `MemoryRawStorage`.
    *
    * A host-supplied backend gets the write-through read cache here — the one composition
    * seam for the local transactor. Without it `BlockStorage` re-reads block metadata on
@@ -713,7 +770,7 @@ export class CollectionFactory {
    */
   private async createLocalTransactor(options: ParsedOptimysticOptions): Promise<ITransactor> {
     const { storage: rawStorage, lease } = withReadCache(
-      options.rawStorageFactory?.() ?? new MemoryRawStorage(), 'quereus:local');
+      this.storageFor(options)?.blocks ?? new MemoryRawStorage(), 'quereus:local');
     // Only a lease THIS call was handed is ours to release. A host that hands an already
     // read-cached storage to `register()` gets it back unchanged, with no lease, and keeps
     // owning it.
@@ -736,7 +793,7 @@ export class CollectionFactory {
       async pend(request) {
         // This writer runs in the storage's own process and the storage applies every pend alone,
         // so each record is stamped with this run (`MessageOptions.localWriter`): a process that
-        // exits between a write's pend and its commit over a persistent `rawStorageFactory` store
+        // exits between a write's pend and its commit over a persistent `storageFactory` block store
         // would otherwise leave a record the next run reads as a live reservation and refuses every
         // later write on, exactly as a one-machine networked group did (GitHub #54).
         return await storageRepo.pend(request, { localWriter: true });
@@ -1116,9 +1173,11 @@ export class CollectionFactory {
    * reader of this network's reference trees a transactor nothing else writes through. For
    * `network` that costs nothing — the node, and so `node.blobs`, outlives this, and the next
    * resolution finds the same store. For every other transactor the next resolution builds a fresh
-   * single-machine store, which is coherent with the block store `test` and `local` also rebuild
-   * from scratch here. The service left behind stays in {@link singleMachineBlobServices} and is
-   * stopped by {@link dispose} (its sweep timer is unref'd until then).
+   * single-machine SERVICE: over the same pieces and blob records when the host supplied a
+   * `storageFactory` ({@link storages} outlives this too), and over fresh in-memory ones when it did
+   * not, which is coherent with the block store `test` and `local` then also rebuild from scratch
+   * here. The service left behind stays in {@link singleMachineBlobServices} and is stopped by
+   * {@link dispose} (its sweep timer is unref'd until then).
    */
   clearCache(): void {
     this.transactors.clear();
@@ -1147,10 +1206,11 @@ export class CollectionFactory {
    * reason: a closed `Database`'s tagged tables are never dropped, so nothing else would release
    * them, and each would keep renewing its cohort registration until the node stops.
    *
-   * Safe to call more than once. A transactor requested afterwards is rebuilt from scratch
-   * (the storage factory is invoked again and takes a fresh lease — on a cold cache if nobody
-   * else holds one over that store), so a stray statement after dispose is coherent. Does NOT
-   * stop libp2p nodes; that is {@link shutdown}, which calls this as its last step.
+   * Safe to call more than once. A transactor requested afterwards is rebuilt from scratch over
+   * THE SAME storage — the host's factory is called once per network for the life of this factory
+   * ({@link storages}), so the rebuild takes a fresh lease over the store it already had, on a cold
+   * cache if nobody else holds one over it — so a stray statement after dispose is coherent. Does
+   * NOT stop libp2p nodes; that is {@link shutdown}, which calls this as its last step.
    */
   async dispose(): Promise<void> {
     const leases = this.readCacheLeases;

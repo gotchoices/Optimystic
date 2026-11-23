@@ -1,6 +1,6 @@
 import type { Libp2p } from '@libp2p/interface';
 import type { ITransactor } from '@optimystic/db-core';
-import type { IKVStore, IPieceStore, IRawStorage, NodeOptions } from '@optimystic/db-p2p';
+import type { NodeOptions, NodeStorage } from '@optimystic/db-p2p';
 import type { BlobReferenceLedger } from './optimystic-adapter/blob-reference-ledger.js';
 import type { TransactionWriteFacts } from './optimystic-adapter/write-description.js';
 
@@ -30,23 +30,28 @@ export interface OptimysticOptions {
   encoding?: 'json' | 'msgpack';
 
   /**
-   * Optional factory for the raw storage backing a `'local'` transactor.
-   * Defaults to `MemoryRawStorage` when omitted. Has no effect for non-local
-   * transactor types.
-   */
-  rawStorageFactory?: () => IRawStorage;
-
-  /**
-   * For a transactor with no libp2p node (`local`, `test`, `mesh-test`, a custom transactor):
-   * where blob pieces and blob records live (docs/blobs.md §SQL). Defaults to both in memory.
-   * Has no effect for `network`, whose blobs live in the node's own store.
+   * Every store the network a table binds to persists to on THIS machine, as one value
+   * (`NodeStorage` in `@optimystic/db-p2p`): the blocks behind a `'local'` transactor, the blob
+   * pieces and blob records behind the blob service of a transactor with no libp2p node
+   * (docs/blobs.md §SQL), and the whole value as `NodeOptions.storage` for the node a `'network'`
+   * transactor builds — so the plugin's own node keeps its blobs, and the pins on them, where this
+   * says, and building a node by hand is no longer the only way to keep them across a restart.
    *
-   * Both or neither should be persistent. A persistent piece store over in-memory records loses
-   * every pin at restart and the next sweep then deletes every piece; persistent records over
-   * in-memory pieces report blobs the machine cannot serve, which `stat` corrects. The plugin
-   * cannot tell whether an `IKVStore` is persistent, so neither case is refused.
+   * Called ONCE per network — per transactor key, `<transactor>:<keyNetwork>` — however many tables
+   * and blob services resolve on it, and the result is kept for the life of the plugin. So a factory
+   * may construct rather than return a value it holds, and the plugin cannot be the reason two sets
+   * of stores open over one location (`fileNodeStorage` in `@optimystic/db-p2p-storage-fs` is one
+   * set per directory; two would double-count the pieces and break the piece store).
+   *
+   * Omitted, everything is in memory and nothing survives a restart; for a `'network'` transactor
+   * the node then logs one `node-wiring` `WARN:` line naming what it is keeping in memory and what
+   * is lost with each.
+   *
+   * The plugin closes NOTHING: it owns no store it was handed, and `plugin.dispose()` releases only
+   * its lease on the read cache in front of `blocks`. A host that must close its stores opens them
+   * outside `register()` and returns them from here.
    */
-  blobStorageFactory?: () => { pieces: IPieceStore; kv: IKVStore };
+  storageFactory?: () => NodeStorage;
 }
 
 /**
@@ -90,8 +95,7 @@ export interface ParsedOptimysticOptions {
   libp2pOptions: LibP2PNodeOptions;
   cache: boolean;
   encoding: 'json' | 'msgpack';
-  rawStorageFactory?: () => IRawStorage;
-  blobStorageFactory?: () => { pieces: IPieceStore; kv: IKVStore };
+  storageFactory?: () => NodeStorage;
 }
 
 /**

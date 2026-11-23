@@ -42,6 +42,7 @@ import register from '../dist/plugin.js';
 import { QuereusEngine, RowCodec, blobReferrer, isBlobRefColumn, splitKeyTuple } from '../dist/index.js';
 import type { StoredTableSchema } from '../dist/index.js';
 import { captureThrown, expectConcurrentModificationRefusal, queryAll } from './query-helpers.js';
+import { blocksOnly } from './storage-helpers.js';
 
 /** Fixed vectors: the 0-byte, 1,000-byte and 262,144-byte files of the builder's reference set. */
 const REF_A = 'bafkreihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku';
@@ -62,7 +63,7 @@ function createDb(storage: MemoryRawStorage): { db: Database; plugin: Plugin } {
 		default_transactor: 'local',
 		default_key_network: 'test',
 		enable_cache: false,
-		rawStorageFactory: () => storage,
+		storageFactory: () => blocksOnly(storage),
 	} as unknown as Record<string, SqlValue>);
 	for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
 	for (const func of plugin.functions) db.registerFunction(func.schema);
@@ -79,7 +80,7 @@ function bindingOptions(storage: MemoryRawStorage) {
 		libp2pOptions: {},
 		cache: false,
 		encoding: 'json' as const,
-		rawStorageFactory: () => storage,
+		storageFactory: () => blocksOnly(storage),
 	};
 }
 

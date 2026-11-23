@@ -58,6 +58,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { blocksOnly } from './storage-helpers.js';
 
 type Plugin = ReturnType<typeof register>;
 
@@ -397,7 +398,7 @@ describe('Session-mode commit reopen durability (local/FileRawStorage, all platf
 			default_transactor: 'local',
 			default_key_network: 'test',
 			enable_cache: false,
-			rawStorageFactory: () => new FileRawStorage(d),
+			storageFactory: () => blocksOnly(new FileRawStorage(d)),
 		} as unknown as Record<string, SqlValue>;
 		const plugin = register(db, config);
 		for (const vtable of plugin.vtables) db.registerModule(vtable.name, vtable.module, vtable.auxData);
@@ -408,7 +409,7 @@ describe('Session-mode commit reopen durability (local/FileRawStorage, all platf
 	async function enableFsSessionMode(db: Database, plugin: Plugin, d: string): Promise<() => void> {
 		const transactor = await plugin.collectionFactory.getOrCreateTransactor({
 			collectionUri: 'tree://unused', transactor: 'local', keyNetwork: 'test',
-			libp2pOptions: {}, cache: false, encoding: 'json', rawStorageFactory: () => new FileRawStorage(d),
+			libp2pOptions: {}, cache: false, encoding: 'json', storageFactory: () => blocksOnly(new FileRawStorage(d)),
 		});
 		const coordinator = new TransactionCoordinator(transactor, plugin.txnBridge.getCollectionRegistry());
 		const engine = new QuereusEngine(db, coordinator);

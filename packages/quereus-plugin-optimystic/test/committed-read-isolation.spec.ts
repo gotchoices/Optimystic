@@ -44,6 +44,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
+import { blocksOnly } from './storage-helpers.js';
 
 /** Vtab-level rows are POSITIONAL (quereus `Row` = `SqlValue[]`); only `db.eval`
  * maps them to named-column objects. */
@@ -521,7 +522,7 @@ describe('Committed-read connection isolation', function () {
 				default_transactor: 'local',
 				default_key_network: 'test',
 				enable_cache: false,
-				rawStorageFactory: () => new FileRawStorage(dir),
+				storageFactory: () => blocksOnly(new FileRawStorage(dir)),
 			} as unknown as Record<string, SqlValue>;
 			const plugin = register(db, config);
 			const injected = makeSelectiveFailureTransactor(new FileRawStorage(dir));
