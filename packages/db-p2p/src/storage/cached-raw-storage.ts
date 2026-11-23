@@ -32,6 +32,7 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	approximateBytesFree?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
 	readCached?: true;
 
@@ -48,6 +49,9 @@ export class RawStorageDriverAdapter implements RawStoreDriver {
 		}
 		if (inner.getApproximateBytesUsed) {
 			this.approximateBytesUsed = () => inner.getApproximateBytesUsed!();
+		}
+		if (inner.getApproximateBytesFree) {
+			this.approximateBytesFree = () => inner.getApproximateBytesFree!();
 		}
 		if (inner.readCached) {
 			this.readCached = true;

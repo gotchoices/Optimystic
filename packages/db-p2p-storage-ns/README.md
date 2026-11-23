@@ -72,9 +72,10 @@ const libp2p = await createLibp2pNode({
 (`SqliteRawStorage`), the key-value store (`SqliteKVStore`) and the piece store
 (`SqlitePieceStore`) over the handle you pass, so the three report one store
 identity and the block store's byte count — the whole database file — already
-measures the `pieces` table. That is what makes the node count its blob pieces
-once rather than reporting itself fuller than it is; the factory asserts it
-before it returns. The three classes stay exported for a caller that needs one on
+measures the `pieces` table and the key-value store's rows. That is what makes the
+node count its blob pieces once rather than reporting itself fuller than it is,
+and its own key-value bookkeeping at all rather than leaving it unmeasured; the
+factory asserts it of all three before it returns. The three classes stay exported for a caller that needs one on
 its own.
 
 The same handle is shared by every consumer. The plugin runs every call on
@@ -153,6 +154,12 @@ database created before the table existed gains it, empty, on its next open.
 This is the SQLite database-file footprint; it is **not** a per-block figure.
 That's adequate for `StorageMonitor` — which uses the value as an advisory
 ring-selection input.
+
+There is **no free-space figure**: this package is handed an already-open
+database, not a path, and NativeScript offers no free-space call reachable from a
+database handle, so `getApproximateBytesFree` is omitted entirely rather than
+stubbed at 0 — 0 would read as "full". A host that knows the device's figure
+supplies it to the node itself.
 
 ## Durability
 

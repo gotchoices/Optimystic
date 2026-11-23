@@ -54,6 +54,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	getApproximateBytesUsed?: () => Promise<number>;
+	getApproximateBytesFree?: () => Promise<number>;
 	getStoreIdentity?: () => StoreIdentity;
 	readCached?: true;
 	close?: () => Promise<void>;
@@ -87,6 +88,9 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 		}
 		if (driver.approximateBytesUsed) {
 			this.getApproximateBytesUsed = () => driver.approximateBytesUsed!();
+		}
+		if (driver.approximateBytesFree) {
+			this.getApproximateBytesFree = () => driver.approximateBytesFree!();
 		}
 		if (driver.readCached) {
 			this.readCached = true;

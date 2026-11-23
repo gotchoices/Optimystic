@@ -55,6 +55,8 @@ export interface BatchBackend<R extends StoredValue = Uint8Array> extends WriteG
 	listBlockIds?(): AsyncIterable<BlockId>;
 	/** Optional — best cheap byte estimate. Omit rather than stub. */
 	approximateBytesUsed?(): Promise<number>;
+	/** Optional — the location's free bytes, with the contract of `RawStoreDriver.approximateBytesFree`: it REJECTS on a failed read, never answering 0. Omit rather than stub. */
+	approximateBytesFree?(): Promise<number>;
 	/** Optional — release what the backend holds open. The driver flushes before calling it. */
 	close?(): Promise<void>;
 }

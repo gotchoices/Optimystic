@@ -1,5 +1,6 @@
-import type { IKVStore } from '@optimystic/db-p2p';
+import { identityForHandle, type IKVStore, type StoreIdentity } from '@optimystic/db-p2p';
 import type { SqliteDb, SqliteStatement } from './db.js';
+import { SQLITE_HANDLE_SCHEME } from './sqlite-storage.js';
 import { PendingSqliteSync } from './sqlite-sync.js';
 
 /**
@@ -29,10 +30,12 @@ export class SqliteKVStore implements IKVStore {
 		list: SqliteStatement;
 	};
 	private readonly prefix: string;
+	private readonly identity: StoreIdentity;
 	private readonly sync: PendingSqliteSync;
 
 	constructor(db: SqliteDb, prefix: string = 'optimystic:txn:') {
 		this.prefix = prefix;
+		this.identity = identityForHandle(SQLITE_HANDLE_SCHEME, db);
 		this.sync = new PendingSqliteSync(db);
 		this.stmts = {
 			get: db.prepare('SELECT s_val FROM kv WHERE key = ?'),
@@ -40,6 +43,11 @@ export class SqliteKVStore implements IKVStore {
 			delete: db.prepare('DELETE FROM kv WHERE key = ?'),
 			list: db.prepare('SELECT key FROM kv WHERE key >= ? AND key < ? ORDER BY key ASC'),
 		};
+	}
+
+	/** The identity `SqliteBatchBackend` reports over this handle, so `assertOneMeasuredLocation` sees one location for all three of a node's stores — the database file the block store measures whole. `IKVStore.storeIdentity`'s contract. */
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	async get(key: string): Promise<string | undefined> {

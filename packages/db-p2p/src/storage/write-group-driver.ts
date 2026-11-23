@@ -53,6 +53,7 @@ function toBatchEntry<V extends StoredValue>({ key, value }: WriteGroupEntry<Sto
 export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements RawStoreDriver<V> {
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	approximateBytesFree?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
 
 	/** The backend's: the overlay adds no durability, it only defers the backend's until the flush. */
@@ -75,6 +76,9 @@ export class WriteGroupDriver<V extends StoredValue = Uint8Array> implements Raw
 		}
 		if (backend.approximateBytesUsed) {
 			this.approximateBytesUsed = () => backend.approximateBytesUsed!();
+		}
+		if (backend.approximateBytesFree) {
+			this.approximateBytesFree = () => backend.approximateBytesFree!();
 		}
 	}
 

@@ -1,4 +1,4 @@
-import { assertBlockStoreCountsPieces, type OpenNodeStorage, type StoreIdentity } from '@optimystic/db-p2p';
+import { assertOneMeasuredLocation, type OpenNodeStorage, type StoreIdentity } from '@optimystic/db-p2p';
 import { FileRawStorage, type FileRawStorageOptions } from './file-storage.js';
 import { FileKVStore, type FileKVStoreOptions } from './file-kv-store.js';
 import { FilePieceStore } from './file-piece-store.js';
@@ -99,8 +99,9 @@ function openDirectory(identity: StoreIdentity, basePath: string, options: FileN
 	const blocks = new FileRawStorage(basePath, options);
 	const kv = new FileKVStore(basePath, options);
 	const pieces = new FilePieceStore(basePath);
-	// The piece store lives inside the base path, which the block store's byte count measures.
-	assertBlockStoreCountsPieces(blocks, pieces, basePath);
+	// The key-value store's files and the piece store's both live inside the base path, which the
+	// block store's byte count measures whole.
+	assertOneMeasuredLocation({ blocks, kv, pieces }, basePath);
 	const opened: OpenDirectory = { identity, blocks, kv, pieces, holders: 0 };
 	openDirectories.set(identity, opened);
 	return opened;

@@ -1,7 +1,7 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type SinkCommitOptions, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
-import { FileWriteLog, assertFileWriteLogOptions, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
+import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type SinkCommitOptions, type StoreIdentity, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
+import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
 
 /** The write group's `idleFlushMs` and the log's checkpoint settings; `setTimer` (test-only) arms both. */
 export type FileKVStoreOptions = WriteGroupOptions & FileWriteLogOptions;
@@ -27,6 +27,7 @@ const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
  */
 export class FileKVStore implements IKVStore {
 	private readonly basePath: string;
+	private readonly identity: StoreIdentity;
 	private readonly options: FileWriteLogOptions;
 	private readonly group: WriteGroup<string>;
 	private log: FileWriteLog | undefined;
@@ -34,12 +35,18 @@ export class FileKVStore implements IKVStore {
 	constructor(basePath: string, options: FileKVStoreOptions = {}) {
 		assertFileWriteLogOptions(options);
 		this.basePath = path.resolve(basePath);
+		this.identity = fileStoreIdentity(basePath);
 		this.options = options;
 		this.group = new WriteGroup<string>(key => key, {
 			commit: (entries, commitOptions) => this.commit(entries, commitOptions),
 			// A store that never committed holds no log, and so has nothing to hasten.
 			sync: () => this.log?.sync() ?? Promise.resolve(),
 		}, options);
+	}
+
+	/** The identity `FileBatchBackend` and `FilePieceStore` report over this base path, so `assertOneMeasuredLocation` sees one location for all three of a node's stores. `IKVStore.storeIdentity`'s contract. */
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	async get(key: string): Promise<string | undefined> {

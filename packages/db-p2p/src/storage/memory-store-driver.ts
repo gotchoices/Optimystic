@@ -192,6 +192,10 @@ export class MemoryStoreDriver implements RawStoreDriver {
 		}
 	}
 
+	// NOTE: no `approximateBytesFree`, for the reason there is no `storeIdentity` either — there is no
+	// location. The free space of a `Map` is the heap, which is not a storage allotment: a node that
+	// read it as one would size its responsibility by how much memory the process happens to have
+	// left. Omitted entirely rather than stubbed, so a consumer's feature detection sees that.
 	async approximateBytesUsed(): Promise<number> {
 		let total = 0;
 		for (const [blockId, value] of this.metadata) {

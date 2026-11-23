@@ -213,6 +213,11 @@ export class SqliteBatchBackend implements BatchBackend {
 		}
 	}
 
+	// NOTE: no `approximateBytesFree`. This package is handed an already-open `SqliteDb`, not a path,
+	// and NativeScript offers no free-space call reachable from a database handle, so there is nothing
+	// honest to answer. Omitted entirely rather than stubbed, under
+	// `BatchBackend.approximateBytesFree`'s rule: a stub answering 0 would read as "full". A host that
+	// knows the device's figure supplies it to the node itself.
 	async approximateBytesUsed(): Promise<number> {
 		try {
 			const pageCountRow = await this.stmts.pageCount.get();

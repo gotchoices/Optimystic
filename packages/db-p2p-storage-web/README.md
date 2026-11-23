@@ -61,9 +61,10 @@ piece store (`IndexedDBPieceStore`) over the `IDBPDatabase` handle you pass —
 IndexedDB permits concurrent transactions across disjoint object stores, so the
 storage layer parallelises naturally. The three therefore report one store
 identity, and the block store's byte count, the origin's estimate, already
-includes the pieces: that is what makes the node count its blob pieces once
-rather than reporting itself fuller than it is, and the factory asserts it before
-it returns. The three classes stay exported for a caller that needs one on its
+includes both the pieces and the key-value store's records: that is what makes the
+node count its blob pieces once rather than reporting itself fuller than it is,
+and its own key-value bookkeeping at all rather than leaving it unmeasured. The
+factory asserts it of all three before it returns. The three classes stay exported for a caller that needs one on its
 own.
 
 **The handle stays yours.** The node closes no store it was handed, so close the
@@ -161,6 +162,14 @@ what fixes it.
 which is **per-origin**, not per-database. That is adequate for `StorageMonitor`
 — which uses the figure as an advisory ring-selection input — but is not a
 precise per-database accounting.
+
+`getApproximateBytesFree()` reads `quota - usage` from the same estimate, so the
+two figures agree and are origin-scoped alike. It is **present only where the
+platform can be asked**: a store built where there is no
+`navigator.storage.estimate` — Node under `fake-indexeddb`, which is how this
+package's own specs run — omits the method entirely, as a backend that cannot ask
+must. A failed estimate, or one that carries no `quota`, rejects rather than
+answering 0, since 0 would read as "full".
 
 ## Durability
 

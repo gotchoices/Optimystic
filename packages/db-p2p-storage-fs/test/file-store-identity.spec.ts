@@ -4,8 +4,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { FileRawStorage, FileBatchBackend, FilePieceStore, fileNodeStorage } from '../src/index.js';
 import {
+	assertOneMeasuredLocation,
 	blockStoreCountsPieces,
-	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, WriteGroupDriver, withReadCache,
+	CachedRawStorage, CachedStoreDriver, KvRawStorage, MemoryKVStore, SharedCachePool, WriteGroupDriver, withReadCache,
 } from '@optimystic/db-p2p';
 
 // `fileStoreIdentity` names the RESOLVED directory a store is backed by, so two storages over one
@@ -71,6 +72,21 @@ describe('FileRawStorage store identity', () => {
 	// whole tree — is the only figure the monitor adds.
 	it('gives a FilePieceStore over the same basePath one identity with the block store, so pieces are counted once', () => {
 		assert.ok(blockStoreCountsPieces(new FileRawStorage(base), new FilePieceStore(base)));
+	});
+
+	// The half of the invariant that would otherwise fail SILENTLY: pieces outside the measured
+	// location get counted twice, but a key-value store outside it is counted not at all — `IKVStore`
+	// reports no bytes of its own, deliberately, because this assertion is what makes its records
+	// part of what the block store measures. A `MemoryKVStore` stands in for any store that is not
+	// inside the base path: it reports no identity at all, which is the strongest form of disagreeing.
+	it('refuses a NodeStorage whose key-value store is not inside the location the block store measures', () => {
+		assert.throws(
+			() => assertOneMeasuredLocation(
+				{ blocks: new FileRawStorage(base), kv: new MemoryKVStore(), pieces: new FilePieceStore(base) },
+				base,
+			),
+			/report more than one location.*kv undefined/s,
+		);
 	});
 
 	// The composition the whole passthrough chain exists for, and the one the `IRawStorage`
@@ -173,6 +189,33 @@ describe('FileRawStorage store identity', () => {
 				/never converge/
 			);
 		});
+	});
+});
+
+// The one end-to-end check that `fs.promises.statfs` is reachable from this package on the platform
+// the suite runs on — the whole storage-allotment chain rests on the figure it gives. Writes (the
+// call opens the directory, which takes the lock), so it gets its own temp directory and closes.
+describe('FileRawStorage free space', () => {
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-free-space-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	it('reports the filesystem free space as a positive number', async () => {
+		const storage = new FileRawStorage(dir);
+		try {
+			assert.strictEqual(typeof storage.getApproximateBytesFree, 'function', 'the fs backend always has one');
+			const free = await storage.getApproximateBytesFree();
+			assert.strictEqual(typeof free, 'number');
+			assert.ok(free > 0, `expected room on the volume holding ${dir}, got ${free}`);
+		} finally {
+			await storage.close();
+		}
 	});
 });
 

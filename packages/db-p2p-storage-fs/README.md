@@ -54,8 +54,17 @@ await storage.close();
 it, so they share one write-ahead log, one lock and one checkpoint, and the block
 store's byte count already measures the piece directory inside it. The three
 therefore report one store identity, which is what makes the node count its blob
-pieces once rather than reporting itself fuller than it is. The factory asserts
-that before it returns.
+pieces once rather than reporting itself fuller than it is, and what keeps its
+own key-value bookkeeping inside the figure it measures rather than unmeasured.
+The factory asserts that of all three before it returns.
+
+The block store also reports how much room is left: `getApproximateBytesFree()`
+is one `statfs` of the base path, giving the bytes the filesystem holding the
+directory will still accept to an unprivileged process. It measures the whole
+filesystem, not this directory's share of anything, so a quota or another process
+filling the same volume moves the figure — which is what a node asking whether it
+can still write wants to know. A failed `statfs` rejects rather than answering 0,
+since 0 means "full".
 
 The node keeps blob pieces in the `pieces` store and their records in the `kv`
 store, and serves both through `libp2p.blobs` (`docs/blobs.md` in the repository
@@ -170,8 +179,8 @@ lock and holds no handle between calls; two stores over one directory are not
 supported, since the second's open deletes the first's temps — which is what
 `fileNodeStorage`'s one-set-per-directory rule makes unreachable for a host.
 
-It reports the same store identity as a `FileRawStorage` over the same
-`basePath`, whose byte count already includes the piece directory, so the
+It reports the same store identity as a `FileRawStorage` and a `FileKVStore` over
+the same `basePath`, whose byte count already includes the piece directory, so the
 node's storage monitor does not count the pieces twice. Its log lines are on
 `optimystic:db-p2p-storage-fs:pieces:file` (`incoming:cleared`,
 `rename:raced`, `temp:close-failed`, `temp:unlink-failed`; see `docs/debugging.md`).

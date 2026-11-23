@@ -164,6 +164,29 @@ export interface IRawStorage {
 	getApproximateBytesUsed?(): Promise<number>;
 
 	/**
+	 * The bytes this storage's LOCATION will still accept, by the backend's cheapest honest
+	 * measure — what a node reads to know how much room the disk it was given has left.
+	 *
+	 * - Advisory and may be stale, exactly as {@link getApproximateBytesUsed} is. It is the
+	 *   LOCATION's free space, not this store's share of it, so two stores over one location
+	 *   answer the same figure; that is why an accounting of a node's room asks the block store
+	 *   and nobody else.
+	 * - **A failed read REJECTS; it never answers 0.** 0 means "full", and a transient failure
+	 *   that read as full would make a node shed responsibility it did not need to shed. The
+	 *   consumer catches, logs, and treats the figure as unknown for that scan.
+	 * - Presence is fixed for the storage's life, like {@link getStoreIdentity}.
+	 * - OPTIONAL BY DESIGN, under the same rule as every optional member here: a backend that
+	 *   cannot ask its platform how much room is left omits the method ENTIRELY and never
+	 *   installs a stub answering 0, so feature-detection
+	 *   (`typeof storage.getApproximateBytesFree === 'function'`) sees the backend's true
+	 *   capability. The filesystem (`statfs`) and browser (`navigator.storage.estimate()`)
+	 *   backends have one; the SQLite and LevelDB packages are handed an open handle with no
+	 *   path to ask about, and a memory store's "free space" is the heap, which is not a
+	 *   storage allotment — all three omit it.
+	 */
+	getApproximateBytesFree?(): Promise<number>;
+
+	/**
 	 * Enumerate the block ids that currently have durable state in this backend —
 	 * one id per block with ANY durable metadata. That includes a block whose only
 	 * durable state is an uncommitted pending transform, since

@@ -61,9 +61,17 @@ TCP transport doesn't get bundled into the React Native app.
 (`LevelDBRawStorage`), the key-value store (`LevelDBKVStore`) and the piece store
 (`LevelDBPieceStore`) over the handle you pass, one ordered keyspace partitioned
 by a leading tag byte. The three therefore report one store identity, and the
-block store's byte count, which covers the whole database, already measures the
-piece range: that is what makes the node count its blob pieces once rather than
-reporting itself fuller than it is, and the factory asserts it before it returns.
+block store's byte count, which covers the whole database, already measures both
+the piece range and the key-value store's keys: that is what makes the node count
+its blob pieces once rather than reporting itself fuller than it is, and its own
+key-value bookkeeping at all rather than leaving it unmeasured. The factory
+asserts it of all three before it returns.
+
+There is **no free-space figure**: this package is handed an already-open handle,
+not a path, and the binding exposes no free-space call, so
+`getApproximateBytesFree` is omitted entirely rather than stubbed at 0 — 0 would
+read as "full". A host that knows the device's figure supplies it to the node
+itself.
 The three classes stay exported for a caller that needs one on its own.
 
 **The handle stays yours.** The node closes no store it was handed, so close the

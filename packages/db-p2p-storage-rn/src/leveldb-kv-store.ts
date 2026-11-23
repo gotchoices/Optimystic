@@ -1,14 +1,16 @@
 import {
 	WriteGroup,
 	asStoredText,
+	identityForHandle,
 	textValueCodec,
 	type CommittedBatch,
 	type FlushOptions,
 	type IKVStore,
+	type StoreIdentity,
 	type WriteGroupEntry,
 	type WriteGroupOptions,
 } from '@optimystic/db-p2p';
-import { drain, type LevelDBLike } from './leveldb-like.js';
+import { LEVELDB_HANDLE_SCHEME, drain, type LevelDBLike } from './leveldb-like.js';
 import { kvKey, kvKeyToString, kvPrefixRange } from './keys.js';
 
 /** The write group's options (`idleFlushMs`, `maxUnsyncedBytes`, the test-only `setTimer`). */
@@ -42,17 +44,24 @@ const textEncoder = new TextEncoder();
  */
 export class LevelDBKVStore implements IKVStore {
 	private readonly group: WriteGroup<string, string>;
+	private readonly identity: StoreIdentity;
 
 	constructor(
 		private readonly db: LevelDBLike,
 		private readonly prefix: string = 'optimystic:txn:',
 		options: LevelDBKVStoreOptions = {},
 	) {
+		this.identity = identityForHandle(LEVELDB_HANDLE_SCHEME, db);
 		this.group = new WriteGroup<string, string>(key => key, {
 			commit: entries => this.commit(entries),
 			// Every commit is as durable as this store can make it when it resolves, so nothing is ever owed a sync.
 			sync: () => Promise.resolve(),
 		}, { ...options, storedBytes: textValueCodec.storedBytes });
+	}
+
+	/** The identity `LevelDBJournalStore` reports over this handle, so `assertOneMeasuredLocation` sees one location for all three of a node's stores — the database the block store measures whole. `IKVStore.storeIdentity`'s contract. */
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	async get(key: string): Promise<string | undefined> {

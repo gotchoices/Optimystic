@@ -1,5 +1,6 @@
 import type { IPieceStore } from '../blob/piece-store.js';
 import type { IRawStorage } from './i-raw-storage.js';
+import { blockStoreCountsPieces } from './store-coverage.js';
 
 export interface StorageCapacity {
 	total: number;
@@ -32,40 +33,6 @@ export interface StorageMonitorConfig {
 	 * wall time.
 	 */
 	now?: () => number;
-}
-
-/**
- * Whether `storage`'s `getApproximateBytesUsed` already measures `pieces`' bytes. Every disk block
- * store measures its whole directory or database, so a piece store inside the same location is
- * counted there and adding its own figure would count it twice. Decided by store identity, whose
- * contract is one-directional: equal identities prove one location, so the piece bytes are left
- * out; anything else (either identity absent, two different strings, or a block store with no
- * `getApproximateBytesUsed`, which measures nothing) adds them.
- */
-// NOTE: two spellings of one location read as two identities, so a piece store over a differently
-// spelled path to the block store's directory is counted twice. That errs toward reporting the node
-// fuller than it is, which delays nothing and moves a ring outward at worst; revisit if a host reports it.
-export function blockStoreCountsPieces(storage: IRawStorage, pieces: IPieceStore): boolean {
-	if (typeof storage.getApproximateBytesUsed !== 'function') return false;
-	const blockIdentity = storage.getStoreIdentity?.();
-	return blockIdentity !== undefined && blockIdentity === pieces.storeIdentity?.();
-}
-
-/**
- * Throws unless {@link blockStoreCountsPieces} holds of a block store and a piece store a platform
- * factory built over ONE location — the thing the monitor's decision above rests on, so a factory
- * that handed back a piece store its block store does not measure would make every node over it
- * report itself fuller than it is. Each storage package's `*NodeStorage` factory calls this before
- * it returns, so an edit that moved the pieces elsewhere (a sibling directory, a second handle
- * opened inside the factory) fails loudly on the first open instead. One comparison of two strings.
- *
- * `location` is the one place both were built over, named for the message: a base path, or a phrase
- * for a handle the caller passed.
- */
-export function assertBlockStoreCountsPieces(blocks: IRawStorage, pieces: IPieceStore, location: string): void {
-	if (!blockStoreCountsPieces(blocks, pieces)) {
-		throw new Error(`The stores opened over ${location} report two locations (blocks ${blocks.getStoreIdentity?.()}, pieces ${pieces.storeIdentity?.()}), so a node over them would count its blob pieces twice`);
-	}
 }
 
 /**

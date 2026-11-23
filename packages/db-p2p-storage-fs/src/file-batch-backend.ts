@@ -306,6 +306,25 @@ export class FileBatchBackend implements BatchBackend {
 		return this.directoryByteSize(this.basePath);
 	}
 
+	/**
+	 * What the filesystem holding this directory will still accept, from one `statfs`: the blocks
+	 * available to an unprivileged process (`bavail`, not `bfree`, which includes the reserve only
+	 * root may use) times the block size. `RawStoreDriver.approximateBytesFree`'s contract — the
+	 * FILESYSTEM's free space, which every store under this base path shares.
+	 *
+	 * Opens first, as `approximateBytesUsed` does, so `statfs` never names a directory the store has
+	 * not created yet. A failed `statfs` REJECTS rather than answering 0: a transient failure read as
+	 * "full" would make a node shed responsibility it did not need to shed.
+	 */
+	// NOTE: this measures the whole filesystem, so a quota, a subvolume limit or another process
+	// filling the same volume all move the figure — which is what a node wanting to know whether it
+	// can still write wants. It is not this directory's share of anything.
+	async approximateBytesFree(): Promise<number> {
+		await this.open();
+		const stats = await fs.statfs(this.basePath);
+		return Number(stats.bavail) * Number(stats.bsize);
+	}
+
 	// --- the one write ---
 
 	/** One log record, synced within `syncWithinMs` (see `FileWriteLog.commit`); the `durable` returned is the log's. */

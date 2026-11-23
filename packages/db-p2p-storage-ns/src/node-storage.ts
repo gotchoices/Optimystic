@@ -1,4 +1,4 @@
-import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertOneMeasuredLocation, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { OptimysticNSDBHandle } from './db.js';
 import { SqliteRawStorage, type SqliteRawStorageOptions } from './sqlite-storage.js';
 import { SqliteKVStore } from './sqlite-kv-store.js';
@@ -26,7 +26,7 @@ export function sqliteNodeStorage(db: OptimysticNSDBHandle, options: SqliteNodeS
 	const blocks = new SqliteRawStorage(db, options);
 	const kv = new SqliteKVStore(db);
 	const pieces = new SqlitePieceStore(db);
-	assertBlockStoreCountsPieces(blocks, pieces, 'this SQLite handle');
+	assertOneMeasuredLocation({ blocks, kv, pieces }, 'this SQLite handle');
 	return {
 		blocks,
 		kv,

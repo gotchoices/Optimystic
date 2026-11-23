@@ -139,10 +139,23 @@ export class IndexedDBJournalStore implements JournalStore {
 	private readonly identity: StoreIdentity;
 	private readonly strict: boolean;
 
+	/**
+	 * Present only where the platform can be asked how much room the origin has left — wired here
+	 * rather than declared as a method, because `BatchBackend.approximateBytesFree`'s contract is
+	 * that a backend which cannot ask OMITS it, and a stub answering 0 would read as "full". Absent
+	 * under Node's `fake-indexeddb`, which the package's own specs run on and where there is no
+	 * `navigator.storage`, so a web store there reports no free space at all — the same answer the
+	 * SQLite and LevelDB packages give.
+	 */
+	approximateBytesFree?: () => Promise<number>;
+
 	constructor(private readonly db: OptimysticWebDBHandle, options: IndexedDBJournalStoreOptions = {}) {
 		this.strict = resolveStrictDurability(options);
 		this.durability = this.strict ? 'power-loss' : 'process-crash';
 		this.identity = identityForHandle(IDB_HANDLE_SCHEME, db);
+		if (typeof navigator !== 'undefined' && typeof navigator.storage?.estimate === 'function') {
+			this.approximateBytesFree = () => this.estimateBytesFree();
+		}
 	}
 
 	storeIdentity(): StoreIdentity {
@@ -210,6 +223,24 @@ export class IndexedDBJournalStore implements JournalStore {
 			log('navigator.storage.estimate() failed: %o', err);
 			return 0;
 		}
+	}
+
+	/**
+	 * What the origin's quota will still accept: `quota - usage` from the same estimate the used
+	 * figure reads, so the two agree and are origin-scoped alike.
+	 *
+	 * Unlike `approximateBytesUsed`, a failure REJECTS rather than answering 0 — the contract on
+	 * `BatchBackend.approximateBytesFree` — and so does an estimate that carries no `quota`, which a
+	 * browser may leave out. 0 means "full", and a node that read a missing quota as full would shed
+	 * responsibility it did not need to shed. Clamped at 0 below, for a usage that exceeds the quota
+	 * after it was tightened.
+	 */
+	private async estimateBytesFree(): Promise<number> {
+		const estimate = await navigator.storage.estimate();
+		if (typeof estimate.quota !== 'number') {
+			throw new Error('navigator.storage.estimate() reported no quota, so the free space of this origin is unknown');
+		}
+		return Math.max(0, estimate.quota - (estimate.usage ?? 0));
 	}
 
 	// --- the journal ---

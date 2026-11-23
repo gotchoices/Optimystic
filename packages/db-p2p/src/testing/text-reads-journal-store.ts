@@ -16,6 +16,7 @@ export class TextReadsJournalStore implements JournalStore<string> {
 	storeIdentity?: () => StoreIdentity;
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	approximateBytesFree?: () => Promise<number>;
 	close?: () => Promise<void>;
 
 	private readonly decoder = new TextDecoder();
@@ -25,6 +26,7 @@ export class TextReadsJournalStore implements JournalStore<string> {
 		if (store.storeIdentity) this.storeIdentity = () => store.storeIdentity!();
 		if (store.listBlockIds) this.listBlockIds = () => store.listBlockIds!();
 		if (store.approximateBytesUsed) this.approximateBytesUsed = () => store.approximateBytesUsed!();
+		if (store.approximateBytesFree) this.approximateBytesFree = () => store.approximateBytesFree!();
 		if (store.close) this.close = () => store.close!();
 	}
 

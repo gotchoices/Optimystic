@@ -204,6 +204,7 @@ export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements Ra
 	 */
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	approximateBytesFree?: () => Promise<number>;
 	storeIdentity?: () => StoreIdentity;
 
 	/**
@@ -253,6 +254,9 @@ export class CachedStoreDriver<V extends StoredValue = Uint8Array> implements Ra
 		}
 		if (inner.approximateBytesUsed) {
 			this.approximateBytesUsed = () => inner.approximateBytesUsed!();
+		}
+		if (inner.approximateBytesFree) {
+			this.approximateBytesFree = () => inner.approximateBytesFree!();
 		}
 	}
 

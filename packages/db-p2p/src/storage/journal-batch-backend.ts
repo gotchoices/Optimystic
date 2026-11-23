@@ -161,6 +161,7 @@ export class JournalBatchBackend<R extends StoredValue = Uint8Array> implements 
 	storeIdentity?: () => StoreIdentity;
 	listBlockIds?: () => AsyncIterable<BlockId>;
 	approximateBytesUsed?: () => Promise<number>;
+	approximateBytesFree?: () => Promise<number>;
 
 	/**
 	 * Records appended and not yet applied, in order, each with its `durable`, with the earliest
@@ -205,6 +206,12 @@ export class JournalBatchBackend<R extends StoredValue = Uint8Array> implements 
 				await this.open();
 				return store.approximateBytesUsed!();
 			};
+		}
+		// A plain passthrough, with no `open()` first: free space is the LOCATION's, so it does not
+		// depend on whether the journal has been recovered into the stores — unlike the used figure,
+		// which would under-count the records an open is about to apply.
+		if (store.approximateBytesFree) {
+			this.approximateBytesFree = () => store.approximateBytesFree!();
 		}
 	}
 

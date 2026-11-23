@@ -204,6 +204,22 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	listBlockIds?(): AsyncIterable<BlockId>;
 	/** Optional — best cheap byte estimate. Passed through by the kernel. */
 	approximateBytesUsed?(): Promise<number>;
+	/**
+	 * Optional — the bytes this driver's LOCATION will still accept, by the backend's cheapest
+	 * honest measure. Passed through by the kernel and by every wrapper, as
+	 * {@link approximateBytesUsed} is.
+	 *
+	 * - Advisory and may be stale, like {@link approximateBytesUsed}. It is the LOCATION's free
+	 *   space, not this driver's share of it, so two stores over one location answer the same
+	 *   figure — which is why a consumer asks the block store and nobody else.
+	 * - **A failed read REJECTS; it never answers 0.** 0 means "full", and a transient failure
+	 *   read as full would make a node shed responsibility it did not need to shed. The consumer
+	 *   catches and treats the figure as unknown for that scan.
+	 * - Presence is fixed for the driver's life, like {@link storeIdentity}: a backend that cannot
+	 *   ask its platform omits the method ENTIRELY and never installs a stub answering 0, so
+	 *   `typeof driver.approximateBytesFree === 'function'` sees its true capability.
+	 */
+	approximateBytesFree?(): Promise<number>;
 	/** Optional — release the underlying handle. */
 	close?(): Promise<void>;
 

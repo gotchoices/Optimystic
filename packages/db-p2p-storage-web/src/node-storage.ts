@@ -1,4 +1,4 @@
-import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertOneMeasuredLocation, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { OptimysticWebDBHandle } from './db.js';
 import { IndexedDBRawStorage, type IndexedDBRawStorageOptions } from './indexeddb-storage.js';
 import { IndexedDBKVStore, type IndexedDBKVStoreOptions } from './indexeddb-kv-store.js';
@@ -27,7 +27,7 @@ export function indexedDbNodeStorage(db: OptimysticWebDBHandle, options: Indexed
 	// The default prefix, named by leaving it out, with the options behind it.
 	const kv = new IndexedDBKVStore(db, undefined, options);
 	const pieces = new IndexedDBPieceStore(db, options);
-	assertBlockStoreCountsPieces(blocks, pieces, 'this IndexedDB handle');
+	assertOneMeasuredLocation({ blocks, kv, pieces }, 'this IndexedDB handle');
 	return {
 		blocks,
 		kv,

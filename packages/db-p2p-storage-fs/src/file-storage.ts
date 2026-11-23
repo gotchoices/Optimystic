@@ -17,16 +17,17 @@ export type FileRawStorageOptions = WriteGroupOptions & FileWriteLogOptions;
  * (`new FileRawStorage(basePath, options?)`) is synchronous: the lock is taken and the log replayed
  * on the first operation.
  *
- * `listBlockIds`/`getApproximateBytesUsed`/`getStoreIdentity`/`close` are re-declared here as
- * always-present (the fs backend always implements the first three, so the driver and kernel always
- * wire them, and the driver always has a `close`) — the base declares them optional, but every fs
- * consumer relies on them. `close()` flushes what is still held, releases this store's reference to
+ * `listBlockIds`/`getApproximateBytesUsed`/`getApproximateBytesFree`/`getStoreIdentity`/`close` are
+ * re-declared here as always-present (the fs backend always implements the first four, so the driver
+ * and kernel always wire them, and the driver always has a `close`) — the base declares them
+ * optional, but every fs consumer relies on them. `close()` flushes what is still held, releases this store's reference to
  * the directory's shared log, and — for the last store over the directory — checkpoints the log,
  * closes it and removes the lock.
  */
 export class FileRawStorage extends KvRawStorage {
 	declare listBlockIds: () => AsyncIterable<BlockId>;
 	declare getApproximateBytesUsed: () => Promise<number>;
+	declare getApproximateBytesFree: () => Promise<number>;
 	declare getStoreIdentity: () => StoreIdentity;
 	declare close: () => Promise<void>;
 

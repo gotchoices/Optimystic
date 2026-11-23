@@ -174,6 +174,10 @@ export class LevelDBJournalStore implements JournalStore<string> {
 	// db, replace with the kernel's incremental write-path counter (see the seam NOTE in
 	// kv-raw-storage.ts's saveMetadata). The piece range is measured from its size keys, 4 bytes per
 	// piece, so blob bytes never pass through the binding here.
+	// NOTE: no `approximateBytesFree`. This package is handed an already-open `LevelDBLike` handle, not
+	// a path, and the binding exposes no free-space call, so there is nothing honest to answer. Omitted
+	// entirely rather than stubbed, under `BatchBackend.approximateBytesFree`'s rule: a stub answering 0
+	// would read as "full". A host that knows the device's figure supplies it to the node itself.
 	async approximateBytesUsed(): Promise<number> {
 		try {
 			const pieces = pieceRange();

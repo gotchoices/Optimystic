@@ -1,4 +1,4 @@
-import { assertBlockStoreCountsPieces, type OpenNodeStorage } from '@optimystic/db-p2p';
+import { assertOneMeasuredLocation, type OpenNodeStorage } from '@optimystic/db-p2p';
 import type { LevelDBLike } from './leveldb-like.js';
 import { LevelDBRawStorage, type LevelDBRawStorageOptions } from './leveldb-storage.js';
 import { LevelDBKVStore, type LevelDBKVStoreOptions } from './leveldb-kv-store.js';
@@ -33,7 +33,7 @@ export function levelDbNodeStorage(db: LevelDBLike, options: LevelDBNodeStorageO
 	// The default prefix, named by leaving it out, with the options behind it.
 	const kv = new LevelDBKVStore(db, undefined, options);
 	const pieces = new LevelDBPieceStore(db);
-	assertBlockStoreCountsPieces(blocks, pieces, 'this LevelDB handle');
+	assertOneMeasuredLocation({ blocks, kv, pieces }, 'this LevelDB handle');
 	return {
 		blocks,
 		kv,

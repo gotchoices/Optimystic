@@ -1,6 +1,7 @@
-import { WriteGroup, type CommittedBatch, type FlushOptions, type IKVStore, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
+import { WriteGroup, identityForHandle, type CommittedBatch, type FlushOptions, type IKVStore, type StoreIdentity, type WriteGroupEntry, type WriteGroupOptions } from '@optimystic/db-p2p';
 import type { OptimysticWebDBHandle } from './db.js';
 import { resolveStrictDurability, transactionDurability, type IndexedDBDurabilityOptions } from './durability.js';
+import { IDB_HANDLE_SCHEME } from './indexeddb-storage.js';
 
 /** The write group's options (`idleFlushMs`, `maxUnsyncedBytes`, the test-only `setTimer`), and whether to ask for strict transactions. */
 export type IndexedDBKVStoreOptions = WriteGroupOptions & IndexedDBDurabilityOptions;
@@ -31,6 +32,7 @@ const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
 export class IndexedDBKVStore implements IKVStore {
 	private readonly group: WriteGroup<string>;
 	private readonly strict: boolean;
+	private readonly identity: StoreIdentity;
 
 	constructor(
 		private readonly db: OptimysticWebDBHandle,
@@ -38,11 +40,17 @@ export class IndexedDBKVStore implements IKVStore {
 		options: IndexedDBKVStoreOptions = {},
 	) {
 		this.strict = resolveStrictDurability(options);
+		this.identity = identityForHandle(IDB_HANDLE_SCHEME, db);
 		this.group = new WriteGroup<string>(key => key, {
 			commit: entries => this.commit(entries),
 			// Every commit is as durable as this store can make it when it resolves, so nothing is ever owed a sync.
 			sync: () => Promise.resolve(),
 		}, options);
+	}
+
+	/** The identity `IndexedDBJournalStore` reports over this handle, so `assertOneMeasuredLocation` sees one location for all three of a node's stores — the origin whose estimate the block store reports. `IKVStore.storeIdentity`'s contract. */
+	storeIdentity(): StoreIdentity {
+		return this.identity;
 	}
 
 	async get(key: string): Promise<string | undefined> {
