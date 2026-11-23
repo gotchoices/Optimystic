@@ -499,9 +499,17 @@ function createRootGroupSnapshots(deps: {
 		},
 		live(coord: RingCoord): Promise<RootGroupSnapshot> {
 			const key = bytesToB64url(coord);
+			// NOTE: this is as fresh as the shared in-flight read, not as fresh as this call — a read another
+			// mode started milliseconds earlier is handed back rather than a new one issued. So on a node that
+			// also serves this coord (whose engine refreshes on every gossip round) a caller can be answered
+			// from ring state read just before the event it is reacting to. The window is one `membersAt` out
+			// of a gossip interval, and losing it costs the same one watch tick the admitting-member residual
+			// already bounds; if a caller ever needs a read strictly its own, give it one that skips `read`.
 			return read(coord, key).catch((err: unknown) => {
 				// A failed fresh read must not leave this caller worse off than `ensure` would have: fall back to
-				// whatever is held, and only propagate when there is nothing to fall back to.
+				// whatever is held, and only propagate when there is nothing to fall back to. Handing back a
+				// stale list is survivable for this caller in particular — a member the group has since dropped
+				// answers `unwilling_member` naming the group, which the walk's own member retry then dials.
 				const current = held.get(key);
 				if (current === undefined) {
 					throw err;

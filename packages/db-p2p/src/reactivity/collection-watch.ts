@@ -758,8 +758,8 @@ export class ReactivityCollectionWatch {
 	 * One attempt per detection — a re-registration that fails, or that lands on the same wrong members again,
 	 * is left to the next reading, exactly as a failed first attach is left to the next tick. The attempt is a
 	 * walk whose root step reads the placement rule live, so it dials exactly what this check compared against;
-	 * landing on the same members again means the admitting member's own view is the stale one (see the NOTE at
-	 * the comparison), which clears within a gossip interval and is then repaired by the next reading.
+	 * landing on the same members again points first at the admitting member's own view being the stale one (see
+	 * the NOTE at the comparison), which clears within a gossip interval and is then repaired by the next reading.
 	 */
 	private async verifyRootGroup(sub: Subscription, confirm: boolean): Promise<void> {
 		const readMembers = this.options.rootGroupMembers;
