@@ -3,7 +3,7 @@ import { Command, InvalidArgumentError } from 'commander';
 import { multiaddr } from '@multiformats/multiaddr';
 import debug from 'debug';
 import { getNetworkManager, createLibp2pNode, memoryNodeStorage, RepoClient, stateHoldingsOnReads, ArachnodeFretAdapter, type OpenNodeStorage } from '@optimystic/db-p2p';
-import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
+import { fileNodeStorage } from '@optimystic/db-p2p-storage-fs';
 import { Diary, NetworkTransactor, BTree, registerDebugModule, type ITransactor, type BlockGets, type GetBlockResults, type ActionBlocks, type BlockActionStatus, type PendRequest, type PendResult, type CommitRequest, type CommitResult } from '@optimystic/db-core';
 import * as readline from 'readline';
 import * as path from 'path';
@@ -51,38 +51,16 @@ interface NetworkSession {
 
 /**
  * All of the node's storage — the blocks, the node-local records that must survive a restart (the
- * under-replication ledger, the blob records) and the blob pieces — opened as one value, closed by
- * this process because the node closes no store it was handed. File storage puts all three over one
- * base path, where they share one write-ahead log and one lock: FileRawStorage.listBlockIds yields
- * only directories that hold a meta.json, so the ledger's `under-replicated/` directory is never read
- * as a block, nor is `optimystic-pieces/`. `memoryNodeStorage()` is passed explicitly for the memory
- * option — a peer asked for memory storage means it, so the node's own warning about losing
- * everything across a restart would only be noise.
+ * under-replication ledger, the blob records) and the blob pieces — opened as one value by the
+ * storage package, and closed by this process because the node closes no store it was handed: after
+ * `node.stop()`, and also when `createLibp2pNode` fails. `fileNodeStorage` puts all three over one
+ * base path, where they share one write-ahead log and one lock, and its close checkpoints that log
+ * and removes the lock. `memoryNodeStorage()` is passed explicitly for the memory option — a peer
+ * asked for memory storage means it, so the node's own warning about losing everything across a
+ * restart would only be noise.
  */
 function openStores(options: { storage?: 'memory' | 'file'; storagePath?: string }): OpenNodeStorage {
-	if (options.storage !== 'file') {
-		return memoryNodeStorage();
-	}
-	const blocks = new FileRawStorage(options.storagePath!);
-	const kv = new FileKVStore(options.storagePath!);
-	const pieces = new FilePieceStore(options.storagePath!);
-	return {
-		blocks,
-		kv,
-		pieces,
-		/** Checkpoints the shared write-ahead log and removes the directory's lock. */
-		close: async () => {
-			try {
-				await pieces.close();
-			} finally {
-				try {
-					await kv.close();
-				} finally {
-					await blocks.close();
-				}
-			}
-		},
-	};
+	return options.storage === 'file' ? fileNodeStorage(options.storagePath!) : memoryNodeStorage();
 }
 
 class PeerSession {

@@ -1,8 +1,10 @@
 import assert from 'node:assert';
+import { promises as fs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { FileRawStorage, FileBatchBackend } from '../src/index.js';
+import { FileRawStorage, FileBatchBackend, fileNodeStorage } from '../src/index.js';
 import {
+	blockStoreCountsPieces,
 	CachedRawStorage, CachedStoreDriver, KvRawStorage, SharedCachePool, WriteGroupDriver, withReadCache,
 } from '@optimystic/db-p2p';
 
@@ -163,5 +165,72 @@ describe('FileRawStorage store identity', () => {
 				/never converge/
 			);
 		});
+	});
+});
+
+/** Resolves whether the path is there, without discriminating a failure that is not ENOENT. */
+async function exists(file: string): Promise<boolean> {
+	return fs.access(file).then(() => true, () => false);
+}
+
+// `fileNodeStorage` opens all three of a node's stores over ONE directory. Unlike the identity cases
+// above, these write: each gets its own temp directory, and every storage opened is closed, since the
+// last close is what checkpoints the directory's log and removes its lock.
+describe('fileNodeStorage', () => {
+	let dir: string;
+
+	beforeEach(async () => {
+		dir = await fs.mkdtemp(path.join(os.tmpdir(), 'optimystic-fs-node-storage-'));
+	});
+
+	afterEach(async () => {
+		await fs.rm(dir, { recursive: true, force: true });
+	});
+
+	// The claim `docs/blobs.md` §The local store makes about a Node host, and the one the factory's own
+	// assertion protects: one location, so the block store's byte count already measures the pieces and
+	// the monitor does not add them again.
+	it('gives the block store and the piece store one identity, so pieces are counted once', async () => {
+		const storage = fileNodeStorage(dir);
+		try {
+			assert.ok(blockStoreCountsPieces(storage.blocks, storage.pieces));
+		} finally {
+			await storage.close();
+		}
+	});
+
+	// The reference counting: `store.lock` is present exactly while some holder has the directory, so
+	// it reports what the stores themselves would only hint at.
+	it('opens one set of stores per directory, released by the last holder', async () => {
+		const lock = path.join(dir, 'store.lock');
+		const first = fileNodeStorage(dir);
+		const second = fileNodeStorage(dir);
+		assert.strictEqual(second.blocks, first.blocks);
+		assert.strictEqual(second.kv, first.kv);
+		assert.strictEqual(second.pieces, first.pieces);
+
+		await first.kv.set('hlc/high-water', '7');
+		// A read the write group's overlay cannot answer opens the directory, which is what takes the lock.
+		assert.strictEqual(await first.kv.get('no-such-key'), undefined);
+		assert.ok(await exists(lock), 'reading the directory holds it');
+
+		await first.close();
+		assert.ok(await exists(lock), 'one holder closing must not release the stores');
+		assert.strictEqual(await second.kv.get('hlc/high-water'), '7');
+
+		// Idempotent per holder: a host that closes one holder twice must not release the other's stores.
+		await first.close();
+		assert.ok(await exists(lock), 'closing one holder twice must not release the stores');
+
+		await second.close();
+		assert.ok(!(await exists(lock)), 'the last holder closing releases the directory');
+
+		const third = fileNodeStorage(dir);
+		try {
+			assert.notStrictEqual(third.blocks, first.blocks, 'a call after the last close opens a fresh set');
+			assert.strictEqual(await third.kv.get('hlc/high-water'), '7', 'which reads what the released set flushed');
+		} finally {
+			await third.close();
+		}
 	});
 });

@@ -52,26 +52,30 @@ import { createLibp2pNode } from '@optimystic/db-p2p/rn';
 import { createLibp2pNode } from '@optimystic/db-p2p/rn';
 import {
   openOptimysticNSDb,
-  SqliteRawStorage,
-  SqliteKVStore,
-  SqlitePieceStore,
+  sqliteNodeStorage,
   loadOrCreateNSPeerKey,
 } from '@optimystic/db-p2p-storage-ns';
 
-const db = await openOptimysticNSDb();           // single shared handle
-const rawStorage = new SqliteRawStorage(db);     // → IRawStorage
-const kvStore = new SqliteKVStore(db);           // → IKVStore (txn recovery)
-const pieceStorage = new SqlitePieceStore(db);   // → IPieceStore (blob pieces)
+const db = await openOptimysticNSDb();      // single shared handle
+const storage = sqliteNodeStorage(db);      // all three of the node's stores over it
 const privateKey = await loadOrCreateNSPeerKey(db);
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
-  // A node takes all of its storage as one value, so none of the three can be left out.
-  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
+  storage,
 });
 ```
+
+**The location is one open database.** `sqliteNodeStorage` builds the block store
+(`SqliteRawStorage`), the key-value store (`SqliteKVStore`) and the piece store
+(`SqlitePieceStore`) over the handle you pass, so the three report one store
+identity and the block store's byte count — the whole database file — already
+measures the `pieces` table. That is what makes the node count its blob pieces
+once rather than reporting itself fuller than it is; the factory asserts it
+before it returns. The three classes stay exported for a caller that needs one on
+its own.
 
 The same handle is shared by every consumer. The plugin runs every call on
 one native thread per database, in the order made, which orders single calls
@@ -86,18 +90,22 @@ Reads (`get`/`all`) stay off the mutex: a read waits for the statements queued
 ahead of it, not for a whole transaction body, so it can land between a body's
 statements and see its uncommitted rows.
 
-Close the storage before the handle, and the handle last:
+**The handle stays yours.** The node closes no store it was handed, so close the
+storage after `stop()`; `storage.close()` never closes the handle, which you may
+be sharing with `loadOrCreateNSPeerKey` or with Quereus, so close that last:
 
 ```ts
-await rawStorage.close();   // flushes what it still holds, syncs it, disarms its timers
-await kvStore.flush();
-await pieceStorage.flush(); // the piece store has nothing to close
+await libp2p.stop();
+await storage.close();   // flushes the pieces and the kv rows, then closes the block store
 await db.close();
 ```
 
-`SqliteRawStorage.close()` does not close the shared handle. A write the
-storage still holds when the handle is closed under it is lost, and a timer it
-still has armed would fire on a closed connection.
+`storage.close()` flushes the piece store and the key-value store — both write by
+autocommit statement and have no `close`, so a flush is the whole of what closing
+either would mean — and then closes the block store, which flushes what its write
+group still holds, syncs it and disarms its timers. A write the block store still
+holds when the handle is closed under it is lost, and a timer it still has armed
+would fire on a closed connection.
 
 ## Persistence model
 

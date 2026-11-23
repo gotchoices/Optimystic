@@ -33,9 +33,7 @@ which keeps the package's unit tests runnable under plain Node (the tests use
 import { createLibp2pNode } from '@optimystic/db-p2p/rn';
 import {
   openOptimysticRNDb,
-  LevelDBRawStorage,
-  LevelDBKVStore,
-  LevelDBPieceStore,
+  levelDbNodeStorage,
   loadOrCreateRNPeerKey,
 } from '@optimystic/db-p2p-storage-rn';
 import { LevelDB, LevelDBWriteBatch } from 'rn-leveldb';
@@ -45,46 +43,55 @@ const db = openOptimysticRNDb({
     new LevelDB(name, createIfMissing, errorIfExists),
   WriteBatch: LevelDBWriteBatch,
 });
-const rawStorage = new LevelDBRawStorage(db);   // → IRawStorage
-const kvStore = new LevelDBKVStore(db);         // → IKVStore (txn recovery)
-const pieceStorage = new LevelDBPieceStore(db); // → IPieceStore (blob pieces)
+const storage = levelDbNodeStorage(db);   // all three of the node's stores over it
 const privateKey = await loadOrCreateRNPeerKey(db);
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
-  // A node takes all of its storage as one value, so none of the three can be left out.
-  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
+  storage,
 });
 ```
 
 Use the Node-free `/rn` entry point of `@optimystic/db-p2p` so the Node-only
 TCP transport doesn't get bundled into the React Native app.
 
-The same handle is shared by all four consumers. Close the storage and the
-key-value store before the handle, and the handle last; the piece store holds
-nothing in memory and has no `close`:
+**The location is one open database.** `levelDbNodeStorage` builds the block store
+(`LevelDBRawStorage`), the key-value store (`LevelDBKVStore`) and the piece store
+(`LevelDBPieceStore`) over the handle you pass, one ordered keyspace partitioned
+by a leading tag byte. The three therefore report one store identity, and the
+block store's byte count, which covers the whole database, already measures the
+piece range: that is what makes the node count its blob pieces once rather than
+reporting itself fuller than it is, and the factory asserts it before it returns.
+The three classes stay exported for a caller that needs one on its own.
+
+**The handle stays yours.** The node closes no store it was handed, so close the
+storage after `stop()`; `storage.close()` never closes the handle, which you may
+be sharing with `loadOrCreateRNPeerKey`, so close that last:
 
 ```ts
-await rawStorage.close();   // releases its read cache, applies what it still holds, disarms its timers
-await kvStore.close();      // commits what it still holds, disarms its timer
+await libp2p.stop();
+await storage.close();   // commits what the kv store and the block store still hold
 await db.close();
 ```
 
-Neither `close()` closes the shared handle. A write a store still holds when the
-handle is closed under it is lost, and a timer it still has armed would fire on
-a closed handle.
+`storage.close()` closes the two stores that hold writes in memory: the key-value
+store commits what it still holds and disarms its timer, and the block store does
+the same after dropping its read cache and releasing the cache pool's claim on the
+handle. There is nothing to call on the piece store: each put is written as it is
+made, so it has neither a `close` nor a flush with work to do. A write a store
+still holds when the handle is closed under it is lost, and a timer it still has
+armed would fire on a closed handle.
 
-Open **one** `LevelDBRawStorage` per handle. Its read cache claims the handle
-in its cache pool, so constructing a second one over the same handle while the
+Call `levelDbNodeStorage` **once** per handle. The block store's read cache claims
+the handle in its cache pool, so a second call over the same handle while the
 first is open throws (`two caches over one backing store never converge`). That
-refusal is new, but the shape was already wrong: two storages over one store
-each hold writes the other cannot see, which is what
+refusal is deliberate: two storages over one store each hold writes the other
+cannot see, which is what
 [storage.md §1. Every write to a store goes through `IRawStorage`](../db-p2p/docs/storage.md#1-every-write-to-a-store-goes-through-irawstorage)
-rules out. Close the first before opening another, including when a node over
-the handle stops and starts again in the same process: the node never closes a
-storage it was handed.
+rules out. Close the first before opening another, including when a node over the
+handle stops and starts again in the same process.
 
 ## Persistence semantics
 

@@ -33,41 +33,61 @@ yarn add @optimystic/db-p2p-storage-fs @optimystic/db-p2p @optimystic/db-core
 ## Usage
 
 ```ts
-import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
+import { fileNodeStorage } from '@optimystic/db-p2p-storage-fs';
 import { createLibp2pNode } from '@optimystic/db-p2p';
 
-const rawStorage   = new FileRawStorage('/var/lib/my-peer/data');
-const kvStore      = new FileKVStore('/var/lib/my-peer/data');
-const pieceStorage = new FilePieceStore('/var/lib/my-peer/data');
+// All three of the node's stores, over one directory.
+const storage = fileNodeStorage('/var/lib/my-peer/data');
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
-  // A node takes all of its storage as one value, so none of the three can be left out.
-  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
+  storage,
 });
 
 // … and on shutdown, after the node has stopped:
 await libp2p.stop();
-await pieceStorage.close();
-await kvStore.close();
-await rawStorage.close();
+await storage.close();
 ```
+
+**The location is one base path.** `fileNodeStorage` builds all three stores over
+it, so they share one write-ahead log, one lock and one checkpoint, and the block
+store's byte count already measures the piece directory inside it. The three
+therefore report one store identity, which is what makes the node count its blob
+pieces once rather than reporting itself fuller than it is. The factory asserts
+that before it returns.
 
 The node keeps blob pieces in the `pieces` store and their records in the `kv`
 store, and serves both through `libp2p.blobs` (`docs/blobs.md` in the repository
-root). The three go in as one `storage` value, so there is no field to forget:
+root). All three go in as one `storage` value, so there is no field to forget:
 without the option at all the node keeps everything in memory and logs one
 `node-wiring` warning saying so.
 
-The node never closes a store it was handed, so close each after `stop()`.
-Closing flushes what the store still holds and, for the last store over the
-directory, checkpoints the write-ahead log and removes the lock. A store that is
+**The host closes it.** The node closes no store it was handed, so call
+`storage.close()` after `stop()`. It closes the piece store, then the key-value
+store, then the block store — last, because the last store over the directory is
+what checkpoints the write-ahead log and removes the lock. A storage that is
 never closed loses nothing it flushed, but leaves a log for the next open to
 replay and a lock the next open replaces as stale.
 
-Both constructors take a `basePath` — the directory under which all data is
-stored — and an optional options object:
+**One directory means one set of stores in this process.** Two
+`fileNodeStorage` calls over one directory hand back the same three stores, and
+count the callers: the stores are closed when the last caller closes, and a call
+after that opens them afresh. Each returned value's `close` releases its own
+caller once, so closing twice does not release another's stores; a `close` by a
+caller that is not the last is a no-op for the stores, so a caller that closes to
+force a checkpoint and then expects a read from disk gets neither while another
+is alive. This is why the factory exists: for files the location is named by a
+path rather than held as an object, and a second `FilePieceStore` over one
+directory is not supported (below). Code that genuinely needs two independent
+sets over one directory — a test reading one set's flushed writes from a cold
+start — constructs `FileRawStorage`, `FileKVStore` and `FilePieceStore` itself,
+which is what the three exported classes are for.
+
+`fileNodeStorage` takes a `basePath` — the directory under which all data is
+stored — and an optional options object, which it passes to each store that
+accepts it (`FilePieceStore` takes none). Each store's own constructor takes the
+same two:
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -80,7 +100,7 @@ first-opened store's; a store opened beside it with different values logs them
 on the `optimystic:db-p2p-storage-fs:write-log` channel and shares the open
 log's.
 
-The two stores can share the same `basePath` in practice because their
+The block store and the key-value store share one `basePath` because their
 top-level names do not collide: block data lives under `<blockId>/`
 subdirectories, while KV data lives under directories named by the first
 segment of each key (a `/`-separated key becomes nested subdirectories — e.g.
@@ -93,7 +113,7 @@ fixed literal segment (`under-replicated/`, `coordinator/`, `participant/`,
 hands it the same store (`optimystic-offline/`) — db-p2p's `NODE_KV_NAMESPACES` —
 and `FileRawStorage.listBlockIds` skips those root directories, so a KV key is
 never mistaken for a block. KV bytes do count
-toward `FileRawStorage.getApproximateBytesUsed` when the path is shared. Over
+toward `FileRawStorage.getApproximateBytesUsed`. Over
 one `basePath` the two share one log, one lock and one checkpoint.
 
 Without a `storage` option at all, the node falls back to in-memory stores for
@@ -147,7 +167,8 @@ piece is whole or absent. `flush()` syncs the directories whose entries changed
 (skipped on Windows, as for the log's checkpoint), after which a put survives a
 power cut. A put of a piece already stored writes nothing. The store takes no
 lock and holds no handle between calls; two stores over one directory are not
-supported, since the second's open deletes the first's temps.
+supported, since the second's open deletes the first's temps — which is what
+`fileNodeStorage`'s one-set-per-directory rule makes unreachable for a host.
 
 It reports the same store identity as a `FileRawStorage` over the same
 `basePath`, whose byte count already includes the piece directory, so the

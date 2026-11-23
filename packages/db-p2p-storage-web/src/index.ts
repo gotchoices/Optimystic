@@ -4,3 +4,4 @@ export * from './indexeddb-storage.js';
 export * from './indexeddb-kv-store.js';
 export * from './indexeddb-piece-store.js';
 export * from './identity.js';
+export * from './node-storage.js';

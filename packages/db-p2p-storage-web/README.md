@@ -39,45 +39,49 @@ import { createLibp2pNode } from '@optimystic/db-p2p/rn';
 import { createLibp2pNode } from '@optimystic/db-p2p/rn';
 import {
   openOptimysticWebDb,
-  IndexedDBRawStorage,
-  IndexedDBKVStore,
-  IndexedDBPieceStore,
+  indexedDbNodeStorage,
   loadOrCreateBrowserPeerKey,
 } from '@optimystic/db-p2p-storage-web';
 
-const db = await openOptimysticWebDb();             // single shared handle
-const rawStorage = new IndexedDBRawStorage(db);     // → IRawStorage
-const kvStore = new IndexedDBKVStore(db);           // → IKVStore (txn recovery)
-const pieceStorage = new IndexedDBPieceStore(db);   // → IPieceStore (blob pieces)
+const db = await openOptimysticWebDb();        // single shared handle
+const storage = indexedDbNodeStorage(db);      // all three of the node's stores over it
 const privateKey = await loadOrCreateBrowserPeerKey(db);
 
 const libp2p = await createLibp2pNode({
   bootstrapNodes: [/* … */],
   networkName: 'my-network',
   privateKey,
-  // A node takes all of its storage as one value, so none of the three can be left out.
-  storage: { blocks: rawStorage, kv: kvStore, pieces: pieceStorage },
+  storage,
 });
 ```
 
-The same `IDBPDatabase` handle is shared by all four consumers — IndexedDB
-permits concurrent transactions across disjoint object stores, so the storage
-layer parallelises naturally. Passing the piece store the block store's handle
-is what makes the node count the pieces' bytes once: both report one store
-identity, and the block store's figure is the origin's estimate, which already
-includes them.
+**The location is one open database.** `indexedDbNodeStorage` builds the block
+store (`IndexedDBRawStorage`), the key-value store (`IndexedDBKVStore`) and the
+piece store (`IndexedDBPieceStore`) over the `IDBPDatabase` handle you pass —
+IndexedDB permits concurrent transactions across disjoint object stores, so the
+storage layer parallelises naturally. The three therefore report one store
+identity, and the block store's byte count, the origin's estimate, already
+includes the pieces: that is what makes the node count its blob pieces once
+rather than reporting itself fuller than it is, and the factory asserts it before
+it returns. The three classes stay exported for a caller that needs one on its
+own.
 
-Close the storage and the key-value store before the handle, and the handle last:
+**The handle stays yours.** The node closes no store it was handed, so close the
+storage after `stop()`; `storage.close()` never closes the handle, which you may
+be sharing with `loadOrCreateBrowserPeerKey`, so close that last:
 
 ```ts
-await rawStorage.close();   // applies what it still holds, disarms its timers
-await kvStore.close();      // commits what it still holds, disarms its timer
-db.close();                 // the piece store has nothing to close or flush
+await libp2p.stop();
+await storage.close();   // commits what the kv store and the block store still hold
+db.close();
 ```
 
-None of the `close()` calls closes the shared handle. A write a store still holds when the
-handle is closed under it is lost, and a timer it still has armed would fire on
-a closed handle.
+`storage.close()` closes the two stores that hold writes in memory, each of which
+commits what it still holds and disarms its timers. There is nothing to call on
+the piece store: every put is its own transaction, durable once it resolves, so it
+has neither a `close` nor a flush with work to do. A write a store still holds
+when the handle is closed under it is lost, and a timer it still has armed would
+fire on a closed handle.
 
 ## Persistence semantics
 

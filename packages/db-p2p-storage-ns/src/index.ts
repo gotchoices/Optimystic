@@ -7,3 +7,5 @@ export { syncSqliteDb } from './sqlite-sync.js';
 export { SqliteKVStore } from './sqlite-kv-store.js';
 export { SqlitePieceStore } from './sqlite-piece-store.js';
 export { loadOrCreateNSPeerKey, DEFAULT_PEER_KEY_NAME } from './identity.js';
+export { sqliteNodeStorage } from './node-storage.js';
+export type { SqliteNodeStorageOptions } from './node-storage.js';
