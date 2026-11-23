@@ -1,5 +1,8 @@
 import { expect } from 'chai';
 import { createLibp2pNode } from '../src/libp2p-node.js';
+import type { ServingNodeOptions } from '../src/libp2p-node-base.js';
+import type { IRawStorage } from '../src/storage/i-raw-storage.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import { KvRawStorage } from '../src/storage/kv-raw-storage.js';
 import { MemoryStoreDriver } from '../src/storage/memory-store-driver.js';
 import { MemoryRawStorage } from '../src/storage/memory-storage.js';
@@ -27,8 +30,14 @@ describe('libp2p node read-cache wiring (resolveStorage / stop release)', functi
 
 	const labels = (): string[] => defaultCachePool().stats().stores.map(s => s.label ?? '');
 
-	async function spawn(networkName: string, storage?: unknown) {
-		return await createLibp2pNode({
+	/**
+	 * `blocks` is the only part of the node's storage this spec is about — the seam under test wraps
+	 * that store and nothing else — so the records and pieces are always fresh memory stores. NOT
+	 * typed `as any`: the whole point of a node taking one `NodeStorage` is that a wrong storage shape
+	 * does not compile, and a cast here would hide exactly that.
+	 */
+	async function spawn(networkName: string, blocks: IRawStorage) {
+		const options: ServingNodeOptions = {
 			port: 0,
 			networkName,
 			bootstrapNodes: [],
@@ -36,8 +45,9 @@ describe('libp2p node read-cache wiring (resolveStorage / stop release)', functi
 			clusterSize: 1,
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false },
-			...(storage === undefined ? {} : { storage }),
-		} as any);
+			storage: { ...memoryNodeStorage(), blocks },
+		};
+		return await createLibp2pNode(options);
 	}
 
 	it('wraps a host-supplied persistent storage and retires the cache when the node stops', async () => {

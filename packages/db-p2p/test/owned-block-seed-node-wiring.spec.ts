@@ -2,7 +2,8 @@ import { expect } from 'chai';
 import type { Libp2p } from 'libp2p';
 import type { BlockId, ActionId, IBlock, BlockHeader, Transforms, IRepo } from '@optimystic/db-core';
 import { createLibp2pNode } from '../src/libp2p-node.js';
-import { MemoryRawStorage } from '../src/storage/memory-storage.js';
+import type { ServingNodeOptions } from '../src/libp2p-node-base.js';
+import { memoryNodeStorage } from '../src/storage/node-storage.js';
 import type { BlockMetadata } from '../src/storage/struct.js';
 
 /**
@@ -23,8 +24,9 @@ import type { BlockMetadata } from '../src/storage/struct.js';
  *
  * The restart is faithful, not simulated: `resolveStorage` returns a supplied `MemoryRawStorage`
  * verbatim (`withReadCache` wraps only non-memory storage) and nothing on the node's stop path
- * closes or clears it, so handing ONE `MemoryRawStorage` to two sequential `createLibp2pNode` calls
- * really does bring the second node up over the first node's durable state.
+ * closes or clears it, so handing ONE `memoryNodeStorage()` to two sequential `createLibp2pNode`
+ * calls really does bring the second node up over the first node's durable state — all of it, since
+ * the node takes its blocks, records and pieces as that one value.
  *
  * Deliberately NOT staged here (each is covered where the mechanism actually lives):
  * - **Both monitors disabled → no scan.** The gate holds, but with no monitor wired there is no
@@ -63,8 +65,10 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 		expect(commit.success, `commit(${blockId})`).to.equal(true);
 	}
 
-	async function spawn(networkName: string, overrides: Record<string, unknown> = {}): Promise<Libp2p> {
-		return await createLibp2pNode({
+	// NOT typed `as any`: a node takes one `NodeStorage`, and the value of that is that a wrong
+	// storage shape fails to compile — which a cast here would hide.
+	async function spawn(networkName: string, overrides: Partial<ServingNodeOptions> = {}): Promise<Libp2p> {
+		const options: ServingNodeOptions = {
 			port: 0,
 			networkName,
 			bootstrapNodes: [],
@@ -73,7 +77,8 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 			clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 },
 			arachnode: { enableRingZulu: false },
 			...overrides,
-		} as any);
+		};
+		return await createLibp2pNode(options);
 	}
 
 	/**
@@ -107,9 +112,9 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 	}
 
 	it('a restarted node seeds its owned-block set from storage the previous run left behind', async () => {
-		// ONE storage instance across two node lifetimes = a real restart. Each `it` builds its own so
-		// ids cannot leak between arms and break set equality.
-		const shared = new MemoryRawStorage();
+		// ONE storage across two node lifetimes = a real restart. Each `it` builds its own so ids
+		// cannot leak between arms and break set equality.
+		const shared = memoryNodeStorage();
 		const networkName = 'seed-restart';
 		const committed = ['seed-restart-b1', 'seed-restart-b2', 'seed-restart-b3'];
 		const pendOnlyId = 'seed-restart-pending';
@@ -169,12 +174,12 @@ describe('owned-block startup seed / node wiring (real libp2p, restart over dura
 		// Storage is pre-populated DIRECTLY here (no producer node): arm 1 already established that a real
 		// commit writes metadata `listBlockIds` enumerates, so this arm only needs *some* durable metadata
 		// to prove the gate.
-		const storage = new MemoryRawStorage();
+		const storage = memoryNodeStorage();
 		const ids = ['seed-gate-b1', 'seed-gate-b2'];
 		let rev = 1;
 		for (const id of ids) {
 			const meta: BlockMetadata = { ranges: [[1, rev]], latest: { rev, actionId: `tx:gate${rev}` as ActionId } };
-			await storage.saveMetadata(id as BlockId, meta);
+			await storage.blocks.saveMetadata(id as BlockId, meta);
 			rev++;
 		}
 

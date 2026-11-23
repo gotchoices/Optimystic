@@ -13,7 +13,7 @@
  *   TRANSACTOR=local node test/repro-issue8.mjs # A/B against the local transactor
  */
 import { Database } from '@quereus/quereus';
-import { createLibp2pNode, KvRawStorage, MemoryStoreDriver, RepoClient, defaultCachePool } from '@optimystic/db-p2p';
+import { createLibp2pNode, KvRawStorage, MemoryStoreDriver, RepoClient, defaultCachePool, memoryNodeStorage } from '@optimystic/db-p2p';
 import { NetworkTransactor } from '@optimystic/db-core';
 import register from '../dist/plugin.js';
 
@@ -122,7 +122,9 @@ async function main() {
 			arachnode: { enableRingZulu: true },
 			// KvRawStorage over a non-memory driver == "host-supplied persistent storage",
 			// so the node attaches its read cache - the cache RN's LevelDBRawStorage builds in.
-			storage: () => new KvRawStorage(driver),
+			// Only `blocks` is the counted store; the records and pieces are memory, as this
+			// harness counts the driver seam the block store sits on.
+			storage: { ...memoryNodeStorage(), blocks: new KvRawStorage(driver) },
 		});
 	}
 

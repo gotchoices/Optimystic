@@ -426,11 +426,18 @@ disagree about the same key's cohort.
 
 ```typescript
 import { createLibp2pNode } from '@optimystic/db-p2p';
-import { FileRawStorage } from '@optimystic/db-p2p-storage-fs';
+import { FileRawStorage, FileKVStore, FilePieceStore } from '@optimystic/db-p2p-storage-fs';
 
-// In-memory when omitted; a raw-storage backend makes it durable. Options such as
+// A node takes ALL of its storage as one value (`NodeStorage`): the blocks, the node-local records
+// and the blob pieces. None of the three can be left out — omitting the whole option is the only
+// way to get memory storage, and the node says so in one `node-wiring` WARN: line. The filesystem
+// backend puts all three over one base path; options such as
 // { idleFlushMs, checkpointBytes, checkpointIdleMs } are in that package's README.
-const storage = new FileRawStorage('/var/lib/optimystic');
+const storage = {
+  blocks: new FileRawStorage('/var/lib/optimystic'),
+  kv: new FileKVStore('/var/lib/optimystic'),
+  pieces: new FilePieceStore('/var/lib/optimystic'),
+};
 
 // Create (and start) a libp2p node. The repo and cluster protocol services are registered by the
 // factory itself — there is no `services` option to pass them in.
@@ -447,8 +454,10 @@ const keyNetwork = node.keyNetwork;            // Peer/coordinator discovery
 
 // ... use them, then:
 await node.stop();
-// The node never closes a store it was handed: closing it flushes, checkpoints and releases its lock
-await storage.close();
+// The node closes no store it was handed: closing flushes, checkpoints and releases the directory's lock
+await storage.pieces.close();
+await storage.kv.close();
+await storage.blocks.close();
 ```
 
 `createLibp2pNode` is all-or-nothing: the node is started early and then wired, so if any wiring step
@@ -486,8 +495,10 @@ const transactor = new NetworkTransactor({
 });
 ```
 
-Options that configure only storage (`storage`, `arachnode`, `rebalance` and the rest) are ignored on
-a client, with one log line naming them. With no serving machine reachable a write, or opening a
+Options that configure only the serving role (`arachnode`, `rebalance`, `storageDurability` and the
+rest) are ignored on a client, with one log line naming them. `storage` is not one of them: a client
+uses that value's `kv` and `pieces` — the HLC clock's high-water mark and the blobs its own host put
+— and leaves only its `blocks` untouched. With no serving machine reachable a write, or opening a
 collection, fails with a retryable `FindCoordinatorError`. What a client builds, what a write costs
 and its limits are in [docs/internals.md §Client nodes](../../docs/internals.md#client-nodes).
 

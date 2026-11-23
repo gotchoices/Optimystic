@@ -622,12 +622,13 @@ export class CollectionFactory {
     let nodeInfo = this.libp2pNodes.get(nodeKey);
 
     if (!nodeInfo) {
-      // NOTE: no `pieceStorage` and no `kvStore`, so the plugin's own node keeps blob pieces and
-      // blob records in memory and loses them on restart — every pin with them, after which the
-      // next sweep deletes the pieces (the node logs its own `node-wiring` warning for each). A
+      // NOTE: no `storage`, so the plugin's own node keeps ALL of its storage in memory — blocks,
+      // blob pieces and blob records — and loses them on restart, every pin with them, after which
+      // the next sweep deletes the pieces (the node logs one `node-wiring` WARN: line saying so). A
       // host that needs them persistent THROUGH the plugin has no option for it today: thread
-      // `blobStorageFactory` into this call's `pieceStorage` and `kvStore` when one does. A host
-      // that builds its own node and registers it with `registerLibp2pNode` already can.
+      // `blobStorageFactory`, and a block store with it, into a `NodeStorage` for this call's
+      // `storage` when one does — all three parts or none, since the option takes the whole value. A
+      // host that builds its own node and registers it with `registerLibp2pNode` already can.
       const node = await createLibp2pNode({
         port: options.libp2pOptions?.port ?? 0,
         networkName: options.libp2pOptions?.networkName ?? 'optimystic',

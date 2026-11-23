@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Database } from '@quereus/quereus';
 import { Collection, NetworkTransactor } from '@optimystic/db-core';
-import { createLibp2pNode } from '@optimystic/db-p2p';
+import { createLibp2pNode, memoryNodeStorage } from '@optimystic/db-p2p';
 import { FileKVStore, FileRawStorage } from '../../db-p2p-storage-fs/dist/src/index.js';
 import register from '../dist/plugin.js';
 
@@ -67,7 +67,11 @@ async function soloNode() {
 	const node = await createLibp2pNode({
 		port: 0, networkName: 'bench', bootstrapNodes: [], fretProfile: 'edge', clusterSize: 1,
 		clusterPolicy: { allowDownsize: true, sizeTolerance: 1.0 }, arachnode: { enableRingZulu: true },
-		...(process.env.STORAGE === 'file' ? { storage: () => new FileRawStorage(mkdtempSync(join(tmpdir(), 'oc-store-'))) } : {}),
+		// A node takes all of its storage as one value, so only `blocks` moves to a file here; the
+		// records and pieces stay in memory, which a bench that never restarts does not miss.
+		...(process.env.STORAGE === 'file'
+			? { storage: { ...memoryNodeStorage(), blocks: new FileRawStorage(mkdtempSync(join(tmpdir(), 'oc-store-'))) } }
+			: {}),
 	});
 	const transactor = new NetworkTransactor({
 		timeoutMs: 10_000, abortOrCancelTimeoutMs: 5_000, keyNetwork: node.keyNetwork, getRepo: () => node.coordinatedRepo,

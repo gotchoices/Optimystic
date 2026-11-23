@@ -1575,7 +1575,7 @@ export async function createLibp2pNodeBase(
 	// when other nodes share the cache — it is cleared and unregistered only when the last lease
 	// goes, so stopping one node never blinds the others. A skipped release leaks only cold
 	// entries the pool evicts under pressure; the point of the polite release is honest pool
-	// occupancy on a long-lived provider node. A client acquires no storage, so holds no lease.
+	// occupancy on a long-lived provider node. A client builds no serving store, so it never reaches this seam and holds no lease.
 	const lease = serving?.lease;
 	if (lease) {
 		const previousStop = node.stop.bind(node);
