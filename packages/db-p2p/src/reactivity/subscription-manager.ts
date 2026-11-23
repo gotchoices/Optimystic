@@ -345,6 +345,11 @@ export class ReactivitySubscriptionManager {
 	 * A second registration for the same topic displaces the first at the service (its renewals stop; no
 	 * tombstone is sent, the old record expires by TTL at the old root — see the `NOTE:` at `startRenewal` in
 	 * db-core's cohort-topic service). The payload's `tailIdAtAttach` is the tail at this registration.
+	 *
+	 * This is also the call for registering again at an **unchanged** root key, which {@link followTail}
+	 * deliberately will not do: the host's watch service calls it when the live registration's latched member set
+	 * is no longer the root group's, so the registration is re-placed by a fresh walk (`verifyRootGroup` in
+	 * `reactivity/collection-watch.ts`).
 	 */
 	async register(): Promise<RegistrationHandle> {
 		const appPayload = subscribeAppPayloadBytes({
@@ -378,7 +383,9 @@ export class ReactivitySubscriptionManager {
 	 *   nothing is sent and nothing re-registers; its cohort sits at `coord_d(P, topicId)`, which the rotation
 	 *   does not move, and a later renewal failover re-walks with the new root key.
 	 * - A registration already naming `tail` as its root key, at either tier → nothing (the host's tick calls
-	 *   this for every tail read, most of which find the tail unchanged).
+	 *   this for every tail read, most of which find the tail unchanged). This compares root *keys* and nothing
+	 *   else, which is right for the question it answers; a registration at the right coordinate held by the
+	 *   wrong member set is the host watch service's to notice and repair through {@link register}.
 	 *
 	 * The tail is recorded first, whatever the registration does: the data a resume or backfill asks for now
 	 * lives at the new root, and a notification announced there is not a rotation.

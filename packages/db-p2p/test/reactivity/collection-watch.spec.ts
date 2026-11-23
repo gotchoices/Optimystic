@@ -24,6 +24,7 @@ import {
 } from '../../src/reactivity/collection-watch.js';
 import { ReactivitySubscriberRegistry } from '../../src/reactivity/subscriber-registry.js';
 import { reactivityCollectionIdBytes, reactivityTailBytes } from '../../src/reactivity/topic-bytes.js';
+import { peerIdToBytes } from '../../src/cohort-topic/peer-codec.js';
 
 const COLLECTION = 'app/users';
 /** The collection's topic: the one key the registry routes under, whatever tail the log is on. */
@@ -34,8 +35,11 @@ const NEW_TAIL = 'tail-block-new' as BlockId;
 /** One `register` call the test settles by hand. */
 interface PendingRegistration {
 	readonly request: RegisterRequest;
-	/** Land the registration at tree tier `treeTier` (default 0, the root), under the request's root key. */
-	resolve(treeTier?: number): void;
+	/**
+	 * Land the registration at tree tier `treeTier` (default 0, the root), under the request's root key, with
+	 * `cohortMembers` as the admitting member's view of the cohort (member-id bytes; default none).
+	 */
+	resolve(treeTier?: number, cohortMembers?: Uint8Array[]): void;
 	reject(err: Error): void;
 }
 
@@ -51,7 +55,7 @@ class HeldRegistrationService implements CohortTopicService {
 		return new Promise<RegistrationHandle>((resolve, reject) => {
 			this.registrations.push({
 				request,
-				resolve: (treeTier = 0) => resolve({
+				resolve: (treeTier = 0, cohortMembers: Uint8Array[] = []) => resolve({
 					topicId: request.topicId,
 					tier: request.tier,
 					treeTier,
@@ -59,7 +63,7 @@ class HeldRegistrationService implements CohortTopicService {
 					primary: new Uint8Array(32),
 					backups: [],
 					cohortEpoch: new Uint8Array(32),
-					cohortMembers: [],
+					cohortMembers,
 					renewal: {},
 				} as unknown as RegistrationHandle),
 				reject,
@@ -145,7 +149,7 @@ function localFeed(): { notifier: Pick<IBlockChangeNotifier, 'onCollectionChange
 	};
 }
 
-type WatchExtras = Pick<ReactivityCollectionWatchOptions, 'localChanges' | 'verifyEveryTicks'>;
+type WatchExtras = Pick<ReactivityCollectionWatchOptions, 'localChanges' | 'verifyEveryTicks' | 'rootGroupMembers'>;
 
 /** A watch whose first registration (under the old tail) is in flight, with the service, registry, tick and tail under the test's control. */
 async function attachedWatch(extras: WatchExtras = {}) {
@@ -412,5 +416,37 @@ describe('reactivity / collection watch', () => {
 
 		await handle.close();
 		expect(feed.listening(), 'closing the last watch stops listening to local storage').to.equal(0);
+	});
+
+	it('a root registration whose member set is not the root group\'s is made again at the same root key: at once when it lands, and on a second consecutive mismatch after that', async () => {
+		// The group the tail's commits are announced by, as this node reads it; the test moves it under the watch.
+		const group = { members: ['peer-stores-a', 'peer-stores-b'] };
+		const fixture = await attachedWatch({ rootGroupMembers: () => Promise.resolve(group.members) });
+		const { service, fireTick } = fixture;
+		const tick = async (): Promise<void> => { fireTick(); await settle(); };
+		const rootKeyOf = (index: number): number[] => [...service.registrations[index]!.request.rootKey!];
+
+		// The reported defect: the walk's first answer names a machine the root group does not have, so the record
+		// is held outside the group that announces and no announcer, gossip round or keep-alive would find it.
+		service.registrations[0]!.resolve(0, ['peer-stores-a', 'peer-elsewhere'].map(peerIdToBytes));
+		await settle();
+		expect(service.registrations, 'the check right after the registration landed did not wait for a tick').to.have.length(2);
+		expect(rootKeyOf(1), 'under the same root key — the tail has not moved, only the group was read wrong').to.deep.equal(rootKeyOf(0));
+
+		// Landed on the group this time: no further registration, however many ticks pass.
+		service.registrations[1]!.resolve(0, ['peer-stores-b', 'peer-stores-a'].map(peerIdToBytes));
+		await settle();
+		await tick();
+		await tick();
+		expect(service.registrations, 'a member set that still matches, in any order, is left alone').to.have.length(2);
+
+		// The group moves under the live registration. One reading is the shape of a momentary misread, so the
+		// tick waits to see it twice.
+		group.members = ['peer-stores-a', 'peer-stores-c'];
+		await tick();
+		expect(service.registrations, 'one mismatched reading is not acted on').to.have.length(2);
+		await tick();
+		expect(service.registrations, 'the second consecutive mismatch registers again').to.have.length(3);
+		expect(rootKeyOf(2)).to.deep.equal(rootKeyOf(0));
 	});
 });

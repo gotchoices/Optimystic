@@ -25,6 +25,13 @@
  * {@link ReactivityCollectionWatch.tick}). Every failure above then costs at most one tick of delay, when the
  * machine answering the read holds the commit.
  *
+ * **Nor is the register walk's answer about who the root group is.** A registration is admitted by the first
+ * root-group member that answers the walk, and that member's own view of the group is latched on the handle for
+ * the registration's life. When that view was wrong the registration is held outside the group that announces,
+ * where no announcer, no cohort gossip and no keep-alive finds it. So the service reads the root group live —
+ * right after a registration lands, and on each tick — and registers again when the registration's member set
+ * is not the group's (see {@link ReactivityCollectionWatch.verifyRootGroup}).
+ *
  * **One tick, one read per reader.** The tick is one timer for the whole service, not one per collection, and
  * reads the tails of every collection that reads through one {@link CollectionTailReader} in one call, so a
  * host that shares one reader across its watches (the Quereus plugin shares one per transactor) pays one read
@@ -79,6 +86,7 @@ import {
 import { ReactivitySubscriptionManager, type RotationNotice } from "./subscription-manager.js";
 import { setUnrefTimer, type RotationTimerCancel } from "./rotation-rereg-scheduler.js";
 import { reactivityCollectionIdBytes, reactivityTailBytes } from "./topic-bytes.js";
+import { bytesToPeerIdString } from "../cohort-topic/peer-codec.js";
 import type { ReactivitySubscriberRegistry } from "./subscriber-registry.js";
 import type { Libp2pReactivityRecoverTransport, RecoverRequestSigners } from "./recover-transport.js";
 import { createLogger } from "../logger.js";
@@ -90,6 +98,24 @@ export const DEFAULT_VERIFY_EVERY_TICKS = 10;
 
 /** The options of a tick's read that is not due for verification. */
 const HELD_ONLY: CommittedTailReadOptions = { skipWindowConsult: true };
+
+/**
+ * Consecutive mismatched readings of a root registration's group before the **tick** registers again. One
+ * reading is the shape of a momentary membership misread, which self-corrects; a group that really moved stays
+ * moved. The check right after a registration lands does not wait for a second reading — it is the fast path
+ * for the case a caller's first read-after-watch depends on.
+ */
+const MISMATCH_READINGS_BEFORE_REREGISTER = 2;
+
+/**
+ * A member set as one comparable, loggable string: its peer-id strings sorted and joined. Order-independent,
+ * which the comparison needs — a register reply's `cohortMembers` are in the admitting member's order, a fresh
+ * root-group read in proximity order from this node — and equivalent to comparing `cohortEpoch` without
+ * hashing, since that epoch is the hash of the sorted members.
+ */
+function memberSetKey(members: readonly string[]): string {
+	return [...members].sort().join(" ");
+}
 
 /** What a watcher knows about a collection's committed log: the tail block and the latest revision. */
 export interface CollectionTail {
@@ -200,6 +226,19 @@ export interface ReactivityCollectionWatchOptions {
 	 * notifications alone wake them.
 	 */
 	readonly localChanges?: Pick<IBlockChangeNotifier, "onCollectionChange">;
+	/**
+	 * A **live** read of the root group at a registration's root key: the peers the key network's storage rule
+	 * puts the tail block on, as dialable peer-id strings. Bind the rule itself
+	 * (`keyNetwork.servingCohortAt(reactivityRootCoord(rootKey))`) and never a snapshot cache — a group snapshot
+	 * up to one gossip interval old is one of the things that lands a registration outside the group in the first
+	 * place, so a check reading that snapshot would agree with the mistake.
+	 *
+	 * The service compares a root registration's latched member set against this, right after a registration
+	 * lands and again on each tick, and registers again when they differ (see
+	 * {@link ReactivityCollectionWatch.verifyRootGroup}). Absent ⇒ no such check is made and the service behaves
+	 * exactly as it does without one.
+	 */
+	readonly rootGroupMembers?: (rootKey: Uint8Array) => Promise<readonly string[]>;
 }
 
 /** One watcher of a collection: its change callback and its way to read the committed tail. */
@@ -224,6 +263,12 @@ interface Subscription {
 	tickQueued: boolean;
 	/** Ticks that have read this subscription since a consulting read of it was last applied. */
 	ticksSinceVerified: number;
+	/**
+	 * Consecutive readings that found this subscription's root registration held by a member set the root group
+	 * at its tail does not have. The tick acts on the second (see {@link ReactivityCollectionWatch.verifyRootGroup});
+	 * a reading that matches, or a registration that is not at the root, restarts the count.
+	 */
+	rootGroupMismatches: number;
 	/** Stops listening to this node's storage for the collection; set while open when the node has a feed. */
 	unsubscribeLocal?: () => void;
 	closed: boolean;
@@ -347,6 +392,7 @@ export class ReactivityCollectionWatch {
 			tickQueued: false,
 			// The first read (`checkTail`) consults, so the count starts there.
 			ticksSinceVerified: 0,
+			rootGroupMismatches: 0,
 			closed: false,
 			work: Promise.resolve(),
 			reAnchorQueued: false,
@@ -446,7 +492,9 @@ export class ReactivityCollectionWatch {
 	 * Keep every registration alive, then check every collection's tail: one read per reader, each answer applied on
 	 * its subscription's queue — wake the listeners if the revision is above the last one they were woken for, and
 	 * follow the tail if the registration is not where its root is, which is also how a registration that failed is
-	 * retried. Settles when the reads have, not when the follows or the renewals have, so one subscription's slow
+	 * retried. Each applied answer is followed by one reading of the registration's root group, so a group that
+	 * moved under a live registration is repaired too ({@link verifyRootGroup}). Settles when the reads have, not
+	 * when the follows, the group readings or the renewals have, so one subscription's slow
 	 * registration walk does not hold back every other collection's next tick. A subscription whose earlier tick's
 	 * answer is still queued sits this tick out, so a queue slower than the tick interval does not grow by a tick's
 	 * steps each interval.
@@ -511,6 +559,11 @@ export class ReactivityCollectionWatch {
 				if (answers !== undefined) {
 					await this.followAnswer(sub, stamp, answers.get(sub.collectionId), verified);
 				}
+				// A root group that became wrong AFTER its registration landed, which the landing check cannot see.
+				// On a tick where a registration also landed the group is read twice; the second reading judges the
+				// registration the first one placed, and the consecutive-mismatch rule is what keeps that from
+				// turning into a second re-registration in the same pass.
+				await this.verifyRootGroup(sub, true);
 			});
 		}
 	}
@@ -543,18 +596,22 @@ export class ReactivityCollectionWatch {
 	/**
 	 * Follow a tail and, if a registration landed, look at the tail once more: a commit made while the
 	 * registration was in flight was announced by a root that did not yet hold this subscriber, so nothing
-	 * else would report it before the next tick.
+	 * else would report it before the next tick. Then check that the registration is held by the group that
+	 * will announce — the register walk's answer about who the group is can be wrong, and a registration the
+	 * wrong machines hold is announced to by nobody ({@link verifyRootGroup}).
 	 */
 	private async moveThenRecheck(sub: Subscription, tailBytes: Uint8Array, lastRevision: number): Promise<void> {
 		if (!(await this.moveTo(sub, tailBytes, lastRevision))) {
 			return;
 		}
 		const tail = await this.readTail(sub);
-		if (tail === undefined) {
-			return;
+		if (tail !== undefined) {
+			this.wakeIfNewer(sub, tail.revision);
+			await this.moveTo(sub, reactivityTailBytes(tail.tailId), tail.revision);
 		}
-		this.wakeIfNewer(sub, tail.revision);
-		await this.moveTo(sub, reactivityTailBytes(tail.tailId), tail.revision);
+		// Checked last, so the reading judges the registration that is live now rather than one the re-read above
+		// has already replaced. A failed re-read leaves the first registration in place and is checked all the same.
+		await this.verifyRootGroup(sub, false);
 	}
 
 	/**
@@ -630,9 +687,19 @@ export class ReactivityCollectionWatch {
 	private async moveTo(sub: Subscription, tailBytes: Uint8Array, lastRevision: number): Promise<boolean> {
 		const manager = sub.manager ?? this.attachManager(sub, tailBytes, lastRevision);
 		manager.rebaseline(lastRevision);
+		return this.place(sub, manager, `tail=${bytesToB64url(tailBytes)}`, () => manager.followTail(tailBytes));
+	}
+
+	/**
+	 * Run one placement of `sub`'s registration — a follow of a moved tail, or a re-registration at an unchanged
+	 * one — and report whether a registration landed on this call. `at` names the placement in the failure log.
+	 *
+	 * @returns true iff a registration landed and the subscription is still open.
+	 */
+	private async place(sub: Subscription, manager: ReactivitySubscriptionManager, at: string, attempt: () => Promise<boolean>): Promise<boolean> {
 		let landed: boolean;
 		try {
-			landed = await manager.followTail(tailBytes);
+			landed = await attempt();
 		} catch (err) {
 			// NOTE: accepted tradeoff — a failed registration is retried by the next tick (30 s Core), not sooner.
 			// A root nobody has registered under before admits its first registration on the request that asks:
@@ -643,7 +710,7 @@ export class ReactivityCollectionWatch {
 			// new root sends two, so early retries spend the allowance, and when the retries were measured
 			// against a cohort that was not ready the attach landed later, not sooner. Revisit if the cohort's
 			// answer starts naming a delay that reflects when it will be ready.
-			log("registration at tail=%s failed for collection=%s (retried by the next tick): %o", bytesToB64url(tailBytes), sub.collectionId, err);
+			log("registration at %s failed for collection=%s (retried by the next tick): %o", at, sub.collectionId, err);
 			return false;
 		}
 		if (sub.closed) {
@@ -655,6 +722,84 @@ export class ReactivityCollectionWatch {
 			return false;
 		}
 		return landed;
+	}
+
+	/**
+	 * Check that a root registration is still held by the group that announces its tail's commits, and register
+	 * again at the same root key when it is not (`docs/reactivity.md` §The node's watch service). Inert without
+	 * {@link ReactivityCollectionWatchOptions.rootGroupMembers}.
+	 *
+	 * A register walk resolves the tail's root group, dials its members in order, and the first that answers
+	 * admits the registration; that member's own view of the group is then latched on the handle for the
+	 * registration's whole life, and `followTail` compares root *keys* only, so a registration at the right
+	 * coordinate with the wrong member set is never made again. Nothing else repairs it either: an announcing
+	 * member looks up direct subscribers only in its own local registry, cohort gossip merges a record delta
+	 * only from a matching cohort epoch (which is a function of the member set), and the holder keeps serving
+	 * what it holds. Even the keep-alive does not fail usefully — the deterministic primary the reply names
+	 * holds nothing, so it answers `unknown_registration`, and three such pings (≈90 s at the Core TTL) strike
+	 * out before the renewal failover re-walks. `isAttached` reports the collection as attached throughout.
+	 *
+	 * `confirm` is the tick's rule: act only on the second consecutive mismatched reading
+	 * ({@link MISMATCH_READINGS_BEFORE_REREGISTER}). The check right after a registration lands passes `false`
+	 * and acts on the first, so the window a caller's push depends on costs one extra walk, not one extra tick.
+	 *
+	 * One attempt per detection — a re-registration that fails is left to the next tick, exactly as a failed
+	 * first attach is.
+	 */
+	private async verifyRootGroup(sub: Subscription, confirm: boolean): Promise<void> {
+		const readMembers = this.options.rootGroupMembers;
+		const manager = sub.manager;
+		const handle = manager?.registration;
+		if (readMembers === undefined || manager === undefined || handle === undefined) {
+			return;
+		}
+		const rootKey = handle.rootKey;
+		// Only a registration AT the root is held by the root group: one below it sits at `coord_d(P, topicId)`,
+		// which the root's movement does not touch, so its member set is legitimately a different one.
+		if (handle.treeTier !== 0 || rootKey === undefined) {
+			sub.rootGroupMismatches = 0;
+			return;
+		}
+		let group: readonly string[];
+		try {
+			group = await readMembers(rootKey);
+		} catch (err) {
+			log("root-group read failed for collection=%s (the next tick reads again): %o", sub.collectionId, err);
+			return;
+		}
+		if (sub.closed || sub.manager?.registration !== handle) {
+			return; // the registration this reading was about is gone, or something else has replaced it
+		}
+		// An empty set on either side means "not known", not "the group is empty": a node whose ring view has not
+		// filled in yet reads no group at all, and a reply that named no members gives nothing to compare against.
+		// Treating either as a mismatch would register again on every reading, forever.
+		if (group.length === 0 || handle.cohortMembers.length === 0) {
+			sub.rootGroupMismatches = 0;
+			return;
+		}
+		// NOTE: this compares the group THIS node reads against the member set the admitting member reported.
+		// The two agree whenever the two nodes' ring views do, which is the assumption root placement rests on
+		// everywhere else. If ring views ever diverge persistently in a wide deployment, a legitimately
+		// better-informed admitting member would be re-registered against once every two ticks per collection
+		// (two register frames a minute, inside the cohort's allowance of four) and the mismatch would never
+		// clear; if that shows up, compare against the group the register walk itself dialed rather than against
+		// this node's live view.
+		const held = memberSetKey(handle.cohortMembers.map(bytesToPeerIdString));
+		const fresh = memberSetKey(group);
+		if (held === fresh) {
+			sub.rootGroupMismatches = 0;
+			return;
+		}
+		sub.rootGroupMismatches++;
+		if (confirm && sub.rootGroupMismatches < MISMATCH_READINGS_BEFORE_REREGISTER) {
+			log("collection=%s: its registration names members [%s] but the root group at its tail reads [%s]; waiting for a second reading", sub.collectionId, held, fresh);
+			return;
+		}
+		sub.rootGroupMismatches = 0;
+		// This condition is otherwise silent — `isAttached` reports a misplaced registration as attached — so the
+		// line is what lets the next report of a deaf watcher be read off a run rather than a probe build.
+		log("re-registering collection=%s: its registration is held outside the root group at its tail — it names members [%s], the group reads [%s]", sub.collectionId, held, fresh);
+		await this.place(sub, manager, `tail=${bytesToB64url(rootKey)} (its root group moved)`, () => manager.register().then(() => true));
 	}
 
 	/** Build the collection's one manager and route the collection's topic to it, ahead of its first registration. */

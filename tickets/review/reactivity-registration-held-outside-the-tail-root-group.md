@@ -1,0 +1,61 @@
+description: A machine that starts watching a table for changes could have its registration recorded by the wrong group of machines, leaving it unnotified for about a minute and a half with nothing noticing. The watcher now re-reads which group is responsible — right after it registers, and on every later check-in — and registers again when the two disagree. Reported from Sereus (`sereus` `tickets/blocked/report-reactivity-registration-lands-outside-the-root-group`).
+architecture: docs/reactivity.md#the-nodes-watch-service
+files: packages/db-p2p/src/reactivity/collection-watch.ts, packages/db-p2p/src/reactivity/subscription-manager.ts, packages/db-p2p/src/libp2p-node-base.ts, packages/db-p2p/src/cohort-topic/host.ts, packages/db-p2p/test/reactivity/collection-watch.spec.ts, docs/reactivity.md
+difficulty: medium
+----
+
+## What changed
+
+A registration with the cohort names the collection's log tail as its root key. The register walk resolves the tail's root group, dials its members in order, and the first that answers admits the registration — and **that member's own view of the group was then latched on the handle for the registration's whole life**. `ReactivitySubscriptionManager.followTail` compares root *keys* only, so a registration sitting at the right coordinate with the wrong member set was never made again, and every other repair path was closed (announcers read only their own local registry; cohort gossip merges a record delta only from a matching cohort epoch, which is a function of the member set; the holder keeps serving what it holds; the keep-alive pings a deterministic primary that holds nothing and strikes out after ≈90 s on Core). `isAttached` reported the collection as attached throughout.
+
+The watch service now reads the root group **live** and registers again when the registration's member set is not the group's.
+
+- **New seam** — `ReactivityCollectionWatchOptions.rootGroupMembers?: (rootKey: Uint8Array) => Promise<readonly string[]>`. Absent ⇒ the checks are inert and the service behaves exactly as before, which is why none of the existing unit tests or mesh specs changed.
+- **Bound on a node** (`libp2p-node-base.ts`, the `reactivityWatch` construction) to the existing `resolveReactivityCohort` = `rootGroupAt(reactivityRootCoord(tailId))` = `keyNetwork.servingCohortAt`. Deliberately the placement rule itself and not the host's `rootGroupMembers`, which goes through `snapshots.ensure` and can answer from a snapshot up to one gossip interval (5 s) old — one of the ways a registration lands outside its group in the first place.
+- **Arm 1 (the reported symptom)** — `moveThenRecheck` now ends with `verifyRootGroup(sub, /* confirm */ false)`: after the existing post-landing tail re-read, the group is read fresh and a mismatch re-registers **at once**. Placed last so the reading judges whichever registration is live after the re-read, not one the re-read already replaced.
+- **Arm 2 (a group that moves later)** — the tick's per-subscription enqueued step ends with `verifyRootGroup(sub, /* confirm */ true)`, which acts only on the **second consecutive** mismatched reading (`MISMATCH_READINGS_BEFORE_REREGISTER = 2`). One reading is the shape of a momentary membership misread; a real move persists.
+- **Skipped**: `treeTier ≥ 1` (its cohort is at `coord_d(P, topicId)`, so a different member set is correct), no `rootKey`, and an empty set on *either* side — an empty read means "not known", not "the group is empty", and comparing it would re-register forever on a node whose ring view has not filled in.
+- **Comparison** is order-independent (`memberSetKey`: peer-id strings sorted and joined), equivalent to comparing `cohortEpoch` without hashing. Handle `cohortMembers` bytes → strings via `bytesToPeerIdString`.
+- **Rate**: one attempt per detection, no retry loop inside a tick, a failure left to the next tick. Worst steady case is 1 re-registration per 2 ticks per collection = 2 register frames/min, inside the cohort's allowance of 4.
+- **Refactor**: `moveTo`'s failure/close handling was lifted into a new `place(sub, manager, at, attempt)` so the re-registration shares it (the accepted-tradeoff `NOTE:` about not retrying inside the tick moved with the `catch` it annotates). `moveTo` is now two lines over `place`.
+- **Observability**: a re-registration logs the collection, the member set the registration names, and the set the group reads. The "waiting for a second reading" case logs too.
+- `ReactivitySubscriptionManager.register()` is the separate call the service uses to re-place at an unchanged root key; `followTail`'s early return is untouched and both are now documented as to why.
+
+## Use cases to test / validate
+
+**The unit test added** (`packages/db-p2p/test/reactivity/collection-watch.spec.ts`, one `it`) — `a root registration whose member set is not the root group's is made again at the same root key: at once when it lands, and on a second consecutive mismatch after that`. It drives, in order: (1) the first registration lands held by `['peer-stores-a','peer-elsewhere']` while the injected seam reads `['peer-stores-a','peer-stores-b']` → a second `register` with the **same root key**, with no tick fired; (2) that one lands on the group in the other order → two ticks produce no further `register` (order-independence and the match case); (3) the group moves to `['peer-stores-a','peer-stores-c']` → one tick does nothing, the next re-registers at the same root key. **Verified it reproduces the defect**: with `verifyRootGroup` short-circuited to `return` the test fails at step (1) (1 registration, expected 2). The fixture's `PendingRegistration.resolve` grew an optional `cohortMembers` argument; its default `[]` keeps every other test identical.
+
+**Not covered by a test, worth a reviewer's eye:**
+
+- **The node binding.** `rootGroupMembers: resolveReactivityCohort` is wiring with no unit coverage (`node-wiring.spec.ts` asserts protocols and registries, not watch options). The thing to check by reading is that `resolveReactivityCohort` is the *live* `servingCohortAt` path and not a snapshot-backed one — that distinction is the whole point of the binding and a future refactor could silently swap it.
+- **The double reading on a landing tick.** On a tick where a registration also landed, `verifyRootGroup` runs twice in the same step (arm 1 inside `moveThenRecheck`, then arm 2). I traced that this cannot produce two re-registrations in one pass — arm 1 resets the counter to 0 before acting, so arm 2's reading lands at 1 and `confirm` holds it — but that argument rests on the counter, not on a structural guard, and it is the thing most likely to break if the counter's reset points are edited. `servingCohortAt` is a local ring computation (no network), so the extra read costs nothing.
+- **Interaction with renewal failover.** `verifyRootGroup` re-checks `sub.manager?.registration !== handle` after its `await` and bails if the handle was replaced. Whether db-core's renewal failover *replaces* the handle or mutates it in place I did not confirm; if it mutates in place the identity check passes and we compare the updated members, which is also fine, but a reviewer who knows that path should sanity-check it.
+- **End-to-end.** No integration test was added (see below), so nothing in this repo exercises the real two-node disagreement. The originating repro is the Sereus scenario `packages/integration-tests/src/scenarios/strand-reactivity-wakes-watchers.integration.ts` in `C:\Projects\sereus` (failed its push assertion in 2 of 4 runs on 2026-11-20 and 2 of 12 on 2026-11-21); the honest validation of this fix is that scenario going green over a run of ~12, which is out-of-band work for a human, not something to attempt inside a ticket.
+
+## Known gaps and judgement calls
+
+- **No integration test, by design** (the ticket's call, which I agree with): the real repro is a three-machine real-socket scenario failing roughly one run in six, several minutes per attempt, for a signal the unit test gives deterministically; `test/substrate-real-libp2p.integration.spec.ts` already covers the happy push path (and waits for the registration to replicate to the announcing member — the crutch the Sereus scenario does not have).
+- **The comparison is asymmetric and I left it that way.** It pits *this node's* live `servingCohortAt` against the member set the *admitting member* reported. Those agree whenever the two ring views do — the assumption root placement rests on everywhere else — but if views diverge persistently in a wide deployment, a legitimately better-informed admitting member gets re-registered against every two ticks and the mismatch never clears. That is recorded as a `NOTE:` tripwire at the comparison site with the fix direction (compare against the group the register walk itself dialed). I judged this below the bar for a ticket because it is conditional on a divergence the rest of the design already assumes away, and because the alternative needs a new field on the handle; a reviewer may disagree and want it filed.
+- **The root cause of the original misread is still open.** This ticket closes "nothing re-checks a latched root group", whatever made it wrong. The `membershipOf` misclassification-window candidate (a peer read as `foreign` between a connection opening and identify landing) is already an arm on `tickets/backlog/debt-a-peer-read-as-refusing-may-only-be-unidentified` — inferred from code, not observed. Nothing here depends on settling it.
+- **Arm 2's cadence is the tick's, 30 s on Core.** A group that moves under a live registration therefore costs up to 2T ≈ 60 s. That is the design, not an oversight — arm 1 is the fast path and the only one the reported symptom needs.
+
+## Tripwires recorded (index — the analysis lives at each site)
+
+- `packages/db-p2p/src/libp2p-node-base.ts`, in the forwarder host's `directSubscribers` (~line 2297): an announcing member sees only its own registry, so for up to one gossip round (5 s) after a registration is admitted, a commit announced by a *different* member of the same group reaches nobody. Harmless today; it is why a test pushing immediately after a watch attaches must wait for replication.
+- `packages/db-p2p/src/cohort-topic/host.ts` (~line 2573), appended to the existing accepted-tradeoff `NOTE:`: its revisit condition — a stale primary for a root-placed topic — **was** seen, and was answered on the participant side (re-register) rather than by closing an engine whose refresh drops self; closing it would need a handoff path for the records it holds and buys nothing while the participant repairs itself.
+- `packages/db-p2p/src/reactivity/collection-watch.ts`, at the member-set comparison in `verifyRootGroup`: the asymmetric-comparison concern described above.
+
+## Commands run
+
+- `yarn build` in `packages/db-p2p` — clean. (Its tsconfig includes `test`, so the spec is typechecked by this.)
+- `node --import ./register.mjs node_modules/mocha/bin/mocha.js test/reactivity/collection-watch.spec.ts` — 12 passing.
+- Same spec with `verifyRootGroup` short-circuited — 1 failing, the new test, at its first assertion (the negative check).
+- `node --import ./register.mjs node_modules/mocha/bin/mocha.js test/reactivity/managers.spec.ts test/reactivity/node-wiring.spec.ts test/reactivity/mesh-cold-to-hot.spec.ts test/reactivity/mesh-mobile-resume.spec.ts test/reactivity/mesh-partition-healing.spec.ts test/reactivity/mesh-slow-subscriber.spec.ts test/reactivity/mesh-tail-rotation.spec.ts` — 63 passing.
+- `yarn lint:docs` (root) — 49 documents, all citations/links resolve.
+- `yarn lint:deps` (root) — every import declared.
+
+Not run, per the project's testing rules: `packages/db-p2p`'s full `yarn test` and `yarn test:integration`.
+
+## Docs
+
+`docs/reactivity.md` §The node's watch service: a new **Then check who actually holds it** bullet after Attach (the latching, why nothing else repairs it, the live-read-not-snapshot binding, the `treeTier ≥ 1` skip); the tick bullet gained the per-tick reading and the second-consecutive rule; *How long a missed commit can go unseen* gained the case this closes — within one register walk now, previously bounded by the renewal failover's ≈90 s strike-out, and 2T for a group that moves under an already-correct registration.

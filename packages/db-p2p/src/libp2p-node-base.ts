@@ -2294,6 +2294,13 @@ export async function createLibp2pNodeBase(
 					// filters to reactivity appState and maps participantId bytes → dialable peer-id strings (the
 					// transport's `peerIdFromString` space) — NOT base64url, which would silently fail to dial. No
 					// engine here (no subscriber has registered at this root) ⇒ [].
+					//
+					// NOTE: this is only what THIS member's registry holds, so for up to one gossip round (5 s)
+					// after a registration is admitted, a commit announced by a different member of the same
+					// group reaches nobody. Harmless today — the watcher's first keep-alive is 30 s away and
+					// gossip has long since converged — but it is why a test that pushes immediately after a
+					// watch attaches has to wait for the registration to replicate. If that window ever matters,
+					// the announcer must ask the group for its subscribers rather than only itself.
 					const engine = host.registry.findByCoord(reactivityRootCoord(rootTail));
 					return engine === undefined || !engine.rootPlaced ? [] : reactivityDirectSubscribers(engine, topicId);
 				},
@@ -2479,6 +2486,12 @@ export async function createLibp2pNodeBase(
 				// A client stores nothing, so it has no local feed; every wake it gets comes over the network.
 				...(served ? { localChanges: served.storageRepo } : {}),
 				scheduleRotation: (notice): void => scheduler.schedule(notice),
+				// The live root group at a registration's root key, so the service can notice a registration a
+				// walk left outside the group that announces its tail's commits. `resolveReactivityCohort` is
+				// `rootGroupAt` — the placement rule itself, read fresh — deliberately NOT the host's snapshot
+				// view, which `snapshots.ensure` may answer from a snapshot up to one gossip interval old and
+				// which is one of the ways a registration lands wrong in the first place.
+				rootGroupMembers: resolveReactivityCohort,
 				recover,
 				recoverSigners,
 				cohortHintCache: reactivityCohortHintCache,
