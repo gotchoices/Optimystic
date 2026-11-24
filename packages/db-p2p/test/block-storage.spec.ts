@@ -1050,6 +1050,15 @@ describe('BlockStorage restore archive vetting', () => {
 				revisions: { 4: { ...goodEntry, action: { ...goodEntry.action, rev: 7 } } },
 				range: [4, 5]
 			}, 'an entry whose declared rev disagrees with its key'],
+			[{
+				blockId,
+				// A peer chooses the action ids in its answer, and they are spelled into a location by a
+				// backend. The vet owes this one the same refusal as a bad revision key: raw storage
+				// refuses such a name by THROWING, which would escape the vet mid-archive instead of
+				// refusing the whole of it.
+				revisions: { 4: { ...goodEntry, action: { ...goodEntry.action, actionId: '../../../escaped' as ActionId } } },
+				range: [4, 5]
+			}, 'an entry whose action id names a location outside the store'],
 			[{ blockId, revisions: {}, range: [4, 5] }, 'an archive carrying no revisions at all']
 		];
 

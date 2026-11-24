@@ -171,6 +171,7 @@ const UNSORTED: Record<string, string> = {
 	BlockPossiblyStaleError: 'a read\'s doubt about currency, raised during refresh, not a write outcome',
 	TreeUpsertGuardKindError: 'a malformed action — a caller bug — raised while staging, deliberately not a refusal',
 	TreeDeleteGuardKindError: 'the delete-side mirror of the same check',
+	InvalidActionIdError: 'one of the three identifier rules of Invariant 7 in `packages/db-p2p/docs/storage.md` — a name that does not sit inside the store, refused at the storage boundary. A caller bug or a hostile peer, never a commit outcome: `createTransactionId` cannot mint a refused id, so no honest commit reaches it, and retrying one that did would fail identically. Its two siblings (`InvalidBlockIdError`, `InvalidRevisionError`) are absent from this table only because `blocks/` is outside SCANNED_DIRS, not because they were sorted differently',
 }
 
 describe('classifyCommitFailure coverage', () => {

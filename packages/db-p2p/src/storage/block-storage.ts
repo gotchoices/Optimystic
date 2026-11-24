@@ -1,5 +1,5 @@
 import type { BlockId, IBlock, Transform, ActionId, ActionRev, ActionTransform, BlockLineage } from "@optimystic/db-core";
-import { applyTransform, canonicalJson, hashString } from "@optimystic/db-core";
+import { applyTransform, canonicalJson, hashString, isValidActionId } from "@optimystic/db-core";
 import type { BlockCommitProof } from "../cluster/commit-proof.js";
 import type { BlockArchive, BlockMetadata, RestoreCallback, RevisionRange } from "./struct.js";
 import type { IRawStorage } from "./i-raw-storage.js";
@@ -794,6 +794,16 @@ export class BlockStorage implements IBlockStorage {
 			const action = entry?.action;
 			if (!action?.actionId) {
 				return refuse('revision %d carries no action', entryRev);
+			}
+			// The archive's action ids are vetted HERE, for the same reason the revision key above is:
+			// both are spelled into a location by a backend, and `noDivergentRewrite` below plus
+			// `saveRestored` after it hand these ids straight to raw storage. `KvRawStorage` would
+			// refuse one that is not a name inside the store (Invariant 7 of `docs/storage.md`), but it
+			// refuses by THROWING, and that throw would escape this vet mid-archive — past the
+			// all-or-nothing refusal the restore wire is built on, after the loop had already issued
+			// reads for the earlier entries. A peer chooses these ids, so the check belongs in the gate.
+			if (!isValidActionId(action.actionId)) {
+				return refuse('revision %d names action %o, which is not a name inside the store', entryRev, action.actionId);
 			}
 			if (action.rev !== undefined && action.rev !== entryRev) {
 				return refuse('revision %d is filed under an action declaring rev=%d', entryRev, action.rev);
