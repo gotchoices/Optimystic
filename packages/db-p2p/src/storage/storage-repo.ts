@@ -1906,8 +1906,10 @@ export class StorageRepo implements IRepo, IBlockChangeNotifier, IBlockDurabilit
 			const latest = await storage.getLatest();
 			// `pastRev === undefined` is a block that held no committed revision when it was released, so
 			// holding one now is itself the advance.
+			// Not logged here: the sweep is this method's only caller and logs both outcomes with the
+			// release they belong to (`sweep:written-again` / `sweep:deleted` under `storage:released`),
+			// so a line here would be the same event under a second namespace with less context.
 			if (latest !== undefined && (pastRev === undefined || latest.rev > pastRev)) {
-				log('deleteBlockIfNotAdvanced:advanced blockId=%s pastRev=%s latest=%d', blockId, pastRev ?? 'none', latest.rev);
 				return 'advanced';
 			}
 			wrote = true;

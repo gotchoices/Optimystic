@@ -12,14 +12,14 @@
  *
  * It runs when a release has just written entries, when the node's pressure reading is at `shedding`
  * or above, and once shortly after start-up, which is what finishes the deletes a crash interrupted
- * (`packages/db-p2p/docs/storage.md` §10). A run that hit its cap asks for the next one itself, so a
- * large shed is cleared without waiting on another trigger.
+ * (`packages/db-p2p/docs/storage.md` §10). A run that hit its cap and made progress asks for the next
+ * one itself ({@link shouldChain}), so a large shed is cleared without waiting on another trigger.
  */
 
 import type { BlockId } from '@optimystic/db-core';
 import type { Logger } from '../logger.js';
 import { hasExhaustedAttempts, RELEASED_BLOCK_DELETE_ATTEMPTS, type ReleasedBlockEntry, type ReleasedBlockLedger } from './released-block-ledger.js';
-import type { IReleasedBlockDeleter } from './storage-repo.js';
+import type { IReleasedBlockDeleter, ReleasedBlockDeleteOutcome } from './storage-repo.js';
 
 /**
  * How many entries one run acts on — deleted, kept or failed alike, since each costs one latch hold.
@@ -145,6 +145,8 @@ export class ReleasedBlockSweep {
 		const entries = await this.deps.ledger.list();
 		const tally = { deleted: 0, kept: 0, failed: 0, exhausted: 0 };
 		let taken = 0;
+		/** Set only by the cap, never by a stop: a stopping node asks for nothing further. */
+		let cappedOff = false;
 		for (const entry of entries) {
 			if (hasExhaustedAttempts(entry)) {
 				tally.exhausted++;
@@ -152,7 +154,11 @@ export class ReleasedBlockSweep {
 			}
 			// Checked per entry rather than once at the top: a stop that arrives mid-run must not start
 			// another block's delete, and the entries left are still recorded.
-			if (this.stopping || taken >= this.limit) {
+			if (this.stopping) {
+				break;
+			}
+			if (taken >= this.limit) {
+				cappedOff = true;
 				break;
 			}
 			taken++;
@@ -167,14 +173,7 @@ export class ReleasedBlockSweep {
 		// not getting any emptier" — nothing has been released — which a suppressed line would not give.
 		this.deps.log('sweep:run found=%d deleted=%d kept=%d failed=%d exhausted=%d remaining=%d',
 			run.found, run.deleted, run.kept, run.failed, run.exhausted, run.remaining);
-		// A run that stopped at its cap leaves work behind, and the next trigger may never come: a node
-		// that dropped below `shedding` by deleting these very blocks gets no further pressure request,
-		// and nothing else asks until the next release. So the run asks for the next one itself.
-		//
-		// It terminates. Every entry a run acts on is either deleted, dropped, or counted one attempt
-		// toward the bound past which it is passed over, so each chained run's actionable set is strictly
-		// smaller than the last's.
-		if (!this.stopping && actionableRemaining(run) > 0) {
+		if (!this.stopping && shouldChain(run, cappedOff)) {
 			this.request();
 		}
 		return run;
@@ -190,8 +189,12 @@ export class ReleasedBlockSweep {
 	 * entry carrying the revision it then holds.
 	 */
 	private async takeOne(entry: ReleasedBlockEntry, tally: { deleted: number; kept: number; failed: number }): Promise<void> {
+		// Set once the storage call answered, which is what tells the catch below WHICH half faulted —
+		// the bytes, or the entry that records them. An operator reading "the delete failed" about a
+		// delete that landed would go looking for bytes that are already gone.
+		let outcome: ReleasedBlockDeleteOutcome | undefined;
 		try {
-			const outcome = await this.deps.storage.deleteBlockIfNotAdvanced(entry.blockId, entry.releasedRev);
+			outcome = await this.deps.storage.deleteBlockIfNotAdvanced(entry.blockId, entry.releasedRev);
 			await this.deps.ledger.remove(entry.blockId);
 			if (outcome === 'deleted') {
 				tally.deleted++;
@@ -203,14 +206,20 @@ export class ReleasedBlockSweep {
 			}
 		} catch (error) {
 			// One block's storage fault must not end the run: the rest of the ledger is still deletable,
-			// and this entry's attempt count is what stops it being retried for ever. A failure of the
-			// ledger's own `remove`, AFTER the delete landed, is caught here too and leaves an entry whose
-			// block is already gone; the next run's `deleteBlock` is a quiet no-op on it and tries the
-			// remove again, so what that costs is a pass, never a byte.
+			// and this entry's attempt count is what stops it being retried for ever. Counted as failed
+			// either way, because the entry is still in the ledger either way — which is what keeps
+			// `remaining` honest.
 			tally.failed++;
 			const attempts = await this.noteFailure(entry.blockId);
-			this.deps.log('sweep:delete-failed blockId=%s attempts=%d/%d - %e',
-				entry.blockId, attempts, RELEASED_BLOCK_DELETE_ATTEMPTS, error);
+			if (outcome === undefined) {
+				this.deps.log('sweep:delete-failed blockId=%s attempts=%d/%d - %e',
+					entry.blockId, attempts, RELEASED_BLOCK_DELETE_ATTEMPTS, error);
+			} else {
+				// The bytes went; the entry recording them did not. The next run's `deleteBlock` is a quiet
+				// no-op on the block and tries the remove again, so what this costs is a pass, never a byte.
+				this.deps.log('sweep:entry-undropped blockId=%s outcome=%s attempts=%d/%d - %e',
+					entry.blockId, outcome, attempts, RELEASED_BLOCK_DELETE_ATTEMPTS, error);
+			}
 		}
 	}
 
@@ -235,12 +244,25 @@ export class ReleasedBlockSweep {
 }
 
 /**
- * Entries a later run could still act on: what this one left, less the ones that have used up their
- * attempts. An entry that exhausted its last attempt THIS run is still counted (it is in `failed`, not
- * yet in `exhausted`), so the chain pays one extra run that finds it exhausted and then stops.
+ * Whether the run should ask for the next one itself. It must, because the external triggers may not
+ * come again: a node that dropped below `shedAbove` by deleting these very blocks gets no further
+ * pressure request, and nothing else asks until the next release — so a run stopped by its cap would
+ * ration the shed rather than chunk it.
+ *
+ * Two conditions, each load-bearing:
+ *
+ * - **The cap stopped it**, so there are actionable entries this run never reached — the cap's `break`
+ *   fires only on an entry that is not exhausted. A run that ended any other way has nothing left a
+ *   next run could take that this one did not already try.
+ * - **It dropped at least one entry**, so the ledger is strictly smaller than when the run started.
+ *   This is what BOUNDS the chain, and it has to be measured rather than argued from the attempt
+ *   count: a run whose whole batch failed under a faulting store may also have failed to record those
+ *   attempts (`noteFailure` is one more write to the same store), and chaining on "entries remain"
+ *   alone would then spin full ledger scans for ever. Such a run waits for the next pressure sample
+ *   or release instead, which is also the back-off a faulting store wants.
  */
-function actionableRemaining(run: ReleasedBlockSweepRun): number {
-	return run.remaining - run.exhausted;
+function shouldChain(run: ReleasedBlockSweepRun, cappedOff: boolean): boolean {
+	return cappedOff && run.deleted + run.kept > 0;
 }
 
 function noop(): void {

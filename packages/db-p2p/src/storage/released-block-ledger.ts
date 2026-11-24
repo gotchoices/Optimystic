@@ -189,10 +189,6 @@ export class ReleasedBlockLedger {
 		return entries.sort((a, b) => a.releasedAt - b.releasedAt);
 	}
 
-	async get(blockId: BlockId): Promise<ReleasedBlockEntry | undefined> {
-		return this.read(blockId);
-	}
-
 	/**
 	 * Drop the entry; no entry is a no-op.
 	 *

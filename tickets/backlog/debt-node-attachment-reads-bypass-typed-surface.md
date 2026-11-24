@@ -58,7 +58,7 @@ few will need the helper's return type fixed rather than just the read site.
 ## Out of scope
 
 `packages/db-p2p/src/libp2p-node-base.ts` also attaches a set of node-*internal* handles
-(`spreadOnChurnMonitor`, `gcEligibleBlocks`, `rebalanceMonitor`, `blockTransferCoordinator`,
+(`spreadOnChurnMonitor`, `releasedBlockLedger`, `releasedBlockSweep`, `rebalanceMonitor`, `blockTransferCoordinator`,
 `ringShiftCoordinator`, `cohortTopicHost`, and the reactivity registries) through the same
 untyped mechanism. Those are deliberately not part of the host-facing surface and typing them is
 a separate decision — do not widen `OptimysticNodeAttachments` to cover them as part of this
