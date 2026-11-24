@@ -2360,7 +2360,7 @@ Every write carries its lane: `serializable`, the quorum lane, where the cohort 
   Neither shape is marked as a validity judgement (next bullet): both say this node could not judge
   the transaction, not that it is wrong.
 - **A reject that judges the transaction itself wrong says so in its signature.** Every member
-  refusal other than a `conflict`, a `held` or an expiry is a `reject` with prose, so a stale
+  refusal other than a `conflict`, a `held`, an `out-of-space` or an expiry is a `reject` with prose, so a stale
   revision, a membership refusal, a content-digest disagreement and a checker fault look identical
   to a writer — and the prose must never become control flow. The six `TransactionValidator`
   refusals that judge the transaction itself wrong — a tampered stamp, a missing or invalid client

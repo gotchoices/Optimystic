@@ -1127,6 +1127,11 @@ export class Collection<TAction> implements ICollection<TAction> {
 		// round until the budget's last round settles it — unlike a fresh attempt's shortfall, which
 		// ends the write at once. If a silent cohort is ever seen holding torn writes for the whole
 		// budget, settle it at once here too.
+		// NOTE: a cohort with no room (`isOutOfSpaceFailure`) lands in the same arm, and there it cannot
+		// clear within one write's budget — a re-send carries the same bytes to the same full members,
+		// which is why a fresh attempt's out-of-space refusal ends the write at once
+		// (`AttemptCycle.recordRefusal`). If a full cohort is ever seen holding torn writes for the whole
+		// budget, settle it at once beside the confirmed rival.
 		// A validity rejection (`isRejectedFailure`) cannot answer the re-send: it carries no
 		// `validation` pair (above), so no checker judges it.
 		// NOTE: a confirmed rival settles at once, even with retry budget left: re-sending is

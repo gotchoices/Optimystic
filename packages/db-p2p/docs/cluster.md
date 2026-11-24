@@ -125,7 +125,8 @@ enum TransactionPhase {
   OurCommitNeeded,       // We need to provide our commit
   Consensus,             // Transaction has reached consensus
   Rejected,              // Transaction was rejected (validity judgement — enough reject votes)
-  ConflictSuperseded,    // Terminal but retryable: conflict votes make super-majority unreachable
+  ConflictSuperseded,    // Terminal for this record, retryable as a fresh one: the transient refusals
+                         // (conflict, held, out-of-space) make super-majority unreachable
   Propagating            // Transaction is being propagated
 }
 ```
@@ -176,18 +177,19 @@ have advanced.
 
 `Rejected` and `ConflictSuperseded` are both terminal and both clear the member's reservation, but
 they mean different things and are counted separately at every threshold: `Rejected` is a validity
-verdict, while `ConflictSuperseded` only says "enough members hold a rival that this one can no
-longer reach super-majority" — the writer retries as a fresh transaction.
+verdict, while `ConflictSuperseded` only says "enough members refused for now that this one can no
+longer reach super-majority" — the writer retries as a fresh transaction. Its name predates the other
+two transient refusals (`held`, `out-of-space`) and is kept; every one of the three counts toward it.
 
 ### Phase 1: Promise Collection (Super-Majority Required)
 
 During the promise phase, each peer evaluates whether they can commit to the transaction. **The coordinator requires a super-majority (default 3/4) of promises** to proceed to the commit phase, providing stronger consensus guarantees than simple majority. A member that first sees the record once it already holds that super-majority casts no promise at all and signs its commit instead (see the decided-map rule under [Phase 2](#phase-2-commit-execution-simple-majority-required)).
 
-A member answers with exactly one of four signed vote kinds (`Signature` in
+A member answers with exactly one of five signed vote kinds (`Signature` in
 `packages/db-core/src/cluster/structs.ts`). Which one is decided in two places: `getTransactionPhase`
 routes a lost race to `handleConflictVoteNeeded` *before* the handler runs (`findConflict` picks
 between `approve` and `conflict`), and `signPromiseVerdict` turns the handler's own verdict into
-`approve`, `reject` or `held`:
+`approve`, `reject`, `held` or `out-of-space`:
 
 ```typescript
 type Signature =
@@ -197,7 +199,10 @@ type Signature =
   | { type: 'conflict'; signature: string; conflictWith: string }
   // The pend's blocks are reserved by a different unresolved action in our storage; `heldBy` is
   // that action's id — a different id space from `conflictWith`, hence its own variant.
-  | { type: 'held'; signature: string; heldBy: string };
+  | { type: 'held'; signature: string; heldBy: string }
+  // We have no storage left for the pend. No payload at all: a byte figure would be unverifiable, a
+  // publication of an operator's disk, and unread, so the type is the whole message.
+  | { type: 'out-of-space'; signature: string };
 ```
 
 ```typescript
@@ -214,9 +219,9 @@ private async handlePromiseNeeded(record: ClusterRecord): Promise<ClusterRecord>
 }
 ```
 
-`reject` is a validity judgement and is permanent; `conflict` and `held` are the two *transient*
-refusals, counted apart from rejections at every threshold so neither can trip the
-permanent-rejection bar (see [docs/correctness.md §Theorem 9](../../../docs/correctness.md#theorem-9-progress-under-contention)).
+`reject` is a validity judgement and is permanent; `conflict`, `held` and `out-of-space` are the
+three *transient* refusals, counted apart from rejections at every threshold so none of them can trip
+the permanent-rejection bar (see [docs/correctness.md §Theorem 9](../../../docs/correctness.md#theorem-9-progress-under-contention)).
 
 **The coordinator's own member votes first, and its vote rides on the round.** Before the record fans out,
 `ClusterCoordinator.prevoteLocalPromise` delivers it to this node's own member in process and merges that
@@ -638,7 +643,7 @@ export function resolveRace(existing: ClusterRecord, incoming: ClusterRecord): '
 `activeTransactions` doubles as each member's reservation table over blocks: while an entry sits
 there, `findConflict` measures every later transaction against it. A member drops an entry as soon as
 it can prove the transaction is finished — consensus reached, enough signed `reject` votes that
-super-majority is unreachable (`TransactionPhase.Rejected`), or enough `conflict` votes for the same
+super-majority is unreachable (`TransactionPhase.Rejected`), or enough transient refusals for the same
 (`TransactionPhase.ConflictSuperseded`) — including the case where the member's own vote is the one
 that makes it unreachable. A member never keeps a record it conflict-voted: it already holds the
 winner, and keeping the loser would reserve the same blocks twice. Absent such proof the only release

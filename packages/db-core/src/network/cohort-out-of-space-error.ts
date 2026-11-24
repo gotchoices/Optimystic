@@ -22,14 +22,16 @@ import type { CohortOutOfSpace, OutOfSpaceFailure } from "./struct.js";
  * all; and each write path (`Collection.sync`, `TransactionCoordinator.commit`) raises it again from
  * that refusal.
  *
- * NOTE: `classifyCommitFailure` has no arm for this class, so an offline drain sorts it as `unknown`
- * and treats the write as in doubt. Conservative and safe — the write was never stored, and a retry
- * under its own identity stores it once — but less specific than the facts allow. If a drain ever
- * needs to tell "the cohort has no room" from "we do not know what happened", give it its own class
- * there rather than folding it into `cohort-unreachable`, whose meaning is "too few members answered".
+ * NOTE: `classifyCommitFailure` has no arm for this class, so an offline drain sorts it as `unknown`.
+ * Conservative and safe — the write was never stored, and a retry under its own identity stores it
+ * once — but it also raises a counter documented as zero in a correct deployment and logs the failure
+ * as one nothing could name. Tracked, with the drain-behaviour decision it needs, in
+ * tickets/backlog/bug-a-full-cohort-refusal-reaches-the-offline-drain-unclassified.
  */
 export class CohortOutOfSpaceError extends Error {
-	/** Peer-id strings of the cohort members that voted `out-of-space`. Never empty. */
+	/** Peer-id strings of the cohort members that voted `out-of-space` — never empty for a refusal a
+	 *  consensus round produced; see {@link CohortOutOfSpace.peerIds} for the cohort-of-one case, which
+	 *  names only itself and names nobody when it does not know its own peer id. */
 	readonly peerIds: readonly string[];
 	/** Approve votes the round received. */
 	readonly approvals: number;

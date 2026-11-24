@@ -11,18 +11,20 @@
  * cohort of three or fewer members at the default super-majority, so a single member's "not right now"
  * expressed as a `reject` becomes a permanent `ValidatorRejectionError` for the whole transaction.
  *
- * Three claims, over the two tiers where they are observable:
+ * Four claims, over the three tiers where they are observable:
  *  - the member signs `out-of-space` (and only for a pend it would otherwise have APPROVED: a stale
  *    revision still wins, permanently, and a member with room still approves);
  *  - the member's own recomputed phase is the terminal-but-retryable one, not `Rejected`;
  *  - the writer's answer is the typed out-of-space refusal — RETURNED, not thrown — and neither a
- *    validator rejection nor a conflict-shaped `StaleFailure` the retry loop would absorb.
+ *    validator rejection nor a conflict-shaped `StaleFailure` the retry loop would absorb;
+ *  - a cohort of ONE, which casts no vote, answers the same refusal from the coordinating repo — and
+ *    exempts a write from the program on its own machine, whose limit is the allotment instead.
  */
 
 import { expect } from 'chai';
 import { localDurability, isConflictFailure, isOutOfSpaceFailure, clusterVoteVerificationPayload } from '@optimystic/db-core';
 import { clusterMember } from '../src/cluster/cluster-repo.js';
-import { CoordinatorRepo } from '../src/repo/coordinator-repo.js';
+import { CoordinatorRepo, coordinatorRepo } from '../src/repo/coordinator-repo.js';
 import { captureLog } from './support/capture-log.js';
 import type {
 	IRepo, ClusterRecord, RepoMessage, BlockGets, GetBlockResults, PendRequest, PendResult,
@@ -71,6 +73,11 @@ const makePend = (over: Partial<PendRequest> = {}): PendRequest => ({
 
 // ─── Member tier (harness mirrors cluster-pend-held-vote.spec.ts: v1 record driven through
 // member.update, the member's own vote read out of record.promises[self]) ───
+//
+// NOTE: everything from `canonicalJson` to `voteVerifies` below is copied from
+// cluster-pend-held-vote.spec.ts, which copied it from cluster-pend-staleness.spec.ts — three specs
+// now carry the same promise-vote harness. If a fourth needs it, move it to test/support/ (where
+// capture-log.ts and commit-proof-fixtures.ts already live) rather than copying it again.
 
 function canonicalJson(value: unknown): string {
 	return JSON.stringify(value, (_, v) =>
@@ -294,5 +301,52 @@ describe('CoordinatorRepo — a cohort with a full member answers out-of-space, 
 		expect(failure.outOfSpace?.approvals).to.equal(2);
 		expect(failure.outOfSpace?.needed).to.equal(3);
 		expect(storage.pendCalls, 'a refused pend must not reach local storage').to.equal(0);
+	});
+});
+
+// ─── Solo tier (a cohort of one casts no vote, so the coordinating repo answers the same refusal
+// itself — and exempts the program on this machine) ───
+
+/** A `CoordinatorRepo` whose cohort for the block is itself alone, at the given pressure. */
+const soloRepo = (storage: IRepo, self: PeerId, refusing: boolean): CoordinatorRepo => {
+	const clusterPeers = makeClusterPeers([self]);
+	const keyNetwork: IKeyNetwork = {
+		async findCoordinator() { return self; },
+		async findCluster() { return { ...clusterPeers }; }
+	};
+	return coordinatorRepo(keyNetwork, () => { throw new Error('a cohort of one runs no consensus'); }, cfg)({
+		storageRepo: storage,
+		localPeerId: self,
+		storagePressure: pressure(refusing)
+	});
+};
+
+describe('CoordinatorRepo — a solo node with no room refuses a pend, except one from its own program', () => {
+	it('refuses a pend from another machine with the typed answer, naming itself', async () => {
+		const { peerId } = await makeKeyPair();
+		const storage = new CountingStorageRepo();
+
+		const result = await soloRepo(storage, peerId, true).pend(makePend());
+
+		expect(result.success, 'a node with no room is a refusal, not a success').to.equal(false);
+		const failure = result as WriteFailure;
+		expect(isOutOfSpaceFailure(failure), 'the same typed answer a cohort produces by vote').to.equal(true);
+		expect(failure.outOfSpace?.peerIds, 'naming itself as the member with no room').to.deep.equal([peerId.toString()]);
+		expect(failure.outOfSpace?.approvals, 'the one member is the one that refused, so it approved nothing').to.equal(0);
+		expect(storage.pendCalls, 'a refused pend must not reach local storage').to.equal(0);
+	});
+
+	it('accepts a write from the program on this machine, which is gated at the allotment instead', async () => {
+		// The exemption is load-bearing on a cohort of one: what clears a full cohort is its members
+		// shedding to peers with room, and a cohort of one has no peer to shed to — so refusing here
+		// would stop a single-machine deployment writing at `refuseAbove`, with no path back but its
+		// operator raising the allotment. `OwnWriteRoom` is the limit the host's own writes meet.
+		const { peerId } = await makeKeyPair();
+		const storage = new CountingStorageRepo();
+
+		const result = await soloRepo(storage, peerId, true).pend(makePend(), { localWriter: true });
+
+		expect(result.success, 'its own writes are the work this node exists to do').to.equal(true);
+		expect(storage.pendCalls).to.equal(1);
 	});
 });

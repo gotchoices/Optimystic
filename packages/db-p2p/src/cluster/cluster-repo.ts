@@ -247,8 +247,8 @@ function equivocationKey(sig: Signature): string {
 /**
  * Widen a boolean-plus-prose check into a {@link PromiseVerdict}. Every check written this way refuses
  * with the `invalid` kind, unmarked — none of them re-checks the transaction itself; only
- * {@link ClusterMember.validatePendOperations} produces the `held` kind and a marked `invalid`, and it
- * builds those verdicts directly.
+ * {@link ClusterMember.validatePendOperations} produces the `held` and `out-of-space` kinds and a
+ * marked `invalid`, and it builds those verdicts directly.
  */
 function verdictOf(result: { valid: boolean; reason?: string }): PromiseVerdict {
 	return result.valid ? { valid: true } : invalidVerdict(result.reason);

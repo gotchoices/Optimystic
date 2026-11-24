@@ -3237,8 +3237,9 @@ export class CoordinatorRepo implements IRepo {
 	 * Without it, a full single-member deployment accepts writes from client nodes until its disk
 	 * fails a write.
 	 *
-	 * The refusal names this node as the peer that has no room, and claims one approval of the one it
-	 * needed, so the facts read the same shape as a cohort's.
+	 * The refusal names this node as the peer that has no room, and reports NO approval of the one it
+	 * needed, so the facts read the same shape as a cohort's: there, the members that refused are
+	 * exactly the ones missing from `approvals`, and here the one member is the one that refused.
 	 *
 	 * **A write from the program on this machine is exempt.** The node's own writes are refused later
 	 * than everybody else's — not at `refuseAbove`, where every inbound door refuses, but only once the
@@ -3256,7 +3257,7 @@ export class CoordinatorRepo implements IRepo {
 		this.log('pend:solo-out-of-space', { actionId: batch.actionId, blockId });
 		return new CohortOutOfSpaceError({
 			peerIds: selfId === undefined ? [] : [selfId],
-			approvals: 1,
+			approvals: 0,
 			peerCount: 1,
 			needed: 1
 		}).toFailure();

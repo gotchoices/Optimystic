@@ -484,7 +484,8 @@ export type CohortOutOfSpace = {
 	 * local peer id — a live node always has one).
 	 */
 	peerIds: string[];
-	/** Approve votes the round received. A cohort-of-one refusal reports its own one approval. */
+	/** Approve votes the round received, which never include a member that refused — so a cohort-of-one
+	 *  refusal reports none: its one member is the one with no room. */
 	approvals: number;
 	/** How many members the cohort the round ran on has; 1 for a cohort-of-one refusal. */
 	peerCount: number;

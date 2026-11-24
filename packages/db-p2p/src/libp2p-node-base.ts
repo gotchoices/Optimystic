@@ -3123,7 +3123,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		createClusterClient,
 		durabilityWindowFor,
 		// The out-of-space promise vote reads this node's last pressure sample; see
-		// `StoragePressureGate` in `cluster/cluster-repo.ts`.
+		// `StoragePressureGate` in `storage/storage-pressure.ts`.
 		storagePressure
 		// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 		// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
