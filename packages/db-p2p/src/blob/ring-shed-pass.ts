@@ -51,7 +51,7 @@ export interface RingShedBlobsDeps {
 	retainLost: (ref: BlobRef) => void;
 }
 
-/** What one pass did, for the caller's log and for tests. */
+/** What one pass did: the counts behind its own `shed:done` line, and what a test of the pass reads. */
 export interface RingShedOutcome {
 	/** Shed references whose release confirmed; their `responsible` hold has been dropped. */
 	released: BlobRef[];
@@ -75,9 +75,9 @@ export async function shedNarrowedBlobs(deps: RingShedBlobsDeps, narrowing: Ring
 	}
 	const { owners, unresolved } = await ownersOf(deps, shed);
 	const releasable = [...owners.keys()];
-	// `Math.max(1, …)` for the same reason the event arm applies it: a floor of zero would release a
-	// hold on nobody's word.
-	const { released, retained } = await deps.reaction.releaseLost(releasable, owners, Math.max(1, deps.floor()));
+	// The floor goes in raw, as the event arm's does: `releaseLost` is what floors it at 1, so a node
+	// whose cohort size reads as zero cannot release a hold on nobody's word whichever path reaches it.
+	const { released, retained } = await deps.reaction.releaseLost(releasable, owners, deps.floor());
 	// In turn, as the monitor's own handler applies them: each release is one serialized record write,
 	// and the holds feed untracks the reference when no `owed` hold remains, so nothing untracks here.
 	for (const ref of released) {
@@ -130,7 +130,12 @@ export async function selectShedBlobRefs(heldRefs: Iterable<string>, narrowing: 
  * NOTE: one `findCluster` per shed reference, in turn, as the monitor's own check makes one per tracked
  * id. A node narrowing out of a deep ring sheds most of what it holds, so this is the pass's cost; if
  * a narrowing ever shows up as slow, the lookups are independent and can go in a bounded parallel run
- * like the reaction's own arms.
+ * like the reaction's own arms. Some of those lookups are spent for nothing: `heldRefs` is the set
+ * kept for the network, which includes a reference held only `owed`, and the release arm discards one
+ * of those (`release:not-responsible`) after this has already looked its cohort up. Bounded by the
+ * blobs this node wrote itself and paid only on a narrowing, so it is left; the fix, if a writer that
+ * owes many blobs ever makes a narrowing expensive, is the one the tracked-set feed's own NOTE names —
+ * feed only `responsible` holds there — not a second responsibility read here.
  */
 async function ownersOf(
 	deps: RingShedBlobsDeps,

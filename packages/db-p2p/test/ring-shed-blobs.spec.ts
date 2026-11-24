@@ -58,8 +58,8 @@ describe('selectShedBlobRefs — which blobs a narrowed ring hands over', () => 
 
 		const shed = await selectShedBlobRefs(held, narrowing);
 
+		// `.members` without `.include` is set equality, so this also says what is NOT shed: nothing the
+		// new slice still covers, and nothing the old slice never covered.
 		expect(shed).to.have.members(givenUp);
-		expect(shed, 'nothing the new slice still covers, and nothing the old slice never covered')
-			.to.have.lengthOf(givenUp.length);
 	});
 });
