@@ -167,10 +167,10 @@ export class LevelDBJournalStore implements JournalStore<string> {
 	 * The whole database: every key and value below the piece range and above it, and the pieces'
 	 * lengths from their size keys (`measurePieces`), so the blob pieces sharing the handle are
 	 * counted once, here, without reading their bytes — `LevelDBPieceStore` reports this store's
-	 * identity, which tells `StorageMonitor` not to add them again.
+	 * identity, which tells `StorageAccount` not to add them again.
 	 */
 	// NOTE: full-scan byte sum of everything but the pieces — O(block-store bytes) per call. Fine as an
-	// advisory StorageMonitor input at current sizes; if a StorageMonitor ever polls this on a large
+	// advisory StorageAccount input at current sizes; if a StorageAccount ever polls this on a large
 	// db, replace with the kernel's incremental write-path counter (see the seam NOTE in
 	// kv-raw-storage.ts's saveMetadata). The piece range is measured from its size keys, 4 bytes per
 	// piece, so blob bytes never pass through the binding here.

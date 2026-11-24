@@ -59,7 +59,7 @@ export interface IPieceStore {
 	 * Optional: the identity of the location this store lives inside, in the scheme block stores use
 	 * (`RawStoreDriver.storeIdentity`). Equal to a block store's `getStoreIdentity()` exactly when
 	 * that block store's `getApproximateBytesUsed` already measures this store's bytes, which is
-	 * what `StorageMonitor` reads it for (`blockStoreCountsPieces`). Omitted by a store that lives
+	 * what `StorageAccount` reads it for (`blockStoreCountsPieces`). Omitted by a store that lives
 	 * nowhere a block store measures (memory); never a stub returning `undefined`.
 	 */
 	storeIdentity?(): StoreIdentity;

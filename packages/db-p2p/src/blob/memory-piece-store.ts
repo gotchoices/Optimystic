@@ -5,7 +5,7 @@ import type { IPieceStore } from './piece-store.js';
 /**
  * The in-memory {@link IPieceStore}, a node's default. Copies on `put` and on `get`, so no caller
  * ever holds the bytes it stores. Lives nowhere a block store measures, so it has no
- * `storeIdentity` and `StorageMonitor` always adds its figure.
+ * `storeIdentity` and `StorageAccount` always adds its figure.
  */
 export class MemoryPieceStore implements IPieceStore {
 	readonly durability: StoreDurability = 'none';

@@ -550,18 +550,20 @@ The storage layer maintains separate stores for:
 
 ### Capacity estimation and staleness
 
-`StorageMonitor.getCapacity` reports how full the store is. Used bytes come from the backend's
+`StorageAccount.capacity` reports how much of its allotment the node has used
+([db-p2p storage.md §9](../packages/db-p2p/docs/storage.md)). Used bytes come from the backend's
 `getApproximateBytesUsed`, which is a **full-store scan** (LevelDB iterates every key+value, the
-filesystem adapter stats the whole tree). Ring selection calls `getCapacity` several times per
-operation, so the scan is memoized behind a short TTL (`usedBytesCacheTtlMs`, default 60s; `0`
-disables it). Within the window callers share the cached value; concurrent misses share a single
-in-flight scan; a supplied `usedBytes`/`availableBytes` override bypasses the scan (and the cache)
-entirely. When the monitor is given a blob piece store (its optional third constructor argument;
-the node does not pass one yet), used bytes also include that store's own figure, read in the same
-scan, unless `blockStoreCountsPieces` in `packages/db-p2p/src/storage/store-coverage.ts` says the block
-store already measured it ([blobs.md §The local store](blobs.md#the-local-store)).
+filesystem adapter stats the whole tree). Ring selection calls `capacity` several times per
+operation, so the scan is memoized behind a short TTL (`storageAllotment.usedBytesCacheTtlMs`,
+default 60s; `0` disables it). Within the window callers share the cached value, and concurrent
+misses share a single in-flight scan. Used bytes also include the node's blob piece store's own
+figure, read in the same scan, unless `blockStoreCountsPieces` in
+`packages/db-p2p/src/storage/store-coverage.ts` says the block store already measured it
+([blobs.md §The local store](blobs.md#the-local-store)). The location's free space is read in that
+same scan, so the use and the room left can never come from different moments.
 
-Consequence: the reported `used`/`available`/`usedPercent` may lag reality by up to the TTL. This
+Consequence: the reported `usedBytes`/`availableBytes`, and the used fraction ring selection derives
+from them, may lag reality by up to the TTL. This
 staleness is acceptable — the sole consumer, ring selection (`RingSelector`), damps its move
 triggers with EWMA smoothing, a hysteresis dead-band, and a 10-minute minimum dwell. A ≤60s-stale
 reading cannot cause a wrong or premature ring move; at worst it delays one by up to the TTL, which

@@ -79,6 +79,7 @@ Each node maintains **references to nodes** in both inner and outer rings:
   - A high overlap factor signals an over abundance of storage, suggesting that **fewer** storage resources are needed.
   - A low overlap factor signals that **more** storage resources are needed.
 - **Damped ring-depth signal**: the per-node ring-depth target is `-log2(capacity/demand)`, but this is a reactive control loop and must **not** be applied to raw instantaneous samples — near a ring boundary that oscillates. The signal is smoothed, gated by a dead-band, and rate-limited by a minimum dwell time before it can trigger a move; see [arachnode-ring-handoff.md § Part 1](arachnode-ring-handoff.md#part-1--damping-the-ring-shift-decision).
+  - The `capacity` in that ratio is the node's **allotment** — how many bytes of the machine the operator gave the network — **bounded by what its disk will still hold**, less what the node has already stored ([db-p2p storage.md §9](../packages/db-p2p/docs/storage.md)). A node that knows neither figure has no capacity to put in the ratio: it takes the whole keyspace, advertises no capacity to its peers, and never moves on storage grounds.
 
 ### **Global Transaction Demand Management**:
 - **Cache Coverage Sampling**: Arachnode periodically samples the **cache coverage** (the percentage of keys that are present in the cache) across the rings.

@@ -156,10 +156,11 @@ export interface IRawStorage {
 	/**
 	 * Approximate bytes currently stored by this backend.
 	 *
-	 * Used by `StorageMonitor` to feed real used-space figures into ring selection.
-	 * Implementations should return their best cheap estimate (e.g. on-disk size for
-	 * filesystem backends, tracked footprint for in-memory backends). The result is
-	 * advisory — `StorageMonitor` treats a missing implementation as 0.
+	 * Read by `StorageAccount` as the whole of what the node has stored (its other two stores live
+	 * inside what this one measures — see `assertOneMeasuredLocation`), and so as the figure ring
+	 * selection prices its coverage against. Implementations should return their best cheap estimate
+	 * (e.g. on-disk size for filesystem backends, tracked footprint for in-memory backends). The
+	 * result is advisory — `StorageAccount` treats a missing implementation as 0.
 	 */
 	getApproximateBytesUsed?(): Promise<number>;
 

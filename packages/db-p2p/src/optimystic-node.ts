@@ -9,6 +9,7 @@ import type { ReactivityCollectionWatch } from './reactivity/collection-watch.js
 import type { PeerReputationService } from './reputation/peer-reputation.js';
 import type { ArrivalPushReceiver } from './matchmaking/arrival-push-receiver.js';
 import type { LinkDeadlines } from './rpc-deadline.js';
+import type { StorageAccount } from './storage/storage-account.js';
 import type { StorageRepo } from './storage/storage-repo.js';
 
 /**
@@ -76,6 +77,17 @@ export interface OptimysticNodeAttachmentsBase {
 	 * observes nothing the node stores. On a client, the clock mints the HLC of every write it sends.
 	 */
 	hlcClock: HlcClock;
+	/**
+	 * How many bytes of this machine this node may use and how many it has used
+	 * (`packages/db-p2p/docs/storage.md` §9), over the stores of `NodeOptions.storage` and the
+	 * allotment of `NodeOptions.storageAllotment`. One measurement per node, memoized for a minute:
+	 * ring selection prices its coverage from it, and an operator reads `capacity()` to see the
+	 * effective total — the allotment bounded by what the disk will still hold — rather than only the
+	 * figure they configured. On a client too, which fills the same disk with blob pieces. Its total
+	 * and available figures are ABSENT when the node knows neither an allotment nor a free-space
+	 * figure, and `usedBytes` may exceed the total on a node past its allotment.
+	 */
+	storageAccount: StorageAccount;
 	/**
 	 * The node's blob service (docs/blobs.md §The node's blob service), over the `pieces` of
 	 * `NodeOptions.storage` and the blob records in its `kv`. On a client too: the machine a blob is put on holds

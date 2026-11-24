@@ -3,6 +3,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys';
 import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { RingSelector, type RingSelectorConfig } from '../src/storage/ring-selector.js';
 import type { ArachnodeFretAdapter, ArachnodeInfo } from '../src/storage/arachnode-fret-adapter.js';
+import type { StorageCapacity } from '../src/storage/storage-account.js';
 
 /** Generate `n` real (base58-encodable) Ed25519 peer-id strings — what calculatePartition needs
  *  to reach p2p-fret's hashPeerId, which reads `peerId.toMultihash().bytes`. */
@@ -15,10 +16,10 @@ async function makeValidPeerIds(n: number): Promise<string[]> {
 	return ids;
 }
 
-/** Mock storage monitor that implements only the getCapacity method needed by RingSelector */
-class MockStorageMonitor {
-	private _total: number;
-	private _used: number;
+/** Mock storage account implementing only the `capacity` method RingSelector needs. */
+class MockStorageAccount {
+	private _total: number | undefined;
+	private _used = 0;
 
 	constructor(total: number, used: number) {
 		this._total = total;
@@ -30,12 +31,16 @@ class MockStorageMonitor {
 		this._used = used;
 	}
 
-	async getCapacity(): Promise<{ total: number; used: number; available: number }> {
-		return {
-			total: this._total,
-			used: this._used,
-			available: this._total - this._used
-		};
+	/** No allotment configured and a backend reporting no free space: the node cannot measure its storage. */
+	setUnknownCapacity(): void {
+		this._total = undefined;
+		this._used = 0;
+	}
+
+	async capacity(): Promise<StorageCapacity> {
+		return this._total === undefined
+			? { usedBytes: this._used }
+			: { allotmentBytes: this._total, totalBytes: this._total, usedBytes: this._used, availableBytes: Math.max(0, this._total - this._used) };
 	}
 }
 
@@ -66,9 +71,9 @@ class FakeClock {
 	advance(ms: number): void { this.t += ms; }
 }
 
-/** Build a minimal advertised ArachnodeInfo at ring `ringDepth`. Capacity fields are unused here. */
+/** Build a minimal advertised ArachnodeInfo at ring `ringDepth`. Only its ring is read here, so it advertises no capacity. */
 function advertise(ringDepth: number, status: ArachnodeInfo['status'] = 'active'): ArachnodeInfo {
-	return { ringDepth, capacity: { total: 0, used: 0, available: 0 }, status };
+	return { ringDepth, status };
 }
 
 describe('RingSelector', () => {
@@ -80,7 +85,7 @@ describe('RingSelector', () => {
 		}
 	};
 
-	let monitor: MockStorageMonitor;
+	let account: MockStorageAccount;
 	let fretAdapter: MockFretAdapter;
 	let selector: RingSelector;
 	let peerIds: string[];
@@ -90,47 +95,56 @@ describe('RingSelector', () => {
 	});
 
 	beforeEach(() => {
-		monitor = new MockStorageMonitor(1024 * 1024 * 1024, 0); // 1GB total, 0 used
+		account = new MockStorageAccount(1024 * 1024 * 1024, 0); // 1GB total, 0 used
 		fretAdapter = new MockFretAdapter();
-		// Cast monitor to satisfy the type - RingSelector only uses getCapacity()
-		selector = new RingSelector(fretAdapter as any, monitor as any, defaultConfig);
+		// Cast the account to satisfy the type - RingSelector only uses capacity()
+		selector = new RingSelector(fretAdapter as any, account as any, defaultConfig);
 	});
 
 	describe('determineRing', () => {
 		it('returns -1 when capacity below minimum', async () => {
-			monitor.setCapacity(512 * 1024, 0); // 512KB, below 1MB minimum
+			account.setCapacity(512 * 1024, 0); // 512KB, below 1MB minimum
 			const ring = await selector.determineRing();
 			expect(ring).to.equal(-1);
 		});
 
+		it('answers ring 0, not -1, when the node cannot measure its storage', async () => {
+			// Unknown is not "low": -1 means "below minCapacity", a claim a node with no figure has
+			// not established. Ring 0 (the whole keyspace) is also where observed ring stats cannot
+			// specialize such a node away from.
+			account.setUnknownCapacity();
+			fretAdapter.setRingStats([{ ringDepth: 0, peerCount: 8, avgCapacity: 100 * 1024 * 1024 }]);
+			expect(await selector.determineRing()).to.equal(0);
+		});
+
 		it('returns ring 0 for very large capacity', async () => {
 			// With huge capacity relative to estimated data, ring 0 (full keyspace)
-			monitor.setCapacity(1024 * 1024 * 1024 * 10, 0); // 10GB
+			account.setCapacity(1024 * 1024 * 1024 * 10, 0); // 10GB
 			const ring = await selector.determineRing();
 			expect(ring).to.equal(0);
 		});
 
 		it('returns higher ring depth for smaller capacity', async () => {
 			// With less capacity, need more partitions
-			monitor.setCapacity(10 * 1024 * 1024, 0); // 10MB
+			account.setCapacity(10 * 1024 * 1024, 0); // 10MB
 			const ring = await selector.determineRing();
 			expect(ring).to.be.greaterThan(0);
 		});
 
 		it('caps ring depth at 16', async () => {
 			// Extremely small capacity should still cap at ring 16
-			monitor.setCapacity(1024 * 1024, 0); // Exactly at minimum
+			account.setCapacity(1024 * 1024, 0); // Exactly at minimum
 			const ring = await selector.determineRing();
 			expect(ring).to.be.at.most(16);
 		});
 
 		it('ring depth increases as available capacity decreases', async () => {
 			// First measurement with lots of capacity
-			monitor.setCapacity(1024 * 1024 * 1024, 0); // 1GB available
+			account.setCapacity(1024 * 1024 * 1024, 0); // 1GB available
 			const ring1 = await selector.determineRing();
 
 			// Second measurement with less capacity (90% used)
-			monitor.setCapacity(1024 * 1024 * 1024, 900 * 1024 * 1024); // 100MB available
+			account.setCapacity(1024 * 1024 * 1024, 900 * 1024 * 1024); // 100MB available
 			const ring2 = await selector.determineRing();
 
 			expect(ring2).to.be.at.least(ring1);
@@ -142,7 +156,7 @@ describe('RingSelector', () => {
 			fretAdapter.setRingStats([
 				{ ringDepth: 0, peerCount: 4, avgCapacity: 100 * 1024 * 1024 }
 			]);
-			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB available
+			account.setCapacity(100 * 1024 * 1024, 0); // 100MB available
 			const ring = await selector.determineRing();
 			expect(ring).to.equal(2);
 		});
@@ -154,14 +168,14 @@ describe('RingSelector', () => {
 				{ ringDepth: 0, peerCount: 1, avgCapacity: 1024 * 1024 * 1024 },
 				{ ringDepth: 4, peerCount: 8, avgCapacity: 100 * 1024 * 1024 }
 			]);
-			monitor.setCapacity(100 * 1024 * 1024, 0);
+			account.setCapacity(100 * 1024 * 1024, 0);
 			const ring = await selector.determineRing();
 			expect(ring).to.equal(5);
 		});
 
 		it('ring depth grows as observed network capacity grows (more peers)', async () => {
 			// Hold local capacity fixed; increase network capacity -> ring depth must rise.
-			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB local
+			account.setCapacity(100 * 1024 * 1024, 0); // 100MB local
 
 			fretAdapter.setRingStats([
 				{ ringDepth: 0, peerCount: 2, avgCapacity: 100 * 1024 * 1024 } // 200MB network
@@ -177,7 +191,7 @@ describe('RingSelector', () => {
 		});
 
 		it('ring depth shrinks as observed network capacity shrinks (fewer peers)', async () => {
-			monitor.setCapacity(100 * 1024 * 1024, 0); // 100MB local
+			account.setCapacity(100 * 1024 * 1024, 0); // 100MB local
 
 			fretAdapter.setRingStats([
 				{ ringDepth: 0, peerCount: 64, avgCapacity: 100 * 1024 * 1024 } // 6.4GB network
@@ -195,7 +209,7 @@ describe('RingSelector', () => {
 		it('falls back to constant-based estimate when no ring stats are observed (bootstrap)', async () => {
 			// Empty stats -> bootstrap: estimatedTotalData = 100MB. With 10GB local, coverage >> 1, ring = 0.
 			fretAdapter.setRingStats([]);
-			monitor.setCapacity(10 * 1024 * 1024 * 1024, 0);
+			account.setCapacity(10 * 1024 * 1024 * 1024, 0);
 			const ring = await selector.determineRing();
 			expect(ring).to.equal(0);
 		});
@@ -267,21 +281,31 @@ describe('RingSelector', () => {
 				minDwellMs: dwellMs,
 				now: clock.now
 			};
-			selector = new RingSelector(fretAdapter as any, monitor as any, dampedConfig);
+			selector = new RingSelector(fretAdapter as any, account as any, dampedConfig);
 		});
 
 		/**
 		 * Drive the demand signal so the *smoothed* continuous depth equals `d` on the first sample
 		 * (EWMA seeds from the first sample, so seeded value == raw). `coverage = available/totalData
-		 * = 2^-d`; usedPercent is set independently via the monitor. total defaults to 1 GB.
+		 * = 2^-d`; usedPercent is set independently via the account. total defaults to 1 GB.
 		 */
 		function setSignal(usedPercent: number, d: number, total = 1024 * 1024 * 1024): void {
 			const used = Math.round(usedPercent * total);
-			monitor.setCapacity(total, used);
+			account.setCapacity(total, used);
 			const available = total - used;
 			const totalData = available * Math.pow(2, d);
 			fretAdapter.setRingStats([{ ringDepth: 0, peerCount: 1, avgCapacity: totalData }]);
 		}
+
+		it('declines to move when the node cannot measure its storage', async () => {
+			// Separate rule from determineRing's ring-0 answer: this node sits where the raw signal
+			// would otherwise move it out, and must still decline rather than seed its EWMA from a
+			// total that does not exist.
+			fretAdapter.setMyArachnodeInfo(advertise(2));
+			setSignal(0.9, 3.0);
+			account.setUnknownCapacity();
+			expect((await selector.shouldTransition()).shouldMove).to.equal(false);
+		});
 
 		it('no move when depth sits inside the dead-band and usage is normal', async () => {
 			fretAdapter.setMyArachnodeInfo(advertise(3));
@@ -442,18 +466,18 @@ describe('RingSelector', () => {
 
 	describe('createArachnodeInfo', () => {
 		it('creates valid info for normal capacity', async () => {
-			monitor.setCapacity(1024 * 1024 * 1024, 100 * 1024 * 1024); // 1GB total, 100MB used
+			account.setCapacity(1024 * 1024 * 1024, 100 * 1024 * 1024); // 1GB total, 100MB used
 			const info = await selector.createArachnodeInfo(peerIds[0]!);
 
 			expect(info.ringDepth).to.be.at.least(0);
-			expect(info.capacity.total).to.equal(1024 * 1024 * 1024);
-			expect(info.capacity.used).to.equal(100 * 1024 * 1024);
-			expect(info.capacity.available).to.equal(924 * 1024 * 1024);
+			expect(info.capacity!.total).to.equal(1024 * 1024 * 1024);
+			expect(info.capacity!.used).to.equal(100 * 1024 * 1024);
+			expect(info.capacity!.available).to.equal(924 * 1024 * 1024);
 			expect(info.status).to.equal('active');
 		});
 
 		it('handles below-minimum capacity gracefully', async () => {
-			monitor.setCapacity(100, 0); // Way below minimum
+			account.setCapacity(100, 0); // Way below minimum
 			const info = await selector.createArachnodeInfo(peerIds[0]!);
 
 			// ringDepth becomes max(0, -1) = 0 when below minimum
@@ -465,7 +489,7 @@ describe('RingSelector', () => {
 			// 50MB available against the bootstrap 100MB estimate → coverage 0.5 → ring 1. With a real
 			// peer id calculatePartition succeeds, so a ring > 0 node DOES publish a partition (the
 			// pre-fix throw would have left partition unset and never surfaced here).
-			monitor.setCapacity(50 * 1024 * 1024, 0);
+			account.setCapacity(50 * 1024 * 1024, 0);
 			const info = await selector.createArachnodeInfo(peerIds[2]!);
 
 			expect(info.ringDepth).to.be.greaterThan(0);

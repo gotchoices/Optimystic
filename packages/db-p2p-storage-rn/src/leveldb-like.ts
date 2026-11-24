@@ -22,7 +22,7 @@
  * The scheme of the `StoreIdentity` every store over one `LevelDBLike` reports
  * (`identityForHandle(LEVELDB_HANDLE_SCHEME, db)`): `LevelDBJournalStore`, and so
  * `LevelDBRawStorage.getStoreIdentity`, and `LevelDBPieceStore`. One handle, one
- * identity, which is how `StorageMonitor` knows the block store's byte count
+ * identity, which is how `StorageAccount` knows the block store's byte count
  * already includes the pieces (`blockStoreCountsPieces`).
  */
 export const LEVELDB_HANDLE_SCHEME = 'leveldb-handle';

@@ -42,7 +42,7 @@ function isProofRef(entry: StoredProofEntry): entry is ProofRef {
 export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawStorage {
 	/**
 	 * Optional passthroughs are wired in the constructor ONLY when the driver
-	 * provides them, so a `StorageMonitor` / owned-block seed that feature-detects
+	 * provides them, so a `StorageAccount` / owned-block seed that feature-detects
 	 * (`typeof storage.listBlockIds === 'function'`) sees the driver's true
 	 * capability instead of a stub that silently reports 0 / no seed. The same rule
 	 * governs `getStoreIdentity`: a stub returning `undefined` would make every store
@@ -112,7 +112,7 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	// saveProofEntry / saveCommitProof / storeCommitProofIfAbsent / saveMaterializedBlock). This is the single choke point where an incremental
 	// byte counter would hook in, replacing the per-driver full-scan
 	// getApproximateBytesUsed. The chosen capacity-estimate mechanism is instead a
-	// short-TTL cache over the full scan in StorageMonitor (see storage-monitor.ts
+	// short-TTL cache over the full scan in StorageAccount (see storage-account.ts
 	// `usedBytesCacheTtlMs`) — backend-agnostic, no write-path changes, and ring
 	// selection tolerates the bounded staleness by design. The counter remains a
 	// future option only if TTL staleness ever proves insufficient; do NOT

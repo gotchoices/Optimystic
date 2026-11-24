@@ -152,8 +152,8 @@ database created before the table existed gains it, empty, on its next open.
 
 `getApproximateBytesUsed()` returns `page_count × page_size` from PRAGMAs.
 This is the SQLite database-file footprint; it is **not** a per-block figure.
-That's adequate for `StorageMonitor` — which uses the value as an advisory
-ring-selection input.
+That's adequate for `StorageAccount` — which uses the value as the node's
+measured use, an advisory ring-selection input.
 
 There is **no free-space figure**: this package is handed an already-open
 database, not a path, and NativeScript offers no free-space call reachable from a

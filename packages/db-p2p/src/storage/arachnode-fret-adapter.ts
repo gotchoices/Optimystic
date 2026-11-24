@@ -14,8 +14,14 @@ export interface ArachnodeInfo {
 		prefixValue: number;
 	};
 
-	/** Storage capacity in bytes */
-	capacity: {
+	/**
+	 * Storage capacity in bytes, present exactly when this node knows its effective total — an
+	 * allotment the operator configured, or the free space its backend reports, or both
+	 * (`StorageAccount`). ABSENT when it knows neither: a node that cannot measure its storage
+	 * advertises nothing rather than a made-up figure, and every reader of a peer's capacity must
+	 * treat its absence as "this peer did not say", never as zero.
+	 */
+	capacity?: {
 		total: number;
 		used: number;
 		available: number;
@@ -124,6 +130,13 @@ export class ArachnodeFretAdapter {
 
 	/**
 	 * Get statistics about discovered rings.
+	 *
+	 * A peer that advertises NO capacity ({@link ArachnodeInfo.capacity} absent — it cannot measure
+	 * its storage) is left out of both the peer count and the capacity total, so `avgCapacity` stays
+	 * an average over the peers that actually said. The aggregate is a sum of what peers claim, and a
+	 * peer claiming nothing must not be read as claiming zero. A ring where nobody said therefore
+	 * yields no stat at all, which `RingSelector.estimateNetworkData` falls through to its bootstrap
+	 * estimate for.
 	 */
 	getRingStats(): Array<{ ringDepth: number; peerCount: number; avgCapacity: number }> {
 		const peers = this.fret.listPeers();
@@ -131,7 +144,7 @@ export class ArachnodeFretAdapter {
 
 		for (const peer of peers) {
 			const arachnode = peer.metadata?.[ArachnodeFretAdapter.ARACHNODE_KEY] as ArachnodeInfo | undefined;
-			if (arachnode) {
+			if (arachnode?.capacity) {
 				const existing = ringMap.get(arachnode.ringDepth) ?? { count: 0, totalCapacity: 0 };
 				ringMap.set(arachnode.ringDepth, {
 					count: existing.count + 1,

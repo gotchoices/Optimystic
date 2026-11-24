@@ -67,11 +67,11 @@ class PeerSession {
 	private session: NetworkSession | null = null;
 	private rl: readline.Interface | null = null;
 
-	private parseStorageCapacity(options: { storageCapacity?: string }): number | undefined {
-		if (!options.storageCapacity) return undefined;
-		const parsed = Number(options.storageCapacity);
+	private parseStorageAllotment(options: { storageAllotment?: string }): number | undefined {
+		if (!options.storageAllotment) return undefined;
+		const parsed = Number(options.storageAllotment);
 		if (!Number.isFinite(parsed) || parsed <= 0) {
-			throw new Error('--storage-capacity must be a positive number of bytes');
+			throw new Error('--storage-allotment must be a positive number of bytes');
 		}
 		return parsed;
 	}
@@ -188,7 +188,7 @@ class PeerSession {
 		return finalCount > 0;
 	}
 
-	private logRingInfo(node: any, totalCapacityOverride?: number): void {
+	private async logRingInfo(node: any): Promise<void> {
 		const fret = (node as any).services?.fret;
 		if (!fret) {
 			logDebug('ring info unavailable (no FRET service)');
@@ -207,9 +207,10 @@ class PeerSession {
 		if (stats.length) {
 			logDebug('ring statistics', stats);
 		}
-		if (totalCapacityOverride) {
-			logDebug('storage capacity override active', { bytes: totalCapacityOverride });
-		}
+		// The account's own figures, not the flag that was typed: an allotment larger than the disk is
+		// bounded by the disk, and a node with neither an allotment nor a free-space figure has no
+		// total at all — both of which an operator can only see from here.
+		logDebug('storage account', await node.storageAccount.capacity());
 	}
 
 	private async ensureDiary(name: string): Promise<Diary<any>> {
@@ -236,7 +237,7 @@ class PeerSession {
 		fretProfile?: 'edge' | 'core';
 		storage?: 'memory' | 'file';
 		storagePath?: string;
-		storageCapacity?: string;
+		storageAllotment?: string;
 		clusterSize?: string;
 		assumedClusterSize?: string;
 		repairCorroborationClusterSize?: string;
@@ -351,11 +352,11 @@ class PeerSession {
 			}
 		}
 
-		const storageCapacityBytes = this.parseStorageCapacity(options);
-		if (storageCapacityBytes) {
-			const humanReadable = storageCapacityBytes >= 1024 * 1024 * 1024 ? `${(storageCapacityBytes / (1024 * 1024 * 1024)).toFixed(2)} GB` : `${storageCapacityBytes} bytes`;
-			console.log(`📦 Storage capacity override set to ${humanReadable}`);
-			logDebug('storage capacity override set', { bytes: storageCapacityBytes, human: humanReadable });
+		const storageAllotmentBytes = this.parseStorageAllotment(options);
+		if (storageAllotmentBytes) {
+			const humanReadable = storageAllotmentBytes >= 1024 * 1024 * 1024 ? `${(storageAllotmentBytes / (1024 * 1024 * 1024)).toFixed(2)} GB` : `${storageAllotmentBytes} bytes`;
+			console.log(`📦 Storage allotment set to ${humanReadable}`);
+			logDebug('storage allotment set', { bytes: storageAllotmentBytes, human: humanReadable });
 		}
 		const clusterSize = this.parseClusterSize(options);
 		if (clusterSize !== undefined) {
@@ -382,7 +383,7 @@ class PeerSession {
 			bootstrapCount: bootstrapNodes.length,
 			storage: options.storage,
 			storagePath: options.storagePath,
-			storageCapacityBytes,
+			storageAllotmentBytes,
 			clusterSize,
 			assumedClusterSize,
 			repairCorroborationClusterSize,
@@ -425,9 +426,9 @@ class PeerSession {
 				|| repairCorroborationClusterSize !== undefined
 				? { superMajorityThreshold, assumedClusterSize, repairCorroborationClusterSize }
 				: undefined,
+			storageAllotment: storageAllotmentBytes ? { bytes: storageAllotmentBytes } : undefined,
 			arachnode: {
-				enableRingZulu: true,
-				storage: storageCapacityBytes ? { totalBytes: storageCapacityBytes } : undefined
+				enableRingZulu: true
 			}
 		}).catch(async (err: unknown) => {
 			// The factory stops a node whose wiring failed, but the stores are ours to close.
@@ -527,7 +528,7 @@ class PeerSession {
 
 		// Wait for FRET to be ready
 		await this.waitForFretReady(node);
-		this.logRingInfo(node, storageCapacityBytes);
+		await this.logRingInfo(node);
 
 		// Optionally announce node info to a file for launchers/mesh setups
 		if (options.announceFile) {
@@ -553,7 +554,7 @@ class PeerSession {
 			console.log('🔄 Bootstrapping to network...');
 			await new Promise(resolve => setTimeout(resolve, 2000));
 			console.log('✅ Network bootstrap complete');
-			this.logRingInfo(node, storageCapacityBytes);
+			await this.logRingInfo(node);
 
 			// Wait for FRET to discover peers (best effort, non-blocking)
 			// FRET neighbor announcements happen asynchronously and take time to propagate
@@ -833,7 +834,7 @@ function withCommonPeerOptions(cmd: Command): Command {
 		.option('--fret-profile <profile>', "FRET profile: 'edge' or 'core'", 'edge')
 		.option('-s, --storage <type>', 'Storage type: memory or file', 'memory')
 		.option('--storage-path <path>', 'Path for file storage')
-		.option('--storage-capacity <bytes>', 'Override storage capacity in bytes (for ring selection)')
+		.option('--storage-allotment <bytes>', 'How many bytes of this machine to give the network (bounded by what the disk will still hold)')
 		.option('--cluster-size <number>', 'Desired cluster size per key (positive integer)')
 		.option('--assumed-cluster-size <number>', 'Smallest cohort this deployment can genuinely field. Sets both the membership admission gate\'s fallback floor (used when the node has no confident network-size estimate; defaults to 2 when unset) and the read-repair/reconcile corroboration floor (unless --repair-corroboration-cluster-size is given; falls back to --cluster-size when neither is set). A mesh smaller than --cluster-size needs this (or --repair-corroboration-cluster-size) to repair damaged blocks')
 		.option('--repair-corroboration-cluster-size <number>', 'Cohort size the read-repair/reconcile corroboration floor alone is measured against (positive integer). Unlike --assumed-cluster-size this does NOT raise the membership admission gate\'s low-confidence write floor, so it tightens repair without risking refused writes. Wins over --assumed-cluster-size for the repair floor; defaults to --assumed-cluster-size, then --cluster-size')

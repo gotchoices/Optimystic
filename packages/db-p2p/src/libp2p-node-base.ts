@@ -22,7 +22,6 @@ import { durabilityWindowMs, resolveDurabilityWindowPolicy, type DurabilityWindo
 import { memoryNodeStorage, type NodeStorage } from './storage/node-storage.js';
 import { KvUnderReplicationLedger } from './repo/kv-under-replication-ledger.js';
 import { KvHlcClockStore } from './storage/kv-hlc-clock-store.js';
-import type { IPieceStore } from './blob/piece-store.js';
 import { LocalBlobService } from './blob/local-blob-service.js';
 import { BlobCacheBudget, DEFAULT_BLOB_CACHE_BUDGET_BYTES } from './blob/cache-budget.js';
 import { blobProtocolService } from './blob/blob-protocol-service.js';
@@ -85,10 +84,10 @@ import { resolveBootstrapContactTimeoutMs, resolveLibp2pDialTimeoutMs, resolveLi
 import type { ClusterLatestAnswer, ClusterLatestCallback } from './repo/coordinator-repo.js';
 import type { ClusterLatestBatchCallback } from './repo/consult-round.js';
 import { RestorationCoordinator } from './storage/restoration-coordinator.js';
-import { RingSelector } from './storage/ring-selector.js';
+import { DEFAULT_MIN_RING_CAPACITY_BYTES, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
-import { StorageMonitor } from './storage/storage-monitor.js';
-import type { StorageMonitorConfig } from './storage/storage-monitor.js';
+import { StorageAccount } from './storage/storage-account.js';
+import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
 import type { FretService } from 'p2p-fret';
@@ -323,6 +322,19 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 */
 	storageDurability?: StorageDurabilityOptions;
 	/**
+	 * How many bytes of this machine the operator gave the network, and the memoization seams of the
+	 * measurement against it (`StorageAllotmentOptions`). `bytes` absent means "as much as the disk
+	 * has", and then the node's effective total is whatever its backend reports as still free; when
+	 * the backend reports no free space either (SQLite, LevelDB, memory, a web store under Node) the
+	 * node cannot tell how full it is, says so in a `node-wiring` `WARN:` line at start-up, takes the
+	 * whole keyspace, and never shifts rings on storage grounds. An allotment larger than the disk is
+	 * bounded by the disk. `bytes` must be an integer above 0 or node construction throws.
+	 *
+	 * NOT a serving-only option: a client node fills the same disk with blob records, blob pieces and
+	 * the owed-blob ledger, so it is given an allotment too and exposes the same `node.storageAccount`.
+	 */
+	storageAllotment?: StorageAllotmentOptions;
+	/**
 	 * The blob service's settings. `digest` is the hashing port that names every piece (docs/blobs.md
 	 * §References and pieces), default `defaultBlobDigest()`. A supplied digest is used as given:
 	 * checking it against the known answers (`checkBlobDigest` in `@optimystic/db-core`) before handing
@@ -397,10 +409,13 @@ export type NodeOptions = ClusterPolicyOptions & {
 	 */
 	responsibilityK?: number;
 
-	/** Arachnode storage configuration */
+	/**
+	 * Arachnode ring membership. The node's storage figure is NOT here — it is
+	 * {@link NodeOptions.storageAllotment}, a top-level option, because it is about this machine's
+	 * disk rather than about ring membership and a client node has one too.
+	 */
 	arachnode?: {
 		enableRingZulu?: boolean; // default: true
-		storage?: StorageMonitorConfig;
 	};
 
 	/**
@@ -871,6 +886,63 @@ function durabilityWindowClause(durability: StoreDurability, policy: DurabilityW
 	}
 }
 
+/** Bytes as an operator would read them in a start-up line: the largest binary unit that leaves a number at or above 1. */
+function formatBytes(bytes: number): string {
+	const units = ['bytes', 'KiB', 'MiB', 'GiB', 'TiB'] as const;
+	let scaled = bytes;
+	let unit = 0;
+	while (scaled >= 1024 && unit < units.length - 1) {
+		scaled /= 1024;
+		unit++;
+	}
+	return unit === 0 ? `${bytes} bytes` : `${scaled.toFixed(2)} ${units[unit]}`;
+}
+
+/**
+ * Report, once at start-up and on either role, how many bytes this node may use and how much of them
+ * it has used — the line that replaces the invented 10 GB total a node used to believe in. Keep this
+ * the ONE line that says so, as {@link logStorageDurability} is the one line about what a write
+ * survives.
+ *
+ * Both figures can be unknown, and then the line is a `WARN:`: ring selection cannot price this
+ * node's coverage, so it takes the whole keyspace and never shifts on storage grounds (see
+ * `RingSelector.determineRing` / `shouldTransition`), which an operator who meant to give the
+ * network a slice of a disk needs to be told.
+ *
+ * Costs the account's first scan, which the memo then serves to ring selection for the next minute.
+ * A scan that REJECTS is reported and swallowed: this line is a report, and failing node
+ * construction over it would make an unreadable directory fatal to a node that may never read it (a
+ * client's block store).
+ */
+async function logStorageAllotment(account: StorageAccount): Promise<void> {
+	let capacity: StorageCapacity;
+	try {
+		capacity = await account.capacity();
+	} catch (err) {
+		wiringLog('WARN: storage allotment: measuring the storage of this node failed, so it cannot yet tell how full it is: %e', err);
+		return;
+	}
+	const { allotmentBytes, locationBytes, totalBytes, usedBytes } = capacity;
+	if (totalBytes === undefined) {
+		wiringLog('WARN: storage allotment: no NodeOptions.storageAllotment.bytes was set and this storage backend reports no free space, so this node cannot tell how full it is. Ring selection will neither narrow nor widen on storage grounds until an allotment is set: the node takes the whole keyspace (ring 0) and never shifts. Set NodeOptions.storageAllotment.bytes to the number of bytes of this machine you gave the network.');
+		return;
+	}
+	const allotmentClause = allotmentBytes === undefined
+		? 'no allotment configured, so as much as the disk has'
+		: `allotment ${formatBytes(allotmentBytes)}`;
+	const locationClause = locationBytes === undefined
+		? 'this storage backend reports no free space'
+		: `this location holds ${formatBytes(locationBytes)} in all`;
+	wiringLog('storage allotment: %s; %s — so this node may use %s, of which %s is used',
+		allotmentClause, locationClause, formatBytes(totalBytes), formatBytes(usedBytes));
+	// Said separately because it is a different fact: such a node is below the floor for serving ANY
+	// ring, so it will hold nothing for the network however much of its allotment is free.
+	if (allotmentBytes !== undefined && allotmentBytes < DEFAULT_MIN_RING_CAPACITY_BYTES) {
+		wiringLog('storage allotment: %s is below the %s a node needs to serve any ring, so this node will serve no part of the keyspace',
+			formatBytes(allotmentBytes), formatBytes(DEFAULT_MIN_RING_CAPACITY_BYTES));
+	}
+}
+
 /**
  * Resolve the node's storage: whatever the host supplied, or `memoryNodeStorage()` with ONE
  * `node-wiring` `WARN:` line naming everything the node is then keeping in memory and what is lost
@@ -913,6 +985,21 @@ function resolveBlobCacheBudgetBytes(declared: number | undefined): number {
 		throw new RangeError(`blobs.cacheBudgetBytes must be an integer number of bytes at or above 0, got ${declared}`);
 	}
 	return declared;
+}
+
+/**
+ * Throw unless the declared allotment is a number of bytes a node could be given. Throws rather than
+ * clamping, the rule {@link resolveBlobCacheBudgetBytes} follows: an operator who meant to give the
+ * network 10 GB and typed something else must be told, not quietly given a different figure to hold
+ * blocks against. Absent is a value — "as much as the disk has".
+ */
+function assertStorageAllotmentBytes(declared: number | undefined): void {
+	if (declared === undefined) {
+		return;
+	}
+	if (!Number.isSafeInteger(declared) || declared <= 0) {
+		throw new RangeError(`storageAllotment.bytes must be an integer number of bytes above 0, got ${declared}`);
+	}
 }
 
 /**
@@ -1274,6 +1361,22 @@ export async function createLibp2pNodeBase(
 	// Here for the same reason, and because this one decides when data is DELETED: a host that
 	// mistyped the grace period is told before the node starts reclaiming on it.
 	const blobReclaimGraceMs = resolveReclaimGraceMs(options.blobs?.reclaimGraceMs);
+	// Checked here, for the third time for the same reason: a host that mistyped the allotment is
+	// told before anything starts rather than being given a different figure to hold blocks against.
+	assertStorageAllotmentBytes(options.storageAllotment?.bytes);
+	// The node's ONE accounting of its disk, on either role and OUTSIDE the arachnode gate below, so
+	// ring selection, the blob cache budget and an operator's dashboard read one memoized scan rather
+	// than each forming its own opinion of how full the machine is. A client has one because it fills
+	// the same disk — blob records, blob pieces, the owed-blob ledger — even though nothing on it
+	// reads the account yet.
+	const storageAccount = new StorageAccount(nodeStorage, options.storageAllotment);
+	// Before anything starts, beside the durability line, and awaited so an operator reading the
+	// start-up log sees the allotment next to what the node's writes survive.
+	// NOTE: this makes every node construction wait on one block-store scan — a directory walk on a
+	// file host. A serving node already paid it inside `createArachnodeInfo`; a client node did not.
+	// If a host ever reports a slow start over a very large store, log the line from a void promise
+	// instead of awaiting it, or seed it from the first ring-selection scan.
+	await logStorageAllotment(storageAccount);
 	// Bound after libp2p has started, below, since the receiver needs the node's key network and fetcher
 	// while the service entry is built before them.
 	let blobReceiver: BlobAnnounceReceiver | undefined;
@@ -1750,7 +1853,7 @@ export async function createLibp2pNodeBase(
 		const served = serving
 			? await wireServingRole({
 				node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore,
+				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
 				partitionDetector
 			})
 			: undefined;
@@ -2079,6 +2182,7 @@ export async function createLibp2pNodeBase(
 			linkDeadlines,
 			cohortReachability,
 			hlcClock,
+			storageAccount,
 			blobs: nodeBlobs,
 			blobReclaim,
 		};
@@ -2647,8 +2751,8 @@ interface ServingRoleContext {
 	onCommitCertificate: CommitCertificateSink | undefined;
 	membership: NetworkMembershipGate | undefined;
 	networkManager: NetworkManagerService | undefined;
-	/** The blob service's piece store, whose bytes the Arachnode storage monitor counts toward this node's use. */
-	pieceStore: IPieceStore;
+	/** The node's one storage accounting, built for both roles; ring selection prices its coverage from it. */
+	storageAccount: StorageAccount;
 	/** The node's one partition detector, built beside the key network; this role is the only half that feeds it. */
 	partitionDetector: PartitionDetector;
 }
@@ -2679,7 +2783,7 @@ interface ServingRole {
 async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	const {
 		node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
-		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, pieceStore,
+		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
 		partitionDetector
 	} = ctx;
 	const { storageRepo, rawStorage, underReplicationLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
@@ -3155,11 +3259,11 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			// a move-out is unsafe without the confirm/release path.
 			let ringShift: RingShiftCoordinator | undefined;
 
-			// Piece bytes count toward this node's use once: added here unless the block store already
-			// measures them (`blockStoreCountsPieces`).
-			const storageMonitor = new StorageMonitor(rawStorage, options.arachnode?.storage ?? {}, pieceStore);
-			const ringSelector = new RingSelector(fretAdapter, storageMonitor, {
-				minCapacity: 100 * 1024 * 1024,
+			// The node's own account, built once above for both roles — not a second one over the same
+			// stores, which would scan the disk twice and could disagree with the figure the start-up
+			// line reported and the cache budget spends against.
+			const ringSelector = new RingSelector(fretAdapter, storageAccount, {
+				minCapacity: DEFAULT_MIN_RING_CAPACITY_BYTES,
 				thresholds: {
 					moveOut: 0.85,
 					moveIn: 0.40

@@ -1,8 +1,11 @@
 import { hashPeerId } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { StorageMonitor } from './storage-monitor.js';
+import type { StorageAccount } from './storage-account.js';
 import type { ArachnodeInfo, ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { extractPrefix } from './arachnode-partition.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('ring-selector');
 
 /** EWMA weight for the demand inputs. Higher = more reactive, lower = smoother. */
 const DEFAULT_SMOOTHING_ALPHA = 0.2;
@@ -12,6 +15,13 @@ const DEFAULT_DEADBAND = 0.5;
 const DEFAULT_MIN_DWELL_MS = 10 * 60 * 1000;
 /** Floor for smoothed coverage so `-log2` never sees 0; the [0,16] clamp bounds the result anyway. */
 const DEPTH_EPSILON = 1e-12;
+/**
+ * The storage a node needs before it can serve any ring at all, and so the value
+ * `libp2p-node-base.ts` passes as {@link RingSelectorConfig.minCapacity}. Stated here, beside the
+ * decision that reads it, so the node's start-up line can say an allotment is below it without a
+ * second copy of the number.
+ */
+export const DEFAULT_MIN_RING_CAPACITY_BYTES = 100 * 1024 * 1024;
 
 export interface RingSelectorConfig {
 	/** Minimum storage capacity in bytes */
@@ -74,11 +84,13 @@ export class RingSelector {
 	private smoothedTotalData: number | undefined;
 	/** Clock time (ms) a move was last triggered; undefined = no move yet, so dwell does not block. */
 	private lastMoveAt: number | undefined;
+	/** Whether the unknown-capacity decline has been logged. Once, not per 60-second tick: the fact does not change until the node is reconfigured. */
+	private loggedUnknownCapacity = false;
 	private readonly now: () => number;
 
 	constructor(
 		private readonly fretAdapter: ArachnodeFretAdapter,
-		private readonly storageMonitor: StorageMonitor,
+		private readonly storageAccount: StorageAccount,
 		private readonly config: RingSelectorConfig
 	) {
 		this.now = config.now ?? ((): number => Date.now());
@@ -93,17 +105,25 @@ export class RingSelector {
 	 * the current snapshot.
 	 */
 	async determineRing(): Promise<number> {
-		const capacity = await this.storageMonitor.getCapacity();
+		const capacity = await this.storageAccount.capacity();
 
-		if (capacity.available < this.config.minCapacity) {
+		if (capacity.availableBytes === undefined) {
+			// No allotment configured and no free-space figure from the backend: the node cannot
+			// price its coverage at all, so it takes the whole keyspace. NOT -1, which means
+			// "below minCapacity" — a claim this node has not established and must not make on a
+			// figure it does not have.
+			return 0;
+		}
+
+		if (capacity.availableBytes < this.config.minCapacity) {
 			// Not enough capacity for any ring
 			return -1;
 		}
 
-		const estimatedTotalData = this.estimateNetworkData(capacity.available);
+		const estimatedTotalData = this.estimateNetworkData(capacity.availableBytes);
 
 		// Calculate what fraction of keyspace we can cover
-		const coverage = capacity.available / estimatedTotalData;
+		const coverage = capacity.availableBytes / estimatedTotalData;
 
 		// Ring depth: 0 = full keyspace, N = 2^N partitions
 		// If coverage = 0.01 (1%), we need ~100 partitions ≈ Ring 7
@@ -209,7 +229,7 @@ export class RingSelector {
 	 * never disagree with the ring the transition decision just chose.
 	 */
 	async createArachnodeInfo(peerId: string, ringDepthOverride?: number): Promise<ArachnodeInfo> {
-		const capacity = await this.storageMonitor.getCapacity();
+		const capacity = await this.storageAccount.capacity();
 		const ringDepth = ringDepthOverride ?? await this.determineRing();
 		const partition = ringDepth >= 0
 			? await this.calculatePartition(ringDepth, peerId)
@@ -218,11 +238,19 @@ export class RingSelector {
 		return {
 			ringDepth: Math.max(0, ringDepth),
 			partition,
-			capacity: {
-				total: capacity.total,
-				used: capacity.used,
-				available: capacity.available
-			},
+			// A node that cannot measure its storage advertises NO capacity rather than a made-up
+			// one. The field is omitted entirely, which is what `ArachnodeFretAdapter.getRingStats`
+			// reads to leave such a peer out of the ring's average instead of counting it as a peer
+			// offering nothing.
+			...(capacity.totalBytes !== undefined && capacity.availableBytes !== undefined
+				? {
+					capacity: {
+						total: capacity.totalBytes,
+						used: capacity.usedBytes,
+						available: capacity.availableBytes
+					}
+				}
+				: {}),
 			status: 'active'
 		};
 	}
@@ -248,13 +276,25 @@ export class RingSelector {
 		direction?: 'in' | 'out';
 		newRingDepth?: number
 	}> {
-		const capacity = await this.storageMonitor.getCapacity();
-		const usedPercent = capacity.total > 0 ? capacity.used / capacity.total : 0;
+		const capacity = await this.storageAccount.capacity();
+		if (capacity.totalBytes === undefined || capacity.availableBytes === undefined) {
+			// A node that cannot measure its storage does not shift rings, and folds NOTHING into
+			// the EWMA: seeding the smoothed signal from a figure that does not exist would carry
+			// the invention forward for many ticks after an allotment was finally configured.
+			if (!this.loggedUnknownCapacity) {
+				this.loggedUnknownCapacity = true;
+				log('no storage total known (no allotment configured and the backend reports no free space), so this node will not shift rings on storage grounds');
+			}
+			return { shouldMove: false };
+		}
+		// Above the total on a node past its allotment, which is deliberate: the move-out arm's
+		// threshold is below 1, so an over-full node trips it.
+		const usedPercent = capacity.totalBytes > 0 ? capacity.usedBytes / capacity.totalBytes : 0;
 
 		// Smoothing updates every tick, regardless of whether we act, so the EWMA keeps tracking
 		// demand even while a candidate move is dwell-blocked or a shift is already in flight.
-		const rawTotalData = this.estimateNetworkData(capacity.available);
-		this.updateSmoothing(capacity.available, rawTotalData);
+		const rawTotalData = this.estimateNetworkData(capacity.availableBytes);
+		this.updateSmoothing(capacity.availableBytes, rawTotalData);
 		const d = this.smoothedDepth();
 
 		const info = this.fretAdapter.getMyArachnodeInfo();

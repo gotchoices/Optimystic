@@ -84,7 +84,7 @@ export * from "./storage/block-archive.js";
 export * from "./storage/storage-repo.js";
 export * from "./storage/restoration-coordinator.js";
 export * from "./storage/ring-selector.js";
-export * from "./storage/storage-monitor.js";
+export * from "./storage/storage-account.js";
 export * from "./storage/store-coverage.js";
 export * from "./storage/arachnode-fret-adapter.js";
 export * from "./sync/protocol.js";

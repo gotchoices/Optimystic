@@ -159,7 +159,7 @@ callbacks are what make the two-tabs violation below **visible**; they are not
 what fixes it.
 
 `getApproximateBytesUsed()` returns `(await navigator.storage.estimate()).usage`,
-which is **per-origin**, not per-database. That is adequate for `StorageMonitor`
+which is **per-origin**, not per-database. That is adequate for `StorageAccount`
 — which uses the figure as an advisory ring-selection input — but is not a
 precise per-database accounting.
 

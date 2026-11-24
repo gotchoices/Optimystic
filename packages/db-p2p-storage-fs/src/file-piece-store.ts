@@ -125,7 +125,7 @@ export class FilePieceStore implements IPieceStore {
 
 	/**
 	 * Equal to a `FileRawStorage` over the same base path, whose byte count measures the whole
-	 * directory, pieces included, so `StorageMonitor` does not add this store's figure again.
+	 * directory, pieces included, so `StorageAccount` does not add this store's figure again.
 	 */
 	storeIdentity(): StoreIdentity {
 		return this.identity;

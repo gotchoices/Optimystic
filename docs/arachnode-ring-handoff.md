@@ -76,9 +76,10 @@ smoothedTotalData ← α · totalData_now + (1 − α) · smoothedTotalData
 d = clamp(-log2(max(ε, smoothedAvailable / smoothedTotalData)), 0, 16)
 ```
 
-The two demand inputs — `available` (`capacity.available`) and `totalData` (`estimatedTotalData`
-from `getRingStats()`) — are each smoothed with the same-α EWMA, and the smoothed coverage is their
-ratio, so a single noisy sample cannot move `d`. (Smoothing the inputs and dividing is a distinct
+The two demand inputs — `available` (`StorageAccount.capacity().availableBytes`, the node's
+allotment bounded by what its disk will still hold, minus what it has used) and `totalData`
+(`estimatedTotalData` from `getRingStats()`) — are each smoothed with the same-α EWMA, and the
+smoothed coverage is their ratio, so a single noisy sample cannot move `d`. (Smoothing the inputs and dividing is a distinct
 EWMA from smoothing the `available/totalData` ratio directly; the input-wise form is what the
 implementation uses.) Each EWMA is seeded from its first real sample, not from 0 — a 0 seed would
 peg `d` at the clamp ceiling for many ticks.
@@ -109,7 +110,24 @@ very next tick.
   takes one step, lets the dwell timer and re-sampled signal settle, then re-evaluates. This keeps
   the shed/gain range to exactly half/double and bounds the membership delta (see Part 3).
 
-### 1.4 Choosing the parameters
+### 1.4 A node that cannot measure its storage
+
+`available` is unknown when the operator configured no allotment AND the backend reports no free
+space (`packages/db-p2p/docs/storage.md` §9 — SQLite, LevelDB, memory, a web store under Node). The
+decision then declines rather than substituting a number:
+
+- **`determineRing` answers ring 0**, the whole keyspace. NOT `-1`: unknown is not "low", and `-1`
+  means "below `minCapacity`", which such a node has not established.
+- **`shouldTransition` answers `{ shouldMove: false }` and folds NOTHING into the EWMA.** A node
+  that cannot measure its storage does not shift rings, and seeding the smoothed signal from a
+  figure that does not exist would carry the invention forward for many ticks after an allotment was
+  finally configured. Logged once, not per tick.
+- **The node advertises no `ArachnodeInfo.capacity` at all**, and `getRingStats` leaves such a peer
+  out of both the peer count and the capacity total, so a peer that claimed nothing is never read as
+  claiming zero. A ring where nobody said yields no stat, which falls through to the bootstrap
+  estimate above.
+
+### 1.5 Choosing the parameters
 
 `α`, `h`, `minDwellMs`, and the `moveOut`/`moveIn` thresholds live in `RingSelectorConfig` with the
 defaults above. They are chosen so that: (a) the dead-band width `2h ≈ 1` ring guarantees a full
@@ -254,7 +272,12 @@ Part 1 (damping) and Parts 2–3 (this handoff) have landed. The state machine l
 coordinator rather than inline in `libp2p-node-base.ts`:
 
 - `packages/db-p2p/src/storage/ring-selector.ts` — damping (Part 1): EWMA state, dead-band in
-  `shouldTransition`, dwell timer, single-step target. `RingSelectorConfig`.
+  `shouldTransition`, dwell timer, single-step target. `RingSelectorConfig`. Also the two
+  unknown-capacity rules of §1.4 (ring 0 from `determineRing`, no move from `shouldTransition`) and
+  the optional capacity in `createArachnodeInfo`.
+- `packages/db-p2p/src/storage/storage-account.ts` — the one accounting the decision reads:
+  `NodeOptions.storageAllotment` bounded by the free space the backend reports, measured against
+  what the node's stores hold, behind one 60-second memo (`packages/db-p2p/docs/storage.md` §9).
 - `packages/db-p2p/src/storage/ring-shift-coordinator.ts` — the Part 2/3 state machine:
   `executeShift` (advertise→confirm→release for move-out; advertise-only for move-in), rollback on
   any Phase-B failure, and `reconcileOnStart` for crash mid-handoff.

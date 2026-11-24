@@ -22,11 +22,11 @@ import type { NetworkMembershipGate } from '../src/network-membership-gate.js';
 const encoder = new TextEncoder();
 const makePeerId = async (): Promise<string> => peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString();
 
-/** Minimal storage monitor (RingSelector.createArachnodeInfo only reads getCapacity). */
-class MockStorageMonitor {
-	async getCapacity() {
-		const total = 1024 * 1024 * 1024;
-		return { total, used: 0, available: total };
+/** Minimal storage account (RingSelector.createArachnodeInfo only reads capacity). */
+class MockStorageAccount {
+	async capacity() {
+		const totalBytes = 1024 * 1024 * 1024;
+		return { allotmentBytes: totalBytes, totalBytes, usedBytes: 0, availableBytes: totalBytes };
 	}
 }
 
@@ -111,7 +111,7 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		peerC = await makePeerId();
 
 		// self's partition after a ring 0 → ring 1 move-out (real hashPeerId), and the shed half's bit.
-		const sel = new RingSelector(new MockAdapter() as unknown as ArachnodeFretAdapter, new MockStorageMonitor() as any, ringSelectorConfig);
+		const sel = new RingSelector(new MockAdapter() as unknown as ArachnodeFretAdapter, new MockStorageAccount() as any, ringSelectorConfig);
 		const p = await sel.calculatePartition(1, selfId);
 		selfBit0 = p!.prefixValue;
 		shedBit0 = 1 - selfBit0;
@@ -131,7 +131,7 @@ describe('RingShiftCoordinator — advertise→confirm→release handoff', () =>
 		adapter = new MockAdapter();
 		fret = new MockFret();
 		partitionDetector = new PartitionDetector();
-		ringSelector = new RingSelector(adapter as unknown as ArachnodeFretAdapter, new MockStorageMonitor() as any, ringSelectorConfig);
+		ringSelector = new RingSelector(adapter as unknown as ArachnodeFretAdapter, new MockStorageAccount() as any, ringSelectorConfig);
 		confirmer = new StubConfirmer();
 		released = [];
 	});

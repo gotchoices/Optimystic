@@ -622,7 +622,7 @@ ArachnodeFretAdapter (Plugin Layer)
 Restoration Components
   - RingSelector: Capacity-based ring selection
   - RestorationCoordinator: Multi-ring queries
-  - StorageMonitor: Capacity tracking
+  - StorageAccount: The node's allotment and what it has used
   - SyncService/Client: Block request protocol
 ```
 
