@@ -421,7 +421,7 @@ describe('FileRawStorage writes nothing outside its directory for an escaping bl
 		await fs.rm(root, { recursive: true, force: true });
 	});
 
-	it('a refused pend leaves the store`s parent untouched and names nothing in the log', async () => {
+	it('a refused pend leaves the store\'s parent untouched and names nothing in the log', async () => {
 		const storage = stores.open(base);
 		const transform: Transform = { insert: { header: { id: 'held' as BlockId, type: 'test', collectionId: 'c1' as BlockId } } as IBlock };
 

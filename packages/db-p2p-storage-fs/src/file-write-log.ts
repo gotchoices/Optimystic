@@ -793,12 +793,17 @@ export class FileWriteLog {
 	 * inside the store.
 	 *
 	 * This guards a RECORDED PATH, not a block id: the rule for block ids is `isValidBlockId` and
-	 * `KvRawStorage` applies it before any id reaches a backend, so nothing this build writes can
-	 * produce an escaping record. Two things still can. A store written by a build from BEFORE that
-	 * check can hold a log record naming `../escaped/...`, and a log is replayed on every open until
-	 * a checkpoint truncates it, so the escaped write would be re-applied after every restart — the
-	 * one place a pre-fix block id survives the upgrade. And a log file damaged or forged on disk can
-	 * name anything; the CRC catches damage but not a record someone wrote on purpose.
+	 * `KvRawStorage` applies it before any id reaches a backend. Three shapes still reach here. A
+	 * store written by a build from BEFORE that check can hold a log record naming `../escaped/...`,
+	 * and a log is replayed on every open until a checkpoint truncates it, so the escaped write would
+	 * be re-applied after every restart — the one place a pre-fix block id survives the upgrade. A log
+	 * file damaged or forged on disk can name anything; the CRC catches damage but not a record
+	 * someone wrote on purpose. And an ACTION id is a path segment in a record too
+	 * (`relativeActionScopedPath` in `file-batch-backend.ts`, which only percent-encodes colons) and
+	 * nothing validates one anywhere, so a peer-chosen action id carrying `../` reaches this guard on
+	 * the LIVE commit path, where a throw latches the whole store rather than refusing one call —
+	 * measured, and the open ticket `bug-an-action-id-is-used-as-a-file-path-without-validation` owns
+	 * moving that refusal up to the kernel beside the block id's.
 	 */
 	private containedTarget(entryPath: string): string {
 		const target = path.resolve(this.basePath, entryPath);

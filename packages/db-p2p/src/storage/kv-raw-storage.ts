@@ -242,11 +242,15 @@ export class KvRawStorage<V extends StoredValue = Uint8Array> implements IRawSto
 	}
 
 	async saveBlockProof(blockId: BlockId, rev: number, proof: BlockCommitProof): Promise<void> {
+		// Checked HERE, not only by `saveProofEntry` below: a refused id must cost the store nothing,
+		// and `ensureCommitProof` would by then have written — and memoized — a proof body for a block
+		// that can never hold a reference to it.
+		const checked = this.checkedId(blockId);
 		const ref: ProofRef = { proofRef: proof.messageHash };
 		// The shared record before the reference: by the flush contract's prefix rule (rule 3 at
 		// `RawStoreDriver.flush`) the reference then never survives a crash without its target.
 		await this.ensureCommitProof(proof);
-		await this.saveProofEntry(blockId, rev, ref);
+		await this.saveProofEntry(checked, rev, ref);
 	}
 
 	async getProofEntry(blockId: BlockId, rev: number): Promise<StoredProofEntry | undefined> {

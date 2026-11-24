@@ -455,14 +455,9 @@ export function runRawStorageConformance(
 
 		it('promotePendingTransaction throws the exact message when no pending entry exists', async () => {
 			const blockId = 'promote-missing' as BlockId;
-			let error: Error | undefined;
-			try {
-				await storage.promotePendingTransaction(blockId, 'nope' as ActionId);
-			} catch (err) {
-				error = err as Error;
-			}
-			expect(error, 'promote of a missing pending throws').to.not.equal(undefined);
-			expect(error!.message).to.equal(`Pending action nope not found for block ${blockId}`);
+			const error = await rejection(storage.promotePendingTransaction(blockId, 'nope' as ActionId));
+			expect(error, 'promote of a missing pending throws').to.be.instanceOf(Error);
+			expect((error as Error).message).to.equal(`Pending action nope not found for block ${blockId}`);
 		});
 
 		// --- deleteBlock (the one operation that takes bytes back off a node) ---
