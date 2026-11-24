@@ -51,7 +51,7 @@ describe('storage pressure stages', () => {
 			{ used: 951, total: 1000, expected: 'refusing', why: 'past refuseAbove' },
 			{ used: 1000, total: 1000, expected: 'refusing', why: 'exactly at the allotment' },
 			{ used: 1400, total: 1000, expected: 'refusing', why: 'past the allotment: used > total' },
-			{ used: 0, total: 0, expected: 'refusing', why: 'a location with no room at all is full, not empty' }
+			{ used: 0, total: 0, expected: 'refusing', why: 'a total of 0 fails toward full, not toward the NaN that would read as steady' }
 		];
 		for (const { used, total, expected, why } of cases) {
 			expect(pressureStageOf(capacity(used, total), thresholds), why).to.equal(expected);

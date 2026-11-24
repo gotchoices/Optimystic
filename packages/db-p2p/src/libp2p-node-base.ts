@@ -87,7 +87,7 @@ import { RestorationCoordinator } from './storage/restoration-coordinator.js';
 import { DEFAULT_MIN_RING_CAPACITY_BYTES, MAX_RING_DEPTH, RingSelector } from './storage/ring-selector.js';
 import { RingShiftCoordinator } from './storage/ring-shift-coordinator.js';
 import { cacheBudgetBytes, StorageAccount } from './storage/storage-account.js';
-import { resolveStoragePressureThresholds, StoragePressure, type StoragePressureThresholds } from './storage/storage-pressure.js';
+import { resolveStoragePressureThresholds, StoragePressure } from './storage/storage-pressure.js';
 import type { StorageAllotmentOptions, StorageCapacity } from './storage/storage-account.js';
 import { ArachnodeFretAdapter } from './storage/arachnode-fret-adapter.js';
 import type { RestoreCallback, BlockArchive } from './storage/struct.js';
@@ -1430,6 +1430,13 @@ export async function createLibp2pNodeBase(
 	// service, while this is built before `createLibp2p`. Read, not captured, on every sample, and a
 	// sample that lands before the budget exists asks nothing — the budget runs one enforcement of its
 	// own as soon as it is built.
+	//
+	// NOTE: on a CLIENT this is new recurring work. A client runs no arachnode tick and enforces its
+	// read cache only after a read that fetched, so before this it scanned its store on no timer at
+	// all; now it pays one memoized `capacity()` per sample interval (60 s), which on a file-backed
+	// store is a directory walk. The sample is what keeps `stage()` free for the gates, and on a
+	// client it currently drives only the cache enforcement. If a per-minute walk ever shows up in a
+	// client's profile, give the client a longer `sampleIntervalMs` rather than removing the reading.
 	let blobCacheBudgetForPressure: BlobCacheBudget | undefined;
 	const storagePressure = new StoragePressure({
 		account: storageAccount,
@@ -1921,7 +1928,7 @@ export async function createLibp2pNodeBase(
 			? await wireServingRole({
 				node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
 				fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
-				storagePressure, pressureThresholds: storagePressureThresholds, partitionDetector
+				storagePressure, partitionDetector
 			})
 			: undefined;
 
@@ -2842,10 +2849,14 @@ interface ServingRoleContext {
 	networkManager: NetworkManagerService | undefined;
 	/** The node's one storage accounting, built for both roles; ring selection prices its coverage from it. */
 	storageAccount: StorageAccount;
-	/** The node's one pressure reading over that account, built for both roles; the ring tick names the stage it moved at from it. */
+	/**
+	 * The node's one pressure reading over that account, built for both roles. The ring tick names the
+	 * stage it moved at from it, and the ring decision's own thresholds come from its
+	 * `configuredThresholds()` — so the resolved `storageAllotment.thresholds` arrive here once, as
+	 * part of the reading that names stages from them, rather than as a second field that could be
+	 * threaded from somewhere else.
+	 */
 	storagePressure: StoragePressure;
-	/** The resolved `storageAllotment.thresholds`, so the ring decision moves on the same figures the pressure reading names stages from. */
-	pressureThresholds: StoragePressureThresholds;
 	/** The node's one partition detector, built beside the key network; this role is the only half that feeds it. */
 	partitionDetector: PartitionDetector;
 }
@@ -2877,7 +2888,7 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 	const {
 		node, options, serving, keyNetwork, protocolPrefix, linkDeadlines, consensusConfig, reputation,
 		fretSvc, nodePrivateKey, onCommitCertificate, membership, networkManager, storageAccount,
-		storagePressure, pressureThresholds, partitionDetector
+		storagePressure, partitionDetector
 	} = ctx;
 	const { storageRepo, rawStorage, underReplicationLedger, transactionStateStore, durabilityWindowFor, onBlockHolders } = serving;
 	const createClusterClient = (peerId: any) => ClusterClient.create(peerId, keyNetwork, protocolPrefix, linkDeadlines);
@@ -3357,13 +3368,13 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 			// line reported and the cache budget spends against.
 			const ringSelector = new RingSelector(fretAdapter, storageAccount, {
 				minCapacity: DEFAULT_MIN_RING_CAPACITY_BYTES,
-				// From the one resolved set of thresholds, not two literals here: the figure the ring
+				// Read off the pressure reading itself, not two literals here: the figure the ring
 				// decision moves on and the figure `node.storagePressure` names a stage from are the same
 				// figure, so they cannot disagree about whether this node is under pressure, and an
 				// operator who set `storageAllotment.thresholds` changed both.
 				thresholds: {
-					moveOut: pressureThresholds.shedAbove,
-					moveIn: pressureThresholds.reclaimBelow
+					moveOut: storagePressure.configuredThresholds().shedAbove,
+					moveIn: storagePressure.configuredThresholds().reclaimBelow
 				},
 				// Damping so the ring decision cannot thrash near a boundary
 				// (docs/arachnode-ring-handoff.md § Part 1).

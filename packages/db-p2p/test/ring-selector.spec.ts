@@ -342,6 +342,19 @@ describe('RingSelector', () => {
 			expect(result.newRingDepth).to.equal(2);
 		});
 
+		it('never moves in from below the minimum capacity, so the deepest-ring answer holds', async () => {
+			// The regression the `minCapacity` floor in `determineRing` alone did not stop: a node short
+			// of room is EMPTY, so usage is below `moveIn` and the smoothed depth is low whenever the
+			// network's observed capacity is small. Without the same floor on this arm the tick walked
+			// such a node one ring inward per dwell from the deepest ring back to the whole keyspace.
+			account.setCapacity(512 * 1024, 0); // below the suite's 1 MB minimum
+			fretAdapter.setMyArachnodeInfo(advertise(MAX_RING_DEPTH));
+			fretAdapter.setRingStats([{ ringDepth: 0, peerCount: 1, avgCapacity: 512 * 1024 }]); // d = 0
+			expect((await selector.shouldTransition()).shouldMove).to.equal(false);
+			// And the one-shot answer it was advertising is unchanged, so the two decisions agree.
+			expect(await selector.determineRing()).to.equal(MAX_RING_DEPTH);
+		});
+
 		it('never moves in from ring 0', async () => {
 			fretAdapter.setMyArachnodeInfo(advertise(0));
 			setSignal(0.05, 0.0); // very low usage, ring 0

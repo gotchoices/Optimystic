@@ -92,7 +92,10 @@ depth is solidly past the boundary by a dead-band `h` (≈ 0.5 ring):
 - Move **out** (`R → R+1`) only when `d ≥ R + 1 − h` **and** `usedPercent > moveOut` (the
   default 0.85; see §1.5).
 - Move **in** (`R → R-1`) only when `d ≤ R − 1 + h` **and** `usedPercent < moveIn` (the default
-  0.40) **and** `R > 0`.
+  0.40) **and** `R > 0` **and** `availableBytes ≥ minCapacity`. That last condition is the same floor
+  §1.4 answers ring 16 below: a node short of room is empty, so `usedPercent` is low and `d` can be
+  low too, and without it the tick would walk such a node one ring inward per dwell straight back to
+  the whole keyspace.
 
 The gap of width `2h` around each integer is the region where a hovering ratio produces **no**
 move. A node already at ring 16 can never move further out, because `d` is clamped at 16 and so
@@ -149,7 +152,9 @@ Two consequences worth stating rather than hiding:
 - **A running node that falls below the minimum does not jump to ring 16.** The single-step rule of
   §1.3 still moves it one ring per dwell. The below-minimum answer is taken at bootstrap, where
   there is no handoff to carry, and by any other one-shot caller — which is exactly where the old
-  `-1 → ring 0` fault lived.
+  `-1 → ring 0` fault lived. What it does *not* do is move back **in**: the move-in arm of §1.2 reads
+  the same floor, so the answer taken at bootstrap holds instead of being walked away one ring per
+  dwell.
 - **Ring 16 is the floor of advertised responsibility** (§1.2), so from there the only remaining
   lever is refusing new data.
 

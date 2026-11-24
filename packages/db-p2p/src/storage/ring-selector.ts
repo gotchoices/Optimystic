@@ -1,6 +1,6 @@
 import { hashPeerId } from 'p2p-fret';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { StorageAccount } from './storage-account.js';
+import type { StorageAccount, StorageCapacity } from './storage-account.js';
 import type { ArachnodeInfo, ArachnodeFretAdapter } from './arachnode-fret-adapter.js';
 import { extractPrefix } from './arachnode-partition.js';
 import { createLogger } from '../logger.js';
@@ -129,7 +129,7 @@ export class RingSelector {
 			return 0;
 		}
 
-		if (capacity.availableBytes < this.config.minCapacity) {
+		if (this.belowMinCapacity(capacity)) {
 			// Too little room to serve a real slice, so the node advertises the DEEPEST ring it allows:
 			// the narrowest slice the ring model has, and the least responsibility it can claim while
 			// still serving what it already holds. This answer used to be -1, which
@@ -154,6 +154,20 @@ export class RingSelector {
 		const ringDepth = Math.max(0, Math.ceil(-Math.log2(Math.max(0.001, coverage))));
 
 		return Math.min(ringDepth, MAX_RING_DEPTH);
+	}
+
+	/**
+	 * Whether the node has measurably too little room to serve a real slice — the ONE place the
+	 * `minCapacity` floor is compared, read by {@link determineRing} (whose answer below the floor is
+	 * {@link MAX_RING_DEPTH}) and by {@link shouldTransition} (which must not move such a node inward).
+	 * Two readers, one comparison: when the floor lived only in `determineRing`, the tick walked a
+	 * below-floor node one ring inward per dwell straight back to the whole keyspace.
+	 *
+	 * An UNMEASURABLE node is not below the floor. It has established nothing either way, which is why
+	 * `determineRing` answers ring 0 for it rather than the deepest ring (`docs/arachnode-ring-handoff.md` §1.4).
+	 */
+	private belowMinCapacity(capacity: StorageCapacity): boolean {
+		return capacity.availableBytes !== undefined && capacity.availableBytes < this.config.minCapacity;
 	}
 
 	// NOTE: prefix extraction lives in `arachnode-partition.ts` (single source of truth shared with
@@ -360,8 +374,14 @@ export class RingSelector {
 			};
 		}
 
-		// Move IN (R → R-1): smoothed depth solidly past the inner boundary AND storage slack AND R>0.
-		if (advertisedRing > 0 && d <= advertisedRing - 1 + h && usedPercent < this.config.thresholds.moveIn) {
+		// Move IN (R → R-1): smoothed depth solidly past the inner boundary AND storage slack AND R>0
+		// AND the node has the room `minCapacity` asks for. That last condition is the same floor
+		// `determineRing` answers MAX_RING_DEPTH below: a node short of room is empty, so `usedPercent`
+		// is low and `d` can be low too (a small network, or no observed ring stats at all), and without
+		// the floor here the tick walked it one ring inward per dwell from 16 back to the whole keyspace
+		// — undoing, over 16 pointless handoffs, the very answer `determineRing` gave it at bootstrap.
+		if (advertisedRing > 0 && d <= advertisedRing - 1 + h && usedPercent < this.config.thresholds.moveIn
+			&& !this.belowMinCapacity(capacity)) {
 			this.lastMoveAt = this.now();
 			return {
 				shouldMove: true,

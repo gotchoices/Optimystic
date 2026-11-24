@@ -134,7 +134,8 @@ export interface StoragePressureDeps {
  * told, not quietly given a node that sheds and reclaims at once.
  *
  * Over the numbers alone, so it runs and throws even on a node that will read `unknown` for its whole
- * life. That is right: a typo is a typo.
+ * life. That is right: a typo is a typo. An explicitly `undefined` field throws for the same reason
+ * rather than falling back to its default: the operator named the field, and the message names it back.
  */
 export function resolveStoragePressureThresholds(declared?: Partial<StoragePressureThresholds>): StoragePressureThresholds {
 	const resolved: StoragePressureThresholds = { ...DEFAULT_STORAGE_PRESSURE_THRESHOLDS, ...declared };
@@ -155,9 +156,11 @@ export function resolveStoragePressureThresholds(declared?: Partial<StoragePress
  * measure its storage. Unclamped above 1, which is the point: `StorageCapacity.usedBytes` is
  * unclamped so a node past its allotment reads above 1.0 and lands in `refusing`.
  *
- * A total of 0 reads as fully used rather than as empty. It can only arise from a location that
- * reports no free space while the node has stored nothing — a genuinely full disk — since an
- * allotment of 0 throws at construction.
+ * A total of 0 is unreachable today: an allotment of 0 throws at construction, and a location that
+ * reports no free space leaves `locationBytes` ABSENT rather than 0 (`StorageScan.locationBytes`), so
+ * `effectiveTotalBytes` answers either a positive figure or nothing. The branch is a guard against a
+ * future total of 0 dividing into `NaN`, which compares false against every threshold and would read
+ * as `steady` — silently disarming every gate. Reading it as fully used fails the other way instead.
  */
 export function usedFractionOf(capacity: StorageCapacity): number | undefined {
 	const { totalBytes, usedBytes } = capacity;
@@ -233,7 +236,12 @@ export class StoragePressure {
 		return this.lastStage;
 	}
 
-	/** The thresholds this reading was built with, for the ring decision and an operator's report. */
+	/**
+	 * The thresholds this reading was built with. The ring decision's `moveOut` / `moveIn` are read
+	 * from here at construction (`libp2p-node-base.ts`), so the resolved
+	 * `storageAllotment.thresholds` reach that decision as part of the reading that names stages from
+	 * them rather than as a second copy threaded beside it.
+	 */
 	configuredThresholds(): StoragePressureThresholds {
 		return this.thresholds;
 	}
@@ -306,8 +314,17 @@ export class StoragePressure {
 		this.lastStage = stage;
 		// Supplies the trigger the read cache was missing. `request()` logs rather than rejects, and is
 		// single-flight with one queued follow-on, so asking every sample costs at most one pass.
+		//
+		// Caught even though today's trigger cannot throw synchronously, because the re-arm is BELOW it:
+		// a trigger that threw would take the sampler down for the life of the node, and every gate
+		// would then read a stage frozen at whatever it last measured. One subsystem's fault must not
+		// disarm the node's reading of its own disk.
 		if (atLeastPressure(stage, 'shedding')) {
-			this.requestCacheEnforcement?.();
+			try {
+				this.requestCacheEnforcement?.();
+			} catch (error) {
+				this.log('pressure:enforcement-refused stage=%s - %e', stage, error);
+			}
 		}
 		this.reschedule();
 		return { stage, capacity };
