@@ -37,3 +37,7 @@ What that guard does **not** cover, and what this ticket is for:
 - No other backend and no layer above has any validation, so the next raw-id consumer starts from nothing.
 
 A consequence of the partial guard, worth knowing while this ticket is open: for an id outside the store a write currently succeeds and the matching read throws. That asymmetry is fail-closed and better than silently serving a file outside the store, but it is not a resting place.
+
+## Promoted to fix (garden, 2026-11-23)
+
+Pulled into this release: a peer-chosen name writing outside the store is a remote write anywhere the process can write, and it is replayed after every restart. Prefer the validator at the storage boundary over encoding name segments: it leaves the on-disk layout, and with it every released upgrade-check fixture, unchanged. Choose encoding only if the validator cannot be placed where every path builder is covered, and then document the upgrade step.
