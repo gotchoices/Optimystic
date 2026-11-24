@@ -6,13 +6,6 @@ severity: corruption
 likelihood: unusual
 tradeoffs: The filesystem backend is one of five and is not what a browser or phone runs, the escape needs a peer that deliberately sends a malformed name, and the cheap narrow guards are already in place at the destructive site — so a maintainer may reasonably rank a full validation pass behind feature work.
 ----
-<!-- resume-note -->
-RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-11-24T07:16:48.284Z (agent: claude)
-  Log file: c:\Projects\optimystic\tickets\.logs\bug-a-block-id-is-used-as-a-file-path-without-validation.fix.2026-11-24T07-16-48-284Z.log
-Read the log to see what was done. Resume where it left off.
-If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
-<!-- /resume-note -->
 
 # A block id is used as a file path without validation
 
