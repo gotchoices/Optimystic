@@ -73,7 +73,29 @@ export type Signature =
 	 * own variant rather than a reused one. Where several rivals hold the blocks, `heldBy` names the
 	 * one the refusal returned on.
 	 */
-	| { type: 'held'; signature: string; heldBy: string };
+	| { type: 'held'; signature: string; heldBy: string }
+	/**
+	 * This member refuses the transaction *for now* for the THIRD transient reason: it has no storage
+	 * left. Retryable and never counted toward the permanent-rejection threshold, exactly like
+	 * `conflict` and `held` — nobody judged the write, and a cohort whose members shed or gain space
+	 * accepts the very same bytes.
+	 *
+	 * Named `out-of-space` rather than `full` because `full` already means something else one layer
+	 * away: `WriteDurability`'s `'full'` is "every cohort member confirmed", the opposite end of the
+	 * same subject.
+	 *
+	 * **It carries no payload, deliberately.** A byte figure would be unverifiable (nothing a
+	 * coordinator can check binds a member's claim about its own disk to anything), a publication of an
+	 * operator's disk to every writer that pends, and unread — the only thing a writer does with the
+	 * refusal is stop expecting this member to take data now. So the vote's type is its whole message,
+	 * as `approve`'s is, and it signs in the same bare-tag form.
+	 *
+	 * Only a PEND record can draw it: it is cast by `ClusterMember.validatePendOperations`, which
+	 * inspects pend operations only. A member that already approved a pend honours the commit whatever
+	 * its space has done since — the refusal is at the gate or nowhere, since an approve is a promise to
+	 * apply and the headroom below the allotment is sized for pends already approved.
+	 */
+	| { type: 'out-of-space'; signature: string };
 
 /** {@link Signature}'s variant `S` without its signature bytes; distributes over the union. */
 type Unsigned<S> = S extends Signature ? Omit<S, 'signature'> : never;
@@ -89,8 +111,12 @@ export type ClusterVote = Unsigned<Signature>;
 /**
  * The exact bytes a vote signature covers: `<hash>:<tag>[:<extra>]`. The tag is the vote's `type`, and
  * `extra` is the variant's own payload — a reject's `rejectReason`, a conflict's `conflictWith`, a
- * held's `heldBy`, nothing for an approve. Folding the extra in is what makes it integrity-protected in
+ * held's `heldBy`. Folding the extra in is what makes it integrity-protected in
  * transit rather than free-floating prose.
+ *
+ * A vote with no payload at all signs the **bare tag**, `<hash>:<type>` and nothing more: the shape
+ * `approve` and `out-of-space` share, and the shape every future payload-less vote takes. For those two
+ * the type IS the whole message, so there is nothing else to bind.
  *
  * Two reject variants carry two fields each, and each has its own tag:
  *  - an expiry vote, a `reject` with {@link Signature} `expiredAt`, is encoded
@@ -102,7 +128,8 @@ export type ClusterVote = Unsigned<Signature>;
  * Two properties make that unambiguous. The tag is decided character by character after the hash (a
  * hash is base64url, so the first `:` always ends it): a plain reject continues `reject` with `:` or
  * nothing, the two marked ones with `-`, and those two differ at the next character (`e` and `i`); every
- * other vote's tag differs from all three at its first character. And a JSON array cannot be read as a
+ * other vote's tag differs from all three at its first character — `approve`, `conflict`, `held` and
+ * `out-of-space` at `a`, `c`, `h` and `o`. And a JSON array cannot be read as a
  * different pair of values. A reason that itself contains `:` — `"x:5"` — can therefore never verify as
  * reason `"x"` with `expiredAt: 5`, a string smuggled into `expiredAt` changes the bytes, and adding,
  * removing or altering a vote's `validity` changes them too. The type keeps the two marked forms apart
@@ -138,7 +165,8 @@ function voteTagAndExtra(vote: ClusterVote): string {
 				: 'reject-expired:' + JSON.stringify([vote.expiredAt, vote.rejectReason ?? null]);
 		case 'conflict': return withExtra('conflict', vote.conflictWith);
 		case 'held': return withExtra('held', vote.heldBy);
-		// `approve`, and any type off the wire this code does not know (which no honest key signed).
+		// The bare-tag form: `approve` and `out-of-space`, which carry no payload to bind — and any type
+		// off the wire this code does not know (which no honest key signed).
 		default: return (vote as { type: string }).type;
 	}
 }

@@ -20,6 +20,9 @@ describe('clusterVoteSigningPayload', () => {
 		expect(text({ type: 'reject', rejectReason: 'stale commit: x:5' })).to.equal('aGFzaA:reject:stale commit: x:5');
 		expect(text({ type: 'conflict', conflictWith: 'winner' })).to.equal('aGFzaA:conflict:winner');
 		expect(text({ type: 'held', heldBy: 'a-rival' })).to.equal('aGFzaA:held:a-rival');
+		// The bare-tag form `approve` and `out-of-space` share: no payload, so the type is the whole
+		// message and there is nothing else to bind.
+		expect(text({ type: 'out-of-space' })).to.equal('aGFzaA:out-of-space');
 	});
 
 	it('never encodes an expiry vote as the same bytes as a different vote', () => {

@@ -19,6 +19,7 @@ import { PenaltyReason } from "../reputation/types.js";
 import type { ITransactionStateStore } from "./i-transaction-state-store.js";
 import { isMissingBaseRevisionFailure, type CommitDigestPreview, type ICommitDigestPreviewer, type ILocalApply, type IDurableStorage, type IRevisionActionReader, type IPendingClaimReader, type IHeldRevisionReader } from "../storage/storage-repo.js";
 import { recordDurabilityWindowMs, type DurabilityWindowFor } from "../storage/durability-window.js";
+import type { StoragePressureGate } from "../storage/storage-pressure.js";
 import type { BlockArchive } from "../storage/struct.js";
 import { isReservationAgainst, isAbandonedClaim, hasLapsed, claimAgeMs, reservationRequestFor, cohortCanMissAPend, type PendingClaim, type ReservationRequest } from "../storage/pending-claim.js";
 import { StuckReservationTracker } from "../repo/stuck-reservation.js";
@@ -41,7 +42,10 @@ enum TransactionPhase {
 	OurCommitNeeded, // We need to provide our commit
 	Consensus,       // Transaction has reached consensus
 	Rejected,        // Transaction was rejected (validity judgement — enough reject votes)
-	ConflictSuperseded, // Terminal but retryable: conflict votes make super-majority unreachable
+	// Terminal for THIS record, retryable as a fresh one: the transient refusals — `conflict`, `held`
+	// and `out-of-space` — make super-majority unreachable. The name predates the other two kinds and
+	// is kept; what it means is the sentence above, not "a conflict vote specifically".
+	ConflictSuperseded,
 	Propagating     // Transaction is being propagated
 }
 
@@ -98,8 +102,16 @@ type VerifyOutcome =
  * existed the member threw instead, and a throw reaches the coordinator as silence: no vote, a
  * `ConsensusTimeout` penalty against an honest peer, and a "super-majority" failure a writer retries.
  *
- * `invalid` covers every refusal that is not `held` or `expired` — a stale revision, a membership
- * refusal, a content-digest disagreement, a checker fault — so most `invalid` verdicts are NOT
+ * `out-of-space` is the fourth: this member has no storage left for the pend. Transient like `held`
+ * and counted apart from approvals and rejections for the same reason — nobody judged the write, and
+ * the cohort accepts the very same bytes once its members shed or gain space. It is the LAST refusal
+ * {@link ClusterMember.validatePendOperations} considers, so it is only ever the answer for a record
+ * this member would otherwise have APPROVED: a record that is genuinely invalid or genuinely expired
+ * must still get the permanent, structured answer that tells the writer not to retry it, and a `held`
+ * refusal names an actionable rival that clears when that rival commits or cancels.
+ *
+ * `invalid` covers every refusal that is not `held`, `expired` or `out-of-space` — a stale revision, a
+ * membership refusal, a content-digest disagreement, a checker fault — so most `invalid` verdicts are NOT
  * judgements that the transaction itself is wrong, and a stale one can clear on a retry after a
  * re-read. The ones that are carry `validity`, which only the transaction checker sets (see
  * {@link ValidityRejection}); it becomes the vote's signed marker.
@@ -110,7 +122,9 @@ type PromiseVerdict =
 	/** `heldBy` is the rival's ACTION id (storage's pending list), never a messageHash — see {@link Signature}. */
 	| { valid: false; kind: 'held'; reason: string; heldBy: ActionId }
 	/** `expiredAt` is this member's wall-clock reading when it judged the record expired. */
-	| { valid: false; kind: 'expired'; reason: string; expiredAt: number };
+	| { valid: false; kind: 'expired'; reason: string; expiredAt: number }
+	/** No payload rides on the vote (see {@link Signature}'s `out-of-space`); the reason is for an operator's log. */
+	| { valid: false; kind: 'out-of-space'; reason: string };
 
 /**
  * A refusal that becomes a plain `reject` vote. `validity` only when the transaction checker judged the
@@ -185,6 +199,9 @@ function voteFor(verdict: PromiseVerdict): ClusterVote {
 	}
 	switch (verdict.kind) {
 		case 'held': return { type: 'held', heldBy: verdict.heldBy };
+		// The reason stays local: this vote carries no payload at all, so the refusal's prose would be
+		// unsigned if it rode along (see {@link Signature}'s `out-of-space`).
+		case 'out-of-space': return { type: 'out-of-space' };
 		case 'expired': return { type: 'reject', rejectReason: verdict.reason, expiredAt: verdict.expiredAt };
 		case 'invalid': return verdict.validity === undefined
 			? { type: 'reject', rejectReason: verdict.reason }
@@ -200,11 +217,12 @@ function signedValidity({ computedHash }: ValidityRejection): ValidityRejection 
 	return computedHash === undefined ? {} : { computedHash };
 }
 
-/** The log line naming each refusal kind; an operator reads them as three different events. */
+/** The log line naming each refusal kind; an operator reads them as four different events. */
 const refusalLogTag: Record<Extract<PromiseVerdict, { valid: false }>['kind'], string> = {
 	invalid: 'cluster-member:validation-rejected',
 	held: 'cluster-member:validation-held',
-	expired: 'cluster-member:validation-expired'
+	expired: 'cluster-member:validation-expired',
+	'out-of-space': 'cluster-member:validation-out-of-space'
 };
 
 /**
@@ -431,6 +449,8 @@ interface ClusterMemberComponents {
 	stateStore?: ITransactionStateStore;
 	/** Restores a block under-replicated by cohort drift; see {@link ReconcileBlockCallback}. */
 	reconcileBlock?: ReconcileBlockCallback;
+	/** This node's storage-pressure reading, for the out-of-space promise vote; see {@link StoragePressureGate}. */
+	storagePressure?: StoragePressureGate;
 	/** Receives the consensus commit cert per committed action; see {@link CommitCertificateSink}. */
 	onCommitCertificate?: CommitCertificateSink;
 	/** Receives who holds each consensus commit this member durably applied; see {@link BlockHoldersSink}. */
@@ -494,7 +514,8 @@ export function clusterMember(components: ClusterMemberComponents): ClusterMembe
 		components.onBlockHolders,
 		components.createClusterClient,
 		components.durabilityWindowFor,
-		components.onCohortCommitApplied
+		components.onCohortCommitApplied,
+		components.storagePressure
 	);
 }
 
@@ -699,7 +720,8 @@ export class ClusterMember implements ICluster {
 		private readonly onBlockHolders?: BlockHoldersSink,
 		createClusterClient?: (peerId: PeerId) => ICluster,
 		private readonly durabilityWindowFor?: DurabilityWindowFor,
-		private readonly onCohortCommitApplied?: CohortCommitAppliedSink
+		private readonly onCohortCommitApplied?: CohortCommitAppliedSink,
+		private readonly storagePressure?: StoragePressureGate
 	) {
 		this.now = now ?? ((): number => Date.now());
 		this.createClusterClient = createClusterClient
@@ -1426,10 +1448,10 @@ export class ClusterMember implements ICluster {
 		const maxAllowedRejections = peerCount - superMajority;
 
 		// Check for rejections — rejected if too many rejections to ever reach super-majority.
-		// ONLY `reject` votes count here: `conflict` and `held` both mean "not now", never a validity
-		// judgement, so neither may push a record into the permanent `Rejected` phase.
+		// ONLY `reject` votes count here: `conflict`, `held` and `out-of-space` all mean "not now", never
+		// a validity judgement, so none of them may push a record into the permanent `Rejected` phase.
 		const rejectedPromises = Object.values(record.promises).filter(s => s.type === 'reject');
-		const retryableRefusals = Object.values(record.promises).filter(s => s.type === 'conflict' || s.type === 'held');
+		const retryableRefusals = Object.values(record.promises).filter(s => s.type === 'conflict' || s.type === 'held' || s.type === 'out-of-space');
 		const rejectedCommits = Object.values(record.commits).filter(s => s.type === 'reject');
 		if (rejectedPromises.length > maxAllowedRejections || this.hasMajority(rejectedCommits.length, peerCount)) {
 			return { phase: TransactionPhase.Rejected };
@@ -1437,9 +1459,10 @@ export class ClusterMember implements ICluster {
 
 		// Retryable refusals don't judge validity, but enough of them still make super-majority
 		// unreachable — a distinct terminal outcome (retryable as a fresh transaction) so logs and
-		// reputation-adjacent paths keep meaning what they say. `held` joins `conflict` here for the
-		// same reason `conflict` clears its record: a member that keeps reserving the blocks of a
-		// transaction that provably cannot win holds them against the very retry meant to win.
+		// reputation-adjacent paths keep meaning what they say. `held` and `out-of-space` join
+		// `conflict` here for the same reason `conflict` clears its record: a member that keeps
+		// reserving the blocks of a transaction that provably cannot win holds them against the very
+		// retry meant to win.
 		if (retryableRefusals.length > 0 && rejectedPromises.length + retryableRefusals.length > maxAllowedRejections) {
 			return { phase: TransactionPhase.ConflictSuperseded };
 		}
@@ -1532,7 +1555,8 @@ export class ClusterMember implements ICluster {
 
 		if (!verdict.valid) {
 			// One tag per refusal kind: a write judged invalid, a write queued behind a live reservation,
-			// and a write this member's clock says has expired are three different events for an operator.
+			// a write this member's clock says has expired, and a write this member has no room for are
+			// four different events for an operator.
 			log(refusalLogTag[verdict.kind], {
 				messageHash: record.messageHash,
 				reason: verdict.reason
@@ -1580,9 +1604,9 @@ export class ClusterMember implements ICluster {
 	/**
 	 * The full promise-phase decision for a record: admit the declared membership FIRST, then (only if
 	 * admitted) validate its pend operations, then its commit operations. Failing any yields a refusal
-	 * the caller turns into a vote — a `reject` for every validity judgement here, and a `held` for the
-	 * one transient refusal {@link validatePendOperations} can make (see {@link PromiseVerdict}).
-	 * Keeping the checks separate keeps
+	 * the caller turns into a vote — a `reject` for every validity judgement here, and a `held` or an
+	 * `out-of-space` for the two transient refusals {@link validatePendOperations} can make (see
+	 * {@link PromiseVerdict}). Keeping the checks separate keeps
 	 * the reason strings distinct — a `membership-not-admitted` reject is a different signal (feeds the
 	 * dispute path) than a stale-revision / custom-validator reject, which is different again from a
 	 * `content-digest-mismatch` (see {@link validateCommitOperations}). A record carries pend OR commit
@@ -1929,8 +1953,9 @@ export class ClusterMember implements ICluster {
 	 * action, to prevent consensus on operations that storage would refuse at apply.
 	 * Returns success if no validator is configured (backwards compatibility).
 	 *
-	 * Every refusal here is a validity judgement EXCEPT the pending-conflict one, which is transient by
-	 * construction and returns the `held` kind — see {@link PromiseVerdict}. Transient means the
+	 * Every refusal here is a validity judgement EXCEPT two transient ones — the pending-conflict
+	 * refusal, which returns the `held` kind, and the no-room-left refusal at the very end, which
+	 * returns the `out-of-space` kind (see {@link PromiseVerdict}). For `held`, transient means the
 	 * reservation it answers is one its holder is still going to commit or cancel: a record claiming
 	 * the slot this pend wants, or a later one. A record claiming a slot the collection has already
 	 * moved past is NOT a reservation against this pend and is not refused on — see
@@ -1947,9 +1972,14 @@ export class ClusterMember implements ICluster {
 	 * a block with no committed revision listed none of the records reserving it.
 	 */
 	private async validatePendOperations(record: ClusterRecord): Promise<PromiseVerdict> {
+		// Whether this record asked this member to STORE anything. Only a pend does, so only a pend can
+		// draw the out-of-space refusal below — a commit record's own vote is never about space (see
+		// {@link Signature}'s `out-of-space`).
+		let sawPend = false;
 		// Find pend operations in the message
 		for (const operation of record.message.operations) {
 			if ('pend' in operation) {
+				sawPend = true;
 				const pendRequest = operation.pend;
 				const blockIds = blockIdsForTransforms(pendRequest.transforms);
 				const viaGet = this.onceGet(blockIds);
@@ -2061,6 +2091,26 @@ export class ClusterMember implements ICluster {
 					return invalidVerdict(validation.reason, validation.validity);
 				}
 			}
+		}
+
+		// LAST among the refusals, and that ordering is this gate's one real correctness requirement. A
+		// member with no room still reads and re-executes the transaction, because reading costs no
+		// storage: a record that is genuinely invalid or genuinely expired must still get the permanent,
+		// structured answer that tells the writer not to retry it, and a transient "I am full" in its
+		// place would send the writer round a loop against content no honest member will ever accept. A
+		// `held` refusal wins for the other half of the same reason — it names an actionable rival that
+		// clears when that rival commits or cancels, where this names only a condition. So
+		// `out-of-space` is the answer only for a record this member would otherwise have APPROVED.
+		//
+		// Reads the last pressure SAMPLE, never a scan: this runs on the inbound path of a consensus
+		// round, and a directory walk here would cost the member its vote to a timeout. A node that
+		// cannot measure its storage, or has taken no sample yet, answers `false` and refuses nothing.
+		if (sawPend && this.storagePressure?.refusingNewData() === true) {
+			return {
+				valid: false,
+				kind: 'out-of-space',
+				reason: 'out of space: this member has no room for new data'
+			};
 		}
 
 		return { valid: true };

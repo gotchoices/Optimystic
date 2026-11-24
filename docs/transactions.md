@@ -672,6 +672,10 @@ A bare `Collection.sync` carries no validation payload and no statements, so a m
 
 No deployment validates at pend yet (see §7 below), so this check runs only where a validator is wired by hand.
 
+**A member also checks whether it has room, and that is the last thing it checks.** A member whose storage has filled the space its operator gave it answers a pend with an `out-of-space` vote rather than approving and discovering the problem when its disk fails the write. The order matters: expiry, membership, a stale revision, a slot hold, a rival's reservation and the transaction re-check above all run first, so the refusal for want of space is only ever the answer for a pend the member would otherwise have *approved*. Reading and re-executing a transaction costs no storage, and a pend that is genuinely invalid or genuinely expired must still get the permanent, structured answer that tells its writer not to retry it — a transient "I am full" in its place would send that writer round a loop against content no honest member will ever accept. The check reads the node's last storage-pressure sample and never scans the disk: a promise round is on the inbound path of a consensus round, and a directory walk inside it would cost the member its vote to a timeout. A node that cannot measure its own storage refuses nothing. The vote is transient and counted apart from approvals and rejections, like `conflict` and `held`; the writer's answer is a typed `OutOfSpaceFailure` naming the refusing members, which no write path retries. See [correctness.md Theorem 1 Case 2](correctness.md#theorem-1-consensus-safety-no-conflicting-commits) for the vote's place among the refusals and why a full block cohort is answered rather than re-placed.
+
+Nothing on the commit path checks space. A member that approved a pend honours its commit whatever its space has done since: the refusal is at the gate or nowhere, and the headroom between the refusal threshold and the node's allotment is sized for exactly the pends it has already approved.
+
 ## Terminology
 
 To support multi-collection transactions, we introduce a clear hierarchy:

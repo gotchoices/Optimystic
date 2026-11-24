@@ -1,6 +1,6 @@
 import type { BlockId } from "../index.js";
 import type { ActionId, ActionRev } from "../collection/action.js";
-import type { ExpiredFailure, RejectedFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
+import type { ExpiredFailure, OutOfSpaceFailure, RejectedFailure, ShortfallFailure, StaleFailure, WriteFailure } from "./struct.js";
 
 /**
  * The single rule for "is this non-success retryable after a re-read?" Both write paths and the
@@ -9,11 +9,12 @@ import type { ExpiredFailure, RejectedFailure, ShortfallFailure, StaleFailure, W
  * {@link StaleFailure.conflict} is authoritative when present. The `missing`/`pending` fallback
  * covers producers that have not been taught the field, including a remote peer on an older build
  * (the repo protocol is plain JSON, so an unset field simply arrives absent). An expiry
- * ({@link isExpiryFailure}), a promise shortfall ({@link isShortfallFailure}) and a validity
- * rejection ({@link isRejectedFailure}) are never a conflict, whatever else arrived beside them.
+ * ({@link isExpiryFailure}), a promise shortfall ({@link isShortfallFailure}), a validity
+ * rejection ({@link isRejectedFailure}) and a cohort with no room ({@link isOutOfSpaceFailure}) are
+ * never a conflict, whatever else arrived beside them.
  */
 export function isConflictFailure(failure: WriteFailure): boolean {
-	if (isExpiryFailure(failure) || isShortfallFailure(failure) || isRejectedFailure(failure)) return false;
+	if (isExpiryFailure(failure) || isShortfallFailure(failure) || isRejectedFailure(failure) || isOutOfSpaceFailure(failure)) return false;
 	return failure.conflict ?? Boolean(failure.missing?.length || failure.pending?.length);
 }
 
@@ -48,6 +49,17 @@ export function isShortfallFailure(failure: WriteFailure): failure is ShortfallF
  */
 export function isRejectedFailure(failure: WriteFailure): failure is RejectedFailure {
 	return failure.rejected !== undefined;
+}
+
+/**
+ * The single rule for "did the cohort refuse this pend because its members have no storage left?"
+ * ({@link OutOfSpaceFailure}). Every write path stops on it rather than retrying: nothing about the
+ * write's revision is the problem, so a re-read and rebase sends the same bytes to the same full
+ * members. Decided by the structured field, never the reason text; a coordinator on a build that
+ * predates the field never produces one at all, since the vote behind it is new too.
+ */
+export function isOutOfSpaceFailure(failure: WriteFailure): failure is OutOfSpaceFailure {
+	return failure.outOfSpace !== undefined;
 }
 
 /**

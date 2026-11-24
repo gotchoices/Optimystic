@@ -3,10 +3,11 @@ import type { BlockBaseRevs } from "../network/struct.js";
 import { clockOf, type HlcClock } from "../hlc/clock.js";
 import type { Transaction, ExecutionResult, ITransactionEngine, CollectionActions, ReadDependency } from "./transaction.js";
 import type { PeerId } from "../network/types.js";
-import { isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure, staleAtOwner } from "../network/stale-failure.js";
+import { isConflictFailure, isExpiryFailure, isOutOfSpaceFailure, isRejectedFailure, isShortfallFailure, staleAtOwner } from "../network/stale-failure.js";
 import { withBlockRevs } from "../network/durability.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
+import { CohortOutOfSpaceError } from "../network/cohort-out-of-space-error.js";
 import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { refuseSoloField } from "../network/refuse-solo.js";
 import type { Lane } from "../lane/lane.js";
@@ -90,7 +91,8 @@ function batchStaleAt(staleAt: ConfirmedRevision | undefined, blocksByCollection
 /** The error a refused pend of `collectionIds` stands for: its validity rejection — never retried, since
  * a re-drive sends the same content to the same checks — its expiry — never retried, since a re-drive's
  * expiration comes from the same clock — or its promise shortfall — never retried, since a re-drive
- * meets the same silent members — or a rejection carrying whether a re-read can clear it, with its
+ * meets the same silent members — or its cohort's want of space — never retried, since a re-drive sends
+ * the same bytes to the same full members — or a rejection carrying whether a re-read can clear it, with its
  * confirmed revision attributed per collection (`staleAtByCollection`, which the caller works out:
  * {@link ownStaleAt} for one collection's pend, {@link batchStaleAt} for a batched one).
  * Retryability comes from the response itself: a producer that classified the failure sets `conflict`,
@@ -99,10 +101,11 @@ function pendRefusalError(
 	collectionIds: readonly CollectionId[],
 	refusal: WriteFailure,
 	staleAtByCollection: ReadonlyMap<CollectionId, ConfirmedRevision>,
-): ValidityRejectedError | TransactionExpiredError | PromiseShortfallError | PendRejectedError {
+): ValidityRejectedError | TransactionExpiredError | PromiseShortfallError | CohortOutOfSpaceError | PendRejectedError {
 	if (isRejectedFailure(refusal)) return new ValidityRejectedError(refusal.rejected);
 	if (isExpiryFailure(refusal)) return new TransactionExpiredError(refusal.expired);
 	if (isShortfallFailure(refusal)) return new PromiseShortfallError(refusal.shortfall);
+	if (isOutOfSpaceFailure(refusal)) return new CohortOutOfSpaceError(refusal.outOfSpace);
 	return new PendRejectedError(collectionIds, isConflictFailure(refusal), refusal.reason, refusal.staleAt, staleAtByCollection);
 }
 
@@ -111,7 +114,7 @@ type TooLargeError = TransactionTooLargeError | BlockTooLargeError;
 
 /** How the pend phase failed. `staleAt` is every refused collection's confirmed revision, where its
  * refusal carried one (see `PendRejectedError.staleAtByCollection`). */
-type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; staleAt?: ReadonlyMap<CollectionId, ConfirmedRevision>; rejected?: ValidityRejectedError; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; tooLarge?: TooLargeError };
+type PendPhaseFailure = { success: false; error: string; staleLoss?: boolean; staleAt?: ReadonlyMap<CollectionId, ConfirmedRevision>; rejected?: ValidityRejectedError; expired?: TransactionExpiredError; shortfall?: PromiseShortfallError; outOfSpace?: CohortOutOfSpaceError; tooLarge?: TooLargeError };
 
 /**
  * One collection's share of an attempt, as the phases send it. For a transaction's attempt it is
@@ -151,8 +154,8 @@ function collectionAttemptOf(staged: StagedAttempt): CollectionAttempt {
  * reason was a conflicting pend ({@link PendRejectedError}`.conflict`) AND none was a hard failure: a
  * single hard failure (storage/policy rejection, or a thrown/unavailable transactor) will not clear on a
  * re-read, so re-driving it would just burn the retry budget. A validity rejection, an expiry, a promise
- * shortfall, and a pend or a block too large to send, are hard failures carried whole: each is the error
- * the commit surfaces.
+ * shortfall, a cohort with no room left, and a pend or a block too large to send, are hard failures
+ * carried whole: each is the error the commit surfaces.
  */
 function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const first = reasons[0];
@@ -160,6 +163,7 @@ function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 	const rejected = reasons.find((reason): reason is ValidityRejectedError => reason instanceof ValidityRejectedError);
 	const expired = reasons.find((reason): reason is TransactionExpiredError => reason instanceof TransactionExpiredError);
 	const shortfall = reasons.find((reason): reason is PromiseShortfallError => reason instanceof PromiseShortfallError);
+	const outOfSpace = reasons.find((reason): reason is CohortOutOfSpaceError => reason instanceof CohortOutOfSpaceError);
 	const tooLarge = reasons.find((reason): reason is TooLargeError => reason instanceof TransactionTooLargeError || reason instanceof BlockTooLargeError);
 	// Each refusal attributed its number to its own collection(s), and no collection is refused twice
 	// in one phase, so the maps are disjoint and merge without a rule.
@@ -172,6 +176,7 @@ function pendFailure(reasons: readonly unknown[]): PendPhaseFailure {
 		...(rejected === undefined ? {} : { rejected }),
 		...(expired === undefined ? {} : { expired }),
 		...(shortfall === undefined ? {} : { shortfall }),
+		...(outOfSpace === undefined ? {} : { outOfSpace }),
 		...(tooLarge === undefined ? {} : { tooLarge }),
 	};
 }
@@ -287,6 +292,9 @@ type CoordinationResult =
 		/** Present when a pend was refused because too few cohort members answered its promise round:
 		 * the error the commit surfaces, never a stale loss. */
 		shortfall?: PromiseShortfallError;
+		/** Present when a pend was refused because cohort members with no storage left refused to take
+		 * it: the error the commit surfaces, never a stale loss. */
+		outOfSpace?: CohortOutOfSpaceError;
 		/** Present when the transaction was refused before anything was sent because its pend, or a block
 		 * it would leave, was too large to send: the error the commit surfaces, never a stale loss. */
 		tooLarge?: TooLargeError;
@@ -302,17 +310,18 @@ function writtenDurability(written: ReadonlyMap<CollectionId, WriteDurability | 
 /**
  * The error an attempt whose phases failed with NOTHING committed is thrown as. A clean stale loss
  * — every refusal a conflict a re-read can clear — is {@link CoordinatorStaleLossError}, which the
- * retry loop re-drives. The four refusals a re-drive can never clear are thrown by name: a validity
+ * retry loop re-drives. The five refusals a re-drive can never clear are thrown by name: a validity
  * rejection (the retry's pend would send the same content to the same checks), an expiry (the
  * retry's expiration comes from the same clock), a promise shortfall (the retry meets the same
- * silent members), and a pend or block too large to send. Anything else is a plain error, the
+ * silent members), a cohort with no room left (the retry sends the same bytes to the same full
+ * members), and a pend or block too large to send. Anything else is a plain error, the
  * historical fail-fast for a hard failure.
  */
 function cleanFailureError(result: CoordinationResult & { success: false }, failed: readonly CollectionId[]): Error {
 	if (result.staleLoss) {
 		return new CoordinatorStaleLossError(failed, result.error, result.staleAt);
 	}
-	return result.rejected ?? result.expired ?? result.shortfall ?? result.tooLarge
+	return result.rejected ?? result.expired ?? result.shortfall ?? result.outOfSpace ?? result.tooLarge
 		?? new Error(`Transaction commit failed: ${result.error}`);
 }
 
@@ -754,7 +763,8 @@ export class TransactionCoordinator {
 	 * or commit the cohort refused because the transaction had expired by its members' clocks, which
 	 * surfaces as {@link TransactionExpiredError} (inside a partial commit's `reason` once a sibling
 	 * has landed), a pend too few of the cohort's members answered, which surfaces as
-	 * {@link PromiseShortfallError}, and a pend the members that sank it judged invalid, which surfaces
+	 * {@link PromiseShortfallError}, a pend cohort members with no storage left refused, which surfaces
+	 * as {@link CohortOutOfSpaceError}, and a pend the members that sank it judged invalid, which surfaces
 	 * as {@link ValidityRejectedError}.
 	 *
 	 * A participant can also be SAVED between attempts: an attempt that reported a loss may still

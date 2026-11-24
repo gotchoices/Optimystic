@@ -287,6 +287,9 @@ export type StaleFailure = {
 	/** Never set on a lost race — a write judged invalid is its own failure shape,
 	 *  {@link RejectedFailure}. */
 	rejected?: never;
+	/** Never set on a lost race — a cohort with no room left is its own failure shape,
+	 *  {@link OutOfSpaceFailure}. */
+	outOfSpace?: never;
 };
 
 /**
@@ -341,6 +344,7 @@ export type ExpiredFailure = {
 	staleAt?: never;
 	shortfall?: never;
 	rejected?: never;
+	outOfSpace?: never;
 };
 
 /**
@@ -408,6 +412,7 @@ export type ShortfallFailure = {
 	staleAt?: never;
 	expired?: never;
 	rejected?: never;
+	outOfSpace?: never;
 };
 
 /**
@@ -459,10 +464,68 @@ export type RejectedFailure = {
 	staleAt?: never;
 	expired?: never;
 	shortfall?: never;
+	outOfSpace?: never;
+};
+
+/**
+ * Why a cohort refused a write for want of storage: the members that sank it answered the promise
+ * round with a signed `out-of-space` vote (`Signature`'s `out-of-space`). Plain data, so it crosses
+ * the JSON repo protocol intact. `CohortOutOfSpaceError` is built from it, wherever it is raised.
+ *
+ * It names who refused and nothing about how full they are: a byte figure would be unverifiable, a
+ * publication of an operator's disk, and unread — see the vote's own doc.
+ */
+export type CohortOutOfSpace = {
+	/**
+	 * Peer-id strings of the members that refused for want of space. For a refusal a consensus round
+	 * produced, the members that voted `out-of-space`, never empty. A `peerCount` of 1 is instead the
+	 * cohort-of-one refusal, where no vote is cast and the coordinating node refused on its own behalf:
+	 * it names itself, or nobody when it does not know its own peer id (a hand-wired repo given no
+	 * local peer id — a live node always has one).
+	 */
+	peerIds: string[];
+	/** Approve votes the round received. A cohort-of-one refusal reports its own one approval. */
+	approvals: number;
+	/** How many members the cohort the round ran on has; 1 for a cohort-of-one refusal. */
+	peerCount: number;
+	/** The approvals the round needed: `ceil(peerCount × superMajorityThreshold)`. */
+	needed: number;
+};
+
+/**
+ * The cohort refused the write because members with no storage left refused to take it — not a lost
+ * race, not silence, and not a judgement of the write. Not retryable by a write path: nothing about
+ * the write's revision is the problem, so a re-read and rebase sends the same bytes to the same full
+ * members. What clears it is those members shedding what they hold, or their operator giving them
+ * more space.
+ *
+ * A pend answer only. `out-of-space` votes come from `ClusterMember.validatePendOperations`, which
+ * inspects pend operations only, so a commit never meets one — a member that approved a pend honours
+ * its commit whatever its space has done since.
+ *
+ * A sibling of {@link StaleFailure}, {@link ExpiredFailure}, {@link ShortfallFailure} and
+ * {@link RejectedFailure}, with the fields it can never carry typed `never`, so a consumer reads
+ * `reason`, `missing` or `staleAt` off any of them unnarrowed. Tell it apart with
+ * `isOutOfSpaceFailure`, never by reading `reason`.
+ */
+export type OutOfSpaceFailure = {
+	success: false;
+	/** The coordinator's description of the refusal, for a log line. Never branch on it. */
+	reason?: string;
+	/** Always false: a cohort with no room is not a conflict a re-read can win. */
+	conflict: false;
+	outOfSpace: CohortOutOfSpace;
+	missing?: never;
+	pending?: never;
+	heldBy?: never;
+	staleAt?: never;
+	expired?: never;
+	shortfall?: never;
+	rejected?: never;
 };
 
 /** Every way a pend or a commit can be refused with an answer rather than a throw. */
-export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure | RejectedFailure;
+export type WriteFailure = StaleFailure | ExpiredFailure | ShortfallFailure | RejectedFailure | OutOfSpaceFailure;
 
 export type PendResult = PendSuccess | WriteFailure;
 

@@ -3121,7 +3121,10 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		onCohortCommitApplied,
 		deriveExpectedCluster,
 		createClusterClient,
-		durabilityWindowFor
+		durabilityWindowFor,
+		// The out-of-space promise vote reads this node's last pressure sample; see
+		// `StoragePressureGate` in `cluster/cluster-repo.ts`.
+		storagePressure
 		// `recomputeArbitratorSet` (invalidation layer-2) is intentionally NOT wired here yet: a live FRET
 		// recompute needs a churn-tolerance window so it does not false-reject legitimate certificates from
 		// late-joiners (a liveness regression). Until that is tuned against live topology — and the
@@ -3251,7 +3254,9 @@ async function wireServingRole(ctx: ServingRoleContext): Promise<ServingRole> {
 		// A `full` commit that settles a ledger entry announces it through the same callable the
 		// drain emits through, so a host hears one event per entry whichever of the two removed it.
 		onBlockDurabilityReached: (event) => storageRepo.emitBlockDurabilityReached(event),
-		durabilityWindowFor
+		durabilityWindowFor,
+		// Read only by the cohort-of-one out-of-space refusal, where no member casts a vote.
+		storagePressure
 	});
 	serving.late.coordinatedRepo = coordinator;
 	cohortCommitAppliedTarget = (applied) => coordinator.noteCohortCommitApplied(applied);

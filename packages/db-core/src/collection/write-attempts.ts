@@ -10,9 +10,10 @@ import { copyTransforms } from "../transform/helpers.js";
 import { describeTouchedBlocks, baseRevsField } from "../transform/digest.js";
 import { oversizedWriteRefusal } from "../network/block-size.js";
 import { mergeDurability } from "../network/durability.js";
-import { highestStaleAt, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isExpiryFailure, isOutOfSpaceFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { TransactionExpiredError } from "../network/transaction-expired-error.js";
 import { PromiseShortfallError } from "../network/promise-shortfall-error.js";
+import { CohortOutOfSpaceError } from "../network/cohort-out-of-space-error.js";
 import { ValidityRejectedError } from "../network/validity-rejected-error.js";
 import { SyncRetryExhaustedError, SyncRevisionStalledError, TornActionError } from "./struct.js";
 import type { CollectionId, InFlightAttempt, SyncOptions } from "./struct.js";
@@ -546,7 +547,7 @@ export class AttemptCycle {
 	 * (TornActionError). The leftover entry itself is tracked in
 	 * tickets/backlog/bug-a-refused-write-can-leave-its-log-entry-behind.
 	 *
-	 * @throws TransactionExpiredError, PromiseShortfallError, ValidityRejectedError, SyncRetryExhaustedError */
+	 * @throws TransactionExpiredError, PromiseShortfallError, ValidityRejectedError, CohortOutOfSpaceError, SyncRetryExhaustedError */
 	recordRefusal(refusal: WriteFailure): void {
 		if (isExpiryFailure(refusal)) {
 			throw new TransactionExpiredError(refusal.expired);
@@ -556,6 +557,13 @@ export class AttemptCycle {
 		}
 		if (isRejectedFailure(refusal)) {
 			throw new ValidityRejectedError(refusal.rejected);
+		}
+		// A cohort with no room left joins the three refusals that end the write rather than spend an
+		// attempt: a re-read and rebase sends the same bytes to the same full members, so retrying it
+		// would burn the whole budget and report `SyncRetryExhaustedError` — a contention story — for a
+		// cohort that is simply out of space.
+		if (isOutOfSpaceFailure(refusal)) {
+			throw new CohortOutOfSpaceError(refusal.outOfSpace);
 		}
 		this.consecutiveFailures++;
 		this.lastReason = refusal.reason ?? this.lastReason;

@@ -1,6 +1,6 @@
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { ActionId, ClusterRecord, IKeyNetwork, RepoMessage, BlockId, ClusterPeers, MessageOptions, ClusterConsensusConfig, ICluster, PendResult, CommitResult, WriteFailure, CarriedOutcome, MemberApplyOutcome, TransactionInvalidity, ValidityRefusal } from "@optimystic/db-core";
-import { CURRENT_MEMBERSHIP_VERSION, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
+import { CURRENT_MEMBERSHIP_VERSION, CohortOutOfSpaceError, LruMap, MaxCarriedRecords, PromiseShortfallError, TransactionExpiredError, computeClusterMessageHash, membershipDigest, routingKeyForBlock } from "@optimystic/db-core";
 import { Pending } from "@optimystic/db-core";
 import type { PeerId } from "@libp2p/interface";
 import { createLogger, verbose } from '../logger.js'
@@ -1125,9 +1125,10 @@ export class ClusterCoordinator {
 		const promised = await this.collectPromises(peers, record);
 		const superMajority = Math.ceil(peerCount * this.cfg.superMajorityThreshold);
 
-		// Count approvals, rejections and the two RETRYABLE refusals separately. A `conflict` vote is a
+		// Count approvals, rejections and the three RETRYABLE refusals separately. A `conflict` vote is a
 		// member saying "not now — I hold the race winner"; a `held` vote is a member saying "not now —
-		// a different unresolved action holds these blocks in my storage". Neither may count toward
+		// a different unresolved action holds these blocks in my storage"; an `out-of-space` vote is a
+		// member saying "not now — I have no room". None may count toward
 		// approvals OR rejections, or a transient refusal would masquerade as a validator rejection
 		// (permanent) or as silence (indistinguishable from an unreachable cohort) — both wrong.
 		const promises = promised.record.promises;
@@ -1135,6 +1136,7 @@ export class ClusterCoordinator {
 		const rejectionCount = Object.values(promises).filter(sig => sig.type === 'reject').length;
 		const conflictCount = Object.values(promises).filter(sig => sig.type === 'conflict').length;
 		const heldCount = Object.values(promises).filter(sig => sig.type === 'held').length;
+		const outOfSpacePeers = Object.entries(promises).flatMap(([peerId, sig]) => sig.type === 'out-of-space' ? [peerId] : []);
 
 		// Check if rejections make super-majority impossible
 		// If more than (peerCount - superMajority) nodes reject, we can never reach super-majority
@@ -1142,7 +1144,7 @@ export class ClusterCoordinator {
 		// Whether the merged record itself PROVES super-majority unreachable — the same sum a member
 		// re-derives as `ConflictSuperseded`/`Rejected` from the signed votes, which is what makes an
 		// abandonment broadcast proof-carrying rather than an unauthenticated "forget this".
-		const refusalsProveUnreachable = rejectionCount + conflictCount + heldCount > maxAllowedRejections;
+		const refusalsProveUnreachable = rejectionCount + conflictCount + heldCount + outOfSpacePeers.length > maxAllowedRejections;
 		if (rejectionCount > maxAllowedRejections) {
 			const rejectReasonsByPeer = Object.fromEntries(Object.entries(promises)
 				.flatMap(([peerId, sig]) => sig.type === 'reject' ? [[peerId, sig.rejectReason ?? 'unknown'] as const] : []));
@@ -1234,6 +1236,35 @@ export class ClusterCoordinator {
 				heldBy);
 		}
 
+		// An `out-of-space`-answered shortfall is the THIRD retryable refusal: members with no storage
+		// left refused to take the pend. Checked after the conflict and held branches — each of those
+		// names a rival, which is strictly more actionable than "a member is full" — and, like them,
+		// before the generic shortfall, which must stay reserved for the genuinely-silent cohort.
+		//
+		// Only a PEND record reaches here with such votes: they come from
+		// `ClusterMember.validatePendOperations`, which inspects pend operations only, so
+		// `CoordinatorRepo.commit` never meets one — exactly as `BlocksHeldError` documents for itself.
+		if (outOfSpacePeers.length > 0 && approvalCount < superMajority) {
+			log('cluster-tx:cohort-out-of-space', {
+				messageHash: record.messageHash,
+				peerCount,
+				approvals: approvalCount,
+				rejections: rejectionCount,
+				outOfSpace: outOfSpacePeers,
+				superMajority
+			});
+			this.updateTransactionRecord(promised.record, 'cohort-out-of-space');
+			if (refusalsProveUnreachable) {
+				this.broadcastAbandonment(promised.record, 'cohort-out-of-space');
+			}
+			throw new CohortOutOfSpaceError({
+				peerIds: outOfSpacePeers,
+				approvals: approvalCount,
+				peerCount,
+				needed: superMajority
+			});
+		}
+
 		if (peerCount > 1 && approvalCount < superMajority) {
 			log('cluster-tx:supermajority-failed', {
 				messageHash: record.messageHash,
@@ -1254,8 +1285,8 @@ export class ClusterCoordinator {
 			// byte-identical because a downstream repository (sereus cadre-core control-write-retry)
 			// matches it to retry a genuinely-silent cohort. Consumers here test `instanceof
 			// PromiseShortfallError`, or `isShortfallFailure` on the refusal `CoordinatorRepo.pend`
-			// returns for it — never the text. Never fold `conflict` or `held` votes into its rejection
-			// count: they are peeled off above.
+			// returns for it — never the text. Never fold `conflict`, `held` or `out-of-space` votes into
+			// its rejection count: they are peeled off above.
 			throw new PromiseShortfallError({
 				approvals: approvalCount,
 				rejections: rejectionCount,

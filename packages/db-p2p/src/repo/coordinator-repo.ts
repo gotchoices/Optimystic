@@ -1,6 +1,7 @@
-import type { ConnectedCohort, WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
-import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits, laneField } from "@optimystic/db-core";
+import type { ConnectedCohort, WriteDurability, PendRequest, ActionBlocks, IRepo, MessageOptions, CommitResult, CommitSuccess, GetBlockResults, PendResult, StaleFailure, WriteFailure, BlockGets, CommitRequest, RepoMessage, IKeyNetwork, ICluster, ClusterConsensusConfig, BlockId, ActionId, ActionRev, ActionContext, ClusterRecord, BlockUnavailableReason, ActionPending, OutOfSpaceFailure, ShortfallFailure, SoloRefusalReason, Lane } from "@optimystic/db-core";
+import { LruMap, transformForBlockId, highestStaleAt, isConflictFailure, isOwnRevision, DEFAULT_SUPER_MAJORITY_THRESHOLD, routingKeyForBlock, localDurability, unroutedDurability, CohortOutOfSpaceError, PromiseShortfallError, TransactionExpiredError, ValidityRejectedError, assertTransactionFits, laneField } from "@optimystic/db-core";
 import { BlocksHeldError, ClusterCoordinator, ConflictRaceLostError, DEFAULT_PEND_DELIVERY_DEFERRAL_MS, ValidatorRejectionError, type CohortResolution } from "./cluster-coordinator.js";
+import type { StoragePressureGate } from "../storage/storage-pressure.js";
 import type { PeerId } from "@libp2p/interface";
 import { peerIdFromString } from "@libp2p/peer-id";
 import type { FretService } from "p2p-fret";
@@ -535,6 +536,12 @@ interface CoordinatorRepoComponents {
 	 */
 	onBlockDurabilityReached?: BlockDurabilitySink;
 	/**
+	 * This node's storage-pressure reading, for the cohort-of-one out-of-space refusal
+	 * ({@link CoordinatorRepo.refuseSoloPendForSpace}). Narrowed to the one synchronous question an
+	 * inbound door asks, exactly as `ClusterMember` takes it; absent → nothing is refused for space.
+	 */
+	storagePressure?: StoragePressureGate;
+	/**
 	 * How long this node's own apply of a write that ran consensus — the fallback pend and commit —
 	 * may let its sync wait, from the size of the cohort the record ran on (`durabilityWindowMs` in
 	 * `../storage/durability-window.ts`, bound to the node's policy by `createLibp2pNodeBase`, which
@@ -590,7 +597,8 @@ export function coordinatorRepo(
 		components.onBlockDurabilityReached,
 		components.durabilityWindowFor,
 		components.clusterLatestBatchCallback,
-		components.blockLineageCallback
+		components.blockLineageCallback,
+		components.storagePressure
 	);
 }
 
@@ -807,7 +815,8 @@ export class CoordinatorRepo implements IRepo {
 		private readonly onBlockDurabilityReached?: BlockDurabilitySink,
 		private readonly durabilityWindowFor?: DurabilityWindowFor,
 		private readonly clusterLatestBatchCallback?: ClusterLatestBatchCallback,
-		private readonly blockLineageCallback?: BlockLineageAsk
+		private readonly blockLineageCallback?: BlockLineageAsk,
+		private readonly storagePressure?: StoragePressureGate
 	) {
 		this.localPeerId = localPeerId;
 		this.log = createLogger('coordinator-repo', localPeerId?.toString());
@@ -2975,9 +2984,9 @@ export class CoordinatorRepo implements IRepo {
 	/** The cluster half of {@link pendMany}, after responsibility is verified: consensus, the
 	 *  local-verdict arms, and the catch that turns each optimistic-concurrency refusal into a retryable
 	 *  answer — the two signed-evidence ones ({@link ConflictRaceLostError}, {@link BlocksHeldError})
-	 *  directly, and a validator rejection only through {@link classifyStaleRejection} — and an expiry
-	 *  or a promise shortfall into the non-retryable answer that names it. Every refusal, whichever
-	 *  request's blocks it came from, answers the whole batch. */
+	 *  directly, and a validator rejection only through {@link classifyStaleRejection} — and an expiry,
+	 *  a promise shortfall or a cohort with no room left into the non-retryable answer that names it.
+	 *  Every refusal, whichever request's blocks it came from, answers the whole batch. */
 	private async pendThroughCluster(batch: PendBatch, options?: MessageOptions): Promise<PendResult> {
 		const coordinatingBlockIds = options?.coordinatingBlockIds ?? batch.blockIds;
 
@@ -3125,6 +3134,16 @@ export class CoordinatorRepo implements IRepo {
 			if (error instanceof PromiseShortfallError) {
 				return error.toFailure();
 			}
+			// And so is a cohort with no room left, for the same two reasons plus a third. A thrown pend is
+			// retried verbatim by db-core as a transport fault (the reasoning `ConflictRaceLostError`'s doc
+			// records), and a retry cannot help here: nothing about the revision is the problem, so a
+			// re-read and rebase sends the same bytes to the same full members. Returned, it carries
+			// `conflict: false` with no `missing`/`pending`, so `isConflictFailure` answers false and the
+			// retry loop does not absorb it either — the writer gets the typed terminal answer instead of
+			// a stale-revision loop it cannot win.
+			if (error instanceof CohortOutOfSpaceError) {
+				return error.toFailure();
+			}
 			// A lost conflict race is an optimistic-concurrency loss, not a fault: surface it as the
 			// StaleFailure shape the retry machinery already understands (`Collection.sync` and the
 			// multi-collection pendPhase retry it via `isConflictFailure`), exactly as a confirmed
@@ -3200,10 +3219,47 @@ export class CoordinatorRepo implements IRepo {
 			const reason = soloRefusalFor(solo, awaitingBootstrap);
 			if (reason !== undefined) return this.refuseSoloPend(batch, blockId, reason, solo, awaitingBootstrap);
 		}
+		const outOfSpace = this.refuseSoloPendForSpace(batch, blockId, options);
+		if (outOfSpace !== undefined) return outOfSpace;
 		// Strict, no `syncWithinMs`: no consensus ran, and only this machine holds the write, so it
 		// is synced before the writer is answered.
 		const result = await this.applyPendsInOrder(batch, options);
 		return result.success ? { ...result, durability: soloCohortDurability(solo) } : result;
+	}
+
+	/**
+	 * {@link pendSolo}'s refusal of a pend this node has no room for, or `undefined` when it has room.
+	 *
+	 * A cohort of one casts no vote, so the member-side gate
+	 * (`ClusterMember.validatePendOperations`) never runs and this is where the same answer has to be
+	 * built. It mirrors how the validity path already reaches a cohort of one — through the
+	 * coordinating node's own storage-tier check rather than a vote (see `ValidityRefusal.peerId`).
+	 * Without it, a full single-member deployment accepts writes from client nodes until its disk
+	 * fails a write.
+	 *
+	 * The refusal names this node as the peer that has no room, and claims one approval of the one it
+	 * needed, so the facts read the same shape as a cohort's.
+	 *
+	 * **A write from the program on this machine is exempt.** The node's own writes are refused later
+	 * than everybody else's — not at `refuseAbove`, where every inbound door refuses, but only once the
+	 * measured use reaches the allotment itself (`OwnWriteRoom` in `../storage/storage-pressure.ts`
+	 * argues why). On a cohort of one that distinction is load-bearing rather than cosmetic: the
+	 * sibling steps that clear a full cohort — a member sheds, the cohort reforms around peers with
+	 * room — need a peer to shed TO, and a cohort of one has none, so refusing this node's own writes
+	 * here would stop its application writing at `refuseAbove` with no path back but the operator
+	 * raising the allotment. `localWriter` is set only by a transactor in this process and is never
+	 * carried on the wire, so a remote writer cannot claim the exemption.
+	 */
+	private refuseSoloPendForSpace(batch: PendBatch, blockId: BlockId, options?: MessageOptions): OutOfSpaceFailure | undefined {
+		if (options?.localWriter === true || this.storagePressure?.refusingNewData() !== true) return undefined;
+		const selfId = this.localPeerId?.toString();
+		this.log('pend:solo-out-of-space', { actionId: batch.actionId, blockId });
+		return new CohortOutOfSpaceError({
+			peerIds: selfId === undefined ? [] : [selfId],
+			approvals: 1,
+			peerCount: 1,
+			needed: 1
+		}).toFailure();
 	}
 
 	/**

@@ -1,6 +1,6 @@
 import { peerIdFromString } from "../network/types.js";
 import type { PeerId } from "../network/types.js";
-import { highestStaleAt, isConflictFailure, isExpiryFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
+import { highestStaleAt, isConflictFailure, isExpiryFailure, isOutOfSpaceFailure, isRejectedFailure, isShortfallFailure } from "../network/stale-failure.js";
 import { BlockUnavailableError, BlockPossiblyStaleError } from "../network/struct.js";
 import { mergeDurability, withTornBlocks } from "../network/durability.js";
 import { judgeCohortLineage, type CohortLineage, type MemberLineage } from "../network/lineage.js";
@@ -1761,6 +1761,10 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * - Otherwise a **promise shortfall** anywhere ({@link isShortfallFailure}) is the answer, verbatim —
  *   the first one, for the same reason: no retry can succeed while that cohort's members are silent.
  *   Below an expiry because a shortfall clears when the members come back, and an expiry does not.
+ * - Otherwise a **cohort with no room** anywhere ({@link isOutOfSpaceFailure}) is the answer, verbatim —
+ *   the first one, for the same reason again: a retry sends the same bytes to the same full members.
+ *   Last of the four by the same ordering rule, least permanent first from the bottom: a full member
+ *   sheds to peers with room on its own, with no operator and no absent machine to wait for.
  * - Otherwise a {@link StaleFailure}: `reason` is the first one any response gave (the only diagnostic
  *   that survives an exhausted retry budget and the coordinator's error text — a refusal whose reason
  *   is `commit-not-durable` must not read as "stale commit", a rival's win); `staleAt` is the highest
@@ -1783,7 +1787,7 @@ function confirmedDurabilities(batches: CoordinatorBatch<BlockId[], CommitResult
  * or if mixed-outcome writes show up as wasted retry latency in practice.
  */
 function refusalFrom(responses: WriteFailure[]): WriteFailure {
-	const unretryable = responses.find(isRejectedFailure) ?? responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure);
+	const unretryable = responses.find(isRejectedFailure) ?? responses.find(isExpiryFailure) ?? responses.find(isShortfallFailure) ?? responses.find(isOutOfSpaceFailure);
 	if (unretryable !== undefined) {
 		return unretryable;
 	}

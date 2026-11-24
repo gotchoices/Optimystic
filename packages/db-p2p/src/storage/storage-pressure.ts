@@ -248,6 +248,21 @@ export function pressureStageOf(capacity: StorageCapacity, thresholds: StoragePr
 }
 
 /**
+ * The pressure reading narrowed to the one question a consensus path asks: does this node still take
+ * data from other machines? ({@link StoragePressure.refusingNewData} — the last sample read against
+ * `refuseAbove`, the same predicate the pushed-replica and announced-blob doors read, so no door
+ * re-derives the threshold comparison.)
+ *
+ * Narrowed rather than the whole class because these callers must read it SYNCHRONOUSLY: a promise
+ * round is on the inbound path of a consensus round, and a disk scan inside it would cost the member
+ * its vote to a timeout. Taken by `ClusterMember` (the `out-of-space` promise vote) and by
+ * `CoordinatorRepo` (the same refusal on a cohort of one, where no vote is cast). Absent — a member or
+ * repo built by hand, or a node with no account — and nothing is ever refused for space, which is also
+ * what an unmeasurable node answers.
+ */
+export type StoragePressureGate = Pick<StoragePressure, 'refusingNewData'>;
+
+/**
  * The node's pressure reading: one sample per tick, one stage, and synchronous accessors for the
  * inbound paths that must not block on a disk scan.
  *

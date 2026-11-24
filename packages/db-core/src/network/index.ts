@@ -1,6 +1,7 @@
 export * from "./i-key-network.js";
 export * from "./i-peer-network.js";
 export * from "./block-size.js";
+export * from "./cohort-out-of-space-error.js";
 export * from "./durability.js";
 export * from "./i-repo.js";
 export * from "./lineage.js";
