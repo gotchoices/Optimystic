@@ -792,18 +792,18 @@ export class FileWriteLog {
 	 * The absolute path a record's relative path names, refusing one that does not resolve strictly
 	 * inside the store.
 	 *
-	 * This guards a RECORDED PATH, not a block id: the rule for block ids is `isValidBlockId` and
-	 * `KvRawStorage` applies it before any id reaches a backend. Three shapes still reach here. A
-	 * store written by a build from BEFORE that check can hold a log record naming `../escaped/...`,
-	 * and a log is replayed on every open until a checkpoint truncates it, so the escaped write would
-	 * be re-applied after every restart — the one place a pre-fix block id survives the upgrade. A log
-	 * file damaged or forged on disk can name anything; the CRC catches damage but not a record
-	 * someone wrote on purpose. And an ACTION id is a path segment in a record too
-	 * (`relativeActionScopedPath` in `file-batch-backend.ts`, which only percent-encodes colons) and
-	 * nothing validates one anywhere, so a peer-chosen action id carrying `../` reaches this guard on
-	 * the LIVE commit path, where a throw latches the whole store rather than refusing one call —
-	 * measured, and the open ticket `bug-an-action-id-is-used-as-a-file-path-without-validation` owns
-	 * moving that refusal up to the kernel beside the block id's.
+	 * This guards a RECORDED PATH, not an identifier. Every identifier a record's path is built from —
+	 * block id, action id, revision number — is checked before it reaches a backend, by `KvRawStorage`
+	 * against `isValidBlockId` / `isValidActionId` / `isValidRevision` (Invariant 7 of
+	 * `packages/db-p2p/docs/storage.md`). So on the live commit path this guard is unreachable, which
+	 * is what makes latching the store the right reaction if it ever does fire there.
+	 *
+	 * Two shapes still reach it, both on REPLAY. A store written by a build from before those checks
+	 * can hold a record naming `../escaped/...`, and a log is replayed on every open until a
+	 * checkpoint truncates it, so the escaped write would be re-applied after every restart — this is
+	 * the one place a pre-check identifier survives the upgrade, and a replay ends at such a record
+	 * rather than latching (see `FileWriteLog.replaySegment`). And a log file damaged or forged on
+	 * disk can name anything; the CRC catches damage but not a record someone wrote on purpose.
 	 */
 	private containedTarget(entryPath: string): string {
 		const target = path.resolve(this.basePath, entryPath);

@@ -1,6 +1,6 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
-import type { BlockId, ActionId } from '@optimystic/db-core';
+import { isValidActionId, type BlockId, type ActionId } from '@optimystic/db-core';
 import { NODE_KV_NAMESPACES, type BatchBackend, type BatchEntry, type CommittedBatch, type SinkCommitOptions, type StoreDurability, type StoreIdentity, type StoreKey } from '@optimystic/db-p2p';
 import { createLogger } from './logger.js';
 import { FileWriteLog, assertFileWriteLogOptions, fileStoreIdentity, readFileIfExists, type FileWriteLogOptions, type WriteLogEntry } from './file-write-log.js';
@@ -16,6 +16,13 @@ const decoder = (): TextDecoder => decoderInstance ??= new TextDecoder();
 
 // Colons are illegal in Windows filenames; encode them so action ids like
 // `tx:<hash>` and `stamp:<hash>` round-trip safely on all platforms.
+//
+// The pair is INJECTIVE on valid action ids, and that rests on `isValidActionId` refusing `%`: with
+// `%` a legal character the two directions collide, because `tx:a` and `tx%3Aa` would be two
+// different ids encoding to one filename — one action's record silently overwriting another's, and
+// the listing below reporting an id that was never written. The rule's `%` clause is what makes
+// that unrepresentable, so do not relax it without re-encoding `%` here (which would also have to
+// stay compatible with the filenames already on disk).
 function encodeActionIdForFilename(actionId: ActionId): string {
 	return actionId.replace(/:/g, '%3A');
 }
@@ -217,22 +224,25 @@ export class FileBatchBackend implements BatchBackend {
 		for (const file of files) {
 			if (!file.endsWith('.json')) continue;
 			const actionId = decodeFilenameToActionId(file.slice(0, -5));
-			// Accept every realistic action id: legacy UUIDs (`[0-9a-f-]`), consensus
-			// tx:/stamp: ids (base64url-encoded SHA-256, alphabet `[A-Za-z0-9_-]` — see
-			// db-core hashString, NOT lowercase hex), AND the bare-alphanumeric ids the
-			// cross-backend conformance suite uses (`a1`, `b1`, ...). This is deliberately
-			// broad-but-not-total: an id is any `[A-Za-z0-9_-]` string, optionally prefixed
-			// with `tx:`/`stamp:`. It is NOT a total accept — a file whose decoded name
-			// carries other punctuation (a dot, a space) is genuine junk in pend/ and is
-			// logged-and-skipped rather than surfaced as a phantom pending. The memory/db
-			// reference drivers key on the raw id and never see a filesystem name, so this
-			// filter is fs-only; it must not drop an id those backends would list, hence the
-			// widened class (an earlier hex-only class silently dropped real consensus ids —
-			// see `optimystic-filestorage-colon-actionid-windows`).
-			if (!/^(?:tx:|stamp:)?[A-Za-z0-9_-]+$/.test(actionId)) {
-				// Leave a breadcrumb rather than silently dropping: the .json + decode guard
-				// already excludes the `*.tmp` orphans an older build's atomic writer could leave, so
-				// anything reaching here is an unexpected filename a maintainer should see.
+			// The filter is the WRITE rule, not a second opinion about what an action id may be:
+			// `isValidActionId` is the same predicate `KvRawStorage` applies before an id reaches this
+			// backend, so every record the write path could have created is listed here. A narrower
+			// charset of its own is what this used to be, and it silently hid real records — `~proof:5`
+			// and `tx:café—🔒—Ω` are both ids the system stores today, and a pend that should have
+			// conflicted with such a record could not see it.
+			//
+			// It is still not a total accept, which is the point: junk in pend/ must not read as a
+			// phantom pending. A decoded name carrying a stray `%` (so not a name this backend wrote),
+			// a path-ish name from a pre-rule build, `.`/`..`, anything an older build left — all are
+			// logged and skipped. The `*.tmp` orphans an older build's atomic writer could leave are
+			// already excluded by the `.json` check above.
+			//
+			// The memory and database reference drivers key on the raw id and never see a filesystem
+			// name, so no filter of this kind exists there; sharing the write rule is what keeps this
+			// one from dropping an id those backends would list.
+			if (!isValidActionId(actionId)) {
+				// Leave a breadcrumb rather than silently dropping: anything reaching here is an
+				// unexpected filename a maintainer should see.
 				log('listPendingActionIds skipping unrecognized action-id file %s for %s', file, blockId);
 				continue;
 			}

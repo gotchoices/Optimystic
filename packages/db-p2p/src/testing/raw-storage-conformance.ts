@@ -1,5 +1,5 @@
 import { expect } from 'chai';
-import { InvalidBlockIdError, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transform, type Transforms } from '@optimystic/db-core';
+import { InvalidActionIdError, InvalidBlockIdError, InvalidRevisionError, type BlockId, type ActionId, type IBlock, type BlockHeader, type Transform, type Transforms } from '@optimystic/db-core';
 import type { BlockCommitProof } from '../cluster/commit-proof.js';
 import type { IRawStorage } from '../storage/i-raw-storage.js';
 import type { BlockMetadata } from '../storage/struct.js';
@@ -541,24 +541,40 @@ export function runRawStorageConformance(
 			await storage.deleteBlock('del-never-seen' as BlockId);
 		});
 
-		// --- Block ids (Invariant 7; the rule's own edges are pinned in db-core's block-id.spec.ts) ---
+		// --- Identifiers (Invariant 7; each rule's own edges are pinned in db-core's
+		// `block-id.spec.ts` / `action-id.spec.ts`) ---
 
-		// One id for every backend, because the enforcement is shared (`KvRawStorage.checkedId`) and
-		// the point here is the CONSEQUENCE: the write is refused and the store is still usable.
-		// Refusing above the write group is what buys the second half — a throw from inside a commit
-		// would latch the store failed and refuse every later write, which is exactly what a peer
-		// naming `../escaped` must not be able to do to a node.
-		it('refuses a write under a block id that names a location outside the store, and stays usable', async () => {
-			const escaping = '../escaped' as BlockId;
+		// One set of names for every backend, because the enforcement is shared
+		// (`KvRawStorage.checkedId` / `checkedActionId` / `checkedRev`) and the point here is the
+		// CONSEQUENCE, over all three identifiers: the write is refused, the READ is refused too, and
+		// the store is still usable. Refusing above the write group is what buys that last part — a
+		// throw from inside a commit would latch the store failed and refuse every later write, which
+		// is exactly what a peer naming `../escaped` must not be able to do to a node. The read half
+		// is not redundant with the write half: reads do not go through the filesystem backend's
+		// write-ahead log at all, so its containment guard is not on that path and an unchecked name
+		// there returned the contents of a `.json` file outside the store.
+		it('refuses a write or a read under a name that is not inside the store, and stays usable', async () => {
+			const escaping = '../escaped';
 			const transform: Transform = { insert: makeBlock('escaped') };
 			const meta: BlockMetadata = { ranges: [[1, 1]], latest: { rev: 1, actionId: 'a1' as ActionId } };
+			const held = 'held' as BlockId;
 
-			const refused = await rejection(storage.savePendingTransaction(escaping, 'tx-abc' as ActionId, transform));
-			expect(refused, 'a pend under an escaping id is refused').to.be.instanceOf(InvalidBlockIdError);
-			expect(await rejection(storage.getMetadata(escaping)), 'a READ of the id is refused too')
-				.to.be.instanceOf(InvalidBlockIdError);
+			expect(await rejection(storage.savePendingTransaction(escaping as BlockId, 'tx-abc' as ActionId, transform)),
+				'a pend under an escaping BLOCK id is refused').to.be.instanceOf(InvalidBlockIdError);
+			expect(await rejection(storage.getMetadata(escaping as BlockId)),
+				'a READ under an escaping block id is refused too').to.be.instanceOf(InvalidBlockIdError);
 
-			// The refusal cost the store nothing: a later write is taken and read back. Were the check
+			expect(await rejection(storage.savePendingTransaction(held, escaping as ActionId, transform)),
+				'a pend under an escaping ACTION id is refused').to.be.instanceOf(InvalidActionIdError);
+			expect(await rejection(storage.getPendingTransaction(held, escaping as ActionId)),
+				'a READ under an escaping action id is refused too').to.be.instanceOf(InvalidActionIdError);
+
+			expect(await rejection(storage.saveRevision(held, escaping as unknown as number, 'tx-abc' as ActionId)),
+				'a revision write under a non-numeric REV is refused').to.be.instanceOf(InvalidRevisionError);
+			expect(await rejection(storage.getRevision(held, escaping as unknown as number)),
+				'a READ under a non-numeric rev is refused too').to.be.instanceOf(InvalidRevisionError);
+
+			// The refusals cost the store nothing: a later write is taken and read back. Were a check
 			// inside the write group instead, the store would have latched failed and refused this.
 			await storage.saveMetadata('kept' as BlockId, meta);
 			await storage.flush();

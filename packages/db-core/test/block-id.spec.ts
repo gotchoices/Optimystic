@@ -8,7 +8,7 @@
  */
 
 import { expect } from 'chai';
-import { assertValidBlockId, isValidBlockId, InvalidBlockIdError, type BlockId } from '../src/index.js';
+import { MAX_STORED_ID_LENGTH, assertValidBlockId, isValidBlockId, InvalidBlockIdError, type BlockId } from '../src/index.js';
 
 describe('isValidBlockId', () => {
 	it('accepts the ids the system actually uses', () => {
@@ -17,6 +17,7 @@ describe('isValidBlockId', () => {
 			'a': 'a one-segment id',
 			'bXkZ9-xQ_ePm3n1T4rVsLgKdHcBaWoYu0Ij2': 'a base64url-shaped random id',
 			'a..b': 'dots INSIDE a segment: only a whole segment of dots can escape',
+			['a'.repeat(MAX_STORED_ID_LENGTH)]: 'exactly at the shared length bound',
 		};
 		for (const [id, reason] of Object.entries(accepted)) {
 			expect(isValidBlockId(id), `${JSON.stringify(id)} — ${reason}`).to.equal(true);
@@ -38,6 +39,7 @@ describe('isValidBlockId', () => {
 			'a/./b': 'an interior `.` segment, which aliases `a/b`',
 			'a/': 'a trailing slash, which aliases `a`',
 			'a\u0000b': 'a NUL, which makes `fs` throw rather than escape',
+			['a'.repeat(MAX_STORED_ID_LENGTH + 1)]: 'one code unit over the shared bound, which is what keeps a built path inside the write-ahead log record format (a long id latched the store before the bound existed)',
 		};
 		for (const [id, reason] of Object.entries(rejected)) {
 			expect(isValidBlockId(id), `${JSON.stringify(id)} — ${reason}`).to.equal(false);

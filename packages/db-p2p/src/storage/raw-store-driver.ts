@@ -72,9 +72,12 @@ export interface RawStoreDriver<V extends StoredValue = Uint8Array> {
 	 * proofs store — keyed by (blockId, rev), the same key shape as the revisions
 	 * store. A revision's `BlockCommitProof` lives here and NOWHERE in the
 	 * transactions store: an action id is chosen by whoever originates a write
-	 * (a client's `pend`, a peer's restore archive) and is never re-derived or
-	 * format-checked, so any reserved action-id convention could be collided with
+	 * (a client's `pend`, a peer's restore archive) and is never re-derived by the
+	 * storing node, so any reserved action-id convention could be collided with
 	 * by an ordinary write. Separate keyspaces make the collision unrepresentable.
+	 * `isValidActionId` does not change that: it refuses only an id that would name
+	 * a location outside the store or alias another id, reserving no prefix and
+	 * imposing no format, so `~proof:5` remains a legal action id.
 	 *
 	 * There is deliberately no per-revision `deleteProof`: an entry lives and dies with its REVISION
 	 * record, and the one site that removes a revision record removes a whole block's —
